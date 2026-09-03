@@ -1272,7 +1272,7 @@ fn record_merge_state(
 /// (`iconst_1; goto L; iconst_0; L: ireturn`) both merge exactly one value.
 /// Four leaves room for nested conditionals without letting an unusual body
 /// reserve an unbounded region.
-const MAX_INLINE_MERGE_DEPTH: usize = 4;
+pub(crate) const MAX_INLINE_MERGE_DEPTH: usize = 4;
 
 impl Compiler {
     // -----------------------------------------------------------------------
@@ -2860,13 +2860,76 @@ impl Compiler {
                                 .map(|(_, offset, _)| *offset);
                             let fresh_ctor_first_store =
                                 inline_site_is_fresh_ctor_first_store(&site, cpc, field_index);
-                            if inline_putfield_enabled()
+                            // GATED reference store — the FOURTH door.
+                            //
+                            // This arm was wired into the top-level `putfield`
+                            // on 2026-09-02 and not into this one, so a
+                            // workload whose reference stores live inside
+                            // INLINED callees never reached it. bt18 is exactly
+                            // that workload: it reported `gated=2` from two
+                            // cold top-level sites and a run-time census of
+                            // ZERO executions, while its hot stores went
+                            // through the two arms below. The sites here were
+                            // not even counted as declines, so the census could
+                            // not show the gap either.
+                            //
+                            // Ordered after the fresh-constructor arm, which is
+                            // a proven cheaper specialization (a `new`-produced
+                            // object needs no barrier at all, so it emits no
+                            // gates), and before the general body arm, which
+                            // requires the field's old value to be null and
+                            // keys on the STORE-side bounds table rather than
+                            // on the collector's published plan.
+                            // The fresh-constructor arm is preferred ONLY where
+                            // it can actually run. It bails to a full helper
+                            // call unless the STORE-side region table holds live
+                            // bounds, and the generational collector never
+                            // publishes that table -- only G1 and ZGC call
+                            // `publish_movable_bounds`. So under the default
+                            // collector that specialization is dead, and every
+                            // constructor field store it owns was an
+                            // out-of-line `jit_putfield_object` that no census
+                            // counted. bt18 is made of exactly those stores.
+                            let fresh_ctor_arm_is_live = fresh_ctor_first_store
+                                && region_bounds_are_live(self.helpers.region_bounds_addr);
+                            let gated_inlined = !fresh_ctor_arm_is_live
+                                && gated_ref_store_enabled()
+                                && inline_putfield_enabled()
+                                && !narrow_oops_block_inline_fields()
+                                && cratonvm_types::compact_ref_fields_enabled()
+                                && match compact_offset {
+                                    // Cast: a compact field offset plus the
+                                    // header is bounded by the object size.
+                                    Some(offset) => {
+                                        let cell_off =
+                                            (cratonvm_types::HEADER_SIZE + offset as usize) as i32;
+                                        // `false`: this door has no
+                                        // stack-type tracker to prove the
+                                        // receiver is an oop, so the gated arm
+                                        // takes the full containment check
+                                        // against the READ bounds rather than
+                                        // a bare null test.
+                                        self.emit_gated_compact_ref_putfield(
+                                            obj_slot,
+                                            val_slot,
+                                            field_index,
+                                            cell_off,
+                                            false,
+                                        )
+                                    }
+                                    None => false,
+                                };
+                            if gated_inlined {
+                                // Complete: store, both gate sequences, the
+                                // helper fallback and the out-of-bounds drop
+                                // all converge inside that emitter.
+                            } else if inline_putfield_enabled()
                                 && !narrow_oops_block_inline_fields()
                                 && cratonvm_types::compact_ref_fields_enabled()
                                 && self.helpers.region_bounds_addr != 0
                             {
                                 if let Some(offset) = compact_offset {
-                                    if fresh_ctor_first_store {
+                                    if fresh_ctor_arm_is_live {
                                         self.emit_inline_fresh_ctor_compact_ref_putfield(
                                             obj_slot,
                                             val_slot,
@@ -2874,6 +2937,12 @@ impl Compiler {
                                             offset,
                                         );
                                     } else {
+                                        // Reached only when the gated arm
+                                        // declined, so this is the
+                                        // pre-existing behaviour, unchanged --
+                                        // and now COUNTED, which it was not
+                                        // before.
+                                        super::note_ungated_ref_store();
                                         self.emit_inline_body_compact_ref_putfield(
                                             obj_slot,
                                             val_slot,
@@ -2882,6 +2951,7 @@ impl Compiler {
                                         );
                                     }
                                 } else {
+                                    super::note_ungated_ref_store();
                                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                     self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
@@ -2889,6 +2959,7 @@ impl Compiler {
                                     self.emit_call_absolute(self.helpers.putfield_object);
                                 }
                             } else {
+                                super::note_ungated_ref_store();
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                 self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                                 self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding

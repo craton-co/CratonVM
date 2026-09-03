@@ -496,6 +496,48 @@ comments. Specifically declined, each for a stated reason:
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The banner says "no binary carrying
+> these changes has been built or run". §7's runnable checks have now been run.
+> Splitting them by what is still falsifiable matters here, because most of §7
+> quotes counts that have since moved for reasons this record cannot touch.
+>
+> **§7a.1 — it compiles.** `cargo check -p cratonvm-native-collections -p
+> cratonvm-native-builtins` finishes clean, no errors and no
+> `rustdoc::private_intra_doc_links` complaint. That was the real risk in a
+> comments-only change: §7a.1 lists nine private intra-doc links and says the fix
+> is to drop the brackets if a lint denies them. Nothing denied them.
+>
+> **§7b — the CHM dial screen passes, and nothing it failed on is CHM's.**
+>
+> ```text
+> CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/concurrent/ConcurrentHashMap
+>   85 of 88 passed; failed: RMapGcStress RJdkVarHandleNullCoord RJdkVarHandleModeSupport
+> ```
+>
+> `RMapGcStress` is the long-standing mode-independent failure (`H9-1` §8's own
+> standing prediction). The two `RJdkVarHandle*` vectors were **added on
+> 2026-09-02** by an unrelated varhandle lane, three weeks after this record.
+> Arming the ConcurrentHashMap shadow dial produced **no CHM-related failure**,
+> which is what §7b exists to screen for.
+>
+> **§7a.2 and §7a.3 are STALE and cannot be re-checked**, and re-freezing them
+> here would be worse than saying so:
+>
+> ```text
+>                                 this record        2026-09-02
+> stub ratchet, mgmt / no-mgmt    1626 / 1615        1645 / 1634
+> rows, mgmt / no-mgmt           13225 / 12857      13897 / 13529
+> --jdk-only                      102 / 102          119 / 125
+> SUITE=core                       61 /  62           81 /  85   (88 by the last run)
+> ```
+>
+> §7a.2's instruction is "Registry must be UNCHANGED ... A comment cannot move
+> any of these; if one moves, the cause is elsewhere in the merge, not here."
+> Every number moved, and the cause IS elsewhere: three weeks of other lanes
+> adding registrations and vectors. The check was sound and is now unmeasurable —
+> the same expiry as `H3-1` §5's `−7` and `W7-30` §11's `+8`. What survives is
+> that the screen is green apart from failures with named, unrelated owners.
+
 ## 7. VERIFICATION PLAN
 
 ### 7a. For what actually landed (comments only)

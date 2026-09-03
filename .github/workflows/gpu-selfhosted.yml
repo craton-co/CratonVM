@@ -129,6 +129,48 @@ jobs:
           TG: ${{ github.workspace }}/test_classes/gpu
         run: bash bench-gpu/marshal-stress.sh | tee marshal-stress.log
 
+      # The residency cache is keyed by a raw heap address, so every
+      # relocation has to re-key its entries. short[]/byte[] entries only
+      # started appearing in that cache on 2026-09-02, and the remap had
+      # never carried one.
+      #
+      # Run once per collector: ZGC, G1 and Generational relocate on
+      # different schedules and through different code.
+      #
+      # The script asserts that a cached array was actually MOVED
+      # (`re-keyed` > 0), not merely that the values matched. Without
+      # that assertion it passes vacuously and did: with the obvious
+      # settings it drove zero collections, and with a small heap alone
+      # it drove 25 collections that never moved a cached array. The
+      # -Xmx and --gpu-min-work defaults inside the script are what make
+      # a cached array small enough and young enough to be relocated.
+      - name: GPU residency across a moving collector (real driver)
+        shell: bash
+        env:
+          CV: ${{ github.workspace }}/target-gpu/release/cratonvm.exe
+          JDK: ${{ env.JDK }}
+          TG: ${{ github.workspace }}/test_classes/gpu
+        run: bash bench-gpu/residency-gc.sh | tee residency-gc.log
+
+      # A JIT-compiled array writer must not leave the residency cache
+      # stale. `offload_jit_gate` keeps such methods out of the JIT, by
+      # scanning for the store opcodes whose arrays the cache can hold --
+      # a list that has to be extended every time a new element type
+      # becomes marshallable, and was not when short[]/byte[] were added.
+      #
+      # The fixture's int[] arm is the control: its writer IS refused, so
+      # a run where short and byte are wrong while int is right names the
+      # opcode set as the cause. The defaults (n=8192, 2000 rounds) are
+      # what make the writers hot enough to be compiled -- at n=131072
+      # over 400 rounds the defect does not reproduce at all.
+      - name: GPU stale-read from a compiled array writer (real driver)
+        shell: bash
+        env:
+          CV: ${{ github.workspace }}/target-gpu/release/cratonvm.exe
+          JDK: ${{ env.JDK }}
+          TG: ${{ github.workspace }}/test_classes/gpu
+        run: bash bench-gpu/jit-writer-stale.sh | tee jit-writer-stale.log
+
       # Concurrent dispatch: one context, many threads — the shape
       # `OffloadCacheRegistry` gives every dispatching Java thread. This
       # is the regression test for the 2026-09-02 `DeviceBuffer::zeros`

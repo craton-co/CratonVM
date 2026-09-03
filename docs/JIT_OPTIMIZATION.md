@@ -690,9 +690,32 @@ lives several hundred lines away in the arm that called it. An edit that broke
 the coupling would not produce a red test, it would produce a crash on a null
 receiver in production.
 
-Only the compact arm opts in. The second `getfield` arm emits its `GC_FLAGS`
-read only under `compact_ref_fields_enabled()`, so it passes `false` rather
-than make the guarantee conditional.
+#### Both arms opt in now, and the second one has bought nothing yet
+
+The legacy-cell `getfield` arm passed `false` at first, because it emits its
+`GC_FLAGS` read only under `compact_ref_fields_enabled()`. It can now make the
+guarantee exactly: `raw_mode` is already false in that branch, so the guard's
+`!raw_mode && compact` reduces to `compact`, and the opt-in is the *same*
+expression rather than a second one that has to be kept in step. The arm binds
+its recovery address where its guarded slow path begins, and that slow path
+reloads the receiver from its frame slot, so a recovered fault needs no
+register repair.
+
+**It changed no number.** On the H2 workload the census reads
+`implicit=285 (compact-arm=285 legacy-arm=0)`; on a purpose-built megamorphic
+probe reading a public field off a JDK class, `compact-arm=8 legacy-arm=0`. The
+legacy arm is 13 sites against the compact arm's 1,705 on H2, and all 13 had
+receivers the dataflow already proved.
+
+So the widening rests on "it could carry sites no proof reaches", not on a
+measurement that it does. That is recorded rather than smoothed over, and the
+census is split by arm precisely so the claim is falsifiable: **if `legacy-arm`
+stays 0 across real workloads, this widening is dead and should be withdrawn.**
+
+It is not the same as unreachable code — the arm does fire, 13 times on H2.
+What is unproven is that it ever fires with a receiver no proof covers, and
+that is a property of workloads rather than of the code, which is why it gets a
+counter instead of an argument.
 
 #### Measured
 
@@ -756,24 +779,42 @@ not recovered are the ones taken before the method compiled. Every arm exited
 `rc=0`. CPU time was 962 s with the flag on against 1001 s off — read as
 identical on a shared host, not as a win.
 
-**Reach, which is the finding that matters.** The same census, pointed at real
-workloads, reads zero:
+**Reach — and the correction that matters.** This section first estimated the
+reach from short suite vectors and synthetic probes, and concluded it was "a
+real set, and a small one". **That was wrong, and it was wrong for a reason
+worth keeping:** the probes were too small to compile much, so they measured
+the JIT's warm-up threshold rather than the feature's reach.
 
-* `RMapGcStress`, `RJitGc`, `RStringOps`: `elided=0 implicit=0 emitted=0`, and
-  `CALL sites emitted by arm:` empty. The compact `getfield` arm was not merely
-  declining — it was **never reached**, because those vectors compile no
-  `getfield` in this tier at all.
-* The soak probe had to be built to provoke it: 32 classes behind an interface,
-  so the call site is megamorphic and the readers cannot be inlined. Even then
-  **8 sites** registered, not 32.
-* The common shape — `this.field` — is now *proved* non-null by
-  `CRATONVM_JIT_THIS_NONNULL`, so it is elided outright and never reaches the
-  implicit path at all.
+* `RMapGcStress`, `RJitGc`, `RStringOps` read `elided=0 implicit=0 emitted=0`
+  with `CALL sites emitted by arm:` **empty**. That empty field is the tell,
+  and it was in the output all along: the arm was not declining, the vectors
+  compile no `getfield` in this tier *at all*. A census of a workload that
+  compiles nothing measures nothing.
+* The soak probe had to be built megamorphic to provoke 8 sites, which said
+  more about the probe than about the feature.
 
-So the population is: single-pass-compiled, compact-layout `getfield`, on a
-trusted-oop receiver the dataflow cannot prove — in practice a field read off a
-*parameter* in a method hot enough to compile but not inlined. That is a real
-set, and a small one.
+Pointed at a **real application** — the H2 engine, 60,000 batched inserts and
+20 sorted full scans over a 3-column table — the same census reads:
+
+| Arm | elided | implicit | emitted |
+|---|---|---|---|
+| default (all on) | 1425 | 288 | **0** |
+| `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` | 1425 | 0 | 288 |
+| `CRATONVM_JIT_THIS_NONNULL=0` | 1000 | 713 | 4 |
+| all three off (the old behaviour) | 0 | 0 | **1715** |
+
+Every arm returns the identical answer, matching HotSpot.
+
+So the real numbers are: **1,715 receiver null checks on this workload before
+any of this work, and 0 after it.** The `this` seed accounts for 425 of the
+elisions on its own (1425 → 1000 when it is switched off). The implicit check
+covers 288 sites that no proof reaches — and the two are complementary rather
+than redundant: with the seed off, 713 sites fall through to the implicit path
+instead, and only 4 end up with neither.
+
+`recovered=0` on this run, because correct code does not dereference null. That
+is the expected steady state: the implicit check costs nothing until a null
+arrives, and then it costs a fault instead of a branch.
 
 **The default is ON**, since 2026-09-02. Opt out with
 `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0`.
@@ -782,8 +823,13 @@ The engineering recommendation at the end of the soak was to leave it off, and
 it is worth recording that it was overruled deliberately rather than forgotten.
 The case for off was never correctness — the soak settles that — it was that
 none of the three things a default usually rests on were present: the
-throughput effect is unmeasurable, the reach is a handful of sites, and the
-failure mode is the only *silent* one in this backend. The case for on is that
+throughput effect is unmeasurable, the reach looked like a handful of sites,
+and the failure mode is the only *silent* one in this backend. **The middle
+term was wrong** — measured on the H2 engine rather than on probes, this work
+removes 1,715 receiver null checks and leaves zero, 288 of them reachable only
+by the implicit path (see the reach table above). The recommendation to leave
+it off was made on synthetic evidence and does not survive the real
+measurement; the decision to default it on does. The case for on is that
 the mechanism is the one thing covering the sites the proof-based elision
 cannot reach, it has soaked clean across three full suite passes and ~12,000
 translated faults, and a feature that is only ever exercised behind an opt-in
@@ -838,6 +884,106 @@ production eviction path to drive drops harder than tier-up does.
 supersede and deopt, and 23 per process is what a compile-everything workload
 produces. Hammering address reuse beyond that needs a deopt storm.
 
+### The 2026-09-02 eight-finding pass — what moved, and what did not
+
+An audit of where the JIT loses to HotSpot produced eight findings; all eight
+are addressed above. What follows is the measurement, and the residuals that
+survive it, stated rather than left to be inferred.
+
+**Method.** ONE binary, every new default flipped off against every one on,
+arms alternated with the order reversed on alternate reps, `-Xmx4g`,
+`bench/CratonBench.java` one phase per fresh process. Windows workstation, not
+the Azure bench host, so these are NOT comparable with `BENCHMARK.md`'s
+HotSpot ratios and are not written there. The statistic is the MINIMUM of each
+arm, which is the least contaminated one.
+
+**The result is NEUTRAL on every CratonBench row, and that is the finding.**
+
+| phase | all-off | all-on | |
+|---|---:|---:|---|
+| HashMap (10M put/get) | 9,115 ms | 8,749 ms | neutral |
+| Binary Trees (d=18) | 13,346 ms | 13,168 ms | neutral |
+| Matrix 1280² | 3,289 ms | 3,191 ms | neutral |
+| Arithmetic (2B ops) | 5,768 ms | 5,804 ms | neutral |
+| String/Regex (100K) | 239 ms | 251 ms | neutral |
+| Fibonacci(44), Sieve | — | — | inside the noise band |
+
+Checksums identical on every row of every arm.
+
+**An earlier draft of this table claimed 1.62x on HashMap and 1.40x on Binary
+Trees. Those numbers were real and they were not this branch's.** They came
+from a VM-thread TLAB on ZGC that `feat/zgc-jit-tlab-20260902` landed in
+parallel — and that feature ships OPT-IN (`CRATONVM_ZGC_JIT_TLAB=1`), because
+its own author measured it slower in the general case. Enabling it in BOTH
+arms attributes this branch correctly: HashMap 4,828 ms with these switches
+off against 4,866 ms with them on. Neutral. The lesson is the one this
+document already states about control arms — an arm that differs in two
+features measures neither.
+
+**What IS established, and it is not a throughput number.** The emitted
+sequences are shorter, verified by disassembly rather than by a clock:
+`BinTreesClassic.itemCheck` is 2,348 bytes against 2,437 with the switches
+off, `fib`'s optimizing-tier body no longer materialises its constants into
+frame words or lowers `n > 1` through a stored boolean, and a receiver is
+proved once per block instead of once per field read. Those removals are real
+and permanent; what this host cannot do is resolve them above a spread that
+reaches 45% inside a single arm. A quiet Linux bench host is where a 3-5%
+codegen change becomes measurable, and that measurement has not been taken.
+
+Correctness, which was measured: regression suite 88/88 with every switch on,
+`cargo test -p cratonvm-jit --lib` 2,178 passed, `jit-api` 56, `types` and
+`gc` green.
+
+**One finding is only half closed, and this says which half.** Finding 4 was
+"allocation and reference stores in the optimizing tier are helper calls". The
+reference stores are fixed here (`emit_gated_compact_ref_store`). Compiled
+allocation under the default collector was fixed in parallel by
+`feat/zgc-jit-tlab-20260902`, which reached `dev` first and is the
+implementation that ships: `VmHeap::refill_tlab` had answered `None` on the
+Zgc arm, so a thread TLAB was always empty and the inline bump both tiers emit
+was dead code. This branch had built the same thing and it was dropped in
+favour of theirs on the merge — including its answer to the registration
+problem below, which they express as `cratonvm_types::
+jit_tlab_registration_required()` rather than as a helper-ABI slot. The optimizing tier's OWN bump
+(`emit_inline_tlab_new_ir`) stays opt-in: turning it on makes
+`regression-suite` vector `RJitMapTierDiff` SIGSEGV 4 runs in 10, inside VM
+code, on a reference read back as `0x2800`. What was ruled out: the header
+writes (read out of a disassembly, they match the single-pass sequence field
+for field) and relocation (4/4 with `CRATONVM_ZGC_RELOCATE=0`). One real
+defect was found and fixed on the way — the reserved tail was freed twice,
+once by `Tlab::retire`'s hook and once by `tlab_retire_locked`, because ZGC's
+own `ZArenaTlab` contains a `Tlab` — and it is not this one.
+`CRATONVM_JIT_C2_ALLOC_UPGRADE` stays opt-in with it, because with that bump
+off a promoted allocation lowers through the stub's CALL again, which is the
+downgrade that gate was shut for.
+
+**Residuals, in the order they are worth taking.**
+
+1. **The operand-stack register cache stays pure-kernel-only, and this pass
+   recommends AGAINST widening it.** Its blocker is unchanged — `SCRATCH_REGS`
+   is `[R8, R9]` and both are argument registers on both ABIs — and the fix
+   would be a dynamic pool of callee-saved registers the local allocator did
+   not hand out. But two things now argue the payoff does not justify it: the
+   RELOAD half of the round-trip is already elided by `slot_mirror` (see the
+   array-load page's step 7), so what remains is one STORE per push; and the
+   adjacent change — reserving the home word at push time — shipped a
+   nondeterministic heap corruption on 2026-09-02 and was reverted the same
+   day. A one-store win is not worth a third visit to that code.
+2. **Every compiled call still republishes RBP and pushes/reloads the shadow
+   stack.** Those buy precise roots, not nothing, and removing them is a GC
+   trade rather than a codegen one.
+3. **Nothing compares a C2 body against the C1 body it replaces.** The
+   policy question is unchanged and deliberately still open — the obvious
+   static metrics both misjudge the good cases, since a bigger body is usually
+   inlining or unrolling and more call sites can be a callee's own calls after
+   its frame was inlined away. What this pass adds is the DATA: with
+   `CRATONVM_DBG=jitc`, a supersede prints `c1=<bytes> c2=<bytes>`. What it
+   also does is remove the causes that made a C2 body worse — the tier now has
+   an inline TLAB bump, gated inline reference stores, and a register file.
+4. **`Node` is still 48 bytes against HotSpot's 24.** Unchanged, structural,
+   and a GC item: see
+   `known-issues/perf/perf-bintrees-9x-gap-characterised.md`.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -845,7 +991,7 @@ produces. Hammering address reuse beyond that needs a deopt storm.
 | Background compilation pipeline | **ON** | `CRATONVM_BG_COMPILE=0` |
 | C1→C2 supersede | **ON** | `CRATONVM_C2_SUPERSEDE=0` |
 | IR backend (int/ref/long/FP, non-virtual calls) | **ON** (bounded shape) | see `ir_compatible()` |
-| IR backend for virtual/interface calls | off | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| IR backend for virtual/interface calls | **ON** | `CRATONVM_JIT_IR_CALL_VIRTUAL=0` |
 | Back-edge OSR | **ON**, threshold 1000 | `CRATONVM_JIT_OSR=0` |
 | OSR for `newarray`-containing methods | **ON** | `CRATONVM_OSR_NEWARRAY=0` |
 | Guarded-inline getfield (region-bounds-checked) | **ON** | `CRATONVM_JIT_GETFIELD_HELPER=1` |
@@ -859,14 +1005,23 @@ produces. Hammering address reuse beyond that needs a deopt storm.
 | BC `crypto/{engines,io,modes,paddings}` + `math/` JIT | **allowed** | — |
 | BC blanket ban (`asn1/`, `util/`, ...) | still banned | `CRATONVM_JIT_ALLOW_PACKAGES` |
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
-| IR-tier register residency (GP + FP files) | off — built and verified, flip wants a measurement | `CRATONVM_JIT_IR_LINEAR_SCAN=1` |
+| IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
+| IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
+| IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
+| IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
+| IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
+| IR-tier inline TLAB bump for `Op::New` | off — the sequence has a defect `RJitMapTierDiff` reproduces 4/10; see `ir_inline_tlab_enabled` | `CRATONVM_JIT_IR_INLINE_TLAB=1` |
+| Thread pointer fetched from a TLS mirror (both tiers) | **ON** where the probe succeeds | `CRATONVM_JIT_TLS_THREAD_FETCH=0` |
+| One post-call sentinel compare (both tiers) | **ON** | `CRATONVM_JIT_MERGED_CALL_SENTINEL=0` |
+| ZGC VM-thread TLAB (the chunk the inline bump bumps) | off — `feat/zgc-jit-tlab-20260902`'s, kept opt-in because it measured slower there | `CRATONVM_ZGC_JIT_TLAB=1` |
+| Receiver-type + call-site profile recording | **ON** | `CRATONVM_TIER_PGO_RECEIVERS=0` (branch/back-edge recording stays behind `CRATONVM_TIER_PGO`) |
+| Guarded virtual inlining on receiver profiles | **ON** | `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=0` |
 | Gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_GATED_REF_STORE=0` |
 | Operand-stack register cache beyond pure kernels | off (see the section above for the ARG_REGS collision) | `CRATONVM_JIT_OPERAND_CACHE=1` |
-| Optimizing tier for allocation-bearing methods | off (a tier-population change, no longer a codegen gap) | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
-| Inline TLAB bump in the optimizing tier | **ON** | `CRATONVM_JIT_IR_INLINE_TLAB=0` |
+| Optimizing tier for allocation-bearing methods | off — the tier's own bump is off, so a promoted allocation would lower through the stub's CALL again | `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` |
 | `this` seeded non-null at method entry | **ON** | `CRATONVM_JIT_THIS_NONNULL=0` |
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
-| Implicit null check (fault + signal translation) | **ON** — soaked clean; the kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
+| Implicit null check (fault + signal translation) | **ON** — 288 sites on H2 that no proof reaches; kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
 
 ### Performance — current status
 

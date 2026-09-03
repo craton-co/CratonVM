@@ -264,6 +264,24 @@ fn maybe_dump_shutdown_reports() {
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // The DYNAMIC split for that pair, only under
+            // CRATONVM_DBG_SP_REF_STORE_TRACE=1. `gated=N` above counts emitted
+            // sequences; this counts executions, and on the optimizing tier the
+            // two turned out to differ by everything -- `gated=2` sitting on
+            // `inline=0` out of 16.4M. `barrier` is a SUBSET of `inline`: those
+            // stores happened inline and then still called the collector's own
+            // write barrier.
+            let (sp_inline, sp_barrier, sp_helper) =
+                cratonvm_jit::metrics::sp_ref_store_path_counts();
+            if sp_inline != 0 || sp_helper != 0 {
+                eprintln!(
+                    "[cratonvm]   ref-store executions: inline={sp_inline} \
+(of which barriered={sp_barrier}) helper={sp_helper}"
+                );
+                for (name, count) in cratonvm_jit::metrics::sp_ref_store_bails() {
+                    eprintln!("[cratonvm]     ref-store bail {name}: {count}");
+                }
+            }
             // The OPTIMIZING tier's own pair, never folded into the one above.
             // Until 2026-09-02 that tier lowered every reference store to the
             // helper unconditionally, so it reported neither number -- and a
@@ -304,9 +322,11 @@ fn maybe_dump_shutdown_reports() {
             // Those look identical as a percentage and want opposite fixes.
             let (nn_elided, nn_emitted) = cratonvm_jit::x64::receiver_null_check_counts();
             let nn_implicit = cratonvm_jit::x64::receiver_null_check_implicit_count();
+            let (nn_i1, nn_i2) = cratonvm_jit::x64::receiver_null_check_implicit_by_arm();
             eprintln!(
                 "[cratonvm] getfield receiver null checks: elided={nn_elided} \
-                 implicit={nn_implicit} emitted={nn_emitted}"
+                 implicit={nn_implicit} (compact-arm={nn_i1} legacy-arm={nn_i2}) \
+                 emitted={nn_emitted}"
             );
             // Implicit null-check table. All four, because no one of them is a
             // verdict: `registered` alone cannot separate "off" from "on and
