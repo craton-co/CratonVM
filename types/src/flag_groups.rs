@@ -1855,6 +1855,7 @@ pub const INVENTORY: &[E] = &[
     // price it is one binary both ways.
     E { group: Group::GC, token: "gpu-wait-latch", on_key: Some("CRATONVM_GPU_WAIT_LATCH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None, since: "2026-06-16" },
+    E { group: Group::GC, token: "gpu-submission-drain", on_key: None, off_key: Some("CRATONVM_GPU_NO_SUBMISSION_DRAIN"), off_word: None, since: "2026-09-02" },
     // Measurement lever: root every heap-backed LinkedHashMap overlay entry
     // again, restoring the unbounded young-gen pinning the skip-set removed.
     E { group: Group::GC, token: "lhm-root-all", on_key: Some("CRATONVM_LHM_ROOT_ALL"), off_key: None, off_word: None, since: "2026-08-01" },

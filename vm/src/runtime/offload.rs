@@ -3855,6 +3855,7 @@ pub fn register_submission(sub: std::sync::Arc<StreamSubmission>) -> u64 {
         table.insert(h, sub);
         table.len()
     };
+    cratonvm_types::gpu_submission_census::note_register(live as u64);
     if live >= SUBMISSION_WARN_THRESHOLD && live.is_power_of_two() {
         tracing::warn!(
             live_submissions = live,
@@ -3922,7 +3923,9 @@ pub fn lookup_submission(handle: u64) -> Option<std::sync::Arc<StreamSubmission>
 /// resulting +1 rather than hiding it.
 #[cfg(feature = "gpu-offload")]
 pub fn release_submission(handle: u64) {
-    submissions().write().remove(&handle);
+    if submissions().write().remove(&handle).is_some() {
+        cratonvm_types::gpu_submission_census::note_release();
+    }
 }
 
 // ── Known-issues followups #3: spontaneous completion reaper ─────────
