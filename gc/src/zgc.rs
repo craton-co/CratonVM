@@ -19974,6 +19974,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// A heap-full auto-box raises, it does not `std::process::abort()`.
+    ///
+    /// Storing a primitive into a REFERENCE array allocates a one-field
+    /// `AUTOBOX_CLASS_ID` wrapper. That allocation went through the infallible
+    /// `alloc_object`, whose failure arm is
+    /// `eprintln!("FATAL: ...."); std::process::abort()` -- so a heap that
+    /// filled while a native was copying primitives into an `Object[]` killed
+    /// the process with no stack trace and no catchable `OutOfMemoryError`.
+    ///
+    /// This fills the heap and then makes exactly that store. Before the fix
+    /// the test binary died; now the store is refused with
+    /// `ARRAY_STORE_OUT_OF_MEMORY`, which `RuntimeError::array_store_fault`
+    /// turns into `java.lang.OutOfMemoryError`. The element is unchanged, so
+    /// nothing is half-written.
+    #[test]
+    fn a_heap_full_autobox_reports_out_of_memory_rather_than_aborting() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 4);
+        // A reference store still works while there is room.
+        assert!(heap.set_array_element(arr, 0, Value::Int(7)).is_ok());
+        assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
+        // Fill the low end, in the SAME shape the auto-box wrapper is: a
+        // one-field object. Filling with 4 KiB arrays is not enough -- the
+        // wrapper still fits in a hole one of those was refused for, which is
+        // exactly the near-miss this test must not accept as a pass.
+        let mut guard = 0;
+        while heap.try_alloc_object(ClassId::new(0), 1).is_some() {
+            guard += 1;
+            assert!(guard < 1_000_000, "a 1 MiB heap cannot serve this many objects");
+        }
+        assert_eq!(
+            heap.set_array_element(arr, 1, Value::Int(9)),
+            Err(cratonvm_types::ARRAY_STORE_OUT_OF_MEMORY),
+            "a heap-full auto-box must report OOM, not abort the process"
+        );
+        assert_eq!(
+            heap.get_array_element(arr, 1),
+            Ok(Value::Object(None)),
+            "and it must leave the element alone -- nothing half-written"
+        );
+        // The element that DID get a wrapper is still readable: the refusal
+        // must not have disturbed the earlier store.
+        assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
+    }
+
     /// The allocation-rate clause of `needs_gc` fires on GARBAGE, well below
     /// the occupancy clause -- and stops firing when it is switched off.
     ///
