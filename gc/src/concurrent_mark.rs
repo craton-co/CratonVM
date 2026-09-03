@@ -778,7 +778,12 @@ impl ConcurrentMarker {
         // being collected now.
         if snapshot_epoch != Some(old_gen.reclaim_epoch()) {
             SWEEP_EPOCH_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(
+            // `info!`: a whole concurrent sweep's work is being thrown
+            // away, at most once per cycle. `SWEEP_EPOCH_ABORTS` is read
+            // only by this file's tests, and as `debug!` this line could
+            // not print in a release build, so the abandonment was
+            // unobservable outside a debug run.
+            tracing::info!(
                 snapshot_epoch = ?snapshot_epoch,
                 current_epoch = old_gen.reclaim_epoch(),
                 eligible = eligible.len(),

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-514 tokens.
+515 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -571,6 +571,7 @@ export inherited from a parent shell.
 | `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
 | `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
 | `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+| `invoke-cache-stats` | `CRATONVM_INVOKE_CACHE_STATS` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
@@ -580,13 +581,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-321 tokens.
+326 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
 | `gpu-approx-math` | `CRATONVM_GPU_APPROX_MATH` |
 | `gpu-dispatch-memo` | `CRATONVM_GPU_DISPATCH_MEMO` |
+| `invoke-cache-pc-key` | `CRATONVM_INVOKE_CACHE_PC_KEY` |
 | `gpu-if-convert` | `CRATONVM_GPU_IF_CONVERT` |
 | `gpu-if-convert-max-ops` | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` |
 | `sp-ic-deny` | `CRATONVM_JIT_SP_IC_DENY` |
@@ -806,9 +808,10 @@ export inherited from a parent shell.
 | `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
-| `invoke-fast-door` | `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
+| `invoke-fast-door` | `CRATONVM_JIT_INVOKE_FAST_DOOR / CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
+| `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
 | `ir-unresumable-trap-guard` | `CRATONVM_JIT_IR_UNRESUMABLE_TRAP_GUARD` |
@@ -883,6 +886,9 @@ export inherited from a parent shell.
 | `verify-types` | `CRATONVM_JIT_VERIFY_TYPES` |
 | `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
 | `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
+| `xt-pinned-peer-depth` | `CRATONVM_XT_PINNED_PEER_DEPTH` |
+| `xt-pinned-peer-publish-only` | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` |
+| `xt-peer-shadow-scan` | `CRATONVM_XT_PEER_SHADOW_SCAN` |
 | `xt-helper-window-interior` | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` |
 | `xt-helper-window-pin` | `CRATONVM_XT_HELPER_WINDOW_PIN` |
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
@@ -908,12 +914,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-124 tokens.
+127 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
+| `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
@@ -998,6 +1006,7 @@ export inherited from a parent shell.
 | `par-threads` | `CRATONVM_GC_PAR_THREADS` |
 | `sync-young-wipe` | `CRATONVM_GC_SYNC_YOUNG_WIPE` |
 | `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
+| `compact-tlab-alloc` | `CRATONVM_COMPACT_TLAB_ALLOC` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
 | `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |

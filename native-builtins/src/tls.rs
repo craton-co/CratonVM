@@ -1843,7 +1843,13 @@ fn trust_store_keystore_id(ctx: &mut dyn NativeContext, allow_jdk_cacerts: bool)
         // Never NARROW trust to nothing on the strength of a file we parsed
         // but got nothing out of: the platform roots are a better guess than
         // an empty anchor set.
-        tracing::debug!(
+        // `warn!`, not `debug!`: this narrows nothing but it DOES mean the
+        // configured trust store contributed no anchors and the platform
+        // roots are standing in. Under `release_max_level_info` a `debug!`
+        // here is compiled out, so the one run where an operator needs to
+        // know their trust store parsed empty is the one that says nothing.
+        // One-shot per store, so no rate limit is needed.
+        tracing::warn!(
             target: "tls",
             "default trust store {path} parsed to zero entries; using platform roots"
         );

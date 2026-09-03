@@ -14016,8 +14016,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `young_spill_pressure` so the NEXT `safe_native_call` boundary —
         // where every argument is pinned and remappable — runs the
         // orchestrated GC this method cannot (see `safe_native_call_impl`).
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        // The shape planner, not a bare legacy size -- see
+        // `plan_tlab_object_shape`.
+        let (requested_size, _, _) =
+            crate::runtime::interpreter::plan_tlab_object_shape(class_id, slots);
         if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
             if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
                 self.thread,
@@ -17067,7 +17069,10 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
                     | MethodHandleKind::InvokeSpecial
             );
             if !kind_admitted {
-                tracing::debug!(
+                // See the sibling site in `runtime/offload.rs`: `debug!` is
+                // compiled out in release, so this decision was
+                // unreachable by any RUST_LOG directive.
+                tracing::info!(
                     target: "gpu.offload",
                     handle_kind = ?lcs.impl_handle.kind,
                     target_class = %lcs.impl_handle.class_name,

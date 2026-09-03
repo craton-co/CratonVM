@@ -779,6 +779,15 @@ impl Compiler {
     /// change this is Phase 2 taking its source set from the card table instead
     /// of from the region-index remembered set, which is a collector policy
     /// change and not an emitter one.
+    /// Count a G1 filter execution that answered "nothing to remember".
+    ///
+    /// Emitted at the caller's skip label, not inside the filter: the filter
+    /// hands its two skip patches back and the CALLER decides where they land,
+    /// so this is the only place the skipped edge is addressable.
+    pub(super) fn emit_g1_barrier_skip_trace(&mut self) {
+        self.emit_ref_store_path_trace(&crate::metrics::G1_INLINE_BARRIER_SKIPPED);
+    }
+
     pub(super) fn emit_g1_post_write_barrier_regs(
         &mut self,
         obj_reg: u8,
@@ -795,9 +804,13 @@ impl Compiler {
         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
         self.load_slot_to_reg(ARG_REGS[2], val_slot);
         self.emit_call_absolute(self.helpers.g1_post_write_barrier);
+        let past_skip = self.emit_jmp_rel32_patch();
+        // The filter's "nothing to remember" edge, counted where it lands.
         for patch in nothing_to_do {
             self.patch_rel32_to_here(patch);
         }
+        self.emit_g1_barrier_skip_trace();
+        self.patch_rel32_to_here(past_skip);
     }
 
     /// F-08 — the two-test filter alone, without the call it guards.
@@ -850,6 +863,14 @@ impl Compiler {
         self.emit_xor_r64_r64(obj_reg, val_reg);
         self.emit_and_r64_mem_disp32(obj_reg, scratch, Self::G1B_REGION_MASK);
         let done_same = self.emit_jcc_rel32_patch(0x84); // JZ
+        crate::metrics::note_g1_inline_barrier_site();
+        // The run-time half of the engagement question. `tracing::info!` above
+        // says the arm was EMITTED; only this says how often its two tests
+        // actually spared the call, which is the whole reason the arm exists.
+        // Emitted here, on the fall-through, because that is the one edge the
+        // caller does not own: the two skip patches belong to the caller and
+        // are counted where it lands them.
+        self.emit_ref_store_path_trace(&crate::metrics::G1_INLINE_BARRIER_CALLED);
         vec![done_null, done_same]
     }
 
