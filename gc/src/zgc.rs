@@ -5334,6 +5334,16 @@ impl ZgcRealHeap {
         let assume_rewritable =
             cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_ASSUME_REWRITABLE").is_some();
         let frames_are_rewritable = refusal.is_none() || assume_rewritable;
+        // The blanket guard short-circuits the proof entirely: a live compiled
+        // frame refuses, proven rewritable or not. Attributed to its own reason
+        // code so a run under it is not mistaken for a coverage failure.
+        let blanket = zgc_jit_blanket_refusal_enabled();
+        let refusal = if blanket && compiled_frames_live {
+            Some(relocation_skip_reason::JIT_ACTIVE_BLANKET)
+        } else {
+            refusal
+        };
+        let frames_are_rewritable = frames_are_rewritable && !(blanket && compiled_frames_live);
         if compiled_frames_live && !frames_are_rewritable {
             self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
             if let Some(r) = refusal {
@@ -9214,8 +9224,19 @@ pub mod relocation_skip_reason {
     /// thread's chunk is still reserved and invisible to the collector. See
     /// `ZArenaTlabRegistry`-side `retire_all_tlabs_at_safepoint`.
     pub const TLAB_RETIRE_INCOMPLETE: usize = 5;
+    /// `CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` -- the collection refused because a
+    /// compiled frame was live AT ALL, without consulting the coverage proof.
+    ///
+    /// This is the rule `gen_heap` and `g1` use
+    /// (`is_active() || unregistered_jit_frame_on_stack()`), which this
+    /// collector replaced with the per-cycle proof on 2026-08-21 precisely
+    /// because `is_active()` is true in every steady-state workload. It exists
+    /// as a flag to PRICE that trade: it is expected to remove the
+    /// relocation-under-live-JIT SIGSEGV and to bring the fragmentation
+    /// `OutOfMemoryError` back with it.
+    pub const JIT_ACTIVE_BLANKET: usize = 6;
     /// One past the highest code; sizes the counter array.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
 
     /// Human-readable label, for the summary line.
     pub fn label(code: usize) -> &'static str {
@@ -9226,9 +9247,31 @@ pub mod relocation_skip_reason {
             FORCED_NON_MOVING_ROOTS => "forced-non-moving-jit-roots",
             UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
             TLAB_RETIRE_INCOMPLETE => "tlab-retire-incomplete-at-safepoint",
+            JIT_ACTIVE_BLANKET => "jit-active-blanket-refusal",
             _ => "unknown",
         }
     }
+}
+
+/// `CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` -- refuse relocation whenever a compiled
+/// frame is live, without consulting the per-cycle coverage proof.
+///
+/// The rule `gen_heap` and `g1` both apply and this collector does not. ZGC
+/// replaced it with the proof on 2026-08-21 because `gc_quiescence::is_active()`
+/// is true in every steady-state workload once the JIT engages, and on a
+/// collector where compaction is the only defragmentation there is, "never
+/// compact under JIT" means "never defragment" -- measured as an
+/// `OutOfMemoryError` on a heap 97 % free.
+///
+/// It is a flag rather than a fix because it is a TRADE, and the point is to
+/// price it: it should remove the relocation-under-live-JIT SIGSEGV that
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` tracks, and restore
+/// the fragmentation OOM that the pinned-peer credit had just eliminated.
+fn zgc_jit_blanket_refusal_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_JIT_BLANKET_REFUSAL").is_some()
+    })
 }
 
 fn targeted_compaction_enabled() -> bool {
