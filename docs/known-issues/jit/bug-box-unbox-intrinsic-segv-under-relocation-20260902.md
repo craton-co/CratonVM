@@ -164,6 +164,63 @@ primitive result. Between those two the reference lives only in `RAX`. Any
 safepoint that observes the frame in that window sees a slot the map no longer
 names — or, worse, names as holding the primitive that replaced it.
 
+## 2026-09-03: a second trigger, with this intrinsic DISABLED
+
+`org.h2.test.jdbc.TestCachedQueryResults` SIGSEGVs 2 of 3 runs (185 s, 100 s) on
+merged dev with the box/unbox intrinsic at its new default -- OFF. The enable
+flag appears nowhere in those logs. Details and arms:
+`known-issues/h2/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`.
+
+What makes that workload crash is an experimental change
+(`CRATONVM_XT_PINNED_PEER_DEPTH=1` + `CRATONVM_XT_PEER_SHADOW_SCAN=1`) whose
+only effect is to let relocation proceed while compiled frames are live:
+`relocation_on_proven_jit` 2 -> 22, `relocation_skipped_jit` 877 -> 3,
+`objects_relocated=519932`.
+
+So the two ingredients this page names are not both necessary. Relocation under
+live compiled frames is sufficient on its own; the intrinsic is one way to reach
+the bad root, not the only one. That is evidence FOR this page's own narrowed
+conclusion -- "a reference held in a LIVE JIT FRAME that relocation moved
+without rewriting, a root the safepoint's oop map does not name" -- and against
+any remaining account in which the inline unbox sequence is itself the
+mechanism.
+
+It also gives the root-cause hunt a second reproducer on a different workload,
+which the surviving run shows is otherwise well-behaved (99978/100000, zero
+OOM, zero NPE, 22 compaction cycles).
+
+### The second trigger behaves like this one on every switch, and the oracle is blind to both
+
+`CRATONVM_ZGC_RELOCATE=0` removes it: **0 / 3**, matching this page's own 0/3.
+The fault `rdi` is page-aligned in every crash (`0x232ECD30000`,
+`0x28DEA7B0000`, `0x1CA01BB0000`) -- this page's signature exactly.
+
+`CRATONVM_DBG_VERIFY_OOP_MAPS=1` does NOT find the root. It refutes
+`fully_oop_covered` immediately on both workloads, but reports
+`verifier_oop=0 verifier_not_oop=1222475 verifier_unknown=1582066` against a
+populated `name_index=(1237 names)`. Every one of 2.8 M never-mapped words is
+either confirmed not-a-reference or unknown; none is corroborated. So the
+unnamed root is not something this oracle can see as an oop -- which is itself a
+constraint on what it can be.
+
+Note for anyone running it: the per-hit lines are capped at 64
+(`STEP3_LOG_CAP`), and both audit summary lines print only at normal exit, so a
+crashing arm produces no verdict.
+
+### Ruled out 2026-09-03: precise oop maps for >64 locals do NOT fix it
+
+`fix/jit-precise-oop-maps-wide-locals-20260903` ("methods above 64 locals had no
+precise oop maps at all") is the closest thing to an unnamed root in a compiled
+frame that has landed, and it is NOT this defect. Rebuilt on dev with that fix
+in (`2632fb2c1` confirmed an ancestor), the second trigger still SIGSEGVs
+**2 of 3** (103 s, 119 s), same page-aligned fault `rdi`.
+
+So the surviving candidates are unchanged: this page's own prediction of
+scalar-replacement, LICM-hoist or GPR-spill slots -- none of which the runtime
+oracle corroborates either (`verifier_oop=0`). Whatever names the stale
+reference, it is not a Java local above the 64 mark and not something the class
+file's type maps call a reference.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set

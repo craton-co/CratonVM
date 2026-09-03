@@ -108,16 +108,39 @@
 //!   parity audit, [`Arm64Backend::label_for_pc`] refuses any method containing
 //!   a backward branch target, so only straight-line / forward-branching bodies
 //!   compile.
-//! - **Oop maps are always empty.** [`Arm64Backend::mark_top_operand_as_oop`]
-//!   is called from three opcode arms, but its only consumer,
-//!   [`Arm64Backend::emit_oop_map_for_safepoint`], has **zero call sites** —
-//!   so `Arm64CompileResult::oop_maps` is unconditionally `Vec::new()`. The
-//!   GC walker therefore always takes its conservative fallback for AArch64
-//!   frames. That is sound (a superset), but the "precise AArch64 oop maps"
-//!   the T1.1.3 comments describe do not exist at runtime. The writer is now
-//!   fail-closed: its native-PC key (`instruction_count * 4`) is wrong for a
-//!   variable-expansion pseudo-op stream, so calling it refuses the method
-//!   rather than publishing a mis-keyed map.
+//! - **Oop maps: the WRITER works; there is no safepoint to call it at.**
+//!   Updated 2026-09-03. [`Arm64Backend::mark_top_operand_as_oop`] is called
+//!   from three opcode arms (`aconst_null`, `aload`, `aload_0..3`), so
+//!   references really do flow through these frames. Its consumer,
+//!   [`Arm64Backend::emit_oop_map_for_safepoint`], used to key its map as
+//!   `instruction_count * 4` — wrong for this pseudo-op stream, since `Label`
+//!   and `Comment` emit nothing, `ConstantPoolEntry` emits 8 bytes and
+//!   `MovImm`/`AddImm`/`CmpImm` and out-of-range `Ldr`/`Str` expand to 1–4
+//!   words — and the 2026-08-01 audit made it fail the method closed rather
+//!   than let a caller inherit that.
+//!
+//!   It is now keyed the way that audit prescribed: off the ENCODER's byte
+//!   offset. The compiler records an [`Arm64PendingOopMap`] against the
+//!   pseudo-op INDEX of the instruction following the safepoint — a distinct
+//!   type, so an unresolved PC cannot be mistaken for a resolved one — and
+//!   [`emit_machine_code_with_oop_maps`] translates it once the encoder knows
+//!   where each pseudo-op landed. A map it cannot place discards the method.
+//!   [`publish_compiled_method`] then attaches the result to the artifact,
+//!   which the `cfg`-gated caller previously did not do at all.
+//!
+//!   **`Arm64CompileResult::pending_oop_maps` is nevertheless still empty in
+//!   practice, and the reason is now elsewhere in this list: there is no
+//!   safepoint.** No allocation, no call, no monitor, and back edges refused,
+//!   so a compiled method contains no GC-capable point to record a map at. The
+//!   GC walker still takes its conservative fallback for AArch64 frames. What
+//!   changed is that the first real safepoint inherits a correct writer and a
+//!   working publication path instead of a mis-keyed one. Two further things
+//!   that safepoint needs, neither of which exists: register-resident oops are
+//!   named by nothing (X19–X28 are callee-saved, so the conservative walk
+//!   covers them — sound for a MARKING collector, unsound for a relocating one,
+//!   which cannot rewrite through a conservative scan), and there is no
+//!   safepoint-id slot, so `fully_oop_covered` must stay false and
+//!   `find_oop_map_for_pc` is the only reader that can select these maps.
 //! - **No deoptimization and no OSR.** Neither word appears in this file.
 //!   There is no frame reconstruction, no uncommon-trap stub, no
 //!   `osr_pc_to_native` table. There is nothing to tier down *from* (this is
@@ -842,28 +865,54 @@ impl Arm64CodeBuffer {
 // ---------------------------------------------------------------------------
 
 /// Output of the compilation pipeline.
+/// A safepoint's oop map as the COMPILER can know it: the frame slots are
+/// final, but the PC is a PSEUDO-OP INDEX, not a byte offset.
+///
+/// The two cannot be the same value on this backend and that is the whole
+/// reason this type exists. `Arm64Instruction` is a pseudo-op stream, not a
+/// fixed-width one: `Label` and `Comment` emit nothing, `ConstantPoolEntry`
+/// emits 8 bytes, and `MovImm` / `AddImm` / `CmpImm` / out-of-range `Ldr`/`Str`
+/// expand to one to four words (`mov_imm64`, `emit_addsub_imm_safe`,
+/// `emit_addr_into_ip0`). So the `instruction_count * 4` the writer used to
+/// record was wrong for any method containing one of those, and a map keyed by
+/// a wrong PC is worse than no map -- the GC reads the WRONG FRAME SLOTS at a
+/// real safepoint and either misses a live reference or rewrites a primitive.
+///
+/// Keeping the unresolved form in its own type means an unresolved PC cannot be
+/// mistaken for a resolved one by a later reader: there is no `OopMapEntry`
+/// anywhere until [`emit_machine_code_with_oop_maps`] has run the encoder and
+/// can say what the byte offset actually is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arm64PendingOopMap {
+    /// Index into [`Arm64CompileResult::instructions`] of the pseudo-op that
+    /// FOLLOWS the safepoint -- the same "return address" convention the x64
+    /// backend uses for `OopMapEntry::native_pc_offset`.
+    pub pseudo_index: u32,
+    /// Frame-slot offsets (relative to FP) holding object references here.
+    pub frame_slot_offsets: Vec<i16>,
+}
+
 pub struct Arm64CompileResult {
     pub instructions: Vec<Arm64Instruction>,
     pub frame: Arm64FrameLayout,
     pub labels: HashMap<u32, usize>,
     pub success: bool,
-    /// T1.1.3 — precise oop maps indexed by native PC offset.
+    /// T1.1.3 — this compilation's safepoint oop maps, PC-UNRESOLVED.
     ///
-    /// Each entry records the frame-slot offsets (relative to FP on
-    /// AArch64, x86-64 uses RBP) that hold object references at a
-    /// GC-triggering safepoint. The walker uses the same
-    /// [`crate::OopMapEntry`] type as x64 so a single data format
-    /// works across both backends.
+    /// Each entry records the frame-slot offsets (relative to FP on AArch64;
+    /// x86-64 uses RBP) that hold object references at a GC-capable safepoint,
+    /// keyed by pseudo-op index. [`emit_machine_code_with_oop_maps`] turns
+    /// these into `crate::OopMapEntry` values keyed by real byte offsets --
+    /// see [`Arm64PendingOopMap`] for why the compiler cannot do that itself.
     ///
-    /// **Always empty today.** The intent was to populate this at safepoint
-    /// call sites (`new`, `anewarray`, `newarray`, method dispatch) — but
-    /// this backend lowers none of those opcodes, so it emits no safepoints,
-    /// and its only writer [`Arm64Backend::emit_oop_map_for_safepoint`] has
-    /// zero call sites. The GC root walker consequently always takes its
-    /// conservative stack-scan fallback for AArch64 frames (sound, since a
-    /// conservative scan is a superset). Asserted by
-    /// `tests::compiled_methods_carry_no_oop_maps`.
-    pub oop_maps: Vec<crate::OopMapEntry>,
+    /// **Still empty in practice, for a reason that is no longer the writer.**
+    /// The writer is correct now; what is missing is a SAFEPOINT to call it at.
+    /// This backend lowers no allocation, no call and no monitor, and refuses
+    /// back edges, so a compiled method contains no GC-capable point at all --
+    /// see the "Safety-critical gaps" section of the module header. The first
+    /// real safepoint on this backend inherits a correct map writer instead of
+    /// the mis-keyed one that used to be here.
+    pub pending_oop_maps: Vec<Arm64PendingOopMap>,
 }
 
 // ---------------------------------------------------------------------------
@@ -939,7 +988,7 @@ pub struct Arm64Backend {
     /// T1.1.3 — collected oop maps, each keyed by the native PC
     /// offset (in the finalized instruction stream) of the
     /// instruction immediately after a safepoint call.
-    pub oop_maps: Vec<crate::OopMapEntry>,
+    pub pending_oop_maps: Vec<Arm64PendingOopMap>,
 }
 
 /// Scratch registers available for the operand stack (X9-X15, 7 regs).
@@ -985,7 +1034,7 @@ impl Arm64Backend {
             failed: false,
             spill_map: HashMap::new(),
             operand_stack_oop_marks: Vec::new(),
-            oop_maps: Vec::new(),
+            pending_oop_maps: Vec::new(),
         }
     }
 
@@ -1010,45 +1059,47 @@ impl Arm64Backend {
         }
     }
 
-    /// T1.1.3 — record an oop map at the current native PC.
+    /// Record this safepoint's oop map: the frame slots that hold object
+    /// references right now, keyed so the encoder can give them a real PC.
     ///
-    /// Called immediately after a safepoint-producing instruction
-    /// (object-allocating helper call, method dispatch). Walks the
-    /// parallel `operand_stack_oop_marks` + `spill_map` to find
-    /// frame-slot offsets that currently hold oops, and emits an
-    /// `OopMapEntry` keyed by the current `buffer.len()` position.
+    /// # Why this does not produce an `OopMapEntry`
     ///
-    /// Empty maps are skipped to keep per-method storage bounded:
-    /// the GC walker falls back to conservative scanning for that
-    /// frame, which is always a correct super-set of the precise
-    /// coverage.
+    /// It cannot, yet. The PC an `OopMapEntry` needs is a BYTE OFFSET into the
+    /// emitted code, and at compile time this backend has only a pseudo-op
+    /// stream whose entries are not 4 bytes each -- `Label` and `Comment` emit
+    /// nothing, `ConstantPoolEntry` emits 8 bytes, `MovImm`/`AddImm`/`CmpImm`
+    /// and out-of-range `Ldr`/`Str` expand to one to four words. The 2026-08-01
+    /// parity audit found this helper keying its map as
+    /// `instruction_count * 4` and made it fail the method closed rather than
+    /// let a first caller inherit a wrong PC, noting that the fix "is to key
+    /// oop maps off the *encoder's* byte offset (`Aarch64Emitter::offset()` in
+    /// `emit_machine_code`), not off the pseudo-op count -- then delete this
+    /// guard".
     ///
-    /// # This helper is fail-closed and must stay that way
+    /// This is that fix. The map is recorded against the pseudo-op INDEX of the
+    /// instruction that follows the safepoint, in an
+    /// [`Arm64PendingOopMap`] that cannot be confused for a resolved one, and
+    /// [`emit_machine_code_with_oop_maps`] translates it once the encoder knows
+    /// where each pseudo-op landed. The guard is gone.
     ///
-    /// (aarch64 parity audit, 2026-08-01.) It has zero call sites, and the
-    /// native PC it records — `instruction_count * 4` — is **wrong**, because
-    /// the pseudo-op stream is not 4 bytes per entry: `Label` and `Comment`
-    /// emit nothing, `ConstantPoolEntry` emits 8 bytes, and `MovImm` /
-    /// `AddImm` / `CmpImm` / out-of-range `Ldr`/`Str` expand to 1–4 words
-    /// (`mov_imm64`, `emit_addsub_imm_safe`, `emit_addr_into_ip0`). A map keyed
-    /// by a wrong PC is worse than no map: the GC would read the *wrong frame
-    /// slots* as oops at a real safepoint and either miss a live reference or
-    /// treat a primitive as one.
+    /// # What is still missing, and it is not this
     ///
-    /// So the first caller must not silently inherit a broken PC. This sets
-    /// `self.failed`, refusing the method, and the correct fix for whoever
-    /// wires up the first real aarch64 safepoint is to key oop maps off the
-    /// *encoder's* byte offset (`Aarch64Emitter::offset()` in
-    /// `emit_machine_code`), not off the pseudo-op count — then delete this
-    /// guard.
+    /// A SAFEPOINT to call this from. The backend lowers no allocation, no call
+    /// and no monitor and refuses back edges, so a compiled method contains no
+    /// GC-capable point -- which is why this still has no production call site
+    /// and `pending_oop_maps` is still empty in practice. What changed is that
+    /// the first one will inherit a correct writer.
+    ///
+    /// Register-resident oops are deliberately NOT named: X19-X28 are
+    /// callee-saved under AAPCS64, so they sit in the caller's saved-register
+    /// area, which the conservative walk covers. That is sound for a MARKING
+    /// collector and would not be for a relocating one -- a conservative scan
+    /// cannot rewrite -- so a moving collector on this backend needs the
+    /// register half before it may trust these maps. Stated here because the
+    /// x64 side learned it the expensive way (see `map_incomplete_cause::
+    /// OOP_STILL_IN_REGISTER` and the `relocation_coverage_complete` gate).
     #[allow(dead_code)]
     fn emit_oop_map_for_safepoint(&mut self) {
-        // Fail closed — see the doc comment above. The map-building body is
-        // left below rather than deleted: it is the shape a correct
-        // implementation takes, and keeping it means the `native_pc` mistake
-        // it embodies stays visible next to the explanation of why it is
-        // wrong. It is unreachable at runtime because of this assignment.
-        self.failed = true;
         if self.failed {
             return;
         }
@@ -1059,20 +1110,20 @@ impl Arm64Backend {
         self.operand_stack_oop_marks
             .truncate(self.operand_stack.len());
 
-        // On AArch64 every instruction is 4 bytes fixed-width, so the
-        // native PC offset of "the instruction after the safepoint"
-        // equals `instruction_count * 4`. When the buffer is later
-        // emitted by the runtime this multiplier may change (e.g. if
-        // instructions are merged or re-encoded); in that case the
-        // runtime is responsible for translating the recorded offset
-        // via its post-emit relocation pass. For now we record the
-        // instruction-count form.
-        let native_pc = (self.buffer.instruction_count() * 4) as u32;
+        // The pseudo-op that will FOLLOW this safepoint. `instruction_count()`
+        // is `instructions.len()`, i.e. the index the next `emit` will occupy,
+        // which is the same "return address" convention x64 records.
+        let pseudo_index = match u32::try_from(self.buffer.instruction_count()) {
+            Ok(n) => n,
+            // A method with more than 4 billion pseudo-ops cannot occur, but a
+            // silent truncation here would be a wrong PC again. Refuse.
+            Err(_) => {
+                self.failed = true;
+                return;
+            }
+        };
+
         let mut slots: Vec<i16> = Vec::new();
-        // Walk spilled slots and emit their frame offsets.
-        // AArch64 frame offsets are computed relative to FP; the
-        // GC walker on aarch64 adds the entry SP (= FP at call time)
-        // to each slot offset to read the qword.
         for (i, &mark) in self.operand_stack_oop_marks.iter().enumerate() {
             if !mark {
                 continue;
@@ -1082,32 +1133,30 @@ impl Arm64Backend {
                 None => continue,
             };
             if let Some(&spill_off) = self.spill_map.get(&reg) {
-                if let Ok(off16) = i16::try_from(spill_off) {
-                    slots.push(off16);
+                match i16::try_from(spill_off) {
+                    Ok(off16) => {
+                        if !slots.contains(&off16) {
+                            slots.push(off16);
+                        }
+                    }
+                    // A spill slot further than `i16` from FP. The x64 side
+                    // counts this (`map_incomplete_cause::STACK_OFF_TOO_DEEP`)
+                    // and marks the map incomplete; here there is no
+                    // completeness channel yet, so refuse the method rather
+                    // than publish a map that silently drops a live reference.
+                    Err(_) => {
+                        self.failed = true;
+                        return;
+                    }
                 }
             }
-            // Register-resident oops are preserved by the ABI
-            // (X19-X28 are callee-saved on AAPCS64); the walker's
-            // conservative fallback catches them since they remain
-            // live in the caller's saved-register area during a
-            // safepoint.
         }
         if slots.is_empty() {
             return;
         }
-        self.oop_maps.push(crate::OopMapEntry {
-            native_pc_offset: native_pc,
-            // Stage 3 precise relocation is x86-64 only for now; aarch64
-            // records no safepoint-id, so leave the bytecode PC unset.
-            bytecode_pc: 0,
+        self.pending_oop_maps.push(Arm64PendingOopMap {
+            pseudo_index,
             frame_slot_offsets: slots,
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
         });
     }
 
@@ -3041,7 +3090,7 @@ impl Arm64Backend {
                     },
                     labels: HashMap::new(),
                     success: false,
-                    oop_maps: Vec::new(),
+                    pending_oop_maps: Vec::new(),
                 }
             }
         };
@@ -3054,7 +3103,7 @@ impl Arm64Backend {
             // the backend. When empty, the walker falls back to the
             // conservative stack scan for AArch64 frames, matching
             // the x64 behavior.
-            oop_maps: std::mem::take(&mut self.oop_maps),
+            pending_oop_maps: std::mem::take(&mut self.pending_oop_maps),
         }
     }
 
@@ -4463,7 +4512,15 @@ fn emit_addsub_imm_safe(
 ///    check was added the flag had **no production reader** anywhere in the
 ///    crate, so on a release `aarch64` build an out-of-range branch was
 ///    silently truncated and emitted as executable code.
-pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
+/// Encode a compiled method, and report where every pseudo-op landed.
+///
+/// The second element is `pseudo_offsets`: `pseudo_offsets[i]` is the byte
+/// offset at which `result.instructions[i]` was encoded, and the vector has one
+/// extra trailing entry equal to the total code length, so a safepoint whose
+/// following pseudo-op is one past the end still resolves. This is the mapping
+/// an aarch64 oop map has to be keyed through -- see [`Arm64PendingOopMap`] for
+/// why `instruction_count * 4` is not it.
+fn emit_machine_code_inner(result: &Arm64CompileResult) -> Option<(Vec<u8>, Vec<usize>)> {
     use crate::aarch64::Aarch64Emitter;
 
     if !result.success {
@@ -4477,7 +4534,11 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
     // (code_offset, label_id) for LDR literal instructions needing pool offset patching
     let mut literal_patches: Vec<(usize, u32)> = Vec::new();
 
+    // One entry per pseudo-op, recorded BEFORE it is encoded, so
+    // `pseudo_offsets[i]` is where instruction `i` begins.
+    let mut pseudo_offsets: Vec<usize> = Vec::with_capacity(result.instructions.len() + 1);
     for inst in &result.instructions {
+        pseudo_offsets.push(emitter.offset());
         match inst {
             Arm64Instruction::Label(id) => {
                 label_offsets.insert(*id, emitter.offset());
@@ -4922,7 +4983,104 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
         return None;
     }
 
-    Some(emitter.code().to_vec())
+    // The sentinel: a safepoint recorded at the very end of the stream has a
+    // following pseudo-op index of `instructions.len()`, whose byte offset is
+    // the end of the code.
+    pseudo_offsets.push(emitter.offset());
+    Some((emitter.code().to_vec(), pseudo_offsets))
+}
+
+/// Encode a compiled method.
+pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
+    emit_machine_code_inner(result).map(|(code, _)| code)
+}
+
+/// Build the publishable artifact for an aarch64 compilation: encode it, and
+/// attach the oop maps the GC will read.
+///
+/// # Why this lives here and not at the call site
+///
+/// Its caller in `try_compile_inner` sits behind
+/// `#[cfg(target_arch = "aarch64")]`, so on an x86-64 developer host or CI
+/// runner that block is not compiled AT ALL -- it is never type-checked, never
+/// linted and never tested. That is how the publication path came to drop
+/// `oop_maps` on the floor without anything noticing: it built its
+/// `CompiledMethod` with `CompiledMethod::new(buf)` and never transferred the
+/// backend's maps, so even a correct map writer would have produced nothing
+/// observable.
+///
+/// Keeping the logic in a function with no `cfg` on it means every `cargo test`
+/// run on any host compiles and exercises it (see
+/// `tests::a_published_artifact_carries_its_resolved_oop_maps`), and the gated
+/// caller shrinks to one line that cannot silently rot.
+pub fn publish_compiled_method(result: &Arm64CompileResult) -> Option<crate::CompiledMethod> {
+    let (machine_code, oop_maps) = emit_machine_code_with_oop_maps(result)?;
+    let mut buf = crate::ExecutableBuffer::new(machine_code.len().max(4096))?;
+    buf.set_tag("aarch64-backend");
+    buf.emit(&machine_code);
+    let mut cm = crate::CompiledMethod::new(buf);
+    // The transfer that was missing. `has_precise_oop_maps()` becomes true when
+    // this is non-empty, which makes the walker enumerate these slots IN
+    // ADDITION to its conservative sweep -- strictly additive, because
+    // suppressing the sweep is gated on `fully_oop_covered`, which this backend
+    // never sets (no safepoint-id slot, no shadow stack, no relocation
+    // support).
+    cm.oop_maps = oop_maps;
+    Some(cm)
+}
+
+/// Encode a compiled method AND resolve its oop maps to real byte offsets.
+///
+/// This is the only way an `OopMapEntry` is ever produced on this backend. The
+/// compiler records [`Arm64PendingOopMap`]s keyed by pseudo-op index because a
+/// byte offset is not knowable until the encoder has run: the pseudo-op stream
+/// is not fixed-width (`Label`/`Comment` emit nothing, `ConstantPoolEntry`
+/// emits 8 bytes, `MovImm`/`AddImm`/`CmpImm` and out-of-range `Ldr`/`Str`
+/// expand to 1-4 words). Keying a map by `instruction_count * 4` -- what this
+/// backend used to do before the writer was made fail-closed in the 2026-08-01
+/// parity audit -- lands the GC on the WRONG FRAME SLOTS at a real safepoint.
+///
+/// Fails closed: a pending map whose `pseudo_index` is not a valid index
+/// discards the whole method rather than publish a map with a guessed PC.
+pub fn emit_machine_code_with_oop_maps(
+    result: &Arm64CompileResult,
+) -> Option<(Vec<u8>, Vec<crate::OopMapEntry>)> {
+    let (code, pseudo_offsets) = emit_machine_code_inner(result)?;
+    let mut maps: Vec<crate::OopMapEntry> = Vec::with_capacity(result.pending_oop_maps.len());
+    for pending in &result.pending_oop_maps {
+        let idx = pending.pseudo_index as usize;
+        // `pseudo_offsets` carries the trailing sentinel, so a safepoint at the
+        // very end of the stream is in range; anything past that is a bug in
+        // the writer, not a method we may publish a map for.
+        let Some(&byte_off) = pseudo_offsets.get(idx) else {
+            return None;
+        };
+        let Ok(native_pc_offset) = u32::try_from(byte_off) else {
+            return None;
+        };
+        maps.push(crate::OopMapEntry {
+            native_pc_offset,
+            // Stage 3 precise relocation is x86-64 only: this backend records
+            // no safepoint-id slot, so there is no bytecode PC to key on and
+            // `find_oop_map_for_safepoint_id` can never select one of these.
+            // `find_oop_map_for_pc` is the reader that applies here.
+            bytecode_pc: 0,
+            frame_slot_offsets: pending.frame_slot_offsets.clone(),
+            // No shadow stack and no relocation support on this backend, and
+            // register-resident oops are covered only by the CONSERVATIVE walk
+            // (see `emit_oop_map_for_safepoint`) -- which marks but cannot
+            // rewrite. Claiming moving-young coverage here would be the exact
+            // false claim `relocation_coverage_complete` exists to prevent.
+            moving_young_coverage_complete: false,
+            live_frame_hi: 0,
+            local_oop_mask: None,
+            num_locals: 0,
+            inline_local_scopes: Vec::new(),
+            non_oop_stack_slots: Vec::new(),
+            stack_marks_exact: false,
+        });
+    }
+    Some((code, maps))
 }
 
 // ---------------------------------------------------------------------------
@@ -6724,7 +6882,7 @@ mod tests {
             frame: Arm64FrameLayout::compute(0, 0, &[]),
             labels: backend.buffer.labels.clone(),
             success: true,
-            oop_maps: Vec::new(),
+            pending_oop_maps: Vec::new(),
         };
 
         let code = emit_machine_code(&result);
@@ -6758,7 +6916,7 @@ mod tests {
             frame: Arm64FrameLayout::compute(0, 0, &[]),
             labels: HashMap::new(),
             success: true,
-            oop_maps: Vec::new(),
+            pending_oop_maps: Vec::new(),
         }
     }
 
@@ -7042,9 +7200,16 @@ mod tests {
         );
     }
 
-    /// `Arm64CompileResult::oop_maps` is unconditionally empty:
-    /// `emit_oop_map_for_safepoint` has no call sites. Documented in the
-    /// module header; asserted here so the claim cannot silently rot.
+    /// A compiled method still carries NO oop maps -- and the reason is no
+    /// longer the writer.
+    ///
+    /// `emit_oop_map_for_safepoint` is correct now (see
+    /// `the_oop_map_pc_is_the_encoders_byte_offset`), but it still has no
+    /// production call site, because this backend lowers no allocation, no call
+    /// and no monitor and refuses back edges -- so a compiled method contains no
+    /// GC-capable point to record a map AT. If this fires, a safepoint was
+    /// added: that is the good outcome, and the module header's
+    /// "Safety-critical gaps" section needs updating with it.
     #[test]
     fn compiled_methods_carry_no_oop_maps() {
         // aload_0; areturn — the reference path that *does* call
@@ -7052,36 +7217,186 @@ mod tests {
         let result = make_backend_with_method(1, 1, &[0x2a, 0xb0]);
         assert!(result.success);
         assert!(
-            result.oop_maps.is_empty(),
-            "oop_maps is always empty (no safepoints are emitted); if this \
-             fires, precise AArch64 maps became real — update the header"
+            result.pending_oop_maps.is_empty(),
+            "no safepoint is emitted on this backend, so nothing calls the map              writer; if this fires, a safepoint landed -- update the header"
         );
+        // ...and the resolved side agrees, which is the half a GC would read.
+        let (_code, maps) =
+            emit_machine_code_with_oop_maps(&result).expect("the method encodes");
+        assert!(maps.is_empty());
     }
 
     // -----------------------------------------------------------------------
     // aarch64 parity audit (2026-08-01) — fail-closed gates
     // -----------------------------------------------------------------------
 
-    /// `emit_oop_map_for_safepoint` computes its native-PC key as
-    /// `instruction_count * 4`, which is wrong for a stream where `Label` and
-    /// `Comment` emit nothing, `ConstantPoolEntry` emits 8 bytes and
-    /// `MovImm`/`AddImm` expand to several words. A map keyed by a wrong PC
-    /// makes the GC read the wrong frame slots at a real safepoint, so the
-    /// helper refuses the method rather than let the first caller inherit it.
+    /// A published artifact carries its resolved oop maps.
+    ///
+    /// The publication path used to build its `CompiledMethod` with
+    /// `CompiledMethod::new(buf)` and never transfer the backend's maps -- so
+    /// even a correct writer would have produced nothing a GC could read. That
+    /// path sits behind `#[cfg(target_arch = "aarch64")]` and is therefore not
+    /// compiled on an x86-64 host at all, which is how it stayed that way; the
+    /// logic now lives in `publish_compiled_method`, which this exercises here.
+    ///
+    /// The buffer is allocated and finalized but never CALLED: these are aarch64
+    /// bytes and the test host is x86-64. This asserts the metadata plumbing,
+    /// which is the half that was broken.
     #[test]
-    fn oop_map_writer_is_fail_closed() {
+    fn a_published_artifact_carries_its_resolved_oop_maps() {
+        let mut result = result_from_instructions(vec![
+            Arm64Instruction::MovImm {
+                rd: Arm64Register::X9,
+                imm: 0x1234_5678_9ABC,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        result.pending_oop_maps = vec![Arm64PendingOopMap {
+            pseudo_index: 1,
+            frame_slot_offsets: vec![32],
+        }];
+
+        let expected_pc = emit_machine_code(&result_from_instructions(vec![
+            Arm64Instruction::MovImm {
+                rd: Arm64Register::X9,
+                imm: 0x1234_5678_9ABC,
+            },
+        ]))
+        .expect("the prefix encodes")
+        .len() as u32;
+
+        let mut cm = publish_compiled_method(&result).expect("the artifact publishes");
+        assert!(
+            cm.has_precise_oop_maps(),
+            "the published artifact must carry the maps -- this is the transfer              that was missing"
+        );
+        assert_eq!(cm.oop_maps.len(), 1);
+        assert_eq!(cm.oop_maps[0].native_pc_offset, expected_pc);
+        assert_eq!(cm.oop_maps[0].frame_slot_offsets, vec![32]);
+        // The claim that would be false: no shadow stack, no relocation
+        // support, and register oops covered only conservatively.
+        assert!(!cm.oop_maps[0].moving_young_coverage_complete);
+        assert!(
+            !cm.fully_oop_covered,
+            "this backend has no safepoint-id slot, so it may never claim full              precise coverage"
+        );
+        // And `find_oop_map_for_pc` -- the reader that applies here, since there
+        // is no safepoint-id to select by -- finds it at that PC.
+        assert!(cm.find_oop_map_for_pc(expected_pc).is_some());
+    }
+
+    /// THE BUG THIS FIXES, pinned as a difference.
+    ///
+    /// `emit_oop_map_for_safepoint` used to key its map as
+    /// `instruction_count * 4`, and the 2026-08-01 parity audit made it fail
+    /// the method closed rather than let a caller inherit that, noting the fix
+    /// was "to key oop maps off the *encoder's* byte offset ... then delete
+    /// this guard".
+    ///
+    /// The stream below is built from exactly the pseudo-ops that break the old
+    /// arithmetic: a `Comment` and a `Label` that emit NOTHING, a wide `MovImm`
+    /// that expands to several words, and a `ConstantPoolEntry` that emits 8
+    /// bytes. The map's PC must be where the encoder actually put the following
+    /// instruction -- and must NOT be `index * 4`.
+    #[test]
+    fn the_oop_map_pc_is_the_encoders_byte_offset() {
+        let prefix = vec![
+            Arm64Instruction::Comment("emits nothing".to_string()),
+            Arm64Instruction::MovImm {
+                rd: Arm64Register::X9,
+                imm: 0x1234_5678_9ABC,
+            },
+            Arm64Instruction::Label(1),
+            Arm64Instruction::ConstantPoolEntry {
+                label: 2,
+                value: 0xDEAD_BEEF,
+            },
+        ];
+        // The safepoint sits before the instruction at index 4.
+        let sp_index = prefix.len() as u32;
+        let mut instructions = prefix.clone();
+        instructions.push(Arm64Instruction::Ret);
+
+        // The expected byte offset, computed by ENCODING THE PREFIX rather than
+        // by hardcoding any instruction's width -- so this test cannot drift
+        // with the encoder.
+        let expected = emit_machine_code(&result_from_instructions(prefix))
+            .expect("the prefix encodes")
+            .len() as u32;
+
+        let mut result = result_from_instructions(instructions);
+        result.pending_oop_maps = vec![Arm64PendingOopMap {
+            pseudo_index: sp_index,
+            frame_slot_offsets: vec![16, 24],
+        }];
+
+        let (_code, maps) =
+            emit_machine_code_with_oop_maps(&result).expect("the method encodes");
+        assert_eq!(maps.len(), 1);
+        assert_eq!(
+            maps[0].native_pc_offset, expected,
+            "the map must be keyed by the encoder's byte offset"
+        );
+        assert_eq!(maps[0].frame_slot_offsets, vec![16, 24]);
+
+        // And the old arithmetic really would have been wrong here -- without
+        // this the test would pass on a stream where the two happen to agree.
+        assert_ne!(
+            expected,
+            sp_index * 4,
+            "this stream must actually distinguish the encoder offset from the              pseudo-op count; pick different pseudo-ops if it stops doing so"
+        );
+    }
+
+    /// The writer records a PENDING map, and refuses rather than truncate.
+    #[test]
+    fn the_oop_map_writer_records_a_pending_map() {
         let mut backend = Arm64Backend::new();
         assert!(!backend.failed);
+        // Nothing marked as an oop yet: an empty map is not recorded at all.
         backend.emit_oop_map_for_safepoint();
+        assert!(!backend.failed, "the writer no longer fails the method closed");
         assert!(
-            backend.failed,
-            "the oop-map writer must refuse the method: its native-PC key is \
-             derived from the pseudo-op count, not the encoded byte offset"
+            backend.pending_oop_maps.is_empty(),
+            "a safepoint with no live reference records nothing"
         );
+    }
+
+    /// Fail closed on a pending map the encoder cannot place.
+    ///
+    /// A `pseudo_index` past the end of the stream cannot be resolved to a byte
+    /// offset, and a GUESSED PC is the failure mode this whole two-phase
+    /// arrangement exists to prevent -- so the method is discarded.
+    #[test]
+    fn an_unplaceable_oop_map_discards_the_method() {
+        let mut result = result_from_instructions(vec![Arm64Instruction::Ret]);
+        result.pending_oop_maps = vec![Arm64PendingOopMap {
+            pseudo_index: 99,
+            frame_slot_offsets: vec![8],
+        }];
         assert!(
-            backend.oop_maps.is_empty(),
-            "and it must not have recorded a (mis-keyed) map"
+            emit_machine_code_with_oop_maps(&result).is_none(),
+            "an oop map that cannot be placed must discard the method"
         );
+        // The plain encoder is unaffected: it publishes no map, so an
+        // unresolvable one cannot mislead anything through that path.
+        assert!(emit_machine_code(&result).is_some());
+    }
+
+    /// A safepoint at the very END of the stream still resolves, via the
+    /// trailing sentinel in `pseudo_offsets`.
+    #[test]
+    fn a_safepoint_at_the_end_of_the_stream_resolves_to_the_code_length() {
+        let instructions = vec![Arm64Instruction::Ret];
+        let mut result = result_from_instructions(instructions);
+        result.pending_oop_maps = vec![Arm64PendingOopMap {
+            pseudo_index: 1,
+            frame_slot_offsets: vec![8],
+        }];
+        let (code, maps) =
+            emit_machine_code_with_oop_maps(&result).expect("the method encodes");
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].native_pc_offset as usize, code.len());
     }
 
     /// A frame big enough to step over the stack guard page must bail, because

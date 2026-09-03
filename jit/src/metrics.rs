@@ -3149,6 +3149,42 @@ pub fn note_ir_getfield_decline(reason: usize) {
 }
 
 /// `(name, count)` for every refusal reason that fired.
+static IR_RECEIVER_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IR_RECV_NULL_ELIDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static IR_RECV_NULL_EMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A block seeded with the receiver as non-null.
+pub fn note_ir_receiver_seed() {
+    IR_RECEIVER_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn note_ir_receiver_null_check_elided() {
+    IR_RECV_NULL_ELIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn note_ir_receiver_null_check_emitted() {
+    IR_RECV_NULL_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(seeded_blocks, elided, emitted)` for the optimizing tier's `getfield`
+/// receiver null check.
+///
+/// Three numbers because two of them are ambiguous alone. `elided=0` with
+/// `emitted=0` means this tier compiled no inline `getfield` at all — which is
+/// what the single-pass census reads on a workload too short to reach the
+/// tier, and is a different finding from "it compiled some and proved none".
+/// `seeded` separates "the graph carried no `receiver_param`" (static methods,
+/// or a hand-built graph) from "it did and nothing used it".
+pub fn ir_receiver_null_check_counts() -> (u64, u64, u64) {
+    (
+        IR_RECEIVER_SEED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_RECV_NULL_ELIDED.load(std::sync::atomic::Ordering::Relaxed),
+        IR_RECV_NULL_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub fn ir_getfield_declines() -> Vec<(&'static str, u64)> {
     IR_GETFIELD_DECLINE_NAMES
         .iter()
@@ -3344,6 +3380,48 @@ pub static SP_REF_STORE_FRESH_CTOR_TAKEN: std::sync::atomic::AtomicU64 =
 /// [`SP_REF_STORE_FRESH_CTOR_TAKEN`].
 pub static SP_REF_STORE_BODY_TAKEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// G1's inline post-write barrier: sites emitted, and what those sites did at
+/// run time.
+///
+/// The arm has existed since F-08 behind `CRATONVM_G1_INLINE_BARRIER`, guarded
+/// by three conjoined conditions, and its only engagement signal was a single
+/// `tracing::info!` line saying it had been emitted at least once. That says
+/// the arm exists; it does not say how many sites got it, and it says nothing
+/// at all about how often the filter actually spared the call — which is the
+/// entire question, because G1's `post_write_barrier_rset` returns immediately
+/// on a null value or a same-region edge and the filter is a copy of exactly
+/// those two tests.
+///
+/// `SKIPPED` counts executions the filter answered "nothing to remember" for;
+/// `CALLED` counts those that reached `jit_g1_post_write_barrier`. The run-time
+/// pair is opt-in under `CRATONVM_DBG_SP_REF_STORE_TRACE=1`, same as its
+/// siblings, and costs a `LOCK INC` apiece.
+pub static G1_INLINE_BARRIER_SITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Filter executions that spared the call. See [`G1_INLINE_BARRIER_SITES`].
+pub static G1_INLINE_BARRIER_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Filter executions that took the call. See [`G1_INLINE_BARRIER_SITES`].
+pub static G1_INLINE_BARRIER_CALLED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record an emitted G1 inline post-write barrier site.
+#[inline]
+pub fn note_g1_inline_barrier_site() {
+    G1_INLINE_BARRIER_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(sites, skipped, called)` for G1's inline post-write barrier.
+pub fn g1_inline_barrier_counts() -> (u64, u64, u64) {
+    (
+        G1_INLINE_BARRIER_SITES.load(std::sync::atomic::Ordering::Relaxed),
+        G1_INLINE_BARRIER_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        G1_INLINE_BARRIER_CALLED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 /// `(fresh_ctor, body)` executions of the two non-gated inline arms.
 pub fn sp_ref_store_other_arm_counts() -> (u64, u64) {

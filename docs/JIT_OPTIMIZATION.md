@@ -1077,6 +1077,76 @@ before the pipeline runs, and it currently is not.
 | `getfield` receiver null-check elision | **ON** | `CRATONVM_JIT_RECEIVER_NULL_ELIM=0` |
 | Implicit null check (fault + signal translation) | **ON** — 288 sites on H2 that no proof reaches; kill switch is the first move on any unexplained compiled-code crash | `CRATONVM_JIT_IMPLICIT_NULL_CHECK=0` |
 
+### The tiering inversion — status, 2026-09-03
+
+The audit that opened this work led with: *the optimizing tier compiles slower
+code than the baseline tier, on every loop measured.* Where that stands, with
+the measurement rather than an argument.
+
+**Method**, because the first two attempts at this were wrong and the method is
+what fixed them: release binary; arms interleaved run-by-run rather than in
+blocks; and **a second arm of each configuration**, identical to the first, so
+the spread between a config and itself is the noise floor. Fifteen reps, CPU
+time, medians. `CRATONVM_C2_SUPERSEDE=0` pins the baseline tier,
+`CRATONVM_JIT_FORCE_C2=1` the optimizing one, and
+`compiles: c1=N c2=M` in the method-stats line witnesses that the arms really
+differ.
+
+| loop shape | baseline | optimizing | verdict |
+|---|---|---|---|
+| int arithmetic | 2.42 | 2.60 / 2.25 | within noise (control spread 14%) |
+| **field read** | **0.86 / 0.83** | **1.39 / 1.41** | **optimizing ~1.65x SLOWER** |
+| long arithmetic | 1.77 | 1.65 / 1.81 | within noise (10%) |
+| double arithmetic | 8.58 | 8.61 / 8.61 | identical (0.3%, ±1% ranges) |
+| array sum | 0.65 | 0.67 / 0.64 | within noise (5%) |
+
+So **"every loop" is no longer true — one shape of five is.** The field-read
+loop reproduces cleanly: both control pairs agree (3.5% and 1.4%) while the
+groups differ by 65%, and the medians are separated by far more than either
+spread.
+
+Two things it is **not**. The optimizing tier emits *less* code for that method
+(1,030 bytes against 1,579), so it is not bloat; and `getfield helper calls`
+is 0 at runtime in both arms, so it is not an out-of-line call per iteration.
+What has not been examined is the instruction-level shape of the loop body at
+each tier. That is where the next person should start, with
+`CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=TierProbe.fieldloop`.
+
+**The named candidate was tried, and it made things worse.** Porting the
+receiver null-check elision to the optimizing tier is built and switchable
+(`CRATONVM_JIT_IR_THIS_NONNULL=1`, default OFF). It is correct and it engages
+— `seeded=9 elided=2 emitted=0` against `0/0/2` with it off, same answer —
+and on the very loop above it is **~20% SLOWER with the check removed**:
+medians 1.78/1.93 on against 1.49/1.61 off, two replicate pairs, within-config
+spread 8%, same direction both times.
+
+At `reps=1`, where the loop barely runs, the arms are 0.19 against 0.18, so
+the per-block seed costs ~0.01s and the 0.3s is in the emitted code, not the
+compile.
+
+Deleting two instructions cannot slow a loop by 20% on its own. What that
+result actually says is that this loop body is dominated by something
+layout- or branch-structure-sensitive, and removing a never-taken forward
+`JZ` moved it. **That is now the most promising lead for the residual
+inversion**, and it is why the switch is kept rather than the change reverted:
+it is the smallest known perturbation that moves this loop by 20%, which makes
+it the cheapest handle on whatever the real cause is.
+
+One structural asymmetry is worth naming as a candidate: the receiver
+null-check elision described above — the `this` seed and
+`CRATONVM_JIT_RECEIVER_NULL_ELIM` — is **single-pass only**. Both arms it
+touches are in `x64/bytecode_walk.rs`; the optimizing tier still emits
+`TEST RAX, RAX; JZ` at every `getfield`. On a loop whose entire body is one
+field read, that is not obviously small.
+
+**A note on the apparatus, because it cost two wrong answers.** The first run
+compared blocked arms with no same-config control and reported the optimizing
+tier slower on three shapes; the second showed the same configuration
+disagreeing with itself by 13–22%, which was larger than every effect claimed.
+A timing arm on this host without a same-config control is not a measurement.
+The `C1/C1B` and `C2/CTRL` pairs above exist for that reason and should be kept
+in any re-run.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

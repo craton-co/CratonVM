@@ -3271,6 +3271,9 @@ pub mod dispatch_timing {
         // REFUSED, which the table above cannot see. See
         // `gpu_refusal_census`.
         cratonvm_types::gpu_refusal_census::exit_summary();
+        // How much of the program `--gpu` moved off the JIT. See
+        // `vm::runtime::offload_jit_gate`.
+        cratonvm_types::gpu_jit_gate_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
