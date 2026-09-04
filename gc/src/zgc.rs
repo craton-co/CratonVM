@@ -13388,8 +13388,16 @@ impl GarbageCollector for ZgcRealHeap {
         // list ALREADY BUILT, so the whole rebuild-and-sort tail below is
         // skipped with it. See `sweep_bitmap`.
         let sweep_workers = self.sweep_workers(gen_on);
+        //
+        // `sweep_workers` REACHES THIS ARM NOW. Until 2026-09-04 the complement
+        // sweep was serial and won the selection before the worker count was
+        // read, so `CRATONVM_ZGC_PARSWEEP=<n>` parsed, clamped, reported, and
+        // did nothing -- a switch that answers about a run that never sharded.
+        // The complement chains `prev_end` across the whole address space, so
+        // sharding it needed the seam join in `ZgcRealHeap::join_complement`
+        // rather than a loop split.
         let bitmap_swept = (sweep_floor == 0 && self.bitmap_sweep_enabled())
-            .then(|| self.sweep_bitmap(&registered, &cfg))
+            .then(|| self.sweep_bitmap(&registered, &cfg, sweep_workers))
             .flatten();
         let (mut swept_total, complement) = match bitmap_swept {
             Some((sh, spans, new_cursor)) => (sh, Some((spans, new_cursor))),
@@ -15758,6 +15766,113 @@ pub(crate) mod tests {
         )
     }
 
+    /// **THE COMPLEMENT SWEEP IS SHARDED TOO, since 2026-09-04**, and this is
+    /// what proves it — the arm the equivalence test above actually runs.
+    ///
+    /// `sweep_bitmap` is default-on and wins the arm selection in
+    /// `collect_garbage`, so before that date `sweep_outcome(4)` and
+    /// `sweep_outcome(1)` swept IDENTICALLY: the worker count was read, clamped,
+    /// reported, and never reached the pass that ran. The equivalence test above
+    /// was green and vacuous. Asserted here rather than trusted, because
+    /// "the sharded arm agrees with the serial one" is worth nothing while the
+    /// two are the same code.
+    #[test]
+    fn the_worker_count_reaches_the_complement_sweep() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        assert!(
+            heap.bitmap_sweep_enabled(),
+            "the complement sweep is the default arm; if it is off, the \
+             equivalence test above is measuring the header-walk sweep instead"
+        );
+        heap.set_sweep_workers(4);
+        assert_eq!(
+            heap.sweep_workers(false),
+            4,
+            "a whole-heap cycle must honour the worker count"
+        );
+        // And the signature is what carries it: a `sweep_bitmap` that does not
+        // take the count cannot shard, whatever the count says.
+        let cfg = {
+            let arena = heap.arena.lock();
+            ZSweepCfg {
+                arena_base: arena.base_ptr() as usize,
+                high_floor: arena.high_cursor(),
+                low_cursor: arena.used(),
+                zero_header_only: true,
+                merge_dead_runs: true,
+                bulk_clearable: heap.mark_bits.is_some(),
+                want_dead: false,
+                collect_dead_hashes: false,
+                gen_on: false,
+                promo_age: 3,
+            }
+        };
+        let registered = heap.registry.snapshot();
+        assert!(
+            heap.sweep_bitmap(&registered, &cfg, 4).is_some(),
+            "the complement sweep must accept a worker count and run"
+        );
+    }
+
+    /// **A SEAM AFTER EMPTY SHARDS.** The complement is a chain, so a shard
+    /// that saw no survivor must not advance it — the next shard's leading
+    /// span has to reach back past every empty shard to where the previous
+    /// survivor actually ended.
+    ///
+    /// The population is chosen to force that: a handful of large arrays and
+    /// nothing else, so almost every bitmap word is zero and the leading shards
+    /// are empty by construction. The serial walk has no seams at all here, so
+    /// any disagreement is the join.
+    ///
+    /// The exact edits that trip it: advancing `chain` for a shard with no
+    /// `first_live`, or emitting a shard's leading span from its own `w0`
+    /// instead of from `chain`.
+    #[test]
+    fn a_sharded_complement_closes_the_seam_after_empty_shards() {
+        fn outcome(workers: usize) -> (usize, usize, usize, usize) {
+            let heap = ZgcRealHeap::with_capacity(8 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            heap.set_sweep_workers(workers);
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            // Large arrays only: each is thousands of bitmap words apart, so
+            // most shards see nothing at all.
+            for i in 0..8 {
+                let a = heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, 64 * 1024);
+                if i % 3 == 0 {
+                    roots.push(a);
+                }
+            }
+            let expect_live = roots.len();
+            {
+                // SAFETY: single-threaded unit test.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            }
+            let survivors = roots
+                .iter()
+                .filter(|r| heap.registry.contains(r.as_ptr() as usize))
+                .count();
+            let arena = heap.arena.lock();
+            (
+                expect_live,
+                survivors,
+                arena.free_list_bytes(),
+                arena.largest_free_block(),
+            )
+        }
+        let serial = outcome(1);
+        assert_eq!(serial.0, serial.1, "every root must have survived");
+        for workers in [2usize, 3, 4, 8] {
+            assert_eq!(
+                outcome(workers),
+                serial,
+                "a {workers}-way sharded complement disagreed with the serial \
+                 one on a heap whose leading shards are empty; the tuple is \
+                 (roots, survivors, free_list_bytes, largest_free_block)"
+            );
+        }
+    }
+
     /// **THE SHARD-EQUIVALENCE TEST.** A sharded sweep must leave the arena in
     /// exactly the state the serial one does.
     ///
@@ -15770,6 +15885,14 @@ pub(crate) mod tests {
     /// test was written after, where a shard whose predecessor produced NO
     /// spans silently lost its first one and a whole dead large array never
     /// reached the free list.
+    ///
+    /// SINCE 2026-09-04 IT COVERS THE COMPLEMENT SWEEP'S SEAM JOIN as well,
+    /// and that is the arm it actually runs: `sweep_bitmap` is default-on and
+    /// wins the selection in `collect_garbage`. Until the complement was
+    /// sharded, the worker count never reached the pass that ran and every arm
+    /// of this test swept identically -- green, and vacuous.
+    /// `the_worker_count_reaches_the_complement_sweep` above is what stops it
+    /// going back to that quietly.
     #[test]
     fn a_sharded_sweep_leaves_the_arena_exactly_as_the_serial_one_does() {
         let serial = sweep_outcome(1);
