@@ -718,6 +718,68 @@ registry. Non-moving ⇒ the pointer map is always empty and
 no barriers are needed; reference semantics come entirely from the VM-level
 protocol.
 
+**The per-cycle bitmap passes are bounded by the arena's bumped ends**
+(`CRATONVM_ZGC_BITMAP_BOUNDS`, default on, added 2026-09-03). The object-start
+registry and the mark bits are sized by CAPACITY — one bit per 8 arena bytes,
+so `-Xmx / 512` bytes of words — and the snapshot the mark phase takes was
+copying all of it every collection: 8.4 million atomic loads into a fresh
+64 MiB `Vec` at `-Xmx4g`, paid whether the heap holds ten objects or ten
+million. That is a pause floor proportional to the heap FLAG, and it is what
+made a 100 ms pause target reachable at 2 GiB and unreachable at 4 GiB.
+
+`Arena` is two-ended, so the span between the low bump cursor and the
+large-object end has never been handed out: no allocation starts there, no bit
+in it is set, and copying it transfers zeroes. The snapshot and the mark-bit
+clear now visit only the two ends. Measured on `G1ChurnPauseProbe 50 1800` at
+`-Xmx4096m` with a 100 ms pause target, one binary and this switch the only
+variable, at matched cycle counts:
+
+| | snapshot | mark | sweep | pause p50 |
+|---|---|---|---|---|
+| whole capacity | 18.8 ms | 13.8 ms | 48.5 ms | 82.5 ms |
+| bounded | 13.7 ms | 8.2 ms | 43.2 ms | **66.4 ms** |
+
+**This is also what pays for the cursor retraction.**
+`Arena::retract_cursor_to` has lowered the cursor onto the last survivor after
+every sweep since 2026-09-02, but with capacity-sized bitmap passes that only
+helped the *allocator* find contiguous space — the pause work was the same
+either way. Bounded, retraction shrinks the pause: the tail of garbage a burst
+allocated is handed back and the next cycle's snapshot, clear and complement
+sweep all stop at the new cursor.
+
+The bound is the HIGH-WATER mark and not the cursor, which is a correctness
+requirement rather than a refinement: retraction lowers the cursor *after* the
+sweep, and the mark bitmap has bits above the new cursor set earlier in the
+same cycle. Clearing bounded by the cursor would leave them, and the next cycle
+would read a mark set carrying a previous cycle's bits and retain whatever they
+name. `Arena::low_high_water` is `cursor.max(pre_retract_high)`, reset once per
+collection after both bitmaps are clear.
+`ZObjectStartBits::debug_assert_clear_outside` verifies the invariant in debug
+builds — it walks the skipped words and asserts every one is zero — and it is
+what turned that ordering bug into a failing test on the first run.
+
+**Pair a pause target with a percentage floor.** The target cannot bound the
+FIRST cycle: it has nothing to measure until a pause has happened, so the
+occupancy clause lets that one run to 75 % of `-Xmx`, and on this probe it is
+the worst pause of the run by a factor of five. Setting
+`CRATONVM_ZGC_ALLOC_TRIGGER` as well caps it, and the target then controls the
+steady state. Measured at `-Xmx4096m`:
+
+| configuration | wall | worst pause |
+|---|---|---|
+| neither | 9091 ms | 466 ms |
+| target 100 ms alone | 12943 ms | 509 ms |
+| **target 100 ms + `ALLOC_TRIGGER=25`** | 11180 ms | **190 ms** |
+| target 200 ms alone | 14849 ms | 530 ms |
+| **target 200 ms + `ALLOC_TRIGGER=25`** | 13548 ms | **221 ms** |
+
+The pairing is better than the target alone on BOTH axes, which is why it is
+worth stating: the floor stops the one cycle the controller is blind to, and
+paying for that cycle up front costs less than the controller's recovery from
+it. It is not the default because the wall cost against no trigger at all is a
+policy call the corpora have not been run against.
+
+
 **Mutators have TLABs on this backend, and since 2026-09-02 the JIT's inline
 allocator can have one too -- OPT-IN.** `VmHeap::refill_tlab` on the `Zgc` arm
 hands the VM thread's own `Tlab` a zeroed chunk from the low arena
