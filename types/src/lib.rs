@@ -754,6 +754,16 @@ pub mod osr_refusal_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    /// OSR compiles whose method the optimizing tier's STRUCTURAL gate
+    /// (`ir::ir_compatible_sized`) would accept, and those it would not.
+    ///
+    /// An UPPER BOUND on the reach of an OSR-to-optimizing-tier route, not a
+    /// prediction of it: `ir_compatible` is the first of four gates, and the
+    /// admission conjunction, `IrBuilder::build` and `ir_lower` each decline
+    /// more. The bound is what a go/no-go needs — if it is near zero, no
+    /// amount of plumbing at this door buys anything.
+    static IR_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static IR_INELIGIBLE: AtomicU64 = AtomicU64::new(0);
     static REFUSALS: std::sync::Mutex<Vec<(&'static str, u64)>> =
         std::sync::Mutex::new(Vec::new());
     static NAMED: std::sync::Mutex<Vec<(String, &'static str)>> =
@@ -764,6 +774,21 @@ pub mod osr_refusal_census {
     #[inline]
     pub fn note_attempt() {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Would the optimizing tier's structural gate have taken this method?
+    ///
+    /// Asked at the OSR door, where the answer is INERT today: that door
+    /// reaches the single-pass backend directly and has no promotion to
+    /// refuse. It is a counter, deliberately, and not a fix — the same shape
+    /// the String-intrinsic pin already takes here, and for the same reason.
+    #[inline]
+    pub fn note_ir_eligibility(eligible: bool) {
+        if eligible {
+            IR_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            IR_INELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// One refusal, tagged with the gate that returned `None`.
@@ -793,6 +818,17 @@ pub mod osr_refusal_census {
             eprintln!(
                 "[cratonvm] osr refusals: attempts={attempts} refused_at_early_gate={refused}"
             );
+            let (ir_yes, ir_no) = (
+                IR_ELIGIBLE.load(Ordering::Relaxed),
+                IR_INELIGIBLE.load(Ordering::Relaxed),
+            );
+            if ir_yes + ir_no > 0 {
+                eprintln!(
+                    "[cratonvm] osr reach: ir_compatible would accept {ir_yes} of {} compiled \
+                     here (upper bound; three further gates follow)",
+                    ir_yes + ir_no,
+                );
+            }
             for (gate, n) in v {
                 eprintln!("[cratonvm] osr refusals:   {gate}: {n}");
             }
