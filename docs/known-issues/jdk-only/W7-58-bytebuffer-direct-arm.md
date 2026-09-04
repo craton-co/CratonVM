@@ -476,6 +476,60 @@ here, both recorded so the next reader does not have to re-find them:
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03. `bb_state`'s missing direct-buffer arm
+> is REAL and still live on both shipping arms.** This record's status was
+> "Nothing here has been built or run on CratonVM"; the CratonVM column exists
+> now, from `probes/DirectByteBufferStateProbe.java` against Temurin
+> 25.0.3+9-LTS on the same host.
+>
+> ```text
+>                   checks ok   BAD   probe reached the end?
+> HotSpot 25            282       0   yes -- PROBE PASS
+> compatible            262       2   NO  -- dies at line 492
+> --jdk-only            262       2   NO  -- dies at line 492
+> --synthetic-jdk       255       9   NO  -- dies at line 492
+> ```
+>
+> **The two BAD rows on the shipping arms are this record's subject**, and they
+> are the defect W7-50 handed over — the one that "survives this fix ... simply
+> now unreachable from the real-JDK arm":
+>
+> ```text
+> seg.heap.isDirect   expected false   got true
+> seg.heap.hasArray   expected true    got false
+> ```
+>
+> `MemorySegment.ofArray(byte[]).asByteBuffer()` produces a buffer that reports
+> itself DIRECT and array-less. A heap-backed segment took the direct arm.
+>
+> **And it then kills the probe.** Because `hasArray` is false, `hb.array()` on
+> the next line throws `UnsupportedOperationException` out of `segmentBuffer`
+> (`DirectByteBufferStateProbe.java:492`) and the run stops there. The ~20
+> remaining rows — `seg.heapSlice.*`, `seg.heapRO.*`, `seg.intArray.*` — are
+> **UNTESTED, not passing.** A naive line-diff reports "23 differing lines" and
+> reads as a broad divergence; 2 are wrong answers and the rest are a truncation.
+> Counted as a diff it also flatters the VM: the aliasing and read-only rows
+> most likely to catch a fabricated buffer are exactly the ones never reached.
+>
+> **The `getIntLE` / `putIntLE` residuals this record documents are
+> `--synthetic-jdk`-ONLY.** They do not reproduce in Compatible or `--jdk-only`:
+>
+> ```text
+> heap.getIntLE            expected 824845084   got 472066609    (synthetic only)
+> heap.putIntLE.byte4/7    expected 4 / 1       got 1 / 4        (synthetic only)
+> heap.ord.asIntBuffer.*   expected BIG_ENDIAN  got LITTLE_ENDIAN (synthetic only)
+> ```
+>
+> That is new information the record could not have: it names them as residuals
+> without a mode, and they are absent from both shipping arms.
+>
+> **What this does NOT verify.** §1's census — 48 textual call sites, 78 after
+> macro expansion — is a source count and was not re-counted; this note verifies
+> BEHAVIOUR only, and only for the sites this probe reaches. Nothing here says
+> which of the 78 sites produces the `isDirect` answer: the defect is confirmed
+> and NOT localised. The rows after line 492 are unmeasured in every CratonVM
+> mode and no claim is made about them in either direction.
+
 ## 12. §6's probe, scheduled — the reachable half (2026-08-12)
 
 §7 is right that "the probe must be run `--features synthetic-jdk` +

@@ -228,20 +228,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** SOURCE-ONLY. **No CratonVM binary was built or run.** Lane W7-46,",
     ),
     (
-        "docs/known-issues/jdk-only/W7-49-slot-index-recensus.md",
-        "status block says: Branch `fix/w44-slot-index-sweep-20260812`. Nothing here is built or run. Every",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-58-bytebuffer-direct-arm.md",
-        "RUN 2026-09-02 on --synthetic-jdk: 264 rows vs HotSpot 285 (21 UNTESTED, not passing), 39 differing; the getIntLE/putIntLE reds are this record's own documented residuals",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-66-live-over-allocations.md",
-        "status block says: **Nothing here was built or run as CratonVM**; the probe transcript quoted below",
     ),
     (
         "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
