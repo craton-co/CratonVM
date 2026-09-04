@@ -1263,12 +1263,40 @@ into callee-saved registers in the prologue:
 3c: mov r14,rdx        ; n    -> r14
 ```
 
-**So the fix is a prologue copy, not an allocator heuristic.** The optimizing
-tier needs to move loop-live parameters out of their ABI registers into the
-allocatable callee-saved file at entry, and tell the allocator that is where
-they live. Until it does, no residency policy can reach them — which is why
-three successive candidates (splits, the null check, the single-use rule) each
-measured zero on this loop.
+The prologue copy was built (`CRATONVM_JIT_IR_PARAM_COPY=1`, default OFF). It
+works: `resident=3` becomes `resident=4`, `param_copies=1`, the loop bound
+gets a callee-saved register. **It measures zero** — 2.07 s against 2.07/2.08
+for the two control arms, which agree with each other to 0.5%, so that is a
+real zero and not one hidden by noise.
+
+#### Four candidates, four zeros, and what that finally says
+
+| candidate | engaged? | effect |
+|---|---|---|
+| split residency | no (`split_recovered=0`) | census mislabel; nothing to reclaim |
+| implicit null check port | yes (`elided=2`) | ~20% *worse*, then noise |
+| loop-weighted use count | yes (params left `single_use`) | none — allocator had already declined them |
+| parameter prologue copy | yes (`resident` 3→4) | none |
+
+Every one of them was a register-residency or null-check argument, and none of
+them moved a loop that is 1.6x slower at this tier. **The cost is not where any
+of that reasoning says it is**, and the disassembly said so from the start if
+the instruction counts are read per ITERATION rather than per body:
+
+* baseline: 178 instructions covering **four** iterations — about **44 per
+  iteration**, because the tier unrolls 4x;
+* optimizing: 95 instructions for **one** — about **95 per iteration**.
+
+A ratio of roughly 2.2x against a measured 1.6x, which is the only account so
+far that is the right size. The counter compare, the backedge and the
+safepoint poll are each paid once per iteration here and once per four
+iterations there, and no amount of register residency changes that.
+
+**So the remaining named cause is unrolling, and it is the one thing on the
+list that has never been tested.** It should be the next thing tried, and the
+four rows above are the argument for testing it before building anything else:
+on this loop, every hypothesis that was not about instruction COUNT has
+measured zero.
 
 The loop-weight rule is kept, default OFF, because it is a correct
 generalisation that will matter once the parameters can be promoted at all —
