@@ -7523,7 +7523,26 @@ impl<'a> Lowerer<'a> {
         // Guarded on the home slot existing, which is belt-and-braces: a node
         // the colourer gave no home was never promotable in the first place
         // (`plan_register_residency` requires one).
-        if self.assigned_gpr(id).is_some() {
+        //
+        // 2026-09-04: **a value already live in its register is not published
+        // again.** A phi is the case that matters, and it is not a small one.
+        // A phi appears in its header block's node list like any other value,
+        // so this site ran for it once per iteration and reloaded the register
+        // out of the home word — while the edge copies had already put the
+        // value there. The disassembly of `FieldLoop.sum` showed both halves of
+        // the resulting loop-carried chain: `mov [rbp-78h],rax` on the back
+        // edge, and `mov rbx,[rbp-78h]` at the top of the next iteration,
+        // waiting on it.
+        //
+        // Skipping is safe for the same reason every read of `gp_reg_live` is:
+        // the allocator gives a register to one value at a time over its live
+        // range, so nothing between the publish and here can have written it.
+        // It applies ONLY to this re-publish. An edge copy must always write
+        // the phi's register — that is the copy — and `emit_phi_copies` does so
+        // whether or not the register was already live.
+        if self.assigned_gpr(id).is_some()
+            && !(ir_skip_live_republish_enabled() && self.resident_gpr(id).is_some())
+        {
             if let Some(off) = self.node_slot.get(id as usize).copied().flatten() {
                 let slot = off.get() as i32;
                 self.publish_gp_from_slot(id, slot);
@@ -13148,6 +13167,18 @@ pub(crate) fn lower_inner_with_scopes(
 /// promoted phi's register at every incoming edge; off, phis stay home-bound
 /// as they were before 2026-09-02 and the residency census reports them
 /// under `phi=`.
+/// A definition whose value is already live in its register is not published
+/// again -- **default OFF**, opt in with `CRATONVM_JIT_IR_SKIP_REPUBLISH=1`.
+///
+/// Off is the historical unconditional reload of the home word at every
+/// definition site, phis included.
+fn ir_skip_live_republish_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SKIP_REPUBLISH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 /// An edge's phi copies move register to register where both ends are
 /// resident -- **default OFF**, opt in with `CRATONVM_JIT_IR_PHI_COPY_REGS=1`.
 ///
