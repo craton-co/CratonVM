@@ -148,14 +148,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
     ),
     (
-        "docs/known-issues/jdk-only/H12-1-the-osr-door-binds-five-bridge-natives-the-method-entry-door-refuses-20260820.md",
-        "status block says: **Status: MEASURED (the defect) / FIXED-UNVERIFIED (the fix).** The divergence",
-    ),
-    (
-        "docs/known-issues/jdk-only/H20-1-the-direct-call-plan-is-a-second-thing-every-door-builds-20260821.md",
-        "status block says: still not been run.",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
