@@ -90,6 +90,7 @@ pub mod bailout;
 pub mod compile_gate;
 pub mod deopt;
 pub mod escape_analysis;
+pub mod gpu_barrier;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;

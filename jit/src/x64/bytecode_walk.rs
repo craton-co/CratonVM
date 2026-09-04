@@ -2268,6 +2268,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_int_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2644,6 +2645,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_long_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2677,6 +2679,7 @@ impl Compiler {
                             self.emit_int_astore_regs();
                         }
                     }
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2711,6 +2714,7 @@ impl Compiler {
                             self.emit_long_astore_regs();
                         }
                     }
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2726,6 +2730,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_byte_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2741,6 +2746,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2756,6 +2762,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 

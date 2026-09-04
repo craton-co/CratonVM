@@ -284,6 +284,15 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
     // down. Both are correct; they cost different things.
     if method_writes_primitive_array(&code_attr.code) {
         match array_writer_policy() {
+            ArrayWriterPolicy::Barrier => {
+                // Nothing to trade any more: the compiled tiers mark what
+                // they wrote and `input_cache::drain_compiled_writes`
+                // evicts it before the next read. The method compiles AND
+                // the cache stays coherent. See `cratonvm_jit::gpu_barrier`.
+                cratonvm_types::gpu_jit_gate_census::note_released_array_writer();
+                // Fall through to the invokestatic scan, which is a
+                // separate reason and still applies.
+            }
             ArrayWriterPolicy::KeepCache => {
                 cratonvm_types::gpu_jit_gate_census::note_blocked_name(
                     format!("{}.{}{}", class.name, method.name, method.descriptor),
@@ -336,10 +345,24 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
 
         // Plain, annotation-free verdict — see "Known limitations" for
         // why hint-loosened kernels are intentionally not covered.
-        if matches!(
-            jit_cuda::analyzer::analyze(target_method),
-            jit_cuda::OffloadVerdict::Eligible(_)
-        ) {
+        let jit_cuda::OffloadVerdict::Eligible(sig) =
+            jit_cuda::analyzer::analyze(target_method)
+        else {
+            continue;
+        };
+
+        // ...and then the DISPATCHER's own gates. `Eligible` answers
+        // "could this bytecode be lowered to PTX", which is not the
+        // question this gate is asking. See
+        // [`target_can_ever_dispatch`].
+        if !target_can_ever_dispatch(&sig, target_descriptor, shared.config.gpu_min_work) {
+            cratonvm_types::gpu_jit_gate_census::note_released_undispatchable(format!(
+                "{target_class_name}.{target_method_name}{target_descriptor}"
+            ));
+            continue;
+        }
+
+        {
             cratonvm_types::gpu_jit_gate_census::note_blocked_name(
                 format!(
                     "{}.{}{} -> calls {}.{}{}",
@@ -356,6 +379,99 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         }
     }
     false
+}
+
+/// Could [`crate::runtime::offload::try_dispatch`] EVER offload a call to
+/// this target — not "is its bytecode lowerable", which is what
+/// [`jit_cuda::analyzer::analyze`] answers.
+///
+/// # Why the analyzer's verdict is the wrong question on its own
+///
+/// AUDIT 2026-09-04. The gate blocked any caller of an `Eligible`
+/// `invokestatic`, and `Eligible` is a statement about the callee's
+/// BYTECODE: no exception handlers, supported parameter types, no
+/// forbidden opcodes. `java/lang/Math.min(II)I` passes all of that. So
+/// does `Math.max(II)I`, `FloatOps.sq(F)F`,
+/// `Currency$SpecialCaseEntry.toIndex`, and
+/// `DirectMethodHandleDesc$Kind.tableIndex`. None of them can be
+/// offloaded, and none of them ever could be — but every caller of any
+/// of them was denied JIT admission for the life of the process.
+///
+/// Measured on kfusion under `--gpu`: 10 methods blocked for this
+/// reason, and the targets included both `Math` intrinsics — which means
+/// `TornadoMath.clamp` and, transitively, every method calling it lost
+/// compilation to protect an offload that could not happen.
+///
+/// # The two gates, mirrored exactly
+///
+/// `try_dispatch` applies these to every `LookupOutcome::Hit` before it
+/// will launch anything:
+///
+/// 1. **Return shape.** Only a `)V` map, or a proven reduction returning
+///    `)I`/`)J`, is transparently dispatched; anything else takes
+///    `DispatchOutcome::FallThrough`. That is the PERMANENT arm — not
+///    `FallThroughKeepHooked` — so a `)I` non-reduction target is not
+///    merely declined today, it is declined on every call forever, and
+///    the hook the gate is protecting has nothing to protect.
+/// 2. **`--gpu-min-work`.** The per-call work estimate is
+///    `largest_primitive_array_len(args)`, and a descriptor with no
+///    array parameter makes that `0` on every call, for every argument
+///    value. With `gpu_min_work > 0` (default 4096) such a target can
+///    never clear the threshold. `ParamKind::from_field` admits only
+///    primitives and primitive arrays, so "the descriptor's parameter
+///    list contains `[`" is exactly "an argument can be an array".
+///
+/// Both are properties of the METHOD, decidable here, and both are read
+/// off the same values `try_dispatch` reads. This is deliberately not a
+/// heuristic: a target that fails either test cannot reach a launch, so
+/// refusing to compile its callers buys nothing and costs the caller.
+///
+/// What this does NOT relax: a `)V` kernel taking arrays still blocks its
+/// callers, which is the case the gate was built for and the one the
+/// module comment argues.
+fn target_can_ever_dispatch(
+    sig: &jit_cuda::KernelSignature,
+    descriptor: &str,
+    gpu_min_work: u32,
+) -> bool {
+    // Gate 1 — `try_dispatch`'s `is_void || is_int_reduction ||
+    // is_long_reduction`, verbatim.
+    let is_void = descriptor.ends_with(")V");
+    let is_int_reduction = sig.is_reduction && descriptor.ends_with(")I");
+    let is_long_reduction = sig.is_reduction && descriptor.ends_with(")J");
+    if !is_void && !is_int_reduction && !is_long_reduction {
+        return false;
+    }
+    // Gate 2 — `--gpu-min-work` against a work estimate that is
+    // structurally zero when nothing in the parameter list can be an
+    // array. `gpu_min_work == 0` disables the threshold, so this half
+    // must not fire then.
+    if gpu_min_work > 0 && !descriptor_has_array_parameter(descriptor) {
+        return false;
+    }
+    true
+}
+
+/// Does `descriptor`'s PARAMETER list contain an array type?
+///
+/// Only the parameters: `([I)I` has one, `(II)[I` has none — the return
+/// type is not an argument and contributes nothing to
+/// `largest_primitive_array_len`. Written as a scan of the substring
+/// between the parentheses rather than a full descriptor parse because
+/// that is the entire question, and a malformed descriptor (no `)`) is
+/// answered `false`, matching [`compute`]'s fail-open-on-can't-tell
+/// stance everywhere else in this file.
+fn descriptor_has_array_parameter(descriptor: &str) -> bool {
+    let Some(open) = descriptor.find('(') else {
+        return false;
+    };
+    let Some(close) = descriptor.find(')') else {
+        return false;
+    };
+    if close < open {
+        return false;
+    }
+    descriptor[open + 1..close].contains('[')
 }
 
 /// Walk `code` instruction-by-instruction — correctly skipping every
@@ -574,9 +690,20 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
 /// unset, keeps the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArrayWriterPolicy {
+    /// Compile the method AND keep the cache: the compiled store marks
+    /// its bucket and `input_cache::drain_compiled_writes` evicts before
+    /// the next read. The default whenever
+    /// [`cratonvm_jit::gpu_barrier::is_armed`], i.e. on an x86_64
+    /// `--gpu` run without the kill switch.
+    ///
+    /// This is not a third point on the trade the other two variants
+    /// split -- it dissolves the trade. Both of those exist because a
+    /// compiled array store could not evict; now it can.
+    Barrier,
     /// Keep the input-residency cache; leave a method that writes a
     /// primitive array interpreted. The pre-2026-09-02 behaviour, and
-    /// the measured default.
+    /// the default on any target the barrier cannot be armed for
+    /// (non-x86_64) or where it was switched off.
     KeepCache,
     /// Compile the method; give up the residency cache for the rest of
     /// the process. See
@@ -584,19 +711,40 @@ enum ArrayWriterPolicy {
     AllowJit,
 }
 
-/// See [`ArrayWriterPolicy`]. Read once per process.
+/// See [`ArrayWriterPolicy`].
+///
+/// `CRATONVM_GPU_JIT_ARRAY_WRITERS` selects explicitly: `allow` gives up
+/// the cache, `refuse` restores the old refuse-to-compile behaviour.
+/// Unset, the answer follows the barrier -- [`ArrayWriterPolicy::Barrier`]
+/// when it is armed, and the historical `KeepCache` when it is not, which
+/// is what keeps a non-x86_64 target and a killed-switch run correct
+/// rather than merely unchanged.
+///
+/// The env read is memoized; the armed check is NOT. Arming happens once
+/// during VM construction, but memoizing the pair would let a caller that
+/// asked before that (a unit test, a second VM in one process) freeze the
+/// wrong answer for the process.
 fn array_writer_policy() -> ArrayWriterPolicy {
     use std::sync::OnceLock;
-    static P: OnceLock<ArrayWriterPolicy> = OnceLock::new();
-    *P.get_or_init(|| {
+    static OVERRIDE: OnceLock<Option<ArrayWriterPolicy>> = OnceLock::new();
+    let explicit = *OVERRIDE.get_or_init(|| {
         match cratonvm_types::flags::runtime_var("CRATONVM_GPU_JIT_ARRAY_WRITERS")
             .ok()
             .as_deref()
         {
-            Some("allow") => ArrayWriterPolicy::AllowJit,
-            _ => ArrayWriterPolicy::KeepCache,
+            Some("allow") => Some(ArrayWriterPolicy::AllowJit),
+            Some("refuse") => Some(ArrayWriterPolicy::KeepCache),
+            _ => None,
         }
-    })
+    });
+    if let Some(p) = explicit {
+        return p;
+    }
+    if cratonvm_jit::gpu_barrier::is_armed() {
+        ArrayWriterPolicy::Barrier
+    } else {
+        ArrayWriterPolicy::KeepCache
+    }
 }
 
 /// Whether `code` contains `iastore` / `lastore` / `fastore` / `dastore`
@@ -657,6 +805,154 @@ mod tests {
     // parts that can go wrong independent of any VM state, so they get
     // the thorough hand-rolled-bytecode coverage.
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // The compiled-tier barrier, decoded rather than re-asserted.
+    //
+    // `gpu_barrier`'s own tests check the encoder against the same
+    // arithmetic that produced it, which cannot catch a wrong ModRM or a
+    // REX bit naming the wrong register -- the sequence would still be
+    // 51 bytes with the jumps landing correctly and would still pass.
+    // `iced-x86` is an independent decoder, and it lives in this crate,
+    // so the check lives here.
+    // ------------------------------------------------------------------
+
+    /// Decode the emitted barrier and assert it is the eleven
+    /// instructions the design says it is, on the registers it says.
+    ///
+    /// A wrong register here is not a crash, it is silent corruption in
+    /// one direction (clobbering a live value) or a silently dead
+    /// barrier in the other (testing a bit of the wrong word, so a
+    /// compiled write never marks its bucket and the device keeps
+    /// serving stale data).
+    #[test]
+    fn the_emitted_barrier_decodes_to_the_documented_sequence() {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+        const BASE: u64 = 0x0000_7FF0_0010_0000;
+        const FILTER: usize = 0x0000_7FF0_0020_0000;
+        const DIRTY: usize = 0x0000_7FF0_0020_0040;
+
+        // Arming is process-global; save and restore so this test does
+        // not change what the rest of this binary would emit.
+        let armed_before = cratonvm_jit::gpu_barrier::is_armed();
+        assert!(
+            !armed_before,
+            "no test in this binary should have armed the barrier"
+        );
+        cratonvm_jit::gpu_barrier::arm(FILTER, DIRTY);
+        let bytes = cratonvm_jit::gpu_barrier::barrier_bytes().expect("armed");
+        cratonvm_jit::gpu_barrier::arm(0, 0);
+
+        let mut decoder = Decoder::with_ip(64, &bytes, BASE, DecoderOptions::NONE);
+        let decoded: Vec<_> = decoder.iter().collect();
+
+        // Eleven instructions, and the decoder must consume the sequence
+        // exactly: a trailing partial instruction would mean the length
+        // constant and the encoding disagree.
+        assert_eq!(decoded.len(), 11, "{decoded:?}");
+        let consumed: usize = decoded.iter().map(|i| i.len()).sum();
+        assert_eq!(consumed, cratonvm_jit::gpu_barrier::BARRIER_LEN);
+        let end = BASE + cratonvm_jit::gpu_barrier::BARRIER_LEN as u64;
+
+        // MOV R11, &ADDR_FILTER
+        assert_eq!(decoded[0].mnemonic(), Mnemonic::Mov);
+        assert_eq!(decoded[0].op0_register(), Register::R11);
+        assert_eq!(decoded[0].immediate64(), FILTER as u64);
+
+        // CMP QWORD [R11], 0 -- the whole fast path rests on this reading
+        // the FILTER WORD, not the pointer to it.
+        assert_eq!(decoded[1].mnemonic(), Mnemonic::Cmp);
+        assert_eq!(decoded[1].op0_kind(), OpKind::Memory);
+        assert_eq!(decoded[1].memory_base(), Register::R11);
+        assert_eq!(decoded[1].memory_displacement64(), 0);
+        assert_eq!(decoded[1].immediate32(), 0);
+
+        // JZ .skip
+        assert_eq!(decoded[2].mnemonic(), Mnemonic::Je);
+        assert_eq!(decoded[2].near_branch_target(), end);
+
+        // MOV R11, [R11] -- the filter word itself
+        assert_eq!(decoded[3].mnemonic(), Mnemonic::Mov);
+        assert_eq!(decoded[3].op0_register(), Register::R11);
+        assert_eq!(decoded[3].memory_base(), Register::R11);
+
+        // MOV R10, RAX -- RAX is the array pointer at every store site.
+        assert_eq!(decoded[4].mnemonic(), Mnemonic::Mov);
+        assert_eq!(decoded[4].op0_register(), Register::R10);
+        assert_eq!(decoded[4].op1_register(), Register::RAX);
+
+        // SHR R10, 3 ; AND R10, 63 -- the `(addr >> 3) & 63` bucket,
+        // identical to `input_cache::addr_bit`.
+        assert_eq!(decoded[5].mnemonic(), Mnemonic::Shr);
+        assert_eq!(decoded[5].op0_register(), Register::R10);
+        assert_eq!(decoded[5].immediate8(), 3);
+        assert_eq!(decoded[6].mnemonic(), Mnemonic::And);
+        assert_eq!(decoded[6].op0_register(), Register::R10);
+        assert_eq!(decoded[6].immediate8to64(), 63);
+
+        // BT R11, R10 -- bit R10 of the filter word. Register
+        // destination, so the offset is mod 64 and the AND above is
+        // belt-and-braces rather than load-bearing.
+        assert_eq!(decoded[7].mnemonic(), Mnemonic::Bt);
+        assert_eq!(decoded[7].op0_register(), Register::R11);
+        assert_eq!(decoded[7].op1_register(), Register::R10);
+
+        // JNC .skip
+        assert_eq!(decoded[8].mnemonic(), Mnemonic::Jae);
+        assert_eq!(decoded[8].near_branch_target(), end);
+
+        // MOV R11, &DIRTY ; MOV BYTE [R11 + R10*1], 1
+        assert_eq!(decoded[9].mnemonic(), Mnemonic::Mov);
+        assert_eq!(decoded[9].op0_register(), Register::R11);
+        assert_eq!(decoded[9].immediate64(), DIRTY as u64);
+        assert_eq!(decoded[10].mnemonic(), Mnemonic::Mov);
+        assert_eq!(decoded[10].op0_kind(), OpKind::Memory);
+        assert_eq!(decoded[10].memory_base(), Register::R11);
+        assert_eq!(decoded[10].memory_index(), Register::R10);
+        assert_eq!(decoded[10].memory_index_scale(), 1);
+        assert_eq!(decoded[10].memory_displacement64(), 0);
+        assert_eq!(decoded[10].immediate8(), 1);
+
+        // Nothing outside R10, R11 and the flags is written. This is the
+        // property that lets the sequence be dropped after a store in
+        // both backends without spilling anything first.
+        for insn in &decoded {
+            for i in 0..insn.op_count() {
+                if insn.op_kind(i) == OpKind::Register {
+                    let r = insn.op_register(i);
+                    assert!(
+                        matches!(r, Register::R10 | Register::R11 | Register::RAX),
+                        "barrier touches {r:?}, which no store site guarantees is dead"
+                    );
+                }
+            }
+        }
+    }
+
+    /// RAX is read and never written: the array pointer is still needed
+    /// by nothing here, but writing it would corrupt a backend that
+    /// keeps using it (the single-pass `fastore` arm re-reads nothing,
+    /// but the contract is what the next store site will rely on).
+    #[test]
+    fn the_barrier_never_writes_rax() {
+        use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
+
+        cratonvm_jit::gpu_barrier::arm(0x1000, 0x2000);
+        let bytes = cratonvm_jit::gpu_barrier::barrier_bytes().expect("armed");
+        cratonvm_jit::gpu_barrier::arm(0, 0);
+
+        let mut decoder = Decoder::with_ip(64, &bytes, 0x1_0000, DecoderOptions::NONE);
+        for insn in decoder.iter() {
+            if insn.op_count() > 0 && insn.op0_kind() == OpKind::Register {
+                assert_ne!(
+                    insn.op0_register(),
+                    Register::RAX,
+                    "the barrier must not clobber the array pointer"
+                );
+            }
+        }
+    }
 
     #[test]
     fn scan_empty_code_finds_nothing() {
