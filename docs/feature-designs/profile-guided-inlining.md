@@ -248,6 +248,42 @@ per guard class, and a recorded invalidation dependency naming the speculated
 receiver class. Any one missing ⇒ `GuardNotEmittable`, `CalleeUnresolved` or
 `NoInvalidationDependency`. All refusals, never warnings.
 
+#### A native anywhere on the receiver-to-declaring chain refuses the splice
+
+`NativeMethodRegistry::find` is keyed on the **exact** class name. The rule "a
+registered native shadows the classfile body" was therefore asked twice -- once
+about the constant-pool class, once about the class that DECLARES the selected
+method -- and both answers can be `None` for a method dispatch would nonetheless
+run natively.
+
+That is not a corner case; it is how the collection carriers are built.
+`native-collections` mints an ArrayList-shaped snapshot under a real JDK class
+name (`java/util/TreeMap$EntryIterator`, `HashMap$KeyIterator`,
+`ConcurrentHashMap$EntryIterator`, ...) and registers `hasNext`/`next`/`remove`
+**on that concrete class**, with a matching row in
+`force_native_over_real_jdk_bytecode`. The JDK declares `hasNext` one level up,
+on `TreeMap$PrivateEntryIterator`, where nothing is registered -- so the
+declaring class answered "no native" for exactly the method the whole scheme
+depends on shadowing, and the spliced JDK body walked a `next` chain the carrier
+never populates.
+
+`resolve_inline_site_from` now walks receiver-to-declaring asking the registry
+at each step, which is the question dispatch asks:
+`populate_virtual_invoke_cache` looks the native up under the RECEIVER's name
+("Check native overrides FIRST") and its `native_override_below_declaring` loop
+is this same walk. Refusal name: `native-shadow-on-receiver-chain`, which
+reports the class it found.
+
+Measured: a compiled `for (e : treeMap.tailMap(k).entrySet())` iterating ZERO
+entries over a six-entry view --
+`internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`,
+`org.h2.test.store.TestRandomMapOps` op:1033.
+`vm/tests/jit_guarded_inline_native_shadow.rs` is the arm; it is the only test
+anywhere that runs with this feature's flag ON, which is why nothing caught this
+for a month. **Any new admission rule added here needs an arm that sets the
+flag** -- the regression suite sets no environment, so its vectors cannot
+exercise this feature at all.
+
 ### Exception-path policy
 
 Three rules, in precedence order:

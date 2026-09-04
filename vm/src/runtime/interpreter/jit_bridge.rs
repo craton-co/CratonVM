@@ -1993,7 +1993,47 @@ pub(super) fn compile_osr_artifact(
                     // admitted=2`. A single-pass-only intrinsic would report
                     // sites and move nothing, which is the exact failure the
                     // `VarHandle` bind below records for itself.
+                    //
+                    // NOT inside a `try`. This OSR compile was ADMITTED above on
+                    // one promise -- `first_unsupported_precise_frame_site` over
+                    // the BYTECODE, that every throwing site inside a protected
+                    // range publishes a reason-9 (`PendingException`) precise
+                    // frame. At that gate this site is an ordinary
+                    // `invokevirtual` and passes. Claiming it here replaces the
+                    // invoke with an inline load whose null-receiver edge is a
+                    // REASON-6 deopt, so the compile keeps an admission it no
+                    // longer satisfies -- and the gate that would have refused
+                    // the method has already run and cannot see it.
+                    //
+                    // Measured 2026-09-04, the day this family went default-ON
+                    // again in `069e67b43`:
+                    // `vm/tests/lambda_jit_tierup_tests.rs::test_npe_from_body`
+                    // run ALONE -- the arm that engages the lambda direct door,
+                    // and the one its own page warns a full-file run never
+                    // reaches -- threw the real `NullPointerException` from the
+                    // lambda body straight past that method's own
+                    // `catch (NullPointerException)`, 3 of 3, always at the
+                    // same iteration. `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`,
+                    // `CRATONVM_JIT_OSR_EXC_TABLE=0` and `CRATONVM_DEOPT_REAL=0`
+                    // each made it clean: three switches over one site, which is
+                    // what named this rather than the intrinsic's arithmetic.
+                    //
+                    // The refusal has to be HERE, not in the codegen's own
+                    // BOX_UNBOX region. Declining there leaves `callee_entry`
+                    // holding the intrinsic sentinel and drops through to the
+                    // plain direct-call path, which emits a `CALL` to that
+                    // sentinel: `SIGSEGV at pc=0xffffffffffffffc7`, measured on
+                    // the first attempt at this fix.
+                    //
+                    // The thin direct binds below still take the site. They are
+                    // a CALL through `jit_invoke_dispatch`'s ordinary machinery,
+                    // which is exactly what the precise-frame contract expects.
+                    // See
+                    // `internal/fixed-bugs/jit-superseded-implicit-npe-leak-FIXED-20260903.md`.
+                    let box_unbox_site_is_protected =
+                        cratonvm_jit::pc_in_protected_range(&osr_exception_table, pc);
                     if invoke_kind == 0
+                        && !box_unbox_site_is_protected
                         && (target_class == "java/lang/Long" || target_class == "java/lang/Integer")
                     {
                         // Through `cm_lock` — see the AtomicInteger arm above for

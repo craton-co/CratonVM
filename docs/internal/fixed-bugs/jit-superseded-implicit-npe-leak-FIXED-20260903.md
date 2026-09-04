@@ -2,9 +2,37 @@
 
 ## Status
 
-**FIXED 2026-09-03.** `take_jit_pending_exception` now drops the implicit-trap
-signals when it hands out an exception. Regression vector:
-`regression-suite/src/RJitLambdaNpeSupersede.java`.
+**FIXED 2026-09-03. Retired 2026-09-04.** `take_jit_pending_exception` now
+drops the implicit-trap signals when it hands out an exception. Regression
+vector: `regression-suite/src/RJitLambdaNpeSupersede.java`, in `run.sh`'s
+`CORE_CLASSES`.
+
+Re-verified on `dev@04a5d4d02` before retiring, because this page's own finding
+is that a green suite was not evidence here -- the sibling tests kept the
+compiler busy and the arm never engaged. So the check that matters is the one
+this page named, run ALONE:
+
+```
+cargo test --release -p cratonvm-vm --test lambda_jit_tierup_tests \
+    test_npe_from_body -- --exact
+```
+
+`test result: ok. 1 passed; 0 failed; 11 filtered out` -- the arm that used to
+fail. `drain_superseded_implicit_signals` is in `vm/src/jit/helpers.rs` beside
+`take_jit_pending_exception`, with the rule stated on it.
+
+**That re-verification found a SECOND defect on the same vector, and it had to
+be fixed before this page could retire.** On `dev@04a5d4d02` the same test,
+alone, failed 3 of 3 -- this time the real NPE escaping its own `catch` rather
+than a spurious one two iterations later. Nothing in the signal machinery had
+changed: `069e67b43` put the BOX_UNBOX intrinsic family back to default-ON that
+morning, and the intrinsic claims a site inside a `try` that the OSR compile's
+admission had already promised would publish a precise exception frame. Fixed
+and recorded at
+`osr-precise-frame-promise-broken-by-an-inline-intrinsic-FIXED-20260904.md`.
+
+This page's own warning is what caught it: **run this test alone.** A full-file
+run was green on the broken binary, exactly as it was for the defect above.
 
 ## The symptom
 
