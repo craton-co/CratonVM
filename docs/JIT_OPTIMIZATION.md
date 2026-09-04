@@ -1687,6 +1687,17 @@ control configuration as the floor:
 instructions out of a thirty-two instruction body, in a loop with enough
 independent work to overlap them, is below what this host can resolve.
 
+**Half of it is inert on this shape, and the counter says which half.**
+`[ir-ls] phi copies: reg_reads=0 reg_publishes=4` — four publishes (two phis
+times two edges) and not one register read, because the sources of those copies
+are the `Add` results, which are single-use and therefore never promoted. The
+read half waits on a shape where a phi's incoming value is itself resident.
+
+Correctness is established rather than assumed: `probes/PhiSwapLoop.java`
+(two-cycle, three-cycle, mixed GP/FP) matches HotSpot with the flags on and
+off, the 2,489 `cratonvm-jit` tests pass with both flags on, and the regression
+suite is 90/90 in both arms.
+
 **The CratonBench arms were vacuous, and the check that caught it is worth
 copying.** `sieve`, `matrix` and `arithmetic` were run the same way and came
 back at 0.407, 0.475 and 0.549 — until `CRATONVM_DBG=ir-linear-scan` was read
