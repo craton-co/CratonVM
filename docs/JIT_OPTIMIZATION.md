@@ -1203,14 +1203,64 @@ is `unallocated_value`: **a value emitted after its own use**.
 and a def at 51 means the definition's *block* is laid out after its user's.
 `ir_schedule`'s own module doc states the opposite as invariant 1 — the layout
 "keeps every definition before every use, so no live range inverts" — so this is
-a violated invariant, not a missing feature. On H2 it denies the optimizing tier
-to `java/lang/String.equals` and `java/lang/StringLatin1.equals`, among the
-hottest methods in any workload.
+a violated invariant, not a missing feature. **Fixed 2026-09-04; see below**,
+where the per-method effect is also stated more carefully than it was here: it
+costs `String.equals` and `StringLatin1.equals` one of their two compilations
+each, not the optimizing tier outright.
 
 Not caused by the 2026-09-02 switches: `CRATONVM_JIT_IR_FUSED_BRANCH=0` and
 `CRATONVM_JIT_IR_LINEAR_SCAN=0` each still produce exactly 3 on CratonBench.
 Left open — correcting global code motion is a change to every compiled method,
 and it wants its own branch and its own per-collector sweep.
+
+### The block order was creation order, and nothing made it a reverse postorder
+
+`ir_lower` emits `schedule.blocks` front to back, so block *index* order is
+emission order. Block indices are assigned in **creation** order — whatever
+order Step 1 happened to walk control nodes in — and nothing turned that into a
+reverse postorder. A block could therefore be emitted before a block that
+dominates it, and a value read before the instruction that defines it.
+
+`verify_data_locations` catches exactly that and refuses the compile, so it was
+never wrong code. It was lost compiles, silently, and until the bailout
+attribution above it could not even be counted.
+
+The machinery to fix it was already present and switched off. `layout_blocks`
+produces a DFS layout whose stated property (invariant 2 of `ir_schedule`'s
+module doc) is "for every edge `u → v` reachable from the entry, `pos(u) <
+pos(v)` unless the edge is retreating" — and a dominator is a DFS ancestor, so
+an RPO layout places it first and def-before-use follows. But it runs only under
+`ScheduleOptions::layout_hot_paths`, which is `false` in the production
+pipeline: `schedule()` is `schedule_with_options(graph, &ScheduleOptions::default())`.
+
+So when hot-path layout is off, the blocks are now still laid out — just without
+the frequency priority. `layout_blocks_rpo` is `dfs_layout(blocks, None)` behind
+the same `validate_order`, and a validation failure keeps creation order and
+compiles anyway, exactly as the hot-path arm already did.
+
+| | `CRATONVM_JIT_IR_RPO_LAYOUT=0` | default |
+|---|---|---|
+| CratonBench: `unallocated_value` | 3 | **0** |
+| CratonBench: fell through | 17 | **14** |
+| H2 `TestAlter`: `unallocated_value` | 4 | **0** |
+| H2 `TestAlter`: `code_buffer_exhausted` | 2 | **0** |
+| H2 `TestAlter`: fell through | 50 | **44** |
+
+Three H2 methods gain an optimizing-tier body they previously never got —
+`FutureTask.awaitDone`, `MVMap.<init>`, `TransactionStore.getEntryId` — and
+`String.equals` / `StringLatin1.equals` go from 1-of-2 compilations wasted to
+2-of-2 lowered. The `code_buffer_exhausted` pair disappearing was not predicted:
+a better block order emits less code, and those two methods were the ones on the
+edge of their estimate.
+
+**No throughput claim.** Six interleaved CratonBench rounds alternate in sign
+(on faster, off faster, on faster) while the absolute totals drift ~50% across
+rounds, which is this host under load, not a result. Checksums are identical in
+every run.
+
+Validated per collector, because reordering blocks moves oop-map and safepoint
+positions in every compiled method: regression-suite 90/90 on ZGC, G1 and
+Generational; `cratonvm-jit` 2225 passed.
 
 ### Summary table
 
@@ -1237,6 +1287,7 @@ and it wants its own branch and its own per-collector sweep.
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
 | Skip the supersede-epoch bump when it cannot invalidate anything | off (nothing to skip: H2 shows 75/75 publishes genuinely changed) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
+| Reverse-postorder block layout (def before use) | **ON** | `CRATONVM_JIT_IR_RPO_LAYOUT=0` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
