@@ -3585,9 +3585,13 @@ fn band_slot_is_verifiable_with_map(
     // holds, the band test reporting the slot as "unpublished" is asking about
     // a mechanism (shadow-stack publication) that is not the one covering it.
     //
-    // OPT-IN, and it stays opt-in until measured: this is the fail-OPEN
-    // direction (fewer words reported => more cycles permitted to move), which
-    // is the direction a mistake here is a missed root.
+    // OPT-IN, and REFUTED — see §24 and the flag's own doc. The claim above is
+    // false in practice: with this on, the stale-after-remap detector reports
+    // 260-545 stale words per run against 2-18 with it off, 54-140 of them in
+    // java locals. Whatever `in_map` guarantees, it is not "the precise path
+    // rewrote this slot", and the shadow-publication requirement is not
+    // redundant for such words. The switch survives as the lever that measured
+    // that, and it is fail-OPEN, so off is safe.
     if band_skip_in_map_enabled() {
         if let Some(slots) = map_slots {
             if slots.contains(&off) {
@@ -3598,8 +3602,20 @@ fn band_slot_is_verifiable_with_map(
     true
 }
 
-/// `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP=1` — §22.3's experiment. See the
-/// note at its use for the claim it tests and why it is opt-in.
+/// `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP=1` — §22.3's experiment, and
+/// **REFUTED**. Do not enable it outside that experiment.
+///
+/// The claim was that a slot the active oop map names is rewritten by
+/// `remap_active_jit_frames`, so the shadow stack need not also publish it.
+/// The stale-after-remap detector says otherwise (§24): with this on,
+/// `CoverageBench` leaves 260-545 stale words per run against 2-18 with it off,
+/// 54-140 of them in `region=java-local` against 0-10. Those are references the
+/// collector moved and nothing rewrote — precisely the corruption the
+/// shadow-publication requirement exists to prevent.
+///
+/// Kept, rather than deleted, because it is the lever that produced that
+/// answer and the one that would re-test it if the underlying mechanism ever
+/// changes. It is fail-OPEN, so leaving it off is leaving it safe.
 fn band_skip_in_map_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
