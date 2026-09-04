@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-335 tokens.
+334 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -684,7 +684,6 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
-| `ir-gated-ref-store` | `CRATONVM_JIT_IR_GATED_REF_STORE` |
 | `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
 | `ir-receiver-guard-cse` | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` |
 | `ir-residency-pays` | `CRATONVM_JIT_IR_RESIDENCY_PAYS` |
