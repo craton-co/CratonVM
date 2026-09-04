@@ -294,6 +294,48 @@ not a fix anyone can ship: the same 4 runs log 8-9 k fragmentation
 `OutOfMemoryError`s and never complete, where the unguarded arm finishes in
 462 s with ZERO. Full numbers on the H2 page.
 
+### 2026-09-03 (final): four fixes, and the one that works says WHERE the defect is
+
+| attempt | what it covers | SIGSEGV | OOM cost |
+|---|---|---|---|
+| pin unnamed frame refs | this thread's frame slots (96 M pins) | no fix | -- |
+| rewrite unmapped dupes | this thread's frame slots (68 words) | no fix | -- |
+| `local_mask_unreached` fail-closed | this thread's safepoint maps | 3 / 4 | **0** |
+| **blanket guard** | **ANY thread in JIT, peers included** | **0 / 4** | ~9700 |
+
+Every targeted repair addresses the CURRENT thread's compiled frames, and none
+works. The only thing that works is the one that also covers PEERS. That is the
+diagnosis, by elimination with a positive control in every batch.
+
+And the mechanism is sitting in the blocked-wake path:
+`vm_exec::apply_pending_blocked_fixups` contains **ZERO** calls to
+`remap_active_jit_frames`, `remap_register_image_words` or
+`shadow_stack.remap`. It remaps a blocked thread's INTERPRETER frames,
+`printed`, `java_thread_obj` and `native_pin_roots` -- and nothing else. So a
+peer that blocked with compiled frames below it resumes with every JIT-frame oop
+at its pre-move address.
+
+Pinning those peers is what the ZGC pinned-peer credit does
+(`bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`), and pinning is
+not sufficient: a pin withholds the PAGE, and the conservative scan that finds
+what to pin cannot see a reference that never left a register. Hence the guard
+-- which refuses whenever any thread is in JIT -- being the only effective
+remedy, and an unaffordable one at ~9700 fragmentation OOMs.
+
+**The fix is rewritability, not immobility**: `apply_pending_blocked_fixups`
+must remap the waking thread's JIT frames, register image and shadow stack, the
+way `apply_pointer_map_to_thread` does on the STW-resume path. That is a change
+to the blocked-wake path and it is the remaining work.
+
+Two ruled-out-by-checking notes for whoever takes it:
+
+* the `gpr-safepoint-spill` region is WRITE-ONLY (`emit_blind_reg_spill` stores;
+  `emit_post_safepoint_reload` reloads from CANONICAL slots), so stale words
+  there are harmless -- do not "fix" them;
+* `local_mask_unreached` is a REAL hole (125 on this workload, dominant, while
+  the shadow half counted the same population and refused) and worth fixing on
+  its own merits at zero measured OOM cost -- it is simply not this crash.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set
