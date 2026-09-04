@@ -334,7 +334,19 @@ Two ruled-out-by-checking notes for whoever takes it:
   there are harmless -- do not "fix" them;
 * `local_mask_unreached` is a REAL hole (125 on this workload, dominant, while
   the shadow half counted the same population and refused) and worth fixing on
-  its own merits at zero measured OOM cost -- it is simply not this crash.
+  its own merits -- it is simply not this crash. PRICED: 4 runs with
+  `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1`, **ZERO OOM on every arm**,
+  the completed run still relocating freely (`compaction_cycles=24`,
+  `relocation_on_proven_jit=24`, `relocation_skipped_jit=3`) and producing
+  99959. Regression suite 88/88. The refusal fires on ~125 safepoints, a thin
+  slice, so it costs nothing measurable -- unlike the blanket guard's ~9700
+  OOMs and total loss of completion. Recommended to land default-ON on that
+  evidence; it is a correctness hole with no measured price.
+
+  That zero is also the discriminator: had the OOMs climbed toward 9700, a clean
+  crash result would have been the guard in disguise. They did not move at all,
+  which is what confirms whatever suppresses the crash in the guard arm is the
+  PEER coverage and not per-safepoint map completeness.
 
 ## The mitigation
 
