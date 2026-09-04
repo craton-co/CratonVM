@@ -77,3 +77,53 @@ safepoint polls, oop maps, coverage claim and the armed verify oracle still have
 not run against a live collector. That needs the whole VM built for aarch64 and
 a Java workload — feasible in the same container, but an order of magnitude more
 emulated build time.
+
+## Running the whole VM on AArch64 (2026-09-04)
+
+The unit tests above exercise the jit crate. Running the VM itself — and with it
+the safepoint polls, oop maps, coverage claim and the armed verify oracle
+against a live collector — needs the binary, and until 2026-09-04
+`cratonvm-cli` had never been built for AArch64 at all.
+
+**Six source errors stood in the way, all in `cratonvm-vm`, all portability
+rather than design:**
+
+| what | where |
+| --- | --- |
+| `core::arch::x86_64::_rdtsc()` ungated (×2) | `vm/src/jit/helpers.rs` |
+| `asm!("mov {}, rbp")` ungated | `vm/src/jit/helpers.rs` |
+| `first_unsupported_precise_frame_site` (x86-only) called unconditionally | `vm/src/runtime/interpreter/jit_bridge.rs` |
+| `osr_enter_planned` (x86-only) called unconditionally | `vm/src/runtime/interpreter/jit_bridge.rs` |
+| `dlopen(.. as *const i8)` — `c_char` is `u8` on AArch64 | `vm/src/vm/vm_exec.rs` |
+
+The counter now reads `CNTVCT_EL0` on AArch64 and the frame pointer `x29`; the
+two OSR sites are gated, because no backend but x86-64 publishes OSR entry
+points. Two system libraries are also needed beyond the jit crate's:
+`libffi-dev` (or autotools, to bootstrap libffi) and `libxcb1-dev`.
+
+Add to the image:
+
+```
+libffi-dev libxcb1-dev libx11-dev build-essential automake autoconf libtool texinfo cmake
+```
+
+and an AArch64 JDK, e.g.
+`curl -sSL https://api.adoptium.net/v3/binary/latest/25/ga/linux/aarch64/jdk/hotspot/normal/eclipse`.
+
+### What it showed
+
+`cratonvm` runs a Java program on AArch64 and gets the right answer, and the
+collector runs under it — 7 collections on a 48 MB heap.
+
+**But the JIT machinery is still NOT exercised, and the oracle's silence is
+therefore vacuous.** With `CRATONVM_JIT_METRICS_OUT` on, the tier-up path
+records two compilation attempts for the one method shaped for this backend
+(`work`, a leaf arithmetic loop) and **both come back
+`"outcome":"abandoned"`** — the backend refuses it. Nothing is compiled, so no
+poll executes, no map is published, no coverage claim is made and the oracle has
+nothing to refute.
+
+So the state is: the VM is portable, the collector runs, and the remaining
+blocker is a single named refusal. **The next step is to find why `work` is
+abandoned** — `CRATONVM_JIT_METRICS_OUT`'s record for it is where to start, and
+that is a much smaller question than "does any of this work on AArch64".
