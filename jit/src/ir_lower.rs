@@ -13375,6 +13375,13 @@ fn ir_inline_tlab_enabled() -> bool {
 }
 
 #[cfg(test)]
+// x86-64 ONLY. These assert x86-64 encodings and several EXECUTE the code
+// they emit, which on another architecture is an illegal instruction that
+// takes the whole test binary down with it -- `cargo test -p cratonvm-jit`
+// died at `a_previously_declined_large_method_now_compiles` with SIGILL the
+// first time it was ever run on aarch64. Gated at the MODULE, because the
+// property is "this module is about x86-64", not a per-test accident.
+#[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
     use crate::ir::IrBuilder;

@@ -9541,4 +9541,142 @@ mod tests {
         let mut backend = Arm64Backend::new();
         assert!(!backend.compile_method(4, 0, 8, &[0x5e]).success);
     }
+
+// ---------------------------------------------------------------------------
+// EXECUTION. Only compiled on aarch64, where the emitted bytes are native.
+// ---------------------------------------------------------------------------
+
+/// Tests that actually RUN the code this backend emits.
+///
+/// Everything else in this file asserts encodings and pseudo-op structure,
+/// which is all a non-aarch64 host can prove. These are the ones that turn that
+/// construction into evidence, and they exist because nothing in this
+/// repository could execute them until an aarch64 container was stood up.
+#[cfg(target_arch = "aarch64")]
+mod arm64_execution {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    /// The safepoint flag the emitted poll reads. ONE byte, like the
+    /// `AtomicBool` the real `GcBarrier` exposes.
+    static TEST_SP_FLAG: AtomicU8 = AtomicU8::new(0);
+    /// Bumped by the slow path so a taken poll is observable.
+    static SLOW_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn test_slow_path() {
+        SLOW_PATH_HITS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// These tests must not run concurrently, for two independent reasons.
+    ///
+    /// They share `TEST_SP_FLAG`, so one test's `store` decides another's
+    /// control flow. And they WRITE THEN EXECUTE code: under qemu-user (the
+    /// only way this file gets run at all today) a buffer being written while
+    /// another thread executes from a neighbouring mapping can leave stale
+    /// translation blocks, which surfaces as `SIGILL` in a test whose own
+    /// codegen is fine. Serialising removes both, and costs nothing -- there
+    /// are three of them.
+    static EXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exec_guard() -> std::sync::MutexGuard<'static, ()> {
+        EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `iload_0; iload_1; iadd; ireturn`
+    const IADD: [u8; 4] = [0x1a, 0x1b, 0x60, 0xac];
+
+    fn call2(cm: &crate::CompiledMethod, a: i64, b: i64) -> i64 {
+        // SAFETY: `cm` is a finalized artifact for a static (II)I method, so
+        // the entry is an `extern "C" fn(i64, i64) -> i64`.
+        unsafe { cm.try_call(&[a, b]) }.expect("the compiled method is callable")
+    }
+
+    /// The emitted code runs at all.
+    #[test]
+    fn a_compiled_leaf_method_executes_and_returns_the_right_value() {
+        let _serial = exec_guard();
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(false);
+        let result = b.compile_method(2, 2, 4, &IADD);
+        assert!(result.success, "iadd must compile");
+        let cm = publish_compiled_method(&result).expect("publishes");
+        assert_eq!(call2(&cm, 7, 35), 42);
+        assert_eq!(call2(&cm, -1, 1), 0);
+    }
+
+    /// THE POLL SEQUENCE EXECUTES, and takes the not-taken path when the flag
+    /// is clear.
+    ///
+    /// This is the `MOVZ/MOVK; LDRB; CBZ` sequence whose encoding is asserted
+    /// by `the_poll_reads_one_byte_and_the_encoding_says_so`. Asserting the
+    /// word is not the same as running it: this proves the flag is read at the
+    /// right width and address and that a clear flag branches PAST the call
+    /// rather than into it.
+    #[test]
+    fn a_clear_flag_skips_the_slow_path() {
+        let _serial = exec_guard();
+        TEST_SP_FLAG.store(0, Ordering::SeqCst);
+        let before = SLOW_PATH_HITS.load(Ordering::SeqCst);
+
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(true);
+        // SAFETY: zeroed helper table, then two real addresses.
+        let mut h: crate::JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        h.safepoint_flag_addr = TEST_SP_FLAG.as_ptr() as usize;
+        h.safepoint_slow_path = test_slow_path as usize;
+        b.set_helpers(h);
+
+        let result = b.compile_method(2, 2, 4, &IADD);
+        assert!(result.success);
+        let cm = publish_compiled_method(&result).expect("publishes");
+        assert_eq!(call2(&cm, 20, 22), 42, "the method still computes");
+        assert_eq!(
+            SLOW_PATH_HITS.load(Ordering::SeqCst),
+            before,
+            "a clear flag must not call the slow path"
+        );
+    }
+
+    /// THE TAKEN PATH RUNS, AND THE ARGUMENTS SURVIVE IT.
+    ///
+    /// The poll's `BLR` clobbers X0-X7 by the AAPCS64 contract, and this
+    /// method's parameters arrive there. The entry poll was originally emitted
+    /// from the END of the prologue -- BEFORE `compile_pass` copies the
+    /// arguments into their local registers -- so on this path every parameter
+    /// would have been garbage. That was found by reading and fixed by moving
+    /// the poll past the copy; this is the test that would have CAUGHT it, and
+    /// it is the first thing in this backend's history that could.
+    #[test]
+    fn a_set_flag_calls_the_slow_path_and_the_arguments_survive() {
+        let _serial = exec_guard();
+        TEST_SP_FLAG.store(1, Ordering::SeqCst);
+        let before = SLOW_PATH_HITS.load(Ordering::SeqCst);
+
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(true);
+        // SAFETY: as above.
+        let mut h: crate::JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        h.safepoint_flag_addr = TEST_SP_FLAG.as_ptr() as usize;
+        h.safepoint_slow_path = test_slow_path as usize;
+        b.set_helpers(h);
+
+        let result = b.compile_method(2, 2, 4, &IADD);
+        assert!(result.success);
+        let cm = publish_compiled_method(&result).expect("publishes");
+
+        let got = call2(&cm, 7, 35);
+        assert!(
+            SLOW_PATH_HITS.load(Ordering::SeqCst) > before,
+            "a set flag must reach the slow path -- otherwise this test proves \
+             nothing about the taken path"
+        );
+        assert_eq!(
+            got, 42,
+            "the arguments must survive the poll's call; X0-X7 are caller-saved"
+        );
+
+        TEST_SP_FLAG.store(0, Ordering::SeqCst);
+    }
+}
+
 }

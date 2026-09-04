@@ -9548,6 +9548,12 @@ fn callee_saved_gpr_local_homes_are_default_on_with_precise_maps() {
 }
 
 #[test]
+// x86-64 only: `CompiledMethod::osr_enter` is itself
+// `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not merely
+// fail -- it does not COMPILE, and took the whole crate's test binary with
+// it. Found by actually building for aarch64 in an emulated container; a
+// cfg-gated API needs cfg-gated tests.
+#[cfg(target_arch = "x86_64")]
 fn test_osr_simple_loop() {
     // Test OSR entry: compile a simple sum loop and enter at the loop header
     // Same bytecode as above: sum(n) = 0 + 1 + ... + (n-1)
@@ -9618,6 +9624,12 @@ fn test_osr_simple_loop() {
 }
 
 #[test]
+// x86-64 only: `CompiledMethod::osr_enter` is itself
+// `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not merely
+// fail -- it does not COMPILE, and took the whole crate's test binary with
+// it. Found by actually building for aarch64 in an emulated container; a
+// cfg-gated API needs cfg-gated tests.
+#[cfg(target_arch = "x86_64")]
 fn test_osr_long_loop() {
     // long addOnly(long n) { long s=0; for(long i=0;i<n;i++) s+=i; return s; }
     // Locals: 0-1=n(long), 2-3=s(long), 4-5=i(long)
