@@ -10565,11 +10565,45 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// and therefore what stops a register-resident value from ever losing it --
 /// see `plan_register_residency`'s `blocked_deopt` census.
 fn ir_deopt_regs_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = DEOPT_REGS_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_DEOPT_REGS").is_some()
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_deopt_regs_enabled`], the same shape (and for
+    /// the same reason) as `LS_FORCE`: the production answer latches a
+    /// process-wide `OnceLock` off the environment, so a test that did not
+    /// override it would measure the developer's shell.
+    static DEOPT_REGS_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_deopt_regs_enabled`] on this thread.
+#[cfg(test)]
+struct DeoptRegsForce;
+
+#[cfg(test)]
+impl DeoptRegsForce {
+    fn on() -> DeoptRegsForce {
+        DEOPT_REGS_FORCE.with(|c| c.set(Some(true)));
+        DeoptRegsForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeoptRegsForce {
+    fn drop(&mut self) {
+        DEOPT_REGS_FORCE.with(|c| c.set(None));
+    }
 }
 
 /// Bytes the frame reserves for the deopt register image.
@@ -20270,6 +20304,191 @@ mod tests {
             .iter()
             .map(|n| count_seq(code, n))
             .sum()
+    }
+
+    /// Build a lowerer whose GP residency file holds exactly `reg`.
+    ///
+    /// `lowerer_with_resident_xmm` covers the other bank; this one is what
+    /// makes `saved_gpr_regs` non-empty (it filters on `gp_reg_of`) and what
+    /// gives `set_residency` something to compute `deopt_nameable` from.
+    #[cfg(test)]
+    fn lowerer_with_resident_gpr(buf_cap: usize, reg: u8) -> Lowerer<'static> {
+        let mut lo = lowerer_with_resident_xmm(buf_cap, None);
+        let n = lo.graph.nodes.len().max(1);
+        let mut gp_reg_of = vec![None; n];
+        gp_reg_of[0] = Some(reg);
+        lo.set_residency(RegResidency {
+            reg_of: vec![None; n],
+            gp_reg_of,
+            promoted: 1,
+            demoted: 0,
+            peak_live: 0,
+        });
+        lo
+    }
+
+    /// The end-to-end one: a value that exists ONLY in a register at the trap
+    /// comes back out of the reconstructed frame.
+    ///
+    /// This runs the emitted bytes. Nothing else proves the spill offsets: the
+    /// region's arithmetic (`gpr[r]` at `[rbp - (base - 8r)]`), the `LEA` that
+    /// turns `deopt_regs_base` into a `*const SavedRegisters`, the third
+    /// argument register on this ABI, and `ir_deopt_entry`'s dereference of it
+    /// are four independent chances to be off by an offset, and each of them
+    /// fails by producing a *plausible number* rather than a crash.
+    ///
+    /// `RegisterLong` deliberately, not `Register`: the latter resolves
+    /// truncated to 32 bits, so a sentinel with a distinctive HIGH half would
+    /// pass a broken 64-bit read.
+    #[test]
+    fn a_deopt_frame_reads_a_register_the_stub_spilled() {
+        let _ls = LsForce::on();
+        let _dr = DeoptRegsForce::on();
+        const RBX: u8 = 3;
+        // Distinctive in both halves, and not a plausible stack value.
+        const SENTINEL: i64 = 0x5EED_1234_0BAD_C0DEu64 as i64;
+
+        let mut lo = lowerer_with_resident_gpr(16384, RBX);
+        assert!(
+            lo.deopt_regs_base > 0,
+            "the flag is on, so the frame must have reserved the region",
+        );
+
+        // LEAK(intentional): the stub bakes this pointer as an immediate and
+        // the entry dereferences it during the call.
+        let point: &'static DeoptimizationPoint = Box::leak(Box::new(DeoptimizationPoint {
+            native_offset: 0,
+            bci: 7,
+            reason: DeoptReason::TransferToInterpreter,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 7,
+                locals: vec![FrameValue::RegisterLong(RBX)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+            semantics: ResumeSemantics::for_reason(DeoptReason::TransferToInterpreter),
+        }));
+
+        // push rbp ; mov rbp, rsp ; sub rsp, frame_size
+        lo.buf.emit_byte(0x55);
+        lo.buf.emit(&[0x48, 0x89, 0xE5]);
+        lo.buf.emit(&[0x48, 0x81, 0xEC]);
+        let frame = lo.frame_size;
+        lo.buf.emit(&frame.to_le_bytes());
+        // Save what the stub's teardown will restore. Without this the stub
+        // hands the RUST caller garbage in RBX/R12-R15 on the way out, which is
+        // a corrupted test process rather than a failed assertion.
+        let gpr_saves: Vec<(u8, i32)> = lo.saved_gpr_regs().collect();
+        for (reg, off) in gpr_saves {
+            lo.emit_gpr_frame_move(reg, off, true);
+        }
+        let xmm_saves: Vec<(u8, i32)> = lo.saved_xmm_regs().collect();
+        for (reg, off) in xmm_saves {
+            lo.emit_xmm_frame_move(reg, off, true);
+        }
+        // The value under test lives in RBX and in NO frame word.
+        // Cast: a fixed test sentinel.
+        lo.emit_mov_reg_imm64(RBX, SENTINEL as u64);
+        // Cast: a leaked pointer baked as the guard's argument.
+        lo.emit_mov_reg_imm64(DEOPT_ARG0, point as *const DeoptimizationPoint as u64);
+        // JMP <stub>, patched by `emit_deopt_stub` exactly as a guard's is.
+        lo.buf.emit_byte(0xE9);
+        let patch = lo.buf.pos();
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.deopt_stub_patches.push(patch);
+        lo.emit_deopt_stub();
+        assert!(!lo.buf.overflowed(), "the harness body must fit");
+
+        let cm = CompiledMethod::new(lo.buf);
+        // SAFETY: the body takes no arguments, builds and tears down its own
+        // frame, and calls only `ir_deopt_entry`.
+        let ret = unsafe { cm.try_call(&[]) }.expect("the harness body runs");
+        assert_eq!(ret, i64::MIN, "the stub returns the deopt sentinel");
+
+        let frame = crate::deopt::take_last_deopt().expect("the entry stashed a frame");
+        assert_eq!(frame.bci, 7);
+        assert_eq!(
+            frame.locals,
+            vec![FrameValue::Long(SENTINEL)],
+            "the reconstructed local must be the value RBX held at the trap,              read out of the spilled register image",
+        );
+    }
+
+    /// With the flag off the stub keeps its historical two-argument shape, and
+    /// the frame grows by nothing.
+    #[test]
+    fn without_the_flag_no_region_is_reserved_and_nothing_is_spilled() {
+        let _ls = LsForce::on();
+        let mut lo = lowerer_with_resident_gpr(16384, 3);
+        assert_eq!(
+            lo.deopt_regs_base, 0,
+            "no region may be reserved when the flag is off",
+        );
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.deopt_stub_patches.push(0);
+        let before = lo.buf.pos();
+        lo.emit_deopt_stub();
+        let with_flag_off = lo.buf.pos() - before;
+
+        let _dr = DeoptRegsForce::on();
+        let mut on = lowerer_with_resident_gpr(16384, 3);
+        on.buf.emit(&[0, 0, 0, 0]);
+        on.deopt_stub_patches.push(0);
+        let before = on.buf.pos();
+        on.emit_deopt_stub();
+        let with_flag_on = on.buf.pos() - before;
+
+        assert!(
+            with_flag_on > with_flag_off,
+            "the flag must add the 32 spill stores and the LEA: {with_flag_on}              bytes on against {with_flag_off} off",
+        );
+    }
+
+    /// Naming is by EXCLUSIVE ownership, not by residency.
+    ///
+    /// Two values sharing a register is the case that reconstructs a
+    /// confidently wrong value: the allocator gives each of them the register
+    /// over its own live range, `release_deopt_pins` means a frame state can
+    /// name either one outside that range, and there is no position mapping in
+    /// this file that could tell which. Both must be refused.
+    #[test]
+    fn two_values_sharing_a_register_are_both_unnameable() {
+        let _ls = LsForce::on();
+        let _dr = DeoptRegsForce::on();
+        let mut lo = lowerer_with_resident_xmm(4096, None);
+        let n = lo.graph.nodes.len().max(4);
+        let mut gp_reg_of = vec![None; n];
+        gp_reg_of[0] = Some(3); // RBX, shared…
+        gp_reg_of[1] = Some(3); // …with this one
+        gp_reg_of[2] = Some(12); // R12, exclusively
+        lo.set_residency(RegResidency {
+            reg_of: vec![None; n],
+            gp_reg_of,
+            promoted: 3,
+            demoted: 0,
+            peak_live: 0,
+        });
+        assert!(!lo.deopt_nameable[0], "a shared register is not nameable");
+        assert!(!lo.deopt_nameable[1], "and neither is its other holder");
+        assert!(lo.deopt_nameable[2], "an exclusive register is nameable");
+        assert_eq!(
+            lo.register_frame_value(2, IrType::Long),
+            Some(FrameValue::RegisterLong(12)),
+        );
+        assert_eq!(
+            lo.register_frame_value(0, IrType::Long),
+            None,
+            "the shared holder must fall through to its home word",
+        );
+        assert_eq!(
+            lo.register_frame_value(2, IrType::Ref),
+            None,
+            "a reference is never described by a register: the oop map names              frame slots only, so a collector could neither walk nor update it",
+        );
     }
 
     /// **The** invariant: every exit restores exactly what the prologue saved.
