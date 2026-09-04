@@ -889,6 +889,9 @@ impl Compiler {
         val_slot: StackSlot,
         field_index: usize,
     ) {
+        // What DECLINING costs, at run time. The compile-time census counts
+        // declined SITES; this counts the stores they actually make.
+        self.emit_ref_store_path_trace(&crate::metrics::REF_STORE_FULL_HELPER_TAKEN);
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
