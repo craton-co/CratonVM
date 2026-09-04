@@ -284,6 +284,47 @@ const MAX_DENSE_CLASS_LAYOUTS: usize = 1 << 20;
 /// `RwLock` per scanned object. A redefine bumps this, invalidating caches.
 static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Layout REPLACEMENTS anywhere in the process, as one counter.
+///
+/// The per-class table below is what an ALLOCATION site guards on: it knows
+/// the class it is allocating, so it can bake that class's slot address and be
+/// invalidated by nothing else.
+///
+/// A compact FIELD-ACCESS site cannot do that. It bakes a packed cell offset
+/// resolved from a constant-pool entry, and the resolver hands back
+/// `(field_index, type_tag, compact_slot)` with no class id in it — there is
+/// no per-class slot for it to name without widening a VM-side callback and
+/// every caller of it. Those sites had NO guard at all, while the two
+/// allocation emitters had one and documented its absence as "confirmed heap
+/// corruption": a replaced layout left an already-compiled site reading and
+/// writing at the OLD offset while the object was laid out by the new one.
+///
+/// This is the guard they can have. It is coarser — any replacement anywhere
+/// invalidates every guarded field-access site, permanently routing each to
+/// its helper — and that is affordable precisely because replacements are
+/// rare: only an existing class_id's layout being SWAPPED bumps it (the
+/// synthetic-stub→real-bytecode upgrade), never a new registration. A
+/// workload that never replaces a layout, which is every benchmark and the
+/// overwhelming majority of real programs, keeps every inline arm.
+///
+/// Coarse and correct beats precise and absent.
+static LAYOUT_REPLACE_EPOCH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// `(address, value)` of the global replacement epoch, for a JIT site to bake
+/// and compare. See [`LAYOUT_REPLACE_EPOCH`].
+pub fn layout_replace_epoch_guard() -> (*const u32, u32) {
+    (
+        &LAYOUT_REPLACE_EPOCH as *const std::sync::atomic::AtomicU32 as *const u32,
+        LAYOUT_REPLACE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// The current global replacement epoch. Diagnostics and tests.
+pub fn layout_replace_epoch() -> u32 {
+    LAYOUT_REPLACE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Per-class layout REPLACEMENT counters (perf/halfgap-20260717).
 ///
 /// `LAYOUT_GENERATION` bumps on every registration — including brand-new
@@ -497,6 +538,10 @@ pub fn register_class_layout(domain: u32, class_id: u32, layout: Arc<CompactLayo
     // already-correct old layout, never observe new-count + old-layout.
     if v[idx].is_some() {
         layout_replace_counts()[idx].fetch_add(1, std::sync::atomic::Ordering::Release);
+        // ...and the global epoch, in the same place and under the same write
+        // lock, so the two can never disagree about whether a replacement
+        // happened. See `LAYOUT_REPLACE_EPOCH`.
+        LAYOUT_REPLACE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     v[idx] = Some(layout);
     // Bump after the store so a reader that observes the new generation also
@@ -567,6 +612,7 @@ pub fn unregister_class_layout(class_id: u32) {
         if slot.take().is_some() {
             if index < MAX_DENSE_CLASS_LAYOUTS {
                 layout_replace_counts()[index].fetch_add(1, std::sync::atomic::Ordering::Release);
+                LAYOUT_REPLACE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
             }
             LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
