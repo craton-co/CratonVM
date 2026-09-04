@@ -4750,6 +4750,12 @@ fn shared_vm_hook_registry() -> &'static SharedVmRegistry {
 /// can drop the registry lock before doing any VM work — the adapters below
 /// take VM-internal locks (`resolution_cache`, `jit_cache`, `class_manager`),
 /// and holding the registry lock across those would invert the lock order.
+/// `live_hook_vms` for callers outside this module (the deferred-`new` resweep
+/// on class definition). Same registry, same lock discipline.
+pub(crate) fn live_hook_vms_for_jit() -> Vec<Arc<SharedVm>> {
+    live_hook_vms()
+}
+
 fn live_hook_vms() -> Vec<Arc<SharedVm>> {
     let mut reg = shared_vm_hook_registry().lock();
     let mut live = Vec::with_capacity(reg.len());

@@ -170,7 +170,10 @@ pub fn report_at_exit() {
             ft_us / 1000,
         );
         let (held, spent) = cratonvm_jit::deferred_new_retry_census();
-        eprintln!("[c2-supersede] deferred-new retries: held={held} spent={spent}");
+        eprintln!(
+            "[c2-supersede] deferred-new retries: held={held} spent={spent} re_offered={}",
+            crate::runtime::interpreter::jit_bridge::deferred_new_reoffered(),
+        );
     }
     if direct_binds_enabled() {
         eprintln!(
