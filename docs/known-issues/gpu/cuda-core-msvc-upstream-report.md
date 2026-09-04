@@ -149,11 +149,3 @@ and that "Linux (tested on Ubuntu 24.04)" is a portability gap rather than
 a design limit. If that reading is right, both might be worth scoping more
 narrowly in the README — a host-side user on Turing or on Windows would
 currently conclude the crate is not for them.
-
-## Context
-
-I have been using `cuda-core` as an opt-in host backend in a JVM's
-GPU-offload bridge. We lower JVM bytecode to PTX at run time, so
-`load_module_from_ptx_src` is the entry point rather than `#[cuda_module]`.
-It has been solid — this build break is the only thing keeping it
-Linux-only for us.
