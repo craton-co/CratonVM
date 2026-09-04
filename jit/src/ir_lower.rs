@@ -12932,6 +12932,7 @@ pub(crate) fn lower_inner_with_scopes(
         spill_hi: spill_cap_off,
         callee_saved_lo: spill_cap_off,
         callee_saved_hi: frame_size,
+        callee_saved_shallow: false,
         // Named separately as well as covered by the band above, so
         // `FrameLayout::region_name` reports `xmm-saved` rather than the
         // catch-all — a frame dump that cannot tell a register image from an

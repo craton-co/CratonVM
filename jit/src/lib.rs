@@ -2548,6 +2548,21 @@ pub struct FrameLayout {
     /// Prologue save area for the caller's callee-saved GPRs.
     pub callee_saved_lo: i32,
     pub callee_saved_hi: i32,
+    /// Is that save area at the SHALLOW end of the frame (nearest the frame
+    /// pointer) rather than the deep end?
+    ///
+    /// x86-64 puts it deepest, which lets the band verifier treat
+    /// `callee_saved_lo` as a half-line -- everything at or beyond it is a
+    /// register image or past the frame. AArch64's prologue puts the saved
+    /// FP/LR pair and the callee-saved GPRs immediately below the frame
+    /// pointer and the spill area BELOW them, so that half-line would exclude
+    /// the entire spill area -- exactly where the oop maps point, leaving the
+    /// verifier unable to see the words it exists to check.
+    ///
+    /// `false` (the derived default) is the x86-64 geometry, so no existing
+    /// producer changes. A backend that sets it gets the RANGE exclusion
+    /// (`is_register_image`) and not the half-line.
+    pub callee_saved_shallow: bool,
     /// Prologue save area for the caller's callee-saved XMMs.
     pub xmm_saved_lo: i32,
     pub xmm_saved_hi: i32,
