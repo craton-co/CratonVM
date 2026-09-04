@@ -102,6 +102,10 @@ const ALLOWED: &[(&str, &str)] = &[
          here only because a unit test asserts the diagnostic message names it",
     ),
     (
+        "CRATONVM_REGEN_DEAD_CITATION_BASELINE",
+        "kind 4: a TEST-HARNESS regeneration switch, not a VM knob.          `types/tests/doc_citation_paths.rs` reads it with a raw          `std::env::var_os` to rewrite the dead-citation baseline, and a run          that regenerates then FAILS on purpose — a regenerating run has          verified nothing, and a CI job that exported the variable would          otherwise pass while checking nothing. Nothing under any `src/`          reads it, so declaring it would put one test binary's maintenance          switch on the runtime flag surface and hand it a `CRATONVM_DBG=`          token the VM would never consult. Same argument as          `CRATONVM_RATCHET_ROWS` below.",
+    ),
+    (
         "CRATONVM_RATCHET_ROWS",
         "kind 4: a TEST-HARNESS dump switch, not a VM knob. \
          `native-builtins/tests/stub_ratchet.rs` reads it with a raw \
