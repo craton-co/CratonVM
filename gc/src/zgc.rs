@@ -10532,17 +10532,80 @@ fn zgc_gen_nursery_percent() -> usize {
 /// firing again requires `budget` bytes of genuinely NEW allocation. A live
 /// set parked above the static threshold -- the shape `gc_rearm` exists to
 /// stop storming on -- cannot re-trigger this clause at all.
-fn zgc_alloc_trigger_percent() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn zgc_alloc_trigger_percent_explicit() -> Option<usize> {
+    static CACHED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_ALLOC_TRIGGER")
+        cratonvm_types::flags::runtime_var("CRATONVM_ZGC_ALLOC_TRIGGER")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-        {
-            Some(p) => p.min(100),
-            None => 0,
-        }
+            .map(|p| p.min(100))
     })
+}
+
+/// The percentage floor a PAUSE TARGET gets when the operator has not named
+/// one: 25% of capacity.
+///
+/// # Why a target needs a floor at all
+///
+/// [`ZgcRealHeap::refresh_pause_target_budget`] is a feedback loop, so it is
+/// blind to the FIRST cycle -- it has nothing to measure until a pause has
+/// happened. The occupancy clause therefore lets that one run to 75% of
+/// `-Xmx`, and on `G1ChurnPauseProbe 50 1800` at `-Xmx4096m` it is the worst
+/// pause of the whole run by a factor of five: everything after the loop
+/// engages settles at 65-115 ms, and that one cycle is 442.
+///
+/// A floor caps it, and the target then controls the steady state. Measured,
+/// one binary, only these two switches moved:
+///
+/// | configuration | wall | worst pause |
+/// |---|---|---|
+/// | neither | 9091 ms | 466 ms |
+/// | target 100 alone | 12943 ms | 509 ms |
+/// | target 100 + floor 25 | 11180 ms | **190 ms** |
+/// | target 200 alone | 14849 ms | 530 ms |
+/// | target 200 + floor 25 | 13548 ms | **221 ms** |
+///
+/// Better than the target ALONE on both axes, which is the part that makes
+/// this a default rather than a tuning knob: paying for the blind first cycle
+/// up front costs less than the controller's recovery from it.
+///
+/// # Why 25 and not tighter
+///
+/// The floor's whole job is the cycle the controller cannot see. Once the loop
+/// has a measurement it takes over, and a floor tighter than the budget the
+/// loop wants is just the loop being overridden by a constant -- which is the
+/// per-workload dial the target exists to replace. 25% is the loosest value
+/// measured to cap the first cycle.
+const ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET: usize = 25;
+
+/// The percentage the allocation clause actually uses: the operator's if they
+/// named one, else the floor under a pause target, else off.
+///
+/// `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal and stays off even
+/// with a target set -- that is the arm that measures the target alone.
+fn zgc_alloc_trigger_percent() -> usize {
+    alloc_trigger_percent_for(
+        zgc_alloc_trigger_percent_explicit(),
+        zgc_pause_target_ms(),
+    )
+}
+
+/// The decision itself, without the environment: the operator's percentage if
+/// they named one, else the floor under a pause target, else off.
+///
+/// Split out because both inputs are `OnceLock`-cached env reads, so a test
+/// cannot vary them in-process -- and the interesting cases here are the
+/// combinations, not the parsing.
+fn alloc_trigger_percent_for(explicit: Option<usize>, pause_target_ms: u64) -> usize {
+    match explicit {
+        // AN EXPLICIT ZERO IS A REFUSAL, not an absence. It is how an operator
+        // says "the target alone", and it is the arm every measurement of the
+        // target on its own was taken with; collapsing it into "unset" would
+        // make that arm unreachable and the comparison unrepeatable.
+        Some(p) => p,
+        None if pause_target_ms != 0 => ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET,
+        None => 0,
+    }
 }
 
 /// `CRATONVM_ZGC_BITMAP_BOUNDS` -- restrict the per-cycle object-start and
@@ -20677,6 +20740,37 @@ pub(crate) mod tests {
         assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
     }
 
+    /// A pause target brings a percentage floor with it; an explicit zero
+    /// refuses one.
+    ///
+    /// The floor exists for the cycle the feedback loop is blind to -- the
+    /// first, which has no pause to measure yet and which the occupancy clause
+    /// otherwise lets run to 75% of `-Xmx`. See
+    /// `ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET` for the measurement.
+    #[test]
+    fn a_pause_target_defaults_a_percentage_floor_under_itself() {
+        // No target, nothing named: the clause is off, exactly as before
+        // pause targets existed.
+        assert_eq!(alloc_trigger_percent_for(None, 0), 0);
+        // A target, nothing named: the floor.
+        assert_eq!(
+            alloc_trigger_percent_for(None, 200),
+            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+        );
+        assert_eq!(
+            alloc_trigger_percent_for(None, 1),
+            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+        );
+        // AN EXPLICIT ZERO IS A REFUSAL, not an absence: it is how an operator
+        // asks for the target alone, and it is the arm every measurement of
+        // the target on its own was taken with.
+        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
+        // And an explicit percentage wins over the floor in both directions.
+        assert_eq!(alloc_trigger_percent_for(Some(12), 200), 12);
+        assert_eq!(alloc_trigger_percent_for(Some(50), 200), 50);
+        assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
+    }
+
     /// A pause target is a CEILING: a pause under it must not move anything.
     ///
     /// This is the property the first two versions of the controller did not
@@ -20696,7 +20790,10 @@ pub(crate) mod tests {
         }
         let (_, affordable, budget, unreachable) = heap.pause_target_state();
         assert_eq!(affordable, 0, "nothing constrained the heap");
-        assert_eq!(budget, 0, "and the trigger clause is still off");
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and the trigger clause is still whatever the percentage form gave              it -- which, under a target, is the default floor"
+        );
         assert_eq!(unreachable, 0);
     }
 
@@ -20760,8 +20857,8 @@ pub(crate) mod tests {
         let (_, released, budget, _) = heap.pause_target_state();
         assert_eq!(released, 0, "relaxing to capacity releases the constraint");
         assert_eq!(
-            budget, 0,
-            "and hands the clause back to the percentage form, which is off"
+            budget, heap.alloc_trigger_percent_bytes,
+            "and hands the clause back to the percentage form"
         );
     }
 
@@ -20841,7 +20938,10 @@ pub(crate) mod tests {
         heap.refresh_pause_target_budget(60_000_000, 60 * MIB, 10 * MIB);
         let (_, after_inert, budget, unreachable) = heap.pause_target_state();
         assert_eq!(after_inert, 0, "going inert must clear the affordable span");
-        assert_eq!(budget, 0, "and hand the clause back to the percentage form");
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and hand the clause back to the percentage form"
+        );
         assert!(unreachable > 0);
 
         // The next overrun re-seeds from this cycle's own span rather than
@@ -20909,11 +21009,8 @@ pub(crate) mod tests {
         }
         let (_, _, budget, gave_up) = heap.pause_target_state();
         assert_eq!(
-            budget, 0,
-            "an unachievable target must go INERT (here: the percentage form, \
-             which is off), not tight -- the pause length is set by the live \
-             set, so a small budget buys pauses of the same length hundreds of \
-             times more often"
+            budget, heap.alloc_trigger_percent_bytes,
+            "an unachievable target must go INERT -- back to the percentage              form -- not tight: the pause length is set by the live set, so a              small budget buys pauses of the same length hundreds of times              more often"
         );
         assert!(
             gave_up > 0,
@@ -20942,7 +21039,10 @@ pub(crate) mod tests {
         let (target, affordable, budget, gave_up) = heap.pause_target_state();
         assert_eq!(target, 0, "the loop disables itself rather than retrying forever");
         assert_eq!(affordable, 0);
-        assert_eq!(budget, 0, "and the clause is the percentage form, which is off");
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and the clause is back to the percentage form"
+        );
         assert!(
             (3..10).contains(&gave_up),
             "it should stop at the third verdict, not keep counting: {gave_up}"
@@ -20967,7 +21067,7 @@ pub(crate) mod tests {
         heap.set_pause_target_ms(u64::MAX / 2_000_000);
         heap.refresh_pause_target_budget(1_000_000, 8 * MIB, 8 * MIB);
         assert_eq!(heap.pause_target_state().1, 0);
-        assert_eq!(heap.pause_target_state().2, 0);
+        assert_eq!(heap.pause_target_state().2, heap.alloc_trigger_percent_bytes);
         // And the other operand: a pause the clock reports as ~292 years,
         // against an ordinary target.
         let heap = ZgcRealHeap::with_capacity(64 * MIB);
@@ -20975,7 +21075,7 @@ pub(crate) mod tests {
         heap.refresh_pause_target_budget(u64::MAX / 2, 8 * MIB, 8 * MIB);
         let (_, _, budget, unreachable) = heap.pause_target_state();
         assert_eq!(
-            budget, 0,
+            budget, heap.alloc_trigger_percent_bytes,
             "an absurdly expensive pause goes inert rather than wrapping"
         );
         assert!(unreachable > 0, "and reports that it could not meet the target");
