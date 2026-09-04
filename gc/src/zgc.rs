@@ -5268,6 +5268,16 @@ impl ZgcRealHeap {
             Some(relocation_skip_reason::SWITCH_OFF)
         } else if !crate::gc_quiescence::moving_young_enabled() {
             Some(relocation_skip_reason::MOVING_YOUNG_DISABLED)
+        } else if zgc_unrewritable_peer_state_refuses()
+            && crate::gc_quiescence::unrewritable_peer_state()
+        {
+            // AHEAD of the coverage test, deliberately. This is a statement
+            // about peer state that a PASSING proof does not answer: the proof
+            // says every compiled frame's oops are published and rewritable,
+            // and this says a frozen peer holds a derived pointer whose base
+            // nothing can name. A cycle that discharges the former still owes
+            // the latter.
+            Some(relocation_skip_reason::UNREWRITABLE_PEER_STATE)
         } else if crate::gc_quiescence::moving_young_coverage_incomplete()
             && !self.coverage_incompleteness_is_page_pinnable()
         {
@@ -9235,8 +9245,23 @@ pub mod relocation_skip_reason {
     /// relocation-under-live-JIT SIGSEGV and to bring the fragmentation
     /// `OutOfMemoryError` back with it.
     pub const JIT_ACTIVE_BLANKET: usize = 6;
+    /// A frozen peer declared UNREWRITABLE PEER STATE, independently of whether
+    /// the coverage proof passed.
+    ///
+    /// Until 2026-09-04 `unrewritable_peer_state()` was consulted in exactly one
+    /// place on this collector -- inside
+    /// [`ZgcRealHeap::coverage_incompleteness_is_page_pinnable`] -- so it could
+    /// only ever bite on a cycle whose proof had ALREADY failed. A cycle that
+    /// discharged its proof never consulted it at all, and the derived-pointer
+    /// hazard it guards ("a frozen peer's registers can hold only a
+    /// derived/interior pointer whose base would otherwise be evacuated from
+    /// under it, then zeroed and re-served") went unchecked.
+    ///
+    /// It is a statement about peer STATE, not about proof completeness, so it
+    /// belongs in the chain on its own.
+    pub const UNREWRITABLE_PEER_STATE: usize = 7;
     /// One past the highest code; sizes the counter array.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// Human-readable label, for the summary line.
     pub fn label(code: usize) -> &'static str {
@@ -9248,6 +9273,7 @@ pub mod relocation_skip_reason {
             UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
             TLAB_RETIRE_INCOMPLETE => "tlab-retire-incomplete-at-safepoint",
             JIT_ACTIVE_BLANKET => "jit-active-blanket-refusal",
+            UNREWRITABLE_PEER_STATE => "unrewritable-peer-state",
             _ => "unknown",
         }
     }
@@ -9267,6 +9293,20 @@ pub mod relocation_skip_reason {
 /// price it: it should remove the relocation-under-live-JIT SIGSEGV that
 /// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` tracks, and restore
 /// the fragmentation OOM that the pinned-peer credit had just eliminated.
+/// `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES=1` -- make `unrewritable_peer_state()`
+/// a refusal term in its own right, not merely an input to the page-pinnable
+/// question.
+///
+/// Pairs with `CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE`: that one restores
+/// the flag on a discharged cycle, this one gives it teeth when the proof
+/// passes. Either alone is inert.
+fn zgc_unrewritable_peer_state_refuses() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES").is_some()
+    })
+}
+
 fn zgc_jit_blanket_refusal_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {

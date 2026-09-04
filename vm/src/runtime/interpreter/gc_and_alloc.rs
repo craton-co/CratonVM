@@ -726,9 +726,45 @@ pub(super) fn stw_take_over_and_wait(
         if !discharged {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
             cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
+        } else if keep_unrewritable_peer_state_on_discharge() {
+            // KEEP THE DERIVED-POINTER GUARD even when the coverage claim is
+            // discharged. The two flags answer different questions and the
+            // first discharge suppressed both.
+            //
+            // `unrewritable_peer_state` exists for one hazard, stated in its own
+            // doc and in the comment above: "a frozen peer's registers can hold
+            // only a derived/interior pointer whose base would otherwise be
+            // evacuated from under it, then zeroed and re-served". That is the
+            // crash signature of
+            // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` exactly
+            // -- a page-ALIGNED fault address, because `compact_low_to` zeroes
+            // the vacated span on purpose, so the reader lands on a valid
+            // all-zero header rather than on a wild pointer.
+            //
+            // The discharge's argument -- an interior-resolving probe pins the
+            // BASE, so a derived pointer is covered -- is an argument about the
+            // coverage PROOF. It is not an argument that no unrewritable peer
+            // state exists, and a derived pointer the probe cannot resolve to a
+            // base is exactly the residue. Five repairs aimed elsewhere changed
+            // nothing while the blanket guard was 0/4, which is the evidence
+            // that what still bites is peer state rather than frame coverage.
+            cratonvm_gc::gc_quiescence::mark_unrewritable_peer_state();
         }
     }
     taken
+}
+
+/// `CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE=1` -- a discharged helper-window
+/// cycle still declares UNREWRITABLE PEER STATE.
+///
+/// The helper-window discharge suppressed two flags where it had an argument
+/// for only one. See the call site.
+fn keep_unrewritable_peer_state_on_discharge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE")
+            .is_some()
+    })
 }
 
 /// INT-3 (G1) — pin-in-place everything a forcibly-frozen peer can address.
