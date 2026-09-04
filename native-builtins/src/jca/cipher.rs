@@ -2714,11 +2714,13 @@ fn pbe_parameter_spec_params(
 /// eight salt bytes as the IV, and left the KEY as the raw password with no
 /// PBKDF2 derivation at all. The AES path then refused the eight-byte "IV":
 ///
-///     Cipher.getInstance("PBEWithHmacSHA256AndAES_256")
-///           .init(ENCRYPT_MODE, pbeKey, new PBEParameterSpec(salt, iters, iv))
-///       CratonVM -> InvalidAlgorithmParameterException:
-///                   Wrong IV length: must be 16 bytes long
-///       HotSpot  -> encrypts
+/// ```text
+/// Cipher.getInstance("PBEWithHmacSHA256AndAES_256")
+///       .init(ENCRYPT_MODE, pbeKey, new PBEParameterSpec(salt, iters, iv))
+///   CratonVM -> InvalidAlgorithmParameterException:
+///               Wrong IV length: must be 16 bytes long
+///   HotSpot  -> encrypts
+/// ```
 ///
 /// measured 2026-09-02 by `apps/probes/JcaCipherVectors`, whose PBES2 CONTROL
 /// row this was — the eight delegated PRFs beside it all matched HotSpot byte

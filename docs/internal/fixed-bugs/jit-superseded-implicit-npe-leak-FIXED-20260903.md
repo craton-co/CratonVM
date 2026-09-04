@@ -34,6 +34,30 @@ and recorded at
 This page's own warning is what caught it: **run this test alone.** A full-file
 run was green on the broken binary, exactly as it was for the defect above.
 
+**REGRESSED 2026-09-04, and the cause is named.** `069e67b43` turned the
+box/unbox intrinsic default-ON, and this vector is a boxing lambda
+(`Function<String, Integer>`, so every `apply` is an `Integer.intValue()`).
+With the intrinsic on, the vector's NPE escapes to `main` uncaught — the exact
+symptom below. One run settles it, no build required:
+
+```text
+$ cratonvm -cp build RJitLambdaNpeSupersede
+Exception in thread "main" java/lang/NullPointerException: ... "<local0>" is null
+
+$ CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1 cratonvm -cp build RJitLambdaNpeSupersede
+PASS RJitLambdaNpeSupersede (3 checks)
+```
+
+So the intrinsic's lowering does not honour the `take_jit_pending_exception`
+discipline the fix below established: it is a second producer of the implicit
+trap signals, and it was not taught to drop them.
+
+Bisected by build, five arms: PASS at `ec96716a8` (the full suite was 90/90),
+FAIL at `ded395383`, `b111a3514`, `842e6d0f9` and `04a5d4d02`. `ded395383` is
+dev's own line with no feature branch merged into it, which is what rules out
+everything landed beside it. The window is the fourteen commits
+`ec96716a8..ded395383`, and `069e67b43` is the one the kill switch names.
+
 ## The symptom
 
 `org.h2`-scale workloads were not needed. The reduced shape is 25 lines:
