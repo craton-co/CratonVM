@@ -88,6 +88,69 @@ pub fn note_vacated(lo: usize, hi: usize) {
     RECORDED.fetch_add(1, Ordering::AcqRel);
 }
 
+// ---------------------------------------------------------------------------
+// DECOMMITTED spans -- the ones that actually fault.
+// ---------------------------------------------------------------------------
+//
+// A VACATED span is zeroed but still MAPPED, so reading it does not fault: it
+// yields zeros, and the reader walks an all-zero header. A page-ALIGNED SIGSEGV
+// needs memory that is not mapped at all, which on this arena means a span the
+// collector DECOMMITTED (`VirtualFree(MEM_DECOMMIT)` / `madvise`).
+//
+// The first witness recorded only vacated spans and reported MISS on 4 of 4
+// crashes with `spans_recorded=7`. That was the instrument's answer to the
+// wrong question: it asked "was this memory relocated out of" when the fault
+// requires "was this memory handed back to the OS".
+
+static DLO: [AtomicUsize; CAP] = [ZERO; CAP];
+static DHI: [AtomicUsize; CAP] = [ZERO; CAP];
+static DCYCLE: [AtomicUsize; CAP] = [ZERO; CAP];
+static DNEXT: AtomicUsize = AtomicUsize::new(0);
+static DRECORDED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many decommitted spans have ever been recorded. The denominator for
+/// [`lookup_decommitted`].
+pub fn decommitted_recorded() -> usize {
+    DRECORDED.load(Ordering::Acquire)
+}
+
+/// Record that `[lo, hi)` was DECOMMITTED -- returned to the OS, so a read of
+/// it faults rather than yielding zeros.
+pub fn note_decommitted(lo: usize, hi: usize) {
+    if hi <= lo {
+        return;
+    }
+    let slot = DNEXT.fetch_add(1, Ordering::AcqRel) % CAP;
+    // HI before LO, for the same false-negative-not-false-positive reason as
+    // `note_vacated`.
+    DHI[slot].store(hi, Ordering::Release);
+    DLO[slot].store(lo, Ordering::Release);
+    DCYCLE[slot].store(CYCLE.load(Ordering::Acquire), Ordering::Release);
+    DRECORDED.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Was `addr` inside a span the collector decommitted? Signal-safe.
+pub fn lookup_decommitted(addr: usize) -> Option<(usize, usize, usize)> {
+    if addr == 0 {
+        return None;
+    }
+    let mut best: Option<(usize, usize, usize)> = None;
+    for i in 0..CAP {
+        let lo = DLO[i].load(Ordering::Acquire);
+        if lo == 0 {
+            continue;
+        }
+        let hi = DHI[i].load(Ordering::Acquire);
+        if addr >= lo && addr < hi {
+            let c = DCYCLE[i].load(Ordering::Acquire);
+            if best.is_none_or(|(_, _, bc)| c > bc) {
+                best = Some((lo, hi, c));
+            }
+        }
+    }
+    best
+}
+
 /// Was `addr` inside a span some recent cycle vacated?
 ///
 /// Returns `(span_lo, span_hi, cycle)`. Signal-safe: atomic loads only.

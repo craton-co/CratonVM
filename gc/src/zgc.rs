@@ -5058,6 +5058,14 @@ impl ZgcRealHeap {
                 // high region, strictly above `from`, and `to + size <= dest <=
                 // high_hi`. The regions may overlap — `copy` is memmove, which
                 // is correct in this direction.
+                // WITNESS the high-region move. `compact_low_to` records the span it
+                // vacates as one range; THIS end moves objects individually, so the
+                // vacated memory is each one's source extent. Omitting it left the
+                // witness blind to exactly the population this workload's failing
+                // allocation belongs to -- a 524304-byte reference array is a large
+                // object and lives at this end -- which is why its first run reported
+                // a MISS that meant nothing.
+                crate::reloc_witness::note_vacated(from, from + size);
                 unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                 pairs.push((from, to));
                 moved += 1;
@@ -5149,6 +5157,10 @@ impl ZgcRealHeap {
     }
 
     fn relocate_stw(&self, live: &[usize]) -> (usize, usize, cratonvm_types::PointerMap) {
+        // Number the cycle so a witness hit says WHICH one vacated the span, and
+        // so a hit attributed to a long-past cycle is recognisable as a stale
+        // ring slot rather than as evidence.
+        crate::reloc_witness::begin_cycle();
         // DO NOT RELOCATE WHILE A JIT FRAME IS LIVE.
         //
         // `gc_quiescence::is_active()` means some thread is inside a compiled

@@ -1194,6 +1194,27 @@ mod windows_fault {
                     );
                 }
             }
+            // THE ONE THAT FAULTS. A vacated span is zeroed but still MAPPED,
+            // so reading it yields zeros; only a DECOMMITTED span is gone from
+            // the address space, and only that produces a hardware fault.
+            let drec = cratonvm_gc::reloc_witness::decommitted_recorded();
+            match cratonvm_gc::reloc_witness::lookup_decommitted(data_addr) {
+                Some((lo, hi, c)) => {
+                    let _ = writeln!(
+                        report,
+                        "#  DECOMMIT WITNESS: this address is INSIDE a span the collector                          DECOMMITTED.
+                         #    span=[0x{lo:016X}, 0x{hi:016X}) decommitted_by_cycle={c}                          offset_into_span=0x{:X}
+                         #    The memory was returned to the OS, so this is a read through a                          reference the collector invalidated -- not a wild pointer.",
+                        data_addr.wrapping_sub(lo),
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        report,
+                        "#  DECOMMIT WITNESS: address NOT in any recorded decommitted span                          (decommitted_recorded={drec}). A zero denominator means the witness                          never ran.",
+                    );
+                }
+            }
         }
         let _ = writeln!(report, "#  pid={} tid={}", pid, super::get_tid());
         let _ = writeln!(report, "#  thread: \"{}\"", tname);

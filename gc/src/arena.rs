@@ -1413,6 +1413,18 @@ impl Arena {
         if hi <= lo {
             return 0;
         }
+        // WITNESS the decommit, in ABSOLUTE addresses. This -- not the vacate --
+        // is the memory whose read FAULTS: a vacated span is zeroed but still
+        // mapped and yields zeros, while a decommitted one is gone from the
+        // address space. A page-ALIGNED SIGSEGV needs the latter.
+        // See `crate::reloc_witness`.
+        {
+            let base = self.data.as_ptr() as usize;
+            crate::reloc_witness::note_decommitted(
+                base.wrapping_add(lo),
+                base.wrapping_add(hi),
+            );
+        }
         self.data.decommit_range(lo, hi - lo)
     }
 
