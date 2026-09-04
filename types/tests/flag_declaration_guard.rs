@@ -82,6 +82,10 @@ const SKIPPED_DIRS: &[&str] = &["target", ".git", "apps", "node_modules"];
 /// that call site — "it was easier" is not a reason.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "CRATONVM_REGEN_DEAD_CITATION_BASELINE",
+        "kind 3: a TEST HARNESS switch, read by `types/tests/doc_citation_paths.rs`          to rewrite its own checked-in baseline instead of asserting against it.          It never reaches a running VM, so there is no `VmFlags` snapshot to          serve it and no `CRATONVM_<GROUP>=token` spelling that would mean          anything; declaring it would put a name in the operator-facing          inventory that an operator can never usefully set.",
+    ),
+    (
         "CRATONVM_",
         "kind 1: the bare prefix, never a variable. Two test helpers named \
          `with_env` (`vm/src/config.rs`, `libcratonvm/src/lib.rs`) \
