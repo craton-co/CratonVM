@@ -1845,6 +1845,66 @@ a sentinel in RBX and in no frame word, jumps to the stub as a guard does, runs
 it, and asserts the reconstructed local is that sentinel. That is a stronger
 proof than a workload would have been, and it is currently the only one.
 
+#### How much of a real workload the optimizing tier reaches: the census
+
+**This is the prerequisite question, and it had never been asked.** Every
+measurement in this section — the 2.38x inversion, the four zeros, the five
+zeros, the register image — concerns the body the optimizing tier emits. None of
+them asked how often it emits one.
+
+`CRATONVM_DBG_IR_COMPILES=1` already answers it: the pipeline has four stages
+that can decline a method (`ir_compatible`, the admission conjunction,
+`IrBuilder::build`, `ir_lower`), and each reports which one it was. Run over
+CratonBench, one phase per process, with `CRATONVM_JIT=force-c2`:
+
+| phase | offered to the gate | admitted | reached lowering | why refused |
+|---|---|---|---|---|
+| arithmetic | **0** | 0 | 0 | never offered at all |
+| hashmap | **0** | 0 | 0 | never offered at all |
+| sieve | 2 | **0** | 0 | a bulk byte-array zero fill (`REP STOSB`) |
+| matrix | 1 | **0** | 0 | one `multianewarray` in the method |
+| fib | 1 | 1 | 1 | — |
+| bintrees | 4 | 4 | 4 | — |
+| stringregex | 91 | 65 | 52 | 22 `invokedynamic`, 12 String pin, 4 over the invoke cap, 1 precise frames |
+
+**On four of the seven kernels the optimizing tier lowers nothing at all**, and
+they are the loop-dominated four. That is the explanation for every zero this
+section records against a real workload, and it is a better explanation than any
+of the per-optimization ones: an A/B of an IR-tier switch on `sieve`, `matrix`,
+`arithmetic` or `hashmap` compares a binary against itself.
+
+Three distinct causes, and they want different answers:
+
+* **Never offered.** `arithmetic` and `hashmap` produce no `[ir]` line whatever
+  — the admission gate is not consulted once. Their hot code enters through OSR,
+  and `compile_osr_artifact` "reaches `x64::compile_with_param_slots` directly":
+  **the OSR door has never gone through the optimizing tier.** No flag changes
+  that.
+* **One instruction disqualifies the whole method.** `matmul` allocates its
+  result with a single `multianewarray` at the top and its hot triple loop is
+  refused along with it; `sieve` zero-fills a byte array once and pays the same.
+  Both refusals are of the form "the single-pass backend has an intrinsic here
+  and the IR tier has none", which is a fair trade when the intrinsic is hot and
+  the wrong one when it runs once per call against a loop that runs millions of
+  times. `CRATONVM_JIT_IR_OVER_INTRINSIC=1` already makes exactly this trade for
+  CALL-SITE intrinsics; neither of these two is covered by it.
+* **Attrition through the funnel.** Where the tier does work, it still loses most
+  of what it takes: `stringregex` goes 91 → 65 → 52 → **17 bodies**, and the
+  largest single loss at the builder is `new-site DEFERRED` — a class not yet
+  loaded when the compile ran, which `take_deferred_new_retry` grants exactly one
+  retry for.
+
+**What this changes about the work in this section.** The tier-inversion
+programme has been optimising a body that, on the kernels used to motivate it,
+is never emitted. Before another switch is added to `ir_lower`, the reach
+number is the one to move — and of the three causes, the OSR door is the largest
+and the only one no flag can reach.
+
+**Method note.** Read `[ir] admission` counts before believing a per-phase A/B,
+and do not read `compiles: c2=N` as "N optimizing-tier compiles": on `sieve` it
+says `c2=3` while the IR backend lowered nothing, because that counter is fed by
+the tier manager's nomination and not by the backend that ran.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
