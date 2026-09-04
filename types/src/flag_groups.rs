@@ -1240,13 +1240,6 @@ pub const INVENTORY: &[E] = &[
     // from the one above on purpose: one switch covering both emitters could not
     // separate "the plan is wrong" from "this emitter is wrong".
     E { group: Group::JIT, token: "ir-ref-store", on_key: Some("CRATONVM_JIT_IR_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
-    // Opt-IN: copy a loop-live int/long PARAMETER into a callee-saved register
-    // at entry, which the optimizing tier otherwise cannot do (entry params are
-    // pinned to caller-saved ABI registers and the allocator skips a pinned
-    // value). Declared here by a passing change: it was read by
-    // `ir_param_prologue_copy_enabled` and declared nowhere, so it was served
-    // by a live getenv rather than the latched snapshot.
-    E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     // Diagnostic-only: the DYNAMIC split between the gated arm's inline path
     // and its helper fallback. The compile-time census counts emitted
     // sequences, which is not the same fact.
