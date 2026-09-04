@@ -136,16 +136,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
     ),
     (
-        "docs/known-issues/jdk-only/F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/http_url_connection.rs`, `native-builtins/src/net_phase_e.rs` — this lane's files); NOMINATED (t",
-    ),
-    (
         "docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/lang_invoke.rs`,",
-    ),
-    (
-        "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
     ),
     (
         "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
