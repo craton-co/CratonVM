@@ -203,7 +203,7 @@ impl DeviceContext {
     /// rest of the crate so sibling test modules can drive
     /// `from_host_async` / `launch_on_stream` / `to_host_async` against
     /// the stub op log without depending on a real `probe()`.
-    #[cfg(all(test, not(feature = "cuda")))]
+    #[cfg(all(test, not(feature = "gpu-driver")))]
     pub(crate) fn for_test() -> Self {
         // Stub `DeviceContextInner` is a unit struct — costs nothing
         // to construct.
@@ -382,12 +382,12 @@ impl DeviceModule {
         kernel: &str,
         n: u32,
     ) -> LaunchConfig {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu-driver")]
         let block = self
             .0
             .optimal_block_size(&ctx.0, kernel)
             .unwrap_or(DEFAULT_ELEMENTWISE_BLOCK);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu-driver"))]
         let block = {
             // Stub mode: no driver to query, so the autotune degenerates
             // to the default block size. `ctx` / `kernel` are unused here
@@ -401,7 +401,7 @@ impl DeviceModule {
     /// Stub-only test constructor — see [`DeviceContext::for_test`].
     /// Builds a synthetic `DeviceModule` whose `launch_on_stream` only
     /// records OpLog ops (no driver call).
-    #[cfg(all(test, not(feature = "cuda")))]
+    #[cfg(all(test, not(feature = "gpu-driver")))]
     pub(crate) fn for_test() -> Self {
         Self(backend::DeviceModuleInner)
     }
@@ -469,7 +469,7 @@ impl KernelArgs {
         // subsequent `to_host_async` / re-launch calls wait on the
         // kernel rather than the upload.
         let last_write = buf.last_write.clone();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu-driver")]
         {
             let (addr, keep_alive) = buf.inner.device_ptr_arg();
             self.raw.push(KernelArg::DevicePtr {
@@ -478,7 +478,7 @@ impl KernelArgs {
                 last_write,
             });
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu-driver"))]
         {
             self.raw.push(KernelArg::DevicePtr {
                 addr: buf.inner.device_ptr_arg(),
@@ -527,7 +527,7 @@ impl KernelArgs {
 // `u64` since there is no real allocation to guard.
 #[derive(Clone)]
 pub(crate) enum KernelArg {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     DevicePtr {
         addr: u64,
         /// Keep-alive only; not read. See the variant comment above.
@@ -540,7 +540,7 @@ pub(crate) enum KernelArg {
         /// after the launch.
         last_write: LastWriteSlot,
     },
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     DevicePtr {
         // Never read in stub mode — the stub `launch_raw` returns
         // `NoDriver` without inspecting args. We still carry the field
@@ -846,7 +846,7 @@ impl<T> Drop for DeviceBuffer<T> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 impl<T: DeviceElem> DeviceBuffer<T> {
     // Reject zero-sized types: a `DeviceBuffer<T>` with `size_of::<T>()
     // == 0` would compute a zero-byte allocation and zero-length copies,
@@ -1178,7 +1178,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 impl<T: DeviceElem> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
@@ -1389,7 +1389,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 }
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 impl<T: DeviceElem> DeviceBuffer<T> {
     /// Stub-only test constructor: build a `DeviceBuffer<T>` without
     /// going through the driver. Mirrors the `for_test` constructors on
@@ -1413,19 +1413,45 @@ impl<T: DeviceElem> DeviceBuffer<T> {
 
 // ── Backend selection ────────────────────────────────────────────────
 
-/// The contract both backends satisfy. See `backend.rs` for what is on
-/// it, what is deliberately off it, and the drift it already caught.
+/// The contract every backend satisfies. See `backend_api.rs` for what
+/// is on it, what is deliberately off it, and the drift it already
+/// caught between the cudarc and stub backends.
 pub(crate) mod backend_api;
+
+// Two real backends and a stub. `cuda` selects cudarc; `cuda-oxide`
+// selects NVlabs' `cuda-core` (the host runtime cuda-oxide is built on);
+// neither selects the no-driver stub. Both real backends define the same
+// module surface, so exactly one may be compiled in.
+#[cfg(all(feature = "cuda", feature = "cuda-oxide"))]
+compile_error!(
+    "features `cuda` and `cuda-oxide` are mutually exclusive: both provide the `backend` module. Pick one driver backend."
+);
 
 #[cfg(feature = "cuda")]
 mod backend_cuda;
 #[cfg(feature = "cuda")]
 use backend_cuda as backend;
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "cuda-oxide")]
+mod backend_oxide;
+#[cfg(feature = "cuda-oxide")]
+use backend_oxide as backend;
+
+#[cfg(not(feature = "gpu-driver"))]
 mod backend_stub;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 use backend_stub as backend;
+
+// Raw CUDA driver handles (`CUevent`, `CUstream`, `CUdeviceptr`,
+// `CUgraph`, ...) under one name, whichever backend is compiled in.
+// These are the SAME driver types in both cases -- cudarc and
+// `cuda-bindings` each generate them from the vendor's `cuda.h` -- but
+// they are distinct Rust paths, so `stream.rs`, `event.rs` and
+// `graph.rs` name them through this alias rather than a vendor path.
+#[cfg(feature = "cuda")]
+pub(crate) use cudarc::driver::sys as drvsys;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) use backend_oxide::sys as drvsys;
 
 pub mod critical;
 pub mod event;
@@ -1440,7 +1466,7 @@ pub use bytemuck;
 pub use event::Event;
 pub use stream::{Stream, StreamOp};
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 mod stub_tests {
     //! Verification of Part A's no-driver contract.
     //!

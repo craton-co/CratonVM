@@ -7,13 +7,14 @@
 //!
 //! `lib.rs` selects a backend by module alias:
 //!
-//! ```ignore
-//! #[cfg(feature = "cuda")]     use backend_cuda as backend;
-//! #[cfg(not(feature = "cuda"))] use backend_stub as backend;
+//! ```text
+//! #[cfg(feature = "cuda")]        use backend_cuda  as backend;  // cudarc
+//! #[cfg(feature = "cuda-oxide")]  use backend_oxide as backend;  // cuda-core
+//! #[cfg(not(feature = "gpu-driver"))] use backend_stub as backend;
 //! ```
 //!
 //! That is a real seam, and until 2026-09-04 it was an entirely
-//! **unwritten** one. Both modules happened to provide
+//! **unwritten** one. The modules happened to provide
 //! `DeviceContextInner`, `DeviceModuleInner`, `DeviceBufferInner<T>`,
 //! `PinnedHostInner<T>`, `probe_device` and `driver_cuda_version`, and
 //! nothing anywhere required them to agree about it. Only one module
