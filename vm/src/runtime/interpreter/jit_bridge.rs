@@ -9303,6 +9303,57 @@ fn resolve_inline_site_from(
     {
         no!("native-shadow-on-selected-method");
     }
+    // ...and the same rule again, over the whole receiver-to-declaring chain.
+    //
+    // # Why the declaring class alone is not enough
+    //
+    // A native is registered on the class the RECEIVER actually has, and the
+    // method it shadows is very often DECLARED on a superclass. The two
+    // screens above ask about the constant-pool class and the declaring class,
+    // and a guarded virtual site has neither: it starts the selection walk at
+    // the runtime receiver, `find_method_recursive` returns the first concrete
+    // body it meets, and that body's declaring class is where the screen then
+    // looks — one or more classes ABOVE the one carrying the native.
+    //
+    // Measured 2026-09-04, `probes/TreeTailIterProbe.java` with
+    // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1`: a compiled
+    // `for (e : treeMap.tailMap(k).entrySet())` iterates ZERO entries while
+    // `entrySet().size()` on the same object answers 6. The single spliced
+    // site is `java/util/Iterator.hasNext()Z`, guarded on
+    // `java/util/TreeMap$EntryIterator` -- which has
+    // `native_al_itr_has_next` registered on it by the `VALUES_ITR_CARRIERS`
+    // loop. But `hasNext` is DECLARED on `java/util/TreeMap$PrivateEntryIterator`,
+    // which carries no native, so `declaring_class_name` above cleared the
+    // screen and the splice ran the real JDK body -- `return next != null` over
+    // a `next` field a natively-managed iterator never populates. False, every
+    // time, from the first compiled call.
+    //
+    // Walking the chain is the precise form of the rule the two screens above
+    // state, because it asks the question DISPATCH asks: not "does the class
+    // that wrote this method have a native" but "does any class this receiver
+    // IS have one". Bounded by `declaring_id` -- past it the body is not the
+    // one being spliced -- and short in practice.
+    if let Some(receiver_id) = receiver_class_id {
+        let mut walk = Some(receiver_id);
+        while let Some(cid) = walk {
+            let Some(class) = store.get(cid) else { break };
+            if shared
+                .natives
+                .native_methods
+                .find(&*class.name, callee_method, callee_desc)
+                .is_some()
+            {
+                no!(format!(
+                    "native-shadow-on-receiver-chain (registered on {}, declared on {})",
+                    class.name, declaring_class_name
+                ));
+            }
+            if cid == declaring_id {
+                break;
+            }
+            walk = class.superclass;
+        }
+    }
     // The class the SPLICED BODY belongs to, which is what an invalidation
     // dependency must name. For a constant-pool resolution this stays the
     // declared name (unchanged behaviour); for a receiver resolution the

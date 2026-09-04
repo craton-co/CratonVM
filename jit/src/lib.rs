@@ -12597,42 +12597,40 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
-/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+/// # It was DEFAULT-OFF for two days, and the crash was not its fault
 ///
-/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
-/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
-/// always a page boundary -- the shape of a read through a reference into a
-/// page the collector has already vacated. Two switches each remove it, 3 runs
-/// of 1200 s clean apiece:
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` with this family on died of
+/// `SIGSEGV` at a fault address that was always a page boundary, `rdi` equal to
+/// it and the fault pc inside libc -- 11/11 when the page was written, and 3/3
+/// in 7 s once an unrelated wrong-answer defect stopped ending the run first.
+/// Two switches each removed it: `CRATONVM_ZGC_RELOCATE=0` and this family off.
+/// The page read that pair as "it takes BOTH relocation and this intrinsic",
+/// and concluded the inline sequence held a receiver across a relocation.
 ///
-/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
-/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+/// **It did not.** A third switch removes it too, and names the mechanism:
+/// `CRATONVM_GC_RESERVE=0`, 3/3 clean against a 3/3 positive control in the
+/// same batch. gdb puts the fault in `ZgcRealHeap::compact_high_region`'s
+/// `memmove`. The collector's relocation slides pick a destination inside FREE
+/// space and copy into it without going through `Arena::hand_out`, and
+/// `Arena::decommit_free_blocks` had already returned those granules to the OS
+/// -- so the first slide after a give-back wrote into `PROT_NONE`. Both slides
+/// now commit first (`Arena::commit_for_relocation`).
 ///
-/// A `git bisect` over the 200 commits between the last known-good tip and the
-/// crashing one (both endpoints re-verified in the SAME build profile, and only
-/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
-/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
-/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
-/// relocation files are byte-identical to one of them. So the defect is the
-/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+/// This family's part was to change the allocation shape enough to make the
+/// high slide run. That is why turning it off hid the crash, and why turning it
+/// off was never a fix. The three-way switch table is the lesson: a pair of
+/// switches that each remove a crash does not identify a mechanism, it
+/// identifies two ingredients -- and a third switch can turn out to be under
+/// both of them.
 ///
-/// The inline sequence pops the receiver off the simulated operand stack and
-/// then dereferences it three times -- the class-id guard at `[RAX]`, the
-/// GC-flags byte, and the payload load -- with no call and therefore no
-/// safepoint in between. That is sound only while the receiver in hand cannot
-/// go stale; under a moving collector it evidently can. Root-causing that is
-/// the follow-up, and it wants the receiver kept as a NAMED root across the
-/// sequence rather than held only in `RAX`.
-///
-/// Correctness first: the family is now opt-in, and the perf win it was
-/// measured for is recoverable the moment the sequence is made relocation-safe.
-/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
-///
+/// Default ON again since 2026-09-04, with the fix, measured at zero SIGSEGV
+/// over six runs of the workload that crashed 11/11.
 /// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
 /// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
-    // Test-only force, consulted BEFORE the cache. The family is opt-in since
-    // it was found to SIGSEGV under relocation, so the matcher's own tests --
+    // Test-only force, consulted BEFORE the cache. The family was opt-in for
+    // two days after it was found to SIGSEGV under relocation, so the matcher's
+    // own tests --
     // which assert the POSITIVE case and say outright that every negative
     // below it is vacuous without it -- cannot reach it through the
     // environment: `OnceLock` fixes the answer at the first read, whichever
@@ -12650,8 +12648,28 @@ fn box_unbox_intrinsic_disabled() -> bool {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
             return true;
         }
-        // Default OFF: enabled only when explicitly asked for.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
+        // DEFAULT ON AGAIN (2026-09-04). The mitigation this replaced existed
+        // for exactly one reason -- `known-issues/jit/
+        // bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`'s SIGSEGV
+        // -- and that crash was not this intrinsic's. It was
+        // `ZgcRealHeap`'s relocation slides writing into arena granules
+        // `Arena::decommit_free_blocks` had already returned to the OS; the
+        // slides now commit their destination first
+        // (`Arena::commit_for_relocation`). The intrinsic's part was to change
+        // the allocation shape enough to make the high slide run, which is why
+        // turning it off hid the crash and why turning it off was never a fix.
+        //
+        // Measured after that fix, on the workload that crashed 11/11 and then
+        // 3/3 in 7 s: `CRATONVM_JIT=box-unbox-intrinsic`, SIX runs (three to a
+        // 1200 s cap, three to 400 s), **zero SIGSEGV**. What those runs end on
+        // instead -- a `NullPointerException` at a later seed -- appears
+        // identically with the family OFF, and is the pre-existing failure
+        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+        // records.
+        //
+        // `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still
+        // means the same thing, so any script that sets it is unaffected.
+        false
     })
 }
 
@@ -12980,20 +12998,22 @@ mod atomic_accessor_intrinsic_tests {
         }
     }
 
-    /// The family is OPT-IN, and the production entry point is what enforces
-    /// it.
+    /// The family is DEFAULT-ON, and the production entry point is what
+    /// decides it.
     ///
     /// The matcher tests above deliberately call `box_unbox_intrinsic_shape`,
-    /// which has no gate — so without this, flipping the default back would
-    /// change nothing any test can see, and so would flipping it back by
-    /// accident. This is the one place the DEFAULT is asserted.
+    /// which has no gate — so without this, flipping the default would change
+    /// nothing any test can see, in either direction. This is the one place the
+    /// DEFAULT is asserted, and that is the point: a flip has to be deliberate.
     ///
-    /// It will need inverting when
-    /// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-    /// is closed and the family goes default-on again. That is the point: the
-    /// flip should have to be deliberate.
+    /// INVERTED 2026-09-04. It read "opt-in until the relocation defect is
+    /// closed" for two days. The defect was closed, and it was not this
+    /// family's: `ZgcRealHeap`'s relocation slides were writing into arena
+    /// granules `Arena::decommit_free_blocks` had returned to the OS. See
+    /// `box_unbox_intrinsic_disabled`, and
+    /// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
     #[test]
-    fn box_unbox_is_opt_in_until_the_relocation_defect_is_closed() {
+    fn box_unbox_is_default_on_and_the_off_switch_still_works() {
         const CID: u32 = 12345;
         assert!(
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
@@ -13004,13 +13024,13 @@ mod atomic_accessor_intrinsic_tests {
         // than the VM's latched configuration, which is the hazard
         // `flag_declaration_guard` exists to name — and reading it raw here is
         // what left `check-surface.sh` red on dev.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
-            // Someone is running the root-cause work with the family on.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            // Someone is running with the family deliberately off.
             return;
         }
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_none(),
-            "the BOX_UNBOX family must stay opt-in while it SIGSEGVs under a              relocating collector (11/11 on H2 TestRandomMapOps)"
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_some(),
+            "the BOX_UNBOX family is default-ON since the ZGC slide fix; a              refusal here means the default was flipped without inverting this test"
         );
     }
 

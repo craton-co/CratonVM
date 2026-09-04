@@ -1921,7 +1921,7 @@ cached_is_set!(no_door_recv_memo, "CRATONVM_JIT_NO_DOOR_RECV_MEMO");
 ///
 /// The line-level defect is NOT yet identified, which is why this is a default
 /// flip and not a repair. See
-/// `known-issues/h2/bug-testrandommapops-deterministic-1810-null-20260903.md`.
+/// `fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`.
 cached_is_set!(invoke_fast_door_opt_in, "CRATONVM_JIT_INVOKE_FAST_DOOR");
 
 /// `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` -- disable the monomorphic

@@ -5464,16 +5464,37 @@ impl ZgcRealHeap {
             // every object start is `base + 8k`, so rounding the difference is
             // what keeps the destination on the same grid — and, because it
             // rounds the move DOWN, keeps `to >= from` without a second check.
-            let to = if immovable {
+            let mut to = if immovable {
                 pinned += 1;
                 from
             } else {
                 from + ((dest - size - from) & !7)
             };
+            // COMMIT THE DESTINATION FIRST. It is free space, and free space is
+            // exactly what `Arena::decommit_free_blocks` hands back to the OS —
+            // on the promise that everything which re-issues it goes through
+            // `hand_out`. A slide does not: it picks `to` arithmetically and
+            // memmoves. So the first slide after a give-back wrote into a
+            // `PROT_NONE` granule and died inside `memcpy`, which is what
+            // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+            // recorded as "the fault address is always a page boundary, `rdi`
+            // equal to it, fault pc inside libc".
+            if to != from && !arena.commit_for_relocation(to - base, size) {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    addr = from,
+                    size,
+                    dest = to,
+                    "zgc relocate: the OS refused the HIGH slide's destination --                      leaving the survivor in place"
+                );
+                pinned += 1;
+                to = from;
+            }
             if to != from {
                 // SAFETY: `size` bytes are live at `from`; `to` is inside the
                 // high region, strictly above `from`, and `to + size <= dest <=
-                // high_hi`. The regions may overlap — `copy` is memmove, which
+                // high_hi`. The commit above proved `[to, to + size)` is mapped
+                // read-write. The regions may overlap — `copy` is memmove, which
                 // is correct in this direction.
                 unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                 pairs.push((from, to));
@@ -6181,16 +6202,32 @@ impl ZgcRealHeap {
                         }
                     }
                     match chosen {
-                        Some(to) => {
+                        Some(to) if arena.commit_for_relocation(to - base, size) => {
                             debug_assert!(to < from, "the slide must never move an object UP");
                             // SAFETY: `size` bytes are live at `from`, `to` is
-                            // inside the arena and strictly below `from`, and the
-                            // regions may overlap -- `copy` is memmove, correct in
-                            // that direction.
+                            // inside the arena and strictly below `from`, the
+                            // guard above proved `[to, to + size)` is mapped
+                            // read-write, and the regions may overlap -- `copy`
+                            // is memmove, correct in that direction.
                             unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                             pairs.push((from, to));
                             moved += 1;
                             dest = to + size;
+                        }
+                        // The destination is free space the give-back returned
+                        // to the OS and the OS would not take back. Same answer
+                        // as "nowhere below it": the object stays put. See
+                        // `Arena::commit_for_relocation` for why a slide has to
+                        // ask at all.
+                        Some(from_stay) => {
+                            tracing::warn!(
+                                target: "cratonvm::gc::guard",
+                                addr = from,
+                                size,
+                                dest = from_stay,
+                                "zgc relocate: the OS refused the LOW slide's destination --                                  leaving the survivor in place"
+                            );
+                            dest = from + size;
                         }
                         // Nowhere below it inside a selected page: it stays put,
                         // and the cursor continues above it so a later survivor
