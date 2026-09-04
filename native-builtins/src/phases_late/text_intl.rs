@@ -2519,6 +2519,64 @@ pub(crate) fn byte_pos_to_java_text_pos(text: &str, pos: usize) -> usize {
     units
 }
 
+/// A word character for word-break purposes, in ANY script.
+///
+/// This used to be `bytes[i].is_ascii_alphanumeric()` applied to the UTF-8
+/// bytes, which makes every non-ASCII letter a NON-word character. That is not
+/// simply "less accurate": it puts a word boundary at every ASCII/non-ASCII
+/// transition, so `"AΣ"` broke between the two letters while `"ΑΣ"` did not —
+/// the all-Greek string was right only because BOTH chars were misclassified
+/// the same way, and the bug showed up exactly where the classification changed.
+///
+/// Found through `G9-1`'s final-sigma rows. `ConditionalSpecialCasing`'s
+/// `isFinalCased` walks backwards from the sigma only while
+/// `!wordBoundary.isBoundary(i)`, so a spurious boundary meant it never reached
+/// the preceding cased letter and `"AΣ".toLowerCase(ROOT)` produced the medial
+/// `σ` instead of the final `ς`.
+fn bi_is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// UAX #29 `MidLetter` / `MidNumLetQ`: punctuation that does NOT break a word
+/// when it sits between two word characters (rules WB6 and WB7), so `"A'Σ"`
+/// and `"can't"` are each one word.
+///
+/// This is the documented subset of those classes, not the whole of UAX #29 —
+/// the full algorithm also has extend/format, regional-indicator, numeric and
+/// Katakana rules that this iterator has never implemented. What is claimed
+/// here is only that a letter is a letter in every script, and that these
+/// connectors join.
+fn bi_is_mid_word(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0027}' | '\u{002E}' | '\u{003A}' | '\u{00B7}' | '\u{0387}' | '\u{05F4}'
+            | '\u{2018}' | '\u{2019}' | '\u{2024}' | '\u{2027}' | '\u{FE13}'
+            | '\u{FE52}' | '\u{FE55}' | '\u{FF07}' | '\u{FF0E}' | '\u{FF1A}'
+    )
+}
+
+/// `text` as `(byte offset, char)` pairs, so the scans below can look at
+/// neighbours without decoding twice.
+fn bi_chars(text: &str) -> Vec<(usize, char)> {
+    text.char_indices().collect()
+}
+
+/// Whether index `k` counts as part of a word run, with WB6/WB7 applied: a
+/// connector is in-word only when a word character sits on BOTH sides.
+fn bi_in_word(chars: &[(usize, char)], k: usize) -> bool {
+    let c = chars[k].1;
+    if bi_is_word_char(c) {
+        return true;
+    }
+    if !bi_is_mid_word(c) {
+        return false;
+    }
+    k > 0
+        && k + 1 < chars.len()
+        && bi_is_word_char(chars[k - 1].1)
+        && bi_is_word_char(chars[k + 1].1)
+}
+
 /// Find the next break boundary after `pos` in `text` for the given iterator kind.
 pub(crate) fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
     let text_len = java_text_len(text);
@@ -2529,21 +2587,16 @@ pub(crate) fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
     let start = java_text_pos_to_byte(text, pos);
     match kind {
         BI_WORD => {
-            // Word boundary: transition between word chars and non-word chars
-            let at_word = start < bytes.len()
-                && (bytes[start].is_ascii_alphanumeric() || bytes[start] == b'_');
-            let mut i = start;
-            if at_word {
-                // Skip word chars to find end of word
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-            } else {
-                // Skip non-word chars to find start of next word
-                while i < bytes.len() && !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
+            // Word boundary: the transition between a word run and a non-word
+            // run, classified per CHARACTER (see `bi_is_word_char`) rather than
+            // per UTF-8 byte.
+            let chars = bi_chars(text);
+            let mut k = chars.partition_point(|(b, _)| *b < start);
+            let at_word = k < chars.len() && bi_in_word(&chars, k);
+            while k < chars.len() && bi_in_word(&chars, k) == at_word {
+                k += 1;
             }
+            let i = chars.get(k).map_or(bytes.len(), |(b, _)| *b);
             Some(byte_pos_to_java_text_pos(text, i))
         }
         BI_SENTENCE => {
@@ -2616,21 +2669,18 @@ pub(crate) fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
     let bytes = text.as_bytes();
     match kind {
         BI_WORD => {
-            let mut i = java_text_pos_to_byte(text, pos);
-            // Move back one step
-            if i > 0 {
-                i -= 1;
+            // The mirror of the `next` arm, same per-character classification.
+            let chars = bi_chars(text);
+            let byte_pos = java_text_pos_to_byte(text, pos);
+            let mut k = chars.partition_point(|(b, _)| *b < byte_pos);
+            if k > 0 {
+                k -= 1;
             }
-            let at_word = i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_');
-            if at_word {
-                while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
-                    i -= 1;
-                }
-            } else {
-                while i > 0 && !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
-                    i -= 1;
-                }
+            let at_word = k < chars.len() && bi_in_word(&chars, k);
+            while k > 0 && bi_in_word(&chars, k - 1) == at_word {
+                k -= 1;
             }
+            let i = chars.get(k).map_or(0, |(b, _)| *b);
             Some(byte_pos_to_java_text_pos(text, i))
         }
         BI_SENTENCE => {

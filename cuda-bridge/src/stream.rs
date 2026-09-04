@@ -39,7 +39,7 @@
 
 use crate::{DeviceContext, Result};
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Mutex,
@@ -88,16 +88,16 @@ pub enum StreamOp {
 
 /// Atomic id counter for stub streams. Real streams get their id from
 /// the same counter so id-equality semantics match across backends.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 static STREAM_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 pub(crate) struct StreamStub {
     ops: Mutex<Vec<StreamOp>>,
     id: u32,
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 impl StreamStub {
     fn new() -> Self {
         Self {
@@ -118,18 +118,18 @@ impl StreamStub {
 // local counter for dependency-graph cross-referencing; not the same
 // number CUDA itself uses internally.
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 pub(crate) struct StreamCuda {
     /// Owned cudarc stream. On drop cudarc synchronises this stream
     /// with the device's default stream (`wait_for` plus
     /// `cuStreamDestroy_v2`), so we don't have to add manual
     /// teardown here.
-    pub(crate) stream: std::sync::Arc<cudarc::driver::safe::CudaStream>,
+    pub(crate) stream: crate::backend::drv::StreamHandle,
     /// AUDIT 2026-05-29 (SOUND-1 / H10c): retained owning device so
     /// `Stream::synchronize` can `bind_to_thread` before driving the
     /// raw stream handle from a possibly-different thread. Required for
     /// the `unsafe impl Send + Sync` on `Stream` to be sound.
-    device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    device: crate::backend::drv::DeviceHandle,
     id: u32,
 }
 
@@ -160,16 +160,16 @@ pub(crate) struct StreamCuda {
 // thread should bind the device on that worker before issuing any
 // stream operation, or use the `bind_to_thread`-on-entry pattern
 // `EventCuda` already follows.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 // SAFETY: every stream-driving public method binds the retained device on the
 // current thread before using the raw handle.
 unsafe impl Send for Stream {}
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 // SAFETY: CUDA serializes stream operations; the retained device keeps the
 // context alive and each driving thread binds it before access.
 unsafe impl Sync for Stream {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 // ── Host callback trampoline (cuda mode) ────────────────────────────────
@@ -189,7 +189,7 @@ static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic:
 // symbol resolved at `cudarc::driver::sys::lib()`). `Stream::add_host_callback`
 // therefore calls the raw function table directly, exactly the way
 // cudarc's own `result::event::query` does internally for `cuEventQuery`.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) {
     // SAFETY: `user_data` was produced by `Stream::add_host_callback`
     // via `Box::into_raw` on a `Box<Box<dyn FnOnce() + Send>>`. The CUDA
@@ -223,14 +223,14 @@ unsafe extern "C" fn host_callback_trampoline(user_data: *mut std::ffi::c_void) 
 /// pipeline (async memcpy, kernel pipelining, event-based dependency
 /// tracking). It is intentionally `!Sync`-by-default — wrap in `Arc`
 /// to share across threads after construction.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 pub struct Stream {
     inner: StreamCuda,
     capturing: std::sync::atomic::AtomicBool,
     captured_slots: std::sync::Mutex<Vec<crate::LastWriteSlot>>,
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 pub struct Stream {
     inner: StreamStub,
     capturing: std::sync::atomic::AtomicBool,
@@ -318,7 +318,7 @@ impl Stream {
     /// reachable from real (`cuda`-feature) code paths in
     /// production. Tests can use the crate-internal `for_test()`
     /// constructor on the stub backend.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn new(ctx: &DeviceContext) -> Result<Self> {
         // `fork_default_stream` is cudarc 0.13's only public path to a
         // non-default `CudaStream`. It internally creates a
@@ -328,21 +328,11 @@ impl Stream {
         // stream at construction time — matching the documented
         // CUDA-runtime stream-fork semantics.
         let device = ctx.inner().device().clone();
-        let cuda_stream = device
-            .fork_default_stream()
-            .map_err(|e| crate::DeviceError::Driver(format!("fork_default_stream: {e:?}")))?;
+        let cuda_stream = crate::backend::drv::fork_default_stream(&device)?;
         let id = CUDA_STREAM_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             inner: StreamCuda {
-                // cudarc's `CudaStream` is not `Send`/`Sync`, but the
-                // wrapping `Stream` carries an explicit `unsafe impl
-                // Send + Sync` (the CUDA driver permits stream use from
-                // any thread once the primary context is bound — see
-                // the impls below `StreamCuda`). The `Arc` only ever
-                // travels inside that wrapper, so the lint's premise
-                // does not hold here.
-                #[allow(clippy::arc_with_non_send_sync)]
-                stream: std::sync::Arc::new(cuda_stream),
+                stream: cuda_stream,
                 device,
                 id,
             },
@@ -356,7 +346,7 @@ impl Stream {
     /// In stub mode the public constructor still consumes `ctx` for
     /// API parity with the real backend, but never reaches this code
     /// in practice because `DeviceContext::new` returns `NoDriver`.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn new(_ctx: &DeviceContext) -> Result<Self> {
         Ok(Self {
             inner: StreamStub::new(),
@@ -379,7 +369,7 @@ impl Stream {
     /// and returns `Ok(())` — there is no real driver to call. In
     /// `cuda` mode this forwards to `cuStreamSynchronize` via
     /// `cudarc::driver::result::stream::synchronize`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn synchronize(&self) -> Result<()> {
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
         // context to this thread before driving the raw stream handle.
@@ -389,7 +379,7 @@ impl Stream {
         self.inner
             .device
             .bind_to_thread()
-            .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         // cudarc 0.13's `CudaStream` does not expose a `synchronize`
         // method directly — the safe wrapper assumes drop-time
         // synchronisation only. We drop down to
@@ -398,16 +388,15 @@ impl Stream {
         // default stream.
         // SAFETY: the retained device was bound above and owns the live stream
         // for the duration of this synchronous wait.
-        unsafe { cudarc::driver::result::stream::synchronize(self.raw()) }
-            .map_err(|e| crate::DeviceError::Driver(format!("cuStreamSynchronize: {e:?}")))
+        unsafe { crate::backend::drv::stream_synchronize(self.raw()) }
     }
 
     /// Crate-internal accessor returning the raw cudarc stream handle.
     /// Used by `launch.rs` and `async_memcpy.rs` to submit launches
     /// and copies onto this stream via the `result::*` namespace.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn raw(&self) -> cudarc::driver::sys::CUstream {
-        self.inner.stream.stream
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn raw(&self) -> crate::drvsys::CUstream {
+        crate::backend::drv::stream_raw(&self.inner.stream)
     }
 
     /// Stub-mode counterpart: there is no real CUstream to expose, but
@@ -415,8 +404,8 @@ impl Stream {
     /// share a single import path. Returns the null pointer (cudarc's
     /// `result::stream::null()` equivalent), which the rest of the
     /// crate must NEVER actually pass to cudarc — stub-mode callers
-    /// gate on `cfg(feature = "cuda")` before touching streams.
-    #[cfg(not(feature = "cuda"))]
+    /// gate on `cfg(feature = "gpu-driver")` before touching streams.
+    #[cfg(not(feature = "gpu-driver"))]
     #[allow(dead_code)]
     pub(crate) fn raw(&self) -> *mut std::ffi::c_void {
         std::ptr::null_mut()
@@ -429,17 +418,17 @@ impl Stream {
     /// (AUDIT 2026-05-24 C32 stream-port fix).
     /// The device this stream belongs to, for the `bind_to_thread` prelude
     /// every raw-handle use in this crate shares.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn device_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaDevice> {
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn device_arc(&self) -> &crate::backend::drv::DeviceHandle {
         &self.inner.device
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn cuda_stream_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaStream> {
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn cuda_stream_arc(&self) -> &crate::backend::drv::StreamHandle {
         &self.inner.stream
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn synchronize(&self) -> Result<()> {
         self.record_op(StreamOp::Synchronize);
         Ok(())
@@ -452,12 +441,12 @@ impl Stream {
     /// and we have no log to expose, so this returns an empty
     /// `Vec` — callers that want to inspect submitted work should do
     /// so at the dependency-graph layer, not via the stream itself.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn ops(&self) -> Vec<StreamOp> {
         Vec::new()
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn ops(&self) -> Vec<StreamOp> {
         // Cloning the inner Vec — NOT draining — so repeated calls
         // observe the same history.
@@ -473,12 +462,12 @@ impl Stream {
     /// Crate-private: callers in the bridge (e.g. async memcpy and
     /// launch helpers added by sibling Phase 2 items) invoke this to
     /// keep the stub-mode log faithful to the work submitted.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub(crate) fn record_op(&self, _op: StreamOp) {
         // No-op: the driver owns the queue.
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub(crate) fn record_op(&self, op: StreamOp) {
         self.inner
             .ops
@@ -530,7 +519,7 @@ impl Stream {
     /// on the calling thread, before this call returns.
     ///
     /// [culaunchhostfunc]: https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g05841eaa5f90f27124241baafb3e856f
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn add_host_callback(&self, f: Box<dyn FnOnce() + Send>) -> Result<()> {
         // AUDIT (SOUND-1 / H10c pattern): bind the owning primary
         // context to this thread before driving the stream handle —
@@ -539,7 +528,7 @@ impl Stream {
         self.inner
             .device
             .bind_to_thread()
-            .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         // Double-box: see the `host_callback_trampoline` module note
         // above for why. `user_data` is handed to the driver as an
         // opaque `void*`; ownership transfers to the trampoline on
@@ -550,13 +539,13 @@ impl Stream {
         // SAFETY: the stream is live in the bound context; `user_data` is a
         // thin Box allocation transferred to the exactly-once trampoline.
         let result = unsafe {
-            cudarc::driver::sys::lib().cuLaunchHostFunc(
+            crate::backend::drv::launch_host_func(
                 self.raw(),
                 Some(host_callback_trampoline),
                 user_data,
             )
         };
-        match result.result() {
+        match result {
             Ok(()) => {
                 self.record_op(StreamOp::HostCallback);
                 Ok(())
@@ -571,9 +560,7 @@ impl Stream {
                 unsafe {
                     drop(Box::from_raw(user_data as *mut Box<dyn FnOnce() + Send>));
                 }
-                Err(crate::DeviceError::Driver(format!(
-                    "cuLaunchHostFunc: {e:?}"
-                )))
+                Err(e)
             }
         }
     }
@@ -584,7 +571,7 @@ impl Stream {
     /// before this call returns — this always succeeds. Also records
     /// [`StreamOp::HostCallback`] so op-log-driven tests can assert a
     /// callback was submitted at the right point in the sequence.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn add_host_callback(&self, f: Box<dyn FnOnce() + Send>) -> Result<()> {
         self.record_op(StreamOp::HostCallback);
         f();
@@ -594,7 +581,7 @@ impl Stream {
 
 // ── Test-only stub constructor ────────────────────────────────────────
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 impl Stream {
     /// Construct a stub-mode `Stream` without going through
     /// `DeviceContext::new` (which returns `NoDriver` in stub mode).
@@ -615,7 +602,7 @@ impl Stream {
 
 // ── Tests (stub mode only) ────────────────────────────────────────────
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 mod tests {
     use super::*;
 
