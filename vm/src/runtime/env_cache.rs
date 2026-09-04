@@ -2372,7 +2372,7 @@ pub fn jit_ir_call_virtual() -> bool {
 /// is spliced against a receiver whose `root` mirror it then reads as null.
 /// That is `org.h2.test.store.TestRandomMapOps` op:1033, which has been failing
 /// H2 in 11-22 s and blocking
-/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902`,
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`,
 /// whose SIGSEGV needs 25-183 s to appear.
 ///
 /// Turning the default off restores exactly the state the surrounding code is
