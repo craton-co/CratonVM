@@ -33,7 +33,7 @@ resolved with `dirname $(dirname $(command -v javap))`
 > record is named for.
 >
 > `probes/ProviderLookupProbe.java` was not in the checkout; it was recovered
-> from `6ddce7ecc` (at `docs/internal/fixed-suite-bugs/repros/…`) and its blob
+> from `6ddce7ecc` (under `fixed-suite-bugs/repros/` in the internal tree) and its blob
 > confirmed present in this repo's object store, so it is committed content, not
 > someone's uncommitted local edit.
 >
