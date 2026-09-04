@@ -15,7 +15,7 @@
 
 pub mod realms;
 pub(crate) mod vm_exec;
-mod vm_init;
+pub(crate) mod vm_init;
 mod vm_object;
 mod vm_util;
 

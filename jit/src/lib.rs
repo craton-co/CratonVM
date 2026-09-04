@@ -18139,6 +18139,13 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
 struct DeferredNewRetry {
     state: u8,
     sites: Vec<(u32, u16)>,
+    /// The method this memo belongs to, so a HELD retry can be re-offered.
+    ///
+    /// The map is keyed by a hash, which is enough to answer "does this method
+    /// have a retry" at the door the method itself walks through, and useless
+    /// for the opposite direction: after holding a retry, something has to go
+    /// looking for it once the class loads, and a hash names no method.
+    key: (std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>),
 }
 
 fn deferred_new_retries(
@@ -18199,12 +18206,20 @@ pub fn note_deferred_new_bail(
         set.entry(h).or_insert_with(|| DeferredNewRetry {
             state: 0,
             sites: deferred_sites.to_vec(),
+            key: (
+                std::sync::Arc::from(class_name),
+                std::sync::Arc::from(method_name),
+                std::sync::Arc::from(descriptor),
+            ),
         });
-        if armed && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-            eprintln!(
-                "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor} ({} unresolved new site(s))",
-                deferred_sites.len(),
-            );
+        if armed {
+            DEFERRED_NEW_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor} ({} unresolved new site(s))",
+                    deferred_sites.len(),
+                );
+            }
         }
     }
 }
@@ -18277,6 +18292,7 @@ pub fn take_deferred_new_retry(
         return false;
     }
     entry.state = 1;
+    DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!("[cratonvm-jitc] deferred-new SPENT {class_name}.{method_name}{descriptor}");
     }
@@ -18297,6 +18313,38 @@ pub fn deferred_new_retry_census() -> (u64, u64) {
         DEFERRED_NEW_HELD.load(Relaxed),
         DEFERRED_NEW_SPENT.load(Relaxed),
     )
+}
+
+/// How many deferred-`new` retries are currently HELD, as one relaxed load.
+///
+/// The sweep that re-offers them runs on every class definition, so its fast
+/// path must not take the memo lock: during startup a lock per definition is a
+/// cost paid by every program, to answer "nothing to do" for almost all of them.
+static DEFERRED_NEW_ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of retries armed and not yet spent. Cheap enough for a hot path.
+pub fn held_deferred_new_count() -> u64 {
+    DEFERRED_NEW_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Every method whose deferred-`new` retry is still HELD, newest-first order
+/// unspecified.
+///
+/// The sweep that re-offers them runs on a class definition, not on the
+/// method's own next compile: a method that bailed on an unloaded class has no
+/// reason to be compiled again, so waiting for it to come back is waiting for
+/// something that does not happen.
+pub fn held_deferred_new_methods() -> Vec<(
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+)> {
+    deferred_new_retries()
+        .read()
+        .values()
+        .filter(|e| e.state == 0)
+        .map(|e| e.key.clone())
+        .collect()
 }
 
 /// Number of methods currently OWED a deferred-`new` retry. Diagnostics.
@@ -39756,6 +39804,16 @@ mod devirt_intrinsic_yield_tests {
 mod deferred_new_retry_gate_tests {
     use super::{note_deferred_new_bail, take_deferred_new_retry};
 
+    /// The memo map and its held-count are process-global, so these tests
+    /// cannot run concurrently with each other: `cargo test` runs them on
+    /// separate threads, and a count asserted as `before + 1` is only stable
+    /// if nothing else is arming or spending at the same time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The retry exists for a TRANSIENT condition, so it must not be spent
     /// while that condition still holds. Before this gate the grant was blind:
     /// it flipped the one-shot memo on the next attempt regardless, the attempt
@@ -39764,6 +39822,7 @@ mod deferred_new_retry_gate_tests {
     /// lost 5 of 6 retries and cost 30 ms of background compile per run.
     #[test]
     fn an_unresolved_site_holds_the_retry_instead_of_spending_it() {
+        let _serial = serial();
         let (c, m, d) = ("T$Hold", "run", "()V");
         note_deferred_new_bail(c, m, d, &[(7, 11)]);
         let never = |_: u32, _: u16| false;
@@ -39783,6 +39842,7 @@ mod deferred_new_retry_gate_tests {
     /// One-shot is one-shot: a granted retry is not re-grantable.
     #[test]
     fn a_spent_retry_is_not_granted_twice() {
+        let _serial = serial();
         let (c, m, d) = ("T$Once", "run", "()V");
         note_deferred_new_bail(c, m, d, &[(1, 2)]);
         let now = |_: u32, _: u16| true;
@@ -39795,6 +39855,7 @@ mod deferred_new_retry_gate_tests {
     /// is still unresolved is a retry spent on the same bail.
     #[test]
     fn one_unresolved_site_among_several_still_holds() {
+        let _serial = serial();
         let (c, m, d) = ("T$Partial", "run", "()V");
         note_deferred_new_bail(c, m, d, &[(1, 2), (1, 3)]);
         let only_first = |_h: u32, cp: u16| cp == 2;
@@ -39805,6 +39866,7 @@ mod deferred_new_retry_gate_tests {
     /// the historical behaviour, not a silent refusal.
     #[test]
     fn a_memo_without_sites_grants_as_before() {
+        let _serial = serial();
         let (c, m, d) = ("T$Unknown", "run", "()V");
         note_deferred_new_bail(c, m, d, &[]);
         let never = |_: u32, _: u16| false;
@@ -39814,7 +39876,42 @@ mod deferred_new_retry_gate_tests {
     /// An un-armed method has no retry to take.
     #[test]
     fn a_method_that_never_bailed_has_no_retry() {
+        let _serial = serial();
         let now = |_: u32, _: u16| true;
         assert!(!take_deferred_new_retry("T$Never", "run", "()V", &now));
+    }
+
+    /// A held retry has to be FINDABLE, or holding it is the same outcome as
+    /// spending it: the method already has a body, so nothing compiles it
+    /// again and no door it walks through will ever ask about it. The memo map
+    /// is keyed by a hash, which cannot name a method — hence the stored key.
+    #[test]
+    fn a_held_retry_can_be_found_again_by_method_name() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Findable", "run", "()V");
+        super::note_deferred_new_bail(c, m, d, &[(3, 4)]);
+        let never = |_: u32, _: u16| false;
+        assert!(!take_deferred_new_retry(c, m, d, &never));
+        let held = super::held_deferred_new_methods();
+        assert!(
+            held.iter()
+                .any(|(hc, hm, hd)| &**hc == c && &**hm == m && &**hd == d),
+            "a held retry must appear in the set the class-definition sweep reads",
+        );
+    }
+
+    /// The sweep's fast path is this counter, so it has to actually track the
+    /// arm/spend pair — a counter stuck at zero silently disables the sweep,
+    /// and one that never decrements makes every class definition do work.
+    #[test]
+    fn the_held_count_tracks_arming_and_spending() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Counted", "run", "()V");
+        let before = super::held_deferred_new_count();
+        super::note_deferred_new_bail(c, m, d, &[(5, 6)]);
+        assert_eq!(super::held_deferred_new_count(), before + 1);
+        let now = |_: u32, _: u16| true;
+        assert!(take_deferred_new_retry(c, m, d, &now));
+        assert_eq!(super::held_deferred_new_count(), before);
     }
 }
