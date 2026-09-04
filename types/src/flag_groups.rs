@@ -1068,7 +1068,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "md-update-direct-helper", on_key: Some("CRATONVM_JIT_MD_UPDATE_DIRECT_HELPER"), off_key: None, off_word: Some("0"), since: "2026-08-28" },
     E { group: Group::JIT, token: "cached-entry-owner-reuse", on_key: Some("CRATONVM_JIT_CACHED_ENTRY_OWNER_REUSE"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::JIT, token: "c2-first-call", on_key: Some("CRATONVM_JIT_C2_FIRST_CALL"), off_key: None, off_word: None, since: "2026-06-21" },
-    E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: None, since: "2026-07-06" },
+    E { group: Group::JIT, token: "c2-supersede", on_key: Some("CRATONVM_C2_SUPERSEDE"), off_key: None, off_word: Some("0"), since: "2026-07-06" },
     E { group: Group::JIT, token: "callee-oop-flush", on_key: None, off_key: Some("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"), off_word: None, since: "2026-06-21" },
     E { group: Group::JIT, token: "spill-slots-cap", on_key: Some("CRATONVM_JIT_SPILL_SLOTS_CAP"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-reserve-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_RESERVE_PATH"), off_word: None, since: "2026-09-02" },
@@ -1160,7 +1160,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-branchy", on_key: None, off_key: Some("CRATONVM_NO_IR_BRANCHY"), off_word: None, since: "2026-06-18" },
     E { group: Group::JIT, token: "ir-call", on_key: Some("CRATONVM_JIT_IR_CALL"), off_key: None, off_word: None, since: "2026-06-20" },
     E { group: Group::JIT, token: "ir-call-special", on_key: Some("CRATONVM_JIT_IR_CALL_SPECIAL"), off_key: None, off_word: None, since: "2026-06-21" },
-    E { group: Group::JIT, token: "ir-call-virtual", on_key: Some("CRATONVM_JIT_IR_CALL_VIRTUAL"), off_key: None, off_word: None, since: "2026-06-21" },
+    E { group: Group::JIT, token: "ir-call-virtual", on_key: Some("CRATONVM_JIT_IR_CALL_VIRTUAL"), off_key: None, off_word: Some("0"), since: "2026-06-21" },
     E { group: Group::JIT, token: "ir-over-intrinsic", on_key: Some("CRATONVM_JIT_IR_OVER_INTRINSIC"), off_key: None, off_word: None, since: "2026-08-17" },
     // Default-ON, `"0"` turns it off: the optimizing tier's String access
     // expander (`length`/`isEmpty`/`charAt` lowered to IR nodes rather than
@@ -1863,7 +1863,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-parsweep", on_key: Some("CRATONVM_ZGC_PARSWEEP"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-bitmap-sweep", on_key: Some("CRATONVM_ZGC_BITMAP_SWEEP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-mark-root-filter", on_key: Some("CRATONVM_ZGC_MARK_ROOT_FILTER"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
-    E { group: Group::GC, token: "zgc-jit-tlab", on_key: Some("CRATONVM_ZGC_JIT_TLAB"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "zgc-jit-tlab", on_key: Some("CRATONVM_ZGC_JIT_TLAB"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-tlab-tail-sink", on_key: Some("CRATONVM_ZGC_TLAB_TAIL_SINK"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-mark-pool-persistent", on_key: Some("CRATONVM_ZGC_MARK_POOL_PERSISTENT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-reserve-heap", on_key: Some("CRATONVM_G1_RESERVE_HEAP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },

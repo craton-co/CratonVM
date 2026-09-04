@@ -657,7 +657,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_BLOCK_PRIVATE_NETS` | SECURITY | `CRATONVM_SECURITY=block-private-nets` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_BOOT_MODULE_REGISTRY` | LOADER | `CRATONVM_LOADER=boot-module-registry` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_BYTEBUFFER_INTRINSIC` | REAL | `CRATONVM_REAL=bytebuffer-intrinsic` | opt-in | off | behaviour | snapshot | native-builtins |
-| `CRATONVM_C2_SUPERSEDE` | JIT | `CRATONVM_JIT=c2-supersede` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_C2_SUPERSEDE` | JIT | `CRATONVM_JIT=c2-supersede` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_CANON_OPENFILE` | IO | `CRATONVM_IO=canon-openfile` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_CAPABILITY_GRANTS` | SECURITY | `CRATONVM_SECURITY=capability-grants` | opt-in | off | behaviour | snapshot | native-api, types |
 | `CRATONVM_CAPABILITY_LOG` | SECURITY | `CRATONVM_SECURITY=capability-log` | opt-in | off | behaviour | snapshot | native-api, types |
@@ -1330,7 +1330,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_INVOKE_FAST_DOOR` | JIT | `CRATONVM_JIT=invoke-fast-door` | both | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_CALL` | JIT | `CRATONVM_JIT=ir-call` | opt-in | off | behaviour | snapshot | difftest, vm |
 | `CRATONVM_JIT_IR_CALL_SPECIAL` | JIT | `CRATONVM_JIT=ir-call-special` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_JIT_IR_CALL_VIRTUAL` | JIT | `CRATONVM_JIT=ir-call-virtual` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_JIT_IR_CALL_VIRTUAL` | JIT | `CRATONVM_JIT=ir-call-virtual` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_COLD_ARG_STAGE` | JIT | `CRATONVM_JIT=ir-cold-arg-stage` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_CONST_IMM` | JIT | `CRATONVM_JIT=ir-const-imm` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_DEOPT_REGS` | JIT | `CRATONVM_JIT=ir-deopt-regs` | default-on | on | behaviour | snapshot | jit |
@@ -1773,7 +1773,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` | GC | `CRATONVM_GC=zgc-gen-nursery-percent` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_GEN_PROMOTION_AGE` | GC | `CRATONVM_GC=zgc-gen-promotion-age` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_HIGH_COMPACTION` | GC | `CRATONVM_GC=zgc-high-compaction` | default-on | on | behaviour | snapshot | gc |
-| `CRATONVM_ZGC_JIT_TLAB` | GC | `CRATONVM_GC=zgc-jit-tlab` | default-on | on | behaviour | snapshot | gc |
+| `CRATONVM_ZGC_JIT_TLAB` | GC | `CRATONVM_GC=zgc-jit-tlab` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_MARKBITS` | GC | `CRATONVM_GC=zgc-markbits` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_MARK_CTX_DIRECT` | GC | `CRATONVM_GC=zgc-mark-ctx-direct` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_MARK_POOL_PERSISTENT` | GC | `CRATONVM_GC=zgc-mark-pool-persistent` | default-on | on | behaviour | snapshot | gc |

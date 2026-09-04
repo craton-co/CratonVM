@@ -1190,6 +1190,32 @@ fall-throughs) **50 of 50 now name a reason**, where 6 did before:
 Read with `CRATONVM_JIT_METRICS=1 CRATONVM_JIT_METRICS_OUT=<path>`, one JSON
 object per compilation.
 
+#### And ranked by site: one refusal is three quarters of them
+
+`unsupported_shape` was 38 of 50 with the site living only in a debug line
+nothing aggregates — 38 identical rows saying "the builder refused", naming
+nothing to fix. The site now rides in the bailout's context, which turns that
+into a work list. On `org.h2.test.db.TestAlter`, 44 build refusals:
+
+| refusal | count | share |
+|---|---:|---:|
+| `ir.rs:7150` — an invoke pc with no `invoke_info` entry | 33 | **75%** |
+| opcode `0x53` (`aastore`) | 5 | 11% |
+| `ir.rs:6888` — `new` with no `new_info` (the deferred-class path) | 3 | 6% |
+| `ir.rs:7094` — `invokespecial`, neither lowering applies | 2 | 4% |
+| opcode `0x5c` (`dup2`) | 1 | 2% |
+
+Three quarters of everything the IR builder turns away on a real workload is a
+single line: `self.invoke_info.get(&pc)` answering `None`. Its neighbour at
+7094 documents why that concentrates so hard — "one non-emittable invoke
+elsewhere in the method discarded the whole map" — so a single unlowerable call
+site refuses **every** call site in the method, and with it the method. That is
+the next thing to fix in this tier, and it is one map rather than a list of
+opcodes.
+
+By contrast the missing opcodes (`aastore`, `dup2`) are 6 of 44 together: real,
+but not where the methods are going.
+
 #### What the census then said: a block-placement defect, not a sizing one
 
 The investigation started from the hypothesis that large methods fail on code
