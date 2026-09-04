@@ -24,9 +24,11 @@ By participating, you are expected to uphold this code.
    ```bash
    git config core.hooksPath .githooks
    ```
-   Currently one `pre-push` hook, running the ~1.8 s flag-surface guards. CI
-   already runs them, but branches here are merged into `dev` and pushed
-   directly, so CI reports a red surface rather than preventing one. See
+   Currently one `pre-push` hook, running the ~1.8 s flag-surface guards — both
+   a flag read but never declared, and one declared whose last reader was
+   deleted or renamed. CI already runs them, but branches here are merged into
+   `dev` and pushed directly, so CI reports a red surface rather than
+   preventing one. One `git config` covers every worktree of the clone. See
    [docs/contributing/flag-surface-hook.md](docs/contributing/flag-surface-hook.md).
 
 ## Development Workflow

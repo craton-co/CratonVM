@@ -12984,7 +12984,12 @@ mod atomic_accessor_intrinsic_tests {
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the shape must match, or this test cannot tell the gate from a              matcher that stopped matching"
         );
-        if std::env::var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
+        // Through the flag boundary, not `std::env` directly: a test that reads
+        // the environment raw is measuring the developer's ambient shell rather
+        // than the VM's latched configuration, which is the hazard
+        // `flag_declaration_guard` exists to name — and reading it raw here is
+        // what left `check-surface.sh` red on dev.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
             // Someone is running the root-cause work with the family on.
             return;
         }
