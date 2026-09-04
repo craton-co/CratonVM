@@ -136,20 +136,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
     ),
     (
-        "docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md",
-        "status block says: **Status: FIXED-UNVERIFIED.** **Prov: HotSpot column MEAS (this host); CratonVM",
-    ),
-    (
-        "docs/known-issues/jdk-only/E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/phases_late/ssl_security.rs`, this lane's file); NOMINATED (the rest).**",
-    ),
-    (
         "docs/known-issues/jdk-only/F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/http_url_connection.rs`, `native-builtins/src/net_phase_e.rs` — this lane's files); NOMINATED (t",
-    ),
-    (
-        "docs/known-issues/jdk-only/F18-1-four-session-doors-with-no-registration-and-the-twin-that-read-another-table-20260813.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs`, `native-builtins/src/phases_late/ssl_security.rs` — t",
     ),
     (
         "docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md",
@@ -222,10 +210,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md",
         "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-46-process-cluster.md",
-        "status block says: **Status:** SOURCE-ONLY. **No CratonVM binary was built or run.** Lane W7-46,",
     ),
     (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",

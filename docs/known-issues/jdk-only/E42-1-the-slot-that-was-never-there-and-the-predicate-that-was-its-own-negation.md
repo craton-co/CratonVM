@@ -11,6 +11,47 @@ and E12-1's residual 5.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03, and the BLOCKING co-requisite is
+> proven to be guarded — not merely present.** This record's status was
+> *"Nothing here was compiled. No `cargo`, no VM, no fixture."*
+>
+> ```text
+> cargo test -p cratonvm-native-builtins new13_tests      31 passed; 0 failed
+> ```
+>
+> **§0.1 is the interesting one.** It says `NEW13_SSL_SESS_FIELDS` goes 3 -> 4
+> and that `t27_tls::session_has_negotiated`'s `_ => true` arm *"must merge with
+> its `3 =>` arm in the same commit or the null session becomes valid again"* —
+> and that the co-requisite *"is enforced by a unit test rather than by a
+> comment"*. All three halves check out:
+>
+> ```text
+> NEW13_SSL_SESS_FIELDS = 4                    ssl_security.rs:1885
+> 3 | 4 => match ctx.get_field(this, 2) { … }  t27_tls.rs:19538   (merged)
+> new13_tests::the_widened_null_session_is_still_not_negotiated   1 passed
+> ```
+>
+> **And the guard was mutation-proven.** A test that passes is not yet a test
+> that guards. Un-merging the arm — `3 | 4` back to `3`, exactly the regression
+> the record warns about — turns it red:
+>
+> ```text
+> the_widened_null_session_is_still_not_negotiated ... FAILED
+>   panicked at native-builtins/src/phases_late/ssl_security.rs:9261
+> ```
+>
+> The mutation was reverted and the tree left byte-identical (`git diff` on
+> `t27_tls.rs` empty). So the record's own claim — that a regression here fails
+> a unit test *"rather than `RSslNullSession` silently reporting a valid null
+> session again"* — is demonstrated, in both directions.
+>
+> **What this does NOT verify.** The record's status is FIXED-UNVERIFIED for
+> **this lane's file only** and NOMINATED for the rest; nothing here adjudicates
+> a nomination. The HotSpot columns from `scratchpad/e42/` are the oracle and
+> were not re-measured — and that scratchpad did not survive its session, so
+> they cannot be. §0.2's "five `SSLSession` widths become three" is a source
+> claim about shapes and was not re-counted.
+
 ## 0. Verdict
 
 1. **The 3-field session now has an attribute slot, and the widening is purely
