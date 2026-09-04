@@ -3352,10 +3352,11 @@ pub static SP_REF_STORE_BAIL: [std::sync::atomic::AtomicU64; 3] = [
 pub const SP_REF_STORE_BAIL_NAMES: [&str; 3] = [
     "receiver-unproven",
     "satb-marking-armed",
-    // Retired the same day it was first measured: the arm emits BOTH store
-    // shapes and picks per object, so a legacy receiver is no longer a reason
-    // to leave it. The slot stays so the indices around it do not move.
-    "receiver-not-compact-RETIRED",
+    // Was "receiver-not-compact", retired the same day it was first measured
+    // when the arm grew both store shapes. Re-used 2026-09-04 for the layout
+    // epoch guard, which is the other way a baked compact offset stops being
+    // usable.
+    "layout-replaced",
 ];
 
 /// Executions of the two OTHER single-pass inline reference-store arms —

@@ -2772,6 +2772,34 @@ impl<'a> Lowerer<'a> {
         true
     }
 
+    /// Guard a baked COMPACT CELL OFFSET against a layout replacement, and
+    /// return the patch site the caller routes to its helper.
+    ///
+    /// The optimizing tier's twin of `x64::objects::emit_layout_epoch_guard`,
+    /// and it exists for the same reason: an emitter that bakes
+    /// `HEADER_SIZE + packed_body_offset` as an immediate is making a
+    /// compile-time claim about a layout the class manager can replace at run
+    /// time. The two ALLOCATION emitters have guarded that since
+    /// perf/halfgap-20260717 and call an unguarded baked layout "confirmed heap
+    /// corruption"; the field-access emitters had no guard at all.
+    ///
+    /// Four instructions against the process-wide replacement epoch, which only
+    /// a REPLACEMENT bumps — never a new class registration — so a workload
+    /// that never swaps a layout keeps every inline arm.
+    fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
+        let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
+        if addr.is_null() {
+            return None;
+        }
+        self.emit_mov_reg_imm64(R11, addr as u64);
+        // MOV ECX, dword [R11]
+        self.buf.emit(&[0x41, 0x8B, 0x0B]);
+        // CMP ECX, imm32
+        self.buf.emit(&[0x81, 0xF9]);
+        self.buf.emit(&(expected as i32).to_le_bytes());
+        Some(self.emit_jcc_rel32(0x85)) // JNE -> the caller's slow path
+    }
+
     /// Receiver alignment + containment in one of the three published
     /// `JIT_READ_BOUNDS` regions, with RAX holding the receiver. Failures push
     /// their patch offsets onto `slow`.
@@ -2941,6 +2969,10 @@ impl<'a> Lowerer<'a> {
         let mut bail_recv: Vec<usize> = Vec::new();
         let mut bail_pre: Vec<usize> = Vec::new();
         let mut bail_barrier: Vec<usize> = Vec::new();
+        // `cell_off` below is a compile-time claim about this class's compact
+        // layout; the receiver checks that follow are not the only way this arm
+        // must be able to decline.
+        bail_recv.extend(self.emit_layout_epoch_guard());
         if !trusted_oop_receiver {
             self.emit_receiver_align_and_containment(&mut bail_recv);
         }
@@ -3242,6 +3274,8 @@ impl<'a> Lowerer<'a> {
 
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
         let mut slow: Vec<usize> = Vec::new();
+        // `cell_off` is a compile-time claim about this class's compact layout.
+        slow.extend(self.emit_layout_epoch_guard());
 
         self.gp_load_value(RAX, base);
         // 2026-09-02: a receiver this block already proved (null-tested and,
@@ -13792,6 +13826,152 @@ mod tests {
         assert!(
             contains_seq(&with, &(COMPACT_REF_PUTFIELD_HELPER as u64).to_le_bytes()),
             "the gated arm must keep `jit_putfield_object` as its fallback"
+        );
+    }
+
+    /// The baked compact cell offset is guarded against a layout REPLACEMENT,
+    /// and the guard is proven to fire.
+    ///
+    /// Every emitter that bakes `HEADER_SIZE + packed_body_offset` claims at
+    /// compile time something the class manager can change at run time. The two
+    /// ALLOCATION emitters have guarded that since perf/halfgap-20260717, whose
+    /// comment calls an unguarded baked layout "confirmed heap corruption"; the
+    /// FIELD-ACCESS emitters had no guard at all until 2026-09-04, and the
+    /// compact TLAB default made their unguarded path the common one.
+    ///
+    /// Asserted by EXECUTION, not by inspecting bytes: the compiled body is run
+    /// against a receiver, then the process-wide replacement epoch is bumped by
+    /// actually replacing a layout, and the same body is run again. The first
+    /// run must store inline; the second must reach the helper. A guard that
+    /// compares against a counter nothing ever bumps would pass an
+    /// inspection-only test and protect nothing.
+    #[test]
+    fn a_replaced_layout_routes_the_gated_store_to_the_helper() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        static HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+            HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        static PRE_GATE: AtomicU64 = AtomicU64::new(0);
+        static POST_GATE: AtomicU64 = AtomicU64::new(1);
+        static READ_BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → slot
+        helpers.read_bounds_addr = READ_BOUNDS.as_ptr() as usize; // Cast: static address
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize; // Cast: static address
+        helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize; // Cast: static
+        helpers.ref_store_post_young_floor = 0;
+        helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (0u32, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let compiled = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("the gated reference store must compile");
+
+        // A young, compact receiver with one slot.
+        let mut obj = Box::new([0u64; 8]);
+        // SAFETY: `obj` is 64 bytes, 8-byte aligned; both writes land inside it.
+        unsafe {
+            let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+            *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+            std::ptr::write_unaligned(
+                p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
+                4u32,
+            );
+        }
+        let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+        let page = obj_addr & !0xFFF;
+        READ_BOUNDS[0].store(page, Ordering::Release);
+        READ_BOUNDS[1].store(page + 0x10000, Ordering::Release);
+        let val = Box::new([0u64; 8]);
+        let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+        HELPER_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: JIT-compiled code from valid bytecode in an executable mmap;
+        // the receiver is a live buffer shaped like an object header and the
+        // marker helper stores nothing.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            HELPER_CALLS.load(Ordering::SeqCst),
+            0,
+            "before any replacement the guard must pass and the store stay inline"
+        );
+        assert_eq!(
+            obj[cratonvm_types::HEADER_SIZE / 8] as usize, // Cast: stored pointer word
+            val_addr,
+            "the inline store must have written the compact cell"
+        );
+
+        // Now REPLACE a layout. Not by poking the counter -- by doing the thing
+        // that bumps it, so the test cannot pass against a guard wired to a
+        // number nothing in the VM ever moves.
+        let before = cratonvm_types::layout_replace_epoch();
+        // A REPLACEMENT is a second `register_class_layout` for a class_id that
+        // already has one; a first registration deliberately does not count.
+        let cid = 900_001u32;
+        let mk = |body: u32| {
+            std::sync::Arc::new(cratonvm_types::CompactLayout {
+                field_offsets: vec![0],
+                is_ref: vec![false],
+                field_kinds: vec![cratonvm_types::FieldStorageKind::Int],
+                ref_offsets: Vec::new(),
+                body_size: body,
+            })
+        };
+        let (l1, l2) = (mk(4), mk(8));
+        cratonvm_types::register_class_layout(cratonvm_types::FIRST_LAYOUT_DOMAIN, cid, l1);
+        cratonvm_types::register_class_layout(cratonvm_types::FIRST_LAYOUT_DOMAIN, cid, l2);
+        assert!(
+            cratonvm_types::layout_replace_epoch() > before,
+            "replacing a registered layout must bump the process-wide epoch, or \
+             the guard below is comparing against a constant"
+        );
+
+        obj[cratonvm_types::HEADER_SIZE / 8] = 0;
+        HELPER_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            HELPER_CALLS.load(Ordering::SeqCst),
+            1,
+            "a replaced layout must route the already-compiled site to the \
+             always-correct helper — its baked cell offset now describes a \
+             layout the object no longer has"
+        );
+        assert_eq!(
+            obj[cratonvm_types::HEADER_SIZE / 8],
+            0,
+            "and the inline store must not have run"
         );
     }
 
