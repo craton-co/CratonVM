@@ -2557,7 +2557,11 @@ mod deopt_stash_root_tests {
 /// `point` must point at a live `DeoptimizationPoint` (owned by the running
 /// `CompiledMethod`), and `rbp` must be the live frame base of the trapping
 /// method. Both are guaranteed by the trampoline that calls this.
-pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) -> i64 {
+pub extern "C" fn ir_deopt_entry(
+    point: *const DeoptimizationPoint,
+    rbp: u64,
+    regs: *const SavedRegisters,
+) -> i64 {
     // Checked, not assumed. The contract above says `point` is non-null, but a
     // deopt trampoline is the worst place in the VM to find out that a
     // contract was broken: dereferencing null here is UB inside a stub with a
@@ -2580,11 +2584,27 @@ pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) ->
     }
     // SAFETY: contract documented above; non-null checked immediately above.
     let point = unsafe { &*point };
-    // The IR lowerer keeps every live value in a frame slot, so no register
-    // file is needed; a register-allocating backend would spill GPRs/XMMs in
-    // the trampoline and pass them here instead.
-    let regs = SavedRegisters::default();
-    let frame = reconstruct_frame_from_machine_state(point, &regs, rbp);
+    // The register image, when this frame has one.
+    //
+    // It did not, until 2026-09-04: the comment here used to read "the IR
+    // lowerer keeps every live value in a frame slot, so no register file is
+    // needed", and that sentence was the reason a register-resident value in
+    // that backend could never lose its home word — a deopt frame had nothing
+    // but frame slots to name. `CRATONVM_JIT_IR_DEOPT_REGS=1` makes the stub
+    // reserve a `SavedRegisters` region and spill the file into it; NULL is
+    // still the answer with the flag off, and still means default zeros.
+    let saved;
+    let regs = if regs.is_null() {
+        saved = SavedRegisters::default();
+        &saved
+    } else {
+        // SAFETY: non-null here means the emitting stub reserved the region in
+        // its own live frame and spilled 16 GPRs and 16 XMMs into it, and this
+        // call happens before that frame's epilogue — the same lifetime
+        // argument `x64_deopt_entry`'s `regs` rests on.
+        unsafe { &*regs }
+    };
+    let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
     LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
     i64::MIN
 }
@@ -5908,7 +5928,10 @@ mod deopt_metadata_tests {
     #[test]
     fn ir_deopt_entry_survives_a_null_point() {
         let _ = take_last_deopt();
-        assert_eq!(ir_deopt_entry(std::ptr::null(), 0), i64::MIN);
+        assert_eq!(
+            ir_deopt_entry(std::ptr::null(), 0, std::ptr::null()),
+            i64::MIN
+        );
         let frame = take_last_deopt().expect("null point stashes the re-run sentinel");
         assert_eq!(frame.bci, u32::MAX);
         assert!(frame.method_key.is_empty());

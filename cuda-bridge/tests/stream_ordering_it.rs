@@ -77,7 +77,7 @@
 //! `concurrent_dispatch_it.rs`, which isolates the shape and is the
 //! regression test.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu-driver")]
 
 use cratonvm_cuda_bridge::{
     DeviceBuffer, DeviceContext, DeviceModule, KernelArgs, LaunchConfig, Stream,

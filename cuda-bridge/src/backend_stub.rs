@@ -8,7 +8,7 @@
 //! returns [`DeviceError::NoDriver`] so the rest of the workspace can
 //! still build, test, and run on commodity hardware.
 
-use crate::{DeviceCaps, DeviceError, Result};
+use crate::{DeviceCaps, DeviceError, KernelArgs, LaunchConfig, Result};
 use std::marker::PhantomData;
 
 pub(crate) fn probe_device(_device_ordinal: u32) -> Result<DeviceCaps> {
@@ -58,7 +58,7 @@ impl DeviceModuleInner {
         _ctx: &DeviceContextInner,
         _ptx: &str,
         _module_name: &str,
-        _kernel_names: &[&str],
+        _kernel_names: &[&'static str],
     ) -> Result<Self> {
         Ok(Self)
     }
@@ -126,5 +126,87 @@ impl<T: Copy + Default> PinnedHostInner<T> {
     /// DMA, so there is nothing to race with.
     pub(crate) unsafe fn as_mut_slice(&self) -> &mut [T] {
         std::slice::from_raw_parts_mut(self.buf.as_ptr() as *mut T, self.buf.len())
+    }
+}
+
+// ── Backend contract ─────────────────────────────────────────────────
+//
+// The stub answers the portable surface honestly: it has no device, so
+// every operation that would need one returns the same "no CUDA device"
+// error the rest of the crate already treats as "run on the CPU".
+// Implementing the trait rather than omitting the methods is the point
+// -- it is what makes the contract checkable instead of conventional.
+
+/// Marker for the no-device backend.
+pub(crate) struct StubBackend;
+
+impl crate::backend_api::BackendApi for StubBackend {
+    type Context = DeviceContextInner;
+    type Module = DeviceModuleInner;
+    /// No device, so nothing to order against.
+    type Stream = ();
+
+    fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
+        probe_device(device_ordinal)
+    }
+
+    fn driver_cuda_version() -> Result<u32> {
+        driver_cuda_version()
+    }
+}
+
+impl crate::backend_api::DeviceContextApi for DeviceContextInner {
+    fn new(device_ordinal: u32) -> Result<Self> {
+        Self::new(device_ordinal)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.synchronize()
+    }
+
+    fn bind_to_thread(&self) -> Result<()> {
+        // Nothing is current because nothing exists; succeeding here
+        // keeps the caller's control flow identical in both builds.
+        Ok(())
+    }
+
+    fn record_alloc_event(&self, event: &crate::Event) -> Result<()> {
+        self.record_alloc_event(event)
+    }
+}
+
+impl crate::backend_api::DeviceModuleApi for DeviceModuleInner {
+    type Ctx = DeviceContextInner;
+    type Stream = ();
+
+    fn from_ptx(
+        ctx: &Self::Ctx,
+        ptx: &str,
+        module_name: &str,
+        kernel_names: &[&'static str],
+    ) -> Result<Self> {
+        Self::from_ptx(ctx, ptx, module_name, kernel_names)
+    }
+
+    fn optimal_block_size(&self, _ctx: &Self::Ctx, _kernel: &str) -> Option<u32> {
+        // `None` is the documented "cannot answer" reply, and the caller
+        // falls back to a fixed block size. Not an error.
+        None
+    }
+
+    fn launch_raw_on_stream(
+        &self,
+        _ctx: &Self::Ctx,
+        _stream: &Self::Stream,
+        kernel: &str,
+        _cfg: &LaunchConfig,
+        _args: KernelArgs,
+    ) -> Result<()> {
+        let _ = kernel;
+        // `NoDriver` is the variant the rest of the crate already reads as
+        // "there is no device; run on the CPU". Inventing a new one here
+        // would make the stub's refusal look different from every other
+        // no-device refusal.
+        Err(DeviceError::NoDriver)
     }
 }
