@@ -3703,7 +3703,14 @@ fn band_slot_is_verifiable_with_map(
     live_hi: Option<i32>,
     map_slots: Option<&std::collections::HashSet<i32>>,
 ) -> bool {
-    if layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
+    // The half-line: on a frame whose callee-save area is DEEPEST (x86-64),
+    // everything at or beyond it is a register image or past the frame. A
+    // backend that puts that area next to the frame pointer instead says so,
+    // and gets the range exclusion below rather than this -- otherwise the
+    // half-line would swallow its whole spill area, which is precisely the
+    // region the oop maps describe.
+    if !layout.callee_saved_shallow && layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo
+    {
         return false;
     }
     if layout.is_register_image(off) {
@@ -6868,7 +6875,31 @@ fn verify_oop_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some() {
+            return true;
+        }
+        // ARMED AUTOMATICALLY FOR THE AARCH64 SAFEPOINT PATH.
+        //
+        // That backend's `fully_oop_covered` is computed from an argument, not
+        // from a run: no host in this repository executes aarch64, so its maps
+        // have never been checked against a live frame. This oracle is the
+        // check -- it walks each frame against its OWN method's maps and
+        // refutes a coverage claim it can disprove
+        // (`incomplete_reason::COVERAGE_ORACLE_REFUTED`) -- and a claim that
+        // has never been executed should not be trusted on its first run
+        // merely because nobody remembered an environment variable.
+        //
+        // It costs a read-only walk per precise frame, on a path that is itself
+        // opt-in and experimental. `CRATONVM_JIT_ARM64_SAFEPOINTS=0` (the
+        // default) leaves this exactly as it was: off.
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ARM64_SAFEPOINTS")
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
     })
 }
 
@@ -9740,6 +9771,61 @@ mod tests {
         );
     }
 
+
+    /// A SHALLOW callee-save area must not blind the verifier to the spill area.
+    ///
+    /// x86-64 puts the caller's saved registers at the DEEP end of the frame,
+    /// which is why `callee_saved_lo` can be read as a half-line: everything at
+    /// or beyond it is a register image or past the frame. AArch64's prologue
+    /// puts the saved FP/LR pair and the callee-saved GPRs immediately below the
+    /// frame pointer, with the spill area BELOW those -- so the same half-line
+    /// would exclude every spill word, which is exactly where that backend's
+    /// oop maps point. The verifier would then inspect nothing and report a
+    /// clean frame: a vacuous green, and the worst possible answer from a
+    /// completeness oracle.
+    ///
+    /// `callee_saved_shallow` selects the range exclusion instead. Both arms are
+    /// asserted on ONE layout so the difference is the flag and nothing else.
+    #[test]
+    fn a_shallow_callee_save_area_keeps_the_spill_region_verifiable() {
+        // Register images at [FP-8..FP-24); this frame's spill words deeper, at
+        // offsets 32 and 40.
+        let mut shallow = cratonvm_jit::FrameLayout {
+            callee_saved_lo: 8,
+            callee_saved_hi: 24,
+            spill_lo: 32,
+            spill_hi: 48,
+            ..Default::default()
+        };
+        shallow.callee_saved_shallow = true;
+
+        for off in [32, 40] {
+            assert!(
+                band_slot_is_verifiable(off, &shallow, None),
+                "spill word at {off} must stay verifiable on a shallow-save frame"
+            );
+        }
+        // ...and the register images are still excluded, by the RANGE.
+        for off in [8, 16] {
+            assert!(
+                !band_slot_is_verifiable(off, &shallow, None),
+                "the caller's saved registers at {off} are not this frame's words"
+            );
+        }
+
+        // The control: the same layout read with x86-64 geometry hides both
+        // spill words behind the half-line.
+        let deep = cratonvm_jit::FrameLayout {
+            callee_saved_shallow: false,
+            ..shallow
+        };
+        for off in [32, 40] {
+            assert!(
+                !band_slot_is_verifiable(off, &deep, None),
+                "the half-line is what would have swallowed the spill area"
+            );
+        }
+    }
     /// The scan must not divert on a frame full of primitives — otherwise
     /// moving-young could never engage at all and the fix would be a disguised
     /// default-off landing.

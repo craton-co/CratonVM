@@ -5763,6 +5763,56 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
     emit_machine_code_inner(result).map(|(code, _)| code)
 }
 
+/// This frame's storage-class partition, for the GC's band verifier.
+///
+/// Without it `CompiledMethod::frame_layout` stays all-zero, and a zero layout
+/// tells the verifier that NOTHING is a register image -- so the prologue's
+/// saved FP/LR pair and the caller's saved X19-X28 all count as in-band words
+/// of THIS frame. Those hold the CALLER's live references, which this frame's
+/// maps have no business naming, so the oracle would report them `never_mapped`
+/// and refute a coverage claim on pure noise. An oracle that cries wolf is
+/// worse than one that is off.
+///
+/// AArch64's geometry is the mirror of x86-64's: the saved FP/LR pair sits at
+/// `[FP-16]`, the callee-saved GPRs immediately below it, and the spill area
+/// BELOW those. `callee_saved_shallow` says so, so the verifier uses the range
+/// exclusion instead of x86-64's "everything at or beyond `callee_saved_lo`"
+/// half-line -- which here would have swallowed the entire spill area, the one
+/// region the oop maps actually describe.
+///
+/// Offsets are positive, meaning `[FP - off]`, matching the x64 convention the
+/// consumer expects.
+fn arm64_frame_layout(frame: &Arm64FrameLayout) -> crate::FrameLayout {
+    let mut out = crate::FrameLayout::default();
+    // Register images: the FP/LR pair at [FP-16]/[FP-8] plus the callee-saved
+    // GPR area right below it, one contiguous span from offset 8.
+    out.callee_saved_lo = 8;
+    out.callee_saved_hi = if frame.saved_regs.is_empty() {
+        // Just the FP/LR pair at [FP-16] and [FP-8].
+        24
+    } else {
+        // `callee_save_offset` is negative and already accounts for the FP/LR
+        // pair, so `-callee_save_offset` is the DEEPEST saved-register offset;
+        // `+8` makes the range half-open over it.
+        (-frame.callee_save_offset) + 8
+    };
+    out.callee_saved_shallow = true;
+    // The spill area: frame-homed locals, then operand slots, then the
+    // safepoint homes and the sp-id word. Every one of those is described by
+    // the dataflow or the operand marks, which is what lets the verifier treat
+    // a word the active map does not name as DEAD rather than missed.
+    if frame.num_spills > 0 {
+        let deepest = -frame.spill_offset; // slot 0 is the deepest word
+        let shallowest = -(frame.spill_offset + (frame.num_spills as i32 - 1) * 8);
+        out.spill_lo = shallowest;
+        out.spill_hi = deepest + 8;
+    }
+    // `java_locals_hi` is deliberately left 0: this backend has no
+    // `[FP - (i+1)*8]` local convention -- a local is either in a callee-saved
+    // register or in the spill area above.
+    out
+}
+
 /// Build the publishable artifact for an aarch64 compilation: encode it, and
 /// attach the oop maps the GC will read.
 ///
@@ -5798,6 +5848,11 @@ pub fn publish_compiled_method(result: &Arm64CompileResult) -> Option<crate::Com
     // The slot the maps above are keyed through. Without it the runtime's
     // `active_safepoint_id` returns `None` and no map can be selected by id.
     cm.sp_id_slot_off = result.sp_id_slot_off;
+    // The storage-class partition the band verifier needs to tell this frame's
+    // words from the caller's saved registers. Publishing a zero layout would
+    // make the oracle report the caller's live references as this frame's
+    // missed roots.
+    cm.frame_layout = arm64_frame_layout(&result.frame);
     // FULLY OOP COVERED -- the claim that lets the collector SUPPRESS its
     // conservative scan of these frames, so every term is a thing that had to
     // be built rather than assumed:
@@ -8984,6 +9039,98 @@ mod tests {
             !cm.fully_oop_covered,
             "and the method must not claim coverage it cannot prove"
         );
+    }
+
+    /// The published frame layout separates the caller's saved registers from
+    /// this frame's own words.
+    ///
+    /// A ZERO layout tells the band verifier that nothing is a register image,
+    /// so the prologue's saved FP/LR pair and the caller's saved X19-X28 would
+    /// count as in-band words of THIS frame. They hold the CALLER's live
+    /// references, which this frame's maps have no business naming -- the
+    /// oracle would report them `never_mapped` and refute the coverage claim on
+    /// noise. An oracle that cries wolf is worse than one that is off.
+    #[test]
+    fn the_published_frame_layout_excludes_the_callers_saved_registers() {
+        let mut b = poll_backend();
+        let result = b.compile_method(3, 1, 4, &[0x2a, 0xb0]); // aload_0; areturn
+        assert!(result.success);
+        let layout = arm64_frame_layout(&result.frame);
+
+        assert!(
+            layout.callee_saved_shallow,
+            "aarch64 puts the save area next to the frame pointer; saying so is \
+             what stops the verifier's x86-64 half-line from swallowing the \
+             whole spill area"
+        );
+        // The FP/LR pair is a register image.
+        assert!(layout.is_register_image(8), "saved LR");
+        assert!(layout.is_register_image(16), "saved FP");
+        // ...and so is every saved GPR.
+        for (i, _) in result.frame.saved_regs.iter().enumerate() {
+            let off = -(result.frame.callee_save_offset + (i as i32) * 8);
+            assert!(
+                layout.is_register_image(off),
+                "saved register {i} at [FP-{off}] must be a register image"
+            );
+        }
+        // The spill area is NOT a register image -- it is this frame's own
+        // words, and it is where the oop maps point.
+        if result.frame.num_spills > 0 {
+            let deepest = -result.frame.spill_offset;
+            assert!(
+                !layout.is_register_image(deepest),
+                "the spill area must stay visible to the verifier"
+            );
+            assert!(
+                layout.spill_hi > layout.spill_lo,
+                "the spill range must be published, or the verifier cannot tell \
+                 a dead slot from a missed root"
+            );
+            assert!(
+                deepest >= layout.spill_lo && deepest < layout.spill_hi,
+                "slot 0 ({deepest}) must fall inside the published spill range \
+                 [{}, {})",
+                layout.spill_lo,
+                layout.spill_hi
+            );
+        }
+        // The two regions must not overlap, or a word belongs to both.
+        assert!(
+            layout.spill_lo >= layout.callee_saved_hi,
+            "spill [{}, {}) overlaps the register images [{}, {})",
+            layout.spill_lo,
+            layout.spill_hi,
+            layout.callee_saved_lo,
+            layout.callee_saved_hi
+        );
+    }
+
+    /// A published artifact carries that layout, not the all-zero default.
+    #[test]
+    fn a_published_artifact_carries_its_frame_layout() {
+        let mut b = poll_backend();
+        let result = b.compile_method(2, 0, 4, &[0xb1]);
+        assert!(result.success);
+        let cm = publish_compiled_method(&result).expect("publishes");
+        assert!(
+            cm.frame_layout.callee_saved_shallow,
+            "the artifact must carry the aarch64 geometry"
+        );
+        assert!(
+            cm.frame_layout.is_register_image(16),
+            "and the saved FP must be excluded from this frame's band"
+        );
+        assert_ne!(
+            cm.frame_layout,
+            cratonvm_jit_frame_layout_default(),
+            "a zero layout would make the oracle report the caller's registers \
+             as this frame's missed roots"
+        );
+    }
+
+    fn cratonvm_jit_frame_layout_default() -> crate::FrameLayout {
+        crate::FrameLayout::default()
     }
     /// A published artifact carries its resolved oop maps.
     ///
