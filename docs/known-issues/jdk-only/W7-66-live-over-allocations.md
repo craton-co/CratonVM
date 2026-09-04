@@ -140,6 +140,63 @@ Branch `fix/layout-over-allocation-live-defects-20260812`.
 > five lines from the arm it misdescribes, in the file every fabricated width in
 > this record is read from.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-03.** This record's status read *"Nothing
+> here was built or run as CratonVM; the probe transcript quoted below is
+> HotSpot, which is the oracle, not the subject."* The subject has now been run:
+> `probes/OverAllocationWidthProbe.java` — this record's own probe, recovered
+> from a sibling worktree after `3b2901531` deleted `probes/` from the checkout
+> — under `CRATONVM_DBG_LAYOUT_ALIAS=1` on a binary built from this tree, with
+> the instrument confirmed present in it by string-probing the binary first.
+>
+> **§1's correction is now measured, not argued.** This record's central claim
+> is that `over` is not on its own a defect predicate. The live census says the
+> same thing from the other side:
+>
+> ```text
+> over   19 species /  97 observations    widest +5
+> under  19 species /  81 observations    widest -16
+> ```
+>
+> Every divergence wider than 6 slots is on the `under` side. The widest `over`
+> in the whole live census is `java/util/HashMap$KeyIterator` at 10 against 5,
+> and `sun/nio/ch/EPollSelectorImpl` at 23 against 18. Against that,
+> `java/util/Properties` runs 16 against 32 and `java/util/HashSet` 1 against
+> 16, the latter on 15 separate observations. A record that had repaired 16
+> `over` sites and left 6 with a reason was right to insist the predicate was
+> the wrong one.
+>
+> **The remaining live `over` species, in full:**
+>
+> ```text
+> java/util/HashMap$KeyIterator      10/5  +5     cratonvm/internal/UnmodifiableSet    2/1  +1   x17
+> java/util/HashMap$EntryIterator    10/5  +5     cratonvm/internal/UnmodifiableList   2/1  +1   x9
+> sun/nio/ch/EPollSelectorImpl      23/18  +5     cratonvm/internal/UnmodifiableItr    2/1  +1   x4
+> sun/nio/ch/UnixAsynchronousSocketChannelImpl 52/48 +4  cratonvm/internal/UnmodifiableMap 2/1 +1 x4
+> sun/nio/ch/UnixAsynchronousServerSocketChannelImpl 20/16 +4  …$UnmodifiableListItr 2/1 +1 x4
+> java/lang/reflect/Field           18/15  +3     java/lang/module/…$Exports          4/3  +1   x4
+> java/util/TreeMap$KeyIterator       7/4  +3     java/lang/module/…$Opens            4/3  +1   x4
+> java/lang/module/ModuleDescriptor 16/14  +2     java/net/URI                      18/17  +1   x2
+> java/lang/invoke/VarHandle          6/4  +2     java/util/HashMap$EntrySet          2/1  +1   x1
+>                                                 java/util/Spliterator               4/3  +1   x1
+> ```
+>
+> Five of these are `cratonvm/internal/Unmodifiable*` — VM-minted carriers, +1
+> each, 38 observations between them. They are the numerically dominant `over`
+> and they are the least interesting one, which is §1's argument restated as
+> data.
+>
+> **What this does NOT verify.** The instrument reports a CLASS and a call-site
+> chain; this record enumerates SOURCE SITES. No row above is matched to any of
+> the 22 sites, so **it is not shown that the 6 sites left with a reason are the
+> ones still firing**, nor that the 16 repairs are the reason the others are
+> absent — a repaired site and a site the probe never dispatched look identical
+> here. The census is also a lower bound by construction: W7-49's headline is
+> that 511 direct allocation call sites never reach this detector at all. Widths
+> are the VM's own request against the VM's own declared layout, so an `over`
+> against a class the VM declares wrongly is not distinguished from an `over`
+> against a class it declares right. The 5 deleted dead sites are untestable by
+> a runtime instrument and are not revisited.
 ## 1. The correction this record exists for
 
 **The `over` direction is not, on its own, a defect predicate — and W7-49's own

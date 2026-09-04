@@ -136,36 +136,16 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
     ),
     (
-        "docs/known-issues/jdk-only/E3-1-the-cipher-name-helper-and-its-real-denominator.md",
-        "status block says: **Status: FIXED-UNVERIFIED.** **Prov: HotSpot column MEAS (this host); CratonVM",
-    ),
-    (
-        "docs/known-issues/jdk-only/E42-1-the-slot-that-was-never-there-and-the-predicate-that-was-its-own-negation.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/phases_late/ssl_security.rs`, this lane's file); NOMINATED (the rest).**",
-    ),
-    (
         "docs/known-issues/jdk-only/F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/http_url_connection.rs`, `native-builtins/src/net_phase_e.rs` — this lane's files); NOMINATED (t",
-    ),
-    (
-        "docs/known-issues/jdk-only/F18-1-four-session-doors-with-no-registration-and-the-twin-that-read-another-table-20260813.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs`, `native-builtins/src/phases_late/ssl_security.rs` — t",
     ),
     (
         "docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/lang_invoke.rs`,",
     ),
     (
-        "docs/known-issues/jdk-only/F30-1-the-registrar-call-graph-and-the-drifted-arm-20260813.md",
-        "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. This lane did **not** run `cargo`",
-    ),
-    (
         "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
-    ),
-    (
-        "docs/known-issues/jdk-only/G10-1-the-bignum-surface-measured-and-the-shipping-twin-20260816.md",
-        "status block says: **Status: CODE LANDED, BEHAVIOUR UNVERIFIED ON CRATONVM.** 2026-08-16, lane",
     ),
     (
         "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
@@ -180,16 +160,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: predates `aed6a3b73`, so no binary containing either this lane's changes or the",
     ),
     (
-        "docs/known-issues/jdk-only/G45-1-the-instrument-that-could-not-name-what-it-saw-20260817.md",
-        "status block says: so no binary contains the fix yet and every 'after' below is **PREDICTED** —",
-    ),
-    (
         "docs/known-issues/jdk-only/G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled-20260816.md",
         "status block says: **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,",
-    ),
-    (
-        "docs/known-issues/jdk-only/G9-1-the-intrinsic-semantics-census-settled-20260816.md",
-        "status block says: **Status:** FIXED-UNVERIFIED-ON-CRATONVM. Four defects fixed, all four measured",
     ),
     (
         "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
@@ -198,10 +170,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/H12-1-the-osr-door-binds-five-bridge-natives-the-method-entry-door-refuses-20260820.md",
         "status block says: **Status: MEASURED (the defect) / FIXED-UNVERIFIED (the fix).** The divergence",
-    ),
-    (
-        "docs/known-issues/jdk-only/H13-2-all-four-assigned-defects-were-closed-and-the-probe-found-two-more-20260820.md",
-        "status block says: are **MEASURED** defects with **FIXED-UNVERIFIED** repairs: no binary carrying",
     ),
     (
         "docs/known-issues/jdk-only/H2-1-the-filetime-epoch-and-the-queue-lock-20260820.md",
@@ -216,52 +184,12 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
     ),
     (
-        "docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md",
-        "status block says: nothing here was built or run):**",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md",
-        "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-46-process-cluster.md",
-        "status block says: **Status:** SOURCE-ONLY. **No CratonVM binary was built or run.** Lane W7-46,",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-49-slot-index-recensus.md",
-        "status block says: Branch `fix/w44-slot-index-sweep-20260812`. Nothing here is built or run. Every",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
     (
-        "docs/known-issues/jdk-only/W7-57-close-flush-swallow-sweep.md",
-        "RUN 2026-09-02 on --synthetic-jdk: CloseFlushSwallowProbe 129 rows vs HotSpot 120, 35 differing, incl. an internal NPE where HotSpot propagates the caller's error",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-58-bytebuffer-direct-arm.md",
-        "RUN 2026-09-02 on --synthetic-jdk: 264 rows vs HotSpot 285 (21 UNTESTED, not passing), 39 differing; the getIntLE/putIntLE reds are this record's own documented residuals",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-66-live-over-allocations.md",
-        "status block says: **Nothing here was built or run as CratonVM**; the probe transcript quoted below",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-70-printstream-close-noop.md",
-        "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
-        "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
         "status block says: **Nothing here has been built or run.** Every claim is either `javap` output from",
-    ),
-    (
-        "docs/known-issues/jdk-only/the-five-owed-records-run-at-last-20260902.md",
-        "status block says: **Status: MEASURED 2026-09-02.** The `unverified_records` ratchet holds five",
     ),
 ];
 

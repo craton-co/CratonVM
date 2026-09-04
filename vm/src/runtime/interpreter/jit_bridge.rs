@@ -4089,6 +4089,87 @@ pub(super) fn try_osr(
     }
 }
 
+/// Re-offer every HELD deferred-`new` retry whose class has since loaded.
+///
+/// Holding a retry rather than burning it on an attempt that would bail keeps
+/// the method's one chance alive, but a kept chance nobody offers again is the
+/// same outcome as a spent one. This is what offers it.
+///
+/// Cost when nothing has loaded is one acquire load: `class_definition_epoch`
+/// is bumped by every class definition, so an unchanged epoch means no `new`
+/// site anywhere can have become resolvable since the last sweep. That is the
+/// whole rate limit — deliberately not a time or count budget, because those
+/// silence a trigger whose rate depends on the workload rather than on whether
+/// there is anything to do.
+pub(super) fn resweep_held_deferred_new_retries(shared: &SharedVm, on_class_definition: bool) {
+    if !crate::runtime::env_cache::c2_supersede() {
+        return;
+    }
+    // One relaxed load, and almost always zero.
+    if cratonvm_jit::held_deferred_new_count() == 0 {
+        return;
+    }
+    // The epoch gate is for the COMPILE door, which fires constantly and where
+    // an unchanged epoch means no `new` site can have become resolvable since
+    // the last look. The class-definition caller IS the event, so it never
+    // needs the gate — and must not take it, or two callers racing on the swap
+    // would let one of them skip the definition that mattered.
+    if !on_class_definition {
+        let epoch = crate::classloading::class_definition_epoch();
+        if LAST_DEFERRED_NEW_SWEEP_EPOCH.swap(epoch, std::sync::atomic::Ordering::AcqRel) == epoch {
+            return;
+        }
+    }
+    let held = cratonvm_jit::held_deferred_new_methods();
+    if held.is_empty() {
+        return;
+    }
+    for (class_name, method_name, descriptor) in held {
+        let granted = cratonvm_jit::take_deferred_new_retry(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
+        );
+        if granted {
+            DEFERRED_NEW_REOFFERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new RE-OFFERED {class_name}.{method_name}{descriptor} — its class has loaded"
+                );
+            }
+            shared
+                .jit
+                .tiered_manager
+                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::new(
+                    &*class_name,
+                    &*method_name,
+                    &*descriptor,
+                ));
+        }
+    }
+}
+
+/// The class-definition epoch the sweep above last ran at.
+static LAST_DEFERRED_NEW_SWEEP_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Retries handed back out by the sweep. A sweep that re-offers nothing is a
+/// sweep that is not running, or one running where no class ever loads after.
+static DEFERRED_NEW_REOFFERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many held deferred-`new` retries the sweep has re-offered.
+pub fn deferred_new_reoffered() -> u64 {
+    DEFERRED_NEW_REOFFERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
 /// `new`/`anewarray` CP index in `holder_cid`'s constant pool to a
 /// [`cratonvm_jit::JitNewSite`] — `Resolved { class_id, num_fields,
@@ -7987,6 +8068,11 @@ pub(super) fn try_jit_compile_callee_slow(
                 &*cached.method_descriptor,
             ));
     }
+    // …and the other half: every method whose retry is HELD because its class
+    // was not loaded. Nothing brings such a method back on its own — it already
+    // has a body, so it is never compiled again, and the door above is only ever
+    // walked by the method being compiled right now.
+    resweep_held_deferred_new_retries(shared, false);
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -12086,5 +12172,22 @@ mod supersede_classification_tests {
         note_supersede_outcome(SupersedeOutcome::Changed);
         let (f1, u1, c1) = supersede_census();
         assert_eq!((f1 - f0, u1 - u0, c1 - c0), (1, 1, 2));
+    }
+}
+
+/// Re-offer held deferred-`new` retries in every live VM, called immediately
+/// after a class-manager write guard releases its lock.
+///
+/// That is the moment a `new` site can have become resolvable, and it is the
+/// only moment: a method holding a retry already has a body, so nothing
+/// compiles it again and no compile-door sweep will ever look at it. Placed
+/// beside `drain_pending_class_hooks` for the same reason that call is there —
+/// the write lock is gone, so taking a fresh read lock here is safe.
+pub fn resweep_deferred_new_after_class_definition() {
+    if cratonvm_jit::held_deferred_new_count() == 0 {
+        return;
+    }
+    for shared in crate::vm::vm_init::live_hook_vms_for_jit() {
+        resweep_held_deferred_new_retries(&shared, true);
     }
 }

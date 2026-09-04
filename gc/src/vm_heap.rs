@@ -3302,6 +3302,22 @@ impl VmHeap {
             // same workload unattributable. A cycle can satisfy more than
             // one, so these do not have to sum to `collections`.
             {
+                {
+                    // WHICH door started each cycle. Printed beside the
+                    // trigger tallies because the two answer different
+                    // halves of the same question, and on the run that
+                    // motivated both, the tallies were all zero.
+                    let (needs, requested, forced, native) =
+                        cratonvm_types::gc_entry_census::totals();
+                    eprintln!(
+                        "[GC] zgc-entry: maybe_gc_needs={needs} \
+                         maybe_gc_requested={requested} forced={forced} \
+                         from_native={native}"
+                    );
+                    for (site, n) in cratonvm_types::gc_entry_census::forced_sites() {
+                        eprintln!("[GC] zgc-entry:   forced by {site}: {n}");
+                    }
+                }
                 let (stress, threshold, headroom, budget, hard) = h.trigger_tallies();
                 eprintln!(
                     "[GC] zgc-trigger: stress={stress} live_bytes_threshold={threshold}                      headroom_low={headroom} alloc_budget={budget}                      hard_alloc_refusals={hard}"

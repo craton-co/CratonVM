@@ -1018,6 +1018,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "oopmap-coverage-presence-only", on_key: Some("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "moving-young-bounds-guard", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD"), off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "moving-young-band-object-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN"), off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "moving-young-band-liveness-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN"), off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
@@ -1238,6 +1239,13 @@ pub const INVENTORY: &[E] = &[
     // from the one above on purpose: one switch covering both emitters could not
     // separate "the plan is wrong" from "this emitter is wrong".
     E { group: Group::JIT, token: "ir-ref-store", on_key: Some("CRATONVM_JIT_IR_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Opt-IN: copy a loop-live int/long PARAMETER into a callee-saved register
+    // at entry, which the optimizing tier otherwise cannot do (entry params are
+    // pinned to caller-saved ABI registers and the allocator skips a pinned
+    // value). Declared here by a passing change: it was read by
+    // `ir_param_prologue_copy_enabled` and declared nowhere, so it was served
+    // by a live getenv rather than the latched snapshot.
+    E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     // Diagnostic-only: the DYNAMIC split between the gated arm's inline path
     // and its helper fallback. The compile-time census counts emitted
     // sequences, which is not the same fact.
@@ -1390,6 +1398,7 @@ pub const INVENTORY: &[E] = &[
     // offenders, which is exactly how the count creeps back up.
     E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0"), since: "2026-08-01" },
     E { group: Group::JIT, token: "deferred-new-retry-blind", on_key: Some("CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "supersede-epoch-skip-useless", on_key: Some("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None, since: "2026-07-25" },
@@ -1589,6 +1598,7 @@ pub const INVENTORY: &[E] = &[
     // through the general `execute_invokevirtual_cached` dispatcher.
     E { group: Group::JIT, token: "invoke-fast-door", on_key: Some("CRATONVM_JIT_INVOKE_FAST_DOOR"), off_key: Some("CRATONVM_JIT_NO_INVOKE_FAST_DOOR"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "door-receiver-record", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD"), off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "door-recv-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECV_MEMO"), off_word: None, since: "2026-09-04" },
     // `nonvirtual-fast-door` — off routes every monomorphic `invokestatic`
     // and `invokespecial` cache hit through the general dispatcher.
     E { group: Group::JIT, token: "nonvirtual-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"), off_word: None, since: "2026-09-02" },
@@ -2074,6 +2084,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-alloc-trigger", on_key: Some("CRATONVM_ZGC_ALLOC_TRIGGER"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::GC, token: "zgc-pause-target-ms", on_key: Some("CRATONVM_ZGC_PAUSE_TARGET_MS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::GC, token: "zgc-bitmap-bounds", on_key: Some("CRATONVM_ZGC_BITMAP_BOUNDS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
     // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run

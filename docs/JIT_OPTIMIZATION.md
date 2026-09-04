@@ -1078,6 +1078,71 @@ CPU per run; the benchmark wall times moved by more than that in both
 directions, which is run-to-run noise on this host, not a result.
 `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` restores the blind grant.
 
+### Holding a retry nobody offers again is the same as spending it
+
+Holding was only half of it. A method that bailed on an unloaded class already
+has a body, so nothing ever compiles it again — and the retry door is only ever
+walked by the method being compiled at that moment. The first sweep was placed
+on the compile door and re-offered *nothing*: `re_offered=0` against `held=21`
+on CratonBench, and on a fixture built to load the class after the bail it held
+four times and never came back.
+
+The event that can change the answer is a class definition, and the place to
+observe it is `ClassManagerWriteGuard::drop` — after the write lock is released,
+beside `drain_pending_class_hooks`, which is there for the same reason. The
+sweep now runs from there across every live VM, and costs one relaxed load
+(`held_deferred_new_count`) when nothing is held.
+
+`bench/DeferredNewReoffer.java` is the fixture that separates the two: the `new`
+sits on a branch warmup never takes, so the class is still unloaded when the hot
+method is compiled, and a later `touch()` loads it.
+
+| | `BLIND=1` (blind grant) | held + re-offered |
+|---|---|---|
+| after the IR build bails | retry spent immediately | retry **held** |
+| second compile | single-pass again, 2492 bytes | — |
+| when the class loads | nothing left to offer | **re-offered** |
+| final body | single-pass, 2492 bytes | **IR, 1495 bytes** |
+
+Same checksum on both arms. This one *is* a capability change rather than
+avoided waste: `make` reaches the optimizing tier, which under the blind grant
+it could not. The size drop is the emitted body, not a timing.
+
+#### Once per collector, because one run per arm is not a measurement
+
+The collector is a variable this fixture has no business depending on, which is
+the reason to check rather than assume. Five runs per collector, and the same
+fixture under `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` as the control:
+
+| collector | armed | re-offered | reached an IR body | control: IR body |
+|---|---|---|---|---|
+| ZGC (default) | 5/5 | 5/5 | 5/5 | 0/3 |
+| G1 | 5/5 | 5/5 | 5/5 | 0/2 |
+| Generational | 4/5 | 4/5 | 4/4 | 0/1 |
+| Serial | 4/5 | 4/5 | 4/4 | 0/1 |
+| Parallel | 5/5 | 5/5 | 5/5 | 0/1 |
+
+Every one of the 25 runs produced checksum `-353614574`. Every re-offer that
+happened produced an IR body (1495 or 1502 bytes against single-pass 2492);
+under the blind grant, **no** armed memo on **any** collector ever reached one.
+So the mechanism is collector-independent, and the control attributes the
+difference to the grant rather than to anything else that moved.
+
+**The fixture is timing-sensitive, and a `0` from it is not a regression.**
+Arming requires `make` to be compiled by the C2 door *before* the C1 door
+reaches it, and which door gets there first varies run to run: a single G1 run
+during this sweep armed 0 times, and five consecutive runs immediately after
+armed 5/5. Read this fixture over at least five runs. `make` contains a `new`,
+so once the C1 door has it, `c2_upgrade_would_engage` refuses it without
+`CRATONVM_JIT_C2_ALLOC_UPGRADE=1` — which is also how to force the arming path
+deterministically when bisecting.
+
+One measurement trap worth recording, because it cost a wrong conclusion here
+first: probing for the IR body by grepping the exact literal `len=1495` reported
+Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
+1502 bytes depending on inlining, and an exact-size probe reads a body that got
+7 bytes bigger as no body at all.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -1226,11 +1291,120 @@ So the named causes of the residual inversion are, in order:
 1. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
    the counter compare, the backedge and the safepoint poll over four
    iterations; the optimizing tier pays all three every iteration.
-2. **Six of nine promoted candidates never reach a register**, and with the
-   census fixed the question "why" is finally answerable rather than
-   guessable. Start with `single_use`, which is by far the largest bucket
-   (13 on this method) and is a policy — `ir_residency_pays_enabled` refuses a
-   value read fewer than twice — not a limitation.
+2. **The loop's values are ENTRY PARAMETERS, and entry parameters cannot be
+   promoted at all.** Traced 2026-09-03, and it is the end of the chain.
+
+`single_use` was the largest bucket (13) and looked like the answer: it refuses
+any value read fewer than twice, counting **static** graph edges. Printing the
+shape first — the lesson from the split miscount immediately above — gave:
+
+```text
+single_use n3 op=Param(0) static_uses=1 loop_weight=10   <- the receiver
+single_use n4 op=Param(1) static_uses=1 loop_weight=10   <- the loop bound
+```
+
+One static use, ten loop-weighted. The rule compares a static count while the
+definition and the uses sit at different loop depths: `this` and `n` are
+defined once at method entry and read every iteration. `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`
+generalises the test to `uses_frequency >= 2 x definition_frequency`, which
+reduces exactly to `use_count >= 2` at depth 0.
+
+**It admits them past that gate and residency does not move** — `resident=3`
+either way; they land in `no_alloc`/`spilled` instead. The policy was never the
+binding constraint, because the allocator had already declined them.
+
+**`MachineModel::pin_entry_params` pins every `Param` to its incoming ABI
+register**, and `allocate_linear_scan` skips a pinned value outright
+(`regalloc.rs`, `live.pinned[id]`). The ABI registers are caller-saved and are
+not in `IR_LOWER_LS_GPRS` (RBX, R12–R15), so an entry parameter can never be
+promoted into the callee-saved file the loop needs. It reaches the loop through
+its frame slot, every iteration, by construction.
+
+The baseline tier does the one thing this tier does not — it copies parameters
+into callee-saved registers in the prologue:
+
+```text
+39: mov r15,rsi        ; this -> r15
+3c: mov r14,rdx        ; n    -> r14
+```
+
+The prologue copy was built (`CRATONVM_JIT_IR_PARAM_COPY=1`, default OFF). It
+works: `resident=3` becomes `resident=4`, `param_copies=1`, the loop bound
+gets a callee-saved register. **It measures zero** — 2.07 s against 2.07/2.08
+for the two control arms, which agree with each other to 0.5%, so that is a
+real zero and not one hidden by noise.
+
+#### Four candidates, four zeros, and what that finally says
+
+| candidate | engaged? | effect |
+|---|---|---|
+| split residency | no (`split_recovered=0`) | census mislabel; nothing to reclaim |
+| implicit null check port | yes (`elided=2`) | ~20% *worse*, then noise |
+| loop-weighted use count | yes (params left `single_use`) | none — allocator had already declined them |
+| parameter prologue copy | yes (`resident` 3→4) | none |
+
+Every one of them was a register-residency or null-check argument, and none of
+them moved a loop that is 1.6x slower at this tier. **The cost is not where any
+of that reasoning says it is**, and the disassembly said so from the start if
+the instruction counts are read per ITERATION rather than per body:
+
+* baseline: 178 instructions covering **four** iterations — about **44 per
+  iteration**, because the tier unrolls 4x;
+* optimizing: 95 instructions for **one** — about **95 per iteration**.
+
+A ratio of roughly 2.2x against a measured 1.6x, which is the only account so
+far that is the right size. The counter compare, the backedge and the
+safepoint poll are each paid once per iteration here and once per four
+iterations there, and no amount of register residency changes that.
+
+#### Unrolling tested: worth a fifth of the gap, not the gap
+
+Tested the cheap way — by removing the advantage from the FAST arm rather than
+building it into the slow one. `CRATONVM_DISABLE_UNROLL=1` turns off the
+baseline's 4x unroll (both its call sites are in `x64/`), so if unrolling
+explains the inversion the baseline should collapse toward the optimizing tier.
+
+| arm | median |
+|---|---|
+| baseline, unrolled | 0.73 |
+| baseline, same config (control) | 0.66 |
+| **baseline, `CRATONVM_DISABLE_UNROLL=1`** | **0.84** |
+| optimizing tier | **1.61** |
+
+Unrolling is worth about **20%** — real, above the ~10% control spread. And it
+is nowhere near the whole gap: the un-unrolled baseline is 0.84 against 1.61,
+**still 1.9x apart**. So the section above overreached in calling instruction
+count per iteration "the only account of the right size"; it is *an* account,
+of about a fifth of it.
+
+#### What that leaves, and the reconciliation the four zeros needed
+
+The remaining 1.9x is per-iteration work that has nothing to do with unrolling,
+and the disassembly names it: the optimizing tier round-trips **every**
+loop-carried value through the frame, roughly eight memory operations against a
+body whose real work is one load and one add.
+
+That also explains why four successive fixes measured zero without any of them
+being wrong. **Each addressed ONE value.** Removing one of eight memory
+operations is ~12% of the loop's memory traffic and a few percent of its time —
+at or under the measurement floor on this host. The four zeros are not evidence
+that frame traffic is innocent; they are evidence that **it cannot be fixed one
+value at a time.**
+
+So the target is the class, not a member of it: the optimizing tier needs
+loop-carried values to stay in registers *as a group*, which means the
+write-through publish (a store at every definition, a load at every publish)
+and the per-value residency policy both have to give way to something that
+treats a loop's live set as one decision. That is a larger change than any of
+the four, and it is the first one whose expected effect is above the noise
+floor rather than under it.
+
+**Do not test it by building it.** The same trick used here works: make the
+BASELINE spill its loop-carried values and see whether it lands on 1.61.
+
+The loop-weight rule is kept, default OFF, because it is a correct
+generalisation that will matter once the parameters can be promoted at all —
+and because its own measurement is on record as not moving this workload.
 
 What it is **not**: splits, register pressure at the file's edge, code size
 (the optimizing tier emits *less* code here), or the null check.

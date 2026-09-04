@@ -1100,13 +1100,13 @@ fn build_interference(
 /// contributes `LOOP_WEIGHT_PER_DEPTH^d`, capped at `MAX_LOOP_DEPTH_WEIGHT` to
 /// keep saturating arithmetic well-behaved and bound the influence of
 /// pathologically deep loops on register-allocation priorities.
-const LOOP_WEIGHT_PER_DEPTH: u32 = 10;
+pub const LOOP_WEIGHT_PER_DEPTH: u32 = 10;
 /// Cap on the loop-depth weight contributed by a single use.
 ///
 /// Corresponds to depth = 6 with `LOOP_WEIGHT_PER_DEPTH = 10` (=> 10^6).
 /// At this cap a deeply-nested use still dominates a non-loop use by 1e6×,
 /// which is more than enough for the graph-coloring spill heuristic.
-const MAX_LOOP_DEPTH_WEIGHT: u32 = 1_000_000;
+pub const MAX_LOOP_DEPTH_WEIGHT: u32 = 1_000_000;
 
 /// Count uses of each local in the bytecode, weighted by loop-nesting depth.
 ///

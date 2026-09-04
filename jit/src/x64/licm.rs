@@ -3593,7 +3593,12 @@ pub(super) fn compute_local_oop_masks_windowed(
 /// Kept for the INLINE-SPLICE path, whose `InlineOopScope` is a single `u64` by
 /// construction -- a spliced callee above 64 locals still fails its safepoints
 /// closed through `mask_at_cur() == None`, which is what that type documents.
-pub(super) fn compute_local_oop_masks(
+// Visible to the whole crate, not just `x64`: this is a BYTECODE dataflow with
+// nothing architecture-specific in it, and the aarch64 backend needs the same
+// answer to name its reference locals at a safepoint. It lives here because x64
+// was the first caller, not because it belongs to x64 (`x64::stack_kinds` is
+// already shared the same way).
+pub(crate) fn compute_local_oop_masks(
     code: &[u8],
     code_len: usize,
     max_locals: usize,
