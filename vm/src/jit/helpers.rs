@@ -4559,7 +4559,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // moving collector rewrites object addresses. (Resolves the prior
         // FIXME that called `heap.collect_garbage` with an unchecked
         // StopTheWorldToken.)
-        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
     }
     // GC-overhead limit: if forced GCs keep freeing almost nothing, the heap is
     // full of live objects — surface OOM now instead of limping on slivers
@@ -5145,7 +5145,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -5207,7 +5207,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         None => {
             if let Some((thread, _guard)) = jit_thread_mut() {
                 thread.tlab.retire();
-                crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
             }
             if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
                 if let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) {
@@ -6064,7 +6064,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -19108,7 +19108,7 @@ fn call_integer_native_raw_inner(
                         && (vm.mem.heap.needs_gc_for_jit_allocation()
                             || vm.mem.heap.old_gen_needs_gc())
                     {
-                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
                     }
                     vm.mem.heap.clear_young_spill_pressure();
                 }

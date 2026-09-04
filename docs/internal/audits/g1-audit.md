@@ -1764,3 +1764,78 @@ cratonvm -Xmx32m -XX:+UseG1GC --verbose:gc -cp probes CoverageBench 20000 150000
 ```
 
 Four reps, compare medians, and treat anything under a point as noise.
+
+## 22. The liveness screen, measured — a null result that explains itself (2026-09-03)
+
+*`perf/band-liveness-screen-measured-20260903`. §21 built the stable workload
+so §20.2's screen could finally be measured. It was, and it does nothing —
+but the debug dump says why, and the reason is more useful than the screen.*
+
+### 22.1 The measurement
+
+The screen had no kill switch, so it could not be A/B'd in one binary — every
+other screen in this file has one and this now does too
+(`CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN`, fail-OPEN like the object
+screen's).
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| screen | incomplete rate per rep | median |
+|---|---|---:|
+| off | 98.29, 96.92, 98.69, 99.60 % | **98.49 %** |
+| on | 97.31, 99.60, 100.00, 96.67 % | **98.46 %** |
+
+`checksum=262248526` and `rc=0` on all eight. The medians differ by 0.03
+points inside a ~3-point spread: **the screen changes nothing.**
+
+(The spread is wider than §21.3's 0.88 points because these runs alternate arms
+on a busier host. It is still a usable surface — H2's was eighty.)
+
+### 22.2 Why, and it is not what the screen was built for
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` on the same workload dumps every word the
+band test reports. Of 93:
+
+| region | count | `in_map` |
+|---|---:|---|
+| `java-local` | 67 | **true** |
+| `reserved-locals-tail` | 26 | false |
+
+Two things follow.
+
+The screen cannot fire on the majority: they are java locals, which is exactly
+the population `verifier_local_verdict` CAN answer for — and it answers `Oop`
+or `Unknown`, not `NotOop`, because they really are references. The screen
+keeps them, correctly. It was built on §19's finding that the residue is
+header-shaped; it turns out the residue is not just header-shaped but genuinely
+live.
+
+And the more interesting half: **`in_map=true`**. The active oop map already
+names those 67 slots. So `scan_active_oop_map_at_rbp` visits them and
+`remap_active_jit_frames` rewrites them — the precise mechanism covers them.
+The band test reports them anyway, because its question is whether the SHADOW
+STACK published the word, and it asks that of slots the oop map has already
+accounted for.
+
+### 22.3 The next hypothesis, stated but not acted on
+
+A word the ACTIVE OOP MAP names may not need shadow-stack publication to be
+rewritable, because the oop-map path rewrites it. If that holds,
+`band_has_unpublished_word_with_map` should not report an `in_map` word at all,
+and 67 of 93 reports on this workload would go away.
+
+It is written here rather than implemented because it is one dump on one
+workload, and this document now records two changes landed on that much
+evidence and withdrawn (§15 → §16, and the §19 screen whose crash §20 fixed).
+The test is cheap and specific: suppress `in_map` words, run §21's four reps,
+and see whether the rate falls by roughly the two-thirds the dump predicts. If
+it does not, the dump was not representative and nothing was lost.
+
+### 22.4 The screen stays
+
+Landed despite the null result, for the reason §19's object screen was: it
+makes the instrument ask a sound question, and it is the only thing standing
+between a future `NotOop` word and a spurious refusal to move. It costs a
+verifier lookup on a diagnostic path that only runs under the precise-only
+switches, and `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN=1` removes it.

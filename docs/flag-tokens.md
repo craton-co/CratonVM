@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-332 tokens.
+333 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -814,6 +814,7 @@ export inherited from a parent shell.
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_INVOKE_FAST_DOOR / CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `door-receiver-record` | `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD` |
+| `door-recv-memo` | `CRATONVM_JIT_NO_DOOR_RECV_MEMO` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
 | `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
@@ -920,7 +921,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-132 tokens.
+133 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -930,6 +931,7 @@ export inherited from a parent shell.
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `moving-young-band-object-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN` |
+| `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |

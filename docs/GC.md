@@ -633,10 +633,10 @@ work scale with the heap FLAG rather than with the garbage: at `-Xmx2g` with
 the span the bump cursor ran over — doubling `-Xmx` doubles every pause on a
 workload whose live set did not change.
 
-`CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` (**default 0, off**, added 2026-09-03)
-adds a second clause that collects once that percent of capacity has been
-allocated since the last cycle, capping the span a pause walks at
-`budget + live`. It is a pause-versus-throughput DIAL, measured on
+`CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` (added 2026-09-03; **0 without a pause
+target, 25 with one** — see the pairing below) adds a second clause that
+collects once that percent of capacity has been allocated since the last
+cycle, capping the span a pause walks at `budget + live`. It is a pause-versus-throughput DIAL, measured on
 `G1ChurnPauseProbe 50 600` at `-Xmx2048m` (release, three runs a row, one
 binary, only this switch moved):
 
@@ -773,11 +773,33 @@ steady state. Measured at `-Xmx4096m`:
 | target 200 ms alone | 14849 ms | 530 ms |
 | **target 200 ms + `ALLOC_TRIGGER=25`** | 13548 ms | **221 ms** |
 
-The pairing is better than the target alone on BOTH axes, which is why it is
-worth stating: the floor stops the one cycle the controller is blind to, and
-paying for that cycle up front costs less than the controller's recovery from
-it. It is not the default because the wall cost against no trigger at all is a
-policy call the corpora have not been run against.
+The pairing is better than the target alone on BOTH axes: the floor stops the
+one cycle the controller is blind to, and paying for that cycle up front costs
+less than the controller's recovery from it. **Since 2026-09-03 it is the
+default** — a pause target brings a 25 % floor with it unless the operator
+names a percentage. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
+rather than an absence, and is how the "target alone" arm is measured; any
+other explicit value wins over the floor in both directions.
+
+The shipped default measured against what it replaced, and against no trigger
+at all — same probe, one binary, switches only:
+
+| `-Xmx` | configuration | wall | pause p50 | worst |
+|---|---|---|---|---|
+| 2048m | no trigger | 11323 ms | 227.8 ms | 276.8 ms |
+| 2048m | target 200 alone (the old default) | 11184 ms | 199.4 ms | 242.1 ms |
+| 2048m | **target 200 + floor 25 (shipped)** | 11234 ms | **92.7 ms** | **116.0 ms** |
+| 4096m | no trigger | 11129 ms | 421.4 ms | 565.6 ms |
+| 4096m | target 200 alone (the old default) | 12449 ms | 147.2 ms | 654.7 ms |
+| 4096m | **target 200 + floor 25 (shipped)** | 11485 ms | 182.6 ms | **227.1 ms** |
+
+At 2048m it more than halves both the median and the worst pause for no wall
+cost at all; at 4096m it cuts the worst pause by 60 % against no trigger and by
+65 % against the target alone, and costs 3 % of wall against no trigger while
+being 8 % FASTER than the old default. The old default was the worse of the
+three on the tail at both sizes — the controller was paying for a first cycle
+it could not see and then recovering from it, which is precisely what the floor
+removes.
 
 
 **Mutators have TLABs on this backend, and since 2026-09-02 the JIT's inline

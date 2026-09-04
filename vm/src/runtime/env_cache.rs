@@ -1901,6 +1901,14 @@ cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
 /// general path and the workload is clean.
 cached_is_set!(no_door_receiver_record, "CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD");
 
+/// `CRATONVM_JIT_NO_DOOR_RECV_MEMO=1` -- make the door's receiver recording do
+/// the full `ProfileStore` lookup on EVERY call instead of reusing a memoized
+/// handle. Same records either way; only the cost differs.
+///
+/// Exists so "the memo made the recording cheaper" is a single-binary A/B
+/// rather than a comparison across two builds on a host whose load moves.
+cached_is_set!(no_door_recv_memo, "CRATONVM_JIT_NO_DOOR_RECV_MEMO");
+
 /// `CRATONVM_JIT_INVOKE_FAST_DOOR` -- OPT IN to the monomorphic invoke fast
 /// door, which is default-OFF since 2026-09-03 because it returns wrong
 /// answers.

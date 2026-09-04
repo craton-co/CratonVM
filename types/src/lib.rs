@@ -715,6 +715,93 @@ pub mod scalar_deopt_census {
 ///
 /// 600x, against 0.48 us for the hook itself and 0.75 for the lost invoke
 /// cache. Nothing counted it until this census existed.
+/// WHICH call actually started a collection.
+///
+/// AUDIT 2026-09-03. `[GC] zgc-trigger` counts the four branches of
+/// `needs_gc`, plus the arena's hard refusal. On kfusion under `--gpu` all
+/// five read ZERO on a run that collected 13 times, so every one of those
+/// cycles entered through a door none of them watches.
+///
+/// There are three doors, and none counted itself:
+///
+/// * `maybe_gc` — the allocation-path check. Fires on `needs_gc()` OR on
+///   the `gc_requested` latch, and the latch is invisible to the trigger
+///   tallies, so a cycle can start here with every trigger at zero.
+/// * `maybe_gc_forced` — the safepoint's forced path, taken when the
+///   boundary's gates say collect.
+/// * `force_gc_from_native` — `System.gc()` / `Runtime.gc()`.
+///
+/// Counting the door is what separates "the heap decided" from "someone
+/// asked", which is the question left after the trigger census came back
+/// empty.
+pub mod gc_entry_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MAYBE_GC_NEEDS: AtomicU64 = AtomicU64::new(0);
+    static MAYBE_GC_REQUESTED: AtomicU64 = AtomicU64::new(0);
+    static FORCED: AtomicU64 = AtomicU64::new(0);
+    static FROM_NATIVE: AtomicU64 = AtomicU64::new(0);
+
+    /// `maybe_gc` collected because `needs_gc()` said so.
+    #[inline]
+    pub fn note_maybe_gc_needs() {
+        MAYBE_GC_NEEDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `maybe_gc` collected because the `gc_requested` latch was set —
+    /// the case no trigger tally can see.
+    #[inline]
+    pub fn note_maybe_gc_requested() {
+        MAYBE_GC_REQUESTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `maybe_gc_forced` ran, tagged with the call site that asked.
+    ///
+    /// `maybe_gc_forced_pub` has 24 call sites across seven files -- the
+    /// safepoint gate, five in the JIT helpers, four on the deopt-resume
+    /// path, and more -- so a bare count says a collection was FORCED
+    /// without saying by whom, which is the question left when every
+    /// trigger tally reads zero.
+    #[inline]
+    pub fn note_forced_at(site: &'static str) {
+        FORCED.fetch_add(1, Ordering::Relaxed);
+        let mut v = FORCED_SITES.lock().unwrap_or_else(|p| p.into_inner());
+        match v.iter_mut().find(|(s, _)| *s == site) {
+            Some((_, n)) => *n += 1,
+            None => v.push((site, 1)),
+        }
+    }
+
+    static FORCED_SITES: std::sync::Mutex<Vec<(&'static str, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// `(site, count)` for every forced collection, busiest first.
+    pub fn forced_sites() -> Vec<(&'static str, u64)> {
+        let mut v = FORCED_SITES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// `System.gc()` / `Runtime.gc()`.
+    #[inline]
+    pub fn note_from_native() {
+        FROM_NATIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(maybe_gc_needs, maybe_gc_requested, forced, from_native)`.
+    pub fn totals() -> (u64, u64, u64, u64) {
+        (
+            MAYBE_GC_NEEDS.load(Ordering::Relaxed),
+            MAYBE_GC_REQUESTED.load(Ordering::Relaxed),
+            FORCED.load(Ordering::Relaxed),
+            FROM_NATIVE.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub mod gpu_jit_gate_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

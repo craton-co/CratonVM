@@ -1108,6 +1108,41 @@ Same checksum on both arms. This one *is* a capability change rather than
 avoided waste: `make` reaches the optimizing tier, which under the blind grant
 it could not. The size drop is the emitted body, not a timing.
 
+#### Once per collector, because one run per arm is not a measurement
+
+The collector is a variable this fixture has no business depending on, which is
+the reason to check rather than assume. Five runs per collector, and the same
+fixture under `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` as the control:
+
+| collector | armed | re-offered | reached an IR body | control: IR body |
+|---|---|---|---|---|
+| ZGC (default) | 5/5 | 5/5 | 5/5 | 0/3 |
+| G1 | 5/5 | 5/5 | 5/5 | 0/2 |
+| Generational | 4/5 | 4/5 | 4/4 | 0/1 |
+| Serial | 4/5 | 4/5 | 4/4 | 0/1 |
+| Parallel | 5/5 | 5/5 | 5/5 | 0/1 |
+
+Every one of the 25 runs produced checksum `-353614574`. Every re-offer that
+happened produced an IR body (1495 or 1502 bytes against single-pass 2492);
+under the blind grant, **no** armed memo on **any** collector ever reached one.
+So the mechanism is collector-independent, and the control attributes the
+difference to the grant rather than to anything else that moved.
+
+**The fixture is timing-sensitive, and a `0` from it is not a regression.**
+Arming requires `make` to be compiled by the C2 door *before* the C1 door
+reaches it, and which door gets there first varies run to run: a single G1 run
+during this sweep armed 0 times, and five consecutive runs immediately after
+armed 5/5. Read this fixture over at least five runs. `make` contains a `new`,
+so once the C1 door has it, `c2_upgrade_would_engage` refuses it without
+`CRATONVM_JIT_C2_ALLOC_UPGRADE=1` — which is also how to force the arming path
+deterministically when bisecting.
+
+One measurement trap worth recording, because it cost a wrong conclusion here
+first: probing for the IR body by grepping the exact literal `len=1495` reported
+Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
+1502 bytes depending on inlining, and an exact-size probe reads a body that got
+7 bytes bigger as no body at all.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -1293,12 +1328,40 @@ into callee-saved registers in the prologue:
 3c: mov r14,rdx        ; n    -> r14
 ```
 
-**So the fix is a prologue copy, not an allocator heuristic.** The optimizing
-tier needs to move loop-live parameters out of their ABI registers into the
-allocatable callee-saved file at entry, and tell the allocator that is where
-they live. Until it does, no residency policy can reach them — which is why
-three successive candidates (splits, the null check, the single-use rule) each
-measured zero on this loop.
+The prologue copy was built (`CRATONVM_JIT_IR_PARAM_COPY=1`, default OFF). It
+works: `resident=3` becomes `resident=4`, `param_copies=1`, the loop bound
+gets a callee-saved register. **It measures zero** — 2.07 s against 2.07/2.08
+for the two control arms, which agree with each other to 0.5%, so that is a
+real zero and not one hidden by noise.
+
+#### Four candidates, four zeros, and what that finally says
+
+| candidate | engaged? | effect |
+|---|---|---|
+| split residency | no (`split_recovered=0`) | census mislabel; nothing to reclaim |
+| implicit null check port | yes (`elided=2`) | ~20% *worse*, then noise |
+| loop-weighted use count | yes (params left `single_use`) | none — allocator had already declined them |
+| parameter prologue copy | yes (`resident` 3→4) | none |
+
+Every one of them was a register-residency or null-check argument, and none of
+them moved a loop that is 1.6x slower at this tier. **The cost is not where any
+of that reasoning says it is**, and the disassembly said so from the start if
+the instruction counts are read per ITERATION rather than per body:
+
+* baseline: 178 instructions covering **four** iterations — about **44 per
+  iteration**, because the tier unrolls 4x;
+* optimizing: 95 instructions for **one** — about **95 per iteration**.
+
+A ratio of roughly 2.2x against a measured 1.6x, which is the only account so
+far that is the right size. The counter compare, the backedge and the
+safepoint poll are each paid once per iteration here and once per four
+iterations there, and no amount of register residency changes that.
+
+**So the remaining named cause is unrolling, and it is the one thing on the
+list that has never been tested.** It should be the next thing tried, and the
+four rows above are the argument for testing it before building anything else:
+on this loop, every hypothesis that was not about instruction COUNT has
+measured zero.
 
 The loop-weight rule is kept, default OFF, because it is a correct
 generalisation that will matter once the parameters can be promoted at all —

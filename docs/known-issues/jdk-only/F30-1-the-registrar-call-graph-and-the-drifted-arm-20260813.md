@@ -15,6 +15,59 @@ on 2026-08-13. Line numbers are post-edit unless marked "pre-edit".
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03. The gate fires.** This record's status
+> was **FIXED-UNVERIFIED-BY-CARGO** — *"This lane did not run `cargo`
+> (build/check/test/clippy)"*, with the new test's logic mutation-checked only
+> *"by a faithful re-implementation run over eight perturbed copies"* (§5.2).
+> `cargo` has now run it, on the real file, in both Cargo configurations.
+>
+> ```text
+>                                                          default   --features synthetic-jdk
+> the_two_real_jdk_arms_run_the_same_registrars_in_the_same_order   ok        ok
+> only_the_synthetic_mode_arm_reaches_register_builtins             ok        ok
+> last_write_wins_ordering_holds_inside_both_real_jdk_arms          ok        ok
+> the_synthetic_jdk_feature_still_implies_management                ok        ok
+> the_feature_off_arm_never_consults_the_runtime_jdk_mode           ok        ok
+> ```
+>
+> **Both configurations really were built.** The two runs report different
+> filtered-out totals — 2,734 tests against 4,257 — so this is two compilations
+> of two different test sets, not the same build scored twice. For a record
+> whose whole subject is that the two arms are compiled by different features,
+> that distinction is the point.
+>
+> **And the gate was mutation-proven against the real file, not a copy.**
+> Deleting one registrar call from real-JDK arm A — `register_collections_natives`
+> at `vm_init.rs:2534`, which is the shape of this record's original defect —
+> turns the witness red and names the drift:
+>
+> ```text
+> the_two_real_jdk_arms_run_the_same_registrars_in_the_same_order ... FAILED
+>   left  [ …, "register_classvalue_natives", "register_random_and_securerandom_natives", … ]
+>   right [ …, "register_classvalue_natives", "register_collections_natives",
+>           "register_random_and_securerandom_natives", … ]
+> ```
+>
+> The mutation was reverted and `vm_init.rs` left byte-identical to `HEAD`.
+> §5.2's eight perturbed copies tested a re-implementation of the logic; this
+> tests the shipped test against the shipped file, which is the half that was
+> missing. Both arms carry **49** registrars, comfortably above the witness's
+> own `len() > 40` parse-collapse floor — so the floor is not what is holding
+> the assertion up.
+>
+> **The original defect is visibly closed in the transcript.** This record's
+> §0 says the `--features synthetic-jdk` build's real-JDK arm was missing four
+> registration passes, *"including the one that stops a seeded
+> `java.util.Random` returning all zeros"*.
+> `register_random_and_securerandom_natives` appears in both arms above.
+>
+> **What this does NOT verify.** These are SOURCE-WITNESS tests: they read
+> `vm_init.rs` as text at run time and assert about its call graph. A green here
+> says the two arms name the same registrars in the same order; it does not say
+> either arm registers the right natives, and no VM was run for this note. §1's
+> four-configuration table and every NOMINATION outside `vm_init.rs` remain
+> unadjudicated — this lane owned that one file, and so does this discharge.
+
 ## 0. The one-paragraph version
 
 `vm_init.rs` has **three** registration arms, not two, and they serve **four**
