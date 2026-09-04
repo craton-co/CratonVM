@@ -34,6 +34,52 @@ labelled SOURCE-VERIFIED where it does.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04.** The provenance line read *"CratonVM
+> column **NOT MEASURED AT ALL**"*. §5's two shadowing findings are ownership
+> claims, and a `--dump-native-registry` run on a binary built from this tree
+> settles both **exactly as written**.
+>
+> **§5.2 — "Seven of `ssl_security.rs`'s ten `SSLSession` doors are dead."**
+> Ten registrations, three own their slot, seven do not:
+>
+> ```text
+> live (owns_slot=true)   getLocalCertificates  getLocalPrincipal  getPeerPrincipal
+> dead (owns_slot=false)  getCipherSuite  getCreationTime  getId  getLastAccessedTime
+>                         getPeerCertificates  getProtocol  isValid
+> ```
+>
+> Ten, three, seven. The in-tree unit test
+> `ssl_security::new13_tests::seven_of_this_files_ssl_session_doors_are_dead_and_three_are_live`
+> also passes, so the claim now holds from both directions — a source witness
+> and a live registry.
+>
+> **§5.1 — "`http_url_connection.rs` overwrites `net_phase_e.rs` for five of six
+> HTTPS accessors."** `net_phase_e.rs` registers exactly six on
+> `HttpsURLConnection`. Five lose the slot; the sixth keeps it:
+>
+> ```text
+> getCipherSuite         net_phase_e.rs:9656  owns=false   -> http_url_connection.rs:665
+> getServerCertificates  net_phase_e.rs:9669  owns=false   -> http_url_connection.rs:625
+> getLocalCertificates   net_phase_e.rs:9692  owns=false   -> http_url_connection.rs:653
+> getPeerPrincipal       net_phase_e.rs:9710  owns=false   -> http_url_connection.rs:695
+> getLocalPrincipal      net_phase_e.rs:9728  owns=false   -> http_url_connection.rs:724
+> getSSLSession          net_phase_e.rs:9746  owns=TRUE    -- the sixth, not overwritten
+> ```
+>
+> Five of six, and the note now names which one survives:
+> `getSSLSession`. `HttpsURLConnectionImpl` shows the same five, the same way.
+>
+> **What this does NOT verify — and it is most of this record.** §§1-1e are a
+> MEASURED HotSpot surface: every accessor in every session state, `SSLEngine`
+> paired in memory, `HttpsURLConnection` end to end. That is the oracle, and
+> **none of it was re-run against CratonVM here.** A registry dump says which
+> function answers a call; it says nothing about what that function returns, so
+> the three MERGE QUESTIONS in §§2-4 — `getSessionContext()`,
+> `getHandshakeSession()` pre-handshake, `getId()` mid-handshake — remain
+> unmeasured on this VM. `RSslLiveSession` and `RSslNullSession` both pass in
+> Compatible and `--jdk-only`, which is consistent with those answers being
+> right and is not evidence that they are.
+
 ## 0. The headline
 
 | merge question | the merge's position | the oracle | outcome |

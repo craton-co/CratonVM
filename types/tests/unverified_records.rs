@@ -136,10 +136,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
     ),
     (
-        "docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/lang_invoke.rs`,",
-    ),
-    (
         "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
         "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
     ),
@@ -150,10 +146,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/G44-1-the-session-the-verifier-was-handed-20260817.md",
         "status block says: predates `aed6a3b73`, so no binary containing either this lane's changes or the",
-    ),
-    (
-        "docs/known-issues/jdk-only/G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled-20260816.md",
-        "status block says: **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,",
     ),
     (
         "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
