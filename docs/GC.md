@@ -778,8 +778,28 @@ one cycle the controller is blind to, and paying for that cycle up front costs
 less than the controller's recovery from it. **Since 2026-09-03 it is the
 default** — a pause target brings a 25 % floor with it unless the operator
 names a percentage. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
-rather than an absence, and is how the "target alone" arm above is measured;
-any other explicit value wins over the floor in both directions.
+rather than an absence, and is how the "target alone" arm is measured; any
+other explicit value wins over the floor in both directions.
+
+The shipped default measured against what it replaced, and against no trigger
+at all — same probe, one binary, switches only:
+
+| `-Xmx` | configuration | wall | pause p50 | worst |
+|---|---|---|---|---|
+| 2048m | no trigger | 11323 ms | 227.8 ms | 276.8 ms |
+| 2048m | target 200 alone (the old default) | 11184 ms | 199.4 ms | 242.1 ms |
+| 2048m | **target 200 + floor 25 (shipped)** | 11234 ms | **92.7 ms** | **116.0 ms** |
+| 4096m | no trigger | 11129 ms | 421.4 ms | 565.6 ms |
+| 4096m | target 200 alone (the old default) | 12449 ms | 147.2 ms | 654.7 ms |
+| 4096m | **target 200 + floor 25 (shipped)** | 11485 ms | 182.6 ms | **227.1 ms** |
+
+At 2048m it more than halves both the median and the worst pause for no wall
+cost at all; at 4096m it cuts the worst pause by 60 % against no trigger and by
+65 % against the target alone, and costs 3 % of wall against no trigger while
+being 8 % FASTER than the old default. The old default was the worse of the
+three on the tail at both sizes — the controller was paying for a first cycle
+it could not see and then recovering from it, which is precisely what the floor
+removes.
 
 
 **Mutators have TLABs on this backend, and since 2026-09-02 the JIT's inline
