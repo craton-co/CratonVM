@@ -432,8 +432,19 @@ static GLOBAL_JIT_DEPTH: cratonvm_types::striped_counter::StripedCounter =
 /// blocked-region transition.
 pub fn xt_pinned_peer_depth_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // DEFAULT ON since 2026-09-04 -- see `helper_window_discharge_enabled` for
+    // the measurement. `CRATONVM_XT_PINNED_PEER_DEPTH=0` is the kill switch.
+    //
+    // This credit was suspected of causing the SIGSEGV on that class for most
+    // of its life, and it did not: the crash was the compaction slide writing
+    // into a decommitted granule (`Arena::ensure_committed_span`). The credit
+    // only ever raised the amount of compaction, and compaction is what runs
+    // slides.
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_DEPTH").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_XT_PINNED_PEER_DEPTH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
@@ -461,8 +472,17 @@ pub fn xt_pinned_peer_publish_only() -> bool {
 /// claims coverage it does not have, and the class SIGSEGVs.
 pub fn xt_peer_shadow_scan_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // DEFAULT ON since 2026-09-04. Without it the pin is incomplete by
+    // construction: a JIT frame's oops live in the shadow stack, a per-thread
+    // HEAP allocation that the register+stack scan cannot see, and a blocked
+    // peer's is scanned by nothing and remapped by nothing. Measured at 2090
+    // heap refs recovered on a 216 s run that registers and stack missed
+    // entirely. `CRATONVM_XT_PEER_SHADOW_SCAN=0` is the kill switch.
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PEER_SHADOW_SCAN").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_XT_PEER_SHADOW_SCAN").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 

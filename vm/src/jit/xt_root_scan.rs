@@ -229,7 +229,22 @@ pub fn helper_window_pin_resolve_enabled() -> bool {
 }
 
 pub fn helper_window_discharge_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_DISCHARGE").is_some()
+    // DEFAULT ON since 2026-09-04. A helper window whose peer is completely
+    // pinned -- register file, whole `[rsp, stack_base)` band, and the peer's
+    // shadow stack -- no longer refuses the collection.
+    //
+    // Measured on `org.h2.test.jdbc.TestCachedQueryResults` with the arena
+    // commit fix in: 5 runs, 0 SIGSEGV, ZERO ref-array OOM, 99953-99978,
+    // completing in 555-728 s, compaction intact at 25 cycles / 545893 objects.
+    // Against 98304 with 1497 OOMs in ~1519 s before. Regression suite 88/88.
+    //
+    // `CRATONVM_XT_HELPER_WINDOW_DISCHARGE=0` is the kill switch: it restores
+    // the blanket refusal, which costs ~6264 OOMs on that class and does not
+    // complete.
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_DISCHARGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
 }
 
 /// Peers the STW cross-thread scan could NOT classify: it signalled them and

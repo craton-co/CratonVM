@@ -1733,7 +1733,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_WAIT_SPURIOUS_MS` | THREADS | `CRATONVM_THREADS=wait-spurious-ms` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_WEAKREF_CLEAR` | GC | `CRATONVM_GC=weakref-clear` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_WIN_HIRES_PARK` | THREADS | `CRATONVM_THREADS=win-hires-park` | default-on | on | behaviour | snapshot | vm |
-| `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` | JIT | `CRATONVM_JIT=xt-helper-window-discharge` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` | JIT | `CRATONVM_JIT=xt-helper-window-discharge` | both | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` | JIT | `CRATONVM_JIT=xt-helper-window-interior` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_HELPER_WINDOW_PIN` | JIT | `CRATONVM_JIT=xt-helper-window-pin` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE` | JIT | `CRATONVM_JIT=xt-helper-window-pin-resolve` | opt-in | off | behaviour | snapshot | vm |
@@ -1743,9 +1743,9 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_XT_JIT_ROOT_SCAN` | JIT | `CRATONVM_JIT=xt-jit-root-scan` | opt-in | off | behaviour | snapshot | jit, vm |
 | `CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE` | JIT | `CRATONVM_JIT=xt-keep-unrewritable-on-discharge` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_PEER_DEADLINE_MS` | JIT | `CRATONVM_JIT=xt-peer-deadline-ms` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_XT_PEER_SHADOW_SCAN` | JIT | `CRATONVM_JIT=xt-peer-shadow-scan` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_XT_PEER_SHADOW_SCAN` | JIT | `CRATONVM_JIT=xt-peer-shadow-scan` | both | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_PEER_TOTAL_MS` | JIT | `CRATONVM_JIT=xt-peer-total-ms` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_XT_PINNED_PEER_DEPTH` | JIT | `CRATONVM_JIT=xt-pinned-peer-depth` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_XT_PINNED_PEER_DEPTH` | JIT | `CRATONVM_JIT=xt-pinned-peer-depth` | both | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` | JIT | `CRATONVM_JIT=xt-pinned-peer-publish-only` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_YOUNGSCAN_STRIDE` | GC | `CRATONVM_GC=youngscan-stride` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_ZGC_ALLOC_TRIGGER` | GC | `CRATONVM_GC=zgc-alloc-trigger` | default-on | on | behaviour | snapshot | gc |
