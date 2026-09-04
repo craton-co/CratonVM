@@ -21888,6 +21888,15 @@ impl DeoptimizationController {
 // (via jit_thread_mut) and the deoptimization controller to invalidate compiled code.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -> i64 {
+    if crate::runtime::env_cache::dbg_jitc() {
+        let pend = jit_thread_mut()
+            .map(|(t, _)| t.jit_pending_exception.is_some())
+            .unwrap_or(false);
+        eprintln!(
+            "[butrap] uncommon_trap reason={reason} bci={bci} pending_exc={pend} npe_set={}",
+            jit_pending_exception_is_set(),
+        );
+    }
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
