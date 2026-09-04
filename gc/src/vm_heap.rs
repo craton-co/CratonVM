@@ -3320,6 +3320,11 @@ impl VmHeap {
                         eprintln!(
                             "[GC] zgc-entry:   tlab refills attempted={att} succeeded={ok};                              bytes_allocated_total={total} (the wedge break's re-arm,                              one break per 64 MB)"
                         );
+                        let (rt, rok) =
+                            cratonvm_types::gc_entry_census::refill_retry_totals();
+                        eprintln!(
+                            "[GC] zgc-entry:   post-break refill retries={rt}                              succeeded={rok} (a success seeds the TLAB, whose                              allocations re-arm the breaker)"
+                        );
                     }
                     for (site, n) in cratonvm_types::gc_entry_census::forced_sites() {
                         eprintln!("[GC] zgc-entry:   forced by {site}: {n}");

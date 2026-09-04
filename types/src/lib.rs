@@ -818,6 +818,35 @@ pub mod gc_entry_census {
         ALLOC_TOTAL_AT_EXIT.store(bytes, Ordering::Relaxed);
     }
 
+    static REFILL_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFILL_RETRY_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+
+    /// The refill RETRY that follows a wedge break, and whether the forced
+    /// collection actually bought a chunk.
+    ///
+    /// Counted apart from the first attempt because it is the only refill
+    /// that can succeed on this backend: the first one is asking a feature
+    /// that is off (`CRATONVM_ZGC_JIT_TLAB`), while the retry runs after a
+    /// coalescing collection. If it succeeds, the TLAB it seeds serves
+    /// allocations that bump `bytes_allocated_total`, which is the wedge
+    /// break's own re-arm -- 64 MB later the breaker fires again. That is a
+    /// LOOP, and this counter is what distinguishes it from a one-off.
+    #[inline]
+    pub fn note_refill_retry(success: bool) {
+        REFILL_RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if success {
+            REFILL_RETRY_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(retry_attempts, retry_successes)`.
+    pub fn refill_retry_totals() -> (u64, u64) {
+        (
+            REFILL_RETRY_ATTEMPTS.load(Ordering::Relaxed),
+            REFILL_RETRY_SUCCESSES.load(Ordering::Relaxed),
+        )
+    }
+
     /// `(attempts, successes, alloc_total)`.
     pub fn refill_totals() -> (u64, u64, u64) {
         (

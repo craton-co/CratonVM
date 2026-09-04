@@ -4310,6 +4310,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             && tlab_refill_wedge_break(thread, shared)
         {
             refill = shared.mem.heap.refill_tlab(requested);
+            cratonvm_types::gc_entry_census::note_refill_retry(refill.is_some());
         }
     } else {
         TLAB_GATE_CONSECUTIVE_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
