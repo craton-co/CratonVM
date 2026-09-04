@@ -124,6 +124,37 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// The pattern in both: **the fixes are usually right.** What is missing is the
 /// run, and a record nobody can act on is worth much less than the work in it.
 ///
+/// # The list reached zero on 2026-09-04, and what that cost
+///
+/// All 61 were paid. The pattern above held for most of them and broke for
+/// four, which is the part worth carrying forward:
+///
+/// * `H13-2` §2 — `ca8f03069` is an ancestor of `HEAD` and the defect
+///   reproduces. A provider written to the documented JCA contract is still
+///   unreachable; the probe the record named could not see it, because that
+///   probe registers no custom provider at all.
+/// * `G9-1` — the fixes landed; `"AΣ".toLowerCase(ROOT)` still gives medial
+///   sigma where the final form is required, 3 of 768 checks.
+/// * `W7-58` — `bb_state`'s missing direct-buffer arm is live, and it kills
+///   the probe partway, so the rows after it are UNTESTED rather than passing.
+/// * `G10-1` — one `doubleValue()` row returns a value no `double` can hold.
+///
+/// So "fixed in source" and "defect closed" are different claims, and this
+/// gate can only ever see the first. `W7-55` measured the same population by
+/// archaeology and concluded the campaign's records "under-retire, never
+/// overclaim" — true of whether a patch is in the tree, and not true of
+/// whether it works.
+///
+/// Two other things this campaign learned the hard way, both of which cost a
+/// wrong answer before they were caught:
+///
+/// * **A vector a record writes out in full is not a vector the suite runs.**
+///   `G10-1` and `G9-1` each embed their vector; neither was ever added, so
+///   the suite reported them ABSENT and a reader would call that passing.
+/// * **A full disk and a compile failure are indistinguishable in `cargo`'s
+///   output.** `cargo test --workspace` returned `cc` link errors across the
+///   tree; `/data` was at 100% and the linker had died with `Bus error`.
+///
 /// One thing the 2026-09-02 run established the hard way: some probes are
 /// arm-specific. `W7-57`/`W7-58`/`W7-70`/`W7-81` name sites registered only
 /// under `--synthetic-jdk`, and a default build produces numbers that measure
@@ -131,66 +162,6 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// reproduce line is `--jdk-only`. Read the record for its arm; do not assume
 /// the neighbour's.
 const ALLOWED: &[(&str, &str)] = &[
-    (
-        "docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md",
-        "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
-    ),
-    (
-        "docs/known-issues/jdk-only/F10-1-the-two-minters-that-told-a-completed-handshake-it-never-happened.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/http_url_connection.rs`, `native-builtins/src/net_phase_e.rs` — this lane's files); NOMINATED (t",
-    ),
-    (
-        "docs/known-issues/jdk-only/F29-1-the-wrapper-class-comes-from-the-call-site-not-the-methodtype-20260813.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/lang_invoke.rs`,",
-    ),
-    (
-        "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
-        "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
-    ),
-    (
-        "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
-        "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
-    ),
-    (
-        "docs/known-issues/jdk-only/G31-1-astype-and-the-verifier-that-was-never-asked-20260817.md",
-        "status block says: --tests` clean), but **no binary carrying them has ever executed**. This lane",
-    ),
-    (
-        "docs/known-issues/jdk-only/G44-1-the-session-the-verifier-was-handed-20260817.md",
-        "status block says: predates `aed6a3b73`, so no binary containing either this lane's changes or the",
-    ),
-    (
-        "docs/known-issues/jdk-only/G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled-20260816.md",
-        "status block says: **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,",
-    ),
-    (
-        "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
-    ),
-    (
-        "docs/known-issues/jdk-only/H12-1-the-osr-door-binds-five-bridge-natives-the-method-entry-door-refuses-20260820.md",
-        "status block says: **Status: MEASURED (the defect) / FIXED-UNVERIFIED (the fix).** The divergence",
-    ),
-    (
-        "docs/known-issues/jdk-only/H2-1-the-filetime-epoch-and-the-queue-lock-20260820.md",
-        "status block says: **Status** `FIXED-UNVERIFIED` — **no binary carrying these changes has been",
-    ),
-    (
-        "docs/known-issues/jdk-only/H20-1-the-direct-call-plan-is-a-second-thing-every-door-builds-20260821.md",
-        "status block says: still not been run.",
-    ),
-    (
-        "docs/known-issues/jdk-only/H24-1-the-module-source-door-and-the-two-modules-a-boot-layer-probe-could-not-see-20260821.md",
-        "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
-        "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
-        "status block says: **Nothing here has been built or run.** Every claim is either `javap` output from",
-    ),
 ];
 
 /// The walk must see at least this many pages, or it is broken rather than the

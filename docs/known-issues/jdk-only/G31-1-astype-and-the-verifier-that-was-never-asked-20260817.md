@@ -20,6 +20,43 @@ Files: `native-builtins/src/lang_invoke.rs`,
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. All seven named vectors are green, and
+> three of this record's own check counts match exactly.** Status was
+> **FIXED-UNRUN**: *"no binary carrying them has ever executed"*, with §5 noting
+> the vectors *"were re-run only in their BEFORE state."*
+>
+> ```text
+>                            HotSpot 25                    CratonVM --jdk-only         differing CK
+> RJdkProxyIface             PASS (38 checks, 9 steps)     PASS (38 checks, 9 steps)        0
+> RSslLiveSession            PASS (95 checks)              PASS (95 checks)                 0
+> RJdkHandles                PASS (331 checks, 40 steps)   PASS (331 checks, 40 steps)      0
+> RJdkLambdas                PASS (38 checks)              PASS (38 checks)                 0
+> RJdkFunctionCombinators    PASS (452 checks)             PASS (452 checks)                0
+> RSslNullSession            PASS (89 checks)              PASS (89 checks)                 0
+> RJdkNet                    PASS (81 checks)              PASS (81 checks)                 0
+> ```
+>
+> **The counts are the corroboration.** This record names three of them —
+> `RJdkHandles` **331**, `RSslNullSession` **89**, `RJdkNet` **81** — and all
+> three match. These are therefore the vectors it measured, not vectors that
+> drifted underneath the record, which is the usual reason a count in a
+> three-week-old page cannot be compared with anything.
+>
+> **The three it flagged as at risk are byte-identical to the oracle.** §5 says
+> *"`RJdkHandles`, `RJdkLambdas` and `RJdkFunctionCombinators` are the ones at
+> risk from fix 1 — they are the vectors that exercise `asType` hardest — and
+> §1.5's under-refusal exists because of them, not in spite of them."* The
+> under-refusal cost them nothing measurable here.
+>
+> **What this does NOT verify — §5's other two items are untouched.** Whether
+> `class_name_of_id` should resolve a hidden class at all is still unswept: the
+> same `None` presumably still reaches every other native that asks, and no
+> probe here looks. NOMINATION 1, `getSSLSession()` identity, is *"diagnosed and
+> located but not fixed"*, and `RSslLiveSession` passing is NOT evidence against
+> it — §5 calls that defect *"the next thing `RSslLiveSession` will report"*,
+> i.e. one this vector does not currently reach. §2's `HttpsURLConnection`
+> verifier analysis is a source and oracle argument and was not re-derived.
+
 ## 0. The headline
 
 | vector / row | before (MEASURED) | after (PREDICTED) |

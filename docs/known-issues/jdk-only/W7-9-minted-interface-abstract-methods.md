@@ -120,6 +120,68 @@ claimed.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. Two of §6's residuals are closed, one
+> is still live — and the live one fails in a DIFFERENT SHAPE than this record
+> predicts.** Status was *"Nothing here has been built or run."*
+>
+> `probes/W79ResidualProbe.java` calls §6's triples directly and prints the
+> outcome class rather than asserting, because three of the five are documented
+> as deliberately-not-fixed and the question is which failure each gives.
+>
+> ```text
+>                                          HotSpot 25                    CratonVM (both arms)
+> Selector.provider()                      EPollSelectorProvider         EPollSelectorProvider
+> DatagramChannel.setOption(SO_RCVBUF)     DatagramChannelImpl           DatagramChannelImpl
+> DatagramChannel.getRemoteAddress() unconn null                          null
+> DatagramChannel.getRemoteAddress() conn   InetSocketAddress             InetSocketAddress
+> DatagramChannel.write(ByteBuffer[],int,int)  Long                       NullPointerException
+> DatagramChannel.read(ByteBuffer[],int,int)   Long                       NullPointerException
+> ```
+>
+> **Residual 1 is confirmed fixed on a binary.** The UPDATED block already
+> records `Selector.provider()` as FIXED 2026-08-12; it now answers
+> `sun.nio.ch.EPollSelectorProvider`, identical to the oracle, in both modes.
+>
+> **Residual 2's premise is STALE, and in the record's favour.** §6 says
+> `setOption` and `getRemoteAddress` *"are dead in the default build"* because
+> `register_datagram_channel` is reached only through
+> `register_synthetic_overrides`, and names a precondition — *"unify the two
+> DatagramChannel layouts first"* — before they could be wired. **Both work in
+> the default build now**, and `getRemoteAddress` is right in BOTH states, which
+> is the harder half: `null` when unconnected and an `InetSocketAddress` when
+> connected. A stand-in that always returned `null` would have passed the first
+> row and failed the second.
+>
+> **Residual 3 is live, and it is NOT the failure this record describes.** §6
+> calls `read([Ljava/nio/ByteBuffer;II)J` and `write` *"genuinely absent, and
+> genuinely reachable"*. An absent native on a minted receiver gives
+> `AbstractMethodError` — that is this record's own §1 mechanism. What actually
+> happens is:
+>
+> ```text
+> NullPointerException: Cannot invoke "java.util.concurrent.locks.ReentrantLock.lock()"
+>                       because "this.writeLock" is null
+> ```
+>
+> That is **real JDK bytecode running** — `DatagramChannelImpl`'s own
+> scattering/gathering path — and finding a field of our minted receiver
+> unpopulated. So the method is not absent; the object is incomplete. The two
+> diagnoses call for different fixes: "add a native" versus "populate
+> `readLock`/`writeLock` when the channel is minted". §8's out-of-file patch is
+> written for the first one.
+>
+> This is the same species as the `ZipOutputStream` NPE recorded in `W7-57`
+> (`"this.names" is null`): our own state, surfacing as an NPE from inside
+> library code, where the caller expected either a result or a named refusal.
+>
+> **What this does NOT verify.** §3's per-class adjudication of eleven classes,
+> §4's two refuted census claims and §5's slot-index residual are `javap` and
+> source arguments; none was re-derived. This probe reaches five triples, not
+> the census. The `--jdk-only` run also logs unrelated refusals for
+> `java/util/Enumeration$Impl` (requested from `classloader.rs:5590` and `:6465`)
+> — noted because it is in the same transcript, NOT investigated, and not this
+> record's.
+
 ## 1. What was being tested
 
 W7-5 established that the VM mints instances **of the real class** — an

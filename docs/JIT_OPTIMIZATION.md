@@ -1016,11 +1016,24 @@ bodies are equal modulo relocations and unequal as bytes. Detecting "unchanged"
 would mean building a relocation table for a case that should not be created in
 the first place.
 
-**And the cost it was going to save is not there.** `epoch_stale_evictions()`
-counts the invoke-cache entries the epoch actually throws away. Over a whole
-CratonBench run: **9**. Over the regex workload: **0**. The invalidation is
-global in reach but each call site evicts once and refills, so the seven
-"wasted" bumps cost nine IC refills, not thousands.
+**And the cost it was going to save is not there** — though not for the reason
+first written here. `epoch_stale_evictions()` counts the invoke-cache entries
+the epoch actually throws away. Over a whole CratonBench run: **9**. Over the
+regex workload: **0**.
+
+**That measurement does not generalize, and this document claimed it did.** On
+an H2 test class (`org.h2.test.db.TestAlter`, 612 compilations) the same counter
+reads **2,640** — roughly 290x the CratonBench figure, because the cost scales
+with live call sites and CratonBench has almost none. The original wording,
+"measured worthless: 9 IC evictions/run", was a micro-benchmark number presented
+as a property of the mechanism.
+
+The *conclusion* survives, on different evidence. On that same H2 run the
+supersede census reads `first_publish=0 unchanged=0 changed=75`: every publish
+replaced a genuinely different body, so every bump was owed, and
+`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` would have skipped **none** of them.
+The switch stays off because there is nothing for it to skip on a real workload,
+not because skipping would be cheap.
 
 So the suppression is implemented, correct, and **off by default**
 (`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1`). Two of the three outcomes
@@ -1143,6 +1156,62 @@ Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
 1502 bytes depending on inlining, and an exact-size probe reads a body that got
 7 bytes bigger as no body at all.
 
+### Why a method falls through: the refusals could not be counted
+
+`bailout.rs`'s own module doc names the gap: of the three ways the compiler says
+"I cannot compile this", `Option::None` from `IrBuilder::build` and
+`ir_lower::lower_inner` "carries no reason at all, so the per-method compiler
+report the review asks for (admitted/bailout counts by reason) cannot be
+produced." It could not, and nothing said so out loud — the per-compilation
+record has carried an empty `bailouts` array since it was added.
+
+Measured before touching anything: over CratonBench, **all 105** compilations
+reported `bailouts:[]`, including the 17 that fell through to single-pass. The
+process-wide category counters were moving the whole time, which is what made
+the hole hard to see — the totals looked alive while every per-method row was
+blank.
+
+Two halves were missing, and both are the same one-line split `verify_or_bail`
+already documents ("attribution, not duplication"): `record_bailout` owns the
+process-wide counters, `metrics::note_current_bailout` attaches the same bailout
+to *this* method. `ir_lower::refuse` did the first and not the second;
+`ir::ir_build_bail` did neither.
+
+With both wired, on `org.h2.test.db.TestAlter` (612 compilations, 50
+fall-throughs) **50 of 50 now name a reason**, where 6 did before:
+
+| reason | phase | count |
+|---|---|---|
+| `unsupported_shape` | build | 38 |
+| `unsupported_opcode` | build | 6 — five `0x53` (`aastore`), one `0x5c` (`dup2`) |
+| `unallocated_value` | lower | 4 |
+| `code_buffer_exhausted` | lower | 2 |
+
+Read with `CRATONVM_JIT_METRICS=1 CRATONVM_JIT_METRICS_OUT=<path>`, one JSON
+object per compilation.
+
+#### What the census then said: a block-placement defect, not a sizing one
+
+The investigation started from the hypothesis that large methods fail on code
+buffer capacity. That is real but rare — 2 of 50. The dominant lowering refusal
+is `unallocated_value`: **a value emitted after its own use**.
+
+    StringUTF16.compress   n21 (Call)    at position 15, used by n34 (Return) at 12
+    Pattern.range          n51 (Cmp(Ne)) at position 51, used by n57 (If)     at 21
+
+`verify_data_locations` models emission as blocks in index order, so a use at 21
+and a def at 51 means the definition's *block* is laid out after its user's.
+`ir_schedule`'s own module doc states the opposite as invariant 1 — the layout
+"keeps every definition before every use, so no live range inverts" — so this is
+a violated invariant, not a missing feature. On H2 it denies the optimizing tier
+to `java/lang/String.equals` and `java/lang/StringLatin1.equals`, among the
+hottest methods in any workload.
+
+Not caused by the 2026-09-02 switches: `CRATONVM_JIT_IR_FUSED_BRANCH=0` and
+`CRATONVM_JIT_IR_LINEAR_SCAN=0` each still produce exactly 3 on CratonBench.
+Left open — correcting global code motion is a change to every compiled method,
+and it wants its own branch and its own per-collector sweep.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -1166,7 +1235,7 @@ Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
 | IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
-| Skip the supersede-epoch bump when it cannot invalidate anything | off (measured worthless: 9 IC evictions/run) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
+| Skip the supersede-epoch bump when it cannot invalidate anything | off (nothing to skip: H2 shows 75/75 publishes genuinely changed) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
@@ -1357,11 +1426,131 @@ far that is the right size. The counter compare, the backedge and the
 safepoint poll are each paid once per iteration here and once per four
 iterations there, and no amount of register residency changes that.
 
-**So the remaining named cause is unrolling, and it is the one thing on the
-list that has never been tested.** It should be the next thing tried, and the
-four rows above are the argument for testing it before building anything else:
-on this loop, every hypothesis that was not about instruction COUNT has
-measured zero.
+#### Unrolling tested: worth a fifth of the gap, not the gap
+
+Tested the cheap way — by removing the advantage from the FAST arm rather than
+building it into the slow one. `CRATONVM_DISABLE_UNROLL=1` turns off the
+baseline's 4x unroll (both its call sites are in `x64/`), so if unrolling
+explains the inversion the baseline should collapse toward the optimizing tier.
+
+| arm | median |
+|---|---|
+| baseline, unrolled | 0.73 |
+| baseline, same config (control) | 0.66 |
+| **baseline, `CRATONVM_DISABLE_UNROLL=1`** | **0.84** |
+| optimizing tier | **1.61** |
+
+Unrolling is worth about **20%** — real, above the ~10% control spread. And it
+is nowhere near the whole gap: the un-unrolled baseline is 0.84 against 1.61,
+**still 1.9x apart**. So the section above overreached in calling instruction
+count per iteration "the only account of the right size"; it is *an* account,
+of about a fifth of it.
+
+#### What that leaves, and the reconciliation the four zeros needed
+
+The remaining 1.9x is per-iteration work that has nothing to do with unrolling,
+and the disassembly names it: the optimizing tier round-trips **every**
+loop-carried value through the frame, roughly eight memory operations against a
+body whose real work is one load and one add.
+
+That also explains why four successive fixes measured zero without any of them
+being wrong. **Each addressed ONE value.** Removing one of eight memory
+operations is ~12% of the loop's memory traffic and a few percent of its time —
+at or under the measurement floor on this host. The four zeros are not evidence
+that frame traffic is innocent; they are evidence that **it cannot be fixed one
+value at a time.**
+
+So the target is the class, not a member of it: the optimizing tier needs
+loop-carried values to stay in registers *as a group*, which means the
+write-through publish (a store at every definition, a load at every publish)
+and the per-value residency policy both have to give way to something that
+treats a loop's live set as one decision. That is a larger change than any of
+the four, and it is the first one whose expected effect is above the noise
+floor rather than under it.
+
+#### Confirmed: register residency is 1.57x of it
+
+Tested the same way, by taking the advantage away from the fast arm.
+`CRATONVM_JIT_LOCAL_REGS=0` truncates the baseline's local-colouring pool to
+empty, so every Java local lives in the frame — the optimizing tier's situation,
+imposed on the tier that normally wins.
+
+| arm | median | vs baseline |
+|---|---|---|
+| baseline | 1.33 | — |
+| baseline, same config (control) | 1.27 | — |
+| **baseline, `CRATONVM_JIT_LOCAL_REGS=0`** | **2.04** | **1.57x** |
+| baseline, no locals **and** no unroll | 2.28 | 1.75x |
+| optimizing tier | 3.09 | 2.38x |
+
+(A busier host than the unrolling table above, so the absolute numbers are
+larger; only the within-run ratios are being read, and the control pair agrees
+to 5%.)
+
+**Spilling the loop-carried values alone costs the baseline 1.57x** — the
+single largest factor found, and it moves the baseline most of the way to the
+optimizing tier without touching anything else. Adding the unroll loss brings
+it to 1.75x of a 2.38x gap: about **two thirds of the inversion**, with
+register residency the dominant share and unrolling roughly 1.12x on top.
+
+#### The residual 1.36x: latency, not volume
+
+Chased, and it is not what the rest of this section assumed. Both tiers were
+disassembled at MATCHED settings — baseline with `CRATONVM_JIT_LOCAL_REGS=0`
+and `CRATONVM_DISABLE_UNROLL=1`, so both spill and neither unrolls — and
+counted:
+
+| | baseline (matched) | optimizing |
+|---|---|---|
+| loop-body instructions | 108 | **95** |
+| distinct frame slots touched | 24 | **15** |
+| memory `mov`s in the body | 41 | **32** |
+| time | 2.23 | **3.01** |
+
+**The optimizing tier does less of everything and takes 1.36x longer.** So the
+residual is not instruction count, not memory-operation count, and not slot
+count — every volume measure points the wrong way. The
+"instructions per iteration" framing earlier in this section explains the
+unrolling fifth and nothing beyond it.
+
+`CRATONVM_JIT_KERNEL_REG_LOCALS=0`, which makes the baseline's operand-stack
+scratch cache inert, moved the matched arm not at all (2.23 against 2.23), so
+that is not it either.
+
+**It is a dependency chain.** A probe with four INDEPENDENT accumulators
+(`a+=this.fx; b+=this.fx; c+=this.fx; d+=this.fx;`) instead of one shrinks the
+gap from **1.36x to 1.18x**, with the two control arms landing on 1.41 and
+1.41. Independent work overlaps a stall; it cannot overlap extra instructions.
+That is the signature of a latency bottleneck, and the disassembly shows the
+mechanism: the optimizing tier's body is a chain of store-then-load pairs on
+the same slot two instructions apart —
+
+```text
+1f5: mov [rbp-88h],rax      ; store the loaded field
+1fc: mov rax,[rbp-78h]
+200: mov rcx,[rbp-88h]      ; reload it, two instructions later
+207: add eax,ecx
+209: mov [rbp-90h],rax      ; and the accumulator goes back to memory
+```
+
+— with the accumulator itself crossing the back edge through the frame, so
+every iteration waits on the previous one's store.
+
+The exact stall could not be named: this host is a VM without PMU passthrough
+(`perf stat` reports `<not supported>` for cycles and instructions), so
+store-forwarding latency is the likely mechanism rather than the measured one.
+
+**What this changes.** It strengthens the register-residency conclusion rather
+than competing with it: keeping a loop's live set in registers removes the
+memory round trip *and* the chain that round trip creates. And it explains the
+four zeros a second way — shortening a serial chain by one link out of several
+does not speed it up. Both readings say the same thing: **the live set has to
+move as a group, or not at all.**
+
+**So the recommendation stands and now has a number behind it.** Getting a
+loop's live set into registers *as a group* is worth about 1.57x on this shape.
+That is an order of magnitude above the measurement floor that swallowed all
+four single-value fixes, which is exactly why it is the one worth building.
 
 The loop-weight rule is kept, default OFF, because it is a correct
 generalisation that will matter once the parameters can be promoted at all —
