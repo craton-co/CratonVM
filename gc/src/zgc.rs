@@ -5460,7 +5460,7 @@ impl ZgcRealHeap {
             // `hand_out`. A slide does not: it picks `to` arithmetically and
             // memmoves. So the first slide after a give-back wrote into a
             // `PROT_NONE` granule and died inside `memcpy`, which is what
-            // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+            // `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
             // recorded as "the fault address is always a page boundary, `rdi`
             // equal to it, fault pc inside libc".
             if to != from && !arena.commit_for_relocation(to - base, size) {

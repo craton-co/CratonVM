@@ -12616,8 +12616,8 @@ fn box_unbox_intrinsic_disabled() -> bool {
             return true;
         }
         // DEFAULT ON AGAIN (2026-09-04). The mitigation this replaced existed
-        // for exactly one reason -- `known-issues/jit/
-        // bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`'s SIGSEGV
+        // for exactly one reason -- the SIGSEGV recorded in `fixed-bugs/
+        // zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
         // -- and that crash was not this intrinsic's. It was
         // `ZgcRealHeap`'s relocation slides writing into arena granules
         // `Arena::decommit_free_blocks` had already returned to the OS; the
@@ -12715,10 +12715,11 @@ pub fn try_resolve_box_unbox_intrinsic(
 ///
 /// Whether the family is ENABLED and whether a triple is one of the two it
 /// serves are separate questions, and only the second is what those tests are
-/// about. Keeping them separate means the tests go on guarding the match when
-/// the default flips back — which is the plan, once the relocation defect in
-/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-/// is closed.
+/// about. Keeping them separate meant the tests went on guarding the match
+/// across the default's two flips — off on 2026-09-02 for a crash that was the
+/// collector's, and on again on 2026-09-04 once
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+/// closed it.
 pub(crate) fn box_unbox_intrinsic_shape(
     class: &str,
     name: &str,
