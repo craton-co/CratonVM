@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-322 tokens.
+331 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -885,6 +885,15 @@ export inherited from a parent shell.
 | `verify-types` | `CRATONVM_JIT_VERIFY_TYPES` |
 | `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
 | `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
+| `xt-pinned-peer-depth` | `CRATONVM_XT_PINNED_PEER_DEPTH` |
+| `xt-pinned-peer-publish-only` | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` |
+| `xt-peer-shadow-scan` | `CRATONVM_XT_PEER_SHADOW_SCAN` |
+| `dbg-stale-frame-words` | `CRATONVM_DBG_STALE_FRAME_WORDS` |
+| `pin-unnamed-frame-refs` | `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS` |
+| `remap-unmapped-dupes` | `CRATONVM_JIT_REMAP_UNMAPPED_DUPES` |
+| `local-mask-unreached-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` |
+| `xt-keep-unrewritable-on-discharge` | `CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE` |
+| `xt-helper-window-pin-resolve` | `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE` |
 | `xt-helper-window-interior` | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` |
 | `xt-helper-window-pin` | `CRATONVM_XT_HELPER_WINDOW_PIN` |
 | `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
@@ -910,7 +919,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-127 tokens.
+130 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -919,6 +928,9 @@ export inherited from a parent shell.
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
+| `zgc-jit-blanket-refusal` | `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` |
+| `blocked-wake-jit-remap` | `CRATONVM_BLOCKED_WAKE_JIT_REMAP` |
+| `zgc-unrewritable-peer-refuses` | `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |
