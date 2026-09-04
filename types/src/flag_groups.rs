@@ -710,6 +710,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "moving-young-band-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_DBG"), off_key: None, off_word: None, since: "2026-07-26" },
+    E { group: Group::GC, token: "moving-young-band-skip-in-map", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "moving-young-coverage-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_COVERAGE_DBG"), off_key: None, off_word: None, since: "2026-07-01" },
     E { group: Group::DBG, token: "moving-young-fallbacks", on_key: Some("CRATONVM_MOVING_YOUNG_FALLBACKS"), off_key: None, off_word: None, since: "2026-07-01" },
     E { group: Group::DBG, token: "moving-young-no-band-verify", on_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY"), off_key: None, off_word: None, since: "2026-07-26" },
@@ -1955,7 +1956,12 @@ pub const INVENTORY: &[E] = &[
     // the one the JIT's inline `new` and the TLAB-miss path already use. Off by
     // default because the single previous attempt at this unification
     // miscompiled `probes/FjpProbe.java`; see `compact_tlab_alloc_enabled`.
-    E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON opt-out since 2026-09-03: `compact_tlab_alloc_enabled` reads
+    // `0`. It shipped opt-in the same day and earned the default with a
+    // 228-program differential soak per collector, 89/89 on the
+    // HotSpot-differential regression suite with the shape enabled, and a real
+    // application allocating 87.5 MB less.
+    E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // Bisection levers for the shape above: which sites may plan compact, and
     // which classes actually did. Both exist because the first miscompile it
     // exposed cost a rebuild per hypothesis until they did not.

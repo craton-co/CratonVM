@@ -12,6 +12,47 @@ Every claim is **MEASURED** (this lane ran it today) or **ARGUED** (read it).
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04, partially — falsifier 2 is answered,
+> falsifier 1 could not be observed.** Status was **FIXED IN SOURCE, NOT
+> VERIFIED BY AN ARM**: *"read, reasoned about and committed, and never
+> executed."*
+>
+> **Falsifier 2, "the load-bearing negative control", does not fire.**
+> `RJdkModule` was predicted to go red if the change is wrong. It passes, in
+> both modes, and so do its two siblings — run through
+> `regression-suite/run.sh`, which is the harness that builds the
+> `--module-path` these vectors need:
+>
+> ```text
+> RJdkModule                  PASS   (compatible and --jdk-only)
+> RJdkServices                PASS   19 checks
+> RServiceLoaderDoubleSource  PASS
+> ```
+>
+> `RServiceLoaderDoubleSource` passing is the substantive one: this record's
+> measured before-state is that *"the vector then dies at
+> `RServiceLoaderDoubleSource.java:490`"*. It no longer dies.
+>
+> **Falsifier 1 is NOT settled here, and the reason is mine, not the VM's.**
+> The check is whether the diagnostic still prints `providers=2`. No `[SL-DBG]`
+> line could be captured: through `run.sh` the diagnostic did not reach the
+> captured output, and invoked directly — even with the suite's own
+> `--module-path regression-suite/build-modules --add-modules
+> cratonvm.jdkonly.svc` — the vector produces no output at all, so that
+> invocation is not the harness's and its silence is evidence about my command
+> line, not about the filter. **No claim is made about `providers=`.**
+>
+> That matters because this record says the two consequences travel together:
+> *"the filter is not reaching this module and `desc.automatic` is false for it
+> — which would also make `E4-R11`'s boot-layer guard inert, contradicting the
+> `:459` assertion that passes today."* The half that could be checked — the
+> vectors — is green. The half that names the mechanism is unmeasured.
+>
+> **What this does NOT verify.** The diagnosis in §1 was MEASURED on
+> `cratonvm-r8.exe` and is not re-derived. The two modules a boot-layer probe
+> could not see are the record's subject and no probe here looks for them; a
+> green vector is not a census. Nothing here is `--synthetic-jdk`.
+
 ## 1. The diagnosis is live, not stale — re-measured before acting
 
 `D1-R11`'s fix landed and its diagnosis expired; `H15-3` said so, and a triage

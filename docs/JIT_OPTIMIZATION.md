@@ -1426,11 +1426,131 @@ far that is the right size. The counter compare, the backedge and the
 safepoint poll are each paid once per iteration here and once per four
 iterations there, and no amount of register residency changes that.
 
-**So the remaining named cause is unrolling, and it is the one thing on the
-list that has never been tested.** It should be the next thing tried, and the
-four rows above are the argument for testing it before building anything else:
-on this loop, every hypothesis that was not about instruction COUNT has
-measured zero.
+#### Unrolling tested: worth a fifth of the gap, not the gap
+
+Tested the cheap way — by removing the advantage from the FAST arm rather than
+building it into the slow one. `CRATONVM_DISABLE_UNROLL=1` turns off the
+baseline's 4x unroll (both its call sites are in `x64/`), so if unrolling
+explains the inversion the baseline should collapse toward the optimizing tier.
+
+| arm | median |
+|---|---|
+| baseline, unrolled | 0.73 |
+| baseline, same config (control) | 0.66 |
+| **baseline, `CRATONVM_DISABLE_UNROLL=1`** | **0.84** |
+| optimizing tier | **1.61** |
+
+Unrolling is worth about **20%** — real, above the ~10% control spread. And it
+is nowhere near the whole gap: the un-unrolled baseline is 0.84 against 1.61,
+**still 1.9x apart**. So the section above overreached in calling instruction
+count per iteration "the only account of the right size"; it is *an* account,
+of about a fifth of it.
+
+#### What that leaves, and the reconciliation the four zeros needed
+
+The remaining 1.9x is per-iteration work that has nothing to do with unrolling,
+and the disassembly names it: the optimizing tier round-trips **every**
+loop-carried value through the frame, roughly eight memory operations against a
+body whose real work is one load and one add.
+
+That also explains why four successive fixes measured zero without any of them
+being wrong. **Each addressed ONE value.** Removing one of eight memory
+operations is ~12% of the loop's memory traffic and a few percent of its time —
+at or under the measurement floor on this host. The four zeros are not evidence
+that frame traffic is innocent; they are evidence that **it cannot be fixed one
+value at a time.**
+
+So the target is the class, not a member of it: the optimizing tier needs
+loop-carried values to stay in registers *as a group*, which means the
+write-through publish (a store at every definition, a load at every publish)
+and the per-value residency policy both have to give way to something that
+treats a loop's live set as one decision. That is a larger change than any of
+the four, and it is the first one whose expected effect is above the noise
+floor rather than under it.
+
+#### Confirmed: register residency is 1.57x of it
+
+Tested the same way, by taking the advantage away from the fast arm.
+`CRATONVM_JIT_LOCAL_REGS=0` truncates the baseline's local-colouring pool to
+empty, so every Java local lives in the frame — the optimizing tier's situation,
+imposed on the tier that normally wins.
+
+| arm | median | vs baseline |
+|---|---|---|
+| baseline | 1.33 | — |
+| baseline, same config (control) | 1.27 | — |
+| **baseline, `CRATONVM_JIT_LOCAL_REGS=0`** | **2.04** | **1.57x** |
+| baseline, no locals **and** no unroll | 2.28 | 1.75x |
+| optimizing tier | 3.09 | 2.38x |
+
+(A busier host than the unrolling table above, so the absolute numbers are
+larger; only the within-run ratios are being read, and the control pair agrees
+to 5%.)
+
+**Spilling the loop-carried values alone costs the baseline 1.57x** — the
+single largest factor found, and it moves the baseline most of the way to the
+optimizing tier without touching anything else. Adding the unroll loss brings
+it to 1.75x of a 2.38x gap: about **two thirds of the inversion**, with
+register residency the dominant share and unrolling roughly 1.12x on top.
+
+#### The residual 1.36x: latency, not volume
+
+Chased, and it is not what the rest of this section assumed. Both tiers were
+disassembled at MATCHED settings — baseline with `CRATONVM_JIT_LOCAL_REGS=0`
+and `CRATONVM_DISABLE_UNROLL=1`, so both spill and neither unrolls — and
+counted:
+
+| | baseline (matched) | optimizing |
+|---|---|---|
+| loop-body instructions | 108 | **95** |
+| distinct frame slots touched | 24 | **15** |
+| memory `mov`s in the body | 41 | **32** |
+| time | 2.23 | **3.01** |
+
+**The optimizing tier does less of everything and takes 1.36x longer.** So the
+residual is not instruction count, not memory-operation count, and not slot
+count — every volume measure points the wrong way. The
+"instructions per iteration" framing earlier in this section explains the
+unrolling fifth and nothing beyond it.
+
+`CRATONVM_JIT_KERNEL_REG_LOCALS=0`, which makes the baseline's operand-stack
+scratch cache inert, moved the matched arm not at all (2.23 against 2.23), so
+that is not it either.
+
+**It is a dependency chain.** A probe with four INDEPENDENT accumulators
+(`a+=this.fx; b+=this.fx; c+=this.fx; d+=this.fx;`) instead of one shrinks the
+gap from **1.36x to 1.18x**, with the two control arms landing on 1.41 and
+1.41. Independent work overlaps a stall; it cannot overlap extra instructions.
+That is the signature of a latency bottleneck, and the disassembly shows the
+mechanism: the optimizing tier's body is a chain of store-then-load pairs on
+the same slot two instructions apart —
+
+```text
+1f5: mov [rbp-88h],rax      ; store the loaded field
+1fc: mov rax,[rbp-78h]
+200: mov rcx,[rbp-88h]      ; reload it, two instructions later
+207: add eax,ecx
+209: mov [rbp-90h],rax      ; and the accumulator goes back to memory
+```
+
+— with the accumulator itself crossing the back edge through the frame, so
+every iteration waits on the previous one's store.
+
+The exact stall could not be named: this host is a VM without PMU passthrough
+(`perf stat` reports `<not supported>` for cycles and instructions), so
+store-forwarding latency is the likely mechanism rather than the measured one.
+
+**What this changes.** It strengthens the register-residency conclusion rather
+than competing with it: keeping a loop's live set in registers removes the
+memory round trip *and* the chain that round trip creates. And it explains the
+four zeros a second way — shortening a serial chain by one link out of several
+does not speed it up. Both readings say the same thing: **the live set has to
+move as a group, or not at all.**
+
+**So the recommendation stands and now has a number behind it.** Getting a
+loop's live set into registers *as a group* is worth about 1.57x on this shape.
+That is an order of magnitude above the measurement floor that swallowed all
+four single-value fixes, which is exactly why it is the one worth building.
 
 The loop-weight rule is kept, default OFF, because it is a correct
 generalisation that will matter once the parameters can be promoted at all —

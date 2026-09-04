@@ -922,12 +922,13 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-133 tokens.
+134 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
+| `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
