@@ -1,5 +1,80 @@
 # The box/unbox intrinsic SIGSEGVs under a relocating collector
 
+## ROOT CAUSE FOUND 2026-09-04 -- it is not a stale root at all
+
+The compaction SLIDE writes into a granule the arena DECOMMITTED.
+
+`relocate_stw` picks a slide destination and copies a survivor into it on a
+SAFETY argument that says `to` "is inside the arena and strictly below `from`".
+Inside the arena is NOT committed: the arena reserves address space and commits
+granules on demand, and `decommit_unbumped_middle` / `decommit_free_blocks` hand
+granules back to the OS while their addresses stay reserved. The destination
+search screens by page and by liveness and never by COMMIT STATE.
+
+Observed, not inferred. A fault-time witness (`gc::reloc_witness`, a granule
+bitmap read from the signal handler) reports on every crash:
+
+| | Z-bm1 | Z-bm4 |
+|---|---|---|
+| faulting access | **write** at `0x2B1F44A0000` | **write** at `0x23EF57A0000` |
+| decommitted span | `[0x2B1F44A0000, 0x2B1F46A0000)` | `[0x23EF57A0000, 0x23EF59A0000)` |
+| decommitted by cycle | 15 | 21 |
+| **offset into span** | **0x0** | **0x0** |
+| frame | `relocate_stw+0x2ECE` | same |
+
+Four facts, each killing a class of explanation: it is a **WRITE** (every repair
+attempted assumed a stale reference being DEREFERENCED); the offset is **0x0**,
+the granule BASE, where no object pointer lands twice by chance; the span is
+exactly one 2 MiB `reservation::GRANULE`, which is commit geometry and not heap
+geometry; and the frame is the slide's own `ptr::copy`, not compiled code.
+
+**So this page's framing was wrong.** "A reference held in a live JIT frame that
+relocation moved without rewriting, a root the safepoint's oop map does not
+name" describes no part of this. No stale root is involved.
+
+That also explains why `RELOCATE_UNDER_PROVEN_JIT=0` and the box/unbox intrinsic
+both looked causal. Neither is: both change how much COMPACTION happens, and
+compaction is what runs slides. The intrinsic's speedup raises allocation
+pressure, the switch removes relocation outright -- each moves the number of
+slides, which moves the chance of landing in a decommitted granule.
+
+### The fix, and its cost
+
+`Arena::ensure_committed_span` commits the destination before the copy; a commit
+that fails leaves the object where it is. Measured on
+`org.h2.test.jdbc.TestCachedQueryResults`, 5 runs:
+
+| | before | after |
+|---|---|---|
+| SIGSEGV | 2-3 of 4 | **0 of 5** |
+| ref-array OOM | 1497 | **0** |
+| `actual` | 98304 | **99953-99978** |
+| completes | ~1519 s | 555-728 s |
+| compaction | -- | 25 cycles, 545893 objects |
+
+Regression suite 88/88. It costs nothing because it COMMITS memory rather than
+refusing to relocate -- unlike every guard measured on this family, which bought
+safety at 2570-14514 fragmentation OOMs and total loss of completion.
+
+Same shape as the `gen_evac` parallel-copy fault fixed 2026-09-02: a path that
+bypasses `Arena::hand_out` commits nothing.
+
+### Method note, worth more than the fix
+
+Seven repairs were proposed, implemented and measured before this, all aimed at
+"which reference went stale" -- unnamed frame slots, duplicate homes, unreached
+local masks, blocked-peer remap, misaligned interiors, one-past-the-end cursors,
+and two blanket refusals. None could work, because the category was wrong.
+
+Every measurement was consistent with the stale-root framing AND with the truth,
+so nothing forced the question. What broke it was an instrument that reports
+FACTS rather than adjudicating a hypothesis -- and the three facts that settled
+it (write, offset 0x0, `relocate_stw`'s own frame) were present in the very
+first crash dump.
+
+**When repeated targeted fixes all fail to move a defect, that is evidence the
+CATEGORY is wrong, not that the next candidate inside it is closer.**
+
 ## Status
 
 **OPEN (root cause), MITIGATED (default flipped) 2026-09-02.** The stated
