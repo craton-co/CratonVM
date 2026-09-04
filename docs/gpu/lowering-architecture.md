@@ -169,9 +169,40 @@ element width — was backwards at the narrow end.
 It may still hold at the wide end. `long[]` is a consistent ~1.55x LOSS
 in cold mode (5/5 runs, tight spread) because `--gpu-min-work` counts
 ELEMENTS, so an 8-byte-per-element kernel is admitted on the same terms
-as a 1-byte one. That is one synthetic kernel at minimal arithmetic
-intensity and is not on its own grounds to change a default; `double[]`
-was too noisy to call. Recorded here as measured, not acted on.
+as a 1-byte one.
+
+**Followed up 2026-09-03 by sweeping arithmetic intensity, and it
+refutes the fix.** The measurement above is one kernel at one op per
+element, which is the worst case BY CONSTRUCTION: transfer dominates
+most exactly there, so of course the widest type loses. Holding bytes
+moved constant and varying only compute (`GpuIntensitySweep`, 1 / 4 / 16
+fused multiply-adds per element, n=131072, cold, 31% host load):
+
+| type | 1 op | 4 ops | 16 ops | crossover |
+|---|---|---|---|---|
+| `byte[]` | 2.14x | 3.47x | 6.65x | below 1 op |
+| `int[]` | 0.64x | 1.16x | 3.78x | ~2 ops |
+| `double[]` | 0.43x | 1.00x | 4.77x | ~4 ops |
+| `long[]` | 0.40x | 0.72x | 1.95x | ~8 ops |
+
+The crossover does scale with element width, so the hypothesis was right
+in direction. **It is still the wrong lever.** `--gpu-min-work` counts
+elements, and the deciding variable is arithmetic intensity, which is a
+property of the kernel BODY. Scaling that threshold by width would
+refuse a large `long[]` kernel doing 16 ops per element -- which wins
+1.95x -- while still admitting a small one doing 1 op, which loses
+0.40x, as long as it cleared the raised bar. It gates on the wrong axis.
+
+Note also that `int[]` loses at 1 op (0.64x) and not only `long[]`, where
+the earlier round measured `int[]` cold at 1.03-1.31x on a nominally
+identical shape. That discrepancy is unexplained; treat both tables as
+indicative rather than settled.
+
+The better-founded proposal, not implemented: the analyzer already walks
+the kernel body, so it could estimate ops-per-element and combine that
+with the element width to predict the transfer:compute ratio, admitting
+on the ratio rather than on a count. That is a design change and should
+not be landed off one synthetic sweep. **No default was changed.**
 
 ### Symptom 2: pattern matching where analysis belongs
 
