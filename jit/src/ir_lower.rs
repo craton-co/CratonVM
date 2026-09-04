@@ -3143,6 +3143,7 @@ impl<'a> Lowerer<'a> {
         // Cast: a compact field offset plus the header is bounded by the
         // object size.
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_COMPACT);
         self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
         self.buf.emit(&cell_off.to_le_bytes());
         let stored = self.emit_jmp_rel32();
@@ -3154,6 +3155,7 @@ impl<'a> Lowerer<'a> {
         // makes `field_index * SLOT_SIZE` addressable, since for a legacy
         // object `num_slots` counts exactly these cells.
         self.patch_rel32_to_here(legacy_shape);
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_LEGACY);
         let legacy_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
         self.emit_mov_reg_imm64(R10, u64::from(cratonvm_types::FIELD_CELL_TAG_OBJECT));
         self.buf.emit(&[0x4C, 0x89, 0x90]); // MOV [RAX + disp32], R10
