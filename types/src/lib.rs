@@ -68,7 +68,8 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
-    compact_tlab_body_size, single_layout_domain,
+    compact_tlab_body_size, layout_replace_epoch, layout_replace_epoch_guard,
+    single_layout_domain,
     foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
     next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
     register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
