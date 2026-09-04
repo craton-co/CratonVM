@@ -40,7 +40,7 @@ use cratonvm_jit::deopt::{FrameValue, ReconstructedFrame, VirtualObjectState};
 use cratonvm_types::ClassId;
 
 use crate::error::{MethodCallFailed, VmError};
-use crate::runtime::interpreter::{alloc_object_shared, maybe_gc_forced_pub};
+use crate::runtime::interpreter::{alloc_object_shared, maybe_gc_forced_pub_at};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::SharedVm;
@@ -267,7 +267,7 @@ pub(crate) fn materialize_virtual_objects(
             // a collection, and that a moving collector forwards the pinned entries
             // in place.
             let t = scope.thread();
-            maybe_gc_forced_pub(shared, t);
+            maybe_gc_forced_pub_at(shared, t, "deopt-materialize");
         }
     }
 

@@ -1053,12 +1053,24 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         zgc_concurrent_mark_cycle(shared, thread);
     }
 
-    if shared.mem.heap.needs_gc()
-        || shared
+    // Evaluated into named locals rather than left in the `||`: the two
+    // halves are different answers to "why did this cycle happen", and the
+    // latch half is invisible to `[GC] zgc-trigger` because it never asks
+    // `needs_gc`. Short-circuiting is preserved -- `needs_gc()` first, and
+    // the swap only when it says no -- so the latch is still consumed
+    // exactly when it was before.
+    let entry_needs = shared.mem.heap.needs_gc();
+    let entry_requested = !entry_needs
+        && shared
             .mem
             .gc_requested
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-    {
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+    if entry_needs || entry_requested {
+        if entry_needs {
+            cratonvm_types::gc_entry_census::note_maybe_gc_needs();
+        } else {
+            cratonvm_types::gc_entry_census::note_maybe_gc_requested();
+        }
         // Retire TLAB before GC — its memory is in from-space
         thread.tlab.retire();
         // Round-5 fix (CRIT — UAF): the GC initiator never passes through
@@ -1432,7 +1444,12 @@ pub(super) fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) ->
 }
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "unlabelled")
+}
+
+/// [`maybe_gc_forced_pub`] with the caller's identity, for the census.
+pub fn maybe_gc_forced_pub_at(shared: &SharedVm, thread: &mut JvmThread, site: &'static str) {
+    maybe_gc_forced_at(shared, thread, site)
 }
 
 /// `zgc_concurrent_mark_cycle` for the JIT allocation helpers.
@@ -1472,7 +1489,7 @@ pub(crate) fn create_string_or_oom(
     // then G1's last-ditch complete mark cycle (dead Old/humongous spans are
     // only reclaimed by a finished cycle's cleanup), then OOM.
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "create-string");
     if let Some(obj) = try_new_string(shared, text) {
         return Ok(obj);
     }
@@ -1504,7 +1521,7 @@ pub(crate) fn create_string_from_units_or_oom(
         return Ok(obj);
     }
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "create-string-units");
     if let Some(obj) = try_new_string(shared, units) {
         return Ok(obj);
     }
@@ -1521,6 +1538,16 @@ pub(crate) fn create_string_from_units_or_oom(
 }
 
 pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
+    maybe_gc_forced_at(shared, thread, "unlabelled")
+}
+
+/// [`maybe_gc_forced`] with the caller's identity, for the census.
+pub(super) fn maybe_gc_forced_at(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    site: &'static str,
+) {
+    cratonvm_types::gc_entry_census::note_forced_at(site);
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
     // failure / `create_exception_object`) was the one GC initiator that did NOT
@@ -1823,6 +1850,7 @@ pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
 /// Runs GC with finalizer-aware resurrection, processes references,
 /// and invokes pending finalizers.
 pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
+    cratonvm_types::gc_entry_census::note_from_native();
     // Retire TLAB before GC
     thread.tlab.retire();
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
@@ -3807,7 +3835,7 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
     }
     TLAB_GATE_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "tlab-refill-wedge");
     true
 }
 
@@ -4171,7 +4199,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
             TLAB_REFILL_BYTES_SINCE_GC.store(0, Ordering::Relaxed);
             thread.tlab.retire();
-            maybe_gc_forced(shared, thread);
+            maybe_gc_forced_at(shared, thread, "tlab-alloc-shaped");
         } else if refilled >= NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES {
             // Consulted and declined: re-arm the bytes stamp so the next
             // consult is another 4 MiB away rather than on every refill.
@@ -4495,7 +4523,7 @@ pub(crate) fn alloc_object_shared(
     }
     // Retire TLAB before GC — its memory is in the arena that will be collected
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "alloc-object-shared");
     // GC-overhead limit: if repeated forced GCs have freed almost nothing, the
     // heap is full of live objects — declare OOM now rather than retrying into a
     // death-spiral (a sliver freed each cycle would otherwise let allocation
@@ -4705,7 +4733,7 @@ pub(crate) fn gc_alloc_array(
     }
     // Retire TLAB before GC
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "gc-alloc-array");
     // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
     // GC-thrashing rather than spinning on slivers.
     if gc_overhead_limit_exceeded(shared) {
@@ -6806,7 +6834,7 @@ fn last_ditch_clear_soft_refs(shared: &SharedVm, thread: &mut JvmThread) {
     }
     thread.tlab.retire();
     crate::runtime::interpreter::with_last_ditch_soft_clear(|| {
-        maybe_gc_forced(shared, thread);
+        maybe_gc_forced_at(shared, thread, "last-ditch-soft-refs");
     });
 }
 
