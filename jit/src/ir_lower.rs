@@ -922,6 +922,20 @@ struct Lowerer<'a> {
     /// `graph.safepoints` and the allocator's positions is needed, and the
     /// question "is the register still his at THIS bci" cannot be got wrong.
     deopt_nameable: Vec<bool>,
+    /// `home_dropped[id]` — this value's home word is never written, so reading
+    /// it would read whatever the last tenant of that frame word left there.
+    ///
+    /// [`Self::slot_of`] refuses such a read and fails the compile, which costs
+    /// coverage (the method runs in a lower tier) and can never be a wrong
+    /// answer. That is deliberately the opposite trade from enumerating the
+    /// readers into a whitelist: a whitelist that is wrong is a silent
+    /// miscompile, and a refusal that is wrong is a census entry.
+    home_dropped: Vec<bool>,
+    /// How many stores were dropped, and how many `slot_of` reads refused.
+    /// A non-zero refusal count names work: the reader wants converting to
+    /// `gp_load_value`. `Cell` because `slot_of` takes `&self`.
+    home_stores_dropped: usize,
+    home_read_refusals: std::cell::Cell<usize>,
     /// How many frame-state slots were described by a register. Engagement, and
     /// `Cell` because `frame_value_for` takes `&self`.
     deopt_reg_named: std::cell::Cell<usize>,
@@ -1390,6 +1404,9 @@ impl<'a> Lowerer<'a> {
             phi_copy_reg_publishes: 0,
             deopt_nameable: Vec::new(),
             deopt_reg_named: std::cell::Cell::new(0),
+            home_dropped: Vec::new(),
+            home_stores_dropped: 0,
+            home_read_refusals: std::cell::Cell::new(0),
             use_count: Vec::new(),
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
@@ -1418,6 +1435,11 @@ impl<'a> Lowerer<'a> {
         // register, and a value is nameable only if the answer for its own is
         // one. See the field comment for why "resident" is not enough.
         self.deopt_nameable = vec![false; self.gp_reg_of.len()];
+        self.home_dropped = vec![false; self.gp_reg_of.len()];
+        // Filled at the bottom of this function, once `deopt_nameable` is
+        // known. **Up front, not lazily at the first edge copy**: `slot_of` has
+        // to refuse from the first instruction emitted, or a read that happens
+        // to precede the copy would silently take the unwritten word.
         if ir_deopt_regs_enabled() {
             let mut holders = [0usize; 16];
             for reg in self.gp_reg_of.iter().flatten() {
@@ -1439,6 +1461,54 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // Two passes: `phi_home_droppable` borrows `&self`.
+        let droppable: Vec<usize> = (0..self.home_dropped.len())
+            .filter(|id| {
+                matches!(
+                    self.graph.nodes.get(*id).map(|n| &n.op),
+                    Some(crate::ir::Op::Phi)
+                )
+            })
+            // Cast: an index into the node arena is a `NodeId`.
+            .filter(|id| self.phi_home_droppable(*id as NodeId))
+            .collect();
+        for id in droppable {
+            self.home_dropped[id] = true;
+        }
+    }
+
+    /// May this phi's home word go unwritten?
+    ///
+    /// **Every clause is load-bearing, and the point of writing them as one
+    /// conjunction is that no combination of switches can satisfy some of them
+    /// and not the rest.** In order:
+    ///
+    /// * the switch, and the register image the deopt path reads;
+    /// * the edge copies publish the register (otherwise nothing puts the value
+    ///   there at all, since the publish this replaces was a load OF the home);
+    /// * a value already in its register is not re-published (otherwise the
+    ///   generic publish site reloads the unwritten home once per iteration and
+    ///   overwrites the register with whatever the frame word holds — the same
+    ///   reload this whole line of work removed, now actively destructive);
+    /// * the register is EXCLUSIVELY this value's, so a deopt frame can name it
+    ///   at any bci (see `deopt_nameable`);
+    /// * and it is an `Int` or a `Long`. A `Ref` is never in this file, and an
+    ///   FP value's home is written by a different path.
+    fn phi_home_droppable(&self, phi: NodeId) -> bool {
+        if !(ir_drop_phi_home_enabled()
+            && ir_deopt_regs_enabled()
+            && ir_phi_copy_regs_enabled()
+            && ir_skip_live_republish_enabled())
+        {
+            return false;
+        }
+        if !self.deopt_nameable.get(phi as usize).copied().unwrap_or(false) {
+            return false;
+        }
+        matches!(
+            self.graph.nodes.get(phi as usize).map(|n| n.ty),
+            Some(IrType::Int) | Some(IrType::Long)
+        )
     }
 
     /// Describe `id` as living in its register, if that is provably where it
@@ -1852,6 +1922,17 @@ impl<'a> Lowerer<'a> {
     /// The only read path into `node_slot`. There is no longer a value that
     /// means "unallocated": an absent location is an `Err`, never `0`.
     fn slot_of_checked(&self, id: NodeId) -> CompileResult<i32> {
+        // A home nobody wrote is not a location. Refusing here fails the
+        // compile and drops the method to the single-pass backend — a coverage
+        // loss, never a wrong answer — and `home_read_refusals` names the site
+        // that wanted converting. See `home_dropped`.
+        if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
+            self.home_read_refusals.set(self.home_read_refusals.get() + 1);
+            return Err(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: id },
+                format!("n{id}'s home word is never written; read it from its register"),
+            ));
+        }
         match self.node_slot.get(id as usize).copied().flatten() {
             // `NonZeroU32` ⇒ never 0, and `alloc_slot_checked` bounds it by
             // `spill_cap_off` ⇒ always inside the frame.
@@ -1868,6 +1949,21 @@ impl<'a> Lowerer<'a> {
     /// back to the single-pass backend — the same outcome as before, but with a
     /// structured reason attached, and returning the poison slot rather than
     /// `0` so no `[rbp - 0]` read can be emitted even transiently.
+    /// The frame offset a value's home WOULD occupy, whether or not anything
+    /// writes it.
+    ///
+    /// The single exemption from [`Self::slot_of`]'s refusal, and it is narrow
+    /// on purpose: `gather_phi_copies` needs the offset to identify a
+    /// destination and to sequentialise the edge's parallel copy, and it hands
+    /// that offset to `emit_copy_op`, which decides per copy whether to store
+    /// through it. Nothing here reads the word.
+    fn slot_of_unwritten(&self, id: NodeId) -> i32 {
+        match self.node_slot.get(id as usize).copied().flatten() {
+            Some(off) => off.get() as i32,
+            None => self.slot_of(id),
+        }
+    }
+
     fn slot_of(&self, id: NodeId) -> i32 {
         match self.slot_of_checked(id) {
             Ok(offset) => offset,
@@ -2280,17 +2376,56 @@ impl<'a> Lowerer<'a> {
         let mut from_reg = false;
         if ir_phi_copy_regs_enabled() {
             if let Some(&sid) = src_node_of.get(&src) {
-                if let Some(r) = self.resident_gpr(sid) {
-                    self.emit_mov_reg_reg64(RAX, r);
-                    from_reg = true;
-                    self.phi_copy_reg_reads += 1;
+                // A source whose home is never written has ONE readable
+                // location, and `resident_gpr`'s "has it been published yet"
+                // gate is the wrong question for it: there is nothing to fall
+                // back to. `assigned_gpr` is the right one, and it is safe for
+                // the same reason the publish is — the value is defined before
+                // any edge that reads it, and the register is exclusively its
+                // own (that is a clause of `phi_home_droppable`).
+                let homeless = self.home_dropped.get(sid as usize).copied().unwrap_or(false);
+                let src_reg = if homeless {
+                    self.assigned_gpr(sid)
+                } else {
+                    self.resident_gpr(sid)
+                };
+                match src_reg {
+                    Some(r) => {
+                        self.emit_mov_reg_reg64(RAX, r);
+                        from_reg = true;
+                        self.phi_copy_reg_reads += 1;
+                    }
+                    // Unreachable by construction: a home is dropped only for a
+                    // value the residency file gave an exclusive register. If
+                    // it ever happens, refuse the compile rather than emit a
+                    // read of a word nothing wrote.
+                    None if homeless => {
+                        return Err(Bailout::with_context(
+                            BailoutReason::UnallocatedValue { node: sid },
+                            format!("n{sid}'s home was dropped but it has no register"),
+                        ));
+                    }
+                    None => {}
                 }
             }
         }
         if !from_reg {
             self.load_to_rax(src);
         }
-        self.store_rax(dst);
+        // ── The store, when anything could read it ───────────────────
+        //
+        // This is what the register image was reserved for. A loop-carried
+        // value whose register a deopt frame can name, whose every reader takes
+        // that register, needs no frame word at all — and this store was the
+        // last frame traffic left in the loop after the two reloads went.
+        let drop_home = phi_of_dst
+            .get(&dst)
+            .is_some_and(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false));
+        if drop_home {
+            self.home_stores_dropped += 1;
+        } else {
+            self.store_rax(dst);
+        }
         // ── Publish: from RAX, which provably holds the value ─────────
         //
         // The reload this replaces was the second half of the store-then-load
@@ -5677,11 +5812,16 @@ impl<'a> Lowerer<'a> {
                 }
                 if let Some(&val_id) = node.inputs.get(k + 1) {
                     if val_id != NO_NODE {
+                        // `slot_of_unwritten`, not `slot_of`: this is the one
+                        // consumer that legitimately wants the ADDRESS of a
+                        // home word it may never write. Everything else that
+                        // reaches `slot_of` is reading a VALUE, and for a
+                        // dropped home that is exactly what must fail.
                         out.push(PhiCopy {
                             phi: id as NodeId,
-                            dst: self.slot_of(id as NodeId),
+                            dst: self.slot_of_unwritten(id as NodeId),
                             src: val_id,
-                            src_slot: self.slot_of(val_id),
+                            src_slot: self.slot_of_unwritten(val_id),
                         });
                     }
                 }
@@ -8027,6 +8167,17 @@ impl<'a> Lowerer<'a> {
             if let Some(v) = self.register_frame_value(node_id, node.ty) {
                 self.deopt_reg_named.set(self.deopt_reg_named.get() + 1);
                 return v;
+            }
+            // A dropped home MUST have been describable by a register: that is
+            // a clause of `phi_home_droppable`, and the two must not be able to
+            // drift apart. If they ever do, refuse the compile rather than
+            // describe the frame word nothing wrote.
+            if self.home_dropped.get(node_id as usize).copied().unwrap_or(false) {
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: node_id },
+                    format!("n{node_id}'s home was dropped but no register describes it"),
+                ));
+                return FrameValue::Unsupported;
             }
         }
         match node.op {
@@ -10577,6 +10728,20 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// is needed". That is what makes a deopt-named value's home word mandatory,
 /// and therefore what stops a register-resident value from ever losing it --
 /// see `plan_register_residency`'s `blocked_deopt` census.
+/// Drop the home-word store for a loop-carried value that a deopt frame can
+/// name in its register -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DROP_PHI_HOME=1`.
+///
+/// This is the payoff the register image exists for, and it is a CONJUNCTION:
+/// see [`Lowerer::phi_home_droppable`], which will not drop a home unless every
+/// reader of that home has somewhere else to read from.
+fn ir_drop_phi_home_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_PHI_HOME") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 fn ir_deopt_regs_enabled() -> bool {
     #[cfg(test)]
     {
@@ -13257,6 +13422,12 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.deopt_nameable.iter().filter(|n| **n).count(),
             lowerer.deopt_reg_named.get(),
             lowerer.deopt_regs_base,
+        );
+        eprintln!(
+            "[ir-ls] homes: dropped_values={} stores_skipped={} read_refusals={}",
+            lowerer.home_dropped.iter().filter(|d| **d).count(),
+            lowerer.home_stores_dropped,
+            lowerer.home_read_refusals.get(),
         );
     }
 
