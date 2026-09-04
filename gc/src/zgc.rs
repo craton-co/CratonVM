@@ -16167,52 +16167,60 @@ pub(crate) mod tests {
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
     ///
-    /// # MEASURED ON A QUIET BOX: it does not scale, and the run-to-run
-    /// variation is larger than the effect
+    /// # MEASURED, PAIRED, TEN ROUNDS: a real but small gain
     ///
-    /// Azure `vm1`, 8 cores, no other build running. 768 MiB heap, 8.26M dead
-    /// objects. THREE separate executions of this bench, three reps each, best
-    /// `sweep_us` per arm:
+    /// Azure `vm1`, 8 cores, 768 MiB heap, 8.26M dead objects, ten interleaved
+    /// rounds. `sweep_us` only, and the headline is the MEDIAN OF PER-ROUND
+    /// RATIOS against the serial arm measured in the same round:
     ///
-    /// | run | 1 worker | 2 | 4 | 8 |
-    /// |---|---|---|---|---|
-    /// | A | 78 ms | 92 | 86 | 93 |
-    /// | B | 67 ms | 63 | 60 | 60 |
-    /// | C | 68 ms | 66 | 55 | (polluted) |
+    /// | workers | n | min | median | max | paired vs serial |
+    /// |---|---|---|---|---|---|
+    /// | 1 | 10 | 68282 | 71799 | 76509 | 1.00x |
+    /// | 2 | 10 | 65934 | 68894 | 109387 | 1.04x [0.67-1.13] |
+    /// | 4 | 10 | 61209 | 64562 | 67877 | **1.12x [1.06-1.20]** |
+    /// | 8 | 10 | 59833 | 63607 | 65625 | **1.15x [1.09-1.22]** |
     ///
-    /// Run A says sharding is a 15% REGRESSION. Runs B and C say it is a
-    /// 6-24% gain. Same box, same binary, same population, opposite signs --
-    /// because the serial arm alone moves 78 -> 67 ms and the two-worker arm
-    /// 92 -> 63 ms BETWEEN executions, which is larger than any difference
-    /// between arms within one.
+    /// The serial arm's own samples still wandered 11% of their median, which
+    /// is why the paired column exists -- and why it is the one to read. At
+    /// four and eight workers the paired RANGE EXCLUDES 1.0: the sharded arm
+    /// won in every one of ten rounds, so the gain is a property of the change
+    /// and not of when it was sampled. At two workers the range spans 1.0
+    /// (0.67-1.13, with one 109 ms outlier), so two workers buys nothing
+    /// demonstrable.
     ///
-    /// # The methodological trap, because it caught me
+    /// # What it does NOT support
     ///
-    /// Within a single execution the three reps are tight -- run A's serial arm
-    /// read 78/80/83, a 4% spread -- and that tightness is exactly what makes
-    /// the number look trustworthy. It is not. Three reps inside one process
-    /// share a page cache, an allocator state and a set of THP mappings; they
-    /// are one sample reported three times, not three samples. The error term
-    /// that matters is across executions, and it is ~20%.
+    /// 1.15x on eight cores, for a phase whose per-object body is independent.
+    /// The sweep is bandwidth bound -- the body is a header zero-write, a
+    /// streaming write over half a gigabyte -- so eight workers contend for a
+    /// memory path that one already most of the way saturates. Anyone reading
+    /// this as "it parallelises" should note that perfect scaling would be 8x
+    /// and this is 1.15x.
     ///
-    /// A first version of this comment claimed "MEASURED, AND IT IS SLOWER" on
-    /// the strength of run A alone. That was wrong, and it was wrong in the
-    /// direction that would have justified deleting a working feature.
+    /// In absolute terms it is ~8 ms off a ~72 ms sweep, inside a pause whose
+    /// other phases are serial. Whether that is worth eight threads per
+    /// collection is a policy call this measurement informs and does not make;
+    /// the switch stays default-off until a workload-level arm (a real
+    /// `sweep_us` on a suite, not this isolated phase) says the pause moved.
     ///
-    /// # What can be said
+    /// # Two earlier readings of this same bench were wrong
     ///
-    /// The sweep does NOT parallelise usefully: the best any arm managed
-    /// against its own run's serial baseline was 1.24x at four workers, on
-    /// eight cores, for a phase whose body is independent per object. That is
-    /// consistent with it being bandwidth bound -- the per-object work is a
-    /// header zero-write, a streaming write over half a gigabyte -- and it is
-    /// nowhere near enough to move a default. It is NOT, on this evidence, a
-    /// regression either, so the switch is worth keeping default-off rather
-    /// than deleting.
+    /// Recorded because the errors are the reusable part. A single execution
+    /// read 78/92/86/93 us and was reported as "sharding is a 15% REGRESSION";
+    /// two more executions read the opposite way. The reps WITHIN each
+    /// execution were tight -- 78/80/83, a 4% spread -- and that tightness is
+    /// what made the number look trustworthy. It was not: three reps inside one
+    /// process share a page cache, an allocator state and a set of THP
+    /// mappings, so they are one sample reported three times. The error term
+    /// that matters is across executions, and it was ~20% -- larger than the
+    /// effect being chased.
     ///
-    /// What would settle it: many more executions (ten-plus per arm,
-    /// interleaved rather than grouped, so a drift in machine state cannot
-    /// align with an arm), or a host with a memory-bandwidth counter.
+    /// The bench was grouped by arm until 2026-09-04, which is what let a drift
+    /// in machine state align with an arm and be read as that arm's effect. It
+    /// now interleaves, rotates the starting arm each round, and reports paired
+    /// ratios. The absolute microseconds above are still contended (another
+    /// session was building during the run); the paired ratios are not, which
+    /// is the whole point of the shape.
     ///
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
