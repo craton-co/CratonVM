@@ -1357,11 +1357,50 @@ far that is the right size. The counter compare, the backedge and the
 safepoint poll are each paid once per iteration here and once per four
 iterations there, and no amount of register residency changes that.
 
-**So the remaining named cause is unrolling, and it is the one thing on the
-list that has never been tested.** It should be the next thing tried, and the
-four rows above are the argument for testing it before building anything else:
-on this loop, every hypothesis that was not about instruction COUNT has
-measured zero.
+#### Unrolling tested: worth a fifth of the gap, not the gap
+
+Tested the cheap way — by removing the advantage from the FAST arm rather than
+building it into the slow one. `CRATONVM_DISABLE_UNROLL=1` turns off the
+baseline's 4x unroll (both its call sites are in `x64/`), so if unrolling
+explains the inversion the baseline should collapse toward the optimizing tier.
+
+| arm | median |
+|---|---|
+| baseline, unrolled | 0.73 |
+| baseline, same config (control) | 0.66 |
+| **baseline, `CRATONVM_DISABLE_UNROLL=1`** | **0.84** |
+| optimizing tier | **1.61** |
+
+Unrolling is worth about **20%** — real, above the ~10% control spread. And it
+is nowhere near the whole gap: the un-unrolled baseline is 0.84 against 1.61,
+**still 1.9x apart**. So the section above overreached in calling instruction
+count per iteration "the only account of the right size"; it is *an* account,
+of about a fifth of it.
+
+#### What that leaves, and the reconciliation the four zeros needed
+
+The remaining 1.9x is per-iteration work that has nothing to do with unrolling,
+and the disassembly names it: the optimizing tier round-trips **every**
+loop-carried value through the frame, roughly eight memory operations against a
+body whose real work is one load and one add.
+
+That also explains why four successive fixes measured zero without any of them
+being wrong. **Each addressed ONE value.** Removing one of eight memory
+operations is ~12% of the loop's memory traffic and a few percent of its time —
+at or under the measurement floor on this host. The four zeros are not evidence
+that frame traffic is innocent; they are evidence that **it cannot be fixed one
+value at a time.**
+
+So the target is the class, not a member of it: the optimizing tier needs
+loop-carried values to stay in registers *as a group*, which means the
+write-through publish (a store at every definition, a load at every publish)
+and the per-value residency policy both have to give way to something that
+treats a loop's live set as one decision. That is a larger change than any of
+the four, and it is the first one whose expected effect is above the noise
+floor rather than under it.
+
+**Do not test it by building it.** The same trick used here works: make the
+BASELINE spill its loop-carried values and see whether it lands on 1.61.
 
 The loop-weight rule is kept, default OFF, because it is a correct
 generalisation that will matter once the parameters can be promoted at all —
