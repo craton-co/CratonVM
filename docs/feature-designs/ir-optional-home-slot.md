@@ -155,14 +155,33 @@ rbx,[rbp-78h]` and `mov r12,[rbp-80h]` at the top of every iteration, each
 waiting on the back edge's store of the same word) and the method loses 12
 bytes, 1030 → 1018.
 
-**What the deopt finding leaves open.** `FrameValue::Register`,
-`RegisterLong` and `RegisterRef` already exist and are tested, so deopt
-metadata CAN name a register — but the IR tier's `emit_deopt_stub` passes only
-`rbp` to `ir_deopt_entry` and reserves no `SavedRegisters` region, so nothing
-would fill one. Dropping the home of a deopt-named value therefore needs that
-region reserved and the file spilled into it first. That is a real piece of
-work with a real prize behind it, and it is now a *sequenced* one rather than
-an assumption.
+**What the deopt finding left open — now closed.** `FrameValue::Register`,
+`RegisterLong` and `RegisterRef` already existed and were tested, so deopt
+metadata could always name a register; what was missing was anything to fill
+one. The IR tier's `emit_deopt_stub` passed only `rbp` to `ir_deopt_entry` and
+reserved no `SavedRegisters` region.
+
+It does now (`CRATONVM_JIT_IR_DEOPT_REGS=1`): 256 bytes reserved below the
+argument staging and deeper than both prologue save bands, 16 GPRs and 16 XMMs
+spilled at the stub before anything there clobbers one, and a third argument
+carrying the pointer. `frame_value_for` answers `Register(r)` / `RegisterLong(r)`
+for a value the residency file owns EXCLUSIVELY — a strictly stronger condition
+than "resident", because releasing the deopt pins means a frame state can name a
+value outside its live range, by which time the register may belong to something
+else.
+
+With that, a home CAN be dropped (`CRATONVM_JIT_IR_DROP_PHI_HOME=1`) — for phis,
+where the store is at one site rather than fifty. `slot_of` on a dropped home
+fails the compile, exactly as this page specified; the refusal count is zero on
+everything measured, so no reader needed converting after all.
+
+The 50-arm refactor this page proposed is still not built, and the census that
+refuted it still says why: `droppable=0`. What changed is that the reason is now
+`blocked_phi` rather than `blocked_deopt`, and the phi path has been taken.
+
+See `JIT_OPTIMIZATION.md`, "the register image was built", for the engagement
+census, the SIGSEGV the executable test caught, and the measurement — which
+resolves nothing on this host.
 
 ## How to know it worked
 

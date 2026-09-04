@@ -123,8 +123,8 @@
 //!   residual SATB buffers, and you are done. One pause suffices, because
 //!   the pause quiesces the only producer.
 //!
-//! **ZGC has no SATB barrier and no write barrier at all.** It marks on
-//! *read*, in the **load barrier**: a mutator that loads a reference whose
+//! **OpenJDK's ZGC has no SATB barrier and no write barrier at all.** It marks
+//! on *read*, in the **load barrier**: a mutator that loads a reference whose
 //! color is not the current good color takes the slow path, and the slow
 //! path marks the target and hands it to the marker. Two consequences, both
 //! of which land squarely on the termination protocol:
@@ -136,6 +136,28 @@
 //!    empty" is therefore **not** a completion condition; it is a *fixed
 //!    point with respect to what has been published so far*, and the very
 //!    next instruction any thread executes can invalidate it.
+//! # THIS BACKEND IS NOT THAT, and the difference is the whole premise above
+//!
+//! `ZgcRealHeap` publishes mark work from an **SATB PRE-WRITE BARRIER**
+//! (`ZgcRealHeap::satb_pre_barrier`, gated on `mark_active` and called from the
+//! field and array-element store accessors), and its load barrier is **never
+//! armed in production**: `relocate_active` and `set_barrier_color(Some(..))`
+//! are written only by unit tests, so `good_mask` never leaves `Z_REMAPPED` and
+//! the slow path described above is unreachable. See
+//! `ZgcRealHeap::forward`'s own note.
+//!
+//! So the producer set here is BOUNDED in the way the section above says ZGC's
+//! is not, and the restart loop is justified by a mechanism this backend does
+//! not run. That does not make the loop wrong -- a mark-end flush can still
+//! produce work, which is exactly what `try_end_mark` tests -- but whether it
+//! needs to RESTART the concurrent phase, rather than drain a residual buffer
+//! in one remark pause as G1 does, is an open question this comment used to
+//! foreclose by describing a different collector.
+//!
+//! Everything below still describes OpenJDK's algorithm faithfully, and is
+//! worth keeping: it is the design this module was written against, and the
+//! shape it would need if the load barrier were ever armed.
+//!
 //! 2. **The mark set grows during the cycle.** SATB's set is a snapshot;
 //!    ZGC's is the transitive closure of "everything any thread has looked
 //!    at since mark start, plus everything reachable from it". Objects

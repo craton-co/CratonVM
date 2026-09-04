@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-336 tokens.
+340 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -692,6 +692,8 @@ export inherited from a parent shell.
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
+| `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
+| `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -770,6 +772,8 @@ export inherited from a parent shell.
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
 | `staged-arg-shadow` | `CRATONVM_JIT_NO_STAGED_ARG_SHADOW` |
 | `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
+| `zero-reserved-tail` | `CRATONVM_JIT_NO_ZERO_RESERVED_TAIL` |
+| `zero-unset-locals` | `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
 | `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
@@ -868,7 +872,7 @@ export inherited from a parent shell.
 | `elide-trivial-ctor` | `CRATONVM_JIT_ELIDE_TRIVIAL_CTOR` |
 | `site-cache-stubs` | `CRATONVM_JIT_SITE_CACHE_STUBS` |
 | `atomic-long-intrinsic` | `CRATONVM_JIT_NO_ATOMIC_LONG_INTRINSIC` |
-| `box-unbox-intrinsic` | `CRATONVM_JIT_BOX_UNBOX_INTRINSIC / CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
+| `box-unbox-intrinsic` | `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC` |
 | `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
 | `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
 | `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
@@ -924,7 +928,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-135 tokens.
+137 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -991,6 +995,8 @@ export inherited from a parent shell.
 | `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
 | `gpu-dispatch-streams` | `CRATONVM_GPU_DISPATCH_STREAMS` |
 | `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
+| `jit-gpu-array-barrier` | `CRATONVM_JIT_GPU_ARRAY_BARRIER` |
+| `gpu-jit-gate-dispatchable` | `CRATONVM_GPU_JIT_GATE_DISPATCHABLE` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |

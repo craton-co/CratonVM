@@ -295,6 +295,16 @@ bytes-saved={saved}"
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // What the DECLINED sites cost, only under the trace. Printed
+            // separately from the gated pair because it is the number that was
+            // missing: `declined=N` with no execution line reads exactly like a
+            // workload that never stored a reference.
+            {
+                let full = cratonvm_jit::metrics::ref_store_full_helper_count();
+                if full != 0 {
+                    eprintln!("[cratonvm]   ref-store full-helper executions: {full}");
+                }
+            }
             // The DYNAMIC split for that pair, only under
             // CRATONVM_DBG_SP_REF_STORE_TRACE=1. `gated=N` above counts emitted
             // sequences; this counts executions, and on the optimizing tier the

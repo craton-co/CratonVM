@@ -754,6 +754,16 @@ pub mod osr_refusal_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    /// OSR compiles whose method the optimizing tier's STRUCTURAL gate
+    /// (`ir::ir_compatible_sized`) would accept, and those it would not.
+    ///
+    /// An UPPER BOUND on the reach of an OSR-to-optimizing-tier route, not a
+    /// prediction of it: `ir_compatible` is the first of four gates, and the
+    /// admission conjunction, `IrBuilder::build` and `ir_lower` each decline
+    /// more. The bound is what a go/no-go needs — if it is near zero, no
+    /// amount of plumbing at this door buys anything.
+    static IR_ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static IR_INELIGIBLE: AtomicU64 = AtomicU64::new(0);
     static REFUSALS: std::sync::Mutex<Vec<(&'static str, u64)>> =
         std::sync::Mutex::new(Vec::new());
     static NAMED: std::sync::Mutex<Vec<(String, &'static str)>> =
@@ -764,6 +774,21 @@ pub mod osr_refusal_census {
     #[inline]
     pub fn note_attempt() {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Would the optimizing tier's structural gate have taken this method?
+    ///
+    /// Asked at the OSR door, where the answer is INERT today: that door
+    /// reaches the single-pass backend directly and has no promotion to
+    /// refuse. It is a counter, deliberately, and not a fix — the same shape
+    /// the String-intrinsic pin already takes here, and for the same reason.
+    #[inline]
+    pub fn note_ir_eligibility(eligible: bool) {
+        if eligible {
+            IR_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            IR_INELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// One refusal, tagged with the gate that returned `None`.
@@ -793,6 +818,17 @@ pub mod osr_refusal_census {
             eprintln!(
                 "[cratonvm] osr refusals: attempts={attempts} refused_at_early_gate={refused}"
             );
+            let (ir_yes, ir_no) = (
+                IR_ELIGIBLE.load(Ordering::Relaxed),
+                IR_INELIGIBLE.load(Ordering::Relaxed),
+            );
+            if ir_yes + ir_no > 0 {
+                eprintln!(
+                    "[cratonvm] osr reach: ir_compatible would accept {ir_yes} of {} compiled \
+                     here (upper bound; three further gates follow)",
+                    ir_yes + ir_no,
+                );
+            }
             for (gate, n) in v {
                 eprintln!("[cratonvm] osr refusals:   {gate}: {n}");
             }
@@ -941,6 +977,8 @@ pub mod gpu_jit_gate_census {
 
     static BLOCKED: AtomicU64 = AtomicU64::new(0);
     static ADMITTED: AtomicU64 = AtomicU64::new(0);
+    static RELEASED_UNDISPATCHABLE: AtomicU64 = AtomicU64::new(0);
+    static RELEASED_ARRAY_WRITER: AtomicU64 = AtomicU64::new(0);
 
     /// One verdict, counted per DISTINCT method: the gate caches its
     /// verdicts, so this counts first judgements rather than consultations,
@@ -999,6 +1037,48 @@ pub mod gpu_jit_gate_census {
         v.push((name, tag));
     }
 
+    /// Targets the analyzer called `Eligible` that the DISPATCHER can
+    /// never actually dispatch, so blocking their callers protected
+    /// nothing. Named, because the count alone would not have shown that
+    /// `java/lang/Math.min(II)I` was one of them.
+    static RELEASED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// One caller NOT blocked because its eligible-looking callee fails a
+    /// gate `try_dispatch` applies unconditionally. `target` is the
+    /// callee, which is the interesting half: one bad target releases
+    /// every caller of it.
+    pub fn note_released_undispatchable(target: String) {
+        RELEASED_UNDISPATCHABLE.fetch_add(1, Ordering::Relaxed);
+        let mut v = RELEASED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+        if v.len() < MAX_NAMED && !v.iter().any(|t| *t == target) {
+            v.push(target);
+        }
+    }
+
+    /// One primitive-array writer admitted to the JIT because the
+    /// compiled tiers now invalidate the residency cache themselves.
+    #[inline]
+    pub fn note_released_array_writer() {
+        RELEASED_ARRAY_WRITER.fetch_add(1, Ordering::Relaxed);
+    }
+
+    static DRAINS: AtomicU64 = AtomicU64::new(0);
+    static DRAINED_BUCKETS: AtomicU64 = AtomicU64::new(0);
+
+    /// One eviction pass triggered by a COMPILED array store.
+    ///
+    /// This is the counter that says whether the barrier is doing
+    /// anything. Admitting the array writers is only sound because the
+    /// compiled tiers now mark what they wrote; a run where writers were
+    /// released and this stays at zero has either never cached an array
+    /// or never written a cached one -- both fine, but not the same as
+    /// the barrier working, and only this can tell them apart.
+    #[inline]
+    pub fn note_compiled_write_drain(buckets: u64) {
+        DRAINS.fetch_add(1, Ordering::Relaxed);
+        DRAINED_BUCKETS.fetch_add(buckets, Ordering::Relaxed);
+    }
+
     pub fn exit_summary() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         let blocked = BLOCKED.load(Ordering::Relaxed);
@@ -1020,6 +1100,26 @@ pub mod gpu_jit_gate_census {
                 eprintln!(
                     "[cratonvm] gpu jit gate:   ... and {} more not listed",
                     blocked as usize - names.len()
+                );
+            }
+            // ENGAGEMENT. Both narrowings are silent by construction --
+            // they show up as methods that are NOT in the list above --
+            // so without these two counters a run where neither fired
+            // and a run where both did read identically.
+            let undisp = RELEASED_UNDISPATCHABLE.load(Ordering::Relaxed);
+            let writers = RELEASED_ARRAY_WRITER.load(Ordering::Relaxed);
+            eprintln!(
+                "[cratonvm] gpu jit gate: released={} (undispatchable-target={undisp}                  array-writer-behind-barrier={writers})",
+                undisp + writers
+            );
+            for t in RELEASED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+                eprintln!("[cratonvm] gpu jit gate:   eligible but never dispatchable: {t}");
+            }
+            let drains = DRAINS.load(Ordering::Relaxed);
+            if drains > 0 || writers > 0 {
+                eprintln!(
+                    "[cratonvm] gpu jit gate: compiled-write drains={drains}                      buckets_evicted={}",
+                    DRAINED_BUCKETS.load(Ordering::Relaxed)
                 );
             }
         });

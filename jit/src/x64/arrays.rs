@@ -209,6 +209,26 @@ impl Compiler {
         self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
+    /// Emit the GPU input-residency barrier after an inline primitive
+    /// array store, if it is armed.
+    ///
+    /// Assumes **RAX still holds the array pointer**, which it does at
+    /// every one of the seven store arms: the store itself is
+    /// `[RAX + RCX*n + ARRAY_DATA_OFFSET]`, and nothing between the
+    /// bounds check and here touches RAX.
+    ///
+    /// Nothing is emitted unless a `--gpu` run armed the barrier, so a
+    /// CPU-only build and a `gpu-offload` build without `--gpu` both get
+    /// byte-identical code to before it existed. See
+    /// [`crate::gpu_barrier`] for the sequence, the register contract
+    /// and why the compiled tier marks a bucket rather than calling
+    /// `input_cache::invalidate`.
+    pub(super) fn emit_gpu_input_cache_barrier(&mut self) {
+        if let Some(bytes) = crate::gpu_barrier::barrier_bytes() {
+            self.buf.emit(&bytes);
+        }
+    }
+
     /// Inline arraylength. Assumes RAX=array ptr. Result in RAX.
     pub(super) fn emit_arraylength_regs(&mut self) {
         // Assumes RAX = array ptr. MOV EAX, DWORD [RAX + ARRAY_LENGTH_OFFSET]

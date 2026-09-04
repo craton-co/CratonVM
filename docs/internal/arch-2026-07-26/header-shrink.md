@@ -420,12 +420,13 @@ audit the shrink was planned from:
   `GC_FLAG_COMPACT` branch — so a smaller header must move both shapes or the
   legacy one writes the wrong cell.
 
-  **Neither automated tripwire sees this site.** `x64.rs`'s scans for the
-  `<CONST> as <ty>` cast form and this expression is not one; the
-  `layout_constant_inventory` in `jit/src/lib.rs` covers only `lib.rs` and
-  `ir_lower.rs`. It is listed here by hand, which is what this section is for,
-  and extending the inventory to `x64/objects.rs` is a worthwhile separate
-  change.
+  **This site used to be seen by neither automated tripwire** — `x64.rs`'s
+  scan matches only the `<CONST> as <ty>` cast form, which this expression is
+  not, and the `layout_constant_inventory` covered only `lib.rs` and
+  `ir_lower.rs`. That gap is closed as of 2026-09-04: the inventory has an
+  `objects.rs` row (`[8, 0, 3, 0, 2, 0, 2, 2]`), so a new or moved layout
+  constant in this file now fails the build rather than relying on someone
+  remembering to add a paragraph here.
 - `ir_lower.rs::emit_inline_getstatic` (added 2026-08-03, cov-01) — the direct
   `getstatic` read: `field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD{32,64}_OFFSET`
   as a disp32, from the class's **statics block** base. It bakes the field-cell

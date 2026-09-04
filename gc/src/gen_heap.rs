@@ -2248,6 +2248,36 @@ pub struct GenerationalHeap {
     /// GC-side stores with the mutator-side loads. Initialised to the empty
     /// range `[0,0)` so a load before the first publish matches nothing.
     region_bounds: [(AtomicUsize, AtomicUsize); 3],
+    /// Lock-free mirror of each region's per-granule COMMIT bitmap, as
+    /// `(words pointer, word count)`. `(0, 0)` means "no screen needed" —
+    /// either the region is wholly committed (the old gen is a plain `Vec<u8>`
+    /// and the young arenas fall back to one when `CRATONVM_GC_RESERVE=0`) or
+    /// nothing has been published yet.
+    ///
+    /// # Why `region_bounds` is not enough
+    ///
+    /// [`Self::region_bounds`] publishes `[base, base + CAPACITY)`, and
+    /// capacity is RESERVED address space: under the default lazy-commit
+    /// backing store (`crate::reservation`) most of that range is unmapped
+    /// until an allocator cursor reaches it. [`Self::is_object_address`]
+    /// dereferences its candidate to read the header, so a conservative stack
+    /// word that merely LOOKS like a young-gen pointer sent it into an
+    /// unmapped page — a SIGSEGV inside the validator whose whole job is to
+    /// answer "is this safe to touch?". Measured 2026-09-03: that is what
+    /// killed ~35% of the Spring Framework suite under `-XX:+UseGenerationalGC`
+    /// while ZGC, whose validator consults a live-base registry instead of
+    /// dereferencing, passed 2832/2848.
+    ///
+    /// Published from [`Self::store_region_bounds_locked`], at exactly the
+    /// same points and under exactly the same STW discipline as the bounds
+    /// themselves — the two must not disagree about which arena a slot names.
+    commit_bits: [(AtomicUsize, AtomicUsize); 3],
+    /// Owning handles for the maps [`Self::commit_bits`] publishes as raw
+    /// pointers. Keeps the words alive for as long as the pointer is
+    /// published, so a `young_to.grow()` that swaps a whole `Reservation` out
+    /// cannot leave a reader dereferencing freed memory. Only ever touched at
+    /// publish time (STW), never on a read path.
+    commit_bits_hold: Mutex<[Option<Arc<[AtomicU64]>>; 3]>,
     /// Card table covering the old generation's address space.
     ///
     /// T5.5.2 (HIGH-1 fix): the table now uses interior mutability for
@@ -2733,6 +2763,12 @@ impl GenerationalHeap {
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
             ],
+            commit_bits: [
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+            ],
+            commit_bits_hold: Mutex::new([None, None, None]),
             card_table,
             next_hash_code: AtomicI32::new(1),
             young_gc_threshold: Mutex::new(threshold),
@@ -2874,6 +2910,73 @@ impl GenerationalHeap {
             // (neither). See `JIT_READ_BOUNDS`.
             publish_jit_read_bounds(i, base, base.wrapping_add(cap));
         }
+        // Republish the commit bitmaps beside the bounds. The old gen (slot 2)
+        // is a wholly-committed `Vec<u8>`, so it never needs a screen; the two
+        // young arenas do whenever the reserve/commit backing store is in use.
+        self.store_commit_bits_locked(yf.commit_bits(), yt.commit_bits());
+    }
+
+    /// Publish the young arenas' commit bitmaps into the lock-free
+    /// [`Self::commit_bits`] mirror, holding the owning `Arc`s alive in
+    /// [`Self::commit_bits_hold`].
+    ///
+    /// Split out of [`Self::store_region_bounds_locked`] only so the borrow of
+    /// the arena guards ends before the hold lock is taken.
+    fn store_commit_bits_locked(
+        &self,
+        yf: Option<Arc<[AtomicU64]>>,
+        yt: Option<Arc<[AtomicU64]>>,
+    ) {
+        let mut hold = self.commit_bits_hold.lock();
+        for (i, bits) in [yf, yt, None].into_iter().enumerate() {
+            match &bits {
+                Some(b) => {
+                    self.commit_bits[i]
+                        .0
+                        .store(b.as_ptr() as usize, Ordering::Release);
+                    self.commit_bits[i].1.store(b.len(), Ordering::Release);
+                }
+                None => {
+                    // Retire the pointer BEFORE dropping the old `Arc`, so no
+                    // reader can be handed a pointer this call is about to
+                    // free. `(0, 0)` reads as "no screen", which is the right
+                    // answer for a wholly-committed store and a harmless one
+                    // for a region with no arena yet (`region_bounds` is
+                    // `[0, 0)` for it too, so nothing reaches the screen).
+                    self.commit_bits[i].1.store(0, Ordering::Release);
+                    self.commit_bits[i].0.store(0, Ordering::Release);
+                }
+            }
+            hold[i] = bits;
+        }
+    }
+
+    /// Is `[addr, addr + len)` backed by committed pages, given that `addr`
+    /// lies inside region `slot` whose base is `base`?
+    ///
+    /// `true` when the region publishes no bitmap — a wholly-committed store
+    /// has every byte of its capacity mapped, so there is nothing to screen.
+    ///
+    /// This is the guard that makes [`Self::is_object_address`]'s header
+    /// dereference safe. See [`Self::commit_bits`] for why the region-bounds
+    /// check alone is not.
+    #[inline]
+    fn region_range_committed(&self, slot: usize, base: usize, addr: usize, len: usize) -> bool {
+        let words = self.commit_bits[slot].1.load(Ordering::Acquire);
+        if words == 0 {
+            return true;
+        }
+        let ptr = self.commit_bits[slot].0.load(Ordering::Acquire);
+        if ptr == 0 {
+            return true;
+        }
+        // SAFETY: `ptr`/`words` were published together from a live
+        // `Arc<[AtomicU64]>` that `commit_bits_hold` keeps alive until the
+        // pointer is retired (and it is retired by storing `words = 0` FIRST,
+        // which this function reads FIRST). `AtomicU64` reads are sound from
+        // any thread.
+        let bits = unsafe { std::slice::from_raw_parts(ptr as *const AtomicU64, words) };
+        crate::reservation::range_committed(bits, addr.wrapping_sub(base), len)
     }
 
     /// Return the primary NUMA node hint recorded at construction.
@@ -4208,15 +4311,36 @@ impl GenerationalHeap {
         // zero, so a candidate there is declined outright. No live object is
         // ever in the inactive semi-space, so this changes no valid answer.
         let skip_inactive = self.wipe_in_flight.load(Ordering::Acquire);
-        let in_region = self.region_bounds.iter().enumerate().any(|(i, (base, end))| {
+        let mut hit: Option<(usize, usize)> = None;
+        for (i, (base, end)) in self.region_bounds.iter().enumerate() {
             if skip_inactive && i == 1 {
-                return false;
+                continue;
             }
             let b = base.load(Ordering::Acquire);
             let e = end.load(Ordering::Acquire);
-            addr >= b && addr < e
-        });
-        if !in_region {
+            if addr >= b && addr < e {
+                hit = Some((i, b));
+                break;
+            }
+        }
+        let Some((slot, region_base)) = hit else {
+            return None;
+        };
+
+        // COMMIT SCREEN. `region_bounds` covers RESERVED address space, and
+        // the young arenas commit lazily in 2 MiB granules, so being inside
+        // the envelope does NOT mean the bytes are mapped. Everything below
+        // this line dereferences `raw`; a candidate in an unmapped granule has
+        // to be declined here or the validator segfaults instead of answering.
+        //
+        // A whole header, not just its first byte: `HEADER_SIZE` is 16 and a
+        // candidate eight bytes short of a granule boundary straddles two.
+        //
+        // Declining is always SAFE. The screen can only refuse an address in a
+        // granule no allocator has touched, and an object cannot live in a
+        // granule that was never committed — so no live object is ever lost,
+        // and there is no false-negative root to worry about.
+        if !self.region_range_committed(slot, region_base, addr, HEADER_SIZE) {
             return None;
         }
 
@@ -4327,6 +4451,15 @@ impl GenerationalHeap {
             addr >= b && addr < e && obj_end <= e
         });
         if !extent_fits {
+            return None;
+        }
+        // ...and the whole extent must be BACKED, not merely inside the arena.
+        // Callers of this function go on to read the object's body (field
+        // slots, array elements); accepting a candidate whose claimed extent
+        // runs off the committed granules would move the segfault from here to
+        // them, which is strictly worse -- it would land in code with no reason
+        // to suspect the address.
+        if !self.region_range_committed(slot, region_base, addr, extent) {
             return None;
         }
 

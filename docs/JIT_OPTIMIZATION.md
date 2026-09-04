@@ -1190,6 +1190,32 @@ fall-throughs) **50 of 50 now name a reason**, where 6 did before:
 Read with `CRATONVM_JIT_METRICS=1 CRATONVM_JIT_METRICS_OUT=<path>`, one JSON
 object per compilation.
 
+#### And ranked by site: one refusal is three quarters of them
+
+`unsupported_shape` was 38 of 50 with the site living only in a debug line
+nothing aggregates — 38 identical rows saying "the builder refused", naming
+nothing to fix. The site now rides in the bailout's context, which turns that
+into a work list. On `org.h2.test.db.TestAlter`, 44 build refusals:
+
+| refusal | count | share |
+|---|---:|---:|
+| `ir.rs:7150` — an invoke pc with no `invoke_info` entry | 33 | **75%** |
+| opcode `0x53` (`aastore`) | 5 | 11% |
+| `ir.rs:6888` — `new` with no `new_info` (the deferred-class path) | 3 | 6% |
+| `ir.rs:7094` — `invokespecial`, neither lowering applies | 2 | 4% |
+| opcode `0x5c` (`dup2`) | 1 | 2% |
+
+Three quarters of everything the IR builder turns away on a real workload is a
+single line: `self.invoke_info.get(&pc)` answering `None`. Its neighbour at
+7094 documents why that concentrates so hard — "one non-emittable invoke
+elsewhere in the method discarded the whole map" — so a single unlowerable call
+site refuses **every** call site in the method, and with it the method. That is
+the next thing to fix in this tier, and it is one map rather than a list of
+opcodes.
+
+By contrast the missing opcodes (`aastore`, `dup2`) are 6 of 44 together: real,
+but not where the methods are going.
+
 #### What the census then said: a block-placement defect, not a sizing one
 
 The investigation started from the hypothesis that large methods fail on code
@@ -1773,6 +1799,203 @@ tested, so deopt metadata CAN name a register — but the IR tier's
 `SavedRegisters` region, so nothing would fill one. Dropping the home of a
 deopt-named value needs that region reserved and the callee-saved file spilled
 into it first. `blocked_deopt` is the counter that says what that would buy.
+
+#### The register image was built, and the home is gone for the values it covers
+
+The sequenced step, taken. `ir_deopt_entry` used to say "the IR lowerer keeps
+every live value in a frame slot, so no register file is needed; a
+register-allocating backend would spill GPRs/XMMs in the trampoline and pass
+them here instead" — and that sentence was the whole reason a resident value
+could never lose its home. Four switches, all default OFF:
+
+| switch | what it does |
+|---|---|
+| `CRATONVM_JIT_IR_DEOPT_REGS=1` | reserve 256 bytes, spill 16 GPRs + 16 XMMs at the stub, pass a `*const SavedRegisters` |
+| `CRATONVM_JIT_IR_DROP_PHI_HOME=1` | stop writing the home word of a value a deopt frame can name in its register |
+| `CRATONVM_JIT_IR_PHI_COPY_REGS=1` | (already present) edge copies move register to register |
+| `CRATONVM_JIT_IR_SKIP_REPUBLISH=1` | (already present) an already-live register is not re-published |
+
+**The naming rule is exclusive ownership, not residency**, and the distinction
+is the whole safety argument. A value owns its register over its LIVE RANGE,
+and `plan_register_residency` releases the deopt pins — so a bytecode local can
+still be named by a frame state long after its last IR use, by which time the
+allocator may have handed the register to something else. A value is therefore
+nameable only when no other value anywhere in the method holds the same
+register: then it holds from the definition to the end of the frame, and no
+mapping between `graph.safepoints` and allocator positions is needed at all.
+`slot_of` on a dropped home fails the compile; `home_read_refusals` counts it.
+
+**It engages, and the loop loses its last frame traffic.** On `FieldLoop.sum`:
+
+```text
+[ir-ls] deopt regs: nameable=2 frame_slots_named_by_register=7 regs_base=464
+[ir-ls] homes:      dropped_values=1 stores_skipped=2 read_refusals=0
+```
+
+Seven frame-state slots now describe a register, one loop-carried value has no
+frame word at all, and no reader refused. In the disassembly the counter is
+`rbx` throughout — no store on the back edge, no reload at the top, nothing.
+
+**A bug the executable test found, which is the reason to write that kind of
+test.** `deopt_regs_base` was computed arithmetically whether or not the region
+had been reserved, so with the flag OFF it came out non-zero — which the stub
+reads as "there is a region here" — and 32 spill stores went over the argument
+staging area and past it. `test_guard_deopt_reconstructs_live_frame` SIGSEGV'd.
+This is the mirror image of the hazard `deopt_spill_region_reserved` already
+records for the single-pass backend, where an unreserved region left the base at
+0 and the stores walked UP over the saved RBP and the return address.
+
+**And it measures nothing.** Interleaved, user CPU time, 15 rounds, with the
+control repeated:
+
+| arm | median | P(arm < control) |
+|---|---|---|
+| control | 0.79 | — |
+| control again | 0.85 | — |
+| phi copies only | 0.93 | 0.411 |
+| all four | 0.95 | 0.424 |
+
+The two controls differ by 7.6%, so the floor swallows everything; `P(all <
+phi)` — the home-drop on its own, against the arm it depends on — is 0.516,
+which is chance. The host was at load 5-9 throughout. The honest reading is
+that this is not resolvable here, not that it is a regression.
+
+**Two limits worth stating rather than discovering later.** With the flag on,
+every IR frame grows by 256 bytes and every deopt stub by 32 stores, which is
+why it is off. And no Java workload built for this reaches an IR-tier deopt at
+all — `deopts=0` everywhere, and the probe written to force one
+(`probes/DeoptRegLoop.java`, a null receiver inside a loop) was never offered to
+the IR backend. The register-naming path is proven by
+`a_deopt_frame_reads_a_register_the_stub_spilled`, which emits a body that puts
+a sentinel in RBX and in no frame word, jumps to the stub as a guard does, runs
+it, and asserts the reconstructed local is that sentinel. That is a stronger
+proof than a workload would have been, and it is currently the only one.
+
+#### How much of a real workload the optimizing tier reaches: the census
+
+**This is the prerequisite question, and it had never been asked.** Every
+measurement in this section — the 2.38x inversion, the four zeros, the five
+zeros, the register image — concerns the body the optimizing tier emits. None of
+them asked how often it emits one.
+
+`CRATONVM_DBG_IR_COMPILES=1` already answers it: the pipeline has four stages
+that can decline a method (`ir_compatible`, the admission conjunction,
+`IrBuilder::build`, `ir_lower`), and each reports which one it was. Run over
+CratonBench, one phase per process, with `CRATONVM_JIT=force-c2`:
+
+| phase | offered to the gate | admitted | reached lowering | why refused |
+|---|---|---|---|---|
+| arithmetic | **0** | 0 | 0 | never offered at all |
+| hashmap | **0** | 0 | 0 | never offered at all |
+| sieve | 2 | **0** | 0 | a bulk byte-array zero fill (`REP STOSB`) |
+| matrix | 1 | **0** | 0 | one `multianewarray` in the method |
+| fib | 1 | 1 | 1 | — |
+| bintrees | 4 | 4 | 4 | — |
+| stringregex | 91 | 65 | 52 | 22 `invokedynamic`, 12 String pin, 4 over the invoke cap, 1 precise frames |
+
+**On four of the seven kernels the optimizing tier lowers nothing at all**, and
+they are the loop-dominated four. That is the explanation for every zero this
+section records against a real workload, and it is a better explanation than any
+of the per-optimization ones: an A/B of an IR-tier switch on `sieve`, `matrix`,
+`arithmetic` or `hashmap` compares a binary against itself.
+
+Three distinct causes, and they want different answers:
+
+* **Never offered.** `arithmetic` and `hashmap` produce no `[ir]` line whatever
+  — the admission gate is not consulted once. Their hot code enters through OSR,
+  and `compile_osr_artifact` "reaches `x64::compile_with_param_slots` directly":
+  **the OSR door has never gone through the optimizing tier.** No flag changes
+  that.
+* **One instruction disqualifies the whole method.** `matmul` allocates its
+  result with a single `multianewarray` at the top and its hot triple loop is
+  refused along with it; `sieve` zero-fills a byte array once and pays the same.
+  Both refusals are of the form "the single-pass backend has an intrinsic here
+  and the IR tier has none", which is a fair trade when the intrinsic is hot and
+  the wrong one when it runs once per call against a loop that runs millions of
+  times. `CRATONVM_JIT_IR_OVER_INTRINSIC=1` already makes exactly this trade for
+  CALL-SITE intrinsics; neither of these two is covered by it.
+* **Attrition through the funnel.** Where the tier does work, it still loses most
+  of what it takes: `stringregex` goes 91 → 65 → 52 → **17 bodies**, and the
+  largest single loss at the builder is `new-site DEFERRED` — a class not yet
+  loaded when the compile ran, which `take_deferred_new_retry` grants exactly one
+  retry for.
+
+**What this changes about the work in this section.** The tier-inversion
+programme has been optimising a body that, on the kernels used to motivate it,
+is never emitted. Before another switch is added to `ir_lower`, the reach
+number is the one to move — and of the three causes, the OSR door is the largest
+and the only one no flag can reach.
+
+**Method note.** Read `[ir] admission` counts before believing a per-phase A/B,
+and do not read `compiles: c2=N` as "N optimizing-tier compiles": on `sieve` it
+says `c2=3` while the IR backend lowered nothing, because that counter is fed by
+the tier manager's nomination and not by the backend that ran.
+
+#### The OSR door: the go/no-go, and the blocker that is actually in the way
+
+The reach census named the OSR door as the largest cause and the only one no
+flag can reach. The first question is whether there is anything at the far end
+of a route through it, and `ir_compatible_sized` is pure and `scan` is already
+in hand at that door, so the question costs nothing to ask. Per CratonBench
+phase, over the methods actually compiled there:
+
+| phase | OSR compiles | pass `ir_compatible` |
+|---|---|---|
+| arithmetic | 1 | **1** |
+| hashmap | 1 | **1** |
+| sieve | 2 | **2** |
+| matrix | 1 | 0 (`multianewarray`) |
+| bintrees | 1 | **1** |
+| stringregex | 1 | **1** |
+
+**Six of seven**, and they include `arithmetic` and `hashmap` — the two phases
+where the optimizing tier is offered nothing whatsoever today. Read it as an
+UPPER BOUND: `ir_compatible` is the first of four gates, and `sieve` in
+particular would still be refused further down for its bulk byte-array zero
+fill. But the route is not empty, which is what a go/no-go needed.
+
+**The design that fits this codebase.** Do NOT teach `osr_trampoline` the IR
+frame. It takes some twenty layout parameters (`osr_local_assignments`,
+`osr_callee_saved_base`, `osr_xmm_saved_base`, …) because it builds the
+single-pass frame from OUTSIDE, and that arrangement depends on a property the
+optimizing tier does not have: a fixed per-method local→home map. IR locals are
+SSA values on colour-assigned slots that differ from bci to bci.
+
+Instead, have `ir_lower` emit its own OSR entry stub per eligible bci. It
+already holds everything needed and the trampoline holds none of it:
+
+* the frame — it built it, bookkeeping slots and save bands included;
+* where local `i` lives at bci `b` — the safepoint snapshot at `b` names the
+  node, and `node_slot` / `gp_reg_of` name its location. This is the same
+  information `build_deopt_points` already reads, used in the opposite
+  direction;
+* the native offset of `b` — `bci_native`.
+
+The VM side then needs only "is there an entry for this bci" and a
+three-argument call, instead of twenty layout fields. Entry bcis must have an
+EMPTY operand stack (a javac loop header does), and a `Ref` local must be
+seeded exactly where that bci's oop map says it lives.
+
+**The blocker, named precisely, because it is not the frame.** The optimizing
+tier's inputs — the invoke plans, `checkcast_info`, the `new`-site resolutions,
+the inline sites — are assembled inside `try_compile_inner`, and the OSR door
+does not go through it. `compile_osr_artifact` assembles a DIFFERENT set for the
+single-pass backend and calls `x64::compile_with_param_slots` directly. So the
+work is not "emit an entry stub"; it is "give this door the optimizing tier's
+input pipeline", and the honest way to do that is to route OSR through the
+common funnel rather than beside it.
+
+That refactor pays for itself twice. The same divergence has already produced
+three bugs this file records — the permanent bail-list, the bisect levers and
+the code-cache cap were each hand-copied to this door after a bug, and the
+`compile_gate::admit` token exists to stop a fourth. A door that goes through
+the funnel cannot drift from it again.
+
+**Not started, deliberately.** Entering a compiled body part-way with a
+hand-seeded frame is the failure mode that produces a plausible wrong number
+rather than a crash, and this section already records what happens when that
+class of work is begun without the instrument first. The census above is the
+instrument; the go is now on the record with a number behind it.
 
 ### Performance — current status
 

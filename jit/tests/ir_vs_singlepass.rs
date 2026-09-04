@@ -18,7 +18,7 @@
 //! back to single-pass, making the comparison trivially identical), so an int
 //! corpus is exactly where the two backends genuinely differ.
 
-use cratonvm_jit::{try_compile, CachedBytecodeMethod, CompiledMethod, JitRuntimeHelpers};
+use cratonvm_jit::{try_compile, CachedBytecodeMethod, CompiledMethod, InlineSite, JitRuntimeHelpers};
 use cratonvm_types::{
     ClassId, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
@@ -7273,5 +7273,180 @@ fn athrow_never_taken_branch_matches_single_pass() {
             "IR vs single-pass diverge for n={n}"
         );
         assert_eq!(r_ir as i32, n as i32, "wrong result for n={n}");
+    }
+}
+
+// ── IR-tier inlining: the arm the designated gate could not see ─────────────
+//
+// The 2026-08-28 IR-inline gauntlet soak lists this as blocker 2 for flipping
+// `CRATONVM_JIT_IR_INLINE` on: a differential harness that runs the inliner
+// zero times cannot gate it, and it is the named gate. It ran zero times for a
+// structural reason — every `try_compile`
+// above passes `None` for `inline_resolver`, so the splicer is never handed a
+// callee body and has nothing to inline, whatever the flag says.
+//
+// Supplying a resolver is the whole fix. What matters as much is that these
+// tests FAIL if inlining stops happening: a differential that silently reverts
+// to comparing two un-inlined bodies is exactly the vacuity being repaired, and
+// it would look green forever.
+
+/// A static `int callee(int a, int b) { return a * 3 + b; }` as raw bytecode.
+///
+/// `iload_0; iconst_3; imul; iload_1; iadd; ireturn`
+fn inline_callee_site() -> InlineSite {
+    let code = vec![0x1a, 0x06, 0x68, 0x1b, 0x60, 0xac, 0x00, 0x00];
+    InlineSite {
+        callee_code_len: code.len() - 2,
+        callee_code: code,
+        callee_max_locals: 2,
+        callee_num_args: 2,
+        callee_is_static: true,
+        return_type: b'I',
+        class_name: "GateCallee".to_string(),
+        // `append_ir_inline_site` re-derives the argument slots from this, so an
+        // empty descriptor (what `..Default::default()` leaves) makes it refuse
+        // the site and plan zero — silently, which is how the first draft of
+        // this test "passed" while nothing was ever spliced.
+        descriptor: "(II)I".to_string(),
+        ..InlineSite::default()
+    }
+}
+
+/// Compile with a real `inline_resolver`, and with `CRATONVM_JIT_IR_INLINE`
+/// forced to `on`/`off` for this thread only.
+///
+/// `ir_inline_enabled()` reads through `flags::runtime_var` and is not cached,
+/// which is what makes a per-thread override reach it — the property the flag
+/// inventory exists to guarantee, used here rather than described.
+fn compile_inline_arm(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    optimize: bool,
+    inline_on: bool,
+) -> Option<CompiledMethod> {
+    let site = inline_callee_site();
+    let ir_inline_resolver =
+        |_c: &str, _m: &str, _d: &str| -> Option<InlineSite> { Some(site.clone()) };
+    let invoke_resolver = |_idx: u16| -> Option<(String, String, String)> {
+        Some((
+            "GateCallee".to_string(),
+            "callee".to_string(),
+            "(II)I".to_string(),
+        ))
+    };
+    // `try_compile_with_invokespecial_resolver`, not `try_compile`: the narrow
+    // wrapper every other test here uses has NO `ir_inline_resolver` parameter,
+    // so the IR splicer can never be handed a callee body through it. That —
+    // and not the flag's default — is why this harness "runs the inliner zero
+    // times" and could not gate `CRATONVM_JIT_IR_INLINE`.
+    //
+    // Note the two resolvers are different questions: `inline_resolver` feeds
+    // the SINGLE-PASS inliner, `ir_inline_resolver` the IR splicer. Supplying
+    // the first and expecting the second to splice is the mistake this comment
+    // exists to stop repeating — it produces a body that differs (a plan was
+    // built) while nothing was ever spliced.
+    cratonvm_types::flags::with_thread_overrides(
+        &[(
+            "CRATONVM_JIT_IR_INLINE",
+            Some(if inline_on { "1" } else { "0" }),
+        )],
+        || {
+            cratonvm_jit::try_compile_with_invokespecial_resolver(
+                cm,                        // 0 cached
+                None,                      // 1 cp_class_name_resolver
+                None,                      // 2 cp_field_resolver
+                None,                      // 3 cp_static_field_resolver
+                Some(&invoke_resolver),    // 4 cp_invoke_resolver
+                None,                      // 5 cp_invokespecial_owner_resolver
+                None,                      // 6 callee_compiler
+                None,                      // 7 cp_new_resolver
+                None,                      // 8 cp_ldc_resolver
+                None,                      // 9 cp_ldc2w_resolver
+                None,                      // 10 profile
+                helpers,                   // 11 helpers
+                None,                      // 12 inline_resolver (single-pass)
+                None,                      // 13 string_layout_resolver
+                None,                      // 14 cp_invoke_class_id_resolver
+                None,                      // 15 cp_elidable_init_resolver
+                optimize,                  // 16 optimize
+                true,                      // 17 ir_emit_calls
+                true,                      // 18 ir_emit_special_calls
+                false,                     // 19 ir_emit_long
+                false,                     // 20 ir_emit_virtual_calls
+                false,                     // 21 ir_emit_fp
+                None,                      // 22 cp_invokedynamic_descriptor_resolver
+                None,                      // 23 class_id_name_resolver
+                None,                      // 24 receiver_inline_resolver
+                Some(&ir_inline_resolver), // 25 ir_inline_resolver  <- the point
+                false,                     // 26 jdk_only
+                None,                      // 27 intrinsic_resolver
+            )
+        },
+    )
+}
+
+/// `int caller(int x) { return callee(x, 7) + 1; }`
+///
+/// `iload_0; bipush 7; invokestatic #1; iconst_1; iadd; ireturn`
+fn inline_caller_code() -> Vec<u8> {
+    vec![0x1a, 0x10, 0x07, 0xb8, 0x00, 0x01, 0x04, 0x60, 0xac, 0x00, 0x00]
+}
+
+/// The gate can now SEE the flag: with a callee body available, turning
+/// `CRATONVM_JIT_IR_INLINE` on changes the emitted body.
+///
+/// A cheap canary, and NOT on its own proof that anything was spliced: while
+/// this test was being written it passed twice with zero splices, because
+/// building an inline PLAN perturbs the emitted code even when every site is
+/// then refused. Both times the compiler's own `[ir] inline-plan` line was the
+/// thing that said so. The real engagement proof is
+/// `ir_inline_agrees_with_the_host` below, which cannot run at all unless the
+/// call was spliced away.
+#[test]
+fn ir_inline_flag_changes_the_emitted_body() {
+    let helpers = dummy_helpers();
+    let cm = cached("caller", "(I)I", inline_caller_code(), 1, 1);
+    let on = compile_inline_arm(&cm, &helpers, true, true)
+        .expect("IR pipeline must compile the caller with inlining on");
+    let off = compile_inline_arm(&cm, &helpers, true, false)
+        .expect("IR pipeline must compile the caller with inlining off");
+    assert_ne!(
+        on.code_bytes(),
+        off.code_bytes(),
+        "CRATONVM_JIT_IR_INLINE changed nothing about the emitted code, so this          harness is not exercising the inliner and cannot gate it — which is          exactly the vacuity ir-inline-gauntlet-soak-20260828 recorded",
+    );
+}
+
+/// And the correctness half: the spliced body must compute what the source says.
+///
+/// Only the INLINED arm is executed, and that is not a shortcut — it is the
+/// same fact that kept this harness from gating the flag. With inlining off the
+/// caller emits a real `invokestatic`, and this file wires no runtime helpers
+/// (`dummy_helpers` panics on any call), so the un-inlined arm cannot be run
+/// here at all. Splicing is what makes the body self-contained.
+///
+/// That also makes this test its own engagement check, which is the property
+/// the soak asked for: if the splice stops happening, the body keeps its
+/// `invokestatic`, `dummy_helpers` panics on the call, and the test aborts. It
+/// is not possible for this to pass while the inliner is inert. (Observed:
+/// with `InlineSite::descriptor` left empty, `append_ir_inline_site` refuses
+/// every site and this test aborts on exactly that panic.)
+///
+/// So the anchor is the host value rather than the other backend:
+/// `callee(x, 7) + 1` = `x * 3 + 7 + 1`. A splicer that drops an argument,
+/// mis-maps a callee local onto a caller slot, or returns the wrong stack entry
+/// fails this — those are the shapes the 2026-08-28 `InternalError` regression
+/// came from.
+#[test]
+fn ir_inline_agrees_with_the_host() {
+    let helpers = dummy_helpers();
+    let cm = cached("caller", "(I)I", inline_caller_code(), 1, 1);
+    let on = compile_inline_arm(&cm, &helpers, true, true).expect("inlining on must compile");
+    for x in [0i64, 1, -1, 7, -13, 1000, -100000] {
+        let want = (x as i32).wrapping_mul(3).wrapping_add(8);
+        // SAFETY: as `check` above — a JIT-produced body, System V i64 entry
+        // ABI, and after splicing no runtime helper is reachable for this shape.
+        let got = unsafe { on.try_call(&[x]) }.expect("inlined call") as i32;
+        assert_eq!(got, want, "spliced body disagrees with the host for x={x}");
     }
 }
