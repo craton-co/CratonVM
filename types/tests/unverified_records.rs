@@ -144,10 +144,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/lang_invoke.rs`,",
     ),
     (
-        "docs/known-issues/jdk-only/F30-1-the-registrar-call-graph-and-the-drifted-arm-20260813.md",
-        "status block says: **Status:** FIXED-UNVERIFIED-BY-CARGO. This lane did **not** run `cargo`",
-    ),
-    (
         "docs/known-issues/jdk-only/F6-1-the-arm-that-had-to-move-and-the-two-minters-it-keeps-wrong.md",
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
     ),
