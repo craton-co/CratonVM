@@ -38828,7 +38828,12 @@ mod layout_constant_inventory {
         // it reconstructs both cell addresses to assert both stores are
         // emitted, which is the assertion that would have caught the
         // compact-only arm before a run-time census had to.
-        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
+        //
+        // 2026-09-04: the layout-epoch guard's regression test adds three more
+        // `HEADER_SIZE` uses (17 -> 20), all of them reading back the compact
+        // cell it just proved is or is not written. No new EMISSION site: the
+        // guard itself bakes an epoch address and a count, not a displacement.
+        ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {

@@ -221,6 +221,9 @@ pub struct OffloadCache {
     chunk_stage_i64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i64>>>>,
     chunk_stage_f32: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f32>>>>,
     chunk_stage_f64: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>>>,
+    chunk_stage_i16: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i16>>>>,
+    chunk_stage_i8: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<i8>>>>,
+    chunk_stage_u16: RwLock<Option<std::sync::Arc<cuda_bridge::PinnedHostBuffer<u16>>>>,
     /// Per-call-site memo for everything `dispatch_method_from_native_on_stream`
     /// used to re-derive from the three name strings on EVERY dispatch.
     ///
@@ -616,6 +619,9 @@ impl OffloadCache {
             chunk_stage_i64: RwLock::new(None),
             chunk_stage_f32: RwLock::new(None),
             chunk_stage_f64: RwLock::new(None),
+            chunk_stage_i16: RwLock::new(None),
+            chunk_stage_i8: RwLock::new(None),
+            chunk_stage_u16: RwLock::new(None),
             dispatch_memo: RwLock::new(FxHashMap::default()),
             min_work_streak: RwLock::new(FxHashMap::default()),
             gpu_array_class_id: RwLock::new(None),
@@ -3363,6 +3369,7 @@ impl OffloadCache {
             {
                 let pool = self.chunk_stream_pool(ctx);
                 if pool.is_empty() {
+                    cratonvm_types::gpu_chunk_census::note_refused();
                     fs.writebacks.push(plain);
                 } else {
                     // Cast: `work` is a JVM array length, so it fits usize.
@@ -3385,6 +3392,7 @@ impl OffloadCache {
                             // reaper stay honest even though the work ran
                             // on the pool streams.
                             if let MarshalWriteback::Chunked { chunks, .. } = &wb {
+                                cratonvm_types::gpu_chunk_census::note_taken(chunks.len() as u64);
                                 for c in chunks {
                                     if let Err(e) = stream.wait_event(&c.done) {
                                         return make(SubmissionStatus::Failed {
@@ -6415,6 +6423,7 @@ pub(crate) mod input_cache {
         F64(Arc<DeviceBuffer<f64>>),
         I16(Arc<DeviceBuffer<i16>>),
         I8(Arc<DeviceBuffer<i8>>),
+        U16(Arc<DeviceBuffer<u16>>),
     }
 
     pub(crate) struct Entry {
@@ -6606,6 +6615,29 @@ pub(crate) mod input_cache {
         } else {
             None
         }
+    }
+    pub(crate) fn get_u16(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<u16>>> {
+        let g = map().lock();
+        let e = g.get(&vm)?.get(&obj)?;
+        if e.element_type != ArrayElementType::Char || e.len != len {
+            return None;
+        }
+        if let CachedBuffer::U16(a) = &e.buf {
+            Some(a.clone())
+        } else {
+            None
+        }
+    }
+    pub(crate) fn put_u16(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<u16>>) {
+        insert(
+            vm,
+            obj,
+            Entry {
+                buf: CachedBuffer::U16(buf),
+                len,
+                element_type: ArrayElementType::Char,
+            },
+        );
     }
     pub(crate) fn put_i8(vm: usize, obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i8>>) {
         insert(
@@ -6895,6 +6927,18 @@ pub enum ChunkedStage {
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>,
         host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<f64>>,
     },
+    I16 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i16>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<i16>>,
+    },
+    I8 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i8>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<i8>>,
+    },
+    U16 {
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u16>>,
+        host: std::sync::Arc<cuda_bridge::PinnedHostBuffer<u16>>,
+    },
 }
 
 /// How many streams a chunked dispatch rotates its launches over, and how
@@ -7056,12 +7100,16 @@ fn take_chunkable_writeback(
                     | MarshalWriteback::I64 { .. }
                     | MarshalWriteback::F32 { .. }
                     | MarshalWriteback::F64 { .. }
+                    | MarshalWriteback::I16 { .. }
+                    | MarshalWriteback::I8 { .. }
+                    | MarshalWriteback::U16 { .. }
             );
-            // I16/I8 are deliberately absent: `ChunkedStage` has no arm
-            // for them, so they fall into `other_array` below and turn
-            // chunking off for the whole dispatch. That is the safe
-            // direction -- the whole-array writeback still runs and is
-            // correct; only the copy/compute overlap is given up.
+            // I16/I8 joined this set on 2026-09-03. They were excluded
+            // when short[]/byte[] became offloadable because
+            // `ChunkedStage` had no arm for them, which cost the whole
+            // dispatch its copy/compute overlap rather than just theirs.
+            // They now have staging slots, stage variants and drain arms
+            // like the other four.
             let other_array = wb.array_len().is_some() && !plain;
             if other_array {
                 // A resident/GpuArray writeback in the mix: bail rather
@@ -7142,6 +7190,27 @@ fn launch_chunked(
                 host: cache.staging_f64(ctx, len)?,
             },
         ),
+        MarshalWriteback::I16 { obj, buf, len } => (
+            obj,
+            ChunkedStage::I16 {
+                buf,
+                host: cache.staging_i16(ctx, len)?,
+            },
+        ),
+        MarshalWriteback::I8 { obj, buf, len } => (
+            obj,
+            ChunkedStage::I8 {
+                buf,
+                host: cache.staging_i8(ctx, len)?,
+            },
+        ),
+        MarshalWriteback::U16 { obj, buf, len } => (
+            obj,
+            ChunkedStage::U16 {
+                buf,
+                host: cache.staging_u16(ctx, len)?,
+            },
+        ),
         other => {
             // `take_chunkable_writeback` only ever hands back the four
             // plain-array variants; anything else is a bug there.
@@ -7197,6 +7266,9 @@ fn launch_chunked(
             ChunkedStage::I64 { buf, host } => copy_chunk!(buf, host),
             ChunkedStage::F32 { buf, host } => copy_chunk!(buf, host),
             ChunkedStage::F64 { buf, host } => copy_chunk!(buf, host),
+            ChunkedStage::I16 { buf, host } => copy_chunk!(buf, host),
+            ChunkedStage::I8 { buf, host } => copy_chunk!(buf, host),
+            ChunkedStage::U16 { buf, host } => copy_chunk!(buf, host),
         }
 
         // A pooled event when one is available, else a fresh one.
@@ -7266,6 +7338,12 @@ staging_slot!(staging_i64, i64, chunk_stage_i64);
 staging_slot!(staging_f32, f32, chunk_stage_f32);
 #[cfg(feature = "gpu-offload")]
 staging_slot!(staging_f64, f64, chunk_stage_f64);
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_i16, i16, chunk_stage_i16);
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_i8, i8, chunk_stage_i8);
+#[cfg(feature = "gpu-offload")]
+staging_slot!(staging_u16, u16, chunk_stage_u16);
 
 // ── Per-type marshalling helpers ────────────────────────────────────
 
@@ -7326,6 +7404,11 @@ pub enum MarshalWriteback {
     I8 {
         obj: cratonvm_types::ObjectRef,
         buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i8>>,
+        len: usize,
+    },
+    U16 {
+        obj: cratonvm_types::ObjectRef,
+        buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u16>>,
         len: usize,
     },
     // Phase 6 #3 / Phase 7 #2 — GpuArray-backed args. The
@@ -7462,6 +7545,15 @@ impl MarshalWriteback {
                     ChunkedStage::F64 { host, .. } => {
                         drain!(host, gpu_marshal::write_back_range_f64, "f64")
                     }
+                    ChunkedStage::I16 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_i16, "i16")
+                    }
+                    ChunkedStage::I8 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_i8, "i8")
+                    }
+                    ChunkedStage::U16 { host, .. } => {
+                        drain!(host, gpu_marshal::write_back_range_u16, "u16")
+                    }
                 }
                 Ok(None)
             }
@@ -7493,6 +7585,11 @@ impl MarshalWriteback {
             Self::I8 { obj, buf, .. } => {
                 gpu_marshal::download_obj_i8(buf.as_ref(), *obj, &shared.mem.heap, token)
                     .map_err(|e| format!("download i8: {e}"))?;
+                Ok(None)
+            }
+            Self::U16 { obj, buf, .. } => {
+                gpu_marshal::download_obj_u16(buf.as_ref(), *obj, &shared.mem.heap, token)
+                    .map_err(|e| format!("download u16 (char[]): {e}"))?;
                 Ok(None)
             }
             // Phase 9 #1 — Resident-arg writebacks no longer
@@ -7609,6 +7706,7 @@ impl MarshalWriteback {
                 | Self::F64 { .. }
                 | Self::I16 { .. }
                 | Self::I8 { .. }
+                | Self::U16 { .. }
         )
     }
 
@@ -7643,7 +7741,8 @@ impl MarshalWriteback {
             | Self::F32 { obj, .. }
             | Self::F64 { obj, .. }
             | Self::I16 { obj, .. }
-            | Self::I8 { obj, .. } => Some(*obj),
+            | Self::I8 { obj, .. }
+            | Self::U16 { obj, .. } => Some(*obj),
             _ => None,
         }
     }
@@ -7661,7 +7760,8 @@ impl MarshalWriteback {
             | Self::F32 { obj, .. }
             | Self::F64 { obj, .. }
             | Self::I16 { obj, .. }
-            | Self::I8 { obj, .. } => Some(obj),
+            | Self::I8 { obj, .. }
+            | Self::U16 { obj, .. } => Some(obj),
             _ => None,
         }
     }
@@ -7677,6 +7777,7 @@ impl MarshalWriteback {
             | Self::F64 { len, .. }
             | Self::I16 { len, .. }
             | Self::I8 { len, .. }
+            | Self::U16 { len, .. }
             | Self::ResidentI32 { len, .. }
             | Self::ResidentI64 { len, .. }
             | Self::ResidentF32 { len, .. }
@@ -7982,7 +8083,7 @@ pub fn is_marshallable_array_element(t: cratonvm_types::ArrayElementType) -> boo
     use cratonvm_types::ArrayElementType as A;
     matches!(
         t,
-        A::Int | A::Long | A::Float | A::Double | A::Short | A::Byte
+        A::Int | A::Long | A::Float | A::Double | A::Short | A::Byte | A::Char
     )
 }
 
@@ -8148,6 +8249,19 @@ fn marshal_array_arg(
             "i8",
             1
         ),
+        // char[] (2026-09-03). The emitter already lowered `caload` /
+        // `castore`; only the analyzer's admission and this arm were
+        // missing, so a char[] kernel was refused here exactly as
+        // short[]/byte[] were before 2026-09-02.
+        ArrayElementType::Char => arm!(
+            u16,
+            U16,
+            gpu_marshal::upload_obj_u16,
+            input_cache::get_u16,
+            input_cache::put_u16,
+            "u16",
+            2
+        ),
         other => {
             // If the predicate says this type is marshallable, the match
             // above owes it an arm. Loud in a debug build rather than a
@@ -8227,10 +8341,11 @@ mod marshaller_analyzer_agreement {
         }
     }
 
-    /// The six the pipeline really carries, spelled out so a silent
+    /// The widths the pipeline really carries, spelled out so a silent
     /// widening or narrowing of either side has to edit this list.
+    /// `char[]` joined on 2026-09-03.
     #[test]
-    fn the_admitted_set_is_exactly_the_six_primitive_widths() {
+    fn the_admitted_set_is_exactly_the_marshallable_widths() {
         for t in [
             ArrayElementType::Int,
             ArrayElementType::Long,
@@ -8238,11 +8353,11 @@ mod marshaller_analyzer_agreement {
             ArrayElementType::Double,
             ArrayElementType::Short,
             ArrayElementType::Byte,
+            ArrayElementType::Char,
         ] {
             assert!(is_marshallable_array_element(t), "{t:?} must be marshallable");
         }
         for t in [
-            ArrayElementType::Char,
             ArrayElementType::Boolean,
             ArrayElementType::Reference,
         ] {

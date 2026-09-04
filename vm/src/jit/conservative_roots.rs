@@ -1232,7 +1232,21 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         publish_self_jit_depth(remaining);
     }
     if pruned > 0 {
-        tracing::debug!(
+        // `info!`, not `debug!`. Under `release_max_level_info` a
+        // `debug!` is compiled out of every release binary, so a count of
+        // LEAKED JIT entries -- an anomaly worth knowing about -- could
+        // never reach anyone running a released VM.
+        //
+        // Promoted only after measuring the rate, because the objection to
+        // promoting an anomaly line is that it might flood. It does not:
+        // across the 88-vector regression suite, `GcStress` under ZGC /
+        // Generational / G1 at -Xmx96m (3, 16 and several collections
+        // respectively), and the GPU runtime-stress and residency-gc gates,
+        // this fired ZERO times. That measures "does not flood"; it does
+        // not prove the line can fire, which is true of any rare-anomaly
+        // report and is still strictly better than invisible-by-
+        // construction.
+        tracing::info!(
             "pruned {} leaked JIT entry/entries (returned frames below scanner \
              SP {:#x}); quiescence healed to live count",
             pruned,
@@ -9609,11 +9623,57 @@ mod tests {
         );
     }
 
+    /// Backing store for a band word that `is_relocatable` will vouch for.
+    ///
+    /// `band_word_is_an_object` DEREFERENCES any word the predicate accepts;
+    /// that is its documented contract, and in production the predicate is a
+    /// published-movable-range test, so the header is mapped. Three band
+    /// tests passed a bare integer (`0xdead_0000`) plus a closure claiming it
+    /// was relocatable, which breaks that precondition and reads unmapped
+    /// memory -- measured as `EXCEPTION_ACCESS_VIOLATION ... read at address
+    /// 0x00000000DEAD0008`, deterministic and reproducible in isolation. The
+    /// object screen (audit 16-18) was added after these tests were written.
+    ///
+    /// 32 bytes is `HEADER_SIZE`, which bounds what
+    /// `plausible_object_header_at` may read; the header is a plain `Object`
+    /// with one slot so the screen answers TRUE, which is what these tests
+    /// assume when they assert that a relocatable word diverts the cycle.
+    struct BandOop {
+        store: Box<[u64; 4]>,
+    }
+
+    impl BandOop {
+        fn new() -> Self {
+            let mut store: Box<[u64; 4]> = Box::new([0; 4]);
+            // SAFETY: `store` is 32 bytes, 8-aligned and exclusively owned
+            // here, so an `ObjectHeader` fits and is properly aligned.
+            unsafe {
+                std::ptr::write(
+                    store.as_mut_ptr() as *mut cratonvm_types::ObjectHeader,
+                    cratonvm_types::ObjectHeader::new(
+                        cratonvm_types::ClassId::new(1),
+                        cratonvm_types::ObjectKind::Object,
+                        cratonvm_types::ArrayElementType::Reference,
+                        0,
+                        1,
+                    ),
+                );
+            }
+            Self { store }
+        }
+
+        fn addr(&self) -> usize {
+            self.store.as_ptr() as usize
+        }
+    }
+
     fn frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published() {
         // A synthetic compiled-frame spill band. `hoisted` stands for any of
         // the three storage classes outside the local/operand model.
-        let published_oop = 0xdead_0000usize;
-        let hoisted_oop = 0xbeef_0000usize;
+        let published_store = BandOop::new();
+        let hoisted_store = BandOop::new();
+        let published_oop = published_store.addr();
+        let hoisted_oop = hoisted_store.addr();
         let band: Vec<usize> = vec![7, published_oop, 0x1234_5678, hoisted_oop, 0];
         let lo = band.as_ptr() as usize;
         let hi = lo + band.len() * 8;
@@ -9646,7 +9706,8 @@ mod tests {
     /// the measured reason moving-young engaged zero times on bt18.
     #[test]
     fn frame_band_scan_skips_register_images() {
-        let stale_oop = 0xbeef_0000usize;
+        let stale_store = BandOop::new();
+        let stale_oop = stale_store.addr();
         // [0] = a genuine slot, [1..3] = a register-image band, [4] = genuine.
         let band: Vec<usize> = vec![0, stale_oop, stale_oop, stale_oop, 0];
         let lo = band.as_ptr() as usize;
@@ -9689,8 +9750,10 @@ mod tests {
     /// every collection while being fully covered.
     #[test]
     fn frame_band_scan_ignores_reclaimed_spill_slots() {
-        let stale_oop = 0xbeef_0000usize;
-        let live_oop = 0xdead_0000usize;
+        let stale_store = BandOop::new();
+        let live_store = BandOop::new();
+        let stale_oop = stale_store.addr();
+        let live_oop = live_store.addr();
         let band: Vec<usize> = vec![0, stale_oop, live_oop, 0, 0];
         let lo = band.as_ptr() as usize;
         let hi = lo + band.len() * 8;
@@ -9998,7 +10061,15 @@ mod tests {
         let published = published_shadow_values(None);
         assert!(published.is_empty());
 
-        let band: Vec<usize> = vec![0x1111];
+        // Header-backed, for the same reason as the three band tests above:
+        // `band_word_is_an_object` screens the word the closure vouches for,
+        // and `0x1111` fails that screen on ALIGNMENT before it is ever
+        // dereferenced -- so this assertion had been failing on dev, hidden
+        // behind the crash in `frame_band_scan_ignores_reclaimed_spill_slots`
+        // that aborted the run before it was reached.
+        let live = BandOop::new();
+        let live_oop = live.addr();
+        let band: Vec<usize> = vec![live_oop];
         let lo = band.as_ptr() as usize;
         assert!(
             band_has_unpublished_word_with(
@@ -10007,7 +10078,7 @@ mod tests {
                 &cratonvm_jit::FrameLayout::default(),
                 None,
                 &published,
-                |w| w == 0x1111
+                |w| w == live_oop
             ),
             "a frame that published nothing cannot prove coverage of a live oop",
         );

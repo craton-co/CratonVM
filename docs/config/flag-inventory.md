@@ -1170,7 +1170,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_DBG_ZERO` | DBG | `CRATONVM_DBG=g1-dbg-zero` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_EAGER_HUMONGOUS` | GC | `CRATONVM_GC=g1-eager-humongous` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_EDEN_STRIPES` | GC | `CRATONVM_GC=g1-eden-stripes` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_G1_INLINE_BARRIER` | GC | `CRATONVM_GC=g1-inline-barrier` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_G1_INLINE_BARRIER` | GC | `CRATONVM_GC=g1-inline-barrier` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_LATE_HEADER_WRITE` | GC | `CRATONVM_GC=g1-late-header-write` | opt-in | off | behaviour | snapshot | gc |
 | `CRATONVM_G1_MARK_LOCK_YIELD` | GC | `CRATONVM_GC=g1-mark-lock-yield` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_MARK_OOB_FAILSAFE` | GC | `CRATONVM_GC=g1-mark-oob-failsafe` | opt-in | off | behaviour | snapshot | gc |
@@ -1354,6 +1354,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_REF_STORE` | JIT | `CRATONVM_JIT=ir-ref-store` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RELOC_EMIT` | JIT | `CRATONVM_JIT=ir-reloc-emit` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RESIDENCY_PAYS` | JIT | `CRATONVM_JIT=ir-residency-pays` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_RPO_LAYOUT` | JIT | `CRATONVM_JIT=ir-rpo-layout` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_SELFREC_DIRECT` | JIT | `CRATONVM_JIT=ir-selfrec-direct` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_STRING_INTRINSICS` | JIT | `CRATONVM_JIT=ir-string-intrinsics` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_THIS_NONNULL` | JIT | `CRATONVM_JIT=ir-this-nonnull` | opt-in | off | behaviour | snapshot | jit |

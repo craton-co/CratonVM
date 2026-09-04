@@ -404,6 +404,7 @@ pub(super) fn compile_osr_artifact(
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
     let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
     osr_stage("entry");
+    cratonvm_types::osr_refusal_census::note_attempt();
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
@@ -428,6 +429,14 @@ pub(super) fn compile_osr_artifact(
     // committed on either of those grounds would cost throughput and buy
     // nothing.
     if cratonvm_jit::compile_gate::compiled_execution_forbidden(&class_name, &method_name) {
+        // Each early gate names itself before returning. Without this they
+        // all report `stage=entry` and a real refusal looks like a method
+        // that was never considered. See `osr_refusal_census`.
+        osr_stage("gate:compiled-execution-forbidden");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "compiled-execution-forbidden",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -445,6 +454,11 @@ pub(super) fn compile_osr_artifact(
         })
         .is_some_and(|method| method.is_synchronized())
     {
+        osr_stage("gate:synchronized");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "synchronized",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // Respect the JIT skip list for OSR — classes that are skipped from
@@ -469,6 +483,11 @@ pub(super) fn compile_osr_artifact(
         method_name_check,
         &method_descriptor,
     ) {
+        osr_stage("gate:gpu-offload");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "gpu-offload",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // Get method info from frame metadata
@@ -485,6 +504,11 @@ pub(super) fn compile_osr_artifact(
         method_name_check,
         &method_descriptor,
     ) {
+        osr_stage("gate:registered-native");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "registered-native",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
 
