@@ -1583,6 +1583,10 @@ impl Compiler {
         if self.failed {
             return;
         }
+        // §25.3 — the shadow push paired with this safepoint ran before the
+        // call; `emit_shadow_reload` below consumes `pending_shadow`, so the
+        // count has to be taken here or not at all.
+        let shadow_pushed_here = u16::try_from(self.pending_shadow.len()).unwrap_or(u16::MAX);
         // Shadow-stack precise roots — reload every oop pushed by the matching
         // `emit_shadow_push` from its (possibly GC-rewritten) shadow slot back
         // into its home register/frame slot, then pop. Emitted right after the
@@ -1947,6 +1951,9 @@ impl Compiler {
                 // `map_incomplete` was SEEDED from this above; read the source
                 // rather than the seed, which later causes also set.
                 stack_marks_exact: self.stack.is_empty() || self.stack_oop_marks_exact,
+                // §25.3 — captured at the top of this function, before
+                // `emit_shadow_reload` took `pending_shadow`.
+                shadow_pushed: shadow_pushed_here,
             });
             self.pending_shadow_coverage_complete = false;
         }

@@ -5761,6 +5761,7 @@ pub fn emit_machine_code_with_oop_maps(
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
     }
     Some((code, maps))
