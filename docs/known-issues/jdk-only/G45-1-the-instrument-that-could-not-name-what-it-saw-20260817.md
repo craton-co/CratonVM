@@ -18,6 +18,60 @@ the three this lane owns. `gc/src/heap.rs` needed **no change at all**; see
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03. The headline holds: the instrument
+> names what it sees.** This record's status was *"no binary contains the fix
+> yet and every 'after' below is PREDICTED"*. Measured now on a binary built
+> from this tree, running the vector this record measured its before-state on:
+>
+> ```text
+> CRATONVM_DBG_COERCION=1 cratonvm … RJdkSecurity
+>
+>   coercion warnings carrying a data class_id   96
+>   still class_id=-1 index=-1                    0
+>   named                                        96   (100%)
+> ```
+>
+> §0's before-state was *"5,431 events across 63 vectors. Every one of them
+> printed `class_id=-1`"*. On this vector it is now none of them. The census
+> line agrees and reports the hottest site rather than a shrug:
+>
+> ```text
+> descriptor-coercion census: total=96 primitive-into-reference[read=88 store=8]
+>   hottest=primitive-into-reference/read class_id=36 index=0 descriptor=[ hits=58
+> ```
+>
+> The distribution across six distinct sites:
+>
+> ```text
+> class_id=36  index=0    58      class_id=596 index=0     3
+> class_id=132 index=16   30      class_id=552 index=1     3
+> class_id=669 index=4     1      class_id=584 index=4     1
+> ```
+>
+> **A residual on this record's own remediation advice.** The warning text tells
+> the reader *"Run with `CRATONVM_DBG_LAYOUT=1` to resolve a `class_id` to a
+> name"*. Run exactly that way, alongside `CRATONVM_DBG_COERCION=1`, **no
+> id-to-name mapping was emitted for any of the six ids above** — 13,135 lines
+> of output and not one resolves 36 or 132. So the instrument now names what it
+> saw with an ID, and the documented route from that id to a class name did not
+> work here. The gap is small but it is the difference between a diagnosis and a
+> lookup the next reader has to invent; it is left open, not fixed.
+>
+> **A counting caution, recorded because it nearly produced the opposite
+> verdict.** A first pass grepped the transcript for `class_id=-1` and found 97
+> — apparently a fix that had not landed. Every one of those was the literal
+> string inside each warning's own explanatory prose (*"class_id=-1/index=-1
+> means the caller has not yet been given provenance"*), not the data. The data
+> field is the trailing one, after `value=`. A message that documents a sentinel
+> is indistinguishable from a message that reports it, to a grep.
+>
+> **What this does NOT verify.** One vector, not the 63 this record's
+> before-state spans — the 5,431-event figure is not re-measured and the
+> proportion named across the whole corpus is unknown. The class ids are
+> unresolved (above), so no row here is tied to a class name, and §2's
+> per-species after-lines are therefore confirmed only in shape. Nothing in
+> §§1-3's MEASURED before-state was re-derived.
+
 ## 0. The headline
 
 G30 gave this tree a four-species counter for silent field coercions. It

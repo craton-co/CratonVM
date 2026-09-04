@@ -164,10 +164,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: predates `aed6a3b73`, so no binary containing either this lane's changes or the",
     ),
     (
-        "docs/known-issues/jdk-only/G45-1-the-instrument-that-could-not-name-what-it-saw-20260817.md",
-        "status block says: so no binary contains the fix yet and every 'after' below is **PREDICTED** —",
-    ),
-    (
         "docs/known-issues/jdk-only/G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled-20260816.md",
         "status block says: **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,",
     ),
@@ -214,10 +210,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
         "status block says: **Nothing here has been built or run.** Every claim is either `javap` output from",
-    ),
-    (
-        "docs/known-issues/jdk-only/the-five-owed-records-run-at-last-20260902.md",
-        "status block says: **Status: MEASURED 2026-09-02.** The `unverified_records` ratchet holds five",
     ),
 ];
 
