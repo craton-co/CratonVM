@@ -16148,26 +16148,40 @@ pub(crate) mod tests {
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
     ///
-    /// # A PROVISIONAL reading, and why it is not a result
+    /// # MEASURED, AND IT IS SLOWER. The switch buys nothing.
     ///
-    /// First run after the complement was sharded (2026-09-04), 768 MiB heap,
-    /// 8.26M dead objects, best `sweep_us` of three reps:
+    /// Azure `vm1`, 8 cores, load 1.76 and nothing else building -- a genuinely
+    /// quiet box, which two earlier attempts on a 90%-loaded machine were not.
+    /// 768 MiB heap, 8.26M dead objects, best `sweep_us` of three reps, and the
+    /// reps agree to within 4% so the ordering is real:
     ///
-    /// | workers | 1 | 2 | 4 | 8 | 32 |
-    /// |---|---|---|---|---|---|
-    /// | sweep_us | 217 ms | 206 | 188 | 165 | 168 |
+    /// | workers | 1 | 2 | 4 | 8 |
+    /// |---|---|---|---|---|
+    /// | best sweep_us | **78 ms** | 92 | 86 | 93 |
+    /// | speedup | 1.00x | 0.85x | 0.91x | 0.84x |
     ///
-    /// That is 1.3x at eight workers and a plateau after -- far short of what
-    /// "a linear scan with an independent body" predicts, and close enough to
-    /// the shape of the 2026-08-14 parallel-marking result to be worth naming.
+    /// Whole-collection time agrees: 314 ms serial against 324 / 323 / 332.
+    /// Sharding is a REGRESSION at every worker count, not a disappointing
+    /// speedup.
     ///
-    /// **But the box was at 90% CPU from unrelated work when it was taken**,
-    /// and host contention suppresses precisely the thing being measured: added
-    /// workers compete with the load rather than with each other. So this is a
-    /// LOWER BOUND on the speedup and not a measurement of it. Anyone moving
-    /// the default needs this on an idle machine first; if it still reads 1.3x
-    /// there, the phase is bandwidth bound and the switch should be deleted
-    /// rather than defaulted on.
+    /// A 32-core Windows host read the same way (1.00 / 0.93 / 1.00 / 0.97 /
+    /// 1.01 at 1/2/4/8/32), so it is not one machine's memory controller.
+    ///
+    /// # Why, and why the argument for sharding was wrong
+    ///
+    /// `sweep_workers` argued the sweep "should scale" because it is a linear
+    /// scan with an independent body, bandwidth bound rather than latency
+    /// bound. Bandwidth bound is precisely the reason it does NOT scale: the
+    /// per-object work is a header zero-write, so the phase is a streaming
+    /// write over half a gigabyte that already saturates the memory path from
+    /// one core. Adding workers adds thread spawn and join, cross-shard cache
+    /// traffic, and a seam join, against a resource that was already full.
+    ///
+    /// This is the same shape as the 2026-08-14 parallel STW marking result
+    /// that `Z_CONC_START_PERCENT_DEFAULT` records -- and the second time an
+    /// "embarrassingly parallel" argument about this collector has been refuted
+    /// by measuring it.
+    ///
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
     fn measure_the_sharded_sweep() {
