@@ -150,10 +150,18 @@ a fork of an NVIDIA crate for. Revisit if upstream declines the fix.
   clean, `cargo clippy` clean (they enforce `clippy::all`, PR #263), and
   `git am` applies to a pristine checkout.
 
-  **Apply it with `git am -s`.** cutile-rs's CONTRIBUTING requires a DCO
-  sign-off on every commit, and a `Signed-off-by` is the submitter's own
-  certification -- it must be added by whoever opens the PR, not baked in
-  on their behalf.
+  **Apply it with a plain `git am`.** cutile-rs's CONTRIBUTING requires a
+  DCO sign-off on every commit, and the patch already carries one:
+
+      From: victor-craton <victor@craton.com.ar>
+      Signed-off-by: victor-craton <victor@craton.com.ar>
+
+  Author and sign-off match, which is what a DCO bot checks (it compares
+  those two, not the committer, so re-applying under a different local
+  git identity is fine). The sign-off is baked in at the repository
+  owner's explicit direction -- it is the submitter's own certification,
+  so do NOT re-generate this patch under someone else's identity without
+  asking them first.
 
 ## Files here
 
