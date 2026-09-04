@@ -236,24 +236,12 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
     (
-        "docs/known-issues/jdk-only/W7-57-close-flush-swallow-sweep.md",
-        "RUN 2026-09-02 on --synthetic-jdk: CloseFlushSwallowProbe 129 rows vs HotSpot 120, 35 differing, incl. an internal NPE where HotSpot propagates the caller's error",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-58-bytebuffer-direct-arm.md",
         "RUN 2026-09-02 on --synthetic-jdk: 264 rows vs HotSpot 285 (21 UNTESTED, not passing), 39 differing; the getIntLE/putIntLE reds are this record's own documented residuals",
     ),
     (
         "docs/known-issues/jdk-only/W7-66-live-over-allocations.md",
         "status block says: **Nothing here was built or run as CratonVM**; the probe transcript quoted below",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-70-printstream-close-noop.md",
-        "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-81-write-route-three-way.md",
-        "RUN 2026-09-02 via CloseFlushSwallowProbe on --synthetic-jdk (the probe both records name); shares W7-57's result",
     ),
     (
         "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
