@@ -1,0 +1,197 @@
+From 7edc8ea2be526b2e569faaa56f8db64d8d356c3b Mon Sep 17 00:00:00 2001
+From: Victor Bobrovskiy <victor.bobrovskiy@gmail.com>
+Date: Fri, 4 Sep 2026 18:24:19 -0300
+Subject: [PATCH] fix(cuda-core): adapt the remaining driver flag types in
+ `simt`
+
+`cuda-core` does not compile for `x86_64-pc-windows-msvc` against a CUDA
+13.3 toolkit: 17 errors, all the same signedness mismatch.
+
+This is the same root cause as #204, which adapted the flag arguments in
+`cuda-core/src/cudarc_shim.rs` and `cuda-async/src/device_future.rs`. The
+equivalent sites under `cuda-core/src/simt/` were not covered and still
+fail.
+
+The underlying type of a plain C enum is implementation-defined. clang on
+Linux gives an all-non-negative enum an `unsigned int` underlying type;
+MSVC gives a plain C enum `int`, signed, regardless. So on this target
+every generated driver enum binds as `c_int` (113 of 113), while the C
+prototypes declare the corresponding parameters `unsigned int`.
+
+Casts are `as _` where inference can supply the target type, matching the
+convention #204 established: it keeps the source portable rather than
+hard-coding either platform's choice. Three sites take an explicit
+`as u32` because inference has nothing to work from -- the
+`CU_CTX_SCHED_MASK` read-modify-write, and the two reverse-direction
+sites where `DriverError(pub CUresult)` is `c_int` while
+`CudaContext::error_state` is an `AtomicU32`.
+
+`SyncPolicy::from_raw` (context.rs:293) is deliberately untouched: it
+takes `raw: CUctx_flags_enum`, so `raw & CU_CTX_SCHED_MASK` is
+`c_int & c_int` and is already consistent on both platforms.
+
+Verified on x86_64-pc-windows-msvc, CUDA 13.3, rustc 1.97.1 stable:
+
+  cargo build  -p cuda-core            # 0 errors, 0 warnings
+  cargo fmt    -p cuda-core -- --check # clean
+  cargo clippy -p cuda-core            # 0 errors
+
+and a runtime-PTX round trip (`load_module_from_ptx_src` ->
+`load_function` -> `DeviceBuffer::from_host` -> `launch_kernel_on_stream`
+-> `to_host_vec`) on an RTX 2060: 0 mismatches over 1048576 elements.
+---
+ cuda-core/src/simt/context.rs | 12 ++++++------
+ cuda-core/src/simt/event.rs   |  2 +-
+ cuda-core/src/simt/mod.rs     | 14 ++++++++------
+ cuda-core/src/simt/module.rs  |  2 +-
+ cuda-core/src/simt/stream.rs  |  4 ++--
+ 5 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/cuda-core/src/simt/context.rs b/cuda-core/src/simt/context.rs
+index 91108c8..da2acba 100644
+--- a/cuda-core/src/simt/context.rs
++++ b/cuda-core/src/simt/context.rs
+@@ -463,7 +463,7 @@ impl CudaContext {
+         if prev == 0 && self.event_tracking.load(Ordering::Relaxed) {
+             self.synchronize()?;
+         }
+-        let flags = cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING;
++        let flags = cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING as _;
+         let mut cu_stream = MaybeUninit::uninit();
+         let cu_stream = unsafe {
+             match priority {
+@@ -720,8 +720,8 @@ impl CudaContext {
+             )
+             .result()?;
+             let current = current.assume_init();
+-            let new_flags =
+-                (current & !cuda_bindings::CUctx_flags_enum_CU_CTX_SCHED_MASK) | policy.to_raw();
++            let new_flags = (current & !(cuda_bindings::CUctx_flags_enum_CU_CTX_SCHED_MASK as u32))
++                | (policy.to_raw() as u32);
+             cuda_bindings::cuDevicePrimaryCtxSetFlags_v2(self.cu_device, new_flags).result()
+         }
+     }
+@@ -742,7 +742,7 @@ impl CudaContext {
+                 active.as_mut_ptr(),
+             )
+             .result()?;
+-            Ok(SyncPolicy::from_raw(flags.assume_init()))
++            Ok(SyncPolicy::from_raw(flags.assume_init() as _))
+         }
+     }
+ 
+@@ -755,7 +755,7 @@ impl CudaContext {
+         if error_state == 0 {
+             Ok(())
+         } else {
+-            Err(DriverError(error_state))
++            Err(DriverError(error_state as _))
+         }
+     }
+ 
+@@ -767,7 +767,7 @@ impl CudaContext {
+     /// calls will surface it. A later store overwrites an earlier one.
+     pub fn record_err<T>(&self, result: Result<T, DriverError>) {
+         if let Err(err) = result {
+-            self.error_state.store(err.0, Ordering::Relaxed)
++            self.error_state.store(err.0 as _, Ordering::Relaxed)
+         }
+     }
+ }
+diff --git a/cuda-core/src/simt/event.rs b/cuda-core/src/simt/event.rs
+index 0ef390a..97a75d7 100644
+--- a/cuda-core/src/simt/event.rs
++++ b/cuda-core/src/simt/event.rs
+@@ -70,7 +70,7 @@ impl CudaContext {
+         self.bind_to_thread()?;
+         let mut cu_event = MaybeUninit::uninit();
+         let cu_event = unsafe {
+-            cuda_bindings::cuEventCreate(cu_event.as_mut_ptr(), flags).result()?;
++            cuda_bindings::cuEventCreate(cu_event.as_mut_ptr(), flags as _).result()?;
+             cu_event.assume_init()
+         };
+         Ok(CudaEvent {
+diff --git a/cuda-core/src/simt/mod.rs b/cuda-core/src/simt/mod.rs
+index 7f07b4c..6b08764 100644
+--- a/cuda-core/src/simt/mod.rs
++++ b/cuda-core/src/simt/mod.rs
+@@ -159,8 +159,9 @@ pub unsafe fn launch_kernel_ex(
+     unsafe {
+         let base = &mut cluster_attr as *mut _ as *mut u8;
+         // id at offset 0
+-        (base as *mut u32)
+-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION);
++        (base as *mut u32).write(
++            cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as _,
++        );
+         // clusterDim.x/y/z at offsets 8, 12, 16
+         let dim_ptr = base.add(8) as *mut u32;
+         dim_ptr.write(cluster_dim.0);
+@@ -284,7 +285,7 @@ pub unsafe fn launch_kernel_cooperative(
+     unsafe {
+         let base = &mut coop_attr as *mut _ as *mut u8;
+         (base as *mut u32)
+-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE);
++            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE as _);
+         let val_ptr = base.add(8) as *mut i32;
+         val_ptr.write(1);
+     }
+@@ -392,8 +393,9 @@ pub unsafe fn launch_kernel_ex_cooperative(
+     let mut attrs: [cuda_bindings::CUlaunchAttribute_st; 2] = unsafe { std::mem::zeroed() };
+     unsafe {
+         let base = &mut attrs[0] as *mut _ as *mut u8;
+-        (base as *mut u32)
+-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION);
++        (base as *mut u32).write(
++            cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as _,
++        );
+         let dim_ptr = base.add(8) as *mut u32;
+         dim_ptr.write(cluster_dim.0);
+         dim_ptr.add(1).write(cluster_dim.1);
+@@ -401,7 +403,7 @@ pub unsafe fn launch_kernel_ex_cooperative(
+ 
+         let base = &mut attrs[1] as *mut _ as *mut u8;
+         (base as *mut u32)
+-            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE);
++            .write(cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE as _);
+         let val_ptr = base.add(8) as *mut i32;
+         val_ptr.write(1);
+     }
+diff --git a/cuda-core/src/simt/module.rs b/cuda-core/src/simt/module.rs
+index a2b4cb6..04c8971 100644
+--- a/cuda-core/src/simt/module.rs
++++ b/cuda-core/src/simt/module.rs
+@@ -649,7 +649,7 @@ impl CudaFunction {
+         unsafe {
+             let base = &mut cluster_attribute as *mut _ as *mut u8;
+             (base as *mut u32).write(
+-                cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
++                cuda_bindings::CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as _,
+             );
+             let dimensions = base.add(8) as *mut u32;
+             dimensions.write(cluster_dim.0);
+diff --git a/cuda-core/src/simt/stream.rs b/cuda-core/src/simt/stream.rs
+index 8a97417..1a00c3e 100644
+--- a/cuda-core/src/simt/stream.rs
++++ b/cuda-core/src/simt/stream.rs
+@@ -147,7 +147,7 @@ impl CudaStream {
+         let cu_stream = unsafe {
+             cuda_bindings::cuStreamCreate(
+                 cu_stream.as_mut_ptr(),
+-                cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
++                cuda_bindings::CUstream_flags_enum_CU_STREAM_NON_BLOCKING as _,
+             )
+             .result()?;
+             cu_stream.assume_init()
+@@ -195,7 +195,7 @@ impl CudaStream {
+             cuda_bindings::cuStreamWaitEvent(
+                 self.cu_stream,
+                 event.cu_event(),
+-                cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT,
++                cuda_bindings::CUevent_wait_flags_enum_CU_EVENT_WAIT_DEFAULT as _,
+             )
+             .result()
+         }
+-- 
+2.55.0.windows.3
+
