@@ -668,7 +668,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_CL_BOOTSTRAP_SCOPED` | LOADER | `CRATONVM_LOADER=cl-bootstrap-scoped` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_CL_STUB_DELEGATION` | LOADER | `CRATONVM_LOADER=stub-delegation` | opt-in | off | behaviour | snapshot | native-builtins |
 | `CRATONVM_COMPACT_REF_FIELDS` | GC | `CRATONVM_GC=compact-ref-fields` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_COMPACT_TLAB_ALLOC` | GC | `CRATONVM_GC=compact-tlab-alloc` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_COMPACT_TLAB_ALLOC` | GC | `CRATONVM_GC=compact-tlab-alloc` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_COMPACT_TLAB_SITES` | GC | `CRATONVM_GC=compact-tlab-sites` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_COMPAT` | COMPAT | `CRATONVM_COMPAT=…` | group | unset | — | snapshot | — |
 | `CRATONVM_COMPATIBILITY_JDK_ONLY` | — | n/a (undeclared) | live | unset | harness/ABI | live getenv | libcratonvm C ABI constant, not a variable |
