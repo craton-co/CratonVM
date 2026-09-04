@@ -1733,6 +1733,38 @@ impl Compiler {
             if self.local_oop_mask_at_current_pc().is_none() {
                 map_incomplete_cause::LOCAL_MASK_UNREACHED
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // FAIL CLOSED, as `LOCAL_MASK_UNSUPPORTED` already does.
+                //
+                // Measured on `org.h2.test.jdbc.TestCachedQueryResults`
+                // 2026-09-03: `local_mask_unreached=125` and climbing, the
+                // dominant cause on that workload -- while the SHADOW half of
+                // the same machinery counted the identical population
+                // (`scauses(... dataflow=125 ...)`) and refused its claim. The
+                // map half counted it and shipped: `map_incomplete` stayed
+                // false, so `fully_oop_covered` stayed TRUE for a safepoint
+                // naming none of its live reference locals.
+                //
+                // That is the same asymmetry `LOCAL_MASK_UNSUPPORTED` was
+                // fixed for -- "one half of the machinery knew and the half
+                // that publishes the claim did not" -- and it is the unnamed
+                // root of `bug-box-unbox-intrinsic-segv-under-relocation-
+                // 20260902`: relocation rewrites the slots the map names, the
+                // unnamed live locals keep pointing into the vacated page, and
+                // reading one is the page-aligned SIGSEGV.
+                //
+                // The counter reads ZERO on `probes/SafepointMapResidue.java`,
+                // which is why this was filed as a ruled-out hypothesis. It was
+                // ruled out on the wrong workload.
+                //
+                // Behind a flag because it is a REFUSAL: each such safepoint
+                // now diverts its cycle to the non-moving sweep. That is
+                // per-safepoint rather than the blanket
+                // `CRATONVM_ZGC_JIT_BLANKET_REFUSAL`, which costs ~9700
+                // fragmentation OOMs on this class, so the cost should be far
+                // smaller -- but it is a cost, and it is measured, not assumed.
+                if crate::x64::licm::local_mask_unreached_fail_closed_enabled() {
+                    map_incomplete = true;
+                }
             }
             // ACROSS EVERY WINDOW, not just the low 64 slots. A method above
             // 64 locals used to get no mask at all and so named none of its

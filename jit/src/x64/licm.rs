@@ -2731,6 +2731,24 @@ pub(super) fn inline_oop_coverage_enabled() -> bool {
 /// alone -- publishing a map that named none of its reference locals while
 /// `fully_oop_covered` read TRUE. See
 /// `map_incomplete_cause::LOCAL_MASK_UNSUPPORTED` for the measurement.
+/// `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1` -- a safepoint whose
+/// local-oop dataflow was never REACHED must not ship a map claiming complete
+/// frame-slot coverage.
+///
+/// Sibling of [`local_mask_fail_closed_enabled`], which covers the case where
+/// the dataflow never ran for the METHOD. This one covers a pc inside a method
+/// it did run on. Default OFF (that one defaults ON) because this population is
+/// larger and its refusal cost is still being priced -- see the call site in
+/// `x64::safepoint` for the measurement that motivated it.
+pub(super) fn local_mask_unreached_fail_closed_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED")
+            .is_some()
+    })
+}
+
 pub(super) fn local_mask_fail_closed_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
