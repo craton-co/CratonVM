@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-333 tokens.
+332 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -804,7 +804,6 @@ export inherited from a parent shell.
 | `ffm-intrinsic` | `CRATONVM_JIT_NO_FFM_INTRINSIC` |
 | `c2-alloc-upgrade` | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
 | `ir-inline` | `CRATONVM_JIT_IR_INLINE` |
-| `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
