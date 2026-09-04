@@ -16230,7 +16230,16 @@ pub(crate) mod tests {
         const CAPACITY: usize = 768 * 1024 * 1024;
         const LIVE_EVERY: usize = 16;
 
-        let rounds: usize = std::env::var("SWEEP_BENCH_ROUNDS")
+        // `flags::runtime_var`, not `std::env::var`. `check-surface.sh` refuses
+        // the latter anywhere in core runtime code -- VM flags must come from
+        // the immutable snapshot, and ordinary variables reach live-read
+        // semantics through the same boundary -- and that check runs BEFORE the
+        // `cargo clippy --workspace --all-targets` step in the same CI job. A
+        // bare `env::var` here therefore does not just fail its own gate: it
+        // fails the step in front of the one that compiles test targets, which
+        // is the masking this file's own header records costing the repository
+        // a compile gate for weeks.
+        let rounds: usize = cratonvm_types::flags::runtime_var("SWEEP_BENCH_ROUNDS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(10);
