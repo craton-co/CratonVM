@@ -508,7 +508,11 @@ pub struct VmConfig {
     pub g1_ihop_percent: Option<u8>,
     /// `-XX:G1HeapRegionSize=<bytes>` — G1 region size.
     pub g1_region_size: Option<usize>,
-    /// `-XX:MaxGCPauseMillis=<n>` — target max pause (mixed-CSet sizing).
+    /// `-XX:MaxGCPauseMillis=<n>` — target max pause. G1 sizes its mixed
+    /// collection set from it; ZGC sizes its allocation budget from it
+    /// (`ZgcRealHeap::refresh_pause_target_budget`). The `g1_` prefix is
+    /// historical — this is the operator's target, not a G1 tuning knob,
+    /// and it is passed to every backend through `G1ConfigOverrides`.
     pub g1_max_gc_pause_ms: Option<u64>,
     /// `-XX:±UseStringDeduplication` — G1 String backing-array dedup.
     pub g1_string_dedup: Option<bool>,

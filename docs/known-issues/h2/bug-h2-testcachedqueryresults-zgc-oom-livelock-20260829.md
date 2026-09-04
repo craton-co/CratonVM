@@ -1235,14 +1235,33 @@ produced -- better than the unsafe `ASSUME_REWRITABLE` bypass (99952 with 48
 NPEs), and obtained by satisfying the obligation rather than skipping it. The
 fragmentation diagnosis is right and the mechanism now demonstrably clears it.
 
-It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting:
+It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting.
 
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-establishes, with `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow
-switch (0/3), that **relocation under LIVE COMPILED FRAMES moves a reference the
-safepoint's oop map does not name** -- and that root cause is OPEN. That page
-also links it to `bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
-"hunting an unnamed root in a compiled frame for days".
+> **REFUTED, and re-measure this section (2026-09-04).** What follows rests on
+> the box/unbox page's reading of its own switch table, and that reading was
+> wrong. The mechanism was never an unnamed oop-map root: `ZgcRealHeap`'s
+> relocation slides were copying into arena granules
+> `Arena::decommit_free_blocks` had already returned to the OS, and both slides
+> now commit their destination first. See
+> `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+>
+> This section's own evidence points the same way and is worth re-reading with
+> that in hand: the fault signature recorded below is `rdi` page-aligned at the
+> fault, which is a `memmove` running off the end of a mapping, not a read
+> through a stale reference. `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` removed
+> it by removing the slide, not by fixing a root.
+>
+> **The arms below have not been re-run on a tree carrying that fix.** Whoever
+> takes this page next starts there, and the cheapest discriminator is
+> `CRATONVM_GC_RESERVE=0`: if it removes the SIGSEGV on the pre-fix binary, this
+> section's crash is the same defect and closes with it.
+
+The reading this section was written under, kept because the argument it
+supports is still the one to re-test: that page established, with
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow switch (0/3), that
+relocation under LIVE COMPILED FRAMES was implicated, and linked it to
+`bug-h2-testrandommapops-small-heap-corruption-20260829.md`, "hunting an
+unnamed root in a compiled frame for days".
 
 Enabling relocation under live JIT frames is precisely and only what this credit
 does. So it is a powerful EXPOSER of that defect, and no arm on this workload
@@ -1335,7 +1354,7 @@ the identification, the three failed repairs, and what remains.
 | discharge only (control) | 0 / 3 |
 
 Relocation is REQUIRED -- the same 0/3 that
-`bug-box-unbox-intrinsic-segv-under-relocation-20260902` measured on that
+`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
 switch. And the fault signature matches that page's: `rdi` page-aligned at the
 fault (`0x232ECD30000`, `0x28DEA7B0000`, `0x1CA01BB0000`), which that page reads
 as "a read through a reference into a page the collector has already vacated".
@@ -1376,7 +1395,7 @@ Two traps this cost, worth not repeating:
 The conclusion below is withdrawn. It is not known to be wrong; it is not
 supported by the evidence that was offered for it.
 
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
 landed on dev the same day: the box/unbox intrinsic SIGSEGVs under a relocating
 collector, **11 of 11 runs, 25-183 s**, and it takes BOTH relocation and that
 intrinsic -- neither alone. Dev flipped the intrinsic to opt-in as the

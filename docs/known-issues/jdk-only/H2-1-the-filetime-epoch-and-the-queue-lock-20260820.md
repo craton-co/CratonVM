@@ -24,6 +24,50 @@ criteria and they were written before this work started.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. All three rows of §"`G90-1` §5 check"
+> hold, including the two that were predicted NOT to move.** Status was
+> *"`FIXED-UNVERIFIED` — no binary carrying these changes has been built or
+> run"*, with the acceptance run named and not yet done.
+>
+> ```text
+> vector                    CK lines   differing from HotSpot   verdict
+> RFileTimes                   69              0                PASS (68 checks)
+> RClassUnloadSweep             1              0                PASS
+> RClassUnloadSweepGen          1              0                PASS
+> ```
+>
+> **Row 1 — predicted to flip, and it flipped.** The check this record is named
+> for now reads identically on both VMs:
+>
+> ```text
+> HotSpot   CK plain.readAttributes.lastModified 2021-01-01T00:00:00Z
+> CratonVM  CK plain.readAttributes.lastModified 2021-01-01T00:00:00Z
+> ```
+>
+> Its stated falsifier is *"any surviving 1601 date"*. The string `1601` occurs
+> **zero** times anywhere in the `--jdk-only` transcript. The record's second
+> falsifier — *"any other wrong instant"*, which would mean `MetadataExt`
+> disagrees with `GetFileAttributesEx` rather than an epoch bug — also does not
+> fire: all 69 `CK` lines match, not just this one.
+>
+> **Rows 2 and 3 — predicted NOT to flip, and their falsifier is appearing in
+> the failing set at all.** Neither appears. Both pass in Compatible and
+> `--jdk-only` in a full 129-vector run and byte-match the oracle when run
+> alone. §4.1's reasoning stands: retiring the prefix removed the VM's only
+> reference-discovery hook, so `java/lang/ref/` is not retired here, and §4.2's
+> state writes did not change weak-reference behaviour.
+>
+> This record's own summary — *"predicted to close one of the three, and to
+> explain rather than close the other two"* — is what happened.
+>
+> **What this does NOT verify.** The acceptance line says *"102 vectors"*; the
+> suite is now **129**, so the total is not comparable with any 102-vector
+> baseline and no such comparison is made — only the three named vectors are
+> adjudicated. §2's JDK 25 source and class metadata are oracle readings and
+> were not re-derived. The `MetadataExt` / `GetFileAttributesEx` distinction is
+> a Windows path; this run is Linux, so row 1's *encoding* fix is confirmed by
+> its observable and not by exercising that code path.
+
 ## 1. The two diffs, and what each one turned out to be
 
 `G90-1` §5 armed `CRATONVM_ENFORCE_NATIVE_SHADOW` on seven prefixes and the

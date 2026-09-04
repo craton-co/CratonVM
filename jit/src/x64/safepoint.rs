@@ -34,10 +34,14 @@ use super::*;
 /// `cur_bc_pc` still holds at that point. Named rather than spelled
 /// `u32::MAX as usize` at each site, because `Compiler::local_oop_mask_at_current_pc`
 /// has to recognise it and a bare literal is not a thing a reader can look up.
-pub(super) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
+pub(crate) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
 
 /// "This frame has not reached a safepoint yet" -- the value the single-pass
 /// prologue stamps into the reserved safepoint-id slot.
+///
+/// Crate-visible because the aarch64 backend stamps and stores the SAME two
+/// synthetic pcs: they are a property of the safepoint-id CONTRACT the runtime
+/// reads (`active_safepoint_id` -> `OopMapEntry::bytecode_pc`), not of x64.
 ///
 /// The IR backend can use `0` for this, because its ids are a monotonic
 /// counter that starts at 1. This backend stores the BYTECODE PC, and **bci 0
@@ -53,7 +57,7 @@ pub(super) const ENTRY_POLL_BC_PC: usize = u32::MAX as usize;
 /// The hazard it removes is the one that is NOT loud: an uninitialised slot can
 /// read as a valid id for the method standing at that rbp, and relocation then
 /// rewrites against the wrong program point's map.
-pub(super) const SP_ID_UNSET_BC_PC: usize = (u32::MAX - 1) as usize;
+pub(crate) const SP_ID_UNSET_BC_PC: usize = (u32::MAX - 1) as usize;
 
 pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
     // 0x48 = REX.W; |0x01 adds REX.B, needed only for r8..r15.
@@ -1579,6 +1583,10 @@ impl Compiler {
         if self.failed {
             return;
         }
+        // §25.3 — the shadow push paired with this safepoint ran before the
+        // call; `emit_shadow_reload` below consumes `pending_shadow`, so the
+        // count has to be taken here or not at all.
+        let shadow_pushed_here = u16::try_from(self.pending_shadow.len()).unwrap_or(u16::MAX);
         // Shadow-stack precise roots — reload every oop pushed by the matching
         // `emit_shadow_push` from its (possibly GC-rewritten) shadow slot back
         // into its home register/frame slot, then pop. Emitted right after the
@@ -1975,6 +1983,9 @@ impl Compiler {
                 // `map_incomplete` was SEEDED from this above; read the source
                 // rather than the seed, which later causes also set.
                 stack_marks_exact: self.stack.is_empty() || self.stack_oop_marks_exact,
+                // §25.3 — captured at the top of this function, before
+                // `emit_shadow_reload` took `pending_shadow`.
+                shadow_pushed: shadow_pushed_here,
             });
             self.pending_shadow_coverage_complete = false;
         }

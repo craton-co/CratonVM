@@ -1681,6 +1681,23 @@ pub struct Graph {
     /// Incremental def-use edges. A hand-built graph can leave this
     /// `UseLists::default()`: the lists are derived on first demand.
     pub uses: UseLists,
+    /// Which `Op::Param` holds the receiver, when this graph is an INSTANCE
+    /// method's. `None` means "static, or nobody said" — never "no receiver",
+    /// because a hand-built graph leaves it `None` and must not thereby claim
+    /// a fact about parameter 0.
+    ///
+    /// # Why the graph carries this and not the lowerer
+    ///
+    /// It is a property of the method, and the lowerer already holds `&Graph`.
+    /// The alternative was a fifteenth positional argument to `Lowerer::new`,
+    /// threaded through `lower` and `lower_inner`, to carry one bit that the
+    /// graph builder already had in hand.
+    ///
+    /// What it licenses is one fact, stated once: `this` is non-null. The JVM
+    /// enters an instance method only through a call site that has already
+    /// null-checked its receiver, `<init>` included — its receiver is
+    /// uninitialized but never null.
+    pub receiver_param: Option<u16>,
 }
 
 impl Graph {
@@ -4423,6 +4440,7 @@ impl IrBuilder {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: UseLists::new(),
+            receiver_param: None,
         };
         // The builder appends: every edge it writes goes through the tracked
         // mutators, so the def-use edges are maintained from an empty graph
@@ -8119,7 +8137,49 @@ pub fn ir_build_bail<T>(site: u32, pc: usize) -> Option<T> {
     if ir_bail_reporting() {
         eprintln!("[ir] IrBuilder::build refused at ir.rs:{site} (bytecode pc {pc})");
     }
+    // `bailout.rs`'s module doc names this as one of the three incompatible
+    // ways the compiler says "I cannot compile this", and the one that "carries
+    // no reason at all, so the per-method compiler report cannot be produced".
+    // It could not: over an H2 test class, 51 of 620 compilations fell through
+    // to single-pass and only 6 carried an attributed reason — the other 45
+    // refused here, invisibly.
+    //
+    // The site/pc pair stays in the debug line above; what the report needs is
+    // the method and the category, which is what this adds.
+    // The SITE, not just the fact. On a real workload (H2 `TestAlter`) 38 of 50
+    // fall-throughs land here, and with one shared category they were 38
+    // identical rows — "the builder refused", 38 times, naming nothing to fix.
+    // `ir.rs:<line>` is what separates them into the distinct refusals they
+    // actually are, and the line is already the argument this function takes.
+    attribute_build_bail_at(
+        crate::bailout::BailoutReason::UnsupportedShape("IrBuilder::build"),
+        site,
+        pc,
+    );
     None
+}
+
+/// Attach a builder refusal to the compilation in flight.
+///
+/// Split out so both bail helpers share one policy: the process-wide category
+/// counter AND the per-compilation report, the same pair `verify_or_bail` uses.
+fn attribute_build_bail(reason: crate::bailout::BailoutReason) {
+    let bailout = crate::bailout::Bailout::new(reason);
+    crate::bailout::record_bailout(&bailout);
+    crate::metrics::note_current_bailout(&bailout, "build");
+}
+
+/// [`attribute_build_bail`] carrying the refusing site.
+///
+/// The category stays one value so the process-wide counters keep their stable
+/// row set; the site rides in the bailout's context, which is what the
+/// per-compilation report prints. That is the difference between "the builder
+/// refused 38 times" and a ranked list of which refusals to go and fix.
+fn attribute_build_bail_at(reason: crate::bailout::BailoutReason, site: u32, pc: usize) {
+    let bailout =
+        crate::bailout::Bailout::with_context(reason, format!("ir.rs:{site} (bytecode pc {pc})"));
+    crate::bailout::record_bailout(&bailout);
+    crate::metrics::note_current_bailout(&bailout, "build");
 }
 
 /// [`ir_build_bail`] for the opcode catch-all, which knows something more
@@ -8130,6 +8190,9 @@ pub fn ir_build_bail_opcode<T>(op: u8, pc: usize) -> Option<T> {
     if ir_bail_reporting() {
         eprintln!("[ir] IrBuilder::build has no lowering for opcode {op:#04x} at bytecode pc {pc}");
     }
+    // The one refusal that already knows exactly what it lacks, so it reports
+    // the opcode rather than the generic shape.
+    attribute_build_bail(crate::bailout::BailoutReason::UnsupportedOpcode { opcode: op });
     None
 }
 
@@ -9060,6 +9123,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: UseLists::new(),
+            receiver_param: None,
         };
         let a = graph.add(Op::Const(1), IrType::Int, vec![], None);
         let b = graph.add(Op::Const(2), IrType::Int, vec![], None);
@@ -9522,6 +9586,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: UseLists::new(),
+            receiver_param: None,
         }
     }
 

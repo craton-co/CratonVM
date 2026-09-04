@@ -28,6 +28,49 @@ W7-64-printstream-trouble-and-errormanager.md's `trouble` recording and on
 W7-57-close-flush-swallow-sweep.md's absorb/propagate split; nothing from
 either is reinvented.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-03.** This record's disposition was
+> "still open on verification, not on source", and named exactly one observable:
+> the two console-echo tokens, "the only observable of the behaviour change",
+> which "nobody has read off a CratonVM run in either mode". They have now been
+> read, in all three modes, by counting occurrences in the process's stdout —
+> one occurrence is the probe's own declaration line, two means the echo fired.
+>
+> ```text
+>                              HotSpot   compatible   --jdk-only   --synthetic-jdk
+> W781-IO-MUST-NOT-ECHO           1          1            1              1
+> W781-ERR-MUST-ECHO              1          2            2              2
+> ```
+>
+> Against this record's own before/after table: `W781-IO-MUST-NOT-ECHO` is
+> **absent** (after: absent; HotSpot: absent) and `W781-ERR-MUST-ECHO` is
+> **echoed** (after: echoed; HotSpot: absent, "the one outcome this VM cannot
+> offer"). Both read the "after" column. The probe collects these and says it
+> "cannot judge" them; the counts judge them.
+>
+> **The defect this section exists for is closed.** The probe's explicit
+> equality — `routeBranchesAgreeOnError`, written because "one branch was fixed"
+> and "both branches were fixed" look identical row by row — **PASSES** on
+> CratonVM (`0/true` == `0/true`) in all three modes.
+>
+> The two `observed.psRouteErrorWriteOutcome` / `pwRouteErrorWriteOutcome`
+> lines still differ from HotSpot (`none` vs the `Error`). Those are **PRINTED,
+> NOT ASSERTED** by the probe, which names them a KEPT divergence and gives the
+> reason at `CloseFlushSwallowProbe.java:1191-1199`: asserting HotSpot's value
+> "would demand the change this lane declined to make". They are not counted as
+> residuals here.
+>
+> **What this does NOT verify.** `psRouteErrorWriteDidNotRecordTrouble` and
+> `pwRouteErrorWriteDidNotRecordTrouble` are `true` where HotSpot is `false`,
+> in all three modes. HotSpot reaches neither, because it throws first — so its
+> `false` is the absence of a decision, not a decision. Whether our `true` is
+> wrong or is simply downstream of the declined change is **not settled here**;
+> it is a hypothesis, and it is the residual this record leaves.
+>
+> Binary built from this tree at the merge of `origin/dev` on 2026-09-03;
+> oracle Temurin 25.0.3+9-LTS on the same host. Reproduce:
+> `javac -d /tmp/p probes/CloseFlushSwallowProbe.java && cd /tmp/p &&`
+> `cratonvm --java-home $JAVA_HOME -cp . CloseFlushSwallowProbe | grep -c W781-ERR-MUST-ECHO`
 ## The defect
 
 `route_write_through_out` returned one `bool`, and its two branches did not

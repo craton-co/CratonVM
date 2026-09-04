@@ -908,6 +908,136 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
 /// loops whose IR the JIT genuinely can't lower.
 pub const OSR_MAX_ATTEMPTS: u32 = 5;
 
+/// The four buffer-shaped pieces of a cached-method frame.
+///
+/// Built once and consumed either by [`Frame::new_pooled_cached_compact`],
+/// which returns a `Frame` by value, or by
+/// [`FrameStack::emplace_cached_compact`], which writes one straight into the
+/// stack slot. Sharing the build is what keeps the two from drifting.
+struct CachedCompactParts {
+    locals: Vec<CompactValue>,
+    local_kinds: Vec<u8>,
+    stack: ValueStack,
+    eff_max_locals: u16,
+}
+
+/// Take the locals and operand-stack buffers for a call to `cached` from the
+/// thread's pools and lay the arguments into them.
+///
+/// Identical in every observable to what `new_pooled_cached_compact` did
+/// inline before this was factored out: same filler, same category-2 layout,
+/// same `effective_max_locals` clamp, same pooled `ValueStack`.
+#[inline]
+fn build_cached_compact_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[(CompactValue, u8)],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> CachedCompactParts {
+    let needed: usize = args
+        .iter()
+        .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
+        .sum();
+    let n = (cached.max_locals as usize).max(needed);
+    let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
+    let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
+    let mut locals = u64_vec_to_compact(vals);
+    locals.clear();
+    kinds.clear();
+    locals.reserve(n);
+    kinds.reserve(n);
+    for (cv, tag) in args {
+        locals.push(*cv);
+        match *tag {
+            b'J' => {
+                kinds.push(LKIND_LONG);
+                locals.push(CompactValue::uninitialized());
+                kinds.push(LKIND_OTHER);
+            }
+            b'D' => {
+                kinds.push(LKIND_DOUBLE);
+                locals.push(CompactValue::uninitialized());
+                kinds.push(LKIND_OTHER);
+            }
+            _ => kinds.push(LKIND_OTHER),
+        }
+    }
+    locals.resize(n, CompactValue::uninitialized());
+    kinds.resize(n, LKIND_OTHER);
+    debug_assert_eq!(locals.len(), n);
+    debug_assert_eq!(kinds.len(), n);
+    let padded_max = (cached.max_stack as usize).max(16) + 8;
+    let stack = if let Some((vals, tags)) = stacks_pool.pop() {
+        ValueStack::from_pooled(vals, tags, padded_max)
+    } else {
+        ValueStack::new(padded_max)
+    };
+    CachedCompactParts {
+        locals,
+        local_kinds: kinds,
+        stack,
+        eff_max_locals,
+    }
+}
+
+
+/// [`build_cached_compact_parts`] for arguments that are still `Value`s.
+///
+/// The general dispatchers decode their arguments before they know which
+/// callee shape they have, so they cannot use the fast doors' verbatim
+/// `(slot, tag)` transfer. Everything after that point is the same, and
+/// sharing [`CachedCompactParts`] is what lets them share the emplace.
+#[inline]
+fn build_cached_value_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> CachedCompactParts {
+    let (locals, local_kinds, eff_max_locals) =
+        init_locals_pooled(cached.max_locals, args, locals_pool);
+    let padded_max = (cached.max_stack as usize).max(16) + 8;
+    let stack = if let Some((vals, tags)) = stacks_pool.pop() {
+        ValueStack::from_pooled(vals, tags, padded_max)
+    } else {
+        ValueStack::new(padded_max)
+    };
+    CachedCompactParts {
+        locals,
+        local_kinds,
+        stack,
+        eff_max_locals,
+    }
+}
+
+/// [`build_cached_value_parts`] for callers outside this module. Tuple, for
+/// the same reason [`take_cached_compact_parts`] is one.
+#[inline]
+pub(crate) fn take_cached_value_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> (Vec<CompactValue>, Vec<u8>, ValueStack, u16) {
+    let p = build_cached_value_parts(cached, args, locals_pool, stacks_pool);
+    (p.locals, p.local_kinds, p.stack, p.eff_max_locals)
+}
+
+/// [`build_cached_compact_parts`] for callers outside this module.
+///
+/// Returns the pieces as a tuple so the struct itself can stay private:
+/// `(locals, local_kinds, stack, effective_max_locals)`.
+#[inline]
+pub(crate) fn take_cached_compact_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[(CompactValue, u8)],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> (Vec<CompactValue>, Vec<u8>, ValueStack, u16) {
+    let p = build_cached_compact_parts(cached, args, locals_pool, stacks_pool);
+    (p.locals, p.local_kinds, p.stack, p.eff_max_locals)
+}
+
 impl Frame {
     /// Return `true` if a fresh OSR attempt should be made for `entry_pc`
     /// given the current `backward_count` and the per-loop exponential
@@ -1148,44 +1278,18 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let (locals, local_kinds, eff_max_locals) =
-            init_locals_pooled(cached.max_locals, args, locals_pool);
-        let padded_max = (cached.max_stack as usize).max(16) + 8;
-        let stack = if let Some((vals, tags)) = stacks_pool.pop() {
-            ValueStack::from_pooled(vals, tags, padded_max)
-        } else {
-            ValueStack::new(padded_max)
-        };
-        let class_id = cached.declaring_class_id;
-        let code = cached.code.clone();
-        let max_stack = cached.max_stack;
-        Self {
-            class_id,
-            pc: 0,
-            last_instr_pc: 0,
+        // CR-CLO-2 cached half lives in `from_cached_compact_parts` now:
+        // `CachedBytecodeMethod` does not yet carry a method slot (see the
+        // field doc — its 38 struct literals live in four crates and none has
+        // a `..` tail), so `method_index` is `None` there for both
+        // constructors, and that is the only line that changes when it lands.
+        let CachedCompactParts {
             locals,
             local_kinds,
             stack,
-            code,
-            max_stack,
-            max_locals: eff_max_locals,
-            inner: {
-                count_frame_kind(false);
-                FrameInner::Cached(cached)
-            },
-            // CR-CLO-2 cached half: `CachedBytecodeMethod` does not yet carry a
-            // method slot (see the field doc — its 38 struct literals live in
-            // four crates and none has a `..` tail, so the field cannot be
-            // added from here without breaking the workspace). When it lands
-            // this becomes `cached.method_index`, resolved once per method
-            // instead of once per push, and this is the only line that changes.
-            method_index: None,
-            backward_count: 0,
-            osr_attempt_counts: Vec::new(),
-            monitor_on_exit: None,
-            seq: next_frame_seq(),
-            exec_epoch: 0,
-        }
+            eff_max_locals,
+        } = build_cached_value_parts(&cached, args, locals_pool, stacks_pool);
+        Frame::from_cached_compact_parts(cached, locals, local_kinds, stack, eff_max_locals)
     }
 
     /// Reset this frame in-place for tail-call elimination.
@@ -1207,44 +1311,12 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let needed: usize = args
-            .iter()
-            .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
-            .sum();
-        let n = (cached.max_locals as usize).max(needed);
-        let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
-        let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
-        let mut locals = u64_vec_to_compact(vals);
-        locals.clear();
-        kinds.clear();
-        locals.reserve(n);
-        kinds.reserve(n);
-        for (cv, tag) in args {
-            locals.push(*cv);
-            match *tag {
-                b'J' => {
-                    kinds.push(LKIND_LONG);
-                    locals.push(CompactValue::uninitialized());
-                    kinds.push(LKIND_OTHER);
-                }
-                b'D' => {
-                    kinds.push(LKIND_DOUBLE);
-                    locals.push(CompactValue::uninitialized());
-                    kinds.push(LKIND_OTHER);
-                }
-                _ => kinds.push(LKIND_OTHER),
-            }
-        }
-        locals.resize(n, CompactValue::uninitialized());
-        kinds.resize(n, LKIND_OTHER);
-        debug_assert_eq!(locals.len(), n);
-        debug_assert_eq!(kinds.len(), n);
-        let padded_max = (cached.max_stack as usize).max(16) + 8;
-        let stack = if let Some((vals, tags)) = stacks_pool.pop() {
-            ValueStack::from_pooled(vals, tags, padded_max)
-        } else {
-            ValueStack::new(padded_max)
-        };
+        let CachedCompactParts {
+            locals,
+            local_kinds: kinds,
+            stack,
+            eff_max_locals,
+        } = build_cached_compact_parts(&cached, args, locals_pool, stacks_pool);
         let class_id = cached.declaring_class_id;
         let code = cached.code.clone();
         let max_stack = cached.max_stack;
@@ -1323,6 +1395,18 @@ impl Frame {
         debug_assert_eq!(self.locals.len(), n);
         debug_assert_eq!(self.local_kinds.len(), n);
 
+        self.reset_cached_tail(cached, eff_max_locals);
+    }
+
+    /// Everything a cached-frame reset does once its locals are laid down:
+    /// the operand stack, and every scalar field.
+    ///
+    /// Shared by [`Self::reset_cached_compact`] and [`Self::reset_cached_value`]
+    /// so the two argument representations cannot drift in what they leave
+    /// behind. Every field is overwritten, so nothing of the retired frame
+    /// survives into the new one.
+    #[inline]
+    fn reset_cached_tail(&mut self, cached: Arc<CachedBytecodeMethod>, eff_max_locals: u16) {
         self.stack
             .reset_in_place((cached.max_stack as usize).max(16) + 8);
 
@@ -1340,6 +1424,65 @@ impl Frame {
         self.exec_epoch = 0;
         count_frame_kind(false);
         self.inner = FrameInner::Cached(cached);
+    }
+
+    /// [`Self::reset_cached_compact`] for arguments that are still `Value`s.
+    ///
+    /// The general dispatchers' half of frame-slot reuse. `push_args_to_locals`
+    /// is the same function `init_locals_pooled` uses, so the locals this
+    /// leaves are those `Frame::new_pooled_cached` would have built — the
+    /// difference is only that the buffers were already here.
+    pub fn reset_cached_value(&mut self, cached: Arc<CachedBytecodeMethod>, args: &[Value]) {
+        let eff_max_locals = effective_max_locals(cached.max_locals, args);
+        let n = eff_max_locals as usize;
+
+        self.locals.clear();
+        self.local_kinds.clear();
+        self.locals.reserve(n);
+        self.local_kinds.reserve(n);
+        push_args_to_locals(&mut self.locals, &mut self.local_kinds, args, n);
+        self.locals.resize(n, CompactValue::uninitialized());
+        self.local_kinds.resize(n, LKIND_OTHER);
+        debug_assert_eq!(self.locals.len(), n);
+        debug_assert_eq!(self.local_kinds.len(), n);
+
+        self.reset_cached_tail(cached, eff_max_locals);
+    }
+
+
+    /// A `Frame` from pieces [`build_cached_compact_parts`] produced.
+    #[inline]
+    fn from_cached_compact_parts(
+        cached: Arc<CachedBytecodeMethod>,
+        locals: Vec<CompactValue>,
+        local_kinds: Vec<u8>,
+        stack: ValueStack,
+        eff_max_locals: u16,
+    ) -> Self {
+        let class_id = cached.declaring_class_id;
+        let code = cached.code.clone();
+        let max_stack = cached.max_stack;
+        Self {
+            class_id,
+            pc: 0,
+            last_instr_pc: 0,
+            locals,
+            local_kinds,
+            stack,
+            code,
+            max_stack,
+            max_locals: eff_max_locals,
+            inner: {
+                count_frame_kind(false);
+                FrameInner::Cached(cached)
+            },
+            method_index: None,
+            backward_count: 0,
+            osr_attempt_counts: Vec::new(),
+            monitor_on_exit: None,
+            seq: next_frame_seq(),
+            exec_epoch: 0,
+        }
     }
 
     pub fn reset_for_tail_call(
@@ -2907,10 +3050,132 @@ impl FrameStack {
         if self.depth >= self.buf.len() {
             return false;
         }
+        // `CRATONVM_DBG_INTERP_FRAMES=1` — this is a frame push like any
+        // other, and the census must see it. It is recorded here rather than
+        // in `reset_cached_compact` because `FrameStack::push` records at the
+        // same level, and because a reset that is not a push (tail call) is
+        // not a new frame.
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
         let d = self.depth;
         self.buf[d].reset_cached_compact(cached, args);
         self.depth += 1;
         true
+    }
+
+    /// [`Self::push_cached_compact_reusing`] for the general dispatchers,
+    /// whose arguments are still `Value`s.
+    ///
+    /// The two differ only in how the argument slots are laid down; the
+    /// resulting locals are identical, which is what
+    /// [`Frame::reset_cached_value`] and [`Frame::reset_cached_compact`]
+    /// sharing [`Frame::reset_cached_tail`] pins.
+    #[inline]
+    pub fn push_cached_value_reusing(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[Value],
+    ) -> bool {
+        if self.depth >= self.buf.len() {
+            return false;
+        }
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
+        let d = self.depth;
+        self.buf[d].reset_cached_value(cached, args);
+        self.depth += 1;
+        true
+    }
+
+
+    /// Build a frame for `cached` **in** the stack's next slot.
+    ///
+    /// The counterpart to [`Self::push_cached_compact_reusing`] for the case
+    /// where no slot is retired — the first call at a depth, and every
+    /// by-value push, which harvests and trims the slot it would have reused.
+    /// `push` receives a `Frame` that has already been built somewhere else
+    /// and moves ~220 bytes into the slot; this writes the struct where it
+    /// belongs, so the only things that travel are the three buffer handles
+    /// the caller just took from the pools.
+    ///
+    /// The struct literal is written by `ptr::write` in this function, so the
+    /// destination is known to the compiler at the point of construction and
+    /// there is no intermediate to copy from.
+    #[inline]
+    pub fn emplace_cached_compact(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        locals: Vec<CompactValue>,
+        local_kinds: Vec<u8>,
+        stack: ValueStack,
+        eff_max_locals: u16,
+    ) {
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
+        self.reserve_stable(1);
+        if self.depth < self.buf.len() {
+            // A retired slot is here after all (a caller that did not harvest).
+            // Assigning drops it, which is exactly what `push` would have done.
+            self.buf[self.depth] = Frame::from_cached_compact_parts(
+                cached,
+                locals,
+                local_kinds,
+                stack,
+                eff_max_locals,
+            );
+        } else {
+            let class_id = cached.declaring_class_id;
+            let code = cached.code.clone();
+            let max_stack = cached.max_stack;
+            count_frame_kind(false);
+            let seq = next_frame_seq();
+            // SAFETY: `reserve_stable(1)` guarantees `capacity > buf.len()`,
+            // and `depth == buf.len()` in this branch, so `dst` is the one
+            // slot past the last initialised element and is valid for a write
+            // of a `Frame`. `set_len` publishes it only after it is fully
+            // initialised, and nothing in between can panic or observe it.
+            unsafe {
+                let dst = self.buf.as_mut_ptr().add(self.depth);
+                std::ptr::write(
+                    dst,
+                    Frame {
+                        class_id,
+                        pc: 0,
+                        last_instr_pc: 0,
+                        locals,
+                        local_kinds,
+                        stack,
+                        code,
+                        max_stack,
+                        max_locals: eff_max_locals,
+                        inner: FrameInner::Cached(cached),
+                        method_index: None,
+                        backward_count: 0,
+                        osr_attempt_counts: Vec::new(),
+                        monitor_on_exit: None,
+                        seq,
+                        exec_epoch: 0,
+                    },
+                );
+                self.buf.set_len(self.depth + 1);
+            }
+        }
+        self.depth += 1;
     }
 
     /// Drop every retired slot, releasing their buffers.
@@ -3206,6 +3471,168 @@ mod tests {
         let thawed = Frame::from_frozen_frame(frozen);
         assert_eq!(thawed.method_index(), None);
         assert_eq!(thawed.method_name(), "m");
+    }
+
+    /// A `CachedBytecodeMethod` shaped for the frame-install tests.
+    fn cached_probe(
+        name: &str,
+        descriptor: &str,
+        max_locals: u16,
+        max_stack: u16,
+    ) -> Arc<CachedBytecodeMethod> {
+        Arc::new(CachedBytecodeMethod {
+            declaring_class_id: ClassId::new(0),
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from(name),
+            method_descriptor: Arc::from(descriptor),
+            source_file: Some(Arc::from("Target.java")),
+            code: padded_bytecode(&[0xb1]),
+            exception_table: Arc::from(Vec::<ExceptionTableEntry>::new().into_boxed_slice()),
+            max_stack,
+            max_locals,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Everything a caller can observe about an installed frame, so the three
+    /// install paths can be compared as wholes rather than field by field
+    /// (`seq` excluded: it is a fresh counter value by design).
+    fn frame_shape(f: &Frame) -> (ClassId, usize, u16, u16, usize, Vec<u64>, Vec<u8>) {
+        (
+            f.class_id,
+            f.pc,
+            f.max_stack,
+            f.max_locals,
+            f.stack.len(),
+            f.locals.iter().map(|c| c.raw_bits()).collect(),
+            f.local_kinds.clone(),
+        )
+    }
+
+    #[test]
+    fn rebuilding_a_retired_slot_holds_what_a_by_value_push_held() {
+        // The claim the general dispatchers' slot reuse rests on. If these two
+        // can differ, a call that happens to find a retired slot runs with
+        // different locals from the same call that does not — which is a
+        // wrong-answer bug that no test of either path alone can see.
+        let cached = cached_probe("m", "(IJLjava/lang/Object;)V", 6, 3);
+        let args = [
+            Value::Int(7),
+            Value::Long(-9_000_000_000),
+            Value::Object(None),
+        ];
+
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+        let fresh = Frame::new_pooled_cached(
+            Arc::clone(&cached),
+            &args,
+            &mut locals_pool,
+            &mut stacks_pool,
+        );
+
+        // A frame that has been used and is now being rebuilt: dirty locals, a
+        // non-empty operand stack, a pc partway through, a monitor to release.
+        let mut used = Frame::new_pooled_cached(
+            cached_probe("other", "(D)V", 12, 9),
+            &[Value::Double(1.5)],
+            &mut locals_pool,
+            &mut stacks_pool,
+        );
+        used.pc = 17;
+        used.backward_count = 42;
+        let _ = used.stack.push(Value::Int(1234));
+        used.reset_cached_value(Arc::clone(&cached), &args);
+
+        assert_eq!(frame_shape(&used), frame_shape(&fresh));
+        assert_eq!(used.backward_count, 0);
+        assert!(used.monitor_on_exit.is_none());
+        assert_eq!(used.method_name(), "m");
+    }
+
+    #[test]
+    fn the_value_and_compact_resets_lay_down_the_same_locals() {
+        // `reset_cached_value` and `reset_cached_compact` are the two argument
+        // representations of one operation. A `long` is the case that can
+        // diverge: it occupies two local slots and the upper half is filler.
+        let cached = cached_probe("m", "(JI)V", 4, 2);
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+
+        let mut by_value =
+            Frame::new_pooled_cached(Arc::clone(&cached), &[], &mut locals_pool, &mut stacks_pool);
+        by_value.reset_cached_value(Arc::clone(&cached), &[Value::Long(5), Value::Int(6)]);
+
+        let mut by_slot =
+            Frame::new_pooled_cached(Arc::clone(&cached), &[], &mut locals_pool, &mut stacks_pool);
+        by_slot.reset_cached_compact(
+            Arc::clone(&cached),
+            &[
+                (CompactValue::from_value_kinded(Value::Long(5)), b'J'),
+                (CompactValue::from_value_kinded(Value::Int(6)), b'I'),
+            ],
+        );
+
+        assert_eq!(frame_shape(&by_slot), frame_shape(&by_value));
+    }
+
+    #[test]
+    fn an_emplaced_value_frame_matches_a_pushed_one() {
+        // The other half of the ladder: no retired slot, so the frame is
+        // written into the next slot instead of being built and moved.
+        let cached = cached_probe("m", "(FI)V", 5, 4);
+        let args = [Value::Float(2.5), Value::Int(-3)];
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+
+        let mut pushed = FrameStack::new();
+        pushed.push(Frame::new_pooled_cached(
+            Arc::clone(&cached),
+            &args,
+            &mut locals_pool,
+            &mut stacks_pool,
+        ));
+
+        let mut emplaced = FrameStack::new();
+        let (locals, kinds, stack, eff) =
+            take_cached_value_parts(&cached, &args, &mut locals_pool, &mut stacks_pool);
+        emplaced.emplace_cached_compact(Arc::clone(&cached), locals, kinds, stack, eff);
+
+        assert_eq!(emplaced.len(), 1);
+        assert_eq!(frame_shape(&emplaced[0]), frame_shape(&pushed[0]));
+    }
+
+    #[test]
+    fn a_value_reuse_push_is_refused_when_no_slot_is_retired() {
+        // `push_cached_value_reusing` must never grow the stack: the caller
+        // reads `false` as "build one", and a version that pushed anyway would
+        // install the frame twice.
+        let cached = cached_probe("m", "()V", 1, 1);
+        let mut frames = FrameStack::new();
+        assert!(!frames.push_cached_value_reusing(Arc::clone(&cached), &[]));
+        assert_eq!(frames.len(), 0);
+
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+        frames.push(Frame::new_pooled_cached(
+            Arc::clone(&cached),
+            &[],
+            &mut locals_pool,
+            &mut stacks_pool,
+        ));
+        assert!(frames.retire_top());
+        assert!(frames.push_cached_value_reusing(cached, &[]));
+        assert_eq!(frames.len(), 1);
     }
 
     #[test]

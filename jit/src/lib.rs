@@ -90,6 +90,7 @@ pub mod bailout;
 pub mod compile_gate;
 pub mod deopt;
 pub mod escape_analysis;
+pub mod gpu_barrier;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
@@ -1636,6 +1637,23 @@ pub struct OopMapEntry {
     /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
     /// a proof into a guess, so the report must not spend it.
     pub stack_marks_exact: bool,
+    /// §25.3's probe — how many oop homes the SHADOW PUSH paired with this
+    /// safepoint published, captured just before `emit_shadow_reload` pops
+    /// them.
+    ///
+    /// Shadow publication is CALL-SCOPED (§25.2): `emit_shadow_push` runs
+    /// before the call and `emit_shadow_reload` pops right after it returns.
+    /// The band verifier's obligation is not scoped that way, so a frame
+    /// stopped at a safepoint that published nothing reports every movable word
+    /// it holds as un-rewritable — even the ones this map names. That is the
+    /// shape §22.2 measured (67 of 93 reported words `in_map=true`) and could
+    /// not explain.
+    ///
+    /// `0` says this safepoint pushed nothing. It does not by itself say
+    /// whether that is because the site is poll-shaped, because the gate was
+    /// off, or because no oop was live — those are separated by the
+    /// `shadow_incomplete_cause` counters.
+    pub shadow_pushed: u16,
 }
 
 impl OopMapEntry {
@@ -1654,6 +1672,7 @@ impl OopMapEntry {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         }
     }
 
@@ -2548,6 +2567,21 @@ pub struct FrameLayout {
     /// Prologue save area for the caller's callee-saved GPRs.
     pub callee_saved_lo: i32,
     pub callee_saved_hi: i32,
+    /// Is that save area at the SHALLOW end of the frame (nearest the frame
+    /// pointer) rather than the deep end?
+    ///
+    /// x86-64 puts it deepest, which lets the band verifier treat
+    /// `callee_saved_lo` as a half-line -- everything at or beyond it is a
+    /// register image or past the frame. AArch64's prologue puts the saved
+    /// FP/LR pair and the callee-saved GPRs immediately below the frame
+    /// pointer and the spill area BELOW them, so that half-line would exclude
+    /// the entire spill area -- exactly where the oop maps point, leaving the
+    /// verifier unable to see the words it exists to check.
+    ///
+    /// `false` (the derived default) is the x86-64 geometry, so no existing
+    /// producer changes. A backend that sets it gets the RANGE exclusion
+    /// (`is_register_image`) and not the half-line.
+    pub callee_saved_shallow: bool,
     /// Prologue save area for the caller's callee-saved XMMs.
     pub xmm_saved_lo: i32,
     pub xmm_saved_hi: i32,
@@ -12564,42 +12598,40 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
-/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+/// # It was DEFAULT-OFF for two days, and the crash was not its fault
 ///
-/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
-/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
-/// always a page boundary -- the shape of a read through a reference into a
-/// page the collector has already vacated. Two switches each remove it, 3 runs
-/// of 1200 s clean apiece:
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` with this family on died of
+/// `SIGSEGV` at a fault address that was always a page boundary, `rdi` equal to
+/// it and the fault pc inside libc -- 11/11 when the page was written, and 3/3
+/// in 7 s once an unrelated wrong-answer defect stopped ending the run first.
+/// Two switches each removed it: `CRATONVM_ZGC_RELOCATE=0` and this family off.
+/// The page read that pair as "it takes BOTH relocation and this intrinsic",
+/// and concluded the inline sequence held a receiver across a relocation.
 ///
-/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
-/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+/// **It did not.** A third switch removes it too, and names the mechanism:
+/// `CRATONVM_GC_RESERVE=0`, 3/3 clean against a 3/3 positive control in the
+/// same batch. gdb puts the fault in `ZgcRealHeap::compact_high_region`'s
+/// `memmove`. The collector's relocation slides pick a destination inside FREE
+/// space and copy into it without going through `Arena::hand_out`, and
+/// `Arena::decommit_free_blocks` had already returned those granules to the OS
+/// -- so the first slide after a give-back wrote into `PROT_NONE`. Both slides
+/// now commit first (`Arena::commit_for_relocation`).
 ///
-/// A `git bisect` over the 200 commits between the last known-good tip and the
-/// crashing one (both endpoints re-verified in the SAME build profile, and only
-/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
-/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
-/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
-/// relocation files are byte-identical to one of them. So the defect is the
-/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+/// This family's part was to change the allocation shape enough to make the
+/// high slide run. That is why turning it off hid the crash, and why turning it
+/// off was never a fix. The three-way switch table is the lesson: a pair of
+/// switches that each remove a crash does not identify a mechanism, it
+/// identifies two ingredients -- and a third switch can turn out to be under
+/// both of them.
 ///
-/// The inline sequence pops the receiver off the simulated operand stack and
-/// then dereferences it three times -- the class-id guard at `[RAX]`, the
-/// GC-flags byte, and the payload load -- with no call and therefore no
-/// safepoint in between. That is sound only while the receiver in hand cannot
-/// go stale; under a moving collector it evidently can. Root-causing that is
-/// the follow-up, and it wants the receiver kept as a NAMED root across the
-/// sequence rather than held only in `RAX`.
-///
-/// Correctness first: the family is now opt-in, and the perf win it was
-/// measured for is recoverable the moment the sequence is made relocation-safe.
-/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
-///
+/// Default ON again since 2026-09-04, with the fix, measured at zero SIGSEGV
+/// over six runs of the workload that crashed 11/11.
 /// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
 /// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
-    // Test-only force, consulted BEFORE the cache. The family is opt-in since
-    // it was found to SIGSEGV under relocation, so the matcher's own tests --
+    // Test-only force, consulted BEFORE the cache. The family was opt-in for
+    // two days after it was found to SIGSEGV under relocation, so the matcher's
+    // own tests --
     // which assert the POSITIVE case and say outright that every negative
     // below it is vacuous without it -- cannot reach it through the
     // environment: `OnceLock` fixes the answer at the first read, whichever
@@ -12617,8 +12649,28 @@ fn box_unbox_intrinsic_disabled() -> bool {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
             return true;
         }
-        // Default OFF: enabled only when explicitly asked for.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
+        // DEFAULT ON AGAIN (2026-09-04). The mitigation this replaced existed
+        // for exactly one reason -- the SIGSEGV recorded in `fixed-bugs/
+        // zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+        // -- and that crash was not this intrinsic's. It was
+        // `ZgcRealHeap`'s relocation slides writing into arena granules
+        // `Arena::decommit_free_blocks` had already returned to the OS; the
+        // slides now commit their destination first
+        // (`Arena::commit_for_relocation`). The intrinsic's part was to change
+        // the allocation shape enough to make the high slide run, which is why
+        // turning it off hid the crash and why turning it off was never a fix.
+        //
+        // Measured after that fix, on the workload that crashed 11/11 and then
+        // 3/3 in 7 s: `CRATONVM_JIT=box-unbox-intrinsic`, SIX runs (three to a
+        // 1200 s cap, three to 400 s), **zero SIGSEGV**. What those runs end on
+        // instead -- a `NullPointerException` at a later seed -- appears
+        // identically with the family OFF, and is the pre-existing failure
+        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+        // records.
+        //
+        // `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still
+        // means the same thing, so any script that sets it is unaffected.
+        false
     })
 }
 
@@ -12697,10 +12749,11 @@ pub fn try_resolve_box_unbox_intrinsic(
 ///
 /// Whether the family is ENABLED and whether a triple is one of the two it
 /// serves are separate questions, and only the second is what those tests are
-/// about. Keeping them separate means the tests go on guarding the match when
-/// the default flips back — which is the plan, once the relocation defect in
-/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-/// is closed.
+/// about. Keeping them separate meant the tests went on guarding the match
+/// across the default's two flips — off on 2026-09-02 for a crash that was the
+/// collector's, and on again on 2026-09-04 once
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+/// closed it.
 pub(crate) fn box_unbox_intrinsic_shape(
     class: &str,
     name: &str,
@@ -12947,32 +13000,39 @@ mod atomic_accessor_intrinsic_tests {
         }
     }
 
-    /// The family is OPT-IN, and the production entry point is what enforces
-    /// it.
+    /// The family is DEFAULT-ON, and the production entry point is what
+    /// decides it.
     ///
     /// The matcher tests above deliberately call `box_unbox_intrinsic_shape`,
-    /// which has no gate — so without this, flipping the default back would
-    /// change nothing any test can see, and so would flipping it back by
-    /// accident. This is the one place the DEFAULT is asserted.
+    /// which has no gate — so without this, flipping the default would change
+    /// nothing any test can see, in either direction. This is the one place the
+    /// DEFAULT is asserted, and that is the point: a flip has to be deliberate.
     ///
-    /// It will need inverting when
-    /// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-    /// is closed and the family goes default-on again. That is the point: the
-    /// flip should have to be deliberate.
+    /// INVERTED 2026-09-04. It read "opt-in until the relocation defect is
+    /// closed" for two days. The defect was closed, and it was not this
+    /// family's: `ZgcRealHeap`'s relocation slides were writing into arena
+    /// granules `Arena::decommit_free_blocks` had returned to the OS. See
+    /// `box_unbox_intrinsic_disabled`, and
+    /// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
     #[test]
-    fn box_unbox_is_opt_in_until_the_relocation_defect_is_closed() {
+    fn box_unbox_is_default_on_and_the_off_switch_still_works() {
         const CID: u32 = 12345;
         assert!(
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the shape must match, or this test cannot tell the gate from a              matcher that stopped matching"
         );
-        if std::env::var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
-            // Someone is running the root-cause work with the family on.
+        // Through the flag boundary, not `std::env` directly: a test that reads
+        // the environment raw is measuring the developer's ambient shell rather
+        // than the VM's latched configuration, which is the hazard
+        // `flag_declaration_guard` exists to name — and reading it raw here is
+        // what left `check-surface.sh` red on dev.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            // Someone is running with the family deliberately off.
             return;
         }
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_none(),
-            "the BOX_UNBOX family must stay opt-in while it SIGSEGVs under a              relocating collector (11/11 on H2 TestRandomMapOps)"
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_some(),
+            "the BOX_UNBOX family is default-ON since the ZGC slide fix; a              refusal here means the default was flipped without inverting this test"
         );
     }
 
@@ -18125,14 +18185,34 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
 /// Keyed like [`jit_bail_list`]. Bounded by [`MAX_DEFERRED_NEW_RETRIES`]
 /// entries so a pathological run cannot grow it without limit.
 ///
-/// The value is the retry state, and it is what makes the grant ONE-SHOT rather
-/// than a loop: `0` means "one retry is owed", `1` means "already granted". A
-/// method whose class is STILL not loaded on the retry bails a second time and
-/// [`note_deferred_new_bail`] then declines to re-arm it, so a class that never
-/// loads cannot make the same method re-enter the optimizing pipeline forever.
-fn deferred_new_retries() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>> {
-    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>>> =
-        std::sync::OnceLock::new();
+/// `state` is what makes the grant ONE-SHOT rather than a loop: `0` means "one
+/// retry is owed", `1` means "already granted".
+///
+/// `sites` are the `new` sites that were `Deferred` when the build bailed, as
+/// `(holder_class_id, cp_idx)` -- the same pair the resolver takes. They are
+/// recorded because the retry used to be spent BLIND: it flipped `0` to `1` on
+/// the next supersede attempt whether or not the class that caused the bail had
+/// loaded. Measured on CratonBench, that lost every retry it granted -- five
+/// `java/util/regex/Pattern` methods each bailed TWICE and then had no retry
+/// left for the moment the class did load. `sites` is what lets the grant wait
+/// for the condition it is retrying on.
+struct DeferredNewRetry {
+    state: u8,
+    sites: Vec<(u32, u16)>,
+    /// The method this memo belongs to, so a HELD retry can be re-offered.
+    ///
+    /// The map is keyed by a hash, which is enough to answer "does this method
+    /// have a retry" at the door the method itself walks through, and useless
+    /// for the opposite direction: after holding a retry, something has to go
+    /// looking for it once the class loads, and a hash names no method.
+    key: (std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>),
+}
+
+fn deferred_new_retries(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, DeferredNewRetry>> {
+    static SET: std::sync::OnceLock<
+        parking_lot::RwLock<rustc_hash::FxHashMap<u64, DeferredNewRetry>>,
+    > = std::sync::OnceLock::new();
     SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -18166,7 +18246,12 @@ const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
 /// The memo is consumed by [`take_deferred_new_retry`], so it grants exactly
 /// ONE extra attempt: a class that is still not loaded on the retry bails
 /// again, records nothing, and the method settles on single-pass as before.
-pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &str) {
+pub fn note_deferred_new_bail(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    deferred_sites: &[(u32, u16)],
+) {
     let h = compute_jit_key_hash(
         class_name,
         method_name,
@@ -18178,11 +18263,42 @@ pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &
     // stays at `1` and is never re-armed.
     if set.len() < MAX_DEFERRED_NEW_RETRIES || set.contains_key(&h) {
         let armed = !set.contains_key(&h);
-        set.entry(h).or_insert(0);
-        if armed && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-            eprintln!("[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor}");
+        set.entry(h).or_insert_with(|| DeferredNewRetry {
+            state: 0,
+            sites: deferred_sites.to_vec(),
+            key: (
+                std::sync::Arc::from(class_name),
+                std::sync::Arc::from(method_name),
+                std::sync::Arc::from(descriptor),
+            ),
+        });
+        if armed {
+            DEFERRED_NEW_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor} ({} unresolved new site(s))",
+                    deferred_sites.len(),
+                );
+            }
         }
     }
+}
+
+/// Restore the historical BLIND deferred-`new` retry grant.
+///
+/// The grant used to flip its one-shot memo whether or not the class that
+/// caused the bail had loaded, which on CratonBench lost every retry it granted
+/// -- five `java/util/regex/Pattern` methods bailed twice each and then had no
+/// retry left. `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` puts that back, as the
+/// bisection lever for anything that looks like a method no longer reaching the
+/// optimizing tier.
+fn deferred_new_retry_blind() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND")
+            .map_or(false, |v| v != "0" && v != "false")
+    })
 }
 
 /// Take (clear) this method's one deferred-`new` retry, if it has one.
@@ -18194,7 +18310,12 @@ pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &
 /// cheap inline TLAB bump for a more optimized body on a method whose
 /// allocations escape anyway; it is not the right answer for a method that was
 /// never given a chance to have its allocation looked at.
-pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+pub fn take_deferred_new_retry(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    site_resolves_now: &dyn Fn(u32, u16) -> bool,
+) -> bool {
     let h = compute_jit_key_hash(
         class_name,
         method_name,
@@ -18202,17 +18323,88 @@ pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: 
         cratonvm_types::ClassId::new(0),
     );
     let mut set = deferred_new_retries().write();
-    let granted = match set.get_mut(&h) {
-        Some(state @ 0) => {
-            *state = 1;
-            true
-        }
-        _ => false,
+    let Some(entry) = set.get_mut(&h) else {
+        return false;
     };
-    if granted && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+    if entry.state != 0 {
+        return false;
+    }
+    // The retry is for a TRANSIENT condition -- a `new` whose class had not
+    // been loaded yet -- so spending it while that condition still holds throws
+    // it away on an attempt guaranteed to bail exactly as the first one did,
+    // and leaves nothing for the moment the class actually loads. Ask first.
+    //
+    // An empty `sites` list is treated as "cannot tell" and grants, which is
+    // the historical behaviour.
+    let ready = deferred_new_retry_blind()
+        || entry.sites.is_empty()
+        || entry
+            .sites
+            .iter()
+            .all(|&(holder, cp_idx)| site_resolves_now(holder, cp_idx));
+    if !ready {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept"
+            );
+        }
+        DEFERRED_NEW_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    entry.state = 1;
+    DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!("[cratonvm-jitc] deferred-new SPENT {class_name}.{method_name}{descriptor}");
     }
-    granted
+    DEFERRED_NEW_SPENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Retries withheld because the deferred class was still not loaded, and
+/// retries actually spent. A gate that never holds, or never grants, is a gate
+/// that is not doing what it says.
+static DEFERRED_NEW_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEFERRED_NEW_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(held, spent)` deferred-`new` retry decisions for this process.
+pub fn deferred_new_retry_census() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DEFERRED_NEW_HELD.load(Relaxed),
+        DEFERRED_NEW_SPENT.load(Relaxed),
+    )
+}
+
+/// How many deferred-`new` retries are currently HELD, as one relaxed load.
+///
+/// The sweep that re-offers them runs on every class definition, so its fast
+/// path must not take the memo lock: during startup a lock per definition is a
+/// cost paid by every program, to answer "nothing to do" for almost all of them.
+static DEFERRED_NEW_ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of retries armed and not yet spent. Cheap enough for a hot path.
+pub fn held_deferred_new_count() -> u64 {
+    DEFERRED_NEW_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Every method whose deferred-`new` retry is still HELD, newest-first order
+/// unspecified.
+///
+/// The sweep that re-offers them runs on a class definition, not on the
+/// method's own next compile: a method that bailed on an unloaded class has no
+/// reason to be compiled again, so waiting for it to come back is waiting for
+/// something that does not happen.
+pub fn held_deferred_new_methods() -> Vec<(
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+)> {
+    deferred_new_retries()
+        .read()
+        .values()
+        .filter(|e| e.state == 0)
+        .map(|e| e.key.clone())
+        .collect()
 }
 
 /// Number of methods currently OWED a deferred-`new` retry. Diagnostics.
@@ -18220,7 +18412,7 @@ pub fn deferred_new_retry_count() -> usize {
     deferred_new_retries()
         .read()
         .values()
-        .filter(|&&v| v == 0)
+        .filter(|e| e.state == 0)
         .count()
 }
 
@@ -21981,6 +22173,50 @@ pub fn first_unsupported_precise_frame_site(
     None
 }
 
+thread_local! {
+    /// Did the optimizing pipeline get entered on this thread's current
+    /// compile, and then hand the method to the single-pass backend?
+    ///
+    /// `metrics` already records this as `fell_through_to_single_pass`, but the
+    /// metrics ring is behind `CRATONVM_JIT_METRICS` and keeps only a bounded
+    /// history, so it can answer questions ABOUT a run and cannot be consulted
+    /// DURING one. Anything that changes behaviour on this fact needs a signal
+    /// that is on when the metrics are off, or the diagnostic becomes the
+    /// thing it is measuring.
+    ///
+    /// Thread-local because a compile runs start-to-finish on one worker; read
+    /// it immediately after the compile call, on the same thread.
+    static IR_PIPELINE_ENTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IR_FELL_THROUGH_TO_SINGLE_PASS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Reset the fall-through signal at the start of a compile.
+fn reset_ir_fall_through_signal() {
+    IR_PIPELINE_ENTERED.with(|c| c.set(false));
+    IR_FELL_THROUGH_TO_SINGLE_PASS.with(|c| c.set(false));
+}
+
+fn note_ir_pipeline_entered() {
+    IR_PIPELINE_ENTERED.with(|c| c.set(true));
+}
+
+fn note_single_pass_entered() {
+    if IR_PIPELINE_ENTERED.with(|c| c.get()) {
+        IR_FELL_THROUGH_TO_SINGLE_PASS.with(|c| c.set(true));
+    }
+}
+
+/// Did the compile that just finished on this thread run the whole optimizing
+/// pipeline and then produce a single-pass body anyway?
+///
+/// True means the C2 task paid for an IR build, optimize and schedule, threw
+/// them away (`ir_lower::lower_inner` returning `None` is the common route),
+/// and recompiled the method with the backend that had already compiled it.
+pub fn last_compile_fell_through_to_single_pass() -> bool {
+    IR_FELL_THROUGH_TO_SINGLE_PASS.with(|c| c.get())
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -22088,6 +22324,8 @@ fn try_compile_inner(
     // native in front of real bytes.
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
 ) -> Option<CompiledMethod> {
+    // One compile, one verdict: the fall-through signal describes THIS call.
+    reset_ir_fall_through_signal();
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
     // drops. `Drop` is deliberate — this function has ~40 `return None` exits
@@ -22173,6 +22411,13 @@ fn try_compile_inner(
         *backend_attempted = true;
 
         let mut backend = aarch64_backend::Arm64Backend::new();
+        // Without this the backend's `safepoint_flag_addr` stays 0 and
+        // `emit_safepoint_poll` emits nothing — the same optional-helper
+        // contract x64 uses, so an unwired build is byte-identical.
+        backend.set_helpers(*helpers);
+        // Seeds the reference-parameter mask, which the entry poll names its
+        // live oops from and the local dataflow starts at bci 0 with.
+        backend.set_method_descriptor(&cached.method_descriptor, cached.is_static);
         let result = backend.compile_method_with_info(
             cached.max_locals as usize,
             num_params,
@@ -22181,12 +22426,13 @@ fn try_compile_inner(
             method_info,
         );
         if result.success {
-            if let Some(machine_code) = aarch64_backend::emit_machine_code(&result) {
-                if let Some(mut buf) = ExecutableBuffer::new(machine_code.len().max(4096)) {
-                    buf.set_tag("aarch64-backend");
-                    buf.emit(&machine_code);
-                    return Some(CompiledMethod::new(buf));
-                }
+            // One line on purpose: everything this used to do inline lives in
+            // `publish_compiled_method`, which has no `cfg` on it and so is
+            // type-checked and unit-tested on every host. This block is not
+            // compiled on x86-64, which is how it came to build its
+            // `CompiledMethod` without ever transferring `oop_maps`.
+            if let Some(cm) = aarch64_backend::publish_compiled_method(&result) {
+                return Some(cm);
             }
         }
         return None;
@@ -22808,6 +23054,7 @@ fn try_compile_inner(
         // `enter_single_pass` is recognisable as a FALL-THROUGH rather than a
         // method that was never a C2 candidate at all.
         metrics.enter_optimizing_pipeline();
+        note_ir_pipeline_entered();
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
@@ -22817,6 +23064,11 @@ fn try_compile_inner(
         let mut ir_compact_fields: std::collections::HashMap<(usize, bool), (u32, bool, u8)> =
             std::collections::HashMap::new();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        // The one fact the optimizing tier cannot derive for itself: whether
+        // parameter 0 is a receiver. `num_params` above already counts the
+        // implicit `this`, so the flag is the only missing half, and it is
+        // right here.
+        builder.graph.receiver_param = if cached.is_static { None } else { Some(0) };
         builder.tdigest_scalar_kernel = cached.class_name.as_ref()
             == "org/elasticsearch/tdigest/Dist"
             && matches!(
@@ -23072,6 +23324,9 @@ fn try_compile_inner(
         // usually its constructor. Read again after `IrBuilder::build`, so the
         // retry is recorded only when the build actually LOST the method.
         let mut any_deferred_new = false;
+        // The sites themselves, not just "there was one": the retry grant asks
+        // whether these resolve NOW, and it cannot ask that from a bool.
+        let mut deferred_new_sites: Vec<(u32, u16)> = Vec::new();
         if let (Some(elidable_resolver), Some(new_resolver)) =
             (cp_elidable_init_resolver, cp_new_resolver)
         {
@@ -23092,7 +23347,13 @@ fn try_compile_inner(
                         }) => {
                             new_info_map.insert(pc, (class_id, num_fields));
                         }
-                        Some(JitNewSite::Deferred { .. }) => any_deferred_new = true,
+                        Some(JitNewSite::Deferred {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            any_deferred_new = true;
+                            deferred_new_sites.push((holder_class_id, cp_idx));
+                        }
                         _ => {}
                     }
                 }
@@ -24516,6 +24777,7 @@ fn try_compile_inner(
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
+                &deferred_new_sites,
             );
         }
         if built.is_none() && ir_stage_reporting() {
@@ -24958,6 +25220,7 @@ fn try_compile_inner(
                     }
                     note_jit_pipeline_stage(JIT_STAGE_LOWER);
                     let metrics_lower = metrics.phase(metrics::Phase::Lower);
+                    ir_lower::clear_lower_bail();
                     let lowered = ir_lower::lower_inner(
                         &graph,
                         &schedule,
@@ -25250,9 +25513,16 @@ fn try_compile_inner(
                         return Some(compiled);
                     }
                     if ir_stage_reporting() {
+                        // Name the bail. "returned None" said the optimizing
+                        // tier declined and nothing about whether the decline
+                        // was predictable, which is the only question that
+                        // decides if the wasted IR build can be avoided.
                         eprintln!(
-                            "[ir] ir_lower::lower_inner returned None for {}.{}{}",
-                            cached.class_name, cached.method_name, cached.method_descriptor,
+                            "[ir] ir_lower::lower_inner refused ({}) for {}.{}{}",
+                            ir_lower::last_lower_bail().unwrap_or("unlabelled"),
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
                         );
                     }
                 }
@@ -25267,6 +25537,7 @@ fn try_compile_inner(
     // as a fall-through, which is what makes "the C2 tier produced no bodies"
     // separable from "the C2 tier was never asked".
     metrics.enter_single_pass();
+    note_single_pass_entered();
 
     // Resolve multianewarray entries.
     //
@@ -29962,6 +30233,12 @@ mod tests {
     /// five days after their capability landed, and `getstatic`/`checkcast`
     /// sat until 2026-08-11 while they held down Tomcat's WebSocket send path.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_admits_exactly_the_opcodes_whose_lowerings_publish() {
         // Publishes via `emit_post_invoke_exception_check` (reason-9) on every
         // throwing path, or cannot throw at all.
@@ -30014,6 +30291,12 @@ mod tests {
     /// `checkcast` must therefore no longer refuse a compile, while a protected
     /// `arraylength` still must.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
         // One protected range covering the whole body.
@@ -30061,6 +30344,12 @@ mod tests {
     /// admission withdrawn the same bytes MUST refuse, and refuse at the `new`.
     /// Without it a gate that had quietly become unconditional would read green.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_admits_a_protected_throw_new_and_refuses_it_when_withdrawn() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
         // pc 0: new #0        (3 bytes)
@@ -30615,6 +30904,12 @@ mod tests {
     /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
     /// appearing in the code identifies which helper the site calls.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn self_recursive_nontail_site_routes_through_dispatch() {
         use std::sync::Arc;
 
@@ -30854,6 +31149,12 @@ mod tests {
     // IR-lowering success path bumps. The counter is thread-local and each cargo
     // `#[test]` runs on its own thread, so parallel compile tests can't perturb it.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn step3_optimize_toggle_routes_c1_singlepass_and_c2_ir() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -30937,6 +31238,12 @@ mod tests {
     // `ir_vs_singlepass.rs` proves the *executed* result is correct; this
     // proves the IR path — not single-pass — produced the body.)
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn step3_getfield_int_routes_through_ir() {
         use std::sync::Arc;
 
@@ -31059,6 +31366,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31120,6 +31428,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31169,6 +31478,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31252,6 +31562,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31522,6 +31833,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31657,6 +31969,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31755,6 +32068,7 @@ mod tests {
                 exit: NO_NODE,
                 safepoints: Vec::new(),
                 uses: Default::default(),
+                receiver_param: None,
             };
             let start = g.add(Op::Start, IrType::Control, vec![], None);
             let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31846,6 +32160,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -32192,6 +32507,12 @@ mod tests {
     // gate. Without it the builder bails on the `invokespecial`, keeping `new`
     // scalar replacement off by default.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
         use std::sync::Arc;
         // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
@@ -32343,6 +32664,12 @@ mod tests {
     // helper unwired must still bail (a hand-built test table must never get a
     // CALL to address 0).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn deferred_new_site_compiles_when_cp_helper_is_wired() {
         use std::sync::Arc;
         // `static int f() { new Cold(); pop; return 0; }`
@@ -32451,6 +32778,12 @@ mod tests {
     // not prove the IR path fired. `IR_LOWER_COMPILES` proves it does (==1 with
     // the flag) and does not (==0 without — the builder bails on the invoke).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32574,6 +32907,12 @@ mod tests {
     /// result-equality alone (the integration harness) would not prove the IR
     /// path ran.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32701,6 +33040,12 @@ mod tests {
     /// the fall-through), so result-equality alone would not prove the IR path
     /// ran — `IR_LOWER_COMPILES` does.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_long_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32770,6 +33115,12 @@ mod tests {
     /// equality alone would not prove the IR path ran — `IR_LOWER_COMPILES`
     /// proves it (==1 with the flag, ==0 without → vacuous single-pass fallback).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_fp_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32849,6 +33200,12 @@ mod tests {
     /// Guards against a vacuous validation: single-pass ALSO dispatches
     /// invokevirtual, so result-equality alone would not prove the IR path ran.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_virtual_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -36868,6 +37225,12 @@ mod tests {
     // ── return_type tests ───────────────────────────────────────────
 
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn recursive_compile_cycle_routes_parent_direct_call_through_dispatch() {
         // Held for the whole test: the recursive-cycle set this clears and
         // then asserts on is process-global. See
@@ -37041,6 +37404,12 @@ mod tests {
     /// The bind used to `continue` straight past the registration at the end
     /// of the scan loop, so this asserted 0 before the fix.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn statically_bound_direct_callee_call_still_registers_invoke_info() {
         // The other clearer of the process-global recursive-cycle set;
         // see `jit_recursive_cycle_test_lock`.
@@ -37200,6 +37569,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let c = g.add(ir::Op::Const(42), ir::IrType::Int, vec![], None);
@@ -37230,6 +37600,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(
@@ -38449,7 +38820,7 @@ mod layout_constant_inventory {
 
     /// `(file, counts)` where `counts[i]` is the number of code uses of
     /// `LAYOUT_CONSTANTS[i]` in that file.
-    const INVENTORY: [(&str, [usize; 8]); 2] = [
+    const INVENTORY: [(&str, [usize; 8]); 3] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
         // two offset closures — `legacy()` (header-plus-cell, then the ref or
         // int-category payload offset inside that cell: one use of each) and
@@ -38589,13 +38960,28 @@ mod layout_constant_inventory {
         // it reconstructs both cell addresses to assert both stores are
         // emitted, which is the assertion that would have caught the
         // compact-only arm before a run-time census had to.
-        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
+        //
+        // 2026-09-04: the layout-epoch guard's regression test adds three more
+        // `HEADER_SIZE` uses (17 -> 20), all of them reading back the compact
+        // cell it just proved is or is not written. No new EMISSION site: the
+        // guard itself bakes an epoch address and a count, not a displacement.
+        ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
+        // x64/objects.rs, added 2026-09-04. It bakes object-header
+        // displacements exactly as the two files above do -- the compact and
+        // legacy reference-store cell addresses, the array header, the inline
+        // TLAB `new` -- and was covered by NEITHER tripwire: the `x64.rs` scan
+        // matches only the `<CONST> as <ty>` cast form, and this inventory
+        // listed two files. The gap was found the honest way, by adding a
+        // legacy emission site there on 2026-09-02 and having to record it by
+        // hand in `header-shrink.md` because nothing counted it.
+        ("objects.rs", [8, 0, 3, 0, 2, 0, 2, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
         match file {
             "lib.rs" => include_str!("lib.rs"),
             "ir_lower.rs" => include_str!("ir_lower.rs"),
+            "objects.rs" => include_str!("x64/objects.rs"),
             other => panic!("no source registered for {other}"),
         }
     }
@@ -39015,6 +39401,10 @@ mod code_cache_lifetime_tests {
     /// newest range for an address must still win, so a recycled address
     /// symbolizes as what is mapped there NOW.
     #[test]
+    // x86-64 only: it registers x86-64 compiled bodies by address; the aarch64
+    // path publishes different artifacts. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn the_newest_registration_for_an_address_wins() {
         let buf = ExecutableBuffer::new(64).expect("alloc executable");
         let entry = buf.as_ptr() as usize;
@@ -39576,5 +39966,121 @@ mod devirt_intrinsic_yield_tests {
                 );
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_new_retry_gate_tests {
+    use super::{note_deferred_new_bail, take_deferred_new_retry};
+
+    /// The memo map and its held-count are process-global, so these tests
+    /// cannot run concurrently with each other: `cargo test` runs them on
+    /// separate threads, and a count asserted as `before + 1` is only stable
+    /// if nothing else is arming or spending at the same time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The retry exists for a TRANSIENT condition, so it must not be spent
+    /// while that condition still holds. Before this gate the grant was blind:
+    /// it flipped the one-shot memo on the next attempt regardless, the attempt
+    /// bailed exactly as the first had, and the method then had no retry left
+    /// for the moment its class actually loaded. Measured on CratonBench, that
+    /// lost 5 of 6 retries and cost 30 ms of background compile per run.
+    #[test]
+    fn an_unresolved_site_holds_the_retry_instead_of_spending_it() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Hold", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[(7, 11)]);
+        let never = |_: u32, _: u16| false;
+        assert!(
+            !take_deferred_new_retry(c, m, d, &never),
+            "a still-unresolved new site must not consume the one retry",
+        );
+        // And the memo survives: the whole point is that it is still there when
+        // the class does load.
+        let now = |_: u32, _: u16| true;
+        assert!(
+            take_deferred_new_retry(c, m, d, &now),
+            "the retry held above must still be available once the site resolves",
+        );
+    }
+
+    /// One-shot is one-shot: a granted retry is not re-grantable.
+    #[test]
+    fn a_spent_retry_is_not_granted_twice() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Once", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[(1, 2)]);
+        let now = |_: u32, _: u16| true;
+        assert!(take_deferred_new_retry(c, m, d, &now));
+        assert!(!take_deferred_new_retry(c, m, d, &now));
+    }
+
+    /// Every site must resolve, not merely one of them: a method bails on the
+    /// FIRST `new` the builder cannot type, so a retry granted while any site
+    /// is still unresolved is a retry spent on the same bail.
+    #[test]
+    fn one_unresolved_site_among_several_still_holds() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Partial", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[(1, 2), (1, 3)]);
+        let only_first = |_h: u32, cp: u16| cp == 2;
+        assert!(!take_deferred_new_retry(c, m, d, &only_first));
+    }
+
+    /// A memo with no recorded sites cannot answer the question, so it grants —
+    /// the historical behaviour, not a silent refusal.
+    #[test]
+    fn a_memo_without_sites_grants_as_before() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Unknown", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[]);
+        let never = |_: u32, _: u16| false;
+        assert!(take_deferred_new_retry(c, m, d, &never));
+    }
+
+    /// An un-armed method has no retry to take.
+    #[test]
+    fn a_method_that_never_bailed_has_no_retry() {
+        let _serial = serial();
+        let now = |_: u32, _: u16| true;
+        assert!(!take_deferred_new_retry("T$Never", "run", "()V", &now));
+    }
+
+    /// A held retry has to be FINDABLE, or holding it is the same outcome as
+    /// spending it: the method already has a body, so nothing compiles it
+    /// again and no door it walks through will ever ask about it. The memo map
+    /// is keyed by a hash, which cannot name a method — hence the stored key.
+    #[test]
+    fn a_held_retry_can_be_found_again_by_method_name() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Findable", "run", "()V");
+        super::note_deferred_new_bail(c, m, d, &[(3, 4)]);
+        let never = |_: u32, _: u16| false;
+        assert!(!take_deferred_new_retry(c, m, d, &never));
+        let held = super::held_deferred_new_methods();
+        assert!(
+            held.iter()
+                .any(|(hc, hm, hd)| &**hc == c && &**hm == m && &**hd == d),
+            "a held retry must appear in the set the class-definition sweep reads",
+        );
+    }
+
+    /// The sweep's fast path is this counter, so it has to actually track the
+    /// arm/spend pair — a counter stuck at zero silently disables the sweep,
+    /// and one that never decrements makes every class definition do work.
+    #[test]
+    fn the_held_count_tracks_arming_and_spending() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Counted", "run", "()V");
+        let before = super::held_deferred_new_count();
+        super::note_deferred_new_bail(c, m, d, &[(5, 6)]);
+        assert_eq!(super::held_deferred_new_count(), before + 1);
+        let now = |_: u32, _: u16| true;
+        assert!(take_deferred_new_retry(c, m, d, &now));
+        assert_eq!(super::held_deferred_new_count(), before);
     }
 }

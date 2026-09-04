@@ -476,6 +476,116 @@ here, both recorded so the next reader does not have to re-find them:
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03. `bb_state`'s missing direct-buffer arm
+> is REAL and still live on both shipping arms.** This record's status was
+> "Nothing here has been built or run on CratonVM"; the CratonVM column exists
+> now, from `probes/DirectByteBufferStateProbe.java` against Temurin
+> 25.0.3+9-LTS on the same host.
+>
+> ```text
+>                   checks ok   BAD   probe reached the end?
+> HotSpot 25            282       0   yes -- PROBE PASS
+> compatible            262       2   NO  -- dies at line 492
+> --jdk-only            262       2   NO  -- dies at line 492
+> --synthetic-jdk       255       9   NO  -- dies at line 492
+> ```
+>
+> **The two BAD rows on the shipping arms are this record's subject**, and they
+> are the defect W7-50 handed over — the one that "survives this fix ... simply
+> now unreachable from the real-JDK arm":
+>
+> ```text
+> seg.heap.isDirect   expected false   got true
+> seg.heap.hasArray   expected true    got false
+> ```
+>
+> `MemorySegment.ofArray(byte[]).asByteBuffer()` produces a buffer that reports
+> itself DIRECT and array-less. A heap-backed segment took the direct arm.
+>
+> **And it then kills the probe.** Because `hasArray` is false, `hb.array()` on
+> the next line throws `UnsupportedOperationException` out of `segmentBuffer`
+> (`DirectByteBufferStateProbe.java:492`) and the run stops there. The ~20
+> remaining rows — `seg.heapSlice.*`, `seg.heapRO.*`, `seg.intArray.*` — are
+> **UNTESTED, not passing.** A naive line-diff reports "23 differing lines" and
+> reads as a broad divergence; 2 are wrong answers and the rest are a truncation.
+> Counted as a diff it also flatters the VM: the aliasing and read-only rows
+> most likely to catch a fabricated buffer are exactly the ones never reached.
+>
+> **The `getIntLE` / `putIntLE` residuals this record documents are
+> `--synthetic-jdk`-ONLY.** They do not reproduce in Compatible or `--jdk-only`:
+>
+> ```text
+> heap.getIntLE            expected 824845084   got 472066609    (synthetic only)
+> heap.putIntLE.byte4/7    expected 4 / 1       got 1 / 4        (synthetic only)
+> heap.ord.asIntBuffer.*   expected BIG_ENDIAN  got LITTLE_ENDIAN (synthetic only)
+> ```
+>
+> That is new information the record could not have: it names them as residuals
+> without a mode, and they are absent from both shipping arms.
+>
+> **What this does NOT verify.** §1's census — 48 textual call sites, 78 after
+> macro expansion — is a source count and was not re-counted; this note verifies
+> BEHAVIOUR only, and only for the sites this probe reaches. Nothing here says
+> which of the 78 sites produces the `isDirect` answer: the defect is confirmed
+> and NOT localised. The rows after line 492 are unmeasured in every CratonVM
+> mode and no claim is made about them in either direction.
+
+> **FIXED 2026-09-04.** The defect this record named — `bb_state`'s missing
+> direct-buffer arm, surviving as *"a real defect in shared code"* — is closed,
+> and `probes/DirectByteBufferStateProbe.java` now runs to the end:
+>
+> ```text
+>                        checks   BAD   reached the end?
+> HotSpot 25               282      0   yes
+> CratonVM compatible      282      0   yes -- PROBE PASS
+> CratonVM --jdk-only      282      0   yes -- PROBE PASS
+> ```
+>
+> Before: 262 checks, 2 BAD, and the run DIED at line 492, leaving ~20 rows
+> untested.
+>
+> **What it actually was.** `MemorySegment.asByteBuffer()` minted a
+> `DirectByteBuffer` unconditionally — the registration comment said so
+> outright, *"asByteBuffer() → a direct ByteBuffer over the segment's own
+> memory"*, stating the defect as if it were the design. A heap segment has no
+> native address, so `ofArray(byte[16]).asByteBuffer()` answered
+> `isDirect() == true` and `hasArray() == false`, and `hb.array()` on the next
+> probe line threw `UnsupportedOperationException` out of the run.
+>
+> **The fix** mirrors `HeapMemorySegmentImpl.makeByteBuffer()`: a heap-backed
+> segment becomes a HEAP buffer over its own backing array, built as
+> `ByteBuffer.wrap(base, start, size).slice()` — `wrap` sets position/limit and
+> `slice` turns the remaining window into capacity while folding the position
+> into `arrayOffset()`, which is byte-for-byte the shape
+> `newHeapByteBuffer(base, start, size, seg)` produces. Two natives that are
+> registered in every mode were chosen deliberately over `slice(II)`, which this
+> VM registers for `CharBuffer`/`IntBuffer`/`LongBuffer`/`FloatBuffer` and **not**
+> for `ByteBuffer`.
+>
+> **CORRECTION 2026-09-04 to the sentence that used to end here.** It called
+> that missing registration "a gap this note records and does not close", which
+> reads as a defect. It is not one on either shipping arm: measured with
+> `probes/SliceProbe.java`, `ByteBuffer.slice(int,int)` is **identical to
+> HotSpot** in Compatible and `--jdk-only` — capacity, `arrayOffset`, `get`,
+> `hasArray`, the direct-buffer rows, and both `IndexOutOfBoundsException`
+> messages — because the real JDK bytecode serves it. An absent REGISTRATION is
+> not an absent method; the siblings are registered for receivers that have no
+> bytecode to fall back on. The choice above still stands on its own reason
+> (`wrap`/`slice()` are registered in every mode, so the heap arm does not
+> depend on which mode it runs in), but nothing here is owed.
+>
+> A non-`byte[]` base is refused by name, as the oracle does
+> (`ofArray(int[8]).asByteBuffer()` is `UnsupportedOperationException` on
+> HotSpot 25), including when the shape check declines to build a view at all —
+> without that second arm an `int[]` segment fell through to the direct path and
+> answered with a `DirectByteBuffer` over memory it does not own.
+>
+> **What is NOT claimed.** §1's census — 48 textual call sites, 78 after macro
+> expansion — was not re-counted, and this fix touches the `asByteBuffer`
+> producer rather than the `bb_state` consumer, so a site that mints a segment
+> buffer some other way is unaffected and untested. The `getIntLE`/`putIntLE`
+> residuals remain `--synthetic-jdk`-only and are not addressed here.
+
 ## 12. §6's probe, scheduled — the reachable half (2026-08-12)
 
 §7 is right that "the probe must be run `--features synthetic-jdk` +

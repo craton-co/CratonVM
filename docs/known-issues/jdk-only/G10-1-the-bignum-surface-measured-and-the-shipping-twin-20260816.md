@@ -28,6 +28,97 @@ proves where a body is, never that it runs (HANDOFF §5).
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. 670 of 671 checks agree; the one that
+> does not is a real defect.** This record's status was **CODE LANDED, BEHAVIOUR
+> UNVERIFIED ON CRATONVM** — *"This lane did not build, did not run the suite,
+> and did not use `--dump-native-registry`."*
+>
+> **`RJdkBigNum` is not in the regression suite.** This record writes the vector
+> out in full and nobody ever added it, so a suite run could never have
+> exercised it — `regression-suite/src/RJdkBigNum.java` does not exist. The
+> source was extracted from §11 of this record and is now kept as
+> `probes/RJdkBigNum.java` so the next reader does not have to.
+>
+> ```text
+>                       checks   differing from HotSpot   self-diff over 2 runs
+> HotSpot 25              671      —                        0
+> CratonVM compatible     671      1                        0
+> CratonVM --jdk-only     671      1                        0
+> ```
+>
+> **671 is exactly the count this record predicted** (*"exit 0, 671 checks,
+> under two seconds"*), so the vector is the one it describes and nothing has
+> drifted underneath it.
+>
+> **The single divergence, in the `doubleValue()` surface of §5.2:**
+>
+> ```text
+> dv.9007199254740993.1     HotSpot 9.007199254740992E14     CratonVM 9.007199254740993E14
+> ```
+>
+> `new BigDecimal(BigInteger.valueOf(9007199254740993L), 1).doubleValue()` is
+> the decimal 900719925474099.3, and 9007199254740993 is 2^53 + 1 — the first
+> integer a `double` cannot represent. HotSpot returns the correctly-rounded
+> nearest `double` and prints `…992`; we print `…993`, a value no `double`
+> holds. The unrounded digits surviving is the tell: the conversion is not going
+> through an IEEE-754 rounding step. It is the only row of the 84
+> `dv.`/`fv.` combinations that differs, and it is deterministic across runs on
+> both VMs, so it is a defect and not a flake.
+>
+> **What this does NOT verify.** §7's deliberate decision to leave
+> `native-builtins/src/biginteger_intrinsics.rs` unchanged — *"the twin that is
+> not compiled at all"* — is untouched: this vector cannot see a file that is
+> not compiled, and a green here is not evidence about it. The MEASURED HotSpot
+> transcripts from `scratchpad/g10/{BdProbe,Bd2Probe,BiProbe}.java` are the
+> oracle and were not re-derived; that scratchpad did not survive its session.
+> The defect above is named, NOT localised to a function.
+
+> **FIXED 2026-09-04 — and NOT where this record says.** §"one divergent row"
+> attributes `dv.9007199254740993.1` to `doubleValue()`. It is not a
+> `BigDecimal` defect at all.
+>
+> **The split that decided it.** `probes/BdBitsProbe.java` prints the same value
+> through two independent routes — the raw IEEE-754 bits and `Double.toString`:
+>
+> ```text
+>                          HotSpot 25              CratonVM (before the fix)
+> bd.doubleValue.rawBits   430999999999999a        430999999999999a   <- IDENTICAL
+> bd.doubleValue.toString  9.007199254740992E14    9.007199254740993E14
+> parseDouble.rawBits      430999999999999a        430999999999999a
+> literal.rawBits          430999999999999a        430999999999999a
+> ```
+>
+> `doubleValue()` was always right. So were `Double.parseDouble` and a plain
+> `double` literal. **`Double.toString` was wrong**, which means the defect was
+> never one `BigDecimal` row — it was every `double` whose shortest decimal
+> lands on a tie.
+>
+> **The cause was a false premise, written down in the code.**
+> `types/src/float_format.rs` opened with *"Rust's `Display` … produces the
+> shortest round-tripping decimal digits — **which agree with Java's**"*. They
+> agree on length, and whenever one candidate is strictly closer to the value.
+> They disagree on the TIE. `0x4309_9999_9999_999a` is exactly
+> `900719925474099.25`; both `900719925474099.2` and `...3` round-trip to it, so
+> both are shortest, and `Double.toString` is specified to take *"the one whose
+> least significant digit is even"*. Ryū takes the other.
+>
+> **The fix** adds Java's tie-break in `java_shortest_sci_f64` / `_f32`, in two
+> stages so the hot path pays at most one extra `format!`: render one digit more
+> than the shortest form and stop unless it is `'5'` (an exact tie terminates
+> there), then confirm against the full exact expansion. The module doc no
+> longer claims the digits agree.
+>
+> ```text
+> RJdkBigNum   671 checks, 0 differing lines   (was 1)
+> BdBitsProbe  identical to HotSpot
+> types tests  11 passed, including a 20,000-value round-trip sweep
+> ```
+>
+> **What is NOT claimed.** The tie-break is proven on the one value this record
+> found, on the six-value non-tie control, and by the sweep asserting every
+> output still parses back to the same bits. It is not proven exhaustively
+> against HotSpot over the whole `double` range — no such sweep was run.
+
 ## 1. Verdict
 
 | | |

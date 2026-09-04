@@ -295,6 +295,16 @@ bytes-saved={saved}"
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // What the DECLINED sites cost, only under the trace. Printed
+            // separately from the gated pair because it is the number that was
+            // missing: `declined=N` with no execution line reads exactly like a
+            // workload that never stored a reference.
+            {
+                let full = cratonvm_jit::metrics::ref_store_full_helper_count();
+                if full != 0 {
+                    eprintln!("[cratonvm]   ref-store full-helper executions: {full}");
+                }
+            }
             // The DYNAMIC split for that pair, only under
             // CRATONVM_DBG_SP_REF_STORE_TRACE=1. `gated=N` above counts emitted
             // sequences; this counts executions, and on the optimizing tier the
@@ -352,6 +362,16 @@ fresh-ctor={fresh_ctor} body={body}"
                 for (name, count) in cratonvm_jit::metrics::ir_ref_store_bails() {
                     eprintln!("[cratonvm]     ir ref-store bail {name}: {count}");
                 }
+                // WHICH shape those inline stores wrote. The legacy arm exists
+                // because compact receivers used to be rare; the compact TLAB
+                // shape is the default since 2026-09-04, so this pair is what
+                // says whether that arm still carries anything.
+                let (shape_c, shape_l) = cratonvm_jit::metrics::ir_ref_store_shape_counts();
+                if shape_c != 0 || shape_l != 0 {
+                    eprintln!(
+                        "[cratonvm]     ir ref-store shapes: compact={shape_c} legacy={shape_l}"
+                    );
+                }
             }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED
             // reading under a default configuration -- `c2_alloc_upgrade` is
@@ -378,6 +398,16 @@ fresh-ctor={fresh_ctor} body={body}"
             // receiver occurred" from "the entry was missing"; and a non-zero
             // `declined` is the reading that says the table filled up and the
             // feature has stopped applying to new compiles.
+            // The optimizing tier's own receiver null checks, never folded
+            // into the single-pass pair above: the two tiers prove the fact by
+            // different routes, and folding them would hide a tier that had
+            // stopped proving it at all.
+            let (ir_seed, ir_el, ir_em) =
+                cratonvm_jit::metrics::ir_receiver_null_check_counts();
+            eprintln!(
+                "[cratonvm] optimizing-tier receiver null checks: seeded={ir_seed} \
+                 elided={ir_el} emitted={ir_em}"
+            );
             let (in_reg, in_ret, in_rec, in_dec) = cratonvm_jit::implicit_null::counts();
             eprintln!(
                 "[cratonvm] implicit null checks: registered={in_reg} retired={in_ret} \
@@ -1196,7 +1226,10 @@ struct Args {
     )]
     g1_region_size: Option<String>,
 
-    /// `-XX:MaxGCPauseMillis=<n>` → G1 pause target (honoured under G1).
+    /// `-XX:MaxGCPauseMillis=<n>` → pause target. G1 sizes its mixed
+    /// collection set from it; ZGC (the default collector) sizes its
+    /// allocation budget from it, since 2026-09-03. The generational
+    /// backend ignores it.
     #[arg(
         long = "XX:MaxGCPause",
         value_name = "MS",

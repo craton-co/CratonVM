@@ -155,6 +155,8 @@ impl Compiler {
             spill_hi: self.spill_limit_offset,
             callee_saved_lo: self.callee_saved_base,
             callee_saved_hi,
+            // x86-64 geometry: the save area is the DEEPEST region.
+            callee_saved_shallow: false,
             xmm_saved_lo: self.xmm_saved_base,
             xmm_saved_hi,
             reg_spill_lo: self.reg_spill_base,

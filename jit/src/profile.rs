@@ -1522,6 +1522,59 @@ mod tests {
         });
     }
 
+    /// A held [`ReceiverRecorder`] must keep writing into the SAME slot the
+    /// store hands out — that is the property the invoke fast door's one-entry
+    /// memo rests on, and the one that would fail silently if it broke.
+    ///
+    /// Silently is the point: a stale handle does not error, it DROPS the
+    /// records. Dropped receiver records are exactly the biased profile that
+    /// made the door return wrong answers
+    /// (`fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`),
+    /// so this is pinned by a test rather than by the comment that says slots
+    /// are insert-only.
+    #[test]
+    fn a_held_receiver_recorder_stays_the_stores_slot() {
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let class_id = 7u32;
+            let name: std::sync::Arc<str> = std::sync::Arc::from("hot");
+            let desc: std::sync::Arc<str> = std::sync::Arc::from("()V");
+
+            // Take the handle FIRST, the way the memo does on its first call.
+            let rec = store.receiver_recorder_borrowed(class_id, &name, &desc);
+
+            // Insert other methods in between, so the handle has to survive
+            // whatever the store does to its shards while it is held.
+            for other in 0..64u32 {
+                let n: std::sync::Arc<str> = std::sync::Arc::from(format!("m{other}"));
+                store.record_receiver_borrowed(class_id + 1 + other, &n, &desc, 1, 1);
+            }
+
+            // Now interleave the two routes into the same method.
+            for _ in 0..10 {
+                rec.record(11, 99);
+            }
+            for _ in 0..5 {
+                store.record_receiver_borrowed(class_id, &name, &desc, 11, 99);
+            }
+
+            let key = MethodKey {
+                class_id,
+                method_name: name.clone(),
+                descriptor: desc.clone(),
+            };
+            let profile = store
+                .get_profile(&key)
+                .expect("the handle and the store must name the same method");
+            let seen = profile.receivers[&11][&99];
+            assert_eq!(
+                seen, 15,
+                "handle-recorded and store-recorded observations must land in \
+                 one slot; a stale handle would show only the store's 5"
+            );
+        });
+    }
+
     #[test]
     fn test_profile_store_receiver_accumulates() {
         with_profiling_enabled(|| {
@@ -2225,5 +2278,50 @@ mod tests {
             assert_eq!(summary.types, 2);
             assert!(summary.is_exact());
         });
+    }
+}
+
+/// A borrowed handle to ONE method's profile slot, so a caller that records
+/// against the same method many times in a row pays the lookup once.
+///
+/// [`ProfileStore::record_receiver_borrowed`] costs a hash pass over
+/// `(class_id, method_name, descriptor)` plus two lock acquisitions plus an
+/// `Arc` clone. That is right once per method and far too much once per CALL —
+/// and the monomorphic invoke fast door records once per call, where it
+/// measured **+44% CPU** on interpreted dispatch
+/// (`fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`).
+///
+/// The profile key is the CALLER's method, which cannot change while its frame
+/// is live, so one handle serves the whole frame.
+///
+/// **Why caching the slot is sound:** `ProfileStore` is insert-only — it has no
+/// remove, clear or reset — so a slot handed out once stays the slot the store
+/// keeps handing out, and a held handle keeps writing where the lookup would.
+/// If that ever changes, this handle has to be generation-checked, because a
+/// stale one silently DROPS records, and dropped receiver records are exactly
+/// the biased profile that made the door return wrong answers.
+#[derive(Clone)]
+pub struct ReceiverRecorder(std::sync::Arc<parking_lot::Mutex<MethodProfile>>);
+
+impl ReceiverRecorder {
+    /// Record one receiver observation — the same effect as the last line of
+    /// [`ProfileStore::record_receiver_borrowed`], without the lookup.
+    #[inline]
+    pub fn record(&self, pc: usize, receiver_class_id: u32) {
+        self.0.lock().record_receiver(pc, receiver_class_id);
+    }
+}
+
+impl ProfileStore {
+    /// Resolve a method's profile slot ONCE and hand back a reusable handle.
+    /// For callers that record repeatedly against one method; see
+    /// [`ReceiverRecorder`].
+    pub fn receiver_recorder_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &std::sync::Arc<str>,
+        descriptor: &std::sync::Arc<str>,
+    ) -> ReceiverRecorder {
+        ReceiverRecorder(self.get_or_insert_borrowed(class_id, method_name, descriptor))
     }
 }

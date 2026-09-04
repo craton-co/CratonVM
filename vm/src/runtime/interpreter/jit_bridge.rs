@@ -404,6 +404,7 @@ pub(super) fn compile_osr_artifact(
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
     let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
     osr_stage("entry");
+    cratonvm_types::osr_refusal_census::note_attempt();
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
@@ -428,6 +429,14 @@ pub(super) fn compile_osr_artifact(
     // committed on either of those grounds would cost throughput and buy
     // nothing.
     if cratonvm_jit::compile_gate::compiled_execution_forbidden(&class_name, &method_name) {
+        // Each early gate names itself before returning. Without this they
+        // all report `stage=entry` and a real refusal looks like a method
+        // that was never considered. See `osr_refusal_census`.
+        osr_stage("gate:compiled-execution-forbidden");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "compiled-execution-forbidden",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -445,6 +454,11 @@ pub(super) fn compile_osr_artifact(
         })
         .is_some_and(|method| method.is_synchronized())
     {
+        osr_stage("gate:synchronized");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "synchronized",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // Respect the JIT skip list for OSR — classes that are skipped from
@@ -469,6 +483,11 @@ pub(super) fn compile_osr_artifact(
         method_name_check,
         &method_descriptor,
     ) {
+        osr_stage("gate:gpu-offload");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "gpu-offload",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // Get method info from frame metadata
@@ -485,6 +504,11 @@ pub(super) fn compile_osr_artifact(
         method_name_check,
         &method_descriptor,
     ) {
+        osr_stage("gate:registered-native");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "registered-native",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
 
@@ -641,6 +665,33 @@ pub(super) fn compile_osr_artifact(
                 }
             };
             osr_stage("past-jit-scan");
+            // ── Would the optimizing tier have taken this method? ─────────
+            //
+            // INERT here, and deliberately so: this door reaches
+            // `x64::compile_with_param_slots` and has no promotion to refuse.
+            // It is a COUNTER, the same shape the String-intrinsic pin already
+            // takes at this door and for the same reason -- a zero from a
+            // one-door instrument is indistinguishable from "there was nothing
+            // to ask about", and that is what made the reach of the optimizing
+            // tier unfalsifiable.
+            //
+            // `ir_compatible_sized` is the FIRST of four gates, so this is an
+            // UPPER BOUND on what an OSR route could deliver, which is exactly
+            // what a go/no-go on building that route needs. The conjunct that
+            // refuses is named on stderr by `ir_reject` under
+            // `CRATONVM_DBG_IR_COMPILES`, so the reasons come free.
+            //
+            // Pure and lock-free: `scan` is already in hand and
+            // `ir_compatible_sized` reads nothing else.
+            let osr_ir_eligible = cratonvm_jit::ir::ir_compatible_sized(&scan, code_len);
+            cratonvm_types::osr_refusal_census::note_ir_eligibility(osr_ir_eligible);
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] osr ir-eligibility: {} for {}.{}{} -- INERT at this door,                      which is single-pass only",
+                    if osr_ir_eligible { "ACCEPTED" } else { "refused" },
+                    class_name, method_name, method_descriptor,
+                );
+            }
             // This method's own exception table. Read ONCE, here, because both
             // of the RBC gates below need it: RBC.6 (immediately below) admits
             // a bare `athrow` only when it is EMPTY, and RBC.6b (further down)
@@ -4087,6 +4138,87 @@ pub(super) fn try_osr(
         }
         _ => Some(None),
     }
+}
+
+/// Re-offer every HELD deferred-`new` retry whose class has since loaded.
+///
+/// Holding a retry rather than burning it on an attempt that would bail keeps
+/// the method's one chance alive, but a kept chance nobody offers again is the
+/// same outcome as a spent one. This is what offers it.
+///
+/// Cost when nothing has loaded is one acquire load: `class_definition_epoch`
+/// is bumped by every class definition, so an unchanged epoch means no `new`
+/// site anywhere can have become resolvable since the last sweep. That is the
+/// whole rate limit — deliberately not a time or count budget, because those
+/// silence a trigger whose rate depends on the workload rather than on whether
+/// there is anything to do.
+pub(super) fn resweep_held_deferred_new_retries(shared: &SharedVm, on_class_definition: bool) {
+    if !crate::runtime::env_cache::c2_supersede() {
+        return;
+    }
+    // One relaxed load, and almost always zero.
+    if cratonvm_jit::held_deferred_new_count() == 0 {
+        return;
+    }
+    // The epoch gate is for the COMPILE door, which fires constantly and where
+    // an unchanged epoch means no `new` site can have become resolvable since
+    // the last look. The class-definition caller IS the event, so it never
+    // needs the gate — and must not take it, or two callers racing on the swap
+    // would let one of them skip the definition that mattered.
+    if !on_class_definition {
+        let epoch = crate::classloading::class_definition_epoch();
+        if LAST_DEFERRED_NEW_SWEEP_EPOCH.swap(epoch, std::sync::atomic::Ordering::AcqRel) == epoch {
+            return;
+        }
+    }
+    let held = cratonvm_jit::held_deferred_new_methods();
+    if held.is_empty() {
+        return;
+    }
+    for (class_name, method_name, descriptor) in held {
+        let granted = cratonvm_jit::take_deferred_new_retry(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
+        );
+        if granted {
+            DEFERRED_NEW_REOFFERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new RE-OFFERED {class_name}.{method_name}{descriptor} — its class has loaded"
+                );
+            }
+            shared
+                .jit
+                .tiered_manager
+                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::new(
+                    &*class_name,
+                    &*method_name,
+                    &*descriptor,
+                ));
+        }
+    }
+}
+
+/// The class-definition epoch the sweep above last ran at.
+static LAST_DEFERRED_NEW_SWEEP_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Retries handed back out by the sweep. A sweep that re-offers nothing is a
+/// sweep that is not running, or one running where no class ever loads after.
+static DEFERRED_NEW_REOFFERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many held deferred-`new` retries the sweep has re-offered.
+pub fn deferred_new_reoffered() -> u64 {
+    DEFERRED_NEW_REOFFERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
@@ -7969,6 +8101,13 @@ pub(super) fn try_jit_compile_callee_slow(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
         )
     {
         shared
@@ -7980,6 +8119,11 @@ pub(super) fn try_jit_compile_callee_slow(
                 &*cached.method_descriptor,
             ));
     }
+    // …and the other half: every method whose retry is HELD because its class
+    // was not loaded. Nothing brings such a method back on its own — it already
+    // has a body, so it is never compiled again, and the door above is only ever
+    // walked by the method being compiled right now.
+    resweep_held_deferred_new_retries(shared, false);
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -8184,6 +8328,128 @@ pub(super) fn ensure_bg_compiler_started(shared: &SharedVm) {
 /// class/method/Code attribute is absent. The padded bytecode matches
 /// `Frame::code`'s layout (`padded_bytecode`, +2 zero tail) so the compiled
 /// artifact's PC mapping lines up with the interpreter frame at OSR entry.
+/// What a C1→C2 supersede publish actually did to the cached body.
+///
+/// The distinction exists because only one of the three can invalidate an
+/// invoke-cache entry, and the supersede epoch is a process-wide counter that
+/// every `Jit` entry in every thread is measured against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SupersedeOutcome {
+    /// No body was in the cache under this key before the publish, so nothing
+    /// was superseded. Reached by `promote_scalar_selfrec_to_ir`, which sends
+    /// the narrow scalar self-recursion shape straight to the optimizing tier
+    /// without a C1 body ever existing.
+    FirstPublish,
+    /// A body was replaced by one with identical code bytes — what a C2 task
+    /// that fell back to the single-pass backend produces.
+    Unchanged,
+    /// A body was replaced by different code.
+    Changed,
+}
+
+impl SupersedeOutcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            SupersedeOutcome::FirstPublish => "first-publish",
+            SupersedeOutcome::Unchanged => "unchanged",
+            SupersedeOutcome::Changed => "changed",
+        }
+    }
+}
+
+/// Classify a supersede from the artifact that was in the cache before the
+/// publish and the one in it afterwards.
+///
+/// A missing *replacement* is reported as `Changed`, not as one of the two
+/// cheap outcomes: the lookup failing is not evidence that nothing changed, and
+/// this decides whether to skip an invalidation, so the unknown case must fail
+/// towards the old unconditional behaviour.
+pub(super) fn classify_supersede(
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> SupersedeOutcome {
+    let Some(before) = before else {
+        return SupersedeOutcome::FirstPublish;
+    };
+    let Some(after) = after else {
+        return SupersedeOutcome::Changed;
+    };
+    // Pointer equality first: `put` may have refused the publish (install-epoch
+    // guard, code-cache cap), leaving the cache holding the very artifact that
+    // was there before. That is an unchanged body by definition and skips the
+    // byte compare entirely.
+    if std::ptr::eq(before.as_ptr(), after.as_ptr()) && before.len() == after.len() {
+        return SupersedeOutcome::Unchanged;
+    }
+    if before == after {
+        SupersedeOutcome::Unchanged
+    } else {
+        SupersedeOutcome::Changed
+    }
+}
+
+/// Engagement census for the three supersede outcomes.
+///
+/// A switch that suppresses work needs a count of what it suppressed, or a
+/// "no regression" reading cannot be told apart from "never fired".
+static SUPERSEDE_FIRST_PUBLISH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SUPERSEDE_UNCHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUPERSEDE_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wall time spent in C2 tasks, split by whether the optimizing pipeline
+/// produced the body or threw its work away and let single-pass do it.
+///
+/// This is the number that decides whether the fall-through is worth
+/// preventing. The epoch bump it also pays was already measured at ~9
+/// invoke-cache evictions per run, i.e. nothing; the COMPILE is the part that
+/// could plausibly cost something, so it is timed rather than assumed.
+static C2_FELL_THROUGH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_FELL_THROUGH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_LOWERED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_LOWERED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_c2_compile(fell_through: bool, micros: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (n, t) = if fell_through {
+        (&C2_FELL_THROUGH_COUNT, &C2_FELL_THROUGH_US)
+    } else {
+        (&C2_LOWERED_COUNT, &C2_LOWERED_US)
+    };
+    n.fetch_add(1, Relaxed);
+    t.fetch_add(micros, Relaxed);
+}
+
+/// `(fell_through_count, fell_through_us, lowered_count, lowered_us)`.
+pub fn c2_compile_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        C2_FELL_THROUGH_COUNT.load(Relaxed),
+        C2_FELL_THROUGH_US.load(Relaxed),
+        C2_LOWERED_COUNT.load(Relaxed),
+        C2_LOWERED_US.load(Relaxed),
+    )
+}
+
+pub(super) fn note_supersede_outcome(outcome: SupersedeOutcome) {
+    let counter = match outcome {
+        SupersedeOutcome::FirstPublish => &SUPERSEDE_FIRST_PUBLISH,
+        SupersedeOutcome::Unchanged => &SUPERSEDE_UNCHANGED,
+        SupersedeOutcome::Changed => &SUPERSEDE_CHANGED,
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(first_publish, unchanged, changed)` supersede counts for this process.
+pub fn supersede_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SUPERSEDE_FIRST_PUBLISH.load(Relaxed),
+        SUPERSEDE_UNCHANGED.load(Relaxed),
+        SUPERSEDE_CHANGED.load(Relaxed),
+    )
+}
+
 pub(super) fn fetch_osr_compile_inputs(
     shared: &SharedVm,
     class_name: &str,
@@ -8403,7 +8669,7 @@ pub(super) fn background_compile_task(
         };
     }
     let start = std::time::Instant::now();
-    // The body about to be REPLACED, measured before the publish overwrites it.
+    // The body about to be REPLACED, captured before the publish overwrites it.
     //
     // Nothing compares a C2 body against the C1 body it supersedes before
     // keeping it, and the open policy question that follows from that
@@ -8413,26 +8679,30 @@ pub(super) fn background_compile_task(
     // usually inlining or unrolling, and MORE call sites can be a callee's
     // calls after its frame was inlined away. What is missing is not a rule
     // but DATA, so this records the replacement instead of guessing at it.
-    let superseded_bytes: Option<usize> = (optimized
-        && crate::runtime::env_cache::dbg_jitc())
-    .then(|| {
-        let (class_id, _, _) = fetch_osr_compile_inputs(
-            &shared,
-            &task.method_key.class_name,
-            &task.method_key.method_name,
-            &task.method_key.descriptor,
-        )?;
-        let jit_cache = shared.jit.jit_cache.read();
-        jit_cache
-            .get(
+    //
+    // The capture is the whole artifact, not its length, and it is NOT gated on
+    // the diagnostic flag any more: the epoch bump below is now conditional on
+    // what this finds, so a debug-only capture would make the diagnostic change
+    // the behaviour it reports. `JitCache::get` returns an `Arc` clone, so
+    // holding it across the publish costs a refcount and keeps the superseded
+    // artifact alive against `defer_jit_owner`'s drop.
+    let superseded_body: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>> = optimized
+        .then(|| {
+            let (class_id, _, _) = fetch_osr_compile_inputs(
+                &shared,
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            )?;
+            let jit_cache = shared.jit.jit_cache.read();
+            jit_cache.get(
                 &task.method_key.class_name,
                 &task.method_key.method_name,
                 &task.method_key.descriptor,
                 class_id,
             )
-            .map(|cm| cm.code_bytes().len())
-    })
-    .flatten();
+        })
+        .flatten();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
     // is the by-name entry point shared with the JIT dispatch helpers; it stores
     // the compiled body under `(class, method, descriptor)` so the mutator's
@@ -8453,52 +8723,132 @@ pub(super) fn background_compile_task(
         optimized,
     )
     .is_some();
-    // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
-    // C1 entry in `jit_cache` (JitCache::put overwrites by key; the old
-    // artifact is retained forever — executable code is never freed). Bump
-    // the global supersede epoch so per-thread invoke-cache `Jit` entries
-    // (which snapshot the epoch at IC-fill time) report stale on their next
-    // hit, self-evict, and re-resolve to the C2 body. Without this, call
-    // sites that already flipped to the C1 artifact would run it forever.
+    // Read on the SAME thread, immediately after the compile: did this C2 task
+    // run the whole optimizing pipeline and then produce a single-pass body?
+    let fell_through = cratonvm_jit::last_compile_fell_through_to_single_pass();
+    let compile_us = start.elapsed().as_micros() as u64;
     if published && optimized {
-        crate::classloading::bump_jit_supersede_epoch();
-        if crate::runtime::env_cache::dbg_jitc() {
-            let replacement = {
-                let jit_cache = shared.jit.jit_cache.read();
-                fetch_osr_compile_inputs(
-                    &shared,
+        note_c2_compile(fell_through, compile_us);
+    }
+    // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
+    // C1 entry in `jit_cache` (JitCache::put overwrites by key). Bump the
+    // global supersede epoch so per-thread invoke-cache `Jit` entries (which
+    // snapshot the epoch at IC-fill time) report stale on their next hit,
+    // self-evict, and re-resolve to the C2 body. Without this, call sites that
+    // already flipped to the C1 artifact would run it forever.
+    //
+    // That bump is GLOBAL: it invalidates every `Jit` invoke-cache entry, for
+    // every call site, in every thread — `CachedInvokeTarget::is_stale`
+    // compares one process-wide counter, and `InvokeCache::get` self-evicts on
+    // it. So it must be paid only when there is something to invalidate. The
+    // first reading off the `c1=`/`c2=` diagnostic said it usually is not:
+    // in one CratonBench run, 7 of 9 supersedes republished a body of exactly
+    // the same size, and a 8th (`fib`) had no predecessor at all.
+    //
+    // Two of the three outcomes below cannot invalidate anything:
+    //
+    //  * `FirstPublish` — no prior body, so no `Jit` entry can be holding a
+    //    replaced one. `fib` reaches C2 without a C1 body at all, because
+    //    `promote_scalar_selfrec_to_ir` sends the narrow scalar self-recursion
+    //    shape straight to the optimizing pipeline. The interpreter's negative
+    //    "no compiled body" memo is NOT this counter's job: `JitCache::put`
+    //    bumps `jit_cache_generation` on every publication precisely so a
+    //    first insertion is observed there.
+    //  * `Unchanged` — the published body is byte-identical to the one it
+    //    replaced, which is what a C2 task that fell back to the single-pass
+    //    backend produces (the IR admission gate declines, single-pass
+    //    recompiles the same bytecode deterministically). An IC entry still
+    //    holding the old artifact executes identical machine code, and it owns
+    //    an `Arc` to it, so the artifact stays alive.
+    //
+    // Identical code bytes also imply an identical ABI — `needs_heap` and
+    // `needs_context` are visible in the prologue — so an entry kept on the old
+    // artifact cannot be called the wrong way.
+    //
+    // Skipping those two is OFF by default: `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1`
+    // turns it on. The bump was measured, not assumed, to be nearly free — 9
+    // invoke-cache evictions over a whole CratonBench run and 0 over the regex
+    // workload — so the saving is real but worth nothing, and a default-on
+    // behaviour change that buys nothing is not worth its risk.
+    if published && optimized {
+        let replacement = {
+            let jit_cache = shared.jit.jit_cache.read();
+            fetch_osr_compile_inputs(
+                &shared,
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            )
+            .and_then(|(class_id, _, _)| {
+                jit_cache.get(
                     &task.method_key.class_name,
                     &task.method_key.method_name,
                     &task.method_key.descriptor,
+                    class_id,
                 )
-                .and_then(|(class_id, _, _)| {
-                    jit_cache
-                        .get(
-                            &task.method_key.class_name,
-                            &task.method_key.method_name,
-                            &task.method_key.descriptor,
-                            class_id,
-                        )
-                        .map(|cm| cm.code_bytes().len())
-                })
-            };
+            })
+        };
+        let outcome = classify_supersede(
+            superseded_body.as_ref().map(|cm| cm.code_bytes()),
+            replacement.as_ref().map(|cm| cm.code_bytes()),
+        );
+        note_supersede_outcome(outcome);
+        let bumped = outcome == SupersedeOutcome::Changed
+            || !crate::runtime::env_cache::supersede_epoch_skip_useless();
+        if bumped {
+            crate::classloading::bump_jit_supersede_epoch();
+        }
+        if crate::runtime::env_cache::dbg_jitc() {
             // `c1=` is the body this one replaced, `c2=` the one that replaced
             // it. Both, always: the question this line exists for is whether
             // the optimizing tier is producing a BETTER body, and a size on
             // its own answers nothing without the size it displaced.
+            //
+            // `outcome=` is what separates the three cases a bare `c1=?` used
+            // to conflate — no predecessor, an identical republish, and a real
+            // replacement — and `epoch_bumped=` says whether this publish
+            // actually paid the process-wide invalidation.
             eprintln!(
-                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={}) c1={} c2={}",
+                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={}) c1={} c2={} outcome={} epoch_bumped={}",
                 task.method_key.class_name,
                 task.method_key.method_name,
                 task.method_key.descriptor,
                 crate::classloading::jit_supersede_epoch(),
-                superseded_bytes
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
+                superseded_body
+                    .as_ref()
+                    .map(|cm| cm.code_bytes().len().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
                 replacement
-                    .map(|b| b.to_string())
+                    .as_ref()
+                    .map(|cm| cm.code_bytes().len().to_string())
                     .unwrap_or_else(|| "?".to_string()),
+                outcome.as_str(),
+                bumped,
             );
+            if fell_through {
+                eprintln!(
+                    "[cratonvm-jitc]   …the optimizing pipeline ran and then handed this method to the single-pass backend ({compile_us} us total)",
+                );
+            }
+            // When a replacement is the same LENGTH but not the same bytes,
+            // say how far apart it actually is. A handful of scattered bytes
+            // is a relocation (an embedded absolute address that moved),
+            // which is a body that could still be treated as unchanged; a
+            // large fraction is genuinely different code and cannot.
+            if let (Some(b), Some(a)) = (superseded_body.as_ref(), replacement.as_ref()) {
+                let (bb, ab) = (b.code_bytes(), a.code_bytes());
+                if bb.len() == ab.len() && bb != ab {
+                    let differing = bb.iter().zip(ab).filter(|(x, y)| x != y).count();
+                    let first = bb.iter().zip(ab).position(|(x, y)| x != y).unwrap_or(0);
+                    eprintln!(
+                        "[cratonvm-jitc]   …same length, {} of {} bytes differ ({:.3}%), first at +0x{:x}",
+                        differing,
+                        bb.len(),
+                        100.0 * differing as f64 / bb.len() as f64,
+                        first,
+                    );
+                }
+            }
         }
     }
     // C1→C2 supersede, trigger side: report whether this method would take
@@ -8511,14 +8861,22 @@ pub(super) fn background_compile_task(
     // that bail happens INSIDE a C2 task, which then falls through to the
     // single-pass backend — so the C1->C2 promotion below, which is only for a
     // C1 publish, is not the door this can use. `take_deferred_new_retry`
-    // consumes the memo, so a class still not loaded on the retry settles on
-    // single-pass exactly as before.
+    // consumes the memo only when the deferred `new` sites RESOLVE now: a class
+    // still unloaded holds the retry rather than burning it on an attempt that
+    // would bail identically.
     let deferred_new_retry = published
         && crate::runtime::env_cache::c2_supersede()
         && cratonvm_jit::take_deferred_new_retry(
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
         );
     let c2_upgrade_candidate = (published
         && !optimized
@@ -8971,6 +9329,57 @@ fn resolve_inline_site_from(
         .is_some()
     {
         no!("native-shadow-on-selected-method");
+    }
+    // ...and the same rule again, over the whole receiver-to-declaring chain.
+    //
+    // # Why the declaring class alone is not enough
+    //
+    // A native is registered on the class the RECEIVER actually has, and the
+    // method it shadows is very often DECLARED on a superclass. The two
+    // screens above ask about the constant-pool class and the declaring class,
+    // and a guarded virtual site has neither: it starts the selection walk at
+    // the runtime receiver, `find_method_recursive` returns the first concrete
+    // body it meets, and that body's declaring class is where the screen then
+    // looks — one or more classes ABOVE the one carrying the native.
+    //
+    // Measured 2026-09-04, `probes/TreeTailIterProbe.java` with
+    // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1`: a compiled
+    // `for (e : treeMap.tailMap(k).entrySet())` iterates ZERO entries while
+    // `entrySet().size()` on the same object answers 6. The single spliced
+    // site is `java/util/Iterator.hasNext()Z`, guarded on
+    // `java/util/TreeMap$EntryIterator` -- which has
+    // `native_al_itr_has_next` registered on it by the `VALUES_ITR_CARRIERS`
+    // loop. But `hasNext` is DECLARED on `java/util/TreeMap$PrivateEntryIterator`,
+    // which carries no native, so `declaring_class_name` above cleared the
+    // screen and the splice ran the real JDK body -- `return next != null` over
+    // a `next` field a natively-managed iterator never populates. False, every
+    // time, from the first compiled call.
+    //
+    // Walking the chain is the precise form of the rule the two screens above
+    // state, because it asks the question DISPATCH asks: not "does the class
+    // that wrote this method have a native" but "does any class this receiver
+    // IS have one". Bounded by `declaring_id` -- past it the body is not the
+    // one being spliced -- and short in practice.
+    if let Some(receiver_id) = receiver_class_id {
+        let mut walk = Some(receiver_id);
+        while let Some(cid) = walk {
+            let Some(class) = store.get(cid) else { break };
+            if shared
+                .natives
+                .native_methods
+                .find(&*class.name, callee_method, callee_desc)
+                .is_some()
+            {
+                no!(format!(
+                    "native-shadow-on-receiver-chain (registered on {}, declared on {})",
+                    class.name, declaring_class_name
+                ));
+            }
+            if cid == declaring_id {
+                break;
+            }
+            walk = class.superclass;
+        }
     }
     // The class the SPLICED BODY belongs to, which is what an invalidation
     // dependency must name. For a constant-pool resolution this stays the
@@ -11796,5 +12205,91 @@ mod elidable_ctor_policy_tests {
                 "{mode:?}: an unregistered triple must not block elision"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_classification_tests {
+    use super::{classify_supersede, note_supersede_outcome, supersede_census, SupersedeOutcome};
+
+    /// The three outcomes a C2 publish can have, and which of them the epoch
+    /// bump is for.
+    #[test]
+    fn classify_supersede_separates_the_three_publish_outcomes() {
+        // No predecessor: `promote_scalar_selfrec_to_ir` reaches C2 without a
+        // C1 body ever existing, and the old diagnostic reported that as
+        // `c1=?` — indistinguishable from a failed lookup.
+        assert_eq!(
+            classify_supersede(None, Some(&[0x90, 0xc3])),
+            SupersedeOutcome::FirstPublish,
+        );
+        assert_eq!(
+            classify_supersede(Some(&[0x90, 0xc3]), Some(&[0x90, 0xc3])),
+            SupersedeOutcome::Unchanged,
+        );
+        assert_eq!(
+            classify_supersede(Some(&[0x90, 0xc3]), Some(&[0x31, 0xc0, 0xc3])),
+            SupersedeOutcome::Changed,
+        );
+    }
+
+    /// A missing replacement must NOT read as one of the two cheap outcomes.
+    /// This decides whether to skip an invalidation, so "I could not tell" has
+    /// to fail towards the historical unconditional bump.
+    #[test]
+    fn classify_supersede_fails_towards_bumping_when_the_replacement_is_unknown() {
+        assert_eq!(
+            classify_supersede(Some(&[0x90]), None),
+            SupersedeOutcome::Changed,
+        );
+    }
+
+    /// Same length is NOT the same body, and this is the case that refuted the
+    /// hypothesis this classifier was built for: a C2 task that falls back to
+    /// the single-pass backend recompiles the same bytecode, but each compile
+    /// embeds fresh `JitInvokeInfo` pointers as absolute immediates
+    /// (`emit_mov_imm64(ARG_REGS[1], info as *const _ as i64)`), so the bodies
+    /// differ in 0.1-1% of their bytes. Measured on CratonBench: 6 of 5193
+    /// bytes for `sieve`, 379 of 35686 for `Pattern.clazz`.
+    #[test]
+    fn classify_supersede_does_not_treat_equal_length_as_equal_code() {
+        let before = [0x48, 0xb8, 0x00, 0x10, 0x20, 0x30];
+        let after = [0x48, 0xb8, 0x00, 0x10, 0x99, 0x30];
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            classify_supersede(Some(&before), Some(&after)),
+            SupersedeOutcome::Changed,
+            "a relocated absolute immediate is a different body as far as byte              equality is concerned; treating equal length as equal code would              skip an invalidation that IS needed when the code really changed",
+        );
+    }
+
+    /// The census must move, or a "no regression" reading cannot be told apart
+    /// from "the classifier never ran".
+    #[test]
+    fn supersede_census_counts_each_outcome() {
+        let (f0, u0, c0) = supersede_census();
+        note_supersede_outcome(SupersedeOutcome::FirstPublish);
+        note_supersede_outcome(SupersedeOutcome::Unchanged);
+        note_supersede_outcome(SupersedeOutcome::Changed);
+        note_supersede_outcome(SupersedeOutcome::Changed);
+        let (f1, u1, c1) = supersede_census();
+        assert_eq!((f1 - f0, u1 - u0, c1 - c0), (1, 1, 2));
+    }
+}
+
+/// Re-offer held deferred-`new` retries in every live VM, called immediately
+/// after a class-manager write guard releases its lock.
+///
+/// That is the moment a `new` site can have become resolvable, and it is the
+/// only moment: a method holding a retry already has a body, so nothing
+/// compiles it again and no compile-door sweep will ever look at it. Placed
+/// beside `drain_pending_class_hooks` for the same reason that call is there —
+/// the write lock is gone, so taking a fresh read lock here is safe.
+pub fn resweep_deferred_new_after_class_definition() {
+    if cratonvm_jit::held_deferred_new_count() == 0 {
+        return;
+    }
+    for shared in crate::vm::vm_init::live_hook_vms_for_jit() {
+        resweep_held_deferred_new_retries(&shared, true);
     }
 }

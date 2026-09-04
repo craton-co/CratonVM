@@ -139,6 +139,10 @@ const DEOPT_ARG1: u8 = 2; // RDX
 const DEOPT_ARG0: u8 = 7; // RDI
 #[cfg(not(target_os = "windows"))]
 const DEOPT_ARG1: u8 = 6; // RSI
+#[cfg(target_os = "windows")]
+const DEOPT_ARG2: u8 = 8; // R8
+#[cfg(not(target_os = "windows"))]
+const DEOPT_ARG2: u8 = 2; // RDX
 
 /// Bytes of caller shadow space reserved above `rsp` for the deopt stub's
 /// `call ir_deopt_entry` (Win64 requires 32; harmless on SysV). Kept clear of
@@ -455,7 +459,8 @@ struct Lowerer<'a> {
     /// Number of parameter slots.
     num_params: usize,
     /// Number of local variable slots.
-    _num_locals: usize,
+    /// `max_locals`. Read by the prologue's unset-local zeroing.
+    num_locals: usize,
     /// Frame size (aligned).
     frame_size: i32,
     /// real-frame-deopt: bytecode pc → earliest native code offset emitted
@@ -751,6 +756,13 @@ struct Lowerer<'a> {
     /// shadow space, the arg-staging region AND the callee-saved XMM save area,
     /// so spills never overlap any of them.
     spill_cap_off: i32,
+    /// Offset of `gpr[0]` in the deopt register image: the stub spills the
+    /// whole file to `[rbp - deopt_regs_base .. +256)` and hands
+    /// `ir_deopt_entry` a `*const SavedRegisters` pointing at it.
+    ///
+    /// Zero when [`ir_deopt_regs_bytes`] reserved nothing, which is the signal
+    /// the stub reads to keep its historical two-argument shape.
+    deopt_regs_base: i32,
     /// Bytes reserved for the callee-saved XMM save area, `[spill_cap_off,
     /// spill_cap_off + this)`. See [`ir_saved_xmm_bytes`] and
     /// [`IR_LOWER_SAVED_XMMS`].
@@ -888,6 +900,46 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// Edge copies that read their source out of a register, and edge copies
+    /// that published their phi's register from RAX. Both are ENGAGEMENT
+    /// counts: a zero says the wiring never fired, which is a different
+    /// finding from "it fired and did not pay".
+    phi_copy_reg_reads: usize,
+    phi_copy_reg_publishes: usize,
+    /// `deopt_nameable[id]` — a deopt frame may describe `id` as living in its
+    /// register rather than in its home word.
+    ///
+    /// **The rule is exclusive ownership, and it is deliberately stronger than
+    /// "the value is resident".** A register-allocated value owns its register
+    /// only over its LIVE RANGE, and `plan_register_residency` releases the
+    /// deopt pins, so a bytecode local can still be named by a frame state long
+    /// after its last IR use — by which time the allocator may have given the
+    /// register to something else. Naming it then would reconstruct a
+    /// confidently wrong value, which is the failure mode this area produces.
+    ///
+    /// So a value is nameable only when **no other value anywhere in the method
+    /// is assigned the same register**. Then the register holds that value from
+    /// its definition to the end of the frame, no position mapping between
+    /// `graph.safepoints` and the allocator's positions is needed, and the
+    /// question "is the register still his at THIS bci" cannot be got wrong.
+    deopt_nameable: Vec<bool>,
+    /// `home_dropped[id]` — this value's home word is never written, so reading
+    /// it would read whatever the last tenant of that frame word left there.
+    ///
+    /// [`Self::slot_of`] refuses such a read and fails the compile, which costs
+    /// coverage (the method runs in a lower tier) and can never be a wrong
+    /// answer. That is deliberately the opposite trade from enumerating the
+    /// readers into a whitelist: a whitelist that is wrong is a silent
+    /// miscompile, and a refusal that is wrong is a census entry.
+    home_dropped: Vec<bool>,
+    /// How many stores were dropped, and how many `slot_of` reads refused.
+    /// A non-zero refusal count names work: the reader wants converting to
+    /// `gp_load_value`. `Cell` because `slot_of` takes `&self`.
+    home_stores_dropped: usize,
+    home_read_refusals: std::cell::Cell<usize>,
+    /// How many frame-state slots were described by a register. Engagement, and
+    /// `Cell` because `frame_value_for` takes `&self`.
+    deopt_reg_named: std::cell::Cell<usize>,
     /// Number of input references to each node, over every input of every
     /// node. Filled by `prepare_fusion_tables` before the first block lowers.
     use_count: Vec<u32>,
@@ -902,6 +954,20 @@ struct Lowerer<'a> {
     /// read-bounds compares): receivers already proven in the block being
     /// lowered. Cleared at every block entry (`ir_receiver_guard_cse_enabled`).
     guarded_receivers: Vec<NodeId>,
+    /// Receivers proven merely NON-NULL in the block being lowered — a weaker
+    /// fact than [`Self::guarded_receivers`], and kept apart from it for that
+    /// reason.
+    ///
+    /// A null test proves null-ness and nothing else. Folding it into the
+    /// mapped-receiver set would let a later site skip the alignment and
+    /// read-bounds compares on the strength of a test that never made them,
+    /// which is the one way this optimisation could go wrong quietly. So this
+    /// set suppresses only the `TEST`/`JZ`; the containment guard still keys
+    /// off `guarded_receivers` alone.
+    ///
+    /// Cleared at every block entry, then RE-SEEDED with the receiver — see
+    /// `seed_block_null_proofs`.
+    null_proven_receivers: Vec<NodeId>,
     /// Register → memory transitions this backend EMITTED for resident values
     /// (one per resident definition, because the wiring is write-through).
     /// Reported as `CompilationReport::spills`.
@@ -1161,12 +1227,48 @@ impl<'a> Lowerer<'a> {
         // The GPR band sits below the XMM one and is excluded from the spill
         // range on exactly the same footing: a spill that overlapped it would
         // be silently destroyed by the prologue save.
+        // The deopt register image sits DEEPER than both prologue save bands
+        // and directly below the outgoing-argument staging, which is the one
+        // placement that leaves `callee_saved_lo == spill_cap_off` and the two
+        // bands' `spill_cap_off + ...` arithmetic untouched: the region simply
+        // extends the non-resumable band, and "storage this frame does not
+        // resume from" is exactly what a register image is.
+        //
+        // `gpr[0]` is its LOWEST address, at `[rbp - deopt_regs_base]`, and the
+        // struct ascends from there — `gpr[r]` at `[rbp - (base - 8r)]`,
+        // `xmm[n]` at `[rbp - (base - 128 - 8n)]`. Same convention as the
+        // single-pass backend's `deopt_regs_base`, deliberately, so the two
+        // stubs can be read against each other.
+        let deopt_regs_bytes = ir_deopt_regs_bytes();
         let spill_cap_off = frame_size
             - shadow
             - stack_arg_reserve
             - args_stage_size
             - saved_xmm_bytes
-            - saved_gpr_bytes;
+            - saved_gpr_bytes
+            - deopt_regs_bytes;
+        // Which lands the region's deep end exactly at the bottom of the
+        // staging region, leaving no gap and no overlap:
+        //   spill_cap_off + saved_xmm + saved_gpr + deopt_regs
+        //     == frame_size - shadow - stack_arg_reserve - args_stage_size
+        //
+        // ZERO when nothing was reserved, and that is not cosmetic: the stub
+        // reads `deopt_regs_base > 0` as "there is a region to spill into", and
+        // an arithmetic base that happened to be non-zero with no reservation
+        // behind it sent 32 stores over the argument staging area and past it.
+        // This is the mirror image of the hazard the single-pass backend
+        // records in `deopt_spill_region_reserved` -- there an unreserved
+        // region made the base 0 and the stores walked UP over the saved RBP
+        // and the return address. Same class, opposite sign.
+        let deopt_regs_base = if deopt_regs_bytes > 0 {
+            spill_cap_off + saved_xmm_bytes + saved_gpr_bytes + deopt_regs_bytes
+        } else {
+            0
+        };
+        debug_assert!(
+            deopt_regs_bytes == 0 || deopt_regs_base == args_stage_top_off - args_stage_size,
+            "the deopt register image must abut the argument staging region"
+        );
 
         Lowerer {
             graph,
@@ -1199,7 +1301,7 @@ impl<'a> Lowerer<'a> {
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
             num_params,
-            _num_locals: num_locals,
+            num_locals,
             frame_size,
             bci_native: HashMap::new(),
             cur_bci: 0,
@@ -1262,6 +1364,7 @@ impl<'a> Lowerer<'a> {
             sp_id_bcis: Vec::new(),
             args_stage_top_off,
             spill_cap_off,
+            deopt_regs_base,
             saved_xmm_bytes,
             saved_gpr_bytes,
             call_exc_patches: Vec::new(),
@@ -1298,10 +1401,18 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
             gp_reg_live: Vec::new(),
+            phi_copy_reg_reads: 0,
+            phi_copy_reg_publishes: 0,
+            deopt_nameable: Vec::new(),
+            deopt_reg_named: std::cell::Cell::new(0),
+            home_dropped: Vec::new(),
+            home_stores_dropped: 0,
+            home_read_refusals: std::cell::Cell::new(0),
             use_count: Vec::new(),
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
             guarded_receivers: Vec::new(),
+            null_proven_receivers: Vec::new(),
             ls_spills: 0,
             ls_reloads: 0,
             mir: None,
@@ -1321,6 +1432,106 @@ impl<'a> Lowerer<'a> {
         self.reg_of = residency.reg_of;
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
         self.gp_reg_of = residency.gp_reg_of;
+        // Exclusive ownership, computed once: how many values share each
+        // register, and a value is nameable only if the answer for its own is
+        // one. See the field comment for why "resident" is not enough.
+        self.deopt_nameable = vec![false; self.gp_reg_of.len()];
+        self.home_dropped = vec![false; self.gp_reg_of.len()];
+        // Filled at the bottom of this function, once `deopt_nameable` is
+        // known. **Up front, not lazily at the first edge copy**: `slot_of` has
+        // to refuse from the first instruction emitted, or a read that happens
+        // to precede the copy would silently take the unwritten word.
+        if ir_deopt_regs_enabled() {
+            let mut holders = [0usize; 16];
+            for reg in self.gp_reg_of.iter().flatten() {
+                if let Some(cell) = holders.get_mut(*reg as usize) {
+                    *cell += 1;
+                }
+            }
+            for id in 0..self.gp_reg_of.len() {
+                let Some(reg) = self.gp_reg_of[id] else { continue };
+                // `IR_LOWER_LS_GPRS` and nothing else: `DEOPT_ARG0` is spilled
+                // holding the point pointer rather than its trapping value
+                // (see `emit_deopt_stub`), and no register outside the file can
+                // be reasoned about here at all.
+                if !IR_LOWER_LS_GPRS.contains(&reg) {
+                    continue;
+                }
+                if holders.get(reg as usize).copied().unwrap_or(0) == 1 {
+                    self.deopt_nameable[id] = true;
+                }
+            }
+        }
+        // Two passes: `phi_home_droppable` borrows `&self`.
+        let droppable: Vec<usize> = (0..self.home_dropped.len())
+            .filter(|id| {
+                matches!(
+                    self.graph.nodes.get(*id).map(|n| &n.op),
+                    Some(crate::ir::Op::Phi)
+                )
+            })
+            // Cast: an index into the node arena is a `NodeId`.
+            .filter(|id| self.phi_home_droppable(*id as NodeId))
+            .collect();
+        for id in droppable {
+            self.home_dropped[id] = true;
+        }
+    }
+
+    /// May this phi's home word go unwritten?
+    ///
+    /// **Every clause is load-bearing, and the point of writing them as one
+    /// conjunction is that no combination of switches can satisfy some of them
+    /// and not the rest.** In order:
+    ///
+    /// * the switch, and the register image the deopt path reads;
+    /// * the edge copies publish the register (otherwise nothing puts the value
+    ///   there at all, since the publish this replaces was a load OF the home);
+    /// * a value already in its register is not re-published (otherwise the
+    ///   generic publish site reloads the unwritten home once per iteration and
+    ///   overwrites the register with whatever the frame word holds — the same
+    ///   reload this whole line of work removed, now actively destructive);
+    /// * the register is EXCLUSIVELY this value's, so a deopt frame can name it
+    ///   at any bci (see `deopt_nameable`);
+    /// * and it is an `Int` or a `Long`. A `Ref` is never in this file, and an
+    ///   FP value's home is written by a different path.
+    fn phi_home_droppable(&self, phi: NodeId) -> bool {
+        if !(ir_drop_phi_home_enabled()
+            && ir_deopt_regs_enabled()
+            && ir_phi_copy_regs_enabled()
+            && ir_skip_live_republish_enabled())
+        {
+            return false;
+        }
+        if !self.deopt_nameable.get(phi as usize).copied().unwrap_or(false) {
+            return false;
+        }
+        matches!(
+            self.graph.nodes.get(phi as usize).map(|n| n.ty),
+            Some(IrType::Int) | Some(IrType::Long)
+        )
+    }
+
+    /// Describe `id` as living in its register, if that is provably where it
+    /// is at every bci a frame state could name it.
+    ///
+    /// `None` for everything else, and the caller then falls through to the
+    /// home word exactly as before — this is additive, and with
+    /// `CRATONVM_JIT_IR_DEOPT_REGS` off it answers `None` for every value.
+    fn register_frame_value(&self, id: NodeId, ty: IrType) -> Option<FrameValue> {
+        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        let reg = self.gp_reg_of.get(id as usize).copied().flatten()?;
+        match ty {
+            // A cat-1 `int`: `Register` resolves it truncated to 32 bits.
+            IrType::Int => Some(FrameValue::Register(reg)),
+            // A cat-2 `long` keeps all 64.
+            IrType::Long => Some(FrameValue::RegisterLong(reg)),
+            // `Ref` is never in this file (the oop map names frame slots only),
+            // and FP lives in the other one. Both fall through to the home.
+            _ => None,
+        }
     }
 
     /// Install the level-2 machine list. Called once, after construction and
@@ -1712,6 +1923,17 @@ impl<'a> Lowerer<'a> {
     /// The only read path into `node_slot`. There is no longer a value that
     /// means "unallocated": an absent location is an `Err`, never `0`.
     fn slot_of_checked(&self, id: NodeId) -> CompileResult<i32> {
+        // A home nobody wrote is not a location. Refusing here fails the
+        // compile and drops the method to the single-pass backend — a coverage
+        // loss, never a wrong answer — and `home_read_refusals` names the site
+        // that wanted converting. See `home_dropped`.
+        if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
+            self.home_read_refusals.set(self.home_read_refusals.get() + 1);
+            return Err(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: id },
+                format!("n{id}'s home word is never written; read it from its register"),
+            ));
+        }
         match self.node_slot.get(id as usize).copied().flatten() {
             // `NonZeroU32` ⇒ never 0, and `alloc_slot_checked` bounds it by
             // `spill_cap_off` ⇒ always inside the frame.
@@ -1728,6 +1950,21 @@ impl<'a> Lowerer<'a> {
     /// back to the single-pass backend — the same outcome as before, but with a
     /// structured reason attached, and returning the poison slot rather than
     /// `0` so no `[rbp - 0]` read can be emitted even transiently.
+    /// The frame offset a value's home WOULD occupy, whether or not anything
+    /// writes it.
+    ///
+    /// The single exemption from [`Self::slot_of`]'s refusal, and it is narrow
+    /// on purpose: `gather_phi_copies` needs the offset to identify a
+    /// destination and to sequentialise the edge's parallel copy, and it hands
+    /// that offset to `emit_copy_op`, which decides per copy whether to store
+    /// through it. Nothing here reads the word.
+    fn slot_of_unwritten(&self, id: NodeId) -> i32 {
+        match self.node_slot.get(id as usize).copied().flatten() {
+            Some(off) => off.get() as i32,
+            None => self.slot_of(id),
+        }
+    }
+
     fn slot_of(&self, id: NodeId) -> i32 {
         match self.slot_of_checked(id) {
             Ok(offset) => offset,
@@ -1936,6 +2173,8 @@ impl<'a> Lowerer<'a> {
             // independent check of that, and must not be read as one.
             non_oop_stack_slots: self.prim_slot_offsets.clone(),
             stack_marks_exact: true,
+            // The IR tier emits no shadow push of its own.
+            shadow_pushed: 0,
         });
     }
 
@@ -2006,7 +2245,7 @@ impl<'a> Lowerer<'a> {
         // Gather (phi_slot, value_id) pairs first to avoid borrowing `self`
         // immutably while emitting (which borrows `self` mutably).
         let gathered = self.gather_phi_copies(pred_block, succ_block);
-        let copies: Vec<(i32, i32)> = gathered.iter().map(|&(_, dst, src)| (dst, src)).collect();
+        let copies: Vec<(i32, i32)> = gathered.iter().map(|c| (c.dst, c.src_slot)).collect();
 
         // Phi copies are a PARALLEL assignment, not a sequence.
         //
@@ -2045,8 +2284,25 @@ impl<'a> Lowerer<'a> {
                 return;
             }
         };
+        // Which node does each frame word in this edge belong to? Two maps,
+        // because one word can be a source here and a destination there, and
+        // the reserved scratch is in neither — a `Save`'s destination and a
+        // `Restore`'s source therefore find nothing and stay memory, which is
+        // what they must be.
+        let (src_node_of, phi_of_dst) = if ir_phi_copy_regs_enabled() {
+            let mut s: HashMap<i32, NodeId> = HashMap::new();
+            let mut d: HashMap<i32, NodeId> = HashMap::new();
+            for c in &gathered {
+                s.insert(c.src_slot, c.src);
+                d.insert(c.dst, c.phi);
+            }
+            (s, d)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) = self.emit_copy_op(op) {
+            if let Err(bailout) = self.emit_copy_op(op, &src_node_of, &phi_of_dst, &mut published) {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -2059,13 +2315,23 @@ impl<'a> Lowerer<'a> {
         // the first published edge (in emission order) still take the home
         // word; every edge publishes, so the register is valid on entry to the
         // block whichever predecessor ran.
+        //
+        // 2026-09-04: a GP phi whose copy went through RAX is published *there*,
+        // from RAX, and appears in `published`. The reload below is what is
+        // left for everything else — the FP half, and any phi whose copy the
+        // resolver dropped as a self-copy (nothing was emitted, so nothing
+        // could publish, and on the first edge in emission order the register
+        // may not be live yet).
         if ir_phi_residency_enabled() {
-            for &(phi, dst, _) in &gathered {
-                if self.assigned_gpr(phi).is_some() {
-                    self.publish_gp_from_slot(phi, dst);
-                } else if self.assigned_xmm(phi).is_some() {
-                    let is_double = self.graph.nodes[phi as usize].ty == IrType::Double;
-                    self.publish_fp_from_slot(phi, dst, is_double);
+            for c in &gathered {
+                if published.contains(&c.phi) {
+                    continue;
+                }
+                if self.assigned_gpr(c.phi).is_some() {
+                    self.publish_gp_from_slot(c.phi, c.dst);
+                } else if self.assigned_xmm(c.phi).is_some() {
+                    let is_double = self.graph.nodes[c.phi as usize].ty == IrType::Double;
+                    self.publish_fp_from_slot(c.phi, c.dst, is_double);
                 }
             }
         }
@@ -2078,7 +2344,13 @@ impl<'a> Lowerer<'a> {
     /// emits at most one live save at a time and always consumes it before
     /// starting another cycle, so a single word suffices no matter how many
     /// disjoint cycles the edge contains.
-    fn emit_copy_op(&mut self, op: CopyOp) -> CompileResult<()> {
+    fn emit_copy_op(
+        &mut self,
+        op: CopyOp,
+        src_node_of: &HashMap<i32, NodeId>,
+        phi_of_dst: &HashMap<i32, NodeId>,
+        published: &mut Vec<NodeId>,
+    ) -> CompileResult<()> {
         let scratch = self.phi_copy_scratch_slot_off;
         let (src, dst) = match op {
             CopyOp::Move { from, to } => (frame_word_off(from)?, frame_word_off(to)?),
@@ -2093,8 +2365,85 @@ impl<'a> Lowerer<'a> {
                 format!("[rbp - {dst}] <- [rbp - {src}]"),
             ));
         }
-        self.load_to_rax(src);
-        self.store_rax(dst);
+        // ── Read: from the source's register when it has one ──────────
+        //
+        // Safe for the same reason the memory schedule is safe, and by the same
+        // argument. `resolve_parallel_copy` orders the ops so that every source
+        // is READ before anything writes it; a register is updated at exactly
+        // the instruction that writes the word (below), so a register and its
+        // home word go stale at the same point, and an order that protects one
+        // protects the other. A cycle's `Save` copies the pre-value out at the
+        // same instant either way.
+        let mut from_reg = false;
+        if ir_phi_copy_regs_enabled() {
+            if let Some(&sid) = src_node_of.get(&src) {
+                // A source whose home is never written has ONE readable
+                // location, and `resident_gpr`'s "has it been published yet"
+                // gate is the wrong question for it: there is nothing to fall
+                // back to. `assigned_gpr` is the right one, and it is safe for
+                // the same reason the publish is — the value is defined before
+                // any edge that reads it, and the register is exclusively its
+                // own (that is a clause of `phi_home_droppable`).
+                let homeless = self.home_dropped.get(sid as usize).copied().unwrap_or(false);
+                let src_reg = if homeless {
+                    self.assigned_gpr(sid)
+                } else {
+                    self.resident_gpr(sid)
+                };
+                match src_reg {
+                    Some(r) => {
+                        self.emit_mov_reg_reg64(RAX, r);
+                        from_reg = true;
+                        self.phi_copy_reg_reads += 1;
+                    }
+                    // Unreachable by construction: a home is dropped only for a
+                    // value the residency file gave an exclusive register. If
+                    // it ever happens, refuse the compile rather than emit a
+                    // read of a word nothing wrote.
+                    None if homeless => {
+                        return Err(Bailout::with_context(
+                            BailoutReason::UnallocatedValue { node: sid },
+                            format!("n{sid}'s home was dropped but it has no register"),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+        }
+        if !from_reg {
+            self.load_to_rax(src);
+        }
+        // ── The store, when anything could read it ───────────────────
+        //
+        // This is what the register image was reserved for. A loop-carried
+        // value whose register a deopt frame can name, whose every reader takes
+        // that register, needs no frame word at all — and this store was the
+        // last frame traffic left in the loop after the two reloads went.
+        let drop_home = phi_of_dst
+            .get(&dst)
+            .is_some_and(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false));
+        if drop_home {
+            self.home_stores_dropped += 1;
+        } else {
+            self.store_rax(dst);
+        }
+        // ── Publish: from RAX, which provably holds the value ─────────
+        //
+        // The reload this replaces was the second half of the store-then-load
+        // pair: `store [dst], rax` and then, a couple of instructions later,
+        // `mov reg, [dst]` — the same word, written and read back across a
+        // store-forwarding stall, once per phi per edge, i.e. once per loop
+        // iteration for every loop-carried value.
+        if ir_phi_copy_regs_enabled() {
+            if let Some(&phi) = phi_of_dst.get(&dst) {
+                if let Some(dst_reg) = self.assigned_gpr(phi) {
+                    self.emit_mov_reg_reg64(dst_reg, RAX);
+                    self.mark_gp_reg_live(phi);
+                    published.push(phi);
+                    self.phi_copy_reg_publishes += 1;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2269,6 +2618,35 @@ impl<'a> Lowerer<'a> {
             self.load_reg_from_frame(RAX, -disp);
             self.store_abi_reg(RAX, ((i as i32) + 1) * 8); // local_offset(i)
         }
+        // Zero every local slot this method did NOT receive as a parameter.
+        //
+        // The JVM's definite-assignment rule means such a slot is never read
+        // before it is written, so its entry value is unobservable to Java --
+        // but it is very observable to the GC. `alloc`'s `long[] a` is slot 1,
+        // and at the `new long[n]` safepoint one instruction later it still
+        // holds whatever the previous frame at this address left there. In an
+        // allocation-heavy workload that is a stale object pointer, so G1's
+        // band verifier finds a movable-resident word that no oop map names
+        // (correctly -- the dataflow knows the local is not live yet) and no
+        // shadow push published, and refuses to relocate.
+        //
+        // That was the ENTIRE residual after the reserved-tail zeroing below:
+        // 8.5-15.2% of pauses incomplete on `CoverageBench`, every report at
+        // this one offset in this one leaf.
+        //
+        // Safe only because this tier's prologue is the sole entry: `osr_enter`
+        // refuses here for want of an `osr_pc_to_native` table, which the
+        // assertion in `finish` pins. An OSR trampoline jumps PAST this
+        // prologue into a frame whose locals the interpreter already
+        // populated -- zeroing them there would destroy live state, so the edit
+        // that wires OSR into this tier must revisit this block, exactly as it
+        // must revisit the callee-saved save area.
+        if !prologue_zero_unset_locals_disabled() {
+            for i in self.num_params..self.num_locals {
+                // Cast: a JVM local index times 8 -- `max_locals` is u16.
+                self.emit_zero_frame_slot(((i as i32) + 1) * 8);
+            }
+        }
         // Zero the cached-thread and watermark slots BEFORE the fetch. The
         // fetch is erased (NOP'd) by `finish_lazy_thread_fetch` when the method
         // publishes nothing, and every consumer below is null-guarded on the
@@ -2278,6 +2656,38 @@ impl<'a> Lowerer<'a> {
         if self.get_current_thread != 0 && self.shadow_thread_slot_off > 0 {
             self.emit_zero_frame_slot(self.shadow_thread_slot_off);
             self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
+            // ... and the OTHER two reserved bookkeeping words, for the same
+            // reason and a second one.
+            //
+            // `shadow_savebase` is written only by a shadow PUSH and
+            // `phi_copy_scratch` only by a parallel copy that needs to break a
+            // cycle. A method that does neither -- every no-oop leaf, and
+            // `finish_lazy_thread_fetch` erases the fetch in exactly those --
+            // leaves both holding whatever the previous frame at this address
+            // left behind. In allocation-heavy code that is a stale object
+            // pointer, and G1's band verifier then finds a movable-resident
+            // word in the reserved-locals tail that no oop map names and no
+            // shadow push published, and correctly refuses to relocate the
+            // whole collection.
+            //
+            // Measured on `CoverageBench` after the §26 window repair: the
+            // ENTIRE residual incomplete rate (~19%, 386 reports over six runs)
+            // was `CoverageBench.alloc`, at three offsets -- and two of them are
+            // these. Neither word is ever read while it holds that garbage, so
+            // zeroing costs two prologue stores and removes the refusal.
+            //
+            // Kept inside this gate deliberately: it is the same "the reserved
+            // tail must read 0, not uninitialised stack" contract the two
+            // stores above already establish, and the same block the
+            // single-pass backend zero-initialises for.
+            if !prologue_zero_reserved_tail_disabled() {
+                if self.shadow_savebase_slot_off > 0 {
+                    self.emit_zero_frame_slot(self.shadow_savebase_slot_off);
+                }
+                if self.phi_copy_scratch_slot_off > 0 {
+                    self.emit_zero_frame_slot(self.phi_copy_scratch_slot_off);
+                }
+            }
         }
         // And the safepoint-id slot, for the SAME reason and on its own gate:
         // `active_safepoint_id` reads `[rbp - sp_id_slot_off]` on any live
@@ -2757,6 +3167,34 @@ impl<'a> Lowerer<'a> {
         true
     }
 
+    /// Guard a baked COMPACT CELL OFFSET against a layout replacement, and
+    /// return the patch site the caller routes to its helper.
+    ///
+    /// The optimizing tier's twin of `x64::objects::emit_layout_epoch_guard`,
+    /// and it exists for the same reason: an emitter that bakes
+    /// `HEADER_SIZE + packed_body_offset` as an immediate is making a
+    /// compile-time claim about a layout the class manager can replace at run
+    /// time. The two ALLOCATION emitters have guarded that since
+    /// perf/halfgap-20260717 and call an unguarded baked layout "confirmed heap
+    /// corruption"; the field-access emitters had no guard at all.
+    ///
+    /// Four instructions against the process-wide replacement epoch, which only
+    /// a REPLACEMENT bumps — never a new class registration — so a workload
+    /// that never swaps a layout keeps every inline arm.
+    fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
+        let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
+        if addr.is_null() {
+            return None;
+        }
+        self.emit_mov_reg_imm64(R11, addr as u64);
+        // MOV ECX, dword [R11]
+        self.buf.emit(&[0x41, 0x8B, 0x0B]);
+        // CMP ECX, imm32
+        self.buf.emit(&[0x81, 0xF9]);
+        self.buf.emit(&(expected as i32).to_le_bytes());
+        Some(self.emit_jcc_rel32(0x85)) // JNE -> the caller's slow path
+    }
+
     /// Receiver alignment + containment in one of the three published
     /// `JIT_READ_BOUNDS` regions, with RAX holding the receiver. Failures push
     /// their patch offsets onto `slow`.
@@ -2926,6 +3364,10 @@ impl<'a> Lowerer<'a> {
         let mut bail_recv: Vec<usize> = Vec::new();
         let mut bail_pre: Vec<usize> = Vec::new();
         let mut bail_barrier: Vec<usize> = Vec::new();
+        // `cell_off` below is a compile-time claim about this class's compact
+        // layout; the receiver checks that follow are not the only way this arm
+        // must be able to decline.
+        bail_recv.extend(self.emit_layout_epoch_guard());
         if !trusted_oop_receiver {
             self.emit_receiver_align_and_containment(&mut bail_recv);
         }
@@ -3015,6 +3457,7 @@ impl<'a> Lowerer<'a> {
         // Cast: a compact field offset plus the header is bounded by the
         // object size.
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_COMPACT);
         self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
         self.buf.emit(&cell_off.to_le_bytes());
         let stored = self.emit_jmp_rel32();
@@ -3026,6 +3469,7 @@ impl<'a> Lowerer<'a> {
         // makes `field_index * SLOT_SIZE` addressable, since for a legacy
         // object `num_slots` counts exactly these cells.
         self.patch_rel32_to_here(legacy_shape);
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_LEGACY);
         let legacy_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
         self.emit_mov_reg_imm64(R10, u64::from(cratonvm_types::FIELD_CELL_TAG_OBJECT));
         self.buf.emit(&[0x4C, 0x89, 0x90]); // MOV [RAX + disp32], R10
@@ -3227,6 +3671,8 @@ impl<'a> Lowerer<'a> {
 
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
         let mut slow: Vec<usize> = Vec::new();
+        // `cell_off` is a compile-time claim about this class's compact layout.
+        slow.extend(self.emit_layout_epoch_guard());
 
         self.gp_load_value(RAX, base);
         // 2026-09-02: a receiver this block already proved (null-tested and,
@@ -3236,10 +3682,19 @@ impl<'a> Lowerer<'a> {
         // address, which is still mapped. `itemCheck` proved `n` once per
         // field it read (`ir_receiver_guard_cse_enabled`).
         let receiver_proven = self.receiver_already_guarded(base);
-        if !receiver_proven {
+        // The null test is suppressed by the WEAKER fact as well: the seed, or
+        // a test already emitted in this block. The containment guard below
+        // still keys off `receiver_proven` alone, so a null-only proof never
+        // licenses skipping the alignment and read-bounds compares.
+        if self.receiver_already_non_null(base) {
+            crate::metrics::note_ir_receiver_null_check_elided();
+        } else {
             // 1. null → slow (the helper raises the NPE).
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
             slow.push(self.emit_jcc_rel32(0x84)); // JZ
+            crate::metrics::note_ir_receiver_null_check_emitted();
+            // Its fall-through is a proof for the rest of the block.
+            self.note_receiver_non_null(base);
         }
         if guarded && !raw_mode && !trusted_oop_receiver && !receiver_proven {
             self.note_receiver_guarded(base);
@@ -3899,6 +4354,24 @@ impl<'a> Lowerer<'a> {
         self.emit_rbp_modrm_disp(xmm, offset);
     }
 
+    /// `MOVSD [rbp - offset], xmm` for **any** xmm, including `XMM8`-`XMM15`.
+    ///
+    /// [`Self::fp_store`] cannot reach those: it emits no REX byte, so its
+    /// ModRM `reg` field is three bits and `XMM8` encodes as `XMM0`. That is
+    /// harmless where it is used ([`IR_LOWER_LS_XMMS`] is low-numbered) and
+    /// fatal here, where the point is to capture the WHOLE file — a spill that
+    /// silently wrote `xmm[0]` eight times would leave the upper half of the
+    /// register image holding stale stack, and a `FrameValue::XmmDouble(9)`
+    /// resolving against it would reconstruct a plausible wrong number.
+    fn emit_movsd_frame_from_xmm(&mut self, offset: i32, xmm: u8) {
+        self.buf.emit_byte(0xF2);
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44); // REX.R
+        }
+        self.buf.emit(&[0x0F, 0x11]);
+        self.emit_rbp_modrm_disp(xmm, offset);
+    }
+
     /// Scalar FP binary op (`<prefix> 0F <op>`), reg-reg form `dst op= src`.
     /// `op` is the second opcode byte: ADD=0x58, SUB=0x5C, MUL=0x59, DIV=0x5E.
     fn fp_binop(&mut self, op: u8, dst: u8, src: u8, is_double: bool) {
@@ -4031,6 +4504,8 @@ impl<'a> Lowerer<'a> {
         // A receiver proof is block-local: control can enter this block from a
         // predecessor that never proved it.
         self.guarded_receivers.clear();
+        self.null_proven_receivers.clear();
+        self.seed_block_null_proofs();
 
         let block = &self.schedule.blocks[block_idx];
 
@@ -5364,7 +5839,11 @@ impl<'a> Lowerer<'a> {
     /// succ_block` carries: one per value phi of the successor's merge whose
     /// input for this edge is a real node. Pure; `emit_phi_copies` emits
     /// exactly these and `edge_has_phi_copies` asks whether there are any.
-    fn gather_phi_copies(&self, pred_block: usize, succ_block: usize) -> Vec<(NodeId, i32, i32)> {
+    fn gather_phi_copies(
+        &self,
+        pred_block: usize,
+        succ_block: usize,
+    ) -> Vec<PhiCopy> {
         let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
         if !matches!(
             self.graph.nodes[merge_ctrl as usize].op,
@@ -5372,7 +5851,7 @@ impl<'a> Lowerer<'a> {
         ) {
             return Vec::new();
         }
-        let mut out: Vec<(NodeId, i32, i32)> = Vec::new();
+        let mut out: Vec<PhiCopy> = Vec::new();
         for id in 0..self.graph.nodes.len() {
             let node = &self.graph.nodes[id];
             if !matches!(node.op, Op::Phi) {
@@ -5395,7 +5874,17 @@ impl<'a> Lowerer<'a> {
                 }
                 if let Some(&val_id) = node.inputs.get(k + 1) {
                     if val_id != NO_NODE {
-                        out.push((id as NodeId, self.slot_of(id as NodeId), self.slot_of(val_id)));
+                        // `slot_of_unwritten`, not `slot_of`: this is the one
+                        // consumer that legitimately wants the ADDRESS of a
+                        // home word it may never write. Everything else that
+                        // reaches `slot_of` is reading a VALUE, and for a
+                        // dropped home that is exactly what must fail.
+                        out.push(PhiCopy {
+                            phi: id as NodeId,
+                            dst: self.slot_of_unwritten(id as NodeId),
+                            src: val_id,
+                            src_slot: self.slot_of_unwritten(val_id),
+                        });
                     }
                 }
             }
@@ -5536,6 +6025,63 @@ impl<'a> Lowerer<'a> {
         ir_receiver_guard_cse_enabled() && self.guarded_receivers.contains(&base)
     }
 
+    /// Is `base` known non-null here — by the receiver seed, or by a null test
+    /// already emitted in this block?
+    fn receiver_already_non_null(&self, base: NodeId) -> bool {
+        self.receiver_already_guarded(base) || self.null_proven_receivers.contains(&base)
+    }
+
+    /// Record that a null test has just proven `base` on its fall-through.
+    fn note_receiver_non_null(&mut self, base: NodeId) {
+        if !self.null_proven_receivers.contains(&base) {
+            self.null_proven_receivers.push(base);
+        }
+    }
+
+    /// Seed this block's null proofs with `this`.
+    ///
+    /// # Why a seed, and not just the per-block CSE
+    ///
+    /// The CSE above proves a receiver once per block. That is worth nothing to
+    /// a loop whose body reads one field: the body is one block, its single
+    /// `getfield` is the first dereference in it, and so the test is emitted
+    /// once and executed on every iteration — forever, for a value the JVM
+    /// guarantees at the call site.
+    ///
+    /// This is the same hole the single-pass backend had, in the same shape
+    /// and for the same reason, and it was closed there by
+    /// `CRATONVM_JIT_THIS_NONNULL` seeding the null-check dataflow's entry
+    /// state. That fix was single-pass only: both arms it touches are in
+    /// `x64/bytecode_walk.rs`, so this tier kept emitting `TEST RAX, RAX; JZ`
+    /// at every `getfield` — and a 2026-09-03 measurement put the optimizing
+    /// tier at ~1.65x the baseline's time on exactly that loop.
+    ///
+    /// The seed is one fact: an instance method's parameter 0 is non-null,
+    /// because the JVM enters one only through a call site that has already
+    /// null-checked the receiver. `<init>` included — its receiver is
+    /// uninitialized, never null.
+    ///
+    /// **It is only ever the parameter NODE.** A local reassigned from
+    /// parameter 0 is a different node and gets nothing; there is no
+    /// bytecode-local pattern match here to mis-attribute, which is the class
+    /// of bug `preceding_aload_nonnull_local` carries a soundness fix for.
+    fn seed_block_null_proofs(&mut self) {
+        if !ir_this_nonnull_enabled() {
+            return;
+        }
+        let Some(recv) = self.graph.receiver_param else {
+            return;
+        };
+        for (id, node) in self.graph.nodes.iter().enumerate() {
+            if node.op == Op::Param(recv) {
+                // Cast: node ids index `graph.nodes`, which the builder bounds.
+                self.null_proven_receivers.push(id as NodeId);
+                crate::metrics::note_ir_receiver_seed();
+                break;
+            }
+        }
+    }
+
     /// Record that the block being lowered has just proved `base`.
     fn note_receiver_guarded(&mut self, base: NodeId) {
         if ir_receiver_guard_cse_enabled() && !self.guarded_receivers.contains(&base) {
@@ -5577,12 +6123,22 @@ impl<'a> Lowerer<'a> {
                 // local_offset(i) = (i + 1) * 8
                 let param_offset = ((*idx as i32) + 1) * 8;
                 self.load_to_rax(param_offset);
-                self.store_rax(slot);
                 // An FP parameter is a loop invariant often enough to be worth
                 // a register; the copy comes from the home word this just
                 // wrote, because the prologue delivered it through a GPR.
-                if matches!(node.ty, IrType::Float | IrType::Double) {
-                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                //
+                // An INT or LONG parameter is exactly as much a loop invariant,
+                // and got nothing until 2026-09-03. `gp_store_value` writes the
+                // home word and then copies RAX into the register, so the
+                // publish here is register-to-register — no reload of a word
+                // this arm just wrote.
+                if matches!(node.ty, IrType::Int | IrType::Long) {
+                    self.gp_store_value(id, slot, RAX);
+                } else {
+                    self.store_rax(slot);
+                    if matches!(node.ty, IrType::Float | IrType::Double) {
+                        self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                    }
                 }
             }
             Op::Add => {
@@ -6584,6 +7140,9 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
                     self.emit_gpr_array_elem_store(*kind);
+                    // RAX still holds the array pointer -- the store above
+                    // addresses through it. See `crate::gpu_barrier`.
+                    self.emit_gpu_input_cache_barrier();
                     return;
                 }
                 let is_d = matches!(kind, MemKind::Double);
@@ -6596,6 +7155,10 @@ impl<'a> Lowerer<'a> {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x11, 0x44, sib, HEADER_SIZE as u8]);
+                // Same contract as the integral arm above: RAX is the array.
+                // The barrier clobbers R10/R11 and the flags only, so an
+                // XMM-resident value elsewhere in the frame is untouched.
+                self.emit_gpu_input_cache_barrier();
             }
             // arraylength (COV-02). inputs = [ctrl, mem, array]. One 32-bit
             // load at a fixed header offset behind the JVMS null check. No
@@ -7342,7 +7905,26 @@ impl<'a> Lowerer<'a> {
         // Guarded on the home slot existing, which is belt-and-braces: a node
         // the colourer gave no home was never promotable in the first place
         // (`plan_register_residency` requires one).
-        if self.assigned_gpr(id).is_some() {
+        //
+        // 2026-09-04: **a value already live in its register is not published
+        // again.** A phi is the case that matters, and it is not a small one.
+        // A phi appears in its header block's node list like any other value,
+        // so this site ran for it once per iteration and reloaded the register
+        // out of the home word — while the edge copies had already put the
+        // value there. The disassembly of `FieldLoop.sum` showed both halves of
+        // the resulting loop-carried chain: `mov [rbp-78h],rax` on the back
+        // edge, and `mov rbx,[rbp-78h]` at the top of the next iteration,
+        // waiting on it.
+        //
+        // Skipping is safe for the same reason every read of `gp_reg_live` is:
+        // the allocator gives a register to one value at a time over its live
+        // range, so nothing between the publish and here can have written it.
+        // It applies ONLY to this re-publish. An edge copy must always write
+        // the phi's register — that is the copy — and `emit_phi_copies` does so
+        // whether or not the register was already live.
+        if self.assigned_gpr(id).is_some()
+            && !(ir_skip_live_republish_enabled() && self.resident_gpr(id).is_some())
+        {
             if let Some(off) = self.node_slot.get(id as usize).copied().flatten() {
                 let slot = off.get() as i32;
                 self.publish_gp_from_slot(id, slot);
@@ -7646,6 +8228,27 @@ impl<'a> Lowerer<'a> {
                 EliminationCause::Unclassified,
             ));
         };
+        // A register beats a frame word, when the register is provably his.
+        // Placed after the `Op::Dead` / out-of-range handling above and before
+        // the constants below, because a CONSTANT needs no machine location at
+        // all and describing one by register would be a strict loss.
+        if !matches!(node.op, Op::Const(_) | Op::ConstF(_)) {
+            if let Some(v) = self.register_frame_value(node_id, node.ty) {
+                self.deopt_reg_named.set(self.deopt_reg_named.get() + 1);
+                return v;
+            }
+            // A dropped home MUST have been describable by a register: that is
+            // a clause of `phi_home_droppable`, and the two must not be able to
+            // drift apart. If they ever do, refuse the compile rather than
+            // describe the frame word nothing wrote.
+            if self.home_dropped.get(node_id as usize).copied().unwrap_or(false) {
+                self.latch_bailout(Bailout::with_context(
+                    BailoutReason::UnallocatedValue { node: node_id },
+                    format!("n{node_id}'s home was dropped but no register describes it"),
+                ));
+                return FrameValue::Unsupported;
+            }
+        }
         match node.op {
             // Integer / long constants need no machine location. A cat-1 `int`
             // constant resolves to `Int`; a cat-2 `long` constant resolves to
@@ -8138,6 +8741,24 @@ impl<'a> Lowerer<'a> {
     /// `MemKind::Ref` is refused by the caller (no store barrier in this tier)
     /// and the FP kinds take the XMM path. One shared header displacement, for
     /// the reason given on [`Self::emit_gpr_array_elem_load`].
+    /// Emit the GPU input-residency barrier after an inline primitive
+    /// array store, if a `--gpu` run armed it.
+    ///
+    /// Assumes RAX holds the array pointer, which both `ArrayStore` arms
+    /// guarantee. Clobbers R10, R11 and the flags: R10 is already this
+    /// backend's guard scratch, R11 is never register-resident, and this
+    /// backend's linear-scan residency uses only callee-saved GPRs
+    /// (`IR_LOWER_LS_GPRS`), so nothing live is at risk.
+    ///
+    /// Emits nothing at all unless armed -- see [`crate::gpu_barrier`],
+    /// which is also where the reason a compiled store marks a bucket
+    /// instead of calling `input_cache::invalidate` is written down.
+    fn emit_gpu_input_cache_barrier(&mut self) {
+        if let Some(bytes) = crate::gpu_barrier::barrier_bytes() {
+            self.buf.emit(&bytes);
+        }
+    }
+
     fn emit_gpr_array_elem_store(&mut self, kind: MemKind) {
         let d = crate::x64::disp::disp8_const(HEADER_SIZE as i64) as u8;
         match kind {
@@ -8172,8 +8793,43 @@ impl<'a> Lowerer<'a> {
             return;
         }
         let stub_off = self.buf.pos();
+        // ── Spill the register file, BEFORE anything here clobbers one ──
+        //
+        // Every guard reaches this stub by a `JMP`, so on entry the registers
+        // still hold their trapping-instant values — with ONE exception, which
+        // is why naming is restricted to `IR_LOWER_LS_GPRS`: the guard site
+        // already loaded the `DeoptimizationPoint` pointer into `DEOPT_ARG0`
+        // (RCX on Windows, RDI on System V) before jumping, so THAT register's
+        // spilled word is the pointer and not the trapping value. Neither
+        // register is in the residency file, and `deopt_nameable` is built from
+        // that file, so no frame value can name one.
+        //
+        // `gpr[r]` at `[rbp - (base - 8r)]` and `xmm[n]` at
+        // `[rbp - (base - 128 - 8n)]` — the `#[repr(C)]` field order of
+        // `SavedRegisters`, and the same arithmetic the single-pass backend's
+        // stub uses.
+        if self.deopt_regs_base > 0 {
+            for r in 0u8..16 {
+                // Cast: a 0..16 register index into the frame displacement.
+                self.store_abi_reg(r, self.deopt_regs_base - (r as i32) * 8);
+            }
+            for n in 0u8..16 {
+                // Cast: as above. MOVSD writes the low 8 bytes, which is
+                // exactly the `u64` the `xmm` half of the struct holds.
+                self.emit_movsd_frame_from_xmm(self.deopt_regs_base - 128 - (n as i32) * 8, n);
+            }
+        }
         // mov arg1, rbp
         self.emit_mov_reg_rbp(DEOPT_ARG1);
+        // arg2 = &SavedRegisters, or NULL when no region was reserved — which
+        // is what `ir_deopt_entry` reads as "this frame has no register image",
+        // giving it back the default-zeros behaviour it had before the region
+        // existed.
+        if self.deopt_regs_base > 0 {
+            self.lea_reg_from_frame(DEOPT_ARG2, self.deopt_regs_base);
+        } else {
+            self.emit_mov_reg_imm64(DEOPT_ARG2, 0);
+        }
         // mov rax, ir_deopt_entry ; call rax
         let fn_addr = ir_deopt_entry as *const () as u64;
         self.emit_mov_reg_imm64(RAX, fn_addr);
@@ -8842,12 +9498,15 @@ fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeed
     let saved_xmms = ir_saved_xmm_bytes() as usize;
     // Cast: `ir_saved_gpr_bytes` returns 0 or 40.
     let saved_gprs = ir_saved_gpr_bytes() as usize;
+    // Cast: `ir_deopt_regs_bytes` returns 0 or 256.
+    let deopt_regs = ir_deopt_regs_bytes() as usize;
     let total = locals
         .saturating_add(context)
         .saturating_add(bookkeeping)
         .saturating_add(spills)
         .saturating_add(saved_xmms)
         .saturating_add(saved_gprs)
+        .saturating_add(deopt_regs)
         .saturating_add(args_stage)
         .saturating_add(shadow)
         .saturating_add(stack_arg_reserve);
@@ -8920,6 +9579,26 @@ fn frame_word_loc(off: i32) -> CompileResult<ValueLoc> {
 
 /// Inverse of [`frame_word_loc`].
 ///
+/// One phi's incoming value on one edge: which phi, where its home word is,
+/// and **which node** the value comes from as well as where that node's home
+/// word is.
+///
+/// The source NODE is the addition. Without it an edge copy can only be
+/// expressed as memory-to-memory — `load rax, [src]; store [dst], rax` — and
+/// that is what put a store and a load of the same word two instructions apart
+/// at the top of every loop this backend compiles (`JIT_OPTIMIZATION.md`, "the
+/// residual 1.36x: latency, not volume"). With the node in hand, a source that
+/// is already register-resident is read from its register, and a destination
+/// that is register-resident is published from RAX rather than reloaded out of
+/// the word just written.
+#[derive(Clone, Copy)]
+struct PhiCopy {
+    phi: NodeId,
+    dst: i32,
+    src: NodeId,
+    src_slot: i32,
+}
+
 /// A [`ValueLoc::Reg`] is unreachable from this backend — it keeps every value
 /// in its home frame word and has no register allocation to disagree with — but
 /// it is representable in the shared type, so it is refused rather than
@@ -9084,17 +9763,28 @@ fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()
     // scheduled order, then its terminator. This is exactly `lower_inner`'s
     // `for block_idx in 0..blocks.len() { lower_block(block_idx) }`.
     let mut emit_index: Vec<Option<usize>> = vec![None; graph.nodes.len()];
+    // Which laid-out block each node lands in. Used only to describe a failure:
+    // "def after use" means one thing when both sit in a single block (an
+    // intra-block scheduling order) and quite another when they do not (a block
+    // LAYOUT that put a definition's block after its user's).
+    let mut block_of: Vec<Option<usize>> = vec![None; graph.nodes.len()];
     let mut seq = 0usize;
-    for block in &schedule.blocks {
+    for (bpos, block) in schedule.blocks.iter().enumerate() {
         for &node_id in &block.nodes {
             if let Some(cell) = emit_index.get_mut(node_id as usize) {
                 *cell = Some(seq);
+            }
+            if let Some(cell) = block_of.get_mut(node_id as usize) {
+                *cell = Some(bpos);
             }
             seq += 1;
         }
         if let Some(term) = block.terminator {
             if let Some(cell) = emit_index.get_mut(term as usize) {
                 *cell = Some(seq);
+            }
+            if let Some(cell) = block_of.get_mut(term as usize) {
+                *cell = Some(bpos);
             }
             seq += 1;
         }
@@ -9170,8 +9860,12 @@ fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()
                     BailoutReason::UnallocatedValue { node: input },
                     format!(
                         "n{input} ({:?}) is emitted at position {def_seq}, after its \
-                         use by n{user} ({:?}) at position {use_seq}",
-                        def.op, node.op
+                         use by n{user} ({:?}) at position {use_seq} \
+                         [def in laid-out block {:?}, use in {:?}]",
+                        def.op,
+                        node.op,
+                        block_of.get(input as usize).copied().flatten(),
+                        block_of.get(user as usize).copied().flatten(),
                     ),
                 ));
             }
@@ -10111,6 +10805,88 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// wider value hiding in it. Zero unless the linear-scan path is on, for the
 /// same reason `ir_saved_xmm_bytes` returns zero then: a frame must not pay for
 /// a register nothing can hand out.
+/// Reserve the 256-byte [`crate::deopt::SavedRegisters`] region in this
+/// backend's frame, spill the register file into it at the deopt stub, and let
+/// a deopt frame NAME a register -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DEOPT_REGS=1`.
+///
+/// Off is the historical arrangement, whose contract `ir_deopt_entry` states:
+/// "the IR lowerer keeps every live value in a frame slot, so no register file
+/// is needed". That is what makes a deopt-named value's home word mandatory,
+/// and therefore what stops a register-resident value from ever losing it --
+/// see `plan_register_residency`'s `blocked_deopt` census.
+/// Drop the home-word store for a loop-carried value that a deopt frame can
+/// name in its register -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DROP_PHI_HOME=1`.
+///
+/// This is the payoff the register image exists for, and it is a CONJUNCTION:
+/// see [`Lowerer::phi_home_droppable`], which will not drop a home unless every
+/// reader of that home has somewhere else to read from.
+fn ir_drop_phi_home_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_PHI_HOME") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+fn ir_deopt_regs_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = DEOPT_REGS_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_DEOPT_REGS").is_some()
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_deopt_regs_enabled`], the same shape (and for
+    /// the same reason) as `LS_FORCE`: the production answer latches a
+    /// process-wide `OnceLock` off the environment, so a test that did not
+    /// override it would measure the developer's shell.
+    static DEOPT_REGS_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_deopt_regs_enabled`] on this thread.
+#[cfg(test)]
+struct DeoptRegsForce;
+
+#[cfg(test)]
+impl DeoptRegsForce {
+    fn on() -> DeoptRegsForce {
+        DEOPT_REGS_FORCE.with(|c| c.set(Some(true)));
+        DeoptRegsForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeoptRegsForce {
+    fn drop(&mut self) {
+        DEOPT_REGS_FORCE.with(|c| c.set(None));
+    }
+}
+
+/// Bytes the frame reserves for the deopt register image.
+///
+/// `size_of::<SavedRegisters>()` exactly: `{ gpr: [u64; 16], xmm: [u64; 16] }`,
+/// `#[repr(C)]`, and `saved_registers_layout_matches_the_stub_spill_region` in
+/// `deopt.rs` pins it.
+/// The whole struct is reserved rather than only the GPR half, because the
+/// pointer handed to `ir_deopt_entry` is a `*const SavedRegisters` and the
+/// resolver indexes both halves.
+fn ir_deopt_regs_bytes() -> i32 {
+    if ir_deopt_regs_enabled() {
+        256
+    } else {
+        0
+    }
+}
+
 fn ir_saved_gpr_bytes() -> i32 {
     if IR_LOWER_SAVED_GPRS.is_empty() || !linear_scan_enabled() {
         return 0;
@@ -10710,6 +11486,129 @@ fn verify_mir_allocation(
 ///
 /// Declared in `types/src/flag_groups.rs` as `jit/ir-linear-scan`, so `-XX:`
 /// options and `flags::with_thread_overrides` reach it.
+/// Seed each block's null proofs with the receiver — **default OFF**, opt in
+/// with `CRATONVM_JIT_IR_THIS_NONNULL=1`.
+///
+/// # It is off because it measured SLOWER, which nobody expected
+///
+/// It is correct and it engages (`seeded=9 elided=2 emitted=0` against
+/// `0/0/2` with it off, same answer). On the loop it was built for — the one
+/// the 2026-09-03 tier comparison found inverted — it is **~20% slower with
+/// the check removed than with it emitted**: medians 1.78/1.93 on against
+/// 1.49/1.61 off, two replicate pairs, within-config spread 8%, same direction
+/// both times.
+///
+/// **The cost is not compile time.** At `reps=1`, where the loop barely runs,
+/// the two arms are 0.19 against 0.18 — so the per-block seed scan is ~0.01s
+/// and the 0.3s is in the emitted code.
+///
+/// Removing two instructions cannot make a loop 20% slower on its own, so what
+/// this really says is that the body is dominated by something layout- or
+/// branch-structure-sensitive, and deleting a never-taken forward `JZ` moved
+/// it. That is a lead worth pulling for the residual tier inversion itself,
+/// and it is the reason this switch stays available rather than being deleted:
+/// it is the smallest known perturbation that moves that loop by 20%.
+///
+/// If nobody finds the cause, withdraw it.
+///
+/// The optimizing-tier half of `CRATONVM_JIT_THIS_NONNULL`, which seeds the
+/// single-pass backend's null-check dataflow. Separate switch because the two
+/// tiers reach the fact by different routes — a bytecode dataflow there, the
+/// graph's `receiver_param` here — and a single flag would make a bisect
+/// unable to say which one moved.
+///
+/// Off restores the previous emission exactly: a `TEST`/`JZ` at every
+/// `getfield` whose receiver the per-block CSE has not already proven.
+/// Does a register for `id` pay for itself, counting loop frequency?
+///
+/// The publish is one memory→register load at the definition; each read it
+/// replaces is one memory→register load at its own site. So the trade is
+/// `uses_frequency >= 2 × definition_frequency`, and the static `use_count >= 2`
+/// is that same test with every frequency pinned to 1.
+///
+/// `live.weight[id]` is already the loop-frequency-weighted use count. The
+/// definition's frequency is derived from `live.loop_depth` and `live.span`,
+/// both public, using the same `LOOP_WEIGHT_PER_DEPTH` model — so the two sides
+/// of the comparison come from one model rather than two.
+///
+/// Falls back to the static rule whenever the loop model cannot place the
+/// definition, which keeps a graph the scheduler left unusual on the old
+/// behaviour rather than on a guess.
+fn ir_residency_pays_here(
+    live: &crate::regalloc::LiveModel,
+    schedule: &Schedule,
+    id: usize,
+    static_uses: u32,
+) -> bool {
+    if !ir_residency_loop_weight_enabled() {
+        return static_uses >= 2;
+    }
+    let Some(def_pos) = live.pos_of.get(id).copied().flatten() else {
+        return static_uses >= 2;
+    };
+    // Which block holds the definition? `span[b]` is that block's
+    // (first position, outgoing-edge position).
+    let mut def_depth: Option<u32> = None;
+    for b in 0..schedule.blocks.len() {
+        if let Some(&(lo, hi)) = live.span.get(b) {
+            if lo <= def_pos && def_pos <= hi {
+                def_depth = live.loop_depth.get(b).copied();
+                break;
+            }
+        }
+    }
+    let Some(depth) = def_depth else {
+        return static_uses >= 2;
+    };
+    let def_freq = u64::from(
+        crate::regalloc::LOOP_WEIGHT_PER_DEPTH
+            .checked_pow(depth)
+            .unwrap_or(crate::regalloc::MAX_LOOP_DEPTH_WEIGHT)
+            .min(crate::regalloc::MAX_LOOP_DEPTH_WEIGHT),
+    );
+    let uses_freq = live.weight.get(id).copied().unwrap_or(0);
+    uses_freq >= def_freq.saturating_mul(2)
+}
+
+/// Weigh the residency trade by loop frequency instead of a static use count —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`.
+///
+/// Off is the static `use_count >= 2` this file has always used.
+fn ir_residency_loop_weight_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LS_LOOP_WEIGHT").is_some()
+    })
+}
+
+/// Copy a loop-live int/long PARAMETER into a callee-saved register at entry —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_PARAM_COPY=1`.
+///
+/// The optimizing tier cannot promote an entry parameter at all: they are
+/// pinned to their incoming ABI registers, which are caller-saved and outside
+/// this file, and the allocator skips a pinned value. The baseline tier copies
+/// them into callee-saved registers in its prologue and reads them from there;
+/// this is that copy.
+///
+/// Off is exactly the previous emission: the parameter reaches every use
+/// through its frame slot.
+fn ir_param_prologue_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_PARAM_COPY").is_some()
+    })
+}
+
+fn ir_this_nonnull_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_THIS_NONNULL").is_some()
+    })
+}
+
 fn linear_scan_enabled() -> bool {
     #[cfg(test)]
     {
@@ -11054,6 +11953,10 @@ fn plan_register_residency(
     // and `skip_phi` in particular is the one that decides whether this file
     // can ever reach a LOOP COUNTER -- which is a phi, at every loop header.
     let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
+    // Split apart from `skip_split` on 2026-09-03: see the refusal below.
+    let (mut skip_no_alloc, mut skip_spilled) = (0usize, 0usize);
+    // Parameters copied into a callee-saved register by the prologue.
+    let mut param_copies = 0usize;
     // 2026-09-02, measured: promotion is not free, and two populations pay for
     // it without ever collecting.
     //
@@ -11095,7 +11998,32 @@ fn plan_register_residency(
                 // for, and its "definition" is an edge copy that is already
                 // paying the store.
                 Some(Op::Phi) => {}
-                _ if use_count.get(id).copied().unwrap_or(0) < 2 => {
+                // The `< 2` rule below counts STATIC graph edges. That is the
+                // right comparison only when the definition and the uses run
+                // equally often, and in a loop they do not: a value defined at
+                // method entry and read once per iteration is one publish
+                // against N reads, and the static count sees 1 and refuses.
+                //
+                // Measured on the loop the 2026-09-03 tier comparison found
+                // inverted: `Param(0)` (the receiver) and `Param(1)` (the loop
+                // bound) both read `static_uses=1 loop_weight=10` — refused by
+                // a rule that could not see the ten. The disassembly showed
+                // exactly that, `mov rax,[rbp-58h]` and `mov rcx,[rbp-60h]`
+                // reloaded every iteration, while the baseline tier held both
+                // in callee-saved registers.
+                //
+                // The loop-aware form compares the uses' frequency against the
+                // DEFINITION's: residency pays when the reads happen at least
+                // twice as often as the single publish. It reduces exactly to
+                // `use_count >= 2` when everything sits at depth 0, so a
+                // method with no loop is byte-identical.
+                _ if !ir_residency_pays_here(
+                    &live,
+                    schedule,
+                    id,
+                    use_count.get(id).copied().unwrap_or(0),
+                ) =>
+                {
                     skip_single_use += 1;
                     continue;
                 }
@@ -11106,11 +12034,32 @@ fn plan_register_residency(
         // spill, a reload, a home-slot stretch in the middle — is refused
         // rather than emitted: this wiring has no reload machinery, so a value
         // whose register goes away partway through must not be read from one.
+        //
+        // **The NO-SEGMENT case is counted separately, and that distinction is
+        // not cosmetic.** A node the scan produced no interval for was never a
+        // candidate — every control and memory node in the graph lands here,
+        // `Start` and `Proj` included — and folding it into the split count
+        // makes the file look like it is losing values to register pressure
+        // when it is only being handed nodes that hold no value at all.
+        //
+        // It read that way for real. On the loop the 2026-09-03 tier
+        // comparison found inverted, this line reported
+        // `split_or_spilled=5` beside the allocator's `splits=4`, and the two
+        // together said: four candidates lost to live-range splits. They were
+        // not. Four of the five had EMPTY segment lists and one was genuinely
+        // spilled; the method had no split value for the file to reclaim at
+        // all. A day of work aimed at split residency followed from that
+        // reading, and its engagement counter read zero — which is how the
+        // miscount was found.
         let reg = match segs.as_slice() {
+            [] => {
+                skip_no_alloc += 1;
+                continue;
+            }
             [seg] => match seg.reg {
                 Some(reg) => reg,
                 None => {
-                    skip_split += 1;
+                    skip_spilled += 1;
                     continue;
                 }
             },
@@ -11259,9 +12208,122 @@ fn plan_register_residency(
         }
     }
 
+    // ── Entry parameters, which the allocator cannot reach ───────────
+    //
+    // `MachineModel::pin_entry_params` pins every `Param` to its INCOMING ABI
+    // register, and `allocate_linear_scan` skips a pinned value outright. Those
+    // ABI registers are caller-saved and are not in `IR_LOWER_LS_GPRS`, so a
+    // parameter can never be promoted into the callee-saved file however the
+    // heuristics are tuned — it reaches a loop through its frame slot, every
+    // iteration, by construction.
+    //
+    // That is what the 2026-09-03 disassembly of the inverted `fieldloop`
+    // showed: `mov rcx,[rbp-60h]` reloading the loop bound on every iteration,
+    // while the baseline tier had copied it into a callee-saved register in its
+    // prologue (`mov r14,rdx`) and read it from there.
+    //
+    // So the copy is made here instead, out of a register the ALLOCATOR DID NOT
+    // USE. That is the whole safety argument: an unassigned register in this
+    // file is written by nothing else — only the residency machinery publishes
+    // into it — and every register in the file is callee-saved, so a call
+    // cannot destroy it either. The parameter is SSA and never redefined, so
+    // one publish at entry is good for the whole method.
+    //
+    // `IrType::Ref` is excluded for the reason the bank match above gives, and
+    // it is not a tuning choice: `OopMapEntry` names frame slots only, so a
+    // reference in a register is invisible to a root walk and cannot be
+    // updated on evacuation. The receiver therefore stays in its frame slot,
+    // and closing that needs oop maps that can name a register.
+    if ir_param_prologue_copy_enabled() {
+        let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
+        taken.sort_unstable();
+        taken.dedup();
+        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+            .iter()
+            .copied()
+            .filter(|r| !taken.contains(r))
+            .collect();
+        for id in 0..n {
+            if free.is_empty() {
+                break;
+            }
+            if gp_reg_of.get(id).copied().flatten().is_some() {
+                continue;
+            }
+            let Some(node) = graph.nodes.get(id) else {
+                continue;
+            };
+            if !matches!(node.op, Op::Param(_)) {
+                continue;
+            }
+            if !matches!(node.ty, IrType::Int | IrType::Long) {
+                continue;
+            }
+            // Worth a register only if the reads outnumber the one publish.
+            // Loop-weighted, because a parameter's uses are typically inside a
+            // loop its definition is not.
+            if live.weight.get(id).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            if let Some(reg) = free.pop() {
+                gp_reg_of[id] = Some(reg);
+                param_copies += 1;
+            }
+        }
+    }
+
     let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
+
+    // ── Could the home slot be dropped? A census, before building it ──
+    //
+    // `docs/feature-designs/ir-optional-home-slot.md` argues that a value which
+    // lives in a register for its whole range needs no frame word, and rests
+    // that on `LiveModel::pinned` covering every deopt-named value. **On this
+    // path it does not**: `release_deopt_pins` above deliberately releases
+    // exactly those pins, and pays for it by keeping every home the COLOURER
+    // planned. So a promoted value here may very well be named by a deopt
+    // frame, and its home is what that frame reads.
+    //
+    // Which makes the size of the opportunity an empirical question rather than
+    // a design one, and this counts it before anything is built:
+    //
+    //   `home_droppable`  promoted, and named by no safepoint and not a phi
+    //   `blocked_deopt`   promoted, but some safepoint's locals/stack names it
+    //   `blocked_phi`     promoted, but its home is written by the edge copies
+    //
+    // A `home_droppable` of zero on real bytecode refutes the design as
+    // written, and says the next move is deopt metadata that can name a
+    // register — not a refactor of the lowering arms.
+    let (home_droppable, blocked_deopt, blocked_phi) = {
+        let mut deopt_named = vec![false; n];
+        for sp in &graph.safepoints {
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if let Some(cell) = deopt_named.get_mut(v as usize) {
+                    *cell = true;
+                }
+            }
+        }
+        let (mut ok, mut deopt, mut phi) = (0usize, 0usize, 0usize);
+        for id in 0..n {
+            if gp_reg_of.get(id).copied().flatten().is_none() {
+                continue;
+            }
+            if graph
+                .nodes
+                .get(id)
+                .is_some_and(|node| matches!(node.op, Op::Phi))
+            {
+                phi += 1;
+            } else if deopt_named.get(id).copied().unwrap_or(false) {
+                deopt += 1;
+            } else {
+                ok += 1;
+            }
+        }
+        (ok, deopt, phi)
+    };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
@@ -11279,7 +12341,12 @@ fn plan_register_residency(
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
-             const={skip_const} single_use={skip_single_use}"
+             const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
+             spilled={skip_spilled} no_alloc={skip_no_alloc}"
+        );
+        eprintln!(
+            "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
+            graph.safepoints.len(),
         );
     }
     if promoted == 0 {
@@ -11306,6 +12373,17 @@ fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
+    // Attribution, not duplication — the same split `verify_or_bail` makes:
+    // `record_bailout` owns the process-wide category counters, and this
+    // attaches the bailout to *this* method in the per-compilation report.
+    //
+    // Without it the report's `bailouts` field is STRUCTURALLY empty for every
+    // lowering refusal: a census over CratonBench read `bailouts:[]` on all 105
+    // compilations, including the 17 that fell through to single-pass, so the
+    // one record that names both the method and the reason named neither. The
+    // counters were moving the whole time, which is what made the hole hard to
+    // see — the totals looked alive while every per-method row was blank.
+    crate::metrics::note_current_bailout(&bailout, "lower");
     None
 }
 
@@ -11571,6 +12649,35 @@ pub fn lower_with_scalar_deopt(
     )
 }
 
+thread_local! {
+/// The reason the most recent `lower_inner` on this thread refused.
+///
+/// A bail that names itself is the difference between "the optimizing tier
+/// declined" and a fact you can act on: the C2 task pays for an IR build,
+/// optimize and schedule before any of these fire, and whether that cost can be
+/// avoided up front depends entirely on WHICH of them fired.
+///
+/// Thread-local and overwritten per compile; read it immediately after the
+/// lowering call, on the same thread.
+static LOWER_BAIL_REASON: std::cell::Cell<Option<&'static str>> =
+    const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn note_lower_bail(reason: &'static str) {
+    LOWER_BAIL_REASON.with(|c| c.set(Some(reason)));
+}
+
+/// Clear the reason before a lowering attempt, so a stale one cannot be read
+/// as this attempt's.
+pub(crate) fn clear_lower_bail() {
+    LOWER_BAIL_REASON.with(|c| c.set(None));
+}
+
+/// The reason the last lowering attempt on this thread refused, if it did.
+pub fn last_lower_bail() -> Option<&'static str> {
+    LOWER_BAIL_REASON.with(|c| c.get())
+}
+
 /// Shared lowering body: profile-guided branch hints, the optional
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
@@ -11710,6 +12817,7 @@ pub(crate) fn lower_inner_with_scopes(
             .iter()
             .any(|node| matches!(node.op, Op::New { .. }))
     {
+        note_lower_bail("new-without-alloc-helper");
         return None;
     }
     // cov-06. Same reasoning, split per `Op::NewArray` shape: a PRIMITIVE
@@ -11722,6 +12830,7 @@ pub(crate) fn lower_inner_with_scopes(
         .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type != 0))
         && helpers.newarray == 0
     {
+        note_lower_bail("newarray-primitive-without-helper");
         return None;
     }
     if graph
@@ -11730,6 +12839,7 @@ pub(crate) fn lower_inner_with_scopes(
         .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type == 0))
         && helpers.anewarray_object == 0
     {
+        note_lower_bail("anewarray-without-helper");
         return None;
     }
     // cov-01. The same reasoning as the two guards above, for the three
@@ -11820,6 +12930,7 @@ pub(crate) fn lower_inner_with_scopes(
                 .iter()
                 .any(|n| matches!(n.op, Op::Store(MemKind::Int)));
         if needs_getfield_helper || needs_putfield_helper {
+            note_lower_bail("getfield-or-putfield-helper-required");
             return None;
         }
     }
@@ -11846,6 +12957,7 @@ pub(crate) fn lower_inner_with_scopes(
         )
     }) && helpers.getfield == 0
     {
+        note_lower_bail("wide-load-without-getfield-helper");
         return None;
     }
     if helpers.dispatch_threw == 0
@@ -11856,6 +12968,7 @@ pub(crate) fn lower_inner_with_scopes(
             )
         })
     {
+        note_lower_bail("wide-load-shape-unsupported");
         return None;
     }
     // COV-03 — every non-int field STORE is helper-only, and each width has its
@@ -11873,6 +12986,7 @@ pub(crate) fn lower_inner_with_scopes(
             _ => false,
         };
         if missing {
+            note_lower_bail("putfield-helper-missing-for-width");
             return None;
         }
     }
@@ -11902,6 +13016,7 @@ pub(crate) fn lower_inner_with_scopes(
                 .and_then(|&o| graph.nodes.get(o as usize))
                 .map_or(true, |o| !matches!(o.op, Op::Const(_)))
     }) {
+        note_lower_bail("non-const-store-operand");
         return None;
     }
 
@@ -12229,6 +13344,7 @@ pub(crate) fn lower_inner_with_scopes(
                 lowerer.shadow_pushes, lowerer.shadow_reloads
             );
         }
+        note_lower_bail("shadow-push-reload-imbalance");
         return None;
     }
 
@@ -12368,6 +13484,38 @@ pub(crate) fn lower_inner_with_scopes(
     if ls_active {
         crate::metrics::note_current_spills(lowerer.ls_spills);
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
+    }
+
+    // ENGAGEMENT, not effect. Both numbers answer "did the wiring fire on this
+    // method", which is the question a null timing result cannot answer on its
+    // own -- and this session spent three A/B arms on `CratonBench` before
+    // noticing that the optimizing tier plans no residency there at all, so
+    // both arms had been running identical machine code.
+    if ls_active
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+    {
+        eprintln!(
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
+            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+        );
+    }
+    if ls_active
+        && ir_deopt_regs_enabled()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+    {
+        eprintln!(
+            "[ir-ls] deopt regs: nameable={} frame_slots_named_by_register={} regs_base={}",
+            lowerer.deopt_nameable.iter().filter(|n| **n).count(),
+            lowerer.deopt_reg_named.get(),
+            lowerer.deopt_regs_base,
+        );
+        eprintln!(
+            "[ir-ls] homes: dropped_values={} stores_skipped={} read_refusals={}",
+            lowerer.home_dropped.iter().filter(|d| **d).count(),
+            lowerer.home_stores_dropped,
+            lowerer.home_read_refusals.get(),
+        );
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to
@@ -12537,6 +13685,7 @@ pub(crate) fn lower_inner_with_scopes(
         spill_hi: spill_cap_off,
         callee_saved_lo: spill_cap_off,
         callee_saved_hi: frame_size,
+        callee_saved_shallow: false,
         // Named separately as well as covered by the band above, so
         // `FrameLayout::region_name` reports `xmm-saved` rather than the
         // catch-all — a frame dump that cannot tell a register image from an
@@ -12607,6 +13756,30 @@ pub(crate) fn lower_inner_with_scopes(
 /// promoted phi's register at every incoming edge; off, phis stay home-bound
 /// as they were before 2026-09-02 and the residency census reports them
 /// under `phi=`.
+/// A definition whose value is already live in its register is not published
+/// again -- **default OFF**, opt in with `CRATONVM_JIT_IR_SKIP_REPUBLISH=1`.
+///
+/// Off is the historical unconditional reload of the home word at every
+/// definition site, phis included.
+fn ir_skip_live_republish_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SKIP_REPUBLISH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// An edge's phi copies move register to register where both ends are
+/// resident -- **default OFF**, opt in with `CRATONVM_JIT_IR_PHI_COPY_REGS=1`.
+///
+/// Off is the historical memory-to-memory copy through RAX followed by a
+/// reload of the word just written.
+fn ir_phi_copy_regs_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_REGS") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 fn ir_phi_residency_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_RESIDENCY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -12653,8 +13826,15 @@ fn ir_receiver_guard_cse_enabled() -> bool {
     }
 }
 
-/// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
-/// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
+/// Inline TLAB bump for the optimizing tier's `Op::New` — **OPT-IN**, on with
+/// `CRATONVM_JIT_IR_INLINE_TLAB=1`.
+///
+/// This line said "**default ON**, opt out with `=0`" for two days after the
+/// body below was flipped to opt-in, which is worse than either state: a reader
+/// checking whether a feature is live got the wrong answer from the only
+/// sentence written to tell them. The mismatch cost a census here — a repro run
+/// came back 0/10 and looked like a fix, when the sequence under test had
+/// simply never executed.
 ///
 /// Off restores `emit_new_object_stub` alone, which is what this arm emitted
 /// before the bump existed, so the two are A/B-able in one binary. That is not
@@ -12668,6 +13848,20 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 /// `the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab`,
 /// which now passes because the bump exists rather than because the gate is
 /// shut.
+///
+/// **The two gates are in series, so the SIGSEGV that keeps the outer one shut
+/// cannot occur in any default build.** Both must be set for the bump to run:
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` to let an allocation-bearing method reach
+/// this tier, and this one to emit the bump rather than the stub. Measured
+/// 2026-09-04 on dev with engagement confirmed (`inline_tlab_bump=1
+/// stub_only=0`, the census in `runtime_lowering::ir_alloc_site_counts`):
+/// `RJitMapTierDiff` passes **0 failures in 30 runs** — 10 on a quiet host and
+/// 20 under six spinners — against the 4-in-10 recorded on 2026-09-02.
+///
+/// That is a reason to re-examine the outer gate, NOT to open it here: its
+/// second stated reason is a perf trade (a promoted allocation lowering through
+/// the stub buys a more optimized body at the price of a cheaper allocation)
+/// that is still unpriced.
 fn ir_inline_tlab_enabled() -> bool {
     // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
     //
@@ -12701,6 +13895,13 @@ fn ir_inline_tlab_enabled() -> bool {
 }
 
 #[cfg(test)]
+// x86-64 ONLY. These assert x86-64 encodings and several EXECUTE the code
+// they emit, which on another architecture is an illegal instruction that
+// takes the whole test binary down with it -- `cargo test -p cratonvm-jit`
+// died at `a_previously_declined_large_method_now_compiles` with SIGILL the
+// first time it was ever run on aarch64. Gated at the MODULE, because the
+// property is "this module is about x86-64", not a per-test accident.
+#[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
     use crate::ir::IrBuilder;
@@ -12769,6 +13970,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12813,6 +14015,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12858,6 +14061,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12908,6 +14112,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12958,6 +14163,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -12998,6 +14204,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -13370,6 +14577,152 @@ mod tests {
         assert!(
             contains_seq(&with, &(COMPACT_REF_PUTFIELD_HELPER as u64).to_le_bytes()),
             "the gated arm must keep `jit_putfield_object` as its fallback"
+        );
+    }
+
+    /// The baked compact cell offset is guarded against a layout REPLACEMENT,
+    /// and the guard is proven to fire.
+    ///
+    /// Every emitter that bakes `HEADER_SIZE + packed_body_offset` claims at
+    /// compile time something the class manager can change at run time. The two
+    /// ALLOCATION emitters have guarded that since perf/halfgap-20260717, whose
+    /// comment calls an unguarded baked layout "confirmed heap corruption"; the
+    /// FIELD-ACCESS emitters had no guard at all until 2026-09-04, and the
+    /// compact TLAB default made their unguarded path the common one.
+    ///
+    /// Asserted by EXECUTION, not by inspecting bytes: the compiled body is run
+    /// against a receiver, then the process-wide replacement epoch is bumped by
+    /// actually replacing a layout, and the same body is run again. The first
+    /// run must store inline; the second must reach the helper. A guard that
+    /// compares against a counter nothing ever bumps would pass an
+    /// inspection-only test and protect nothing.
+    #[test]
+    fn a_replaced_layout_routes_the_gated_store_to_the_helper() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        static HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+            HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        static PRE_GATE: AtomicU64 = AtomicU64::new(0);
+        static POST_GATE: AtomicU64 = AtomicU64::new(1);
+        static READ_BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → slot
+        helpers.read_bounds_addr = READ_BOUNDS.as_ptr() as usize; // Cast: static address
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize; // Cast: static address
+        helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize; // Cast: static
+        helpers.ref_store_post_young_floor = 0;
+        helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (0u32, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let compiled = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("the gated reference store must compile");
+
+        // A young, compact receiver with one slot.
+        let mut obj = Box::new([0u64; 8]);
+        // SAFETY: `obj` is 64 bytes, 8-byte aligned; both writes land inside it.
+        unsafe {
+            let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+            *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+            std::ptr::write_unaligned(
+                p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
+                4u32,
+            );
+        }
+        let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+        let page = obj_addr & !0xFFF;
+        READ_BOUNDS[0].store(page, Ordering::Release);
+        READ_BOUNDS[1].store(page + 0x10000, Ordering::Release);
+        let val = Box::new([0u64; 8]);
+        let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+        HELPER_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: JIT-compiled code from valid bytecode in an executable mmap;
+        // the receiver is a live buffer shaped like an object header and the
+        // marker helper stores nothing.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            HELPER_CALLS.load(Ordering::SeqCst),
+            0,
+            "before any replacement the guard must pass and the store stay inline"
+        );
+        assert_eq!(
+            obj[cratonvm_types::HEADER_SIZE / 8] as usize, // Cast: stored pointer word
+            val_addr,
+            "the inline store must have written the compact cell"
+        );
+
+        // Now REPLACE a layout. Not by poking the counter -- by doing the thing
+        // that bumps it, so the test cannot pass against a guard wired to a
+        // number nothing in the VM ever moves.
+        let before = cratonvm_types::layout_replace_epoch();
+        // A REPLACEMENT is a second `register_class_layout` for a class_id that
+        // already has one; a first registration deliberately does not count.
+        let cid = 900_001u32;
+        let mk = |body: u32| {
+            std::sync::Arc::new(cratonvm_types::CompactLayout {
+                field_offsets: vec![0],
+                is_ref: vec![false],
+                field_kinds: vec![cratonvm_types::FieldStorageKind::Int],
+                ref_offsets: Vec::new(),
+                body_size: body,
+            })
+        };
+        let (l1, l2) = (mk(4), mk(8));
+        cratonvm_types::register_class_layout(cratonvm_types::FIRST_LAYOUT_DOMAIN, cid, l1);
+        cratonvm_types::register_class_layout(cratonvm_types::FIRST_LAYOUT_DOMAIN, cid, l2);
+        assert!(
+            cratonvm_types::layout_replace_epoch() > before,
+            "replacing a registered layout must bump the process-wide epoch, or \
+             the guard below is comparing against a constant"
+        );
+
+        obj[cratonvm_types::HEADER_SIZE / 8] = 0;
+        HELPER_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            HELPER_CALLS.load(Ordering::SeqCst),
+            1,
+            "a replaced layout must route the already-compiled site to the \
+             always-correct helper — its baked cell offset now describes a \
+             layout the object no longer has"
+        );
+        assert_eq!(
+            obj[cratonvm_types::HEADER_SIZE / 8],
+            0,
+            "and the inline store must not have run"
         );
     }
 
@@ -14820,6 +16173,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -14888,6 +16242,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -15012,6 +16367,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -15656,6 +17012,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -15948,6 +17305,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -15971,6 +17329,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -16050,6 +17409,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -16251,6 +17611,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         }
     }
 
@@ -16904,7 +18265,7 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op)
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 
@@ -17241,6 +18602,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -17531,6 +18893,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -17639,6 +19002,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -18841,6 +20205,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -18881,6 +20246,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
@@ -19217,6 +20583,191 @@ mod tests {
             .iter()
             .map(|n| count_seq(code, n))
             .sum()
+    }
+
+    /// Build a lowerer whose GP residency file holds exactly `reg`.
+    ///
+    /// `lowerer_with_resident_xmm` covers the other bank; this one is what
+    /// makes `saved_gpr_regs` non-empty (it filters on `gp_reg_of`) and what
+    /// gives `set_residency` something to compute `deopt_nameable` from.
+    #[cfg(test)]
+    fn lowerer_with_resident_gpr(buf_cap: usize, reg: u8) -> Lowerer<'static> {
+        let mut lo = lowerer_with_resident_xmm(buf_cap, None);
+        let n = lo.graph.nodes.len().max(1);
+        let mut gp_reg_of = vec![None; n];
+        gp_reg_of[0] = Some(reg);
+        lo.set_residency(RegResidency {
+            reg_of: vec![None; n],
+            gp_reg_of,
+            promoted: 1,
+            demoted: 0,
+            peak_live: 0,
+        });
+        lo
+    }
+
+    /// The end-to-end one: a value that exists ONLY in a register at the trap
+    /// comes back out of the reconstructed frame.
+    ///
+    /// This runs the emitted bytes. Nothing else proves the spill offsets: the
+    /// region's arithmetic (`gpr[r]` at `[rbp - (base - 8r)]`), the `LEA` that
+    /// turns `deopt_regs_base` into a `*const SavedRegisters`, the third
+    /// argument register on this ABI, and `ir_deopt_entry`'s dereference of it
+    /// are four independent chances to be off by an offset, and each of them
+    /// fails by producing a *plausible number* rather than a crash.
+    ///
+    /// `RegisterLong` deliberately, not `Register`: the latter resolves
+    /// truncated to 32 bits, so a sentinel with a distinctive HIGH half would
+    /// pass a broken 64-bit read.
+    #[test]
+    fn a_deopt_frame_reads_a_register_the_stub_spilled() {
+        let _ls = LsForce::on();
+        let _dr = DeoptRegsForce::on();
+        const RBX: u8 = 3;
+        // Distinctive in both halves, and not a plausible stack value.
+        const SENTINEL: i64 = 0x5EED_1234_0BAD_C0DEu64 as i64;
+
+        let mut lo = lowerer_with_resident_gpr(16384, RBX);
+        assert!(
+            lo.deopt_regs_base > 0,
+            "the flag is on, so the frame must have reserved the region",
+        );
+
+        // LEAK(intentional): the stub bakes this pointer as an immediate and
+        // the entry dereferences it during the call.
+        let point: &'static DeoptimizationPoint = Box::leak(Box::new(DeoptimizationPoint {
+            native_offset: 0,
+            bci: 7,
+            reason: DeoptReason::TransferToInterpreter,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: String::new(),
+                bci: 7,
+                locals: vec![FrameValue::RegisterLong(RBX)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+            semantics: ResumeSemantics::for_reason(DeoptReason::TransferToInterpreter),
+        }));
+
+        // push rbp ; mov rbp, rsp ; sub rsp, frame_size
+        lo.buf.emit_byte(0x55);
+        lo.buf.emit(&[0x48, 0x89, 0xE5]);
+        lo.buf.emit(&[0x48, 0x81, 0xEC]);
+        let frame = lo.frame_size;
+        lo.buf.emit(&frame.to_le_bytes());
+        // Save what the stub's teardown will restore. Without this the stub
+        // hands the RUST caller garbage in RBX/R12-R15 on the way out, which is
+        // a corrupted test process rather than a failed assertion.
+        let gpr_saves: Vec<(u8, i32)> = lo.saved_gpr_regs().collect();
+        for (reg, off) in gpr_saves {
+            lo.emit_gpr_frame_move(reg, off, true);
+        }
+        let xmm_saves: Vec<(u8, i32)> = lo.saved_xmm_regs().collect();
+        for (reg, off) in xmm_saves {
+            lo.emit_xmm_frame_move(reg, off, true);
+        }
+        // The value under test lives in RBX and in NO frame word.
+        // Cast: a fixed test sentinel.
+        lo.emit_mov_reg_imm64(RBX, SENTINEL as u64);
+        // Cast: a leaked pointer baked as the guard's argument.
+        lo.emit_mov_reg_imm64(DEOPT_ARG0, point as *const DeoptimizationPoint as u64);
+        // JMP <stub>, patched by `emit_deopt_stub` exactly as a guard's is.
+        lo.buf.emit_byte(0xE9);
+        let patch = lo.buf.pos();
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.deopt_stub_patches.push(patch);
+        lo.emit_deopt_stub();
+        assert!(!lo.buf.overflowed(), "the harness body must fit");
+
+        let cm = CompiledMethod::new(lo.buf);
+        // SAFETY: the body takes no arguments, builds and tears down its own
+        // frame, and calls only `ir_deopt_entry`.
+        let ret = unsafe { cm.try_call(&[]) }.expect("the harness body runs");
+        assert_eq!(ret, i64::MIN, "the stub returns the deopt sentinel");
+
+        let frame = crate::deopt::take_last_deopt().expect("the entry stashed a frame");
+        assert_eq!(frame.bci, 7);
+        assert_eq!(
+            frame.locals,
+            vec![FrameValue::Long(SENTINEL)],
+            "the reconstructed local must be the value RBX held at the trap,              read out of the spilled register image",
+        );
+    }
+
+    /// With the flag off the stub keeps its historical two-argument shape, and
+    /// the frame grows by nothing.
+    #[test]
+    fn without_the_flag_no_region_is_reserved_and_nothing_is_spilled() {
+        let _ls = LsForce::on();
+        let mut lo = lowerer_with_resident_gpr(16384, 3);
+        assert_eq!(
+            lo.deopt_regs_base, 0,
+            "no region may be reserved when the flag is off",
+        );
+        lo.buf.emit(&[0, 0, 0, 0]);
+        lo.deopt_stub_patches.push(0);
+        let before = lo.buf.pos();
+        lo.emit_deopt_stub();
+        let with_flag_off = lo.buf.pos() - before;
+
+        let _dr = DeoptRegsForce::on();
+        let mut on = lowerer_with_resident_gpr(16384, 3);
+        on.buf.emit(&[0, 0, 0, 0]);
+        on.deopt_stub_patches.push(0);
+        let before = on.buf.pos();
+        on.emit_deopt_stub();
+        let with_flag_on = on.buf.pos() - before;
+
+        assert!(
+            with_flag_on > with_flag_off,
+            "the flag must add the 32 spill stores and the LEA: {with_flag_on}              bytes on against {with_flag_off} off",
+        );
+    }
+
+    /// Naming is by EXCLUSIVE ownership, not by residency.
+    ///
+    /// Two values sharing a register is the case that reconstructs a
+    /// confidently wrong value: the allocator gives each of them the register
+    /// over its own live range, `release_deopt_pins` means a frame state can
+    /// name either one outside that range, and there is no position mapping in
+    /// this file that could tell which. Both must be refused.
+    #[test]
+    fn two_values_sharing_a_register_are_both_unnameable() {
+        let _ls = LsForce::on();
+        let _dr = DeoptRegsForce::on();
+        let mut lo = lowerer_with_resident_xmm(4096, None);
+        let n = lo.graph.nodes.len().max(4);
+        let mut gp_reg_of = vec![None; n];
+        gp_reg_of[0] = Some(3); // RBX, shared…
+        gp_reg_of[1] = Some(3); // …with this one
+        gp_reg_of[2] = Some(12); // R12, exclusively
+        lo.set_residency(RegResidency {
+            reg_of: vec![None; n],
+            gp_reg_of,
+            promoted: 3,
+            demoted: 0,
+            peak_live: 0,
+        });
+        assert!(!lo.deopt_nameable[0], "a shared register is not nameable");
+        assert!(!lo.deopt_nameable[1], "and neither is its other holder");
+        assert!(lo.deopt_nameable[2], "an exclusive register is nameable");
+        assert_eq!(
+            lo.register_frame_value(2, IrType::Long),
+            Some(FrameValue::RegisterLong(12)),
+        );
+        assert_eq!(
+            lo.register_frame_value(0, IrType::Long),
+            None,
+            "the shared holder must fall through to its home word",
+        );
+        assert_eq!(
+            lo.register_frame_value(2, IrType::Ref),
+            None,
+            "a reference is never described by a register: the oop map names              frame slots only, so a collector could neither walk nor update it",
+        );
     }
 
     /// **The** invariant: every exit restores exactly what the prologue saved.
@@ -19657,6 +21208,30 @@ mod tests {
 /// which is default-ON. Latched: read once, because a codegen decision must not
 /// change under a running process. With it set, one binary reproduces the
 /// stale-mirror `ACTIVE_FRAME_MAP` refusals this fixed.
+/// Kill switch for zeroing the two reserved bookkeeping words the prologue used
+/// to leave holding the previous frame's stack (`shadow_savebase`,
+/// `phi_copy_scratch`).
+///
+/// Off restores the old behaviour, so the effect is one binary's A/B. This is a
+/// codegen change on every prologue, which is exactly the kind that has to ship
+/// with a switch.
+/// Kill switch for zeroing the local slots a method did not receive as
+/// parameters. Separate from [`prologue_zero_reserved_tail_disabled`] so the
+/// two prologue changes stay independently attributable.
+fn prologue_zero_unset_locals_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS").is_some()
+    })
+}
+
+fn prologue_zero_reserved_tail_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL").is_some()
+    })
+}
+
 fn ic_frame_republish_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {

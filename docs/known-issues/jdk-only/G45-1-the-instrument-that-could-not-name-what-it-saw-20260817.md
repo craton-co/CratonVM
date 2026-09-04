@@ -18,6 +18,98 @@ the three this lane owns. `gc/src/heap.rs` needed **no change at all**; see
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03. The headline holds: the instrument
+> names what it sees.** This record's status was *"no binary contains the fix
+> yet and every 'after' below is PREDICTED"*. Measured now on a binary built
+> from this tree, running the vector this record measured its before-state on:
+>
+> ```text
+> CRATONVM_DBG_COERCION=1 cratonvm … RJdkSecurity
+>
+>   coercion warnings carrying a data class_id   96
+>   still class_id=-1 index=-1                    0
+>   named                                        96   (100%)
+> ```
+>
+> §0's before-state was *"5,431 events across 63 vectors. Every one of them
+> printed `class_id=-1`"*. On this vector it is now none of them. The census
+> line agrees and reports the hottest site rather than a shrug:
+>
+> ```text
+> descriptor-coercion census: total=96 primitive-into-reference[read=88 store=8]
+>   hottest=primitive-into-reference/read class_id=36 index=0 descriptor=[ hits=58
+> ```
+>
+> The distribution across six distinct sites:
+>
+> ```text
+> class_id=36  index=0    58      class_id=596 index=0     3
+> class_id=132 index=16   30      class_id=552 index=1     3
+> class_id=669 index=4     1      class_id=584 index=4     1
+> ```
+>
+> **A residual on this record's own remediation advice.** The warning text tells
+> the reader *"Run with `CRATONVM_DBG_LAYOUT=1` to resolve a `class_id` to a
+> name"*. Run exactly that way, alongside `CRATONVM_DBG_COERCION=1`, **no
+> id-to-name mapping was emitted for any of the six ids above** — 13,135 lines
+> of output and not one resolves 36 or 132. So the instrument now names what it
+> saw with an ID, and the documented route from that id to a class name did not
+> work here. The gap is small but it is the difference between a diagnosis and a
+> lookup the next reader has to invent; it is left open, not fixed.
+>
+> **A counting caution, recorded because it nearly produced the opposite
+> verdict.** A first pass grepped the transcript for `class_id=-1` and found 97
+> — apparently a fix that had not landed. Every one of those was the literal
+> string inside each warning's own explanatory prose (*"class_id=-1/index=-1
+> means the caller has not yet been given provenance"*), not the data. The data
+> field is the trailing one, after `value=`. A message that documents a sentinel
+> is indistinguishable from a message that reports it, to a grep.
+>
+> **What this does NOT verify.** One vector, not the 63 this record's
+> before-state spans — the 5,431-event figure is not re-measured and the
+> proportion named across the whole corpus is unknown. The class ids are
+> unresolved (above), so no row here is tied to a class name, and §2's
+> per-species after-lines are therefore confirmed only in shape. Nothing in
+> §§1-3's MEASURED before-state was re-derived.
+
+> **The remediation-advice residual is FIXED 2026-09-04.** The discharge note
+> above recorded that this record's own warning text — *"Run with
+> `CRATONVM_DBG_LAYOUT=1` to resolve a `class_id` to a name"* — produced nothing:
+> 13,135 lines of output and not one `[layout]` row, so none of the six class ids
+> in that transcript could be resolved.
+>
+> **The cause is a cheap gate standing in front of an informative one.**
+> `ClassRegistry::register_compact_layout_if_enabled` opened with
+>
+> ```rust
+> if !cratonvm_types::compact_ref_fields_enabled() {
+>     return;                      // <- the diagnostic sat past this
+> }
+> ```
+>
+> so with compact reference fields off — the default — `CRATONVM_DBG_LAYOUT=1`
+> printed nothing at all, while **three** separate doc comments told readers to
+> use it for exactly this mapping: `gc/src/autobox.rs`, `gc/src/heap.rs` (this
+> record's own warning), and `types/src/compact_value.rs`. The flag was gated on
+> an unrelated FEATURE, not on what it reports.
+>
+> The class-id-to-name mapping exists in every configuration, so it is now
+> emitted in both: unchanged when compact layouts are on, and as
+> `[layout] <name> cid=<N> (no compact layout: …)` when they are off.
+>
+> **`autobox.rs`'s own comment, two flags earlier, says why this mattered**:
+> that message once advertised `CRATONVM_DBG_TOARRAY=1`, which printed nothing
+> at its site, and *"a diagnostic that names the wrong instrument costs more
+> than no diagnostic, because it is trusted"* — measured by two readers who each
+> followed the advice and got an empty transcript. This was the same failure one
+> flag over, and it was found the same way.
+>
+> **What is NOT fixed.** The four-species coercion counter and its
+> `class_id`/`index` provenance are unchanged — this makes the ids RESOLVABLE,
+> it does not resolve them into the coercion warning itself, so a reader still
+> has to cross-reference two lines of output. The 5,431-event, 63-vector
+> before-state is still not re-measured.
+
 ## 0. The headline
 
 G30 gave this tree a four-species counter for silent field coercions. It

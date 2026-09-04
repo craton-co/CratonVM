@@ -341,6 +341,9 @@ pub struct Arena {
     /// rest of the run, which is what makes the region test on a free block
     /// (`offset >= high_cursor`) permanently correct.
     high_cursor: usize,
+    /// The cursor value the most recent retractions moved away from, maxed --
+    /// see [`Self::low_high_water`], which is the only reader.
+    pre_retract_high: usize,
     /// Reclaimed regions at or above [`Self::high_cursor`] — the large-object
     /// end's free list.
     ///
@@ -741,6 +744,7 @@ impl Arena {
             free_pushed: 0,
             coalesce_threshold: COALESCE_THRESHOLD_MIN,
             high_cursor: capacity,
+            pre_retract_high: 0,
             free_high: Vec::new(),
             high_max: 0,
             high_pushed: 0,
@@ -2364,6 +2368,38 @@ impl Arena {
         self.cursor
     }
 
+    /// The highest the low bump cursor has been since
+    /// [`Self::reset_low_high_water`], which is the span any bitmap over this
+    /// arena may have bits set in.
+    ///
+    /// # Why the cursor alone is not that bound
+    ///
+    /// [`Self::retract_cursor_to`] LOWERS the cursor onto the last survivor
+    /// after every sweep, and it is the only thing that does. A bitmap pass
+    /// bounded by the cursor after a retraction therefore skips the span the
+    /// retraction just gave back -- and the MARK bitmap has bits there, set
+    /// during the cycle when the cursor was still high. Clearing bounded by
+    /// the new cursor leaves them set, and the next cycle then reads a mark
+    /// set carrying a previous cycle's bits: it retains whatever they name.
+    ///
+    /// `pre_retract_high` is what makes the two agree. It is maxed with the
+    /// cursor a retraction moved away FROM, so `cursor.max(pre_retract_high)`
+    /// is exactly the high-water mark, and it costs a compare on the
+    /// retraction path rather than anything on the bump path.
+    pub(crate) fn low_high_water(&self) -> usize {
+        self.cursor.max(self.pre_retract_high)
+    }
+
+    /// Forget the retraction history, so the next
+    /// [`Self::low_high_water`] starts from the current cursor.
+    ///
+    /// Called once per collection, AFTER every bitmap over this arena has been
+    /// cleared -- calling it earlier would hand a later pass a bound that no
+    /// longer covers the bits it has to reach.
+    pub(crate) fn reset_low_high_water(&mut self) {
+        self.pre_retract_high = 0;
+    }
+
     /// `vacated` is the third argument and the reason it exists is the whole
     /// of `Follow-up 2026-08-29` on
     /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`:
@@ -2841,6 +2877,7 @@ impl Arena {
         let old_cursor = self.cursor;
         let reclaimed = old_cursor - new_cursor;
         self.cursor = new_cursor;
+        self.pre_retract_high = self.pre_retract_high.max(old_cursor);
         self.decommit_span(new_cursor, old_cursor);
         reclaimed
     }
@@ -2866,6 +2903,7 @@ impl Arena {
         }
         let old_cursor = self.cursor;
         self.cursor = off;
+        self.pre_retract_high = self.pre_retract_high.max(old_cursor);
         // GIVE THE PAGES BACK. `[off, old_cursor)` was just proved free (it was
         // one free-list block ending exactly at the cursor) and has been
         // removed from the list, so it is un-bumped space that nothing can
@@ -2913,11 +2951,20 @@ impl Arena {
     /// the middle-only give-back returned **2 MiB of 64**.
     ///
     /// A free-list block is by definition not live, so its granules can go
-    /// back. The bytes come with no obligation either: every path that hands
-    /// one out again goes through [`Self::hand_out`], which commits before it
-    /// returns a pointer, and a re-committed granule reads as zero -- which is
-    /// what a caller of a reused block is entitled to and what `Arena::alloc`'s
-    /// consumers already zero for themselves.
+    /// back. The bytes come with an obligation, and it is worth stating
+    /// exactly: every path that ALLOCATES one out again goes through
+    /// [`Self::hand_out`], which commits before it returns a pointer, and a
+    /// re-committed granule reads as zero -- which is what a caller of a reused
+    /// block is entitled to and what `Arena::alloc`'s consumers already zero
+    /// for themselves.
+    ///
+    /// **Allocation is not the only path that writes here.** A relocating
+    /// collector's slide picks a destination inside free space arithmetically
+    /// and `memmove`s into it without asking the allocator for anything, so it
+    /// never reaches `hand_out`. That is what [`Self::commit_for_relocation`]
+    /// exists for, and both of `ZgcRealHeap`'s slides call it. This doc used to
+    /// claim `hand_out` was the only door, and the two slides were writing into
+    /// granules this method had already returned to the OS.
     ///
     /// WHOLE granules only, rounded INWARD: a block's ends usually share a
     /// granule with a live object, and rounding outward would take it too --
@@ -2946,6 +2993,35 @@ impl Arena {
         released
     }
 
+    /// Make `[offset, offset + len)` writable for a caller that is about to
+    /// write arena bytes WITHOUT going through [`Self::hand_out`].
+    ///
+    /// # The one such caller, and why it needs its own door
+    ///
+    /// [`Self::decommit_free_blocks`] gives free-list granules back to the OS
+    /// on a stated promise: "every path that hands one out again goes through
+    /// `hand_out`, which commits before it returns a pointer". A relocating
+    /// collector's SLIDE is a path that hands one out and does not — it picks
+    /// a destination inside free space arithmetically and `memmove`s into it,
+    /// because the whole point of a slide is that it never asks the allocator
+    /// for anything. `ZgcRealHeap`'s two slides (`compact_high_region` and the
+    /// low slide in `relocate_stw`) are exactly that shape.
+    ///
+    /// Measured 2026-09-04: with the give-back active, the first high slide
+    /// after one packs a survivor against `capacity` and faults inside
+    /// `__memcpy_avx512_unaligned_erms` on a `PROT_NONE` granule — reproduced
+    /// 3/3 in 7 s on `org.h2.test.store.TestRandomMapOps`, and 0/3 with
+    /// `CRATONVM_GC_RESERVE=0`, which is the whole of the reserve/commit
+    /// store's involvement.
+    ///
+    /// Returns `false` when the OS refuses, and the caller must then leave the
+    /// object where it is: a slide that cannot have its destination is a
+    /// missed compaction, never a reason to write anyway.
+    #[must_use = "a refused commit means the object must not be moved"]
+    pub(crate) fn commit_for_relocation(&mut self, offset: usize, len: usize) -> bool {
+        self.data.commit_range(offset, len)
+    }
+
     /// Is `offset` inside a granule that is currently committed, i.e. safe to
     /// read?
     ///
@@ -2956,56 +3032,20 @@ impl Arena {
         self.data.is_committed_at(offset)
     }
 
+    /// This arena's per-granule commit bitmap, readable without the arena
+    /// lock. `None` on the wholly-committed fallback store.
+    ///
+    /// See [`crate::reservation::HeapStore::commit_bits`] for what a reader is
+    /// buying: the right to ask "is this address backed?" before dereferencing
+    /// it, which `[base, base + capacity)` alone cannot answer.
+    pub fn commit_bits(&self) -> Option<std::sync::Arc<[std::sync::atomic::AtomicU64]>> {
+        self.data.commit_bits()
+    }
+
     /// Bytes of this arena's capacity that are actually committed.
     ///
     /// Equal to `capacity()` on the wholly-committed fallback store; below it,
     /// often far below, on a reserving one.
-    /// Ensure `[addr, addr + len)` is COMMITTED, for a caller that is about to
-    /// write there without going through [`Self::hand_out`].
-    ///
-    /// # The defect this closes
-    ///
-    /// `ZgcRealHeap::relocate_stw`'s slide picks a destination `to` and copies a
-    /// survivor into it, on a SAFETY argument that says `to` "is inside the
-    /// arena and strictly below `from`". Inside the arena is NOT committed: the
-    /// arena reserves address space and commits granules on demand, and
-    /// `decommit_unbumped_middle` / `decommit_free_blocks` hand granules back
-    /// while their addresses stay reserved. Sliding into one writes to unmapped
-    /// memory.
-    ///
-    /// Observed directly rather than reasoned about: a fault-time witness
-    /// (`crate::reloc_witness`) reports the faulting address INSIDE a granule
-    /// the collector decommitted, the access is a WRITE, the offset into the
-    /// granule is 0x0 in every crash, and the frame is
-    /// `relocate_stw+0x2ECE` -- the slide's own `ptr::copy`. Seven prior repairs
-    /// aimed at stale references in compiled frames all changed nothing,
-    /// because the defect is arena commit bookkeeping and not a GC root at all.
-    ///
-    /// Same shape as the `gen_evac` parallel-copy fault fixed 2026-09-02: a
-    /// path that bypasses `hand_out` commits nothing.
-    ///
-    /// Returns `false` when the range cannot be committed; the caller must then
-    /// leave the object where it is rather than write.
-    pub fn ensure_committed_span(&mut self, addr: usize, len: usize) -> bool {
-        if len == 0 {
-            return true;
-        }
-        let base = self.data.as_ptr() as usize;
-        if addr < base {
-            return false;
-        }
-        let off = addr - base;
-        if off.saturating_add(len) > self.capacity() {
-            return false;
-        }
-        let ok = self.data.commit_range(off, len);
-        if ok {
-            crate::reloc_witness::note_arena_base(base);
-            crate::reloc_witness::note_committed(addr, addr + len);
-        }
-        ok
-    }
-
     pub fn committed_bytes(&self) -> usize {
         self.data.committed_bytes()
     }

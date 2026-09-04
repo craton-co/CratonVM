@@ -35,6 +35,10 @@ public class GpuJitWriterStale {
         for (int i = 0; i < out.length; i++) out[i] = (byte) (in[i] * 3 - 7);
     }
 
+    static void scaleC(char[] in, char[] out) {
+        for (int i = 0; i < out.length; i++) out[i] = (char) (in[i] * 3 - 7);
+    }
+
     static void scaleI(int[] in, int[] out) {
         for (int i = 0; i < out.length; i++) out[i] = in[i] * 3 - 7;
     }
@@ -48,6 +52,10 @@ public class GpuJitWriterStale {
 
     static void bumpB(byte[] a, int r) {
         for (int i = 0; i < a.length; i += 64) a[i] = (byte) (a[i] + r + 1);
+    }
+
+    static void bumpC(char[] a, int r) {
+        for (int i = 0; i < a.length; i += 64) a[i] = (char) (a[i] + r + 1);
     }
 
     static void bumpI(int[] a, int r) {
@@ -70,6 +78,12 @@ public class GpuJitWriterStale {
         return h;
     }
 
+    static long sumC(char[] v) {
+        long h = 0;
+        for (char x : v) h = mix(h, x);
+        return h;
+    }
+
     static long sumI(int[] v) {
         long h = 0;
         for (int x : v) h = mix(h, x);
@@ -83,21 +97,25 @@ public class GpuJitWriterStale {
         short[] sIn = new short[n], sOut = new short[n];
         byte[] bIn = new byte[n], bOut = new byte[n];
         int[] iIn = new int[n], iOut = new int[n];
+        char[] cIn = new char[n], cOut = new char[n];
         for (int i = 0; i < n; i++) {
             sIn[i] = (short) (i % 1013);
             bIn[i] = (byte) (i % 113);
             iIn[i] = i % 1013;
+            cIn[i] = (char) (i % 1013);
         }
 
-        long hs = 0, hb = 0, hi = 0;
+        long hs = 0, hb = 0, hi = 0, hc = 0;
         for (int r = 0; r < rounds; r++) {
             // Submit: the input becomes device-resident.
             scaleS(sIn, sOut);
             scaleB(bIn, bOut);
             scaleI(iIn, iOut);
+            scaleC(cIn, cOut);
             hs = mix(hs, sumS(sOut));
             hb = mix(hb, sumB(bOut));
             hi = mix(hi, sumI(iOut));
+            hc = mix(hc, sumC(cOut));
 
             // Mutate through a compiled writer. If the cache entry is
             // not evicted, the NEXT submit computes from the device copy
@@ -105,11 +123,13 @@ public class GpuJitWriterStale {
             bumpS(sIn, r);
             bumpB(bIn, r);
             bumpI(iIn, r);
+            bumpC(cIn, r);
         }
 
         System.out.println("jit_writer_short=" + mix(hs, sumS(sIn)));
         System.out.println("jit_writer_byte=" + mix(hb, sumB(bIn)));
         System.out.println("jit_writer_int=" + mix(hi, sumI(iIn)));
+        System.out.println("jit_writer_char=" + mix(hc, sumC(cIn)));
         System.out.println("JIT_WRITER_DONE n=" + n + " rounds=" + rounds);
     }
 }

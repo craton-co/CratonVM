@@ -5,6 +5,40 @@
 **2026-08-13, lane E12.** Closes residual 1 and NOMINATION 2 of
 `E3-1-the-cipher-name-helper-and-its-real-denominator.md`.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** "This lane may not build or run the
+> VM. Every CratonVM 'after' below is PRED." The fixture has now been run on a
+> build of this tree, against HotSpot on the same host:
+>
+> ```text
+> HotSpot              rc=0   91 CK lines
+> CratonVM compatible  rc=0   91 CK lines   diff vs HotSpot: EMPTY
+> CratonVM --jdk-only  rc=0   91 CK lines   diff vs HotSpot: EMPTY
+> ```
+>
+> **The CK LINES were counted, not the vector's verdict**, and that distinction
+> is this fixture's own history. `E31-1` §"unblocked" records that
+> `RSslNullSession` "runs **1 of its 47 checks** today — it dies on" the door it
+> names. A vector that dies after one check can still exit 0 and be reported by
+> the suite as `1 passed`; through `regression-suite/run.sh` that is exactly what
+> this looks like. Counting `^CK` lines is what tells the two apart, and all 91
+> are present on both arms.
+>
+> **Ninety-one, not the forty-seven §6 specifies.** The fixture was extended
+> after this record was written. That is ordinary growth, unlike `W7-5`'s count,
+> and the assertions are what was checked: the diff against HotSpot is empty
+> line-for-line, so every check §6 specifies is among them and agrees.
+>
+> `E12-1` §6's three doors are all exercised — the unconnected
+> `SSLSocketFactory.getDefault().createSocket()` arm and the same socket after
+> `close()`, the `createSSLEngine()` arm before any handshake, and the mechanised
+> cipher-suite argument. §6's own falsifier is that
+> `TLS_AES_256_GCM_SHA384` / `TLS_AES_128_GCM_SHA256` must read true; the output
+> is byte-identical to HotSpot's, so they do.
+>
+> **Scope.** This closes the "CratonVM column PRED" for the surface the fixture
+> covers, on both arms. It does not touch the NOMINATED rows in other files, and
+> it is not evidence for any door the fixture does not open.
+
 **This lane may not build or run the VM.** Every CratonVM "after" below is
 **PREDICTED**. The JSSE numbers are executed on this host, HotSpot
 25.0.3+9-LTS, by four probes in `scratchpad/e12/`:

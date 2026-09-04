@@ -1111,12 +1111,24 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         zgc_concurrent_mark_cycle(shared, thread);
     }
 
-    if shared.mem.heap.needs_gc()
-        || shared
+    // Evaluated into named locals rather than left in the `||`: the two
+    // halves are different answers to "why did this cycle happen", and the
+    // latch half is invisible to `[GC] zgc-trigger` because it never asks
+    // `needs_gc`. Short-circuiting is preserved -- `needs_gc()` first, and
+    // the swap only when it says no -- so the latch is still consumed
+    // exactly when it was before.
+    let entry_needs = shared.mem.heap.needs_gc();
+    let entry_requested = !entry_needs
+        && shared
             .mem
             .gc_requested
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-    {
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+    if entry_needs || entry_requested {
+        if entry_needs {
+            cratonvm_types::gc_entry_census::note_maybe_gc_needs();
+        } else {
+            cratonvm_types::gc_entry_census::note_maybe_gc_requested();
+        }
         // Retire TLAB before GC — its memory is in from-space
         thread.tlab.retire();
         // Round-5 fix (CRIT — UAF): the GC initiator never passes through
@@ -1490,7 +1502,12 @@ pub(super) fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) ->
 }
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "unlabelled")
+}
+
+/// [`maybe_gc_forced_pub`] with the caller's identity, for the census.
+pub fn maybe_gc_forced_pub_at(shared: &SharedVm, thread: &mut JvmThread, site: &'static str) {
+    maybe_gc_forced_at(shared, thread, site)
 }
 
 /// `zgc_concurrent_mark_cycle` for the JIT allocation helpers.
@@ -1530,7 +1547,7 @@ pub(crate) fn create_string_or_oom(
     // then G1's last-ditch complete mark cycle (dead Old/humongous spans are
     // only reclaimed by a finished cycle's cleanup), then OOM.
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "create-string");
     if let Some(obj) = try_new_string(shared, text) {
         return Ok(obj);
     }
@@ -1562,7 +1579,7 @@ pub(crate) fn create_string_from_units_or_oom(
         return Ok(obj);
     }
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "create-string-units");
     if let Some(obj) = try_new_string(shared, units) {
         return Ok(obj);
     }
@@ -1579,6 +1596,16 @@ pub(crate) fn create_string_from_units_or_oom(
 }
 
 pub(super) fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
+    maybe_gc_forced_at(shared, thread, "unlabelled")
+}
+
+/// [`maybe_gc_forced`] with the caller's identity, for the census.
+pub(super) fn maybe_gc_forced_at(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    site: &'static str,
+) {
+    cratonvm_types::gc_entry_census::note_forced_at(site);
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
     // failure / `create_exception_object`) was the one GC initiator that did NOT
@@ -1881,6 +1908,7 @@ pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
 /// Runs GC with finalizer-aware resurrection, processes references,
 /// and invokes pending finalizers.
 pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
+    cratonvm_types::gc_entry_census::note_from_native();
     // Retire TLAB before GC
     thread.tlab.retire();
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
@@ -3293,7 +3321,8 @@ pub(super) fn gc_alloc_object(
 
     // ONE shape decision for this allocation, used both to reserve the region
     // and to stamp the header. See `plan_tlab_object_shape`.
-    let (total_size, _body_size, _gc_flags) = plan_tlab_object_shape(class_id, num_fields);
+    let (total_size, _body_size, _gc_flags) =
+        plan_tlab_object_shape_at(class_id, num_fields, tlab_site::INTERPRETER);
     let _ = (HEADER_SIZE, SLOT_SIZE);
 
     // TLAB fast path: try thread-local bump allocation (no lock)
@@ -3490,15 +3519,7 @@ pub(crate) fn tlab_alloc_object(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    // Re-planned here rather than taken as an argument: every caller computes
-    // `total_size` from the same planner, so this reads the same answer, and a
-    // wrapper that took the shape separately would let a caller pass a size
-    // and a shape that disagree.
-    let (planned_total, body_size, gc_flags) = plan_tlab_object_shape(class_id, num_fields);
-    debug_assert_eq!(
-        planned_total, total_size,
-        "a TLAB object's reserved size must be the one its shape plan asked for"
-    );
+    let (body_size, gc_flags) = shape_of_reserved(num_fields, total_size);
     tlab_alloc_object_inner(
         thread,
         shared,
@@ -3591,11 +3612,7 @@ pub(crate) fn tlab_alloc_object_guarded_refill(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    let (planned_total, body_size, gc_flags) = plan_tlab_object_shape(class_id, num_fields);
-    debug_assert_eq!(
-        planned_total, total_size,
-        "a TLAB object's reserved size must be the one its shape plan asked for"
-    );
+    let (body_size, gc_flags) = shape_of_reserved(num_fields, total_size);
     tlab_alloc_object_inner(
         thread,
         shared,
@@ -3858,6 +3875,7 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
         return false;
     }
     let alloc_total = shared.mem.bytes_allocated_total.load(Ordering::Relaxed);
+    cratonvm_types::gc_entry_census::note_alloc_total(alloc_total);
     let last = TLAB_LAST_BREAK_ALLOC_TOTAL.load(Ordering::Relaxed);
     if last != 0 && alloc_total.saturating_sub(last) < WEDGE_REARM_BYTES {
         return false;
@@ -3876,27 +3894,61 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
     }
     TLAB_GATE_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "tlab-refill-wedge");
     true
 }
 
-/// `CRATONVM_COMPACT_TLAB_ALLOC=1` — let the interpreter's TLAB fast path
-/// allocate the COMPACT body shape for classes that have one, instead of the
-/// uniform 16-byte-cell layout it has always written.
+/// The interpreter's TLAB fast path allocates the COMPACT body shape for
+/// classes that have one, instead of the uniform 16-byte-cell layout it wrote
+/// for years — **default ON since 2026-09-03**, opt out with
+/// `CRATONVM_COMPACT_TLAB_ALLOC=0`.
 ///
-/// **Default OFF.** Not because the shape is wrong — the JIT's inline `new` has
-/// emitted exactly this shape for months, and `gen_heap::alloc_object` (the
-/// TLAB-miss path) plans it too, so the same class already gets both shapes
-/// today depending on which allocator ran. It is off because the one previous
-/// attempt to change this path, on the ZGC arm on 2026-09-02, MISCOMPILED
-/// `probes/FjpProbe.java` — wrong per-task sums, no collection involved — and
-/// the comment it left says the unification has to happen at every allocation
-/// site at once with that probe in the gate. This lands the unification and the
-/// gate; the default is the measurement's to earn.
+/// # Why this is the right shape
+///
+/// It is the shape everything else already uses. The JIT's inline `new`
+/// (`emit_inline_tlab_new`) has emitted compact bodies for months, and
+/// `gen_heap::alloc_object` — the TLAB-miss and large-object path — plans them
+/// too. Only this path did not, so the same class got one shape or the other
+/// depending on which allocator happened to serve it, and every compact fast
+/// path in the JIT needed a second legacy-shaped arm to cope. Three of those
+/// arms were added in the week before this flipped.
+///
+/// # What earned the default
+///
+/// It shipped OFF first, because the one previous attempt at this unification
+/// miscompiled `probes/FjpProbe.java` and the comment it left demanded the
+/// change be made at every allocation site at once with that probe in the gate.
+/// The switch then reproduced that miscompile deterministically, which is how
+/// its root cause was found: the `Integer`/`Long` boxing fast paths wrote a raw
+/// 16-byte `Value` cell under a SAFETY comment asserting the object was
+/// legacy-layout — an assumption about which allocator the site calls, not a
+/// property of the object.
+///
+/// With that fixed, the evidence for turning it on:
+///
+/// * `regression-suite/run.sh` 89/89 with the shape enabled, on the default
+///   collector, under `-XX:+UseGenerationalGC` and under `-XX:+UseG1GC` — a
+///   HotSpot-differential oracle, not a self-comparison.
+/// * A 228-program differential soak per collector: every workload run twice
+///   with the shape off to establish it is reproducible at all, then once with
+///   it on, comparing exit status and stdout byte for byte. 164 deterministic
+///   programs agree on Generational; the two that differ are a clock probe and
+///   `RandomLeak`, which prints `javaHeapUsed` and reports **35% less heap**
+///   (14.7 MB against 9.6 MB) for identical program output.
+/// * `org.h2.test.unit.TestCache`, a real application: `rc=0`, 1,872,185 of
+///   2,508,687 objects compacted, **87.5 MB less allocated**.
+/// * Throughput is a wash — eight alternated rounds, medians 16.6 s either way.
+///   The prize here is memory, and `header-shrink.md` always said it would be.
+///
+/// `=0` restores the legacy shape exactly, and remains the first thing to set
+/// if an object is ever suspected of being read at the wrong offset.
 pub(crate) fn compact_tlab_alloc_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_COMPACT_TLAB_ALLOC").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_COMPACT_TLAB_ALLOC").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
@@ -3933,17 +3985,86 @@ pub fn tlab_object_shape_counts() -> (u64, u64, u64) {
 /// class's layout were replaced between them (the exact hazard the JIT's inline
 /// emitter carries a layout-replace guard for), and a body sized by one lookup
 /// with a header stamped by the other is heap corruption.
+/// Which TLAB object sites may plan the compact shape, as a bitmask —
+/// `CRATONVM_COMPACT_TLAB_SITES`, default all.
+///
+/// A bisection lever, not a tuning knob. `CRATONVM_COMPACT_TLAB_ALLOC=1`
+/// reproduces the `FjpProbe` miscompile in one run but says nothing about
+/// WHICH of the five sites is responsible, and each answer would otherwise cost
+/// a fifteen-minute rebuild. See [`TlabSite`].
+pub(crate) fn compact_tlab_site_mask() -> u32 {
+    static G: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_COMPACT_TLAB_SITES") {
+            Ok(v) => v.trim().parse::<u32>().unwrap_or(u32::MAX),
+            Err(_) => u32::MAX,
+        }
+    })
+}
+
+/// The TLAB object allocation sites, as mask bits for
+/// [`compact_tlab_site_mask`].
+pub(crate) mod tlab_site {
+    /// `gc_alloc_object` — the interpreter's own `new`.
+    pub const INTERPRETER: u32 = 1;
+    /// `jit_new_object`'s guarded-refill TLAB attempt.
+    pub const JIT_NEW: u32 = 2;
+    /// The two `tlab_alloc_object` sites inside the JIT helpers.
+    pub const JIT_HELPER: u32 = 4;
+    /// The native-call allocation site in `vm_exec`.
+    pub const NATIVE: u32 = 8;
+    /// The compact-`String` site in `vm_object`.
+    pub const STRING: u32 = 16;
+}
+
+/// One line per distinct class that gets the compact shape —
+/// `CRATONVM_DBG_COMPACT_TLAB=1`.
+fn note_compact_tlab_class(class_id: ClassId, num_fields: usize, site: u32) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_TLAB").is_none() {
+        return;
+    }
+    use std::sync::atomic::Ordering;
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, u32)>>> =
+        std::sync::Mutex::new(None);
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut g = match SEEN.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let seen = g.get_or_insert_with(std::collections::HashSet::new);
+    if !seen.insert((class_id.as_u32(), site)) {
+        return;
+    }
+    // Bounded: a runaway class count would drown the run it is meant to
+    // explain.
+    if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
+        return;
+    }
+    let name = cratonvm_gc::gc::resolve_class_info(class_id.as_u32())
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| "<unresolved>".to_string());
+    eprintln!(
+        "[compact-tlab] site={site} class={name} id={} num_fields={num_fields}",
+        class_id.as_u32()
+    );
+}
+
 #[inline]
-pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (usize, u32, u8) {
+pub(crate) fn plan_tlab_object_shape_at(
+    class_id: ClassId,
+    num_fields: usize,
+    site: u32,
+) -> (usize, u32, u8) {
     use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
     use std::sync::atomic::Ordering;
     let legacy_total = HEADER_SIZE + num_fields * SLOT_SIZE;
-    if compact_tlab_alloc_enabled() {
+    if compact_tlab_alloc_enabled() && (compact_tlab_site_mask() & site) != 0 {
         if let Some(body) = cratonvm_types::compact_tlab_body_size(class_id.as_u32(), num_fields) {
             if let (Some(total), Ok(body_u32)) =
                 (HEADER_SIZE.checked_add(body), u32::try_from(body))
             {
                 TLAB_COMPACT_OBJECTS.fetch_add(1, Ordering::Relaxed);
+                note_compact_tlab_class(class_id, num_fields, site);
                 TLAB_COMPACT_BYTES_SAVED
                     .fetch_add(legacy_total.saturating_sub(total) as u64, Ordering::Relaxed);
                 return (total, body_u32, cratonvm_types::GC_FLAG_COMPACT);
@@ -3952,6 +4073,44 @@ pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (u
     }
     TLAB_LEGACY_OBJECTS.fetch_add(1, Ordering::Relaxed);
     (legacy_total, 0, 0)
+}
+
+/// The header shape implied by the size a caller actually RESERVED.
+///
+/// Derived, never re-planned. The wrappers used to call the planner a second
+/// time and `debug_assert` that the two agreed; they cannot be relied on to
+/// agree once the planner is site-screened (`CRATONVM_COMPACT_TLAB_SITES`),
+/// and a body sized by one answer with a header stamped from the other is heap
+/// corruption. Reading the shape back out of the reservation makes the two
+/// impossible to separate.
+///
+/// A compact body packs each field to its natural width (at most 8 bytes), so
+/// it is strictly smaller than the legacy `num_fields * SLOT_SIZE` for any
+/// non-empty object; equality means legacy. A zero-field object has no body at
+/// all and the shapes coincide, which is why it reads as legacy and why that
+/// costs nothing.
+#[inline]
+fn shape_of_reserved(num_fields: usize, total_size: usize) -> (u32, u8) {
+    use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+    let legacy_total = HEADER_SIZE + num_fields * SLOT_SIZE;
+    if total_size == legacy_total {
+        return (0, 0);
+    }
+    let body = total_size.saturating_sub(HEADER_SIZE);
+    match u32::try_from(body) {
+        Ok(body) => (body, cratonvm_types::GC_FLAG_COMPACT),
+        Err(_) => (0, 0),
+    }
+}
+
+/// [`plan_tlab_object_shape_at`] for a caller that does not name a site.
+///
+/// Used by the two TLAB wrappers, which re-plan only to check that the size
+/// they were handed is the one the shape asked for; the site screen is the
+/// original caller's and must not be applied twice.
+#[inline]
+pub(crate) fn plan_tlab_object_shape(class_id: ClassId, num_fields: usize) -> (usize, u32, u8) {
+    plan_tlab_object_shape_at(class_id, num_fields, u32::MAX)
 }
 
 /// Which header [`tlab_alloc_object_inner`] should stamp on the region it
@@ -4133,7 +4292,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
             TLAB_REFILL_BYTES_SINCE_GC.store(0, Ordering::Relaxed);
             thread.tlab.retire();
-            maybe_gc_forced(shared, thread);
+            maybe_gc_forced_at(shared, thread, "tlab-alloc-shaped");
         } else if refilled >= NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES {
             // Consulted and declined: re-arm the bytes stamp so the next
             // consult is another 4 MiB away rather than on every refill.
@@ -4228,6 +4387,7 @@ pub(super) fn tlab_alloc_shaped_inner(
     thread.tlab.retire();
 
     let mut refill = shared.mem.heap.refill_tlab(requested);
+    cratonvm_types::gc_entry_census::note_refill(refill.is_some());
     if refill.is_none() {
         dbg_refill_fail(1, requested);
         // Second-wedge fix, stage-1 arm (perf/halfgap-20260717): the gate
@@ -4242,6 +4402,7 @@ pub(super) fn tlab_alloc_shaped_inner(
             && tlab_refill_wedge_break(thread, shared)
         {
             refill = shared.mem.heap.refill_tlab(requested);
+            cratonvm_types::gc_entry_census::note_refill_retry(refill.is_some());
         }
     } else {
         TLAB_GATE_CONSECUTIVE_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -4457,7 +4618,7 @@ pub(crate) fn alloc_object_shared(
     }
     // Retire TLAB before GC — its memory is in the arena that will be collected
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "alloc-object-shared");
     // GC-overhead limit: if repeated forced GCs have freed almost nothing, the
     // heap is full of live objects — declare OOM now rather than retrying into a
     // death-spiral (a sliver freed each cycle would otherwise let allocation
@@ -4667,7 +4828,7 @@ pub(crate) fn gc_alloc_array(
     }
     // Retire TLAB before GC
     thread.tlab.retire();
-    maybe_gc_forced(shared, thread);
+    maybe_gc_forced_at(shared, thread, "gc-alloc-array");
     // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
     // GC-thrashing rather than spinning on slivers.
     if gc_overhead_limit_exceeded(shared) {
@@ -6768,7 +6929,7 @@ fn last_ditch_clear_soft_refs(shared: &SharedVm, thread: &mut JvmThread) {
     }
     thread.tlab.retire();
     crate::runtime::interpreter::with_last_ditch_soft_clear(|| {
-        maybe_gc_forced(shared, thread);
+        maybe_gc_forced_at(shared, thread, "last-ditch-soft-refs");
     });
 }
 

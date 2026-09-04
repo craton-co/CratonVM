@@ -13,6 +13,44 @@ opener. Parsing is not type-checking; see §7.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. §"How to verify" step 1 was run as
+> written, and the mutation matrix reproduces exactly.** The status block says
+> *"No `cargo`, no VM, no fixture"*, with only `rustfmt` parse-checking — and
+> §7's own caution that *"parsing is not type-checking"*.
+>
+> The record does not ask for a green; it specifies a 2-by-3 experiment, because
+> two tests passing says nothing about whether they are complementary. Run on a
+> binary built from this tree:
+>
+> ```text
+>                                       widened_null   null_socket_session   negotiated_keeps
+>                                       _not_negotiated  _no_id_not_valid     _id_and_validity
+> baseline                                  ok               ok                    ok
+> mutation A:  3 | 4  ->  3                FAILED           FAILED                 ok
+> mutation B:  session_has_negotiated
+>              returns false                ok               ok                  FAILED
+> ```
+>
+> That is precisely what §"How to verify" predicts: A turns the two null-session
+> tests red *"while `a_session_that_negotiated_keeps_its_id_and_its_validity`
+> stays green"*, and B turns only that third one red. Both mutations were
+> reverted and `t27_tls.rs` left byte-identical to `HEAD`.
+>
+> **The value is in the off-diagonal.** Each mutation is caught by exactly the
+> tests that should catch it and ignored by the one that should not, so neither
+> test is vacuous and neither is merely a copy of the other. A pair that both
+> went red on both mutations would have been consistent with a single
+> over-broad assertion; this rules that out.
+>
+> **What this does NOT verify.** The `cargo test` bar is step 1, the cheapest of
+> the list; the later steps involve a real HTTPS handshake and
+> `scratchpad/f6/F6Invalidate.java`, which did not survive its session and cannot
+> be re-run. §4's HotSpot column is cited from E12-1/E42-1 rather than
+> re-derived, as this record itself says, and this note does not re-derive it
+> either. The two minters this record *"deliberately keeps wrong"* are still
+> wrong on purpose — nothing here changes or checks them, and a green above is
+> not evidence about them.
+
 ## 0. Verdict
 
 1. **The tree was already in the hazardous state when this lane opened it.**

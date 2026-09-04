@@ -14,6 +14,53 @@ W7-64-printstream-trouble-and-errormanager.md landed is used, not reinvented.
 Closes the residual W7-64 named first under **What is left**, and the one
 W7-57-close-flush-swallow-sweep.md left before it.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-03. The fix works on both shipping arms
+> and this record's headline defect is STILL LIVE under `--synthetic-jdk`.**
+>
+> Run via `probes/CloseFlushSwallowProbe.java`, the handle this record shares
+> with W7-57 and W7-81. This record's own opening example was
+> `new PrintStream(fileOutputStream).close()` delivering "no bytes on disk".
+> The probe asserts exactly that:
+>
+> ```text
+>                                    HotSpot        compatible  --jdk-only  --synthetic-jdk
+> printStreamFileNonEmptyAfterClose   true            PASS        PASS         false
+> printStreamFileContentAfterClose    data-on-disk    PASS        PASS         "" (empty)
+> printStreamCloseIoSinkTrace         flush,close     flush,close,flush  (same)  (same)
+> ```
+>
+> So the receiver test this record shipped — "a null `out` IS the console" —
+> is doing its job in Compatible and `--jdk-only`, and the exact byte loss the
+> record was written about reproduces verbatim under `--synthetic-jdk`.
+>
+> **It is not a stale second registration.** That was the first thing checked,
+> because this record's own diagnosis was that `close` is registered
+> unconditionally in both registrars. The registry dump under `--synthetic-jdk`
+> says both doors point at the fixed native and names which one runs:
+>
+> ```text
+> close ()V  by=native-builtins/src/logging_shims.rs:363  owns_slot=False  inv=0
+> close ()V  by=native-builtins/src/lib.rs:24078          owns_slot=True   inv=6   overwrote=bridge
+> ```
+>
+> The owning slot is the repaired `native_printstream_close` and it ran six
+> times. The loss is downstream of the close, not in front of it.
+>
+> **The residual on the shipping arms** is one extra `flush`:
+> `flush,close,flush` against HotSpot's `flush,close`. The probe already
+> isolates its cause in a printed observation —
+> `observed.printStreamCheckErrorOnClosedStreamReflushed=1` against HotSpot's
+> `0` — so `checkError()` on an already-closed `PrintStream` re-flushes it.
+> That is a new, narrow defect, not a return of the no-op.
+>
+> **What this does NOT verify, and what is NOT diagnosed.** The
+> `--synthetic-jdk` byte loss is measured, not explained. A GC guard fired in
+> that same run (`zgc::get_field: plain-object field access on an ARRAY
+> receiver`, `element_type=Char`) and it is **co-located, not shown to be the
+> cause** — it is recorded so the next reader has the thread, not as a finding.
+> Nothing here re-verifies §§ that this record measured on HotSpot or read from
+> source; this note covers the CratonVM column the record never had.
 ## The defect
 
 ```rust

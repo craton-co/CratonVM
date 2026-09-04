@@ -2081,6 +2081,32 @@ impl SharedVm {
         // value or its uniqueness — only when it becomes available.
         let vm_identity = NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed);
 
+        // Arm the compiled-tier GPU input-residency barrier, before any
+        // class is loaded and so before any method can be compiled. A
+        // method compiled ahead of this would carry no barrier and could
+        // stale a cache entry created later, which is the whole reason
+        // this sits at the top of VM construction rather than beside the
+        // offload registry it belongs to (that one is built lazily, on
+        // first dispatch, long after the first compile).
+        //
+        // Only under `--gpu`, and only on x86_64: `gpu_barrier` encodes
+        // x64, and an unarmed barrier is what keeps `offload_jit_gate`
+        // refusing array writers on every other target, exactly as it
+        // did before. `CRATONVM_JIT_GPU_ARRAY_BARRIER=0` is the kill
+        // switch and restores that behaviour here too.
+        #[cfg(all(feature = "gpu-offload", target_arch = "x86_64"))]
+        if config.gpu_offload_enabled
+            && cratonvm_types::flags::runtime_var("CRATONVM_JIT_GPU_ARRAY_BARRIER")
+                .ok()
+                .as_deref()
+                != Some("0")
+        {
+            cratonvm_jit::gpu_barrier::arm(
+                crate::runtime::offload::input_cache::filter_addr(),
+                crate::runtime::offload::input_cache::dirty_addr(),
+            );
+        }
+
         let mut native_methods = NativeMethodRegistry::new();
 
         // ── Capability policy, installed before ANY `register_*` pass ───────
@@ -4750,6 +4776,12 @@ fn shared_vm_hook_registry() -> &'static SharedVmRegistry {
 /// can drop the registry lock before doing any VM work — the adapters below
 /// take VM-internal locks (`resolution_cache`, `jit_cache`, `class_manager`),
 /// and holding the registry lock across those would invert the lock order.
+/// `live_hook_vms` for callers outside this module (the deferred-`new` resweep
+/// on class definition). Same registry, same lock discipline.
+pub(crate) fn live_hook_vms_for_jit() -> Vec<Arc<SharedVm>> {
+    live_hook_vms()
+}
+
 fn live_hook_vms() -> Vec<Arc<SharedVm>> {
     let mut reg = shared_vm_hook_registry().lock();
     let mut live = Vec::with_capacity(reg.len());

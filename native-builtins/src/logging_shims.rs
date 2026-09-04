@@ -1266,6 +1266,26 @@ pub(crate) fn native_printstream_flush(
             )?;
             return Ok(None);
         }
+        // `out` is not a Java sink, and there are TWO reasons for that which
+        // must not be confused:
+        //
+        //  * the stream was CLOSED — `close()` nulled `out`, so `flush()`'s
+        //    opening `ensureOpen()` throws `IOException("Stream closed")` into
+        //    its own `catch` and sets `trouble` WITHOUT touching any sink;
+        //  * this is the process console, whose `out` was never a Java object.
+        //
+        // The `closing` latch separates them, and it is only ever latched on
+        // the branch that had a real sink. Gating on `closing` ALONE would be
+        // wrong: when `close()` propagates an `Error`, HotSpot never reaches
+        // its `out = null`, so `closing` is set while `out` is still live and
+        // a later `flush()` really does flush the sink and leaves `trouble`
+        // clear. That is `CloseFlushSwallowProbe`'s over-correction guard,
+        // `printStreamCheckErrorAfterPropagatedCloseError`, and testing the
+        // FIELD rather than the latch is what keeps it passing.
+        if cratonvm_native_api::print_error_state::is_closing(&*ctx, this) {
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+            return Ok(None);
+        }
         // The fd path below is `PrintStream.flush()` over the process console.
         // A failing `write`/`flush` on the fd is exactly the `IOException` the
         // JDK's `catch` names, so it records too — see `stream_write`.
@@ -1403,6 +1423,22 @@ pub(crate) fn native_printstream_close(
     cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, flushed)?;
     let closed = ctx.invoke_virtual(sink, "close", "()V", &[]);
     cratonvm_native_api::print_error_state::absorb_io_exception_recording(&*ctx, this, closed)?;
+    // `textOut = null; charOut = null; out = null;` — the JDK's last three
+    // statements in `close()`, and they are not bookkeeping. `checkError()` is
+    // `if (out != null) { flush(); } … return trouble;`, so a closed stream
+    // skips the flush ENTIRELY: HotSpot answers `false` after a clean close and
+    // never touches the sink. Leaving `out` populated made every `checkError()`
+    // on a closed stream re-flush the sink — `flush,close,flush` where the
+    // oracle traces `flush,close` (`CloseFlushSwallowProbe`'s
+    // `printStreamCloseIoSinkTrace`), and one more flush per call after that.
+    //
+    // Nulling it is safe HERE and only here: the console branch above returns
+    // BEFORE `closing` is latched, so a latched `closing` means this stream had
+    // a real Java sink and a null `out` can no longer be mistaken for the
+    // console marker. Every path that would read `out` after this point —
+    // `write`/`print` via `printstream_refuse_if_closed`, and `flush` above —
+    // now refuses on the `closing` latch before looking at the field at all.
+    ctx.set_field_by_name(this, "out", Value::Object(None));
     Ok(None)
 }
 

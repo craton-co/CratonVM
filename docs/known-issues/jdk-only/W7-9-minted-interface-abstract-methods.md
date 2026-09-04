@@ -120,6 +120,124 @@ claimed.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. Two of §6's residuals are closed, one
+> is still live — and the live one fails in a DIFFERENT SHAPE than this record
+> predicts.** Status was *"Nothing here has been built or run."*
+>
+> `probes/W79ResidualProbe.java` calls §6's triples directly and prints the
+> outcome class rather than asserting, because three of the five are documented
+> as deliberately-not-fixed and the question is which failure each gives.
+>
+> ```text
+>                                          HotSpot 25                    CratonVM (both arms)
+> Selector.provider()                      EPollSelectorProvider         EPollSelectorProvider
+> DatagramChannel.setOption(SO_RCVBUF)     DatagramChannelImpl           DatagramChannelImpl
+> DatagramChannel.getRemoteAddress() unconn null                          null
+> DatagramChannel.getRemoteAddress() conn   InetSocketAddress             InetSocketAddress
+> DatagramChannel.write(ByteBuffer[],int,int)  Long                       NullPointerException
+> DatagramChannel.read(ByteBuffer[],int,int)   Long                       NullPointerException
+> ```
+>
+> **Residual 1 is confirmed fixed on a binary.** The UPDATED block already
+> records `Selector.provider()` as FIXED 2026-08-12; it now answers
+> `sun.nio.ch.EPollSelectorProvider`, identical to the oracle, in both modes.
+>
+> **Residual 2's premise is STALE, and in the record's favour.** §6 says
+> `setOption` and `getRemoteAddress` *"are dead in the default build"* because
+> `register_datagram_channel` is reached only through
+> `register_synthetic_overrides`, and names a precondition — *"unify the two
+> DatagramChannel layouts first"* — before they could be wired. **Both work in
+> the default build now**, and `getRemoteAddress` is right in BOTH states, which
+> is the harder half: `null` when unconnected and an `InetSocketAddress` when
+> connected. A stand-in that always returned `null` would have passed the first
+> row and failed the second.
+>
+> **Residual 3 is live, and it is NOT the failure this record describes.** §6
+> calls `read([Ljava/nio/ByteBuffer;II)J` and `write` *"genuinely absent, and
+> genuinely reachable"*. An absent native on a minted receiver gives
+> `AbstractMethodError` — that is this record's own §1 mechanism. What actually
+> happens is:
+>
+> ```text
+> NullPointerException: Cannot invoke "java.util.concurrent.locks.ReentrantLock.lock()"
+>                       because "this.writeLock" is null
+> ```
+>
+> That is **real JDK bytecode running** — `DatagramChannelImpl`'s own
+> scattering/gathering path — and finding a field of our minted receiver
+> unpopulated. So the method is not absent; the object is incomplete. The two
+> diagnoses call for different fixes: "add a native" versus "populate
+> `readLock`/`writeLock` when the channel is minted". §8's out-of-file patch is
+> written for the first one.
+>
+> This is the same species as the `ZipOutputStream` NPE recorded in `W7-57`
+> (`"this.names" is null`): our own state, surfacing as an NPE from inside
+> library code, where the caller expected either a result or a named refusal.
+>
+> **What this does NOT verify.** §3's per-class adjudication of eleven classes,
+> §4's two refuted census claims and §5's slot-index residual are `javap` and
+> source arguments; none was re-derived. This probe reaches five triples, not
+> the census. The `--jdk-only` run also logs unrelated refusals for
+> `java/util/Enumeration$Impl` (requested from `classloader.rs:5590` and `:6465`)
+> — noted because it is in the same transcript, NOT investigated, and not this
+> record's.
+
+> **§6's THIRD residual is FIXED 2026-09-04, and the two `provider()` accessors
+> with it.** The measurements are `probes/ResidualProbe.java`, both shipping
+> arms, against Temurin 25 on the same host.
+>
+> ```text
+>                                    HotSpot 25                    CratonVM (now)
+> DatagramChannel.write(ByteBuffer[],0,2)   4                      4
+> DatagramChannel.read(ByteBuffer[],0,2)    4                      4
+> DatagramChannel.provider()         EPollSelectorProvider         EPollSelectorProvider
+> AsynchronousSocketChannel.provider()      LinuxAsynchronousChannelProvider   same
+> AsynchronousServerSocketChannel.provider() LinuxAsynchronousChannelProvider  same
+> ```
+>
+> **The scattering/gathering pair.** §6 called them *"genuinely absent, and
+> genuinely reachable"* and declined them because they are *"not composable from
+> the single-buffer natives that do exist: for a datagram channel a scattering
+> read consumes exactly one datagram"*. That reasoning is correct and is why the
+> fix is not a loop: a gathering write must produce ONE datagram, so writing
+> each buffer in turn would put N messages on the wire. The buffers are
+> concatenated VM-side through the same `bb_storage_view` / `bb_read_byte`
+> machinery `native_dc_write` already uses, sent once, and each source is then
+> advanced by exactly what the socket took. The scattering read mirrors it and
+> discards the datagram's tail, which is the contract. Both one-argument forms
+> delegate to the three-argument ones, as the JDK defines them.
+>
+> **A correction to this record's own §6, which the discharge note above already
+> flagged.** The failure was NOT the `AbstractMethodError` an absent native
+> produces on a minted receiver. It was
+> `NullPointerException: … because "this.writeLock" is null` — the JDK's own
+> `DatagramChannelImpl` bytecode running against our synthetic channel and
+> finding a field nothing populated. Registering the natives means that bytecode
+> is no longer reached, which is why this closes without touching the channel's
+> field layout.
+>
+> **The `provider()` accessors are a third instance of the shape §6 opens with**
+> (`Selector.provider()`, fixed 2026-08-12) and one this record never listed:
+> `DatagramChannel.provider()` was also `null`. All three now delegate to the
+> STATIC provider — `AsynchronousChannelProvider.provider()` and
+> `SelectorProvider.provider()`, both of which already resolved on this VM and
+> return the same singleton HotSpot's instance accessors do.
+>
+> That route was chosen deliberately over the field. `async_socket.rs`'s
+> `aio_assc_open` documents a LIVE slot-map collision — `F_OPEN` occupies the
+> slot the real layout calls `provider` — and states that repairing it needs one
+> change spanning two crates, which a prior lane attempted and correctly
+> reverted. Registering the accessor leaves that repair exactly as open as it
+> was, and does not add a second source of truth: the value comes from the same
+> singleton either way.
+>
+> **What is NOT fixed.** §6's residual 1 (`Selector.provider()`) was already
+> closed; residual 2's premise — that `setOption`/`getRemoteAddress` are dead in
+> the default build — was refuted in the discharge note above. The slot-map
+> collision itself is untouched, so `F_OPEN` still sits in the `provider` slot
+> and any FUTURE reader of that field by name still gets an `Int`. §§3-5 are
+> `javap` and source arguments and were not re-derived.
+
 ## 1. What was being tested
 
 W7-5 established that the VM mints instances **of the real class** — an

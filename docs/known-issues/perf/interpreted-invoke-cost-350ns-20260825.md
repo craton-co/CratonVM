@@ -1270,11 +1270,68 @@ answer, and one of them was invisible until the control arm was believed.
    moves *where* a resource is released, check every path that releases it,
    including the one the kill switch turns back on.**
 
+#### The emplace, and why it needed its own switch to be visible
+
+The slot-reuse section above left one item: when **no** slot is retired, the
+door still built a `Frame` on the Rust stack and `push` moved ~220 bytes of it
+into the very slot it could have been written in.
+
+`Frame::new_pooled_cached_compact`'s buffer build is now factored into
+`build_cached_compact_parts`, shared with `FrameStack::emplace_cached_compact`
+so the by-value constructor and the emplace cannot drift. The emplace writes
+the struct literal through `ptr::write` **in the same function as the write**,
+so the destination is known at the point of construction and there is no
+intermediate to copy from; only the three buffer handles the caller just took
+from the pools travel.
+
+**That path is cold by default, and that is the whole measurement problem.**
+After slot reuse, a warm loop retires and rebuilds the same slot forever and
+never emplaces at all; the first call at each depth is one call in millions.
+So the change cannot be measured in the configuration that ships — not because
+it does nothing, but because the arm it governs almost never runs.
+
+`CRATONVM_JIT_NO_FRAME_SLOT_REUSE=1` forces it: with reuse off, the recycle
+harvests and trims, so every door call finds no retired slot and takes the
+emplace. That plus a switch on the emplace itself
+(`CRATONVM_JIT_NO_FRAME_EMPLACE`) isolates exactly the 220-byte move inside one
+binary. `probes/Dispatch.java` at 200k x 5, six interleaved passes, Azure at
+load 3.4 (`nocall` dead flat at 27-28 ns, which is what says the host was
+quiet):
+
+| arm | emplace | no-emplace |
+|---|---|---|
+| `nocall` (control) | 28 27 28 27 27 27 | 27 27 27 29 27 28 |
+| `static0` | 142 135 137 134 134 134 | 149 146 144 153 143 147 |
+| `static1` | 146 140 141 140 140 140 | 154 152 150 160 150 150 |
+| `static4` | 174 157 157 158 158 161 | 174 169 168 170 168 170 |
+| `virtual1` | 159 147 147 147 147 150 | 164 161 157 157 156 158 |
+| `special1` | 153 147 148 146 147 149 | 157 157 156 162 155 155 |
+| `iface1` | 164 150 149 159 156 151 | 164 170 163 170 160 159 |
+
+**~9-12 ns per call, 6/6 pairwise on `static0`/`static1`/`virtual1`/`special1`
+(5/6 and a tie on `static4` and `iface1`), and the no-call control does not
+move at all.** `static0` and `static1` do not even overlap: the emplace arm's
+worst pass beats the other arm's best.
+
+So the emplace is worth what the frame move costs, on the path where the frame
+move happens. What it buys in a default run is the first call at each depth
+plus every call in a workload whose retired slots keep being destroyed by
+interleaved by-value pushes — and it makes `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`
+a much cheaper fallback than it was.
+
+**What it does not cover, deliberately.** The general dispatchers still push by
+value through `push_frame_and_fire_entry`, and because that harvests and trims
+the slot it would have reused, *every* non-door call takes the by-value build.
+Converting those is the same change again, but their call sites interleave the
+monitor-enter, the frame trace and the JVMTI entry event around the push in
+three different orders, and reordering that is not a change to make on the way
+past. It is the obvious next increment, and it is worth more than this one
+because it is not a cold path.
+
 #### What is left
 
-The fill, which is the oop-map half, and the `Frame` struct itself: a
-by-value push still moves ~220 bytes when no slot is retired (the first call
-at each depth). Emplacing it would take the remaining `frame_push` cycles.
+The fill, which is the oop-map half, and the general dispatchers' by-value
+push (see the note that closes the emplace section above).
 
 ## Exit criteria
 
@@ -1307,3 +1364,131 @@ javac -d /tmp/probeout probes/InvokeAttributionProbe.java
 `both` self-times and prints `withCall_ns`, `noCall_ns` and `invokeDelta_ns` per
 round. `call` and `nocall` select a single arm, which is what a native profiler
 needs: recording both in one process mixes them and no symbol can be attributed.
+
+### The general dispatchers, on a day the doors went dark
+
+The section above ends by naming what it did not cover. Between then and this,
+`f74e88d8a` made the monomorphic invoke fast door **default-OFF** — it returns
+wrong answers on `TestRandomMapOps`
+(`known-issues/h2/bug-testrandommapops-deterministic-1810-null-20260903.md`) —
+and because `nonvirtual_fast_door_on` is `invoke_fast_door_on && ...`, the
+`invokestatic` and `invokespecial` doors went off with it.
+
+So this is no longer an increment. **The general dispatchers are the
+interpreted call path**, and everything the last three passes built was
+reachable only through a door nothing opens. Worse than not helping: a general
+call went through `push_frame_and_fire_entry`, which **harvests and trims** the
+retired slot before pushing, so it destroyed the slot the next call would have
+reused. Frame-slot reuse was not merely unused on the default path — it was
+being actively undone, once per call.
+
+`CRATONVM_DBG_FIELD_SITE=1` says it in one line, and says the same thing with
+and without the door kill switches, which is how the door state was noticed at
+all:
+
+```
+door: static hit=0 miss=0 special hit=0 miss=0 | install: reuse=2800557 emplace=447 byvalue=0
+```
+
+#### One install, three paths
+
+All five general pushes — four in `execute_invokevirtual_cached` /
+`_vtable_fast`, one in `execute_invokestatic_cached` — now go through
+`install_cached_frame`, which is the ladder the doors already had:
+
+1. rebuild the retired slot at this depth (`Frame::reset_cached_value`),
+2. emplace into the next slot when none is retired,
+3. build by value and move it in — what `CRATONVM_JIT_NO_FRAME_EMPLACE`
+   restores, taking the harvest with it, so that arm is the old behaviour whole.
+
+The doors transfer arguments verbatim as `(slot, tag)` pairs; a general
+dispatcher has already decoded to `Value`s by the time it knows the callee
+shape, so the two differ in that and nothing else.
+`build_cached_value_parts` and `build_cached_compact_parts` produce the same
+`CachedCompactParts`; `reset_cached_value` and `reset_cached_compact` share
+`reset_cached_tail`; four unit tests assert that a rebuilt slot, an emplaced
+slot and a by-value push are indistinguishable field for field.
+
+#### What it costs, priced in cycles because the host would not hold still
+
+Wall clock was unusable: `nocall`, which pushes no frame, swung 27-60 ns and
+three other sessions had `cratonvm` at ~100% CPU on the same host. One pass in
+twelve had a quiet control in all three arms. That run was discarded rather
+than mined.
+
+`CRATONVM_DBG=invoke-phases` counts rdtsc cycles inside the process over ten
+million calls, and it does hold still. `probes/Dispatch.java` 400k x 9, **eight
+interleaved passes**, three arms — `on`, `off` (the kill switch) and `dev`,
+which is there because the switch cannot reach the refactor around it:
+
+| cyc/call | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| `on` | 604 | 643 | 650 | 659 | 662 | 650 | 647 | 634 |
+| `dev` | 686 | 724 | 735 | 753 | 747 | 733 | 739 | 728 |
+| `off` | 709 | 749 | 760 | 803 | 762 | 758 | 775 | 757 |
+
+**8/8 pairwise against dev, 11-13% off a whole interpreted `invokestatic`, and
+the two do not overlap**: the worst `on` pass (662) beats the best `dev` pass
+(686). User CPU time over ten separate passes agrees more coarsely — 8/10, mean
+7.40 s against 8.08 s.
+
+The same run says where it went. `frame_build` and `frame_push` were re-scoped
+for this change (there is no boundary between building a frame in place and
+pushing it), so read them as one number — the install:
+
+| corrected cycles | `frame_build` | `frame_push` | install |
+|---|---|---|---|
+| `on` | 11-21 | **0.0** | **11-21** |
+| `dev` | 50-58 | 27-36 | 77-94 |
+| `off` | 61-72 | 39-47 | 100-115 |
+
+**The install falls from ~85 cycles to ~16**, and ~70 cycles is what the ~85
+cyc/call total improvement is made of. `guards` (100-123) and `args` (63-87)
+are flat across all three arms in every pass, which is the control inside the
+instrument: the change is not supposed to touch them, and it does not.
+
+#### The kill switch is not free, and the third arm is why that is known
+
+`off` is **worse than dev**, by 21-51 cyc/call. The switch restores the
+by-value build but cannot undo the refactor around it: `install_cached_frame`
+is an out-of-line call where dev inlined the build, plus a census bump. A
+two-arm A/B would have reported 15-19% by measuring against a control that is
+itself a regression. The honest headline is `on` against `dev`, and the
+recovery path this switch offers is a few percent slower than dev rather than
+equal to it.
+
+#### The control that licensed shipping this at all
+
+This change puts the doors' in-place install on the path that serves *every*
+interpreted call. If the door's wrong answer came from that machinery rather
+than from its argument transfer, this would spread a wrong answer from a
+default-off path to all of them — and the bug page could not say which half was
+at fault, because `-invoke-fast-door` switches off both at once.
+
+Forcing the door back on and disabling **only** the install
+(`CRATONVM_JIT_INVOKE_FAST_DOOR=1 CRATONVM_JIT_NO_FRAME_SLOT_REUSE=1
+CRATONVM_JIT_NO_FRAME_EMPLACE=1`) still fails 3/3 — same seed, same `op:1033`,
+same `(1810, null)`, in 9.3-11.8 s. The install is excluded; the argument
+transfer is not. That row is now on the bug page.
+
+#### Two instruments that had gone quiet
+
+* **The reusing push never took the interp-frame census.**
+  `FrameStack::push` records `CRATONVM_DBG_INTERP_FRAMES`;
+  `push_cached_compact_reusing` did not. After warmup nearly every door call
+  reused a slot, so the very methods the census exists to find were the ones
+  missing from it.
+* **Three diagnostics saw only by-value pushes.** Splitting the JVMTI event out
+  for the doors left `SBF-TRACE`, the bytecode dump and the WFLYCTL0079
+  dup-call filter reachable only from `push_frame_and_fire_entry`. Nothing
+  failed; a Spring boot trace simply stopped seeing any call that took a
+  cheaper install. They now live in `fire_entry_and_diagnostics_after_push`
+  and every install path runs them.
+
+#### What is left
+
+The three `Frame::new_pooled_cached` sites in `jit/helpers.rs` — the JIT's
+interpreted-callee path — still build by value, but they hand the frame to
+`execute_prebuilt_frame` rather than pushing it, so converting them is a change
+to that function's contract and not this one. And the locals **fill** is still
+the precise-oop-map half.

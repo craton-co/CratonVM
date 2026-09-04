@@ -1930,34 +1930,17 @@ pub(super) fn execute_invokestatic_cached(
                 ph_t2,
                 ph_t3,
             );
-            let mut frame = Frame::new_pooled_cached(
+            // `install_cached_frame` charges `P_FRAME_BUILD` and `P_PUSH`
+            // itself: once the frame is written in place there is no boundary
+            // between building it and pushing it to bracket from out here.
+            install_cached_frame(
+                shared,
+                thread,
                 cached,
                 args_slice,
-                &mut thread.locals_pool,
-                &mut thread.stacks_pool,
-            );
-            frame.monitor_on_exit = monitor_obj;
-            if crate::runtime::env_cache::frame_trace() {
-                eprintln!(
-                    "[FRAME_PUSH/stackless_cached] depth={} {}.{}{}",
-                    thread.frames.len(),
-                    frame.class_name(),
-                    frame.method_name(),
-                    frame.method_descriptor()
-                );
-            }
-            let ph_t4 = crate::runtime::interpreter::invoke_phases::now();
-            crate::runtime::interpreter::invoke_phases::charge(
-                crate::runtime::interpreter::invoke_phases::P_FRAME_BUILD,
-                ph_t3,
-                ph_t4,
-            );
-            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
-            let ph_t5 = crate::runtime::interpreter::invoke_phases::now();
-            crate::runtime::interpreter::invoke_phases::charge(
-                crate::runtime::interpreter::invoke_phases::P_PUSH,
-                ph_t4,
-                ph_t5,
+                monitor_obj,
+                Some("stackless_cached"),
+                true,
             );
             crate::runtime::interpreter::invoke_phases::count_call();
             Ok(CachedCallResult::FramePushed)

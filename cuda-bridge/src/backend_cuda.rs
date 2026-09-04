@@ -1384,3 +1384,237 @@ impl<T: Copy> Drop for PinnedHostInner<T> {
         }
     }
 }
+
+// ── Backend contract ─────────────────────────────────────────────────
+//
+// See `backend_api` for what is on this contract and what is
+// deliberately off it. The inherent methods `device()`, `event_pool()`,
+// `alloc_bytes()` and `slice_from_raw()` are NOT here: they return
+// `Arc<CudaDevice>`, `Arc<EventPool>`, `CUdeviceptr` and `CudaSlice<T>`,
+// which are cudarc types. Putting them on the trait would make the
+// abstraction a synonym for cudarc and guarantee no second backend
+// could satisfy it.
+
+/// The thin driver operations `event.rs` and `stream.rs` need.
+///
+/// Twin of `backend_oxide::drv`, same names and same signatures. Those
+/// two files are backend-neutral except for a handful of raw FFI calls
+/// and two handle types; routing them through this module is what keeps
+/// the crate's UAF and cross-stream-ordering audits in ONE place instead
+/// of forking per vendor.
+pub(crate) mod drv {
+    use crate::{DeviceError, Result};
+    use std::sync::Arc;
+
+    /// Keeps the owning primary context alive for a handle's lifetime.
+    pub(crate) type DeviceHandle = Arc<cudarc::driver::safe::CudaDevice>;
+    /// An owned stream.
+    pub(crate) type StreamHandle = Arc<cudarc::driver::safe::CudaStream>;
+
+    /// Map a context-binding failure. Named so shared code can pass it
+    /// to `map_err` without naming either vendor's error type.
+    pub(crate) fn bind_err(e: cudarc::driver::DriverError) -> DeviceError {
+        DeviceError::Driver(format!("bind_to_thread: {e:?}"))
+    }
+
+    /// Bind `device`'s context to the calling thread.
+    pub(crate) fn device_bind(device: &DeviceHandle) -> Result<()> {
+        device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))
+    }
+
+    /// A new non-blocking stream ordered after all work already
+    /// submitted to the device's default stream.
+    ///
+    /// This is a fork point in the stream DAG: the new stream observes
+    /// everything queued on the default stream at construction time, and
+    /// nothing queued after it.
+    pub(crate) fn fork_default_stream(device: &DeviceHandle) -> Result<StreamHandle> {
+        let stream = device
+            .fork_default_stream()
+            .map_err(|e| DeviceError::Driver(format!("fork_default_stream: {e:?}")))?;
+        // cudarc's `CudaStream` is not `Send`/`Sync` because it holds a
+        // raw `CUstream`. The wrapping `Stream` carries an explicit
+        // `unsafe impl Send + Sync` (the driver permits stream use from
+        // any thread once the context is bound), and the `Arc` only ever
+        // travels inside that wrapper, so the lint's premise does not
+        // hold here.
+        #[allow(clippy::arc_with_non_send_sync)]
+        Ok(Arc::new(stream))
+    }
+
+    /// The raw handle behind an owned stream.
+    pub(crate) fn stream_raw(stream: &StreamHandle) -> cudarc::driver::sys::CUstream {
+        stream.stream
+    }
+
+    /// Create a timing-disabled event. The bridge never measures
+    /// elapsed GPU time, so it does not pay for the timing variant.
+    pub(crate) fn event_create() -> Result<cudarc::driver::sys::CUevent> {
+        cudarc::driver::result::event::create(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        )
+        .map_err(|e| DeviceError::Driver(format!("cuEventCreate: {e:?}")))
+    }
+
+    /// # Safety
+    /// `event` and `stream` must be live and share the bound context.
+    pub(crate) unsafe fn event_record(
+        event: cudarc::driver::sys::CUevent,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<()> {
+        unsafe { cudarc::driver::result::event::record(event, stream) }
+            .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))
+    }
+
+    /// `Ok(true)` when the event has fired, `Ok(false)` while it is
+    /// still in flight.
+    ///
+    /// cudarc reports "still in flight" as `Err(CUDA_ERROR_NOT_READY)`.
+    /// Folding that into `Ok(false)` here is what lets the caller avoid
+    /// grepping for a vendor-specific error variant.
+    ///
+    /// # Safety
+    /// `event` must be live and its context bound.
+    pub(crate) unsafe fn event_query(event: cudarc::driver::sys::CUevent) -> Result<bool> {
+        match unsafe { cudarc::driver::result::event::query(event) } {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                use cudarc::driver::sys::CUresult;
+                if e.0 == CUresult::CUDA_ERROR_NOT_READY {
+                    Ok(false)
+                } else {
+                    Err(DeviceError::Driver(format!("cuEventQuery: {e:?}")))
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// `event` must be live and its context bound.
+    pub(crate) unsafe fn event_synchronize(event: cudarc::driver::sys::CUevent) -> Result<()> {
+        unsafe { cudarc::driver::result::event::synchronize(event) }
+            .map_err(|e| DeviceError::Driver(format!("cuEventSynchronize: {e:?}")))
+    }
+
+    /// # Safety
+    /// `event` must be uniquely owned here and its context bound.
+    pub(crate) unsafe fn event_destroy(event: cudarc::driver::sys::CUevent) {
+        unsafe {
+            let _ = cudarc::driver::result::event::destroy(event);
+        }
+    }
+
+    /// Make `stream` wait for `event` without blocking the host.
+    ///
+    /// # Safety
+    /// Both handles must be live and share the bound context.
+    pub(crate) unsafe fn stream_wait_event(
+        stream: cudarc::driver::sys::CUstream,
+        event: cudarc::driver::sys::CUevent,
+    ) -> Result<()> {
+        unsafe {
+            cudarc::driver::result::stream::wait_event(
+                stream,
+                event,
+                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| DeviceError::Driver(format!("cuStreamWaitEvent: {e:?}")))
+    }
+
+    /// # Safety
+    /// `stream` must be live and its context bound.
+    pub(crate) unsafe fn stream_synchronize(stream: cudarc::driver::sys::CUstream) -> Result<()> {
+        unsafe { cudarc::driver::result::stream::synchronize(stream) }
+            .map_err(|e| DeviceError::Driver(format!("cuStreamSynchronize: {e:?}")))
+    }
+
+    /// Enqueue a host callback on `stream`.
+    ///
+    /// cudarc 0.13 ships no safe wrapper for `cuLaunchHostFunc`, so this
+    /// reaches the raw symbol through `sys::lib()`.
+    ///
+    /// # Safety
+    /// `stream` must be live in the bound context and `user_data` must
+    /// be valid for the trampoline that receives it.
+    pub(crate) unsafe fn launch_host_func(
+        stream: cudarc::driver::sys::CUstream,
+        callback: cudarc::driver::sys::CUhostFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        use cudarc::driver::sys::CUresult;
+        let raw =
+            unsafe { cudarc::driver::sys::lib().cuLaunchHostFunc(stream, callback, user_data) };
+        if raw == CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(DeviceError::Driver(format!("cuLaunchHostFunc: {raw:?}")))
+        }
+    }
+}
+
+/// Marker for the cudarc-backed CUDA backend.
+pub(crate) struct CudaBackend;
+
+impl crate::backend_api::BackendApi for CudaBackend {
+    type Context = DeviceContextInner;
+    type Module = DeviceModuleInner;
+    type Stream = Arc<CudaStream>;
+
+    fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
+        probe_device(device_ordinal)
+    }
+
+    fn driver_cuda_version() -> Result<u32> {
+        driver_cuda_version()
+    }
+}
+
+impl crate::backend_api::DeviceContextApi for DeviceContextInner {
+    fn new(device_ordinal: u32) -> Result<Self> {
+        Self::new(device_ordinal)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.synchronize()
+    }
+
+    fn bind_to_thread(&self) -> Result<()> {
+        self.bind_to_thread()
+    }
+
+    fn record_alloc_event(&self, event: &crate::Event) -> Result<()> {
+        self.record_alloc_event(event)
+    }
+}
+
+impl crate::backend_api::DeviceModuleApi for DeviceModuleInner {
+    type Ctx = DeviceContextInner;
+    type Stream = Arc<CudaStream>;
+
+    fn from_ptx(
+        ctx: &Self::Ctx,
+        ptx: &str,
+        module_name: &str,
+        kernel_names: &[&'static str],
+    ) -> Result<Self> {
+        Self::from_ptx(ctx, ptx, module_name, kernel_names)
+    }
+
+    fn optimal_block_size(&self, ctx: &Self::Ctx, kernel: &str) -> Option<u32> {
+        self.optimal_block_size(ctx, kernel)
+    }
+
+    fn launch_raw_on_stream(
+        &self,
+        ctx: &Self::Ctx,
+        stream: &Self::Stream,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> Result<()> {
+        self.launch_raw_on_stream(ctx, stream, kernel, cfg, args)
+    }
+}
