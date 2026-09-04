@@ -1236,7 +1236,20 @@ impl<'a> Lowerer<'a> {
         // staging region, leaving no gap and no overlap:
         //   spill_cap_off + saved_xmm + saved_gpr + deopt_regs
         //     == frame_size - shadow - stack_arg_reserve - args_stage_size
-        let deopt_regs_base = spill_cap_off + saved_xmm_bytes + saved_gpr_bytes + deopt_regs_bytes;
+        //
+        // ZERO when nothing was reserved, and that is not cosmetic: the stub
+        // reads `deopt_regs_base > 0` as "there is a region to spill into", and
+        // an arithmetic base that happened to be non-zero with no reservation
+        // behind it sent 32 stores over the argument staging area and past it.
+        // This is the mirror image of the hazard the single-pass backend
+        // records in `deopt_spill_region_reserved` -- there an unreserved
+        // region made the base 0 and the stores walked UP over the saved RBP
+        // and the return address. Same class, opposite sign.
+        let deopt_regs_base = if deopt_regs_bytes > 0 {
+            spill_cap_off + saved_xmm_bytes + saved_gpr_bytes + deopt_regs_bytes
+        } else {
+            0
+        };
         debug_assert!(
             deopt_regs_bytes == 0 || deopt_regs_base == args_stage_top_off - args_stage_size,
             "the deopt register image must abut the argument staging region"
