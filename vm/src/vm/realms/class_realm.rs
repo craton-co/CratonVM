@@ -826,6 +826,11 @@ impl Drop for ClassManagerWriteGuard<'_> {
         // `class_manager_write()`/`.read()` itself: the lock this guard held
         // is already gone by this point.
         cratonvm_classloading::drain_pending_class_hooks();
+        // A class definition is the only event that can turn a deferred `new`
+        // site resolvable, and a method holding a retry for one already has a
+        // body — so nothing recompiles it and no other sweep ever looks at it
+        // again. Costs one relaxed load when nothing is held.
+        crate::runtime::interpreter::jit_bridge::resweep_deferred_new_after_class_definition();
     }
 }
 

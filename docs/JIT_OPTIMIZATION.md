@@ -1078,6 +1078,36 @@ CPU per run; the benchmark wall times moved by more than that in both
 directions, which is run-to-run noise on this host, not a result.
 `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` restores the blind grant.
 
+### Holding a retry nobody offers again is the same as spending it
+
+Holding was only half of it. A method that bailed on an unloaded class already
+has a body, so nothing ever compiles it again — and the retry door is only ever
+walked by the method being compiled at that moment. The first sweep was placed
+on the compile door and re-offered *nothing*: `re_offered=0` against `held=21`
+on CratonBench, and on a fixture built to load the class after the bail it held
+four times and never came back.
+
+The event that can change the answer is a class definition, and the place to
+observe it is `ClassManagerWriteGuard::drop` — after the write lock is released,
+beside `drain_pending_class_hooks`, which is there for the same reason. The
+sweep now runs from there across every live VM, and costs one relaxed load
+(`held_deferred_new_count`) when nothing is held.
+
+`bench/DeferredNewReoffer.java` is the fixture that separates the two: the `new`
+sits on a branch warmup never takes, so the class is still unloaded when the hot
+method is compiled, and a later `touch()` loads it.
+
+| | `BLIND=1` (blind grant) | held + re-offered |
+|---|---|---|
+| after the IR build bails | retry spent immediately | retry **held** |
+| second compile | single-pass again, 2492 bytes | — |
+| when the class loads | nothing left to offer | **re-offered** |
+| final body | single-pass, 2492 bytes | **IR, 1495 bytes** |
+
+Same checksum on both arms. This one *is* a capability change rather than
+avoided waste: `make` reaches the optimizing tier, which under the blind grant
+it could not. The size drop is the emitted body, not a timing.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -1226,11 +1256,53 @@ So the named causes of the residual inversion are, in order:
 1. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
    the counter compare, the backedge and the safepoint poll over four
    iterations; the optimizing tier pays all three every iteration.
-2. **Six of nine promoted candidates never reach a register**, and with the
-   census fixed the question "why" is finally answerable rather than
-   guessable. Start with `single_use`, which is by far the largest bucket
-   (13 on this method) and is a policy — `ir_residency_pays_enabled` refuses a
-   value read fewer than twice — not a limitation.
+2. **The loop's values are ENTRY PARAMETERS, and entry parameters cannot be
+   promoted at all.** Traced 2026-09-03, and it is the end of the chain.
+
+`single_use` was the largest bucket (13) and looked like the answer: it refuses
+any value read fewer than twice, counting **static** graph edges. Printing the
+shape first — the lesson from the split miscount immediately above — gave:
+
+```text
+single_use n3 op=Param(0) static_uses=1 loop_weight=10   <- the receiver
+single_use n4 op=Param(1) static_uses=1 loop_weight=10   <- the loop bound
+```
+
+One static use, ten loop-weighted. The rule compares a static count while the
+definition and the uses sit at different loop depths: `this` and `n` are
+defined once at method entry and read every iteration. `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`
+generalises the test to `uses_frequency >= 2 x definition_frequency`, which
+reduces exactly to `use_count >= 2` at depth 0.
+
+**It admits them past that gate and residency does not move** — `resident=3`
+either way; they land in `no_alloc`/`spilled` instead. The policy was never the
+binding constraint, because the allocator had already declined them.
+
+**`MachineModel::pin_entry_params` pins every `Param` to its incoming ABI
+register**, and `allocate_linear_scan` skips a pinned value outright
+(`regalloc.rs`, `live.pinned[id]`). The ABI registers are caller-saved and are
+not in `IR_LOWER_LS_GPRS` (RBX, R12–R15), so an entry parameter can never be
+promoted into the callee-saved file the loop needs. It reaches the loop through
+its frame slot, every iteration, by construction.
+
+The baseline tier does the one thing this tier does not — it copies parameters
+into callee-saved registers in the prologue:
+
+```text
+39: mov r15,rsi        ; this -> r15
+3c: mov r14,rdx        ; n    -> r14
+```
+
+**So the fix is a prologue copy, not an allocator heuristic.** The optimizing
+tier needs to move loop-live parameters out of their ABI registers into the
+allocatable callee-saved file at entry, and tell the allocator that is where
+they live. Until it does, no residency policy can reach them — which is why
+three successive candidates (splits, the null check, the single-use rule) each
+measured zero on this loop.
+
+The loop-weight rule is kept, default OFF, because it is a correct
+generalisation that will matter once the parameters can be promoted at all —
+and because its own measurement is on record as not moving this workload.
 
 What it is **not**: splits, register pressure at the file's edge, code size
 (the optimizing tier emits *less* code here), or the null check.

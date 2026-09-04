@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-330 tokens.
+332 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -722,6 +722,7 @@ export inherited from a parent shell.
 | `call-frame-dedupe` | `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `deferred-new-retry-blind` | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND` |
+| `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `supersede-epoch-skip-useless` | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
@@ -919,7 +920,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-131 tokens.
+132 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1044,6 +1045,7 @@ export inherited from a parent shell.
 | `zgc-gen-nursery-percent` | `CRATONVM_ZGC_GEN_NURSERY_PERCENT` |
 | `zgc-alloc-trigger` | `CRATONVM_ZGC_ALLOC_TRIGGER` |
 | `zgc-pause-target-ms` | `CRATONVM_ZGC_PAUSE_TARGET_MS` |
+| `zgc-bitmap-bounds` | `CRATONVM_ZGC_BITMAP_BOUNDS` |
 | `zgc-sweep-header-zero` | `CRATONVM_ZGC_SWEEP_HEADER_ZERO` |
 | `zgc-sweep-dead-runs` | `CRATONVM_ZGC_SWEEP_DEAD_RUNS` |
 | `zgc-mark-ctx-direct` | `CRATONVM_ZGC_MARK_CTX_DIRECT` |
