@@ -132,18 +132,6 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// the neighbour's.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
-        "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
-    ),
-    (
-        "docs/known-issues/jdk-only/G31-1-astype-and-the-verifier-that-was-never-asked-20260817.md",
-        "status block says: --tests` clean), but **no binary carrying them has ever executed**. This lane",
-    ),
-    (
-        "docs/known-issues/jdk-only/G44-1-the-session-the-verifier-was-handed-20260817.md",
-        "status block says: predates `aed6a3b73`, so no binary containing either this lane's changes or the",
-    ),
-    (
         "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
         "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
     ),

@@ -21,6 +21,45 @@ NOMINATION in §6.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04.** The status block reads *"After: NOT
+> MEASURED, and could not be."* §5's registrar table has now been re-taken from
+> a `--dump-native-registry` run on a binary built from this tree, and it is
+> **unchanged again — only the line numbers moved**, which is exactly what §5
+> itself found when it re-measured against `G35-1` §3 three weeks ago:
+>
+> ```text
+>                        G44-1 §5 (9ae371468)            this tree (2026-09-04)
+> getCipherSuite         net_phase_e:8439        false   net_phase_e:9656        false
+>                        http_url_connection:445 TRUE    http_url_connection:665 TRUE
+> getServerCertificates  net_phase_e:8447        false   net_phase_e:9669        false
+>                        http_url_connection:405 TRUE    http_url_connection:625 TRUE
+> getLocalCertificates   net_phase_e:8470        false   net_phase_e:9692        false
+>                        http_url_connection:433 TRUE    http_url_connection:653 TRUE
+> getPeerPrincipal       net_phase_e:8488        false   net_phase_e:9710        false
+>                        http_url_connection:466 TRUE    http_url_connection:695 TRUE
+> getLocalPrincipal      net_phase_e:8501        false   net_phase_e:9728        false
+>                        http_url_connection:495 TRUE    http_url_connection:724 TRUE
+> getSSLSession          net_phase_e:8519        TRUE    net_phase_e:9746        TRUE
+> ```
+>
+> Five overwritten, one keeping its slot, same six rows, same directions. §5's
+> decision — *"the registrar collapse: re-measured, and NOT taken"* — rests on
+> that table, and the table has survived three weeks of churn intact. `G7-1`
+> §5.1 states the same finding from the other side; both now hold on one dump.
+>
+> The vectors this record's family is measured by are green in both modes in a
+> full 129-vector run: `RSslLiveSession` (95 checks), `RJdkX509Intercept`,
+> `RJdkSecurity`, `RCrypto`, `RJdkNet`, `RJdkAsyncChannel`.
+>
+> **What this does NOT verify, and it is the substance of §§1-3.** The subject
+> is *the session the verifier was handed*: §1's `huc_verify_hostname` minting
+> its own session, §1a's row-by-row list of what N1 must not disturb, §2's
+> `disconnect()` never tearing the connection down, §3's drain hook one file
+> over. **None of that is exercised here.** An ownership dump says which
+> function answers a call, not what it hands a hostname verifier, and no HTTPS
+> fixture was run. §4's argument that widening the 4-field client session is the
+> WRONG fix is untouched, as is §8, *"What this lane could not settle"*.
+
 ## 0. The headline
 
 | | before (MEASURED, `9ae371468`) | after (PREDICTED) |
