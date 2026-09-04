@@ -1078,6 +1078,36 @@ CPU per run; the benchmark wall times moved by more than that in both
 directions, which is run-to-run noise on this host, not a result.
 `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` restores the blind grant.
 
+### Holding a retry nobody offers again is the same as spending it
+
+Holding was only half of it. A method that bailed on an unloaded class already
+has a body, so nothing ever compiles it again — and the retry door is only ever
+walked by the method being compiled at that moment. The first sweep was placed
+on the compile door and re-offered *nothing*: `re_offered=0` against `held=21`
+on CratonBench, and on a fixture built to load the class after the bail it held
+four times and never came back.
+
+The event that can change the answer is a class definition, and the place to
+observe it is `ClassManagerWriteGuard::drop` — after the write lock is released,
+beside `drain_pending_class_hooks`, which is there for the same reason. The
+sweep now runs from there across every live VM, and costs one relaxed load
+(`held_deferred_new_count`) when nothing is held.
+
+`bench/DeferredNewReoffer.java` is the fixture that separates the two: the `new`
+sits on a branch warmup never takes, so the class is still unloaded when the hot
+method is compiled, and a later `touch()` loads it.
+
+| | `BLIND=1` (blind grant) | held + re-offered |
+|---|---|---|
+| after the IR build bails | retry spent immediately | retry **held** |
+| second compile | single-pass again, 2492 bytes | — |
+| when the class loads | nothing left to offer | **re-offered** |
+| final body | single-pass, 2492 bytes | **IR, 1495 bytes** |
+
+Same checksum on both arms. This one *is* a capability change rather than
+avoided waste: `make` reaches the optimizing tier, which under the blind grant
+it could not. The size drop is the emitted body, not a timing.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
