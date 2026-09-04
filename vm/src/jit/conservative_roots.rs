@@ -2952,20 +2952,48 @@ fn shadow_window_from_frame(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
 ) -> Option<(usize, usize)> {
+    shadow_window_from_frame_why(rbp, cm)
+        .or_else(|e| {
+            if band_thread_window_disabled() {
+                Err(e)
+            } else {
+                shadow_window_for_thread_why(cm)
+            }
+        })
+        .ok()
+}
+
+/// `shadow_window_from_frame`, but NAMING the refusal instead of erasing it.
+///
+/// §25.4. The band reporter printed `published=0` on all 272 of a run's reports
+/// and that read as "the shadow push declined to publish these oops" -- a
+/// codegen fact, pointing at `collect_live_oop_homes`. It was not: the window
+/// was never resolved, so `published_shadow_values` had nothing to read and
+/// returned an empty set. `Option` folds ten distinct refusals and a genuinely
+/// empty stack into one indistinguishable `None`, and those point at opposite
+/// repairs -- a missing reserved slot is a codegen gap, a foreign thread
+/// pointer is a frame mis-attribution, a size mismatch is a torn read.
+///
+/// The wrapper above is the only caller that discards the reason, so the
+/// diagnostic cannot drift away from the path actually taken.
+fn shadow_window_from_frame_why(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+) -> Result<(usize, usize), &'static str> {
     let thr_off = cm.shadow_thread_slot_off;
     if thr_off <= 0 || cm.shadow_off_in_thread <= 0 || rbp < thr_off as usize {
-        return None;
+        return Err("no-thread-slot");
     }
     let slot = rbp - thr_off as usize;
     if slot & 0x7 != 0 {
-        return None;
+        return Err("frame-slot-misaligned");
     }
     // SAFETY: `slot` is an aligned address inside this thread's own live
     // compiled frame, bounded by the same frame-size check the caller applied
     // before calling here.
     let thread_ptr = unsafe { (slot as *const usize).read() };
     if thread_ptr == 0 || thread_ptr & 0x7 != 0 {
-        return None;
+        return Err("thread-null-or-misaligned");
     }
     // That word is only a thread pointer when `cm` really describes the frame
     // at `rbp`. Callers are expected to have excluded the mis-attribution case
@@ -2978,11 +3006,61 @@ fn shadow_window_from_frame(
     // entered JIT code, where there is no frame to mis-attribute).
     let current = crate::jit::helpers::current_jit_thread_ptr() as usize;
     if current != 0 && thread_ptr != current {
-        return None;
+        return Err("foreign-thread");
     }
-    let ss = thread_ptr.checked_add(cm.shadow_off_in_thread as usize)?;
+    shadow_window_at(thread_ptr, cm.shadow_off_in_thread)
+}
+
+/// The thread's shadow window WITHOUT going through a frame slot.
+///
+/// §25.4's repair. `shadow_window_from_frame_why` reads the cached thread
+/// pointer out of `[rbp - shadow_thread_slot_off]`, and `ir_lower`'s
+/// `finish_lazy_thread_fetch` ERASES the fetch that fills that slot whenever
+/// the method publishes nothing (`!shadow_pushed_any`) -- so a leaf that has no
+/// oops to push leaves the slot zero BY DESIGN. That is a correct optimisation;
+/// the band verifier's use of it was not. It resolved the window from the
+/// INNERMOST frame alone, and when that frame was such a leaf the window came
+/// back `None`, `published_shadow_values` returned an empty set, and every oop
+/// in every OUTER frame read as unpublished. Measured on `CoverageBench`: 228
+/// of 229 pauses declined relocation with `compiled-frame-oop-not-published`
+/// while `main` had pushed 3 of its 3 mapped slots and `alloc` -- the innermost
+/// frame, whose map names nothing -- was the only reason the window was lost.
+///
+/// The shadow stack is per-THREAD, so the frame slot was only ever a cache.
+/// When a thread is installed, ask it directly. The frame path stays for the
+/// case that has no installed thread (unit tests, and threads that never
+/// entered JIT code), which is also the only case where the two could disagree
+/// -- `shadow_window_from_frame_why` refuses a `thread_ptr` that is not
+/// `current` anyway.
+fn shadow_window_for_thread_why(
+    cm: &cratonvm_jit::CompiledMethod,
+) -> Result<(usize, usize), &'static str> {
+    if cm.shadow_off_in_thread <= 0 {
+        return Err("no-shadow-offset");
+    }
+    let current = crate::jit::helpers::current_jit_thread_ptr() as usize;
+    if current == 0 {
+        return Err("no-installed-thread");
+    }
+    if current & 0x7 != 0 || current < 0x1_0000 {
+        return Err("thread-null-or-misaligned");
+    }
+    shadow_window_at(current, cm.shadow_off_in_thread)
+}
+
+/// The shared half: validate `thread_ptr + shadow_off` as a `ShadowStack` and
+/// return its `[base, top)` window. Both resolvers end here, so a window
+/// reached through the frame cache and one reached through the installed
+/// thread are held to identical invariants.
+fn shadow_window_at(
+    thread_ptr: usize,
+    shadow_off: i32,
+) -> Result<(usize, usize), &'static str> {
+    let ss = thread_ptr
+        .checked_add(shadow_off as usize)
+        .ok_or("shadow-addr-overflow")?;
     if ss & 0x7 != 0 {
-        return None;
+        return Err("shadow-addr-misaligned");
     }
     // `thread_ptr` came out of a raw frame slot and is trustworthy ONLY when
     // `cm` really describes the frame at `rbp`. It does not always: an
@@ -3014,22 +3092,25 @@ fn shadow_window_from_frame(
         Some(unsafe { (at as *const usize).read() })
     };
     if thread_ptr < 0x1_0000 {
-        return None;
+        return Err("thread-addr-low");
     }
-    let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)?;
-    let end = read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET)?;
-    let base = read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET)?;
+    let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)
+        .ok_or("top-unreadable")?;
+    let end = read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET)
+        .ok_or("end-unreadable")?;
+    let base = read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET)
+        .ok_or("base-unreadable")?;
     const SHADOW_BYTES: usize = cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS * 8;
     if base < 0x1_0000 || base & 0x7 != 0 || top & 0x7 != 0 || end & 0x7 != 0 {
-        return None;
+        return Err("fields-misaligned");
     }
     if end.checked_sub(base) != Some(SHADOW_BYTES) {
-        return None;
+        return Err("buffer-size-mismatch");
     }
     if top < base || top > end {
-        return None;
+        return Err("top-out-of-range");
     }
-    Some((base, top))
+    Ok((base, top))
 }
 
 /// Collect the values currently published on the shadow window `[base, top)`.
@@ -3164,7 +3245,13 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
             // its frames is live, and a resolved callee is kept alive by the
             // live frame whose return address resolved it.
             let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
-            let published = published_shadow_values(shadow_window_from_frame(rbp, cm));
+            // §25.4 -- keep the WINDOW, not just the values read out of it.
+            // `published_shadow_values(None)` and a genuinely empty window both
+            // return an empty set, so `published=0` alone cannot say whether
+            // publication was declined or the window could not be resolved at
+            // all. Those point at opposite repairs.
+            let window = shadow_window_from_frame(rbp, cm);
+            let published = published_shadow_values(window);
             let mut frames = 0usize;
             while frames < 4096 {
                 frames += 1;
@@ -3182,7 +3269,9 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 let live_hi = moving_young_frame_live_hi(rbp, cm);
                 if band_has_unpublished_young_word(rbp, frame_size, cm, live_hi, &published) {
                     if band_dbg() {
-                        report_unpublished_band_words(rbp, frame_size, cm, live_hi, &published);
+                        report_unpublished_band_words(
+                            rbp, frame_size, cm, live_hi, &published, window,
+                        );
                     }
                     unpublished = true;
                     break;
@@ -3263,7 +3352,21 @@ fn report_unpublished_band_words(
     cm: &cratonvm_jit::CompiledMethod,
     live_hi: Option<i32>,
     published: &std::collections::HashSet<usize>,
+    // The shadow window `published` was read out of, resolved from the
+    // INNERMOST frame of this chain. `None` means `shadow_window_from_frame`
+    // declined -- no reserved thread slot, a misaligned or foreign thread
+    // pointer -- which is a different fact from a window that resolved and held
+    // nothing, and the `published` set cannot tell the two apart.
+    window: Option<(usize, usize)>,
 ) {
+    let win = match window {
+        None => format!(
+            "unresolved(frame={} thread={})",
+            shadow_window_from_frame_why(rbp, cm).err().unwrap_or("ok"),
+            shadow_window_for_thread_why(cm).err().unwrap_or("ok"),
+        ),
+        Some((base, top)) => format!("0x{base:x}..0x{top:x}({})", top.saturating_sub(base) / 8),
+    };
     let map_slots = frame_active_map_slots(rbp, cm);
     let lo = rbp - frame_size;
     let mut addr = (lo + 7) & !7usize;
@@ -3338,6 +3441,40 @@ fn report_unpublished_band_words(
                     }
                 }
             };
+            // §25.3's PROBE -- the safepoint KIND, printed as
+            // `pushed/named` per map matching the resolved id.
+            //
+            // Four candidate explanations for an `in_map=true` word that the
+            // shadow push did not publish were eliminated in §25.1-.2, and the
+            // structural fact that survived is that publication is CALL-SCOPED:
+            // `emit_shadow_push` runs on the path into a call, and
+            // `emit_shadow_reload` pops the homes again at the top of
+            // `emit_oop_map_for_safepoint`. A safepoint that is not call-shaped
+            // -- a loop poll, a re-entry -- therefore carries a map naming N
+            // slots while nothing was ever pushed for it. The band verifier's
+            // obligation has no such scope: it asks about EVERY safepoint.
+            //
+            // `0/N` on the reporting safepoints is that answer, and it puts the
+            // repair in the PAIRING (publish for poll-shaped safepoints too, or
+            // let the verifier consult the map instead of the push) rather than
+            // in either side alone. A nonzero left-hand number refutes it and
+            // sends the search back to `collect_live_oop_homes`.
+            let shadow_pushed: String = match sp_id {
+                None => "n/a".to_string(),
+                Some(id) => {
+                    let v: Vec<String> = cm
+                        .oop_maps
+                        .iter()
+                        .filter(|m| m.bytecode_pc == id)
+                        .map(|m| format!("{}/{}", m.shadow_pushed, m.frame_slot_offsets.len()))
+                        .collect();
+                    if v.is_empty() {
+                        "none".to_string()
+                    } else {
+                        v.join(",")
+                    }
+                }
+            };
             // THE DISCRIMINATOR for a `no-map-for-id` frame, and the reason
             // this dump exists at all.
             //
@@ -3371,8 +3508,8 @@ fn report_unpublished_band_words(
                 );
             }
             eprintln!(
-                "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} \
+                "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} window={win} \
+                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} shadow_pushed={shadow_pushed} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
@@ -3712,6 +3849,20 @@ fn band_liveness_screen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN")
+            .is_some()
+    })
+}
+
+/// Kill switch for §25.4's thread-pointer fallback, so its effect is one
+/// binary's A/B rather than two builds.
+///
+/// Off restores the pre-fix behaviour: the shadow window is resolved from the
+/// innermost frame's cached thread pointer alone, and a no-publish leaf there
+/// costs the whole chain its coverage proof.
+fn band_thread_window_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW")
             .is_some()
     })
 }
@@ -10221,6 +10372,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.fully_oop_covered = true;
         cm.fully_shadow_covered = true;
@@ -10258,6 +10410,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         // The direct-call shape: shadow complete, frame-slot subset incomplete.
         cm.fully_shadow_covered = true;
@@ -10298,6 +10451,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.fully_shadow_covered = false;
         // `fully_oop_covered` true and shadow false is the inverse of the pair
@@ -10414,6 +10568,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
@@ -10426,6 +10581,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
@@ -10438,6 +10594,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -10497,6 +10654,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         assert!(cm.has_precise_oop_maps());
 

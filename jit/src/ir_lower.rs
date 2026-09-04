@@ -1959,6 +1959,8 @@ impl<'a> Lowerer<'a> {
             // independent check of that, and must not be read as one.
             non_oop_stack_slots: self.prim_slot_offsets.clone(),
             stack_marks_exact: true,
+            // The IR tier emits no shadow push of its own.
+            shadow_pushed: 0,
         });
     }
 
