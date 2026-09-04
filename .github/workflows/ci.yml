@@ -226,6 +226,38 @@ jobs:
       # Forbid reintroduction of bring-up eprintln!/println! markers
       # ([WP*], [DIAG*], [TRACE*], ...) in landed code.
       # Bash-only script, so gate to the Linux leg.
+      - name: Clippy
+        # `[workspace.lints]` in Cargo.toml already silences the noise lints
+        # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
+        # empty_loop / while_let_loop), so this check measures the repository's
+        # configured lint policy rather than the full default lint set.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # THE CORRECTNESS GATES RUN FIRST, and the policy ratchets below them.
+      #
+      # `Clippy --workspace --all-targets` is the only thing in this file that
+      # compiles TEST targets, and `Test` is the only thing that runs them.
+      # GitHub Actions skips every later step of a job once one fails, so any
+      # check standing in front of those two can switch them off -- silently,
+      # because the job's annotation names only the step that failed.
+      #
+      # That has now happened twice. The `fmt` job's header records the first:
+      # a whole-tree `cargo fmt --all --check` failed on every push and took the
+      # compile gate with it for weeks, which is how `084098bce` landed five
+      # `#[test]` functions applying `?` to a `Result` while declaring `-> ()`.
+      # Splitting `fmt` into its own job fixed that instance and left the shape
+      # intact: four policy steps still stood in front, and on 2026-09-04 the
+      # flag-surface guard went red -- a bench reading `SWEEP_BENCH_ROUNDS`
+      # through `std::env::var` -- and masked the gate again, in the same window
+      # an `OopMapEntry` field left two test files unable to compile on `dev`.
+      #
+      # Ordering is the fix rather than more jobs: the ratchets below need the
+      # same `Build` this job already paid for, and a separate job would pay for
+      # it twice. They still run, and still fail the build; they simply no
+      # longer stand in front of "does it compile" and "do the tests pass".
       - name: Forbid debug-trace prints
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -260,15 +292,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python tools/check_markdown_links.py
 
-      - name: Clippy
-        # `[workspace.lints]` in Cargo.toml already silences the noise lints
-        # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
-        # empty_loop / while_let_loop), so this check measures the repository's
-        # configured lint policy rather than the full default lint set.
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
 
       # THE PRODUCER FOR CRATONVM_REQUIRE_E2E. Until this step existed, nothing
       # under .github/workflows/ mentioned the variable at all.

@@ -342,35 +342,27 @@ fn t1_jit_entry_guard_with_compiled_is_callable() {
 /// This test lives in the vm crate to keep the JIT crate's tests free
 /// of VM-level types; the round-trip is what T1.1.a adds over the
 /// pre-existing precise-infra.
+/// An `OopMapEntry` naming only what these tests actually assert about: the
+/// safepoint's PC and the slots recorded at it.
+///
+/// The tests used to build it with a struct literal naming every field, which
+/// meant every field ADDED to `OopMapEntry` broke a test with no opinion about
+/// it -- `shadow_pushed` left this file and `gc/tests/phase_h_integration.rs`
+/// unable to compile on `dev`. `OopMapEntry::new` already supplies the
+/// documented defaults.
+fn oop_map_at(native_pc_offset: u32, frame_slot_offsets: Vec<i16>) -> cratonvm_jit::OopMapEntry {
+    let mut e = cratonvm_jit::OopMapEntry::new(native_pc_offset);
+    e.frame_slot_offsets = frame_slot_offsets;
+    e
+}
+
 #[test]
 fn t1_oop_map_round_trip_in_compiled_method() {
     use cratonvm_jit::OopMapEntry;
     // Minimum: build two entries with different pc offsets, verify the
     // find_oop_map_for_pc binary search returns the right one.
-    let entry_a = OopMapEntry {
-        bytecode_pc: 0,
-        native_pc_offset: 0x40,
-        frame_slot_offsets: vec![-8i16, -16],
-        moving_young_coverage_complete: false,
-        live_frame_hi: 0,
-        local_oop_mask: None,
-        num_locals: 0,
-        inline_local_scopes: Vec::new(),
-        non_oop_stack_slots: Vec::new(),
-        stack_marks_exact: false,
-    };
-    let entry_b = OopMapEntry {
-        bytecode_pc: 0,
-        native_pc_offset: 0x80,
-        frame_slot_offsets: vec![-8i16, -24, -32],
-        moving_young_coverage_complete: false,
-        live_frame_hi: 0,
-        local_oop_mask: None,
-        num_locals: 0,
-        inline_local_scopes: Vec::new(),
-        non_oop_stack_slots: Vec::new(),
-        stack_marks_exact: false,
-    };
+    let entry_a = oop_map_at(0x40, vec![-8i16, -16]);
+    let entry_b = oop_map_at(0x80, vec![-8i16, -24, -32]);
     // Sanity on the entry constructors themselves.
     assert_eq!(entry_a.slot_count(), 2);
     assert_eq!(entry_b.slot_count(), 3);
@@ -426,42 +418,9 @@ fn t1_oop_map_end_to_end_push_and_find() {
     // Simulate several safepoints in a fake method. Real codegen
     // records monotonically increasing native_pc_offsets.
     let entries = vec![
-        OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: 0x10,
-            frame_slot_offsets: vec![-8, -16],
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        },
-        OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: 0x20,
-            frame_slot_offsets: vec![-8, -24],
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        },
-        OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: 0x40,
-            frame_slot_offsets: vec![-16, -32, -40],
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        },
+        oop_map_at(0x10, vec![-8, -16]),
+        oop_map_at(0x20, vec![-8, -24]),
+        oop_map_at(0x40, vec![-16, -32, -40]),
     ];
     // slot counts must round-trip
     assert_eq!(entries[0].slot_count(), 2);
@@ -486,42 +445,12 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
     // (inside inlined callee body), 0x50 (after callee returns).
     // Each has a different set of live oops.
     let maps = vec![
-        OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: 0x10,
-            frame_slot_offsets: vec![-8], // caller's `this`
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        },
-        OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: 0x30,
-            frame_slot_offsets: vec![-8, -24], // caller's this + callee's arg
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        },
-        OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: 0x50,
-            frame_slot_offsets: vec![-8, -48], // caller's this + return value
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        },
+        // caller's `this`
+        oop_map_at(0x10, vec![-8]),
+        // caller's `this` + the callee's arg
+        oop_map_at(0x30, vec![-8, -24]),
+        // caller's `this` + the return value
+        oop_map_at(0x50, vec![-8, -48]),
     ];
     // Each entry is independent and addressable by native_pc_offset.
     let pcs: Vec<u32> = maps.iter().map(|m| m.native_pc_offset).collect();
@@ -559,18 +488,7 @@ fn t1_oop_map_property_random_slot_sets_round_trip() {
             let raw = -((((next_u32() & 0x1F) + 1) * 8) as i32);
             slots.push(raw as i16);
         }
-        entries.push(OopMapEntry {
-            bytecode_pc: 0,
-            native_pc_offset: pc,
-            frame_slot_offsets: slots,
-            moving_young_coverage_complete: false,
-            live_frame_hi: 0,
-            local_oop_mask: None,
-            num_locals: 0,
-            inline_local_scopes: Vec::new(),
-            non_oop_stack_slots: Vec::new(),
-            stack_marks_exact: false,
-        });
+        entries.push(oop_map_at(pc, slots));
     }
     // Every entry is addressable + its slot list is preserved.
     for e in &entries {
@@ -1098,18 +1016,8 @@ fn t1_aarch64_oop_map_data_shape() {
     use cratonvm_jit::OopMapEntry;
     // Representative entry matching what the ARM64 backend emits at
     // a safepoint in a method with one oop at [fp - 16].
-    let entry = OopMapEntry {
-        bytecode_pc: 0,
-        native_pc_offset: 0x14, // a representative byte offset, NOT a count × 4
-        frame_slot_offsets: vec![-16],
-        moving_young_coverage_complete: false,
-        live_frame_hi: 0,
-        local_oop_mask: None,
-        num_locals: 0,
-        inline_local_scopes: Vec::new(),
-        non_oop_stack_slots: Vec::new(),
-        stack_marks_exact: false,
-    };
+    // 0x14 is a representative byte offset, NOT a count x 4.
+    let entry = oop_map_at(0x14, vec![-16]);
     assert_eq!(entry.slot_count(), 1);
     assert_eq!(entry.frame_slot_offsets[0], -16);
     // The data shape is shared across both backends.

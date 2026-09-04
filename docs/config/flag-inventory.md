@@ -1335,7 +1335,9 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_CALL_VIRTUAL` | JIT | `CRATONVM_JIT=ir-call-virtual` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_COLD_ARG_STAGE` | JIT | `CRATONVM_JIT=ir-cold-arg-stage` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_CONST_IMM` | JIT | `CRATONVM_JIT=ir-const-imm` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_DEOPT_REGS` | JIT | `CRATONVM_JIT=ir-deopt-regs` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_DIRECT_CALL` | JIT | `CRATONVM_JIT=ir-direct-call` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_DROP_PHI_HOME` | JIT | `CRATONVM_JIT=ir-drop-phi-home` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_FP` | JIT | `CRATONVM_JIT=ir-fp` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_IR_FUSED_BRANCH` | JIT | `CRATONVM_JIT=ir-fused-branch` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_GC_POINT_MAPS` | JIT | `CRATONVM_JIT=ir-gc-point-maps` | default-on | on | behaviour | snapshot | jit |

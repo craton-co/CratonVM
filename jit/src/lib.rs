@@ -38709,7 +38709,7 @@ mod layout_constant_inventory {
 
     /// `(file, counts)` where `counts[i]` is the number of code uses of
     /// `LAYOUT_CONSTANTS[i]` in that file.
-    const INVENTORY: [(&str, [usize; 8]); 2] = [
+    const INVENTORY: [(&str, [usize; 8]); 3] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
         // two offset closures — `legacy()` (header-plus-cell, then the ref or
         // int-category payload offset inside that cell: one use of each) and
@@ -38855,12 +38855,22 @@ mod layout_constant_inventory {
         // cell it just proved is or is not written. No new EMISSION site: the
         // guard itself bakes an epoch address and a count, not a displacement.
         ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
+        // x64/objects.rs, added 2026-09-04. It bakes object-header
+        // displacements exactly as the two files above do -- the compact and
+        // legacy reference-store cell addresses, the array header, the inline
+        // TLAB `new` -- and was covered by NEITHER tripwire: the `x64.rs` scan
+        // matches only the `<CONST> as <ty>` cast form, and this inventory
+        // listed two files. The gap was found the honest way, by adding a
+        // legacy emission site there on 2026-09-02 and having to record it by
+        // hand in `header-shrink.md` because nothing counted it.
+        ("objects.rs", [8, 0, 3, 0, 2, 0, 2, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
         match file {
             "lib.rs" => include_str!("lib.rs"),
             "ir_lower.rs" => include_str!("ir_lower.rs"),
+            "objects.rs" => include_str!("x64/objects.rs"),
             other => panic!("no source registered for {other}"),
         }
     }
