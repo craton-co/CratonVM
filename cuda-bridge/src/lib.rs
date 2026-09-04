@@ -216,14 +216,12 @@ impl DeviceContext {
 /// of kernel identifiers (tens to low hundreds), so this bound is far
 /// above any legitimate need while capping the worst case at a fixed,
 /// bounded amount of leaked memory (≈ this many short boxed strings).
-#[cfg(feature = "cuda")]
 const MAX_INTERNED_KERNEL_NAMES: usize = 4096;
 
 /// `'static` sentinel returned once the interner is saturated. It is a
 /// deliberately invalid kernel name: any `get_func` lookup against it
 /// fails with [`DeviceError::KernelNotFound`] (a clean, surfaced error)
 /// rather than silently growing the process heap without bound.
-#[cfg(feature = "cuda")]
 const INTERN_OVERFLOW_SENTINEL: &str = "__cratonvm_kernel_name_intern_overflow__";
 
 /// Process-wide kernel-name interner.
@@ -246,7 +244,6 @@ const INTERN_OVERFLOW_SENTINEL: &str = "__cratonvm_kernel_name_intern_overflow__
 /// instead of leaking further; the subsequent kernel lookup fails
 /// cleanly with `KernelNotFound` rather than corrupting state or growing
 /// the heap. The cap is far above any legitimate kernel-name count.
-#[cfg(feature = "cuda")]
 fn intern_kernel_name(name: &str) -> &'static str {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -353,16 +350,18 @@ impl DeviceModule {
         // name is interned through a process-wide dedup cache so a given
         // distinct name is leaked at most once; repeat loads of the same
         // kernel name reuse the existing `'static` slot.
-        #[cfg(feature = "cuda")]
-        {
-            let static_names: Vec<&'static str> =
-                kernel_names.iter().map(|n| intern_kernel_name(n)).collect();
-            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, &static_names).map(Self)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, kernel_names).map(Self)
-        }
+        //
+        // AUDIT 2026-09-04: this used to be two cfg-gated bodies -- the
+        // CUDA one interning, the stub one passing the borrowed slice
+        // straight through, because `backend_stub::from_ptx` took
+        // `&[&str]` where `backend_cuda`'s took `&[&'static str]`. That
+        // divergence was invisible (only one module compiles per build)
+        // and meant the stub accepted strictly more than the real
+        // backend. `backend_api::DeviceModuleApi` now fixes the stricter
+        // signature for every backend, so there is one body.
+        let static_names: Vec<&'static str> =
+            kernel_names.iter().map(|n| intern_kernel_name(n)).collect();
+        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, &static_names).map(Self)
     }
 
     /// Build a 1-D elementwise [`LaunchConfig`] for `kernel` sized to
@@ -1413,6 +1412,10 @@ impl<T: DeviceElem> DeviceBuffer<T> {
 }
 
 // ── Backend selection ────────────────────────────────────────────────
+
+/// The contract both backends satisfy. See `backend.rs` for what is on
+/// it, what is deliberately off it, and the drift it already caught.
+pub(crate) mod backend_api;
 
 #[cfg(feature = "cuda")]
 mod backend_cuda;

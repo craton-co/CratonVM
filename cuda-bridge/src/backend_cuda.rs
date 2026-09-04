@@ -1384,3 +1384,77 @@ impl<T: Copy> Drop for PinnedHostInner<T> {
         }
     }
 }
+
+// ── Backend contract ─────────────────────────────────────────────────
+//
+// See `backend_api` for what is on this contract and what is
+// deliberately off it. The inherent methods `device()`, `event_pool()`,
+// `alloc_bytes()` and `slice_from_raw()` are NOT here: they return
+// `Arc<CudaDevice>`, `Arc<EventPool>`, `CUdeviceptr` and `CudaSlice<T>`,
+// which are cudarc types. Putting them on the trait would make the
+// abstraction a synonym for cudarc and guarantee no second backend
+// could satisfy it.
+
+/// Marker for the cudarc-backed CUDA backend.
+pub(crate) struct CudaBackend;
+
+impl crate::backend_api::BackendApi for CudaBackend {
+    type Context = DeviceContextInner;
+    type Module = DeviceModuleInner;
+    type Stream = Arc<CudaStream>;
+
+    fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
+        probe_device(device_ordinal)
+    }
+
+    fn driver_cuda_version() -> Result<u32> {
+        driver_cuda_version()
+    }
+}
+
+impl crate::backend_api::DeviceContextApi for DeviceContextInner {
+    fn new(device_ordinal: u32) -> Result<Self> {
+        Self::new(device_ordinal)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.synchronize()
+    }
+
+    fn bind_to_thread(&self) -> Result<()> {
+        self.bind_to_thread()
+    }
+
+    fn record_alloc_event(&self, event: &crate::Event) -> Result<()> {
+        self.record_alloc_event(event)
+    }
+}
+
+impl crate::backend_api::DeviceModuleApi for DeviceModuleInner {
+    type Ctx = DeviceContextInner;
+    type Stream = Arc<CudaStream>;
+
+    fn from_ptx(
+        ctx: &Self::Ctx,
+        ptx: &str,
+        module_name: &str,
+        kernel_names: &[&'static str],
+    ) -> Result<Self> {
+        Self::from_ptx(ctx, ptx, module_name, kernel_names)
+    }
+
+    fn optimal_block_size(&self, ctx: &Self::Ctx, kernel: &str) -> Option<u32> {
+        self.optimal_block_size(ctx, kernel)
+    }
+
+    fn launch_raw_on_stream(
+        &self,
+        ctx: &Self::Ctx,
+        stream: &Self::Stream,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> Result<()> {
+        self.launch_raw_on_stream(ctx, stream, kernel, cfg, args)
+    }
+}
