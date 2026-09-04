@@ -79,9 +79,31 @@ no instrument that would have made the omission visible: with the arm off the
 census reads `sites=0`, which is indistinguishable from "this collector has no
 such arm".
 
-## Should it be default-on?
+## Default ON since 2026-09-04
 
-The evidence says yes and this change does **not** do it. What is established:
+It is now the default. The two things this page said were missing have been
+supplied:
+
+- **A 228-program differential soak under G1**, comparing the new default
+  against `CRATONVM_G1_INLINE_BARRIER=0`, with each workload first run twice at
+  the default to prove it is reproducible at all: **166 agree, 2 divergent, 43
+  non-deterministic, 17 already failing.** Both divergences were examined —
+  `CpuClockCheck` is a clock probe (`wall=500,0ms` against `500,1ms`), and
+  `InvokeAllCount` returned 127 once on the *barrier-off* arm while the
+  regression suite was running concurrently, then passed 5 of 5 on re-run in
+  both arms. rc=127 is the classic failed-exec code. Zero semantic divergences.
+- **The remembered-set audit** (`CRATONVM_G1_DBG_RSET=1`), which is the check
+  that would catch the failure mode the WildFly card-miss was:
+  **6,392 audited collection cycles, 3,237,469,944 edges examined, `missing=0`**
+  with the barrier on. Non-vacuous: `rset_completeness_counts` was deliberately
+  split from its printing wrapper so a unit test can prove it CAN report a
+  violation — its own comment says "`missing=0` from a checker that is
+  incapable of returning anything else is not evidence".
+
+Plus `regression-suite/run.sh` **90/90 under `-XX:+UseG1GC`** with the barrier
+on by default, and `=0` verified to restore `sites=0`.
+
+### The evidence this page already had
 
 - `regression-suite/run.sh` 88/88 under `-XX:+UseG1GC` with the barrier ON, and
   88/88 on the default collector with the branch's other changes.
