@@ -1162,6 +1162,39 @@ mod windows_fault {
                 op, data_addr
             );
         }
+        // DID THIS READ LAND IN MEMORY THE COLLECTOR VACATED?
+        //
+        // The question every relocation-corruption report on this codebase has
+        // had to answer by inference. `reloc_witness` records the span each
+        // relocating cycle vacates, so it can be answered by lookup instead --
+        // signal-safe, atomic loads only, no lock the faulting thread might
+        // already hold.
+        //
+        // `recorded` is printed as the DENOMINATOR: "not in a vacated span"
+        // means nothing if no span was ever recorded, which is the
+        // zero-from-an-instrument-that-never-fired shape this repository keeps
+        // being bitten by.
+        {
+            let recorded = cratonvm_gc::reloc_witness::recorded();
+            let cycle = cratonvm_gc::reloc_witness::cycle();
+            match cratonvm_gc::reloc_witness::lookup(data_addr) {
+                Some((lo, hi, c)) => {
+                    let _ = writeln!(
+                        report,
+                        "#  RELOCATION WITNESS: this address is INSIDE a span the collector                          vacated.
+                         #    span=[0x{lo:016X}, 0x{hi:016X}) vacated_by_cycle={c}                          current_cycle={cycle} offset_into_span=0x{:X}
+                         #    The span was zeroed on vacate, so the object header read here                          is all-zero rather than garbage -- a stale reference into relocated                          memory, not a wild pointer.",
+                        data_addr.wrapping_sub(lo),
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        report,
+                        "#  RELOCATION WITNESS: address NOT in any recorded vacated span                          (spans_recorded={recorded} current_cycle={cycle}).                          spans_recorded=0 means the witness never ran, which is not the                          same as a clean answer.",
+                    );
+                }
+            }
+        }
         let _ = writeln!(report, "#  pid={} tid={}", pid, super::get_tid());
         let _ = writeln!(report, "#  thread: \"{}\"", tname);
         let _ = writeln!(report, "#  exe module base: 0x{:016X}", module_base);

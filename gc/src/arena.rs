@@ -2380,6 +2380,23 @@ impl Arena {
         // Zero the vacated span. A slid-down survivor leaves its old bytes
         // behind verbatim, including a valid-looking `ObjectHeader`, and a
         // conservative scanner that met one would resurrect a corpse.
+        // WITNESS the vacated span before it is zeroed, in ABSOLUTE addresses.
+        //
+        // A read through a reference into this span is the crash
+        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` reports, and
+        // its fault address is page-ALIGNED precisely because the fill below
+        // makes the reader land on a valid all-zero header. Recording the span
+        // lets the crash handler say WHICH cycle vacated the memory that was
+        // read, instead of leaving the next person to guess which reference
+        // went stale -- seven such guesses have now been measured and none was
+        // right. See `crate::reloc_witness`.
+        {
+            let base = self.data.as_ptr() as usize;
+            crate::reloc_witness::note_vacated(
+                base.wrapping_add(new_cursor),
+                base.wrapping_add(self.cursor),
+            );
+        }
         self.data.fill_zero(new_cursor, self.cursor);
         let old_cursor = self.cursor;
         self.cursor = new_cursor;

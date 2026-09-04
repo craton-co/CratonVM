@@ -120,6 +120,7 @@ pub mod gc_quiescence;
 /// copy-then-CAS forwarding protocol, per-worker to-space buffers, and the
 /// work-sharing closure. Driven only by [`gen_heap`]; the census counters are
 /// public so a run can say whether the parallel path engaged.
+pub mod reloc_witness;
 pub mod gen_evac;
 pub mod gen_heap;
 pub mod heap;
