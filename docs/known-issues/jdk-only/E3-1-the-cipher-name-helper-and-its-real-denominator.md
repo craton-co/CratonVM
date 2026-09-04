@@ -14,6 +14,37 @@ type-checked and executed with plain `rustc` on a self-contained extract
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03.** This record's status was
+> **FIXED-UNVERIFIED**, *"CratonVM column PRED"*, *"This lane may not build or
+> run the VM."* §5 gave two verification commands in order of cost. **Both were
+> run, and both pass.**
+>
+> ```text
+> cargo test -p cratonvm-native-builtins t27_loopback_self_test
+>   1 passed; 0 failed
+> cargo test -p cratonvm-native-builtins the_only_rustls_suite_spelling_left_is_the_adapters_own
+>   1 passed; 0 failed
+> ```
+>
+> **The first one is a behavioural check, not a compile.** It performs a real
+> in-process TLS 1.3 handshake and asserts the spelling this record is about:
+>
+> ```rust
+> assert!(msg.contains("cipher=TLS_"),  "cipher must carry JSSE's spelling: {}", msg);
+> assert!(!msg.contains("cipher=TLS13_"));
+> ```
+>
+> §5 says of it: *"It fails today without the fix, which is what makes it worth
+> more than the witness."* The assertion is present, it runs, and it is green.
+>
+> **What this does NOT verify.** §5 opens *"No in-tree fixture observes this
+> across a real network handshake"*, and that is still true — the loopback test
+> is in-process. The `javap`/JSSE denominator in §0 (one caller out of eight,
+> and the sixth of seven nominated sites) is a source and oracle census; it was
+> not re-counted here. This note verifies the two commands the record itself
+> nominated, and no more. The claim "it fails today without the fix" was NOT
+> re-proven by mutation.
+
 ## 0. Verdict
 
 C12-2 NOM 2 nominated seven sites. **Six were adapted; one was not, and should

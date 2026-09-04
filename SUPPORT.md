@@ -67,7 +67,10 @@ For the fastest answer, include:
 - The Rust toolchain version (`rustc --version`).
 - The JDK used to compile your `.class` files (`javac -version`).
 - The exact command line you ran.
-- The full output, ideally with `RUST_LOG=debug` set.
+- The full output, ideally with `RUST_LOG=info` set. (`debug` and
+  `trace` are compiled out of release builds -- the workspace pins
+  `tracing` with `release_max_level_info` -- so setting them on a
+  released binary changes nothing. They work only in a debug build.)
 - A minimal Java source file that reproduces the problem.
 
 ## Response Expectations

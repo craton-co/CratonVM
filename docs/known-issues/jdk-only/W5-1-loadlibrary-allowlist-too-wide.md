@@ -182,6 +182,62 @@ on this host the same build now lives at
 `C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot`, which is what the
 2026-08-11 `javap` and `lib/src.zip` readings below used.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-04.** The status block says *"nothing here
+> was built or run"*, and the reconciliation says the binary verification was
+> taken once, on 2026-08-12, against `ba65f1a19`. It has been taken again on a
+> binary built from this tree, and widened from the two arms the record names to
+> three.
+>
+> **The headline divergence is gone, and it is gone in Compatible mode too** —
+> which this record never claimed. The observable is one character of `CK`
+> output, and `run.sh` compares `CK` lines rather than exit codes:
+>
+> ```text
+> HotSpot 25              CK RJdkJni loadedLibrary=net mapped=libfoo.so   PASS (41 checks)
+> CratonVM --jdk-only     CK RJdkJni loadedLibrary=net mapped=libfoo.so   PASS (41 checks)
+> CratonVM --real-jdk     CK RJdkJni loadedLibrary=net mapped=libfoo.so   PASS (41 checks)
+> CratonVM compatible     CK RJdkJni loadedLibrary=net mapped=libfoo.so   PASS (41 checks)
+> ```
+>
+> `RJdkJni.java` tries `System.loadLibrary("zip")` first and only falls through
+> to the `net` probe if `zip` throws. Every arm now takes the fallback, so
+> `is_vm_provided_jdk_library` no longer answers "success" for `zip`. The check
+> count is 41 against this record's 35-then-40; that is the shared vector
+> growing, not a result.
+>
+> **This answers half of the record's own open question.** It lists under
+> *"Cannot adjudicate without a run"*: whether arming residual 1 flips
+> `RJdkJni`'s `net` probe, since *"source cannot decide whether
+> `BootLoader.loadLibrary("net")` is reached before `RJdkJni.java:189-202`."*
+> The unarmed half is now measured and it is at parity. So arming is **not
+> required** for this observable — and if arming made `net` count as
+> already-loaded, it could only move a matching line to a non-matching one. The
+> armed half was NOT run: nothing here implements the arming, so the A/B the
+> record specifies is still only half done, and no claim is made about what
+> arming would do.
+>
+> **Residuals 1 and 3 are still open, re-checked in this tree at today's
+> lines** — the record's own line cites had rotted once already, so these are
+> re-derived rather than copied:
+>
+> ```text
+> 1  BootLoader.loadLibrary is still |_ctx, _args| Ok(None)   native-builtins/src/lib.rs:14766
+>    record_boot_loader_library                               lang_system.rs:4334
+>    its callers: still ZERO (the two other hits are its own doc comment)
+> 3  load_native_library still returns a table index, not the resolved path
+> ```
+>
+> Item 2 is confirmed CLOSED at today's lines: `runtime_load_args` reads
+> `args.get(1)` for the `fromClass` mirror and `args.get(2)` for the name, and
+> no `args.get(1)`-as-name read survives on either arm.
+>
+> **What this does NOT verify.** The 2026-08-07 HotSpot measurements and the
+> `NativeLibraries` same-file-two-loaders rule in "The predicted cause was
+> wrong" are oracle and JDK-source readings; they were not re-derived. This note
+> measures ONE vector's `CK` line — it does not re-census the allowlist's
+> contents, and a name that is wrongly allowed but that `RJdkJni` never asks for
+> is invisible here.
 ## The divergence
 
 One character of `CK` output, and `run.sh` compares `CK`/`PASS` lines, not exit

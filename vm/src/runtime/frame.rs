@@ -908,6 +908,94 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
 /// loops whose IR the JIT genuinely can't lower.
 pub const OSR_MAX_ATTEMPTS: u32 = 5;
 
+/// The four buffer-shaped pieces of a cached-method frame.
+///
+/// Built once and consumed either by [`Frame::new_pooled_cached_compact`],
+/// which returns a `Frame` by value, or by
+/// [`FrameStack::emplace_cached_compact`], which writes one straight into the
+/// stack slot. Sharing the build is what keeps the two from drifting.
+struct CachedCompactParts {
+    locals: Vec<CompactValue>,
+    local_kinds: Vec<u8>,
+    stack: ValueStack,
+    eff_max_locals: u16,
+}
+
+/// Take the locals and operand-stack buffers for a call to `cached` from the
+/// thread's pools and lay the arguments into them.
+///
+/// Identical in every observable to what `new_pooled_cached_compact` did
+/// inline before this was factored out: same filler, same category-2 layout,
+/// same `effective_max_locals` clamp, same pooled `ValueStack`.
+#[inline]
+fn build_cached_compact_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[(CompactValue, u8)],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> CachedCompactParts {
+    let needed: usize = args
+        .iter()
+        .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
+        .sum();
+    let n = (cached.max_locals as usize).max(needed);
+    let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
+    let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
+    let mut locals = u64_vec_to_compact(vals);
+    locals.clear();
+    kinds.clear();
+    locals.reserve(n);
+    kinds.reserve(n);
+    for (cv, tag) in args {
+        locals.push(*cv);
+        match *tag {
+            b'J' => {
+                kinds.push(LKIND_LONG);
+                locals.push(CompactValue::uninitialized());
+                kinds.push(LKIND_OTHER);
+            }
+            b'D' => {
+                kinds.push(LKIND_DOUBLE);
+                locals.push(CompactValue::uninitialized());
+                kinds.push(LKIND_OTHER);
+            }
+            _ => kinds.push(LKIND_OTHER),
+        }
+    }
+    locals.resize(n, CompactValue::uninitialized());
+    kinds.resize(n, LKIND_OTHER);
+    debug_assert_eq!(locals.len(), n);
+    debug_assert_eq!(kinds.len(), n);
+    let padded_max = (cached.max_stack as usize).max(16) + 8;
+    let stack = if let Some((vals, tags)) = stacks_pool.pop() {
+        ValueStack::from_pooled(vals, tags, padded_max)
+    } else {
+        ValueStack::new(padded_max)
+    };
+    CachedCompactParts {
+        locals,
+        local_kinds: kinds,
+        stack,
+        eff_max_locals,
+    }
+}
+
+
+/// [`build_cached_compact_parts`] for callers outside this module.
+///
+/// Returns the pieces as a tuple so the struct itself can stay private:
+/// `(locals, local_kinds, stack, effective_max_locals)`.
+#[inline]
+pub(crate) fn take_cached_compact_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[(CompactValue, u8)],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> (Vec<CompactValue>, Vec<u8>, ValueStack, u16) {
+    let p = build_cached_compact_parts(cached, args, locals_pool, stacks_pool);
+    (p.locals, p.local_kinds, p.stack, p.eff_max_locals)
+}
+
 impl Frame {
     /// Return `true` if a fresh OSR attempt should be made for `entry_pc`
     /// given the current `backward_count` and the per-loop exponential
@@ -1207,44 +1295,12 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let needed: usize = args
-            .iter()
-            .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
-            .sum();
-        let n = (cached.max_locals as usize).max(needed);
-        let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
-        let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
-        let mut locals = u64_vec_to_compact(vals);
-        locals.clear();
-        kinds.clear();
-        locals.reserve(n);
-        kinds.reserve(n);
-        for (cv, tag) in args {
-            locals.push(*cv);
-            match *tag {
-                b'J' => {
-                    kinds.push(LKIND_LONG);
-                    locals.push(CompactValue::uninitialized());
-                    kinds.push(LKIND_OTHER);
-                }
-                b'D' => {
-                    kinds.push(LKIND_DOUBLE);
-                    locals.push(CompactValue::uninitialized());
-                    kinds.push(LKIND_OTHER);
-                }
-                _ => kinds.push(LKIND_OTHER),
-            }
-        }
-        locals.resize(n, CompactValue::uninitialized());
-        kinds.resize(n, LKIND_OTHER);
-        debug_assert_eq!(locals.len(), n);
-        debug_assert_eq!(kinds.len(), n);
-        let padded_max = (cached.max_stack as usize).max(16) + 8;
-        let stack = if let Some((vals, tags)) = stacks_pool.pop() {
-            ValueStack::from_pooled(vals, tags, padded_max)
-        } else {
-            ValueStack::new(padded_max)
-        };
+        let CachedCompactParts {
+            locals,
+            local_kinds: kinds,
+            stack,
+            eff_max_locals,
+        } = build_cached_compact_parts(&cached, args, locals_pool, stacks_pool);
         let class_id = cached.declaring_class_id;
         let code = cached.code.clone();
         let max_stack = cached.max_stack;
@@ -1340,6 +1396,42 @@ impl Frame {
         self.exec_epoch = 0;
         count_frame_kind(false);
         self.inner = FrameInner::Cached(cached);
+    }
+
+
+    /// A `Frame` from pieces [`build_cached_compact_parts`] produced.
+    #[inline]
+    fn from_cached_compact_parts(
+        cached: Arc<CachedBytecodeMethod>,
+        locals: Vec<CompactValue>,
+        local_kinds: Vec<u8>,
+        stack: ValueStack,
+        eff_max_locals: u16,
+    ) -> Self {
+        let class_id = cached.declaring_class_id;
+        let code = cached.code.clone();
+        let max_stack = cached.max_stack;
+        Self {
+            class_id,
+            pc: 0,
+            last_instr_pc: 0,
+            locals,
+            local_kinds,
+            stack,
+            code,
+            max_stack,
+            max_locals: eff_max_locals,
+            inner: {
+                count_frame_kind(false);
+                FrameInner::Cached(cached)
+            },
+            method_index: None,
+            backward_count: 0,
+            osr_attempt_counts: Vec::new(),
+            monitor_on_exit: None,
+            seq: next_frame_seq(),
+            exec_epoch: 0,
+        }
     }
 
     pub fn reset_for_tail_call(
@@ -2911,6 +3003,87 @@ impl FrameStack {
         self.buf[d].reset_cached_compact(cached, args);
         self.depth += 1;
         true
+    }
+
+
+    /// Build a frame for `cached` **in** the stack's next slot.
+    ///
+    /// The counterpart to [`Self::push_cached_compact_reusing`] for the case
+    /// where no slot is retired — the first call at a depth, and every
+    /// by-value push, which harvests and trims the slot it would have reused.
+    /// `push` receives a `Frame` that has already been built somewhere else
+    /// and moves ~220 bytes into the slot; this writes the struct where it
+    /// belongs, so the only things that travel are the three buffer handles
+    /// the caller just took from the pools.
+    ///
+    /// The struct literal is written by `ptr::write` in this function, so the
+    /// destination is known to the compiler at the point of construction and
+    /// there is no intermediate to copy from.
+    #[inline]
+    pub fn emplace_cached_compact(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        locals: Vec<CompactValue>,
+        local_kinds: Vec<u8>,
+        stack: ValueStack,
+        eff_max_locals: u16,
+    ) {
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
+        self.reserve_stable(1);
+        if self.depth < self.buf.len() {
+            // A retired slot is here after all (a caller that did not harvest).
+            // Assigning drops it, which is exactly what `push` would have done.
+            self.buf[self.depth] = Frame::from_cached_compact_parts(
+                cached,
+                locals,
+                local_kinds,
+                stack,
+                eff_max_locals,
+            );
+        } else {
+            let class_id = cached.declaring_class_id;
+            let code = cached.code.clone();
+            let max_stack = cached.max_stack;
+            count_frame_kind(false);
+            let seq = next_frame_seq();
+            // SAFETY: `reserve_stable(1)` guarantees `capacity > buf.len()`,
+            // and `depth == buf.len()` in this branch, so `dst` is the one
+            // slot past the last initialised element and is valid for a write
+            // of a `Frame`. `set_len` publishes it only after it is fully
+            // initialised, and nothing in between can panic or observe it.
+            unsafe {
+                let dst = self.buf.as_mut_ptr().add(self.depth);
+                std::ptr::write(
+                    dst,
+                    Frame {
+                        class_id,
+                        pc: 0,
+                        last_instr_pc: 0,
+                        locals,
+                        local_kinds,
+                        stack,
+                        code,
+                        max_stack,
+                        max_locals: eff_max_locals,
+                        inner: FrameInner::Cached(cached),
+                        method_index: None,
+                        backward_count: 0,
+                        osr_attempt_counts: Vec::new(),
+                        monitor_on_exit: None,
+                        seq,
+                        exec_epoch: 0,
+                    },
+                );
+                self.buf.set_len(self.depth + 1);
+            }
+        }
+        self.depth += 1;
     }
 
     /// Drop every retired slot, releasing their buffers.

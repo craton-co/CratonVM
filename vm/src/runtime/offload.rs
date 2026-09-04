@@ -239,6 +239,9 @@ pub struct OffloadCache {
     /// `kernels` already has, since it is keyed on `(class_id, method_index)`
     /// and a redefinition would reuse neither.
     dispatch_memo: RwLock<FxHashMap<u64, ResolvedDispatch>>,
+    /// Consecutive `below_min_work` refusals per CALL SITE, keyed by
+    /// `(caller class id, bytecode pc)`. See [`min_work_giveup_after`].
+    min_work_streak: RwLock<FxHashMap<u64, u32>>,
     /// The open graph capture, if any.
     ///
     /// While this is `Some`, `dispatch_method_from_native_on_stream` takes
@@ -443,6 +446,38 @@ static NEXT_GRAPH_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Hash of a call site's name triple, the memo's key.
 #[cfg(feature = "gpu-offload")]
+/// Consecutive `below_min_work` refusals after which a CALL SITE is allowed
+/// into the invoke cache. `0` never gives up.
+///
+/// # Why this needs a pc-keyed invoke cache
+///
+/// A site whose target is offload-eligible is deliberately kept out of the
+/// per-call-site invoke cache so a later call with bigger arrays can still
+/// offload. The hook that does the keeping is cheap -- 0.48 us per refusal,
+/// caller guard included -- but the site then pays the UNCACHED
+/// `invokestatic` path on every call, 10.3 us against 0.35 us cached. 96% of
+/// the measured "hook overhead" is that, not the hook.
+///
+/// Giving up on a site therefore pays, but only if a SITE is a thing the
+/// cache can name. Under the old `(class, cp index, is_special)` key it was
+/// not: two call sites invoking the same method share a constant-pool entry
+/// and one cache entry, so promoting the small-array site also promoted the
+/// big-array one and it silently stopped offloading -- measured at 1.47 ms
+/// against 81.7 us on `GpuHookOverheadBench`, an 18x regression, which is
+/// why the first attempt at this was reverted.
+///
+/// So this is gated on `CRATONVM_INVOKE_CACHE_PC_KEY`. With pc-keying off
+/// the promotion never fires, because it would be the same defect again.
+fn min_work_giveup_after() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_MIN_WORK_GIVEUP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(256)
+    })
+}
+
 fn dispatch_memo_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -582,6 +617,7 @@ impl OffloadCache {
             chunk_stage_f32: RwLock::new(None),
             chunk_stage_f64: RwLock::new(None),
             dispatch_memo: RwLock::new(FxHashMap::default()),
+            min_work_streak: RwLock::new(FxHashMap::default()),
             gpu_array_class_id: RwLock::new(None),
             capture: RwLock::new(None),
             replay_bind: RwLock::new(None),
@@ -628,6 +664,39 @@ impl OffloadCache {
 
     /// Remember one call site's resolution.
     #[cfg(feature = "gpu-offload")]
+    /// Count one `below_min_work` refusal at `site` and say whether the site
+    /// should be PROMOTED into the invoke cache.
+    ///
+    /// Always `false` unless the invoke cache is pc-keyed: without that a
+    /// "site" is a method reference, and promoting one caller silently
+    /// deoptimises every other caller of the same kernel. See
+    /// [`min_work_giveup_after`].
+    pub(crate) fn note_site_below_min_work(&self, site: u64) -> bool {
+        let limit = min_work_giveup_after();
+        if limit == 0 || !cratonvm_classloading::resolution::pc_key_enabled() {
+            return false;
+        }
+        let mut streaks = self.min_work_streak.write();
+        let n = streaks.entry(site).or_insert(0);
+        *n = n.saturating_add(1);
+        *n > limit
+    }
+
+    /// Clear `site`'s streak: it just offloaded, so a later small call must
+    /// not inherit a count from before.
+    pub(crate) fn clear_site_below_min_work(&self, site: u64) {
+        if min_work_giveup_after() == 0 || !cratonvm_classloading::resolution::pc_key_enabled() {
+            return;
+        }
+        // A read first: the common case is an empty streak, and taking the
+        // write lock on every offloaded dispatch would be a cost on the path
+        // this whole feature exists to make fast.
+        if self.min_work_streak.read().get(&site).is_none_or(|n| *n == 0) {
+            return;
+        }
+        self.min_work_streak.write().insert(site, 0);
+    }
+
     fn dispatch_memo_put(
         &self,
         class_name: &str,
@@ -1191,7 +1260,13 @@ impl OffloadCache {
         // opted out, so we record the verdict and don't even hand the
         // method to the analyzer.
         if let Some(exclude) = &method_annotations.gpu_exclude {
-            tracing::debug!(
+            // `info!`, not `debug!`: docs/gpu/annotations.md tells users to
+            // read this line with `RUST_LOG=gpu.offload=...`, and under
+            // `release_max_level_info` a `debug!` is compiled out of every
+            // release build, so no RUST_LOG value could ever surface it.
+            // Bounded by the number of @GpuExclude-annotated methods, and
+            // still below the default WARN filter.
+            tracing::info!(
                 target: "gpu.offload",
                 class = %class_name,
                 method = method_index,

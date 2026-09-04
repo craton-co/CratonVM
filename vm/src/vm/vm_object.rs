@@ -159,8 +159,13 @@ pub fn create_java_string_uninterned_gc_safe_threaded(
         && text.is_ascii()
     {
         let (class_id, fields) = java_string_allocation_layout(shared);
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-        let object_size = HEADER_SIZE + fields.saturating_mul(SLOT_SIZE);
+        // The shape planner, not a bare legacy size -- see
+        // `plan_tlab_object_shape`.
+        let (object_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+            class_id,
+            fields,
+            crate::runtime::interpreter::tlab_site::STRING,
+        );
         let str_obj = crate::runtime::interpreter::tlab_alloc_object(
             thread,
             shared,

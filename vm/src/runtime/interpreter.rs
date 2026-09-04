@@ -5410,6 +5410,10 @@ fn execute_frame_from_index(
     // call is armed: PGO (it records call sites and receivers), the invoke
     // traces, the frame trace, or a virtual thread. See
     // `execute_invokevirtual_fast_door`.
+    // Default-ON again as of 2026-09-03: the wrong answers this door produced
+    // were the receiver profile it was not recording, and it records it now.
+    // `CRATONVM_JIT_INVOKE_FAST_DOOR=1` remains accepted (it forced the door on
+    // while the default was off) and is now a no-op.
     let invoke_fast_door_on = !crate::runtime::env_cache::no_invoke_fast_door()
         && !pgo_enabled
         && !crate::runtime::env_cache::frame_trace()
@@ -7498,6 +7502,7 @@ fn execute_frame_from_index(
                             cp_index,
                             false,
                             fast_field_zgc,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7523,6 +7528,7 @@ fn execute_frame_from_index(
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_nonvirtual_fast_door(
                             shared, thread, frame_idx, cp_index, false,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7633,7 +7639,7 @@ fn execute_frame_from_index(
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_nonvirtual_fast_door(
-                            shared, thread, frame_idx, cp_index, true,
+                            shared, thread, frame_idx, cp_index, true, saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7755,6 +7761,7 @@ fn execute_frame_from_index(
                     if nonvirtual_fast_door_on {
                         match invoke_fast::execute_invokestatic_fast_door(
                             shared, thread, frame_idx, cp_index,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;
@@ -7835,6 +7842,7 @@ fn execute_frame_from_index(
                             cp_index,
                             true,
                             fast_field_zgc,
+                            saved_pc,
                         ) {
                             Some(Ok(CachedCallResult::FramePushed)) => {
                                 frame_idx = thread.frames.len() - 1;

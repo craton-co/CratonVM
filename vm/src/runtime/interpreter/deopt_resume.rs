@@ -955,7 +955,7 @@ pub(crate) fn build_deopt_frame_inner(
     // every reconstructed oop is pinned (a GC after the re-read would stale the
     // unrooted `*_fwd` vecs / the un-pushed frame; there is none, by construction).
     if stress {
-        maybe_gc_forced_pub(shared, thread);
+        maybe_gc_forced_pub_at(shared, thread, "deopt-resume");
     }
 
     thread.refill_pools_from_shared(
@@ -2338,7 +2338,7 @@ mod deopt_step3_tests {
 
         // Force a GC: the oop must survive via the pushed frame (and be forwarded
         // in place under a moving collector).
-        maybe_gc_forced_pub(&shared, &mut thread);
+        maybe_gc_forced_pub_at(&shared, &mut thread, "deopt-resume");
 
         let frame = thread.frames.last().expect("resumed frame is on the stack");
         assert_eq!(frame.pc, 3);
@@ -2417,7 +2417,7 @@ mod deopt_step3_tests {
         assert_eq!(thread.frames.len(), 1);
 
         // Force a GC: the materialized shell must survive via the pushed frame.
-        maybe_gc_forced_pub(&shared, &mut thread);
+        maybe_gc_forced_pub_at(&shared, &mut thread, "deopt-resume");
         let frame = thread.frames.last().expect("resumed frame is on the stack");
         assert_eq!(frame.pc, 4);
         match frame.get_local(0) {
@@ -3109,7 +3109,7 @@ mod deopt_step3_tests {
         // No Java allocation between in-stub capture and the in-place write, so the
         // raw address was valid; the frame slot now roots it. Force a GC — it must
         // survive (and be forwarded in place under a moving collector).
-        maybe_gc_forced_pub(&shared, &mut thread);
+        maybe_gc_forced_pub_at(&shared, &mut thread, "deopt-resume");
         let frame = &thread.frames[0];
         assert_eq!(frame.pc, 3);
         match frame.get_local(0) {

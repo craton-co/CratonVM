@@ -2121,6 +2121,7 @@ pub mod vector_gate {
                 exit: NO_NODE,
                 safepoints: Vec::new(),
                 uses: UseLists::new(),
+            receiver_param: None,
             }
         }
 

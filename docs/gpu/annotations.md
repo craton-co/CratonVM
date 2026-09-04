@@ -311,11 +311,19 @@ DEBUG gpu.offload: blacklisted by @GpuExclude class="MyOps" method=3 reason=""
 
 (`method` is the numeric method-table index, not a name+descriptor
 string; `reason` is whatever string, if any, you passed to
-`@GpuExclude(reason = "...")`.) The level is `debug`, so it is
+`@GpuExclude(reason = "...")`.) The level is `info`, so it is
 suppressed by CratonVM's default tracing filter (`WARN` and above —
-see `vm-cli/src/main.rs`). Enable it with `RUST_LOG=gpu.offload=debug`
-(or any broader directive like `RUST_LOG=debug`). `--print-gpu-decisions`
+see `vm-cli/src/main.rs`). Enable it with `RUST_LOG=gpu.offload=info`
+(or any broader directive like `RUST_LOG=info`). `--print-gpu-decisions`
 has no effect on this particular line.
+
+> **Changed 2026-09-03.** This line used to be emitted at `debug`, and
+> this section used to tell you to set `RUST_LOG=gpu.offload=debug`.
+> That could never have worked on a release build: the workspace pins
+> `tracing` with `release_max_level_info`, so `debug!` and `trace!`
+> expand to no-ops and no `RUST_LOG` value can bring them back. The
+> line was not being filtered — it did not exist. It is `info!` now,
+> which the filter can actually reach.
 
 #### Before / after
 
@@ -326,7 +334,7 @@ Without `@GpuExclude`, running with `--print-gpu-decisions` alone (no separate `
 INFO cratonvm_vm::runtime::offload: gpu offload: MyOps.tinyAdd([I[I[I)V -> Eligible(KernelSignature { ... })
 ```
 
-With `@GpuExclude`, running with `RUST_LOG=gpu.offload=debug` (the
+With `@GpuExclude`, running with `RUST_LOG=gpu.offload=info` (the
 flag above is irrelevant to this line; it fires either way):
 
 ```
@@ -436,11 +444,11 @@ nothing above changes how `RUST_LOG` itself behaves, only what
    unconditionally — independent of `--print-gpu-decisions`, and **not**
    covered by the flag's new self-sufficiency (different target string).
    Visibility is still controlled purely by `RUST_LOG`, e.g.
-   `RUST_LOG=gpu.offload=debug`.
+   `RUST_LOG=gpu.offload=info`.
 
 To see everything this page describes at once (including the `gpu.offload`
-target), use `RUST_LOG=gpu.offload=debug --print-gpu-decisions` — the flag
-covers item 1 and warmup below on its own; `RUST_LOG=gpu.offload=debug` is
+target), use `RUST_LOG=gpu.offload=info --print-gpu-decisions` — the flag
+covers item 1 and warmup below on its own; `RUST_LOG=gpu.offload=info` is
 still needed for item 2.
 
 `@EnableGpuAsync` warmup (`OffloadCache::warmup_class`) is a *third*,

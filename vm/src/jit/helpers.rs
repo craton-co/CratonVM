@@ -886,6 +886,19 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
+        // Publish this thread's shadow-stack ADDRESS, plus the `base`/`end` of
+        // its backing buffer, so a GC initiator that freezes this thread can
+        // scan the window it cannot otherwise reach -- and can verify the
+        // address still describes THIS buffer before trusting `top`.
+        // Once per thread. See
+        // `cratonvm_gc::gc_quiescence::publish_self_shadow_addr`.
+        if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
+            crate::jit::conservative_roots::publish_self_shadow_addr_once(
+                &thread.shadow_stack as *const _ as usize,
+                thread.shadow_stack.base,
+                thread.shadow_stack.end,
+            );
+        }
         if if crate::runtime::env_cache::hot_lookup_cache() {
             crate::runtime::env_cache::dbg_shadow()
         } else {
@@ -1275,7 +1288,46 @@ pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
 /// address if a collection intervened, because the slot it comes out of is
 /// rooted and remapped (`memory/roots.rs` §10, `memory/gc.rs` §10).
 pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
-    thread.jit_pending_exception.take()
+    let exc = thread.jit_pending_exception.take();
+    if exc.is_some() {
+        drain_superseded_implicit_signals();
+    }
+    exc
+}
+
+/// Drop the implicit-trap flags when a real exception is being delivered.
+///
+/// An implicit signal (`npe`, `aioobe`, `arithmetic`) is a REQUEST for a
+/// throwable, not a throwable. Once another exception is in flight, that request
+/// can never be granted: the frame whose trap raised it is unwinding, and no
+/// door downstream owns the flag. Leaving it set is not inert -- the next
+/// unrelated JIT call drains it and builds a fresh exception at a site that
+/// never faulted.
+///
+/// The shape that found this (2026-09-03, see
+/// `known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`): the
+/// lambda direct arm finishes a deopted body in the interpreter and returns a
+/// zero with the real NPE parked in `jit_pending_exception`, exactly as its
+/// contract says. Compiled code then evaluates the second operand of the same
+/// expression before its post-invoke guard fires, dereferences the SAME null and
+/// raises a second trap. The first exception is delivered and caught; the second
+/// flag survives two iterations and surfaces as a `NullPointerException` for a
+/// receiver that was never null.
+///
+/// This is the same rule [`take_all_jit_signals`] already applies by taking
+/// everything at once -- stated for the other consumption point, so the two
+/// cannot disagree about whether a signal outlives the exception that overtook
+/// it. The deopt flag is deliberately NOT dropped: it describes the compiled
+/// frame's fate, which an exception does not settle.
+fn drain_superseded_implicit_signals() {
+    if take_jit_pending_npe() {
+        // The snapshot was taken for a raise that will never happen; a later
+        // drain would attach frames the raising code has long since left.
+        let _ = take_jit_pending_npe_action();
+        let _ = take_jit_pending_npe_compiled_frames();
+    }
+    let _ = take_jit_pending_aioobe();
+    let _ = take_jit_pending_arithmetic();
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -4507,7 +4559,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // moving collector rewrites object addresses. (Resolves the prior
         // FIXME that called `heap.collect_garbage` with an unchecked
         // StopTheWorldToken.)
-        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
     }
     // GC-overhead limit: if forced GCs keep freeing almost nothing, the heap is
     // full of live objects — surface OOM now instead of limping on slivers
@@ -5080,12 +5132,20 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // over-sized object. In all cases the inline bump did not commit a
     // half-initialized object: the TLAB cursor in memory is the
     // last-allocated-object's end, so `retire()` here is safe.
-    let total_size = cratonvm_types::HEADER_SIZE
-        + (num_fields as usize).saturating_mul(cratonvm_types::SLOT_SIZE);
+    // The shape planner, not a bare legacy size. This site reserves the region
+    // that `tlab_alloc_object_guarded_refill` stamps a header onto, so a legacy
+    // reservation here with a compact header there is an object claiming a
+    // smaller size than it was given -- which every header-strided heap walk
+    // then misparses.
+    let (total_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+        class_id,
+        num_fields as usize,
+        crate::runtime::interpreter::tlab_site::JIT_NEW,
+    );
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -5147,7 +5207,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         None => {
             if let Some((thread, _guard)) = jit_thread_mut() {
                 thread.tlab.retire();
-                crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
             }
             if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
                 if let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) {
@@ -6004,7 +6064,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -17150,8 +17210,15 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape_at(
+                        class_id,
+                        slots,
+                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                    );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -17171,14 +17238,35 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     // bytes `set_field_as(.., b'I')` would store, minus that
                     // path's per-call header read + layout dispatch. A
                     // primitive store takes no write barrier.
-                    // SAFETY: `object` is a live legacy-layout allocation
-                    // with >= 1 slot (`slots.max(1)` above); the cell is
-                    // exclusively ours until published below.
-                    unsafe {
-                        std::ptr::write(
-                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
-                            Value::Int(value),
-                        );
+                    // ...but ONLY when it really is legacy. That premise was
+                    // an assumption about which allocator this site calls, not
+                    // a property of the object, and `CRATONVM_COMPACT_TLAB_ALLOC`
+                    // falsified it: with compact planning on, `java.lang.Integer`
+                    // gets a packed 4-byte `value` and this 16-byte `Value` cell
+                    // overwrote it and the bytes after it. `FjpProbe` summed
+                    // boxed integers and returned 215812748544 instead of
+                    // 499999500000 -- no collection involved, exactly as the
+                    // note on `tlab_alloc_object_inner` described. The cold arm
+                    // immediately below has always used the layout-aware store
+                    // and says why; this asks the object rather than assuming.
+                    // SAFETY: `object` was just allocated here, so its first
+                    // HEADER_SIZE bytes are a live, fully written `ObjectHeader`.
+                    let compact = cratonvm_types::is_compact_object(unsafe {
+                        &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
+                    });
+                    if compact {
+                        vm.mem.heap.set_field_as(object, 0, Value::Int(value), b'I');
+                    } else {
+                        // SAFETY: `object` is a live legacy-layout allocation
+                        // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
+                        // immediately above, not assumed; the cell is
+                        // exclusively ours until published below.
+                        unsafe {
+                            std::ptr::write(
+                                object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                                Value::Int(value),
+                            );
+                        }
                     }
                     // Object-return handoff root (see `call_integer_native_raw`).
                     thread.native_pending_return = Some(object);
@@ -17405,8 +17493,15 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape_at(
+                        class_id,
+                        slots,
+                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                    );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -17425,14 +17520,26 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     // zeroed 16-byte `Value` cells), so field 0 is the `Value`
                     // cell at `HEADER_SIZE`. A primitive store takes no write
                     // barrier.
-                    // SAFETY: `object` is a live legacy-layout allocation with
-                    // >= 1 slot (`slots.max(1)` above); the cell is exclusively
-                    // ours until published below.
-                    unsafe {
-                        std::ptr::write(
-                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
-                            Value::Long(value),
-                        );
+                    // ...but ONLY when it really is legacy -- see the
+                    // `Integer` twin for the miscompile that premise produced.
+                    // SAFETY: `object` was just allocated here, so its first
+                    // HEADER_SIZE bytes are a live, fully written `ObjectHeader`.
+                    let compact = cratonvm_types::is_compact_object(unsafe {
+                        &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
+                    });
+                    if compact {
+                        vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                    } else {
+                        // SAFETY: `object` is a live legacy-layout allocation
+                        // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
+                        // immediately above, not assumed; the cell is
+                        // exclusively ours until published below.
+                        unsafe {
+                            std::ptr::write(
+                                object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                                Value::Long(value),
+                            );
+                        }
                     }
                     thread.native_pending_return = Some(object);
                     return object.as_ptr() as i64;
@@ -19001,7 +19108,7 @@ fn call_integer_native_raw_inner(
                         && (vm.mem.heap.needs_gc_for_jit_allocation()
                             || vm.mem.heap.old_gen_needs_gc())
                     {
-                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
                     }
                     vm.mem.heap.clear_young_spill_pressure();
                 }

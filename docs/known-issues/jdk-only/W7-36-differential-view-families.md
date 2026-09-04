@@ -1,5 +1,37 @@
 # W7-36 — the collections families the round-2 differential left: views that do not write through, and refusals that never fire
 
+> **VERIFIED AGAINST A BINARY 2026-09-02. The differential is ZERO.**
+>
+> ```text
+> HotSpot 25              872 lines
+> CratonVM --real-jdk     872 lines
+> divergent observables   0        (this record's baseline: 43)
+> ```
+>
+> W7-33's baseline was 43 and this record re-took it at 43. It is now **0**: the
+> nineteen observables changed in source here, and everything the sibling lanes
+> changed since, have closed the whole set.
+>
+> **The probe had to be recovered before it could be run.** This record's
+> reproduce block points at `$SCRATCH/probesrc/ShadowDifferentialProbe.java` — a
+> scratchpad path, not a tracked file — and `probes/ShadowDifferentialProbe.java`
+> was deleted from the tree by `3b2901531` ("major doc consistency update before
+> the release"), the same commit that removed `probes/` wholesale. Restored from
+> `3b2901531^` (3002 lines) and re-added. A record whose only handle lives in a
+> scratchpad has a handle that expires with the session.
+>
+> **The zero is trustworthy because `W7-42`'s ledger says so**, which is the
+> whole point of that instrument:
+>
+> ```text
+> PROBE-SECTIONS=28
+> PROBE-LEDGER=missing:0,undeclared:0,duplicate:0,multiline:0,unrenderable:0
+> ```
+>
+> Twenty-eight sections ran and nothing was lost, so the empty diff is agreement
+> rather than a hole. Without that line a 0 here would be indistinguishable from
+> a probe that stopped early — the exact failure `W7-42` was written to close.
+
 **Status: 19 of 20 assigned observables CHANGED IN SOURCE 2026-08-12, NOT
 REBUILT, NOT VERIFIED. 1 recorded and deliberately not attempted.**
 

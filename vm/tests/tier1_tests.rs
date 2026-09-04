@@ -1081,11 +1081,18 @@ fn t1_async_exception_round_trip_through_registry() {
 // T1.1.3 — AArch64 oop-map result plumbing
 // ===========================================================================
 
-/// T1.1.3 — `Arm64CompileResult` carries an `oop_maps` field that's
-/// populated by the backend and shaped identically to the x64
-/// `OopMapEntry`. We don't run a full ARM64 JIT end-to-end here
-/// (that requires an ARM64 host); instead we exercise the data
-/// shape so a future ARM64-host test can consume it.
+/// T1.1.3 — the aarch64 backend's maps are shaped identically to the x64
+/// `OopMapEntry`. We don't run a full ARM64 JIT end-to-end here (that requires
+/// an ARM64 host); instead we exercise the data shape so a future ARM64-host
+/// test can consume it.
+///
+/// Two corrections, 2026-09-03. The field is `Arm64CompileResult::pending_oop_maps`
+/// and it holds `Arm64PendingOopMap` (PC-unresolved), not `OopMapEntry`; the
+/// resolved entries this shape describes are produced by
+/// `aarch64_backend::emit_machine_code_with_oop_maps`. And the `native_pc_offset`
+/// below is NOT "5 instructions × 4 bytes" — that arithmetic is exactly the bug
+/// that writer had, since the pseudo-op stream is not fixed-width. It is simply
+/// a representative byte offset.
 #[test]
 fn t1_aarch64_oop_map_data_shape() {
     use cratonvm_jit::OopMapEntry;
@@ -1093,7 +1100,7 @@ fn t1_aarch64_oop_map_data_shape() {
     // a safepoint in a method with one oop at [fp - 16].
     let entry = OopMapEntry {
         bytecode_pc: 0,
-        native_pc_offset: 0x14, // 5 instructions × 4 bytes
+        native_pc_offset: 0x14, // a representative byte offset, NOT a count × 4
         frame_slot_offsets: vec![-16],
         moving_young_coverage_complete: false,
         live_frame_hi: 0,

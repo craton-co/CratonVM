@@ -260,6 +260,37 @@ fn maybe_dump_shutdown_reports() {
         // collector because the path it disabled was already unreachable
         // (`region_bounds_are_live` is false under G1 and ZGC).
         {
+            // G1's inline post-write barrier (F-08, CRATONVM_G1_INLINE_BARRIER).
+            // Sites always; the run-time pair only under the ref-store trace.
+            // `sites=0` is the expected reading on every other collector and
+            // under the default configuration, which is exactly why it is
+            // printed rather than inferred.
+            {
+                let (sites, skipped, called) = cratonvm_jit::metrics::g1_inline_barrier_counts();
+                if sites != 0 {
+                    eprintln!("[cratonvm] G1 inline post-write barrier: sites={sites}");
+                    if skipped != 0 || called != 0 {
+                        eprintln!(
+                            "[cratonvm]   G1 barrier executions: skipped={skipped} called={called}"
+                        );
+                    }
+                }
+            }
+            // TLAB object SHAPES. The pair plus the bytes, because "compact=0"
+            // means either that `CRATONVM_COMPACT_TLAB_ALLOC` is off or that no
+            // allocated class has a registered layout, and those are different
+            // facts -- while the saving is the only number that says whether
+            // the change was worth making.
+            {
+                let (compact, legacy, saved) =
+                    cratonvm_vm::runtime::interpreter::tlab_object_shape_counts();
+                if compact != 0 || legacy != 0 {
+                    eprintln!(
+                        "[cratonvm] TLAB object shapes: compact={compact} legacy={legacy} \
+bytes-saved={saved}"
+                    );
+                }
+            }
             let (gated, declined) = cratonvm_jit::x64::ref_store_site_counts();
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
@@ -347,6 +378,16 @@ fresh-ctor={fresh_ctor} body={body}"
             // receiver occurred" from "the entry was missing"; and a non-zero
             // `declined` is the reading that says the table filled up and the
             // feature has stopped applying to new compiles.
+            // The optimizing tier's own receiver null checks, never folded
+            // into the single-pass pair above: the two tiers prove the fact by
+            // different routes, and folding them would hide a tier that had
+            // stopped proving it at all.
+            let (ir_seed, ir_el, ir_em) =
+                cratonvm_jit::metrics::ir_receiver_null_check_counts();
+            eprintln!(
+                "[cratonvm] optimizing-tier receiver null checks: seeded={ir_seed} \
+                 elided={ir_el} emitted={ir_em}"
+            );
             let (in_reg, in_ret, in_rec, in_dec) = cratonvm_jit::implicit_null::counts();
             eprintln!(
                 "[cratonvm] implicit null checks: registered={in_reg} retired={in_ret} \
@@ -1165,7 +1206,10 @@ struct Args {
     )]
     g1_region_size: Option<String>,
 
-    /// `-XX:MaxGCPauseMillis=<n>` → G1 pause target (honoured under G1).
+    /// `-XX:MaxGCPauseMillis=<n>` → pause target. G1 sizes its mixed
+    /// collection set from it; ZGC (the default collector) sizes its
+    /// allocation budget from it, since 2026-09-03. The generational
+    /// backend ignores it.
     #[arg(
         long = "XX:MaxGCPause",
         value_name = "MS",
@@ -5921,6 +5965,17 @@ fn run() -> Result<()> {
                  taken_over={taken} xt_roots={roots} helper_windows={hw} hw_pinned={hw_pin} hw_refused={hw_ref} \
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
+            );
+            // Engagement census for the blocked-peer SHADOW-STACK scan. A
+            // clean run with `sh_windows=0` means the scan never ran, and any
+            // conclusion drawn from it is vacuous.
+            let sh_w = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_WINDOWS.load(O::Relaxed);
+            let sh_s = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_SLOTS.load(O::Relaxed);
+            let sh_r = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_ROOTS.load(O::Relaxed);
+            let sh_u = cratonvm_vm::jit::xt_root_scan::XT_PEER_SHADOW_UNTRUSTED.load(O::Relaxed);
+            eprintln!(
+                "[GC] xt_peer_shadow: sh_windows={sh_w} sh_slots={sh_s} sh_roots={sh_r}                  sh_untrusted={sh_u} enabled={}",
+                cratonvm_vm::jit::conservative_roots::xt_peer_shadow_scan_enabled(),
             );
             // H2-CID0 (2026-08-05): the unregistered-JIT-frame memo's audit.
             // `suppressed` counts times the memo answered "clean" while a scan

@@ -18125,14 +18125,34 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
 /// Keyed like [`jit_bail_list`]. Bounded by [`MAX_DEFERRED_NEW_RETRIES`]
 /// entries so a pathological run cannot grow it without limit.
 ///
-/// The value is the retry state, and it is what makes the grant ONE-SHOT rather
-/// than a loop: `0` means "one retry is owed", `1` means "already granted". A
-/// method whose class is STILL not loaded on the retry bails a second time and
-/// [`note_deferred_new_bail`] then declines to re-arm it, so a class that never
-/// loads cannot make the same method re-enter the optimizing pipeline forever.
-fn deferred_new_retries() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>> {
-    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashMap<u64, u8>>> =
-        std::sync::OnceLock::new();
+/// `state` is what makes the grant ONE-SHOT rather than a loop: `0` means "one
+/// retry is owed", `1` means "already granted".
+///
+/// `sites` are the `new` sites that were `Deferred` when the build bailed, as
+/// `(holder_class_id, cp_idx)` -- the same pair the resolver takes. They are
+/// recorded because the retry used to be spent BLIND: it flipped `0` to `1` on
+/// the next supersede attempt whether or not the class that caused the bail had
+/// loaded. Measured on CratonBench, that lost every retry it granted -- five
+/// `java/util/regex/Pattern` methods each bailed TWICE and then had no retry
+/// left for the moment the class did load. `sites` is what lets the grant wait
+/// for the condition it is retrying on.
+struct DeferredNewRetry {
+    state: u8,
+    sites: Vec<(u32, u16)>,
+    /// The method this memo belongs to, so a HELD retry can be re-offered.
+    ///
+    /// The map is keyed by a hash, which is enough to answer "does this method
+    /// have a retry" at the door the method itself walks through, and useless
+    /// for the opposite direction: after holding a retry, something has to go
+    /// looking for it once the class loads, and a hash names no method.
+    key: (std::sync::Arc<str>, std::sync::Arc<str>, std::sync::Arc<str>),
+}
+
+fn deferred_new_retries(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<u64, DeferredNewRetry>> {
+    static SET: std::sync::OnceLock<
+        parking_lot::RwLock<rustc_hash::FxHashMap<u64, DeferredNewRetry>>,
+    > = std::sync::OnceLock::new();
     SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -18166,7 +18186,12 @@ const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
 /// The memo is consumed by [`take_deferred_new_retry`], so it grants exactly
 /// ONE extra attempt: a class that is still not loaded on the retry bails
 /// again, records nothing, and the method settles on single-pass as before.
-pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &str) {
+pub fn note_deferred_new_bail(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    deferred_sites: &[(u32, u16)],
+) {
     let h = compute_jit_key_hash(
         class_name,
         method_name,
@@ -18178,11 +18203,42 @@ pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &
     // stays at `1` and is never re-armed.
     if set.len() < MAX_DEFERRED_NEW_RETRIES || set.contains_key(&h) {
         let armed = !set.contains_key(&h);
-        set.entry(h).or_insert(0);
-        if armed && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-            eprintln!("[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor}");
+        set.entry(h).or_insert_with(|| DeferredNewRetry {
+            state: 0,
+            sites: deferred_sites.to_vec(),
+            key: (
+                std::sync::Arc::from(class_name),
+                std::sync::Arc::from(method_name),
+                std::sync::Arc::from(descriptor),
+            ),
+        });
+        if armed {
+            DEFERRED_NEW_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new ARMED {class_name}.{method_name}{descriptor} ({} unresolved new site(s))",
+                    deferred_sites.len(),
+                );
+            }
         }
     }
+}
+
+/// Restore the historical BLIND deferred-`new` retry grant.
+///
+/// The grant used to flip its one-shot memo whether or not the class that
+/// caused the bail had loaded, which on CratonBench lost every retry it granted
+/// -- five `java/util/regex/Pattern` methods bailed twice each and then had no
+/// retry left. `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` puts that back, as the
+/// bisection lever for anything that looks like a method no longer reaching the
+/// optimizing tier.
+fn deferred_new_retry_blind() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND")
+            .map_or(false, |v| v != "0" && v != "false")
+    })
 }
 
 /// Take (clear) this method's one deferred-`new` retry, if it has one.
@@ -18194,7 +18250,12 @@ pub fn note_deferred_new_bail(class_name: &str, method_name: &str, descriptor: &
 /// cheap inline TLAB bump for a more optimized body on a method whose
 /// allocations escape anyway; it is not the right answer for a method that was
 /// never given a chance to have its allocation looked at.
-pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+pub fn take_deferred_new_retry(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    site_resolves_now: &dyn Fn(u32, u16) -> bool,
+) -> bool {
     let h = compute_jit_key_hash(
         class_name,
         method_name,
@@ -18202,17 +18263,88 @@ pub fn take_deferred_new_retry(class_name: &str, method_name: &str, descriptor: 
         cratonvm_types::ClassId::new(0),
     );
     let mut set = deferred_new_retries().write();
-    let granted = match set.get_mut(&h) {
-        Some(state @ 0) => {
-            *state = 1;
-            true
-        }
-        _ => false,
+    let Some(entry) = set.get_mut(&h) else {
+        return false;
     };
-    if granted && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+    if entry.state != 0 {
+        return false;
+    }
+    // The retry is for a TRANSIENT condition -- a `new` whose class had not
+    // been loaded yet -- so spending it while that condition still holds throws
+    // it away on an attempt guaranteed to bail exactly as the first one did,
+    // and leaves nothing for the moment the class actually loads. Ask first.
+    //
+    // An empty `sites` list is treated as "cannot tell" and grants, which is
+    // the historical behaviour.
+    let ready = deferred_new_retry_blind()
+        || entry.sites.is_empty()
+        || entry
+            .sites
+            .iter()
+            .all(|&(holder, cp_idx)| site_resolves_now(holder, cp_idx));
+    if !ready {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept"
+            );
+        }
+        DEFERRED_NEW_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    entry.state = 1;
+    DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!("[cratonvm-jitc] deferred-new SPENT {class_name}.{method_name}{descriptor}");
     }
-    granted
+    DEFERRED_NEW_SPENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Retries withheld because the deferred class was still not loaded, and
+/// retries actually spent. A gate that never holds, or never grants, is a gate
+/// that is not doing what it says.
+static DEFERRED_NEW_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEFERRED_NEW_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(held, spent)` deferred-`new` retry decisions for this process.
+pub fn deferred_new_retry_census() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DEFERRED_NEW_HELD.load(Relaxed),
+        DEFERRED_NEW_SPENT.load(Relaxed),
+    )
+}
+
+/// How many deferred-`new` retries are currently HELD, as one relaxed load.
+///
+/// The sweep that re-offers them runs on every class definition, so its fast
+/// path must not take the memo lock: during startup a lock per definition is a
+/// cost paid by every program, to answer "nothing to do" for almost all of them.
+static DEFERRED_NEW_ARMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of retries armed and not yet spent. Cheap enough for a hot path.
+pub fn held_deferred_new_count() -> u64 {
+    DEFERRED_NEW_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Every method whose deferred-`new` retry is still HELD, newest-first order
+/// unspecified.
+///
+/// The sweep that re-offers them runs on a class definition, not on the
+/// method's own next compile: a method that bailed on an unloaded class has no
+/// reason to be compiled again, so waiting for it to come back is waiting for
+/// something that does not happen.
+pub fn held_deferred_new_methods() -> Vec<(
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+    std::sync::Arc<str>,
+)> {
+    deferred_new_retries()
+        .read()
+        .values()
+        .filter(|e| e.state == 0)
+        .map(|e| e.key.clone())
+        .collect()
 }
 
 /// Number of methods currently OWED a deferred-`new` retry. Diagnostics.
@@ -18220,7 +18352,7 @@ pub fn deferred_new_retry_count() -> usize {
     deferred_new_retries()
         .read()
         .values()
-        .filter(|&&v| v == 0)
+        .filter(|e| e.state == 0)
         .count()
 }
 
@@ -21981,6 +22113,50 @@ pub fn first_unsupported_precise_frame_site(
     None
 }
 
+thread_local! {
+    /// Did the optimizing pipeline get entered on this thread's current
+    /// compile, and then hand the method to the single-pass backend?
+    ///
+    /// `metrics` already records this as `fell_through_to_single_pass`, but the
+    /// metrics ring is behind `CRATONVM_JIT_METRICS` and keeps only a bounded
+    /// history, so it can answer questions ABOUT a run and cannot be consulted
+    /// DURING one. Anything that changes behaviour on this fact needs a signal
+    /// that is on when the metrics are off, or the diagnostic becomes the
+    /// thing it is measuring.
+    ///
+    /// Thread-local because a compile runs start-to-finish on one worker; read
+    /// it immediately after the compile call, on the same thread.
+    static IR_PIPELINE_ENTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IR_FELL_THROUGH_TO_SINGLE_PASS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Reset the fall-through signal at the start of a compile.
+fn reset_ir_fall_through_signal() {
+    IR_PIPELINE_ENTERED.with(|c| c.set(false));
+    IR_FELL_THROUGH_TO_SINGLE_PASS.with(|c| c.set(false));
+}
+
+fn note_ir_pipeline_entered() {
+    IR_PIPELINE_ENTERED.with(|c| c.set(true));
+}
+
+fn note_single_pass_entered() {
+    if IR_PIPELINE_ENTERED.with(|c| c.get()) {
+        IR_FELL_THROUGH_TO_SINGLE_PASS.with(|c| c.set(true));
+    }
+}
+
+/// Did the compile that just finished on this thread run the whole optimizing
+/// pipeline and then produce a single-pass body anyway?
+///
+/// True means the C2 task paid for an IR build, optimize and schedule, threw
+/// them away (`ir_lower::lower_inner` returning `None` is the common route),
+/// and recompiled the method with the backend that had already compiled it.
+pub fn last_compile_fell_through_to_single_pass() -> bool {
+    IR_FELL_THROUGH_TO_SINGLE_PASS.with(|c| c.get())
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -22088,6 +22264,8 @@ fn try_compile_inner(
     // native in front of real bytes.
     intrinsic_resolver: Option<&dyn Fn(&str, &str, &str) -> bool>,
 ) -> Option<CompiledMethod> {
+    // One compile, one verdict: the fall-through signal describes THIS call.
+    reset_ir_fall_through_signal();
     // C2-review P0 "Measure compilation quality": one structured
     // `metrics::CompilationReport` per compilation, published when this handle
     // drops. `Drop` is deliberate — this function has ~40 `return None` exits
@@ -22173,6 +22351,13 @@ fn try_compile_inner(
         *backend_attempted = true;
 
         let mut backend = aarch64_backend::Arm64Backend::new();
+        // Without this the backend's `safepoint_flag_addr` stays 0 and
+        // `emit_safepoint_poll` emits nothing — the same optional-helper
+        // contract x64 uses, so an unwired build is byte-identical.
+        backend.set_helpers(*helpers);
+        // Seeds the reference-parameter mask, which the entry poll names its
+        // live oops from and the local dataflow starts at bci 0 with.
+        backend.set_method_descriptor(&cached.method_descriptor, cached.is_static);
         let result = backend.compile_method_with_info(
             cached.max_locals as usize,
             num_params,
@@ -22181,12 +22366,13 @@ fn try_compile_inner(
             method_info,
         );
         if result.success {
-            if let Some(machine_code) = aarch64_backend::emit_machine_code(&result) {
-                if let Some(mut buf) = ExecutableBuffer::new(machine_code.len().max(4096)) {
-                    buf.set_tag("aarch64-backend");
-                    buf.emit(&machine_code);
-                    return Some(CompiledMethod::new(buf));
-                }
+            // One line on purpose: everything this used to do inline lives in
+            // `publish_compiled_method`, which has no `cfg` on it and so is
+            // type-checked and unit-tested on every host. This block is not
+            // compiled on x86-64, which is how it came to build its
+            // `CompiledMethod` without ever transferring `oop_maps`.
+            if let Some(cm) = aarch64_backend::publish_compiled_method(&result) {
+                return Some(cm);
             }
         }
         return None;
@@ -22808,6 +22994,7 @@ fn try_compile_inner(
         // `enter_single_pass` is recognisable as a FALL-THROUGH rather than a
         // method that was never a C2 candidate at all.
         metrics.enter_optimizing_pipeline();
+        note_ir_pipeline_entered();
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
@@ -22817,6 +23004,11 @@ fn try_compile_inner(
         let mut ir_compact_fields: std::collections::HashMap<(usize, bool), (u32, bool, u8)> =
             std::collections::HashMap::new();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
+        // The one fact the optimizing tier cannot derive for itself: whether
+        // parameter 0 is a receiver. `num_params` above already counts the
+        // implicit `this`, so the flag is the only missing half, and it is
+        // right here.
+        builder.graph.receiver_param = if cached.is_static { None } else { Some(0) };
         builder.tdigest_scalar_kernel = cached.class_name.as_ref()
             == "org/elasticsearch/tdigest/Dist"
             && matches!(
@@ -23072,6 +23264,9 @@ fn try_compile_inner(
         // usually its constructor. Read again after `IrBuilder::build`, so the
         // retry is recorded only when the build actually LOST the method.
         let mut any_deferred_new = false;
+        // The sites themselves, not just "there was one": the retry grant asks
+        // whether these resolve NOW, and it cannot ask that from a bool.
+        let mut deferred_new_sites: Vec<(u32, u16)> = Vec::new();
         if let (Some(elidable_resolver), Some(new_resolver)) =
             (cp_elidable_init_resolver, cp_new_resolver)
         {
@@ -23092,7 +23287,13 @@ fn try_compile_inner(
                         }) => {
                             new_info_map.insert(pc, (class_id, num_fields));
                         }
-                        Some(JitNewSite::Deferred { .. }) => any_deferred_new = true,
+                        Some(JitNewSite::Deferred {
+                            holder_class_id,
+                            cp_idx,
+                        }) => {
+                            any_deferred_new = true;
+                            deferred_new_sites.push((holder_class_id, cp_idx));
+                        }
                         _ => {}
                     }
                 }
@@ -24516,6 +24717,7 @@ fn try_compile_inner(
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
+                &deferred_new_sites,
             );
         }
         if built.is_none() && ir_stage_reporting() {
@@ -24958,6 +25160,7 @@ fn try_compile_inner(
                     }
                     note_jit_pipeline_stage(JIT_STAGE_LOWER);
                     let metrics_lower = metrics.phase(metrics::Phase::Lower);
+                    ir_lower::clear_lower_bail();
                     let lowered = ir_lower::lower_inner(
                         &graph,
                         &schedule,
@@ -25250,9 +25453,16 @@ fn try_compile_inner(
                         return Some(compiled);
                     }
                     if ir_stage_reporting() {
+                        // Name the bail. "returned None" said the optimizing
+                        // tier declined and nothing about whether the decline
+                        // was predictable, which is the only question that
+                        // decides if the wasted IR build can be avoided.
                         eprintln!(
-                            "[ir] ir_lower::lower_inner returned None for {}.{}{}",
-                            cached.class_name, cached.method_name, cached.method_descriptor,
+                            "[ir] ir_lower::lower_inner refused ({}) for {}.{}{}",
+                            ir_lower::last_lower_bail().unwrap_or("unlabelled"),
+                            cached.class_name,
+                            cached.method_name,
+                            cached.method_descriptor,
                         );
                     }
                 }
@@ -25267,6 +25477,7 @@ fn try_compile_inner(
     // as a fall-through, which is what makes "the C2 tier produced no bodies"
     // separable from "the C2 tier was never asked".
     metrics.enter_single_pass();
+    note_single_pass_entered();
 
     // Resolve multianewarray entries.
     //
@@ -31059,6 +31270,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31120,6 +31332,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31169,6 +31382,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31252,6 +31466,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31522,6 +31737,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31657,6 +31873,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31755,6 +31972,7 @@ mod tests {
                 exit: NO_NODE,
                 safepoints: Vec::new(),
                 uses: Default::default(),
+                receiver_param: None,
             };
             let start = g.add(Op::Start, IrType::Control, vec![], None);
             let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -31846,6 +32064,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
@@ -37200,6 +37419,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let c = g.add(ir::Op::Const(42), ir::IrType::Int, vec![], None);
@@ -37230,6 +37450,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(ir::Op::Start, ir::IrType::Void, vec![], None);
         let alloc = g.add(
@@ -39576,5 +39797,121 @@ mod devirt_intrinsic_yield_tests {
                 );
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_new_retry_gate_tests {
+    use super::{note_deferred_new_bail, take_deferred_new_retry};
+
+    /// The memo map and its held-count are process-global, so these tests
+    /// cannot run concurrently with each other: `cargo test` runs them on
+    /// separate threads, and a count asserted as `before + 1` is only stable
+    /// if nothing else is arming or spending at the same time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The retry exists for a TRANSIENT condition, so it must not be spent
+    /// while that condition still holds. Before this gate the grant was blind:
+    /// it flipped the one-shot memo on the next attempt regardless, the attempt
+    /// bailed exactly as the first had, and the method then had no retry left
+    /// for the moment its class actually loaded. Measured on CratonBench, that
+    /// lost 5 of 6 retries and cost 30 ms of background compile per run.
+    #[test]
+    fn an_unresolved_site_holds_the_retry_instead_of_spending_it() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Hold", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[(7, 11)]);
+        let never = |_: u32, _: u16| false;
+        assert!(
+            !take_deferred_new_retry(c, m, d, &never),
+            "a still-unresolved new site must not consume the one retry",
+        );
+        // And the memo survives: the whole point is that it is still there when
+        // the class does load.
+        let now = |_: u32, _: u16| true;
+        assert!(
+            take_deferred_new_retry(c, m, d, &now),
+            "the retry held above must still be available once the site resolves",
+        );
+    }
+
+    /// One-shot is one-shot: a granted retry is not re-grantable.
+    #[test]
+    fn a_spent_retry_is_not_granted_twice() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Once", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[(1, 2)]);
+        let now = |_: u32, _: u16| true;
+        assert!(take_deferred_new_retry(c, m, d, &now));
+        assert!(!take_deferred_new_retry(c, m, d, &now));
+    }
+
+    /// Every site must resolve, not merely one of them: a method bails on the
+    /// FIRST `new` the builder cannot type, so a retry granted while any site
+    /// is still unresolved is a retry spent on the same bail.
+    #[test]
+    fn one_unresolved_site_among_several_still_holds() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Partial", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[(1, 2), (1, 3)]);
+        let only_first = |_h: u32, cp: u16| cp == 2;
+        assert!(!take_deferred_new_retry(c, m, d, &only_first));
+    }
+
+    /// A memo with no recorded sites cannot answer the question, so it grants —
+    /// the historical behaviour, not a silent refusal.
+    #[test]
+    fn a_memo_without_sites_grants_as_before() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Unknown", "run", "()V");
+        note_deferred_new_bail(c, m, d, &[]);
+        let never = |_: u32, _: u16| false;
+        assert!(take_deferred_new_retry(c, m, d, &never));
+    }
+
+    /// An un-armed method has no retry to take.
+    #[test]
+    fn a_method_that_never_bailed_has_no_retry() {
+        let _serial = serial();
+        let now = |_: u32, _: u16| true;
+        assert!(!take_deferred_new_retry("T$Never", "run", "()V", &now));
+    }
+
+    /// A held retry has to be FINDABLE, or holding it is the same outcome as
+    /// spending it: the method already has a body, so nothing compiles it
+    /// again and no door it walks through will ever ask about it. The memo map
+    /// is keyed by a hash, which cannot name a method — hence the stored key.
+    #[test]
+    fn a_held_retry_can_be_found_again_by_method_name() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Findable", "run", "()V");
+        super::note_deferred_new_bail(c, m, d, &[(3, 4)]);
+        let never = |_: u32, _: u16| false;
+        assert!(!take_deferred_new_retry(c, m, d, &never));
+        let held = super::held_deferred_new_methods();
+        assert!(
+            held.iter()
+                .any(|(hc, hm, hd)| &**hc == c && &**hm == m && &**hd == d),
+            "a held retry must appear in the set the class-definition sweep reads",
+        );
+    }
+
+    /// The sweep's fast path is this counter, so it has to actually track the
+    /// arm/spend pair — a counter stuck at zero silently disables the sweep,
+    /// and one that never decrements makes every class definition do work.
+    #[test]
+    fn the_held_count_tracks_arming_and_spending() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Counted", "run", "()V");
+        let before = super::held_deferred_new_count();
+        super::note_deferred_new_bail(c, m, d, &[(5, 6)]);
+        assert_eq!(super::held_deferred_new_count(), before + 1);
+        let now = |_: u32, _: u16| true;
+        assert!(take_deferred_new_retry(c, m, d, &now));
+        assert_eq!(super::held_deferred_new_count(), before);
     }
 }

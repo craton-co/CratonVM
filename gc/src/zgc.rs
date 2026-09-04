@@ -689,6 +689,17 @@ struct ZgcCounters {
     /// nothing. Counted at the POLL, not at the collection, so a trigger that
     /// fires and is then overtaken by another clause still shows.
     alloc_trigger_fires: AtomicUsize,
+    /// Cycles in which the PAUSE TARGET was unreachable: the live set alone
+    /// projects a pause past the target, or what the target leaves after it is
+    /// below `ZGC_ALLOC_TRIGGER_FLOOR`.
+    ///
+    /// The distinguishing counter for the pause-target loop. A small budget is
+    /// what a working loop produces on a workload with big pauses, and it is
+    /// ALSO what a loop produces when it has given up and fallen back to the
+    /// floor. Those are opposite situations -- one says the target is being
+    /// met, the other says it cannot be -- and without this they report the
+    /// same `alloc_trigger=` line.
+    pause_target_unreachable: AtomicUsize,
     /// Fixed-point waits the mark driver served by TIMING OUT rather than by
     /// being woken, summed across every cycle — see
     /// [`mark::ZMarkTerminator::park_timeouts`].
@@ -747,6 +758,25 @@ struct ZgcCounters {
     /// measurement is a vacuous green.**
     parallel_mark_cycles: AtomicUsize,
     compaction_cycles: AtomicUsize,
+    /// Why `needs_gc` said yes, one counter per branch.
+    ///
+    /// AUDIT 2026-09-03. `needs_gc` has four independent reasons and the
+    /// stats reported only the TOTAL, so "13 collections against 2" could
+    /// not be attributed. Measured on kfusion, one frame, same binary:
+    /// `--gpu` collects 13 times and without it twice, for 27% more
+    /// garbage -- a trigger difference, not an allocation difference, and
+    /// no way to tell which trigger without these.
+    trigger_stress: AtomicUsize,
+    trigger_threshold: AtomicUsize,
+    trigger_headroom: AtomicUsize,
+    trigger_alloc_budget: AtomicUsize,
+    /// Allocations the arena genuinely REFUSED, which latch
+    /// `hard_alloc_failure` and make the safepoint collect without ever
+    /// consulting `needs_gc`. Counted because the four `trigger_*` tallies
+    /// above came back ALL ZERO on a run that collected 13 times, leaving
+    /// this as the only remaining explanation -- and a conclusion by
+    /// elimination is worth exactly one counter.
+    trigger_hard_alloc_fail: AtomicUsize,
     objects_relocated: AtomicUsize,
     vacated_spans_published: AtomicUsize,
     vacated_bytes_published: AtomicUsize,
@@ -1333,9 +1363,57 @@ pub struct ZgcRealHeap {
     /// a generational one: it is the answer to "how much garbage is worth a
     /// cycle", which is a question a non-generational heap has too.
     ///
-    /// Atomic only so a test can flip the clause on a live heap and assert
-    /// both arms of it; nothing in the collector writes it after construction.
+    /// Atomic because [`Self::refresh_pause_target_budget`] REWRITES it at the
+    /// end of every collection while a pause target is CONSTRAINING -- that is
+    /// the whole of the pause-target mode's effect on the trigger -- and so a
+    /// test can flip the clause on a live heap and assert both arms of it.
     alloc_trigger_bytes: AtomicUsize,
+    /// What [`zgc_alloc_trigger_percent`] alone asked for, fixed at
+    /// construction. `0` when the percentage form is off, which is the default.
+    ///
+    /// The pause-target loop is a CEILING and starts unconstrained; when it
+    /// releases its constraint -- pauses came back comfortably under the
+    /// target, or the target turned out to be unachievable -- it has to hand
+    /// [`Self::alloc_trigger_bytes`] back to something, and that something is
+    /// this. Without it, releasing would leave whatever the last constrained
+    /// cycle happened to compute.
+    alloc_trigger_percent_bytes: usize,
+    /// The pause this collector tries to stay under, in MILLISECONDS. `0`
+    /// means no target, and then [`Self::alloc_trigger_bytes`] keeps whatever
+    /// [`zgc_alloc_trigger_percent`] gave it at construction.
+    ///
+    /// Seeded from [`zgc_pause_target_ms`]; `-XX:MaxGCPauseMillis` overwrites
+    /// it through [`Self::set_pause_target_ms`] after construction.
+    pause_target_ms: AtomicU64,
+    /// The span that produced the most recent OVERRUN, in bytes. `0` means
+    /// "no overrun is remembered".
+    ///
+    /// The relax path may not widen [`Self::pause_affordable_span`] past
+    /// seven-eighths of this. Without that memory the loop re-probes the
+    /// region it already knows overruns: it relaxes a quarter at a time, the
+    /// span climbs back to where the last long pause happened, the pause
+    /// overruns again, and it cuts. Measured on `G1ChurnPauseProbe 50 1800` at
+    /// `-Xmx2048m` with a 200 ms target, that cycle cost 13% of wall and left
+    /// the worst pause at 290 ms against an unconstrained 296 -- all of the
+    /// cost of a ceiling and none of the benefit. This is the `ssthresh` of a
+    /// multiplicative-decrease loop, and leaving it out is the same mistake.
+    ///
+    /// Forgotten when a pause comes in at or below a QUARTER of the target:
+    /// that is a span far cheaper than the remembered overrun implies, which
+    /// means the workload changed and the memory is now about a heap that no
+    /// longer exists.
+    pause_overrun_span: AtomicU64,
+    /// The span, in BYTES, that a pause of [`Self::pause_target_ms`] can
+    /// afford to walk -- the controller's state. `0` means "never measured",
+    /// and nothing can be projected from it, which is why the first cycle of
+    /// any run is still triggered by the occupancy clauses. You cannot predict
+    /// a pause you have never taken.
+    ///
+    /// The budget is this minus the live bytes. Held in the units of the thing
+    /// being controlled rather than as a cost coefficient, which is what makes
+    /// the rate limit in [`ZgcRealHeap::refresh_pause_target_budget`]
+    /// expressible at all.
+    pause_affordable_span: AtomicU64,
     /// `allocated` as of the end of the last collection.
     ///
     /// `allocated - cycle_alloc_watermark` is BYTES ALLOCATED SINCE THE LAST
@@ -1781,6 +1859,13 @@ impl ZgcRealHeap {
                 0 => 0,
                 pct => (cap / 100 * pct).max(ZGC_ALLOC_TRIGGER_FLOOR),
             }),
+            alloc_trigger_percent_bytes: match zgc_alloc_trigger_percent() {
+                0 => 0,
+                pct => (cap / 100 * pct).max(ZGC_ALLOC_TRIGGER_FLOOR),
+            },
+            pause_target_ms: AtomicU64::new(zgc_pause_target_ms()),
+            pause_affordable_span: AtomicU64::new(0),
+            pause_overrun_span: AtomicU64::new(0),
             gc_rearm: AtomicUsize::new(0),
             native_alloc_pressure: AtomicBool::new(false),
             hard_alloc_failure: AtomicBool::new(false),
@@ -1894,6 +1979,7 @@ impl ZgcRealHeap {
                 mark_park_timeouts: AtomicUsize::new(0),
                 gen_nursery_overshoot_max: AtomicUsize::new(0),
                 alloc_trigger_fires: AtomicUsize::new(0),
+                pause_target_unreachable: AtomicUsize::new(0),
                 gen_zero_bytes_skipped: AtomicUsize::new(0),
                 gen_dead_runs: AtomicUsize::new(0),
                 gen_dead_objects: AtomicUsize::new(0),
@@ -1906,6 +1992,11 @@ impl ZgcRealHeap {
                 gen_recards_after_relocation: AtomicUsize::new(0),
                 parallel_mark_cycles: AtomicUsize::new(0),
                 compaction_cycles: AtomicUsize::new(0),
+            trigger_stress: AtomicUsize::new(0),
+            trigger_threshold: AtomicUsize::new(0),
+            trigger_headroom: AtomicUsize::new(0),
+            trigger_alloc_budget: AtomicUsize::new(0),
+            trigger_hard_alloc_fail: AtomicUsize::new(0),
                 objects_relocated: AtomicUsize::new(0),
                 vacated_spans_published: AtomicUsize::new(0),
                 vacated_bytes_published: AtomicUsize::new(0),
@@ -2253,6 +2344,302 @@ impl ZgcRealHeap {
         let hi = threshold * MAX_PERCENT as u64 / 100;
         self.conc_start_bytes
             .store(want.clamp(lo, hi) as usize, Ordering::Relaxed);
+    }
+
+    /// Set the pause target, in milliseconds. `0` turns the pause-target
+    /// budget off.
+    ///
+    /// This is `-XX:MaxGCPauseMillis`'s door into this collector. The flag
+    /// reached only G1 before 2026-09-03 (`G1ConfigOverrides::max_gc_pause_ms`);
+    /// on the DEFAULT collector an operator who asked for a pause target got
+    /// no answer and no diagnostic, which is worse than not supporting it.
+    pub fn set_pause_target_ms(&self, ms: u64) {
+        self.pause_target_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// `(target ms, affordable span bytes, budget bytes, cycles the target was
+    /// unreachable in)` -- the pause-target loop's own state, so a run can be
+    /// asked why it sized its budget the way it did.
+    pub fn pause_target_state(&self) -> (u64, u64, usize, usize) {
+        (
+            self.pause_target_ms.load(Ordering::Relaxed),
+            self.pause_affordable_span.load(Ordering::Relaxed),
+            self.alloc_trigger_bytes.load(Ordering::Relaxed),
+            self.counters.pause_target_unreachable.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Re-derive the allocation budget from the PAUSE TARGET, using what this
+    /// cycle just cost. Called once per collection, at the safepoint.
+    ///
+    /// # A target is a CEILING, not a setpoint
+    ///
+    /// This is the whole design, and the first two versions of it got the
+    /// point wrong. The obvious controller solves `pause == target`:
+    ///
+    /// ```text
+    ///     affordable = span * target / pause
+    ///     budget     = affordable - live
+    /// ```
+    ///
+    /// whose fixed point is a pause exactly ON the target, from either side.
+    /// Measured on `G1ChurnPauseProbe 50 600` at `-Xmx2048m`, whose natural
+    /// worst pause is 175 ms: with a 200 ms target that controller fired seven
+    /// cycles, grew the budget until pauses reached 203 ms, and cost 17% of
+    /// wall. It did exactly what it was asked -- it held 200 ms -- by making
+    /// the pauses LONGER and paying for the privilege. Nobody who sets
+    /// `-XX:MaxGCPauseMillis=200` is asking for that.
+    ///
+    /// So the loop is one-sided, and it starts UNCONSTRAINED:
+    ///
+    /// * **A pause that overran the target TIGHTENS.**
+    ///   `affordable = span * target / pause`, floored at half the previous
+    ///   value so one anomalous pause cannot collapse the budget.
+    /// * **A pause under THREE QUARTERS of the target RELAXES**, by a quarter,
+    ///   never past seven-eighths of the span that last overran
+    ///   ([`Self::pause_overrun_span`]), and hands back control entirely once
+    ///   the affordable span reaches capacity. Without a relax path a single
+    ///   transient spike would constrain the heap for the rest of the run.
+    /// * **Anything in between leaves the budget alone** -- the hysteresis
+    ///   band `[0.75, 1.0] x target` that stops the loop hunting. Three
+    ///   quarters and not a half: pause length is noisy, so a loop that has
+    ///   settled just under the target overruns every few cycles and tightens,
+    ///   and a band that wide means the cycles in between never give anything
+    ///   back. It RATCHETS. Measured at `-Xmx4096m` against a 100 ms target
+    ///   with a half-target band: pauses held at 55-95 ms for a hundred
+    ///   consecutive cycles while the budget walked one way from 199 MiB to
+    ///   11 MiB and the run collected 139 times instead of 3.
+    ///
+    /// The shape is `CRATONVM_G1_YOUNG_PAUSE_TARGET`'s in `g1.rs` -- tighten
+    /// after an overrun, relax while pauses stay comfortably under the goal --
+    /// with the band narrowed for the reason above.
+    ///
+    /// The consequence that matters: on a workload whose pauses never reach
+    /// the target the clause NEVER ENGAGES, and costs one relaxed load per
+    /// collection. That is what makes a non-zero default defensible, where the
+    /// percentage form ([`zgc_alloc_trigger_percent`]) had to ship off.
+    ///
+    /// # Why the correction is multiplicative
+    ///
+    /// The pause is not proportional to the span. It is roughly
+    /// `fixed + k * span`, and on this collector the fixed part is large -- a
+    /// measured 35 ms pause over a 5.7 MiB span next to a 48 ms pause over a
+    /// 167 MiB one puts it near 34 ms. A controller that fitted `k` as a plain
+    /// ratio of pause to span would attribute all of that fixed cost to the
+    /// span: the first version did, and it reported coefficients an order of
+    /// magnitude too high on the small early cycles, cutting the budget to
+    /// 8-27 MiB where the converged answer was over 140. Scaling the span by
+    /// `target / pause` never has to know `fixed` or `k`, because the only
+    /// place the correction factor is 1 is the place the pause equals the
+    /// target.
+    ///
+    /// # The clamps, and why an unmeetable target means DO NOTHING
+    ///
+    /// * **Ceiling** (capacity). A budget above the heap can never be reached,
+    ///   which is the same as being unconstrained -- so reaching it hands
+    ///   control back to [`zgc_alloc_trigger_percent`]'s constant.
+    /// * **Floor** ([`ZGC_ALLOC_TRIGGER_FLOOR`], 8 MiB) for a budget the loop
+    ///   wants SMALLER than that, against a live set the target can afford.
+    /// * **`affordable <= live`: the clause goes inert**, hands control back
+    ///   to [`zgc_alloc_trigger_percent`]'s constant, FORGETS its state, and
+    ///   [`ZgcRealCounters::pause_target_unreachable`] counts the cycle.
+    ///
+    /// The last two look alike and are opposite, and collapsing them was a
+    /// defect. When the LIVE SET alone projects past the target, the pause
+    /// length is set by the live set and no budget changes it: collecting
+    /// every 8 MiB against a 1.5 GiB live set buys pauses of exactly the same
+    /// length, hundreds of times more often, and the clause deliberately does
+    /// not consult `gc_rearm` (see `zgc_alloc_trigger_percent`) so nothing
+    /// else would have stopped it. But when the live set is CHEAP and the loop
+    /// merely wants a tight budget, going inert loses control completely --
+    /// measured at `-Xmx4096m`, a tightening step that crossed the floor
+    /// dropped the constraint and the next cycle ran unconstrained to 670 ms.
+    ///
+    /// Going inert also has to RESET the loop. The tighten arm never widens
+    /// and the relax arm is capped by [`Self::pause_overrun_span`], so a stale
+    /// affordable span is a ceiling on everything the controller can ever
+    /// believe again: a startup cycle that overran by 3% on a 5 MiB span
+    /// pinned it at 4.8 MiB, below the live set, and the run never recovered.
+    /// "I have no constraint" is the same state as "I have never
+    /// constrained".
+    ///
+    /// A climbing `unreachable` is the diagnosis: the target is not achievable
+    /// at this live set, which is an answer, and a different one from "the
+    /// loop is holding the target".
+    ///
+    /// # What the clock covers
+    ///
+    /// `pause_ns` is the same figure `[GC] zgc-pause:` reports, which is taken
+    /// BEFORE the optional compaction slide (`CRATONVM_ZGC_RELOCATE=1`). Under
+    /// that flag the real pause is longer than the one being modelled, so the
+    /// loop holds its ceiling on a pause that is not the whole pause. Sizing
+    /// from a clock that stops early is still self-correcting for everything
+    /// it does cover; it is simply blind to the part it does not.
+    fn refresh_pause_target_budget(&self, pause_ns: u64, live_bytes: usize, bytes_freed: usize) {
+        let target_ms = self.pause_target_ms.load(Ordering::Relaxed);
+        if target_ms == 0 {
+            return;
+        }
+        let span_bytes = live_bytes.saturating_add(bytes_freed) as u64;
+        if span_bytes == 0 || pause_ns == 0 {
+            // Nothing was walked, or the clock could not resolve the pause.
+            // Either way this cycle carries no correction factor -- `pause` is
+            // the divisor -- and inventing one would size the next budget off
+            // a cycle that did not happen.
+            return;
+        }
+        let target_ns = target_ms.saturating_mul(1_000_000);
+        let prior = self.pause_affordable_span.load(Ordering::Relaxed);
+        let affordable = if pause_ns > target_ns {
+            // OVERRAN. Remember the span that did it -- the relax path may not
+            // climb back into it -- and scale the span by how far over it
+            // went. `u128` so the product cannot wrap: span is bounded by the
+            // heap, but `target_ns` is a flag and `pause_ns` a clock reading,
+            // and neither is bounded by anything this file owns.
+            self.pause_overrun_span.store(span_bytes, Ordering::Relaxed);
+            let sample = (u128::from(span_bytes) * u128::from(target_ns) / u128::from(pause_ns))
+                .min(u128::from(u64::MAX)) as u64;
+            if prior == 0 {
+                sample
+            } else {
+                // Never widen on an overrun, and never cut by more than half.
+                sample.clamp(prior / 2, prior)
+            }
+        } else if prior != 0 && pause_ns.saturating_mul(4) <= target_ns {
+            // FAR under -- a quarter of the target or less. The span this
+            // cycle walked is much cheaper than the remembered overrun says it
+            // should be, so the memory is about a heap that no longer exists:
+            // drop it and let the loop relax freely again.
+            self.pause_overrun_span.store(0, Ordering::Relaxed);
+            prior.saturating_add(prior / 4)
+        } else if prior != 0 && pause_ns.saturating_mul(4) <= target_ns.saturating_mul(3) {
+            // UNDER THREE QUARTERS of the target, and currently constrained:
+            // give a quarter back, but NEVER past seven-eighths of the span
+            // that last overran. See `pause_overrun_span` for what re-probing
+            // that region costs.
+            //
+            // Three quarters and not a half. The band has to be narrow enough
+            // that a loop sitting just under the target still relaxes,
+            // otherwise it RATCHETS: pause length is noisy, so a settled loop
+            // overruns every few cycles and tightens, while a band of
+            // `[target/2, target]` means the cycles in between are never
+            // comfortable enough to give anything back. Measured on
+            // `G1ChurnPauseProbe 50 1800` at `-Xmx4096m` with a 100 ms target
+            // and a half-target band: pauses sat at 55-95 ms for a hundred
+            // consecutive cycles -- the loop was holding the target perfectly
+            // -- while the budget walked one way from 199 MiB down to 11 MiB
+            // and the run collected 139 times instead of 3. Noise alone drove
+            // it, because tightening had no dead zone and relaxing was
+            // unreachable.
+            let wider = prior.saturating_add(prior / 4);
+            match self.pause_overrun_span.load(Ordering::Relaxed) {
+                0 => wider,
+                overran => wider.min(overran / 8 * 7).max(prior),
+            }
+        } else {
+            // In the hysteresis band, or never constrained. Leave it.
+            return;
+        };
+        let cap = self.heap_capacity();
+        if affordable >= cap as u64 {
+            // Unconstrained again: hand the clause back to the percentage
+            // form, which is `0` (off) unless an operator set one.
+            self.pause_affordable_span.store(0, Ordering::Relaxed);
+            self.alloc_trigger_bytes
+                .store(self.alloc_trigger_percent_bytes, Ordering::Relaxed);
+            return;
+        }
+        self.pause_affordable_span
+            .store(affordable, Ordering::Relaxed);
+        // TWO DIFFERENT SITUATIONS, and collapsing them into one clamp was a
+        // defect worth its own paragraph.
+        //
+        //   * `affordable <= live` -- the LIVE SET alone projects past the
+        //     target. No budget makes this pause fit, so go INERT: the pause
+        //     length is set by the live set and a small budget would buy
+        //     pauses of exactly the same length, hundreds of times more often.
+        //     The clause deliberately skips `gc_rearm`, so nothing else would
+        //     have stopped it.
+        //   * `0 < affordable - live < FLOOR` -- the loop wants a SMALL budget
+        //     against a cheap live set. That is not the same thing at all, and
+        //     going inert there loses control completely: measured on
+        //     `G1ChurnPauseProbe 50 1800` at `-Xmx4096m` with a 100 ms target,
+        //     a tightening step that crossed the floor dropped the constraint,
+        //     the next cycle ran unconstrained to 670 ms, and the loop spent
+        //     the run oscillating between a tight budget and no budget. The
+        //     floor is the right answer here -- it is the tightest useful
+        //     budget, and against a live set the target can afford it is not a
+        //     storm.
+        let budget = match affordable.checked_sub(live_bytes as u64) {
+            // Converted in `u64`: `affordable` can legitimately exceed
+            // `usize::MAX` on a 32-bit host, where `as usize` would truncate a
+            // huge budget into a small one.
+            Some(b) if b > 0 => usize::try_from(b)
+                .unwrap_or(usize::MAX)
+                .clamp(ZGC_ALLOC_TRIGGER_FLOOR.min(cap), cap),
+            _ => {
+                self.counters
+                    .pause_target_unreachable
+                    .fetch_add(1, Ordering::Relaxed);
+                // AND FORGET EVERYTHING. "I have no constraint" has to be the
+                // same state as "I have never constrained", or the loop can
+                // lock itself out permanently -- which it did.
+                //
+                // The tighten arm never widens (`sample.clamp(prior / 2,
+                // prior)`), and the relax arm is capped by
+                // `pause_overrun_span`. So a stale `prior` is a CEILING on
+                // everything the loop can ever believe again. Observed at
+                // `-Xmx4096m` with a 100 ms target: a startup cycle overran by
+                // 3% while walking a ~5 MiB span, pinning `affordable` at
+                // 4.8 MiB; that is below the live set, so the clause went
+                // inert; being inert means no constraint, so every following
+                // cycle ran unconstrained at 640-733 ms; and each of those
+                // could only ever clamp back down to the stale 4.8 MiB. The
+                // run never recovered.
+                //
+                // Cleared, the next overrun re-seeds from `prior == 0` with
+                // that cycle's own span, which is the freshest evidence there
+                // is.
+                self.pause_affordable_span.store(0, Ordering::Relaxed);
+                self.pause_overrun_span.store(0, Ordering::Relaxed);
+                // AND GIVE UP AFTER THE THIRD TIME.
+                //
+                // Re-engaging after an unreachable verdict repeats the
+                // discovery, and the discovery costs one UNCONSTRAINED cycle
+                // every time: inert means no budget, the next cycle walks the
+                // whole span, and the loop tightens back down to the same
+                // verdict. Measured at `-Xmx4096m` against a 100 ms target,
+                // 56 cycles and +101% wall for a p50 of 103.8 ms -- worse on
+                // both axes than not trying.
+                //
+                // The reason a target can be permanently unachievable is
+                // structural, and it is worth stating because it is not
+                // obvious from this function: THE PAUSE FLOOR IS THE ARENA'S
+                // HIGH-WATER MARK, not the live set. The bitmap sweep covers
+                // `[base, low_cursor)` and the cursor does not retract, so
+                // once any cycle has run the bump cursor out to 1.3 GiB every
+                // later pause pays a scan over that span whatever the budget
+                // is. No allocation trigger can undo it; only compaction and a
+                // cursor retraction can, and those are `CRATONVM_ZGC_RELOCATE`
+                // and `Arena::retract_cursor_to`.
+                //
+                // Three, not one: a single verdict can come from a transient
+                // live-set spike, and the reset above already makes the next
+                // attempt an honest one. Three consecutive failures to find
+                // ANY budget that meets the target is a property of the
+                // workload, not of a bad cycle.
+                if self
+                    .counters
+                    .pause_target_unreachable
+                    .load(Ordering::Relaxed)
+                    >= 3
+                {
+                    self.pause_target_ms.store(0, Ordering::Relaxed);
+                }
+                self.alloc_trigger_percent_bytes
+            }
+        };
+        self.alloc_trigger_bytes.store(budget, Ordering::Relaxed);
     }
 
     /// Fold this cycle's concurrent-phase duration into the average
@@ -2766,6 +3153,20 @@ impl ZgcRealHeap {
     }
 
     /// Number of collections performed so far.
+    /// `(stress, threshold, headroom, alloc_budget, hard_alloc_fail)` —
+    /// why a cycle happened. The first four are `needs_gc`'s branches; the
+    /// last is the arena refusing an allocation, which collects WITHOUT
+    /// consulting `needs_gc` at all. See the counters' declaration.
+    pub fn trigger_tallies(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.counters.trigger_stress.load(Ordering::Relaxed),
+            self.counters.trigger_threshold.load(Ordering::Relaxed),
+            self.counters.trigger_headroom.load(Ordering::Relaxed),
+            self.counters.trigger_alloc_budget.load(Ordering::Relaxed),
+            self.counters.trigger_hard_alloc_fail.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn gc_count(&self) -> usize {
         self.gc_count.load(Ordering::Relaxed)
     }
@@ -7092,7 +7493,7 @@ impl ZgcRealHeap {
 
     /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
     /// base address. Returns `None` on OOM.
-    fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
+    fn alloc_raw(&self, size: usize, init: &dyn Fn(*mut u8)) -> Option<*mut u8> {
         // Which end of the arena. See `Arena::high_cursor` for the measurement
         // this exists for; the short version is that one long-lived object
         // inside a thread's private TLAB chunk caps every hole in the heap at
@@ -7191,6 +7592,9 @@ impl ZgcRealHeap {
                     // the case it was written for: see the `hard_alloc_failure`
                     // field doc.
                     self.hard_alloc_failure.store(true, Ordering::Relaxed);
+                    self.counters
+                        .trigger_hard_alloc_fail
+                        .fetch_add(1, Ordering::Relaxed);
                     // ...and WHERE that collection should compact. The latch
                     // above has always asked for a cycle; this is the first
                     // thing that tells it where the request actually needs
@@ -7243,6 +7647,22 @@ impl ZgcRealHeap {
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
             ptr
         };
+        // THE HEADER, BEFORE THE REGISTRY. `registry.insert` is this heap's
+        // publication point: it is what `is_object_address` answers from and
+        // what `collect_garbage`'s snapshot enumerates, so between the insert
+        // and the caller's header write the address is an object nothing has
+        // described. The span above is zeroed, so a reader in that window
+        // decodes `class_id=0, shape=0, kind=Object` -- a well-formed EMPTY
+        // object -- and the sweep would size it at `HEADER_SIZE`, find
+        // `GC_FLAG_MARKED` clear (`allocate_black_if_marking` has not run
+        // either) and free 16 bytes of an object that is neither dead nor 16
+        // bytes long.
+        //
+        // See `G1Region::bump_alloc_initialized` for the same ordering in the
+        // G1 backend and `GenerationalHeap::try_alloc_young_initialized`, whose
+        // SAFETY comment has stated the rule since long before either: "`init`
+        // writes the valid header before the arena lock is released".
+        init(ptr);
         // One `fetch_or` into the object-start bitmap — no lock, no hash, no
         // table that grows with the live set. See the "Object-start membership"
         // section header for the measurement this replaced.
@@ -7284,17 +7704,25 @@ impl ZgcRealHeap {
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
         let total = HEADER_SIZE.checked_add(fields_size)?;
-        let ptr = self.alloc_raw_tlab(total)?;
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).ok()?,
-        );
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-        }
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
+        let num_slots = u32::try_from(num_fields).ok()?;
+        let ptr = self.alloc_raw_tlab(total, |ptr| {
+            // SAFETY: `ptr` is the base of a zeroed, exclusively-owned span the
+            // allocator has just reserved and not yet published.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        class_id,
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        0,
+                        num_slots,
+                    ),
+                );
+            }
+        })?;
         // Allocate BLACK while a concurrent cycle is marking. Must follow
         // the header write above; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -7369,12 +7797,18 @@ impl ZgcRealHeap {
         }
         let data_size = array_data_size(length, element_type).ok()?;
         let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
-        let ptr = self.alloc_raw_tlab(total)?;
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
         let len_u32 = u32::try_from(length).ok()?;
-        let header = ObjectHeader::new(class_id, ObjectKind::Array, element_type, len_u32, len_u32);
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-        }
+        let ptr = self.alloc_raw_tlab(total, |ptr| {
+            // SAFETY: as in `try_alloc_object`.
+            unsafe {
+                std::ptr::write(
+                    ptr as *mut ObjectHeader,
+                    ObjectHeader::new(class_id, ObjectKind::Array, element_type, len_u32, len_u32),
+                );
+            }
+        })?;
         // Allocate BLACK while a concurrent cycle is marking. Must follow
         // the header write above; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -8514,6 +8948,64 @@ impl ZgcRealHeap {
         }
     }
 
+    /// The arena address ranges that can hold an object start: the low bump
+    /// region and the large-object end, with the never-bumped middle between
+    /// them excluded.
+    ///
+    /// This is what makes the per-cycle bitmap passes cost what the heap USES
+    /// rather than what `-Xmx` reserves. The object-start registry and the mark
+    /// bits are both sized by capacity -- one bit per 8 arena bytes -- and the
+    /// snapshot the mark phase takes was copying all of it every cycle. At
+    /// `-Xmx4g` that is 8.4 million atomic loads into a fresh 64 MiB `Vec`,
+    /// paid whether the heap holds ten objects or ten million.
+    ///
+    /// Measured on `G1ChurnPauseProbe 50 1800`, comparing cycles at the SAME
+    /// registered-object count so the only variable is the heap flag:
+    /// `snapshot_us` 11-13 ms at `-Xmx2048m` against 21-23 ms at `-Xmx4096m`.
+    /// Exactly the ratio of the capacities. That is a pause floor no allocation
+    /// budget can lower, and it is why a pause target that holds at 2 GiB was
+    /// unreachable at 4 GiB (see `refresh_pause_target_budget`).
+    ///
+    /// # The middle is provably empty
+    ///
+    /// `Arena` is two-ended: small objects and TLAB chunks bump UP from offset
+    /// 0, allocations at or above `ZGC_LARGE_OBJECT_MIN` bump DOWN from
+    /// capacity, and the span between the two cursors has never been handed
+    /// out. No allocation starts there, so no start bit in it is set, so
+    /// copying it transfers zeroes.
+    ///
+    /// This is also what pays for `Arena::retract_cursor_to`. Retraction lowers
+    /// the low cursor onto the last survivor after every sweep; without bounded
+    /// passes that only helped the allocator find contiguous space, because the
+    /// bitmap work stayed sized by capacity either way. With them, retraction
+    /// SHRINKS THE PAUSE: the tail of garbage a burst allocated is handed back,
+    /// and the next cycle's snapshot, clear and complement sweep all stop at
+    /// the new cursor.
+    ///
+    /// Takes the arena lock. The caller is at a safepoint, so the two cursors
+    /// cannot move while the ranges are in use.
+    fn live_bitmap_bounds(&self) -> [(usize, usize); 2] {
+        let base = self.arena_base;
+        let (low_end, high_start, end) = {
+            let arena = self.arena.lock();
+            (
+                // HIGH-WATER, not the cursor. `Arena::retract_cursor_to`
+                // lowers the cursor onto the last survivor after every sweep,
+                // and the MARK bitmap has bits above the new cursor -- set
+                // during the cycle, when it was still high. A clear bounded by
+                // the cursor leaves them, and the next cycle then reads a mark
+                // set carrying a previous cycle's bits. `Arena::low_high_water`
+                // is the bound both bitmaps need; the debug verifier in
+                // `ZObjectStartBits::debug_assert_clear_outside` is what caught
+                // the cursor being the wrong one.
+                base + arena.low_high_water(),
+                base + arena.high_cursor(),
+                base + arena.capacity(),
+            )
+        };
+        [(base, low_end), (high_start, end)]
+    }
+
     /// Clear **every** mark bit in the heap.
     ///
     /// One linear pass over `capacity / 512` bytes on the bitmap arm; on the
@@ -8532,7 +9024,23 @@ impl ZgcRealHeap {
         // by its thread -- and a missed one is an object swept while live.
         match &self.mark_bits {
             Some(bits) => {
-                bits.clear_all();
+                // BOUNDED, for the reason `live_bitmap_bounds` gives: a word
+                // in the never-bumped middle is already zero and storing a
+                // zero into it is work that buys nothing. Cheaper than the
+                // snapshot's saving (a linear store, not an atomic load) but
+                // paid on the same per-cycle schedule.
+                if zgc_bitmap_bounds_enabled() {
+                    bits.clear_within(&self.live_bitmap_bounds());
+                    // Both bitmaps over this arena are clear now, so the
+                    // retraction history has done its job: the next cycle's
+                    // bound starts from the retracted cursor rather than from
+                    // wherever this one peaked. Reset AFTER the clear -- doing
+                    // it earlier hands the clear a bound that does not cover
+                    // the bits it has to reach.
+                    self.arena.lock().reset_low_high_water();
+                } else {
+                    bits.clear_all();
+                }
                 true
             }
             None => false,
@@ -10024,15 +10532,103 @@ fn zgc_gen_nursery_percent() -> usize {
 /// firing again requires `budget` bytes of genuinely NEW allocation. A live
 /// set parked above the static threshold -- the shape `gc_rearm` exists to
 /// stop storming on -- cannot re-trigger this clause at all.
-fn zgc_alloc_trigger_percent() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn zgc_alloc_trigger_percent_explicit() -> Option<usize> {
+    static CACHED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_ALLOC_TRIGGER")
+        cratonvm_types::flags::runtime_var("CRATONVM_ZGC_ALLOC_TRIGGER")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-        {
-            Some(p) => p.min(100),
-            None => 0,
+            .map(|p| p.min(100))
+    })
+}
+
+/// The percentage floor a PAUSE TARGET gets when the operator has not named
+/// one: 25% of capacity.
+///
+/// # Why a target needs a floor at all
+///
+/// [`ZgcRealHeap::refresh_pause_target_budget`] is a feedback loop, so it is
+/// blind to the FIRST cycle -- it has nothing to measure until a pause has
+/// happened. The occupancy clause therefore lets that one run to 75% of
+/// `-Xmx`, and on `G1ChurnPauseProbe 50 1800` at `-Xmx4096m` it is the worst
+/// pause of the whole run by a factor of five: everything after the loop
+/// engages settles at 65-115 ms, and that one cycle is 442.
+///
+/// A floor caps it, and the target then controls the steady state. Measured,
+/// one binary, only these two switches moved:
+///
+/// | configuration | wall | worst pause |
+/// |---|---|---|
+/// | neither | 9091 ms | 466 ms |
+/// | target 100 alone | 12943 ms | 509 ms |
+/// | target 100 + floor 25 | 11180 ms | **190 ms** |
+/// | target 200 alone | 14849 ms | 530 ms |
+/// | target 200 + floor 25 | 13548 ms | **221 ms** |
+///
+/// Better than the target ALONE on both axes, which is the part that makes
+/// this a default rather than a tuning knob: paying for the blind first cycle
+/// up front costs less than the controller's recovery from it.
+///
+/// # Why 25 and not tighter
+///
+/// The floor's whole job is the cycle the controller cannot see. Once the loop
+/// has a measurement it takes over, and a floor tighter than the budget the
+/// loop wants is just the loop being overridden by a constant -- which is the
+/// per-workload dial the target exists to replace. 25% is the loosest value
+/// measured to cap the first cycle.
+const ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET: usize = 25;
+
+/// The percentage the allocation clause actually uses: the operator's if they
+/// named one, else the floor under a pause target, else off.
+///
+/// `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal and stays off even
+/// with a target set -- that is the arm that measures the target alone.
+fn zgc_alloc_trigger_percent() -> usize {
+    alloc_trigger_percent_for(
+        zgc_alloc_trigger_percent_explicit(),
+        zgc_pause_target_ms(),
+    )
+}
+
+/// The decision itself, without the environment: the operator's percentage if
+/// they named one, else the floor under a pause target, else off.
+///
+/// Split out because both inputs are `OnceLock`-cached env reads, so a test
+/// cannot vary them in-process -- and the interesting cases here are the
+/// combinations, not the parsing.
+fn alloc_trigger_percent_for(explicit: Option<usize>, pause_target_ms: u64) -> usize {
+    match explicit {
+        // AN EXPLICIT ZERO IS A REFUSAL, not an absence. It is how an operator
+        // says "the target alone", and it is the arm every measurement of the
+        // target on its own was taken with; collapsing it into "unset" would
+        // make that arm unreachable and the comparison unrepeatable.
+        Some(p) => p,
+        None if pause_target_ms != 0 => ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET,
+        None => 0,
+    }
+}
+
+/// `CRATONVM_ZGC_BITMAP_BOUNDS` -- restrict the per-cycle object-start and
+/// mark-bit passes to the arena's two BUMPED ends instead of its whole
+/// capacity. **Default on**; `0`/`off`/`false`/`no` restores the
+/// whole-capacity passes byte for byte, which is the A/B arm.
+///
+/// See [`ZgcRealHeap::live_bitmap_bounds`] for the measurement (a
+/// capacity-proportional `snapshot_us` of 11-13 ms at `-Xmx2048m` against
+/// 21-23 ms at `-Xmx4096m`, at the same object count) and for why the middle
+/// between the two cursors is provably empty.
+fn zgc_bitmap_bounds_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_BITMAP_BOUNDS") {
+            Ok(value) => {
+                let value = value.trim();
+                !matches!(
+                    value,
+                    "0" | "false" | "False" | "FALSE" | "off" | "Off" | "OFF" | "no" | "No" | "NO"
+                )
+            }
+            Err(_) => true,
         }
     })
 }
@@ -10045,6 +10641,49 @@ fn zgc_alloc_trigger_percent() -> usize {
 /// same reason: it is the smallest allocation window in which a real workload
 /// does enough to be worth a cycle.
 const ZGC_ALLOC_TRIGGER_FLOOR: usize = 8 * 1024 * 1024;
+
+/// `CRATONVM_ZGC_PAUSE_TARGET_MS` -- the pause this collector tries to stay
+/// under, in milliseconds. Default 200 (HotSpot's `MaxGCPauseMillis` default,
+/// and G1's default in this tree); `0` turns the pause-target budget off and
+/// leaves [`zgc_alloc_trigger_percent`] in charge of the allocation clause.
+///
+/// `-XX:MaxGCPauseMillis=<n>` sets the same thing and WINS over this variable:
+/// the CLI flag is applied to the constructed heap
+/// ([`ZgcRealHeap::set_pause_target_ms`]) after this default has been read, so
+/// an operator's explicit target is never overridden by an A/B switch.
+///
+/// # Why a target rather than a percentage
+///
+/// `CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` (2026-09-03) made pause work scale
+/// with the GARBAGE rather than with `-Xmx`, and its measurement showed the
+/// problem with expressing that as a percentage: the percent is a
+/// pause-versus-throughput dial that the operator has to tune per workload,
+/// because a percentage of capacity says nothing about how long the resulting
+/// pause will be. 12% bought a 79 ms worst pause for +30% wall on
+/// `G1ChurnPauseProbe`; on a workload with a tenth of the live set the same
+/// 12% would buy a pause nobody needed to shorten, at the same cost.
+///
+/// A target inverts that. It is a CEILING: the clause starts unconstrained and
+/// only engages once a pause has actually OVERRUN the target, tightening in
+/// proportion to the overrun and relaxing back to unconstrained once pauses
+/// return to comfortably under it. So it spends throughput only where a pause
+/// would otherwise overrun, and on a workload whose pauses never reach the
+/// target it costs one relaxed load per collection and nothing else -- which
+/// is what makes a non-zero default defensible here where the percentage form
+/// had to ship off. See [`ZgcRealHeap::refresh_pause_target_budget`], whose
+/// doc also records what the two earlier, wrong versions of this loop did.
+fn zgc_pause_target_ms() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_PAUSE_TARGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(ms) => ms,
+            None => 200,
+        }
+    })
+}
 
 /// `CRATONVM_ZGC_GEN_MINORS_PER_MAJOR` -- young cycles allowed between
 /// whole-heap ones. Default [`generation::Z_DEFAULT_MINORS_PER_MAJOR`] (8).
@@ -11543,25 +12182,31 @@ impl GarbageCollector for ZgcRealHeap {
         let total = HEADER_SIZE
             .checked_add(fields_size)
             .expect("object total size overflow");
-        let ptr = self.alloc_raw_tlab(total).unwrap_or_else(|| {
-            eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
-            std::process::abort();
-        });
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            0,
-            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
-        );
-        if let Some(body) = compact_body {
-            header.set_compact_shape(num_fields as u32, body);
-        }
-        // SAFETY: `ptr` is a fresh zeroed allocation of `total >= HEADER_SIZE`.
-        let obj = unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        };
+        let num_slots = u32::try_from(num_fields).expect("field count exceeds u32::MAX");
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
+        let ptr = self
+            .alloc_raw_tlab(total, |ptr| {
+                let mut header = ObjectHeader::new(
+                    class_id,
+                    ObjectKind::Object,
+                    ArrayElementType::Reference,
+                    0,
+                    num_slots,
+                );
+                if let Some(body) = compact_body {
+                    header.set_compact_shape(num_slots, body);
+                }
+                // SAFETY: `ptr` is a fresh zeroed span of `total >= HEADER_SIZE`
+                // bytes that the allocator has not yet published.
+                unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+            })
+            .unwrap_or_else(|| {
+                eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
+                std::process::abort();
+            });
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        let obj = unsafe { ObjectRef::from_raw(ptr) };
         // Allocate BLACK while a concurrent cycle is marking. Must follow the
         // header write; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -11582,23 +12227,31 @@ impl GarbageCollector for ZgcRealHeap {
         let total = HEADER_SIZE
             .checked_add(data_size)
             .expect("array total size overflow");
-        let ptr = self.alloc_raw_tlab(total).unwrap_or_else(|| {
-            eprintln!("FATAL: ZGC(real): out of heap space for array ({total} bytes)");
-            std::process::abort();
-        });
         let len_u32 = u32::try_from(length).expect("array length exceeds u32::MAX");
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            len_u32,
-            len_u32, // mirror length into num_slots, like Heap/G1/gen_heap
-        );
-        // SAFETY: fresh zeroed allocation of `total >= HEADER_SIZE`.
-        let obj = unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-            ObjectRef::from_raw(ptr)
-        };
+        // The header is written by the INITIALIZER, i.e. before the address
+        // enters the object-start registry. See `alloc_raw`.
+        let ptr = self
+            .alloc_raw_tlab(total, |ptr| {
+                // SAFETY: fresh zeroed, unpublished span of `total >= HEADER_SIZE`.
+                unsafe {
+                    std::ptr::write(
+                        ptr as *mut ObjectHeader,
+                        ObjectHeader::new(
+                            class_id,
+                            ObjectKind::Array,
+                            element_type,
+                            len_u32,
+                            len_u32, // mirror length into num_slots, like Heap/G1/gen_heap
+                        ),
+                    );
+                }
+            })
+            .unwrap_or_else(|| {
+                eprintln!("FATAL: ZGC(real): out of heap space for array ({total} bytes)");
+                std::process::abort();
+            });
+        // SAFETY: the initializer above wrote a well-formed header at `ptr`.
+        let obj = unsafe { ObjectRef::from_raw(ptr) };
         // Allocate BLACK while a concurrent cycle is marking. Must follow the
         // header write; see `allocate_black_if_marking`.
         self.allocate_black_if_marking(ptr);
@@ -11961,6 +12614,7 @@ impl GarbageCollector for ZgcRealHeap {
             if step > 0 {
                 let last = self.counters.gc_stress_mark.load(Ordering::Relaxed);
                 if a.saturating_sub(last) >= step {
+                    self.counters.trigger_stress.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -11982,6 +12636,17 @@ impl GarbageCollector for ZgcRealHeap {
         if a >= self.gc_rearm.load(Ordering::Relaxed)
             && (a >= self.gc_threshold || self.headroom_low.load(Ordering::Relaxed))
         {
+            // Both halves are recorded, and deliberately not as an
+            // either/or: a cycle can satisfy the live-bytes threshold AND
+            // be short of contiguous headroom, and which one is driving a
+            // workload is the whole question when the collection COUNT is
+            // what differs between two arms.
+            if a >= self.gc_threshold {
+                self.counters.trigger_threshold.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.headroom_low.load(Ordering::Relaxed) {
+                self.counters.trigger_headroom.fetch_add(1, Ordering::Relaxed);
+            }
             return true;
         }
 
@@ -12005,6 +12670,9 @@ impl GarbageCollector for ZgcRealHeap {
         {
             self.counters
                 .alloc_trigger_fires
+                .fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .trigger_alloc_budget
                 .fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -12056,9 +12724,14 @@ impl GarbageCollector for ZgcRealHeap {
         // Pause clock for the `--verbose:gc` line at the end of this function.
         // Taken ONLY when logging is armed, so a quiet run pays one relaxed
         // load per collection and no clock read at all.
-        let gc_started = self
-            .gc_log_enabled
-            .load(Ordering::Relaxed)
+        //
+        // ALSO taken when a pause TARGET is set, whether or not logging is on:
+        // `refresh_pause_target_budget` sizes the next budget from this same
+        // reading, and a control loop that only runs under `--verbose:gc`
+        // would make the flag change the collector's behaviour rather than
+        // just its output.
+        let gc_started = (self.gc_log_enabled.load(Ordering::Relaxed)
+            || self.pause_target_ms.load(Ordering::Relaxed) != 0)
             .then(std::time::Instant::now);
 
         // ---- CLOSE AN IN-FLIGHT CONCURRENT CYCLE -------------------------
@@ -12180,7 +12853,15 @@ impl GarbageCollector for ZgcRealHeap {
         // bytes rather than 8+ bytes per live object, so it is also strictly
         // cheaper than the set clone at any occupancy above ~1.5%.
         let tlab_us = clock.lap();
-        let registered: ZObjectStartsSnapshot = self.registry.snapshot();
+        let registered: ZObjectStartsSnapshot = if zgc_bitmap_bounds_enabled() {
+            // BOUNDED to the two ends the arena has actually bumped. See
+            // `live_bitmap_bounds` for the measurement and for why the middle
+            // is provably empty; `CRATONVM_ZGC_BITMAP_BOUNDS=0` restores the
+            // whole-capacity copy.
+            self.registry.snapshot_within(&self.live_bitmap_bounds())
+        } else {
+            self.registry.snapshot()
+        };
         // COUNTED, not collected. `bases()` here allocated one `usize` per
         // registered object -- 87 MB on the 10.8M-object arm, inside the pause,
         // which the 2026-08-17 anatomy measured as 13% of it. Every phase below
@@ -12707,8 +13388,16 @@ impl GarbageCollector for ZgcRealHeap {
         // list ALREADY BUILT, so the whole rebuild-and-sort tail below is
         // skipped with it. See `sweep_bitmap`.
         let sweep_workers = self.sweep_workers(gen_on);
+        //
+        // `sweep_workers` REACHES THIS ARM NOW. Until 2026-09-04 the complement
+        // sweep was serial and won the selection before the worker count was
+        // read, so `CRATONVM_ZGC_PARSWEEP=<n>` parsed, clamped, reported, and
+        // did nothing -- a switch that answers about a run that never sharded.
+        // The complement chains `prev_end` across the whole address space, so
+        // sharding it needed the seam join in `ZgcRealHeap::join_complement`
+        // rather than a loop split.
         let bitmap_swept = (sweep_floor == 0 && self.bitmap_sweep_enabled())
-            .then(|| self.sweep_bitmap(&registered, &cfg))
+            .then(|| self.sweep_bitmap(&registered, &cfg, sweep_workers))
             .flatten();
         let (mut swept_total, complement) = match bitmap_swept {
             Some((sh, spans, new_cursor)) => (sh, Some((spans, new_cursor))),
@@ -13099,6 +13788,27 @@ impl GarbageCollector for ZgcRealHeap {
             .store(bits_clear, Ordering::Release);
 
         let sweep_us = clock.lap();
+        // RE-DERIVE THE ALLOCATION BUDGET from what this pause actually cost.
+        // Before the logging block, and outside it, so the loop runs on a
+        // quiet run too -- see `gc_started` above.
+        //
+        // FULL CYCLES ONLY. A young cycle's sweep skips everything below
+        // `sweep_floor`, so its `bytes_freed` describes the nursery while its
+        // `live_bytes` includes the old generation it never walked: the span
+        // reconstructed from the pair is far larger than the span the pause
+        // actually covered, and folding that in would teach the loop that a
+        // pause is cheaper per byte than it is. A young pause and a full pause
+        // are different cost functions; this models the one whose length is
+        // the problem.
+        if let Some(started) = gc_started {
+            if !young_cycle {
+                self.refresh_pause_target_budget(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    live_bytes,
+                    bytes_freed,
+                );
+            }
+        }
         if let Some(started) = gc_started {
             let pause_us = started.elapsed().as_micros();
             // `mark=` is the ONE field that says whether this collection's
@@ -13142,7 +13852,9 @@ impl GarbageCollector for ZgcRealHeap {
                 "[GC] zgc-pause: cycle={cycle} total_us={pause_us} \
                  markend_us={markend_us} tlab_us={tlab_us} snapshot_us={snapshot_us} \
                  mark_us={mark_us} resurrect_us={resurrect_us} refs_us={refs_us} \
-                 sweep_us={sweep_us} registered={} dead={}                  alloc_trigger={}/{}",
+                 sweep_us={sweep_us} registered={} dead={} \
+                 alloc_trigger={}/{} \
+                 pause_target={}ms/{}/unreachable={}",
                 registered_count,
                 dead_count,
                 // ENGAGEMENT for F1: fires/budget. `0/<n>` means every cycle
@@ -13150,6 +13862,18 @@ impl GarbageCollector for ZgcRealHeap {
                 // trigger measured nothing; `<n>/0` means the switch is off.
                 self.counters.alloc_trigger_fires.load(Ordering::Relaxed),
                 self.alloc_trigger_bytes.load(Ordering::Relaxed),
+                // And the loop that SIZED that budget: the target, the span
+                // in BYTES the controller currently believes a target-length
+                // pause can walk, and the cycles where the target was not
+                // achievable at all. A budget equal to capacity with
+                // `unreachable` climbing is the loop saying it cannot
+                // deliver, which looks identical to a budget equal to
+                // capacity because pauses are comfortably short -- opposite
+                // situations, same number, and this field is what separates
+                // them.
+                self.pause_target_ms.load(Ordering::Relaxed),
+                self.pause_affordable_span.load(Ordering::Relaxed),
+                self.counters.pause_target_unreachable.load(Ordering::Relaxed),
             );
         }
 
@@ -15042,6 +15766,113 @@ pub(crate) mod tests {
         )
     }
 
+    /// **THE COMPLEMENT SWEEP IS SHARDED TOO, since 2026-09-04**, and this is
+    /// what proves it — the arm the equivalence test above actually runs.
+    ///
+    /// `sweep_bitmap` is default-on and wins the arm selection in
+    /// `collect_garbage`, so before that date `sweep_outcome(4)` and
+    /// `sweep_outcome(1)` swept IDENTICALLY: the worker count was read, clamped,
+    /// reported, and never reached the pass that ran. The equivalence test above
+    /// was green and vacuous. Asserted here rather than trusted, because
+    /// "the sharded arm agrees with the serial one" is worth nothing while the
+    /// two are the same code.
+    #[test]
+    fn the_worker_count_reaches_the_complement_sweep() {
+        let heap = ZgcRealHeap::with_capacity(1024 * 1024);
+        assert!(
+            heap.bitmap_sweep_enabled(),
+            "the complement sweep is the default arm; if it is off, the \
+             equivalence test above is measuring the header-walk sweep instead"
+        );
+        heap.set_sweep_workers(4);
+        assert_eq!(
+            heap.sweep_workers(false),
+            4,
+            "a whole-heap cycle must honour the worker count"
+        );
+        // And the signature is what carries it: a `sweep_bitmap` that does not
+        // take the count cannot shard, whatever the count says.
+        let cfg = {
+            let arena = heap.arena.lock();
+            ZSweepCfg {
+                arena_base: arena.base_ptr() as usize,
+                high_floor: arena.high_cursor(),
+                low_cursor: arena.used(),
+                zero_header_only: true,
+                merge_dead_runs: true,
+                bulk_clearable: heap.mark_bits.is_some(),
+                want_dead: false,
+                collect_dead_hashes: false,
+                gen_on: false,
+                promo_age: 3,
+            }
+        };
+        let registered = heap.registry.snapshot();
+        assert!(
+            heap.sweep_bitmap(&registered, &cfg, 4).is_some(),
+            "the complement sweep must accept a worker count and run"
+        );
+    }
+
+    /// **A SEAM AFTER EMPTY SHARDS.** The complement is a chain, so a shard
+    /// that saw no survivor must not advance it — the next shard's leading
+    /// span has to reach back past every empty shard to where the previous
+    /// survivor actually ended.
+    ///
+    /// The population is chosen to force that: a handful of large arrays and
+    /// nothing else, so almost every bitmap word is zero and the leading shards
+    /// are empty by construction. The serial walk has no seams at all here, so
+    /// any disagreement is the join.
+    ///
+    /// The exact edits that trip it: advancing `chain` for a shard with no
+    /// `first_live`, or emitting a shard's leading span from its own `w0`
+    /// instead of from `chain`.
+    #[test]
+    fn a_sharded_complement_closes_the_seam_after_empty_shards() {
+        fn outcome(workers: usize) -> (usize, usize, usize, usize) {
+            let heap = ZgcRealHeap::with_capacity(8 * 1024 * 1024);
+            heap.set_tlab_enabled(false);
+            heap.set_sweep_workers(workers);
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            // Large arrays only: each is thousands of bitmap words apart, so
+            // most shards see nothing at all.
+            for i in 0..8 {
+                let a = heap.alloc_array(ClassId::new(1), ArrayElementType::Byte, 64 * 1024);
+                if i % 3 == 0 {
+                    roots.push(a);
+                }
+            }
+            let expect_live = roots.len();
+            {
+                // SAFETY: single-threaded unit test.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            }
+            let survivors = roots
+                .iter()
+                .filter(|r| heap.registry.contains(r.as_ptr() as usize))
+                .count();
+            let arena = heap.arena.lock();
+            (
+                expect_live,
+                survivors,
+                arena.free_list_bytes(),
+                arena.largest_free_block(),
+            )
+        }
+        let serial = outcome(1);
+        assert_eq!(serial.0, serial.1, "every root must have survived");
+        for workers in [2usize, 3, 4, 8] {
+            assert_eq!(
+                outcome(workers),
+                serial,
+                "a {workers}-way sharded complement disagreed with the serial \
+                 one on a heap whose leading shards are empty; the tuple is \
+                 (roots, survivors, free_list_bytes, largest_free_block)"
+            );
+        }
+    }
+
     /// **THE SHARD-EQUIVALENCE TEST.** A sharded sweep must leave the arena in
     /// exactly the state the serial one does.
     ///
@@ -15054,6 +15885,14 @@ pub(crate) mod tests {
     /// test was written after, where a shard whose predecessor produced NO
     /// spans silently lost its first one and a whole dead large array never
     /// reached the free list.
+    ///
+    /// SINCE 2026-09-04 IT COVERS THE COMPLEMENT SWEEP'S SEAM JOIN as well,
+    /// and that is the arm it actually runs: `sweep_bitmap` is default-on and
+    /// wins the selection in `collect_garbage`. Until the complement was
+    /// sharded, the worker count never reached the pass that ran and every arm
+    /// of this test swept identically -- green, and vacuous.
+    /// `the_worker_count_reaches_the_complement_sweep` above is what stops it
+    /// going back to that quietly.
     #[test]
     fn a_sharded_sweep_leaves_the_arena_exactly_as_the_serial_one_does() {
         let serial = sweep_outcome(1);
@@ -15308,6 +16147,27 @@ pub(crate) mod tests {
     /// `--verbose:gc`'s `sweep_us` on a real workload before moving the
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
+    ///
+    /// # A PROVISIONAL reading, and why it is not a result
+    ///
+    /// First run after the complement was sharded (2026-09-04), 768 MiB heap,
+    /// 8.26M dead objects, best `sweep_us` of three reps:
+    ///
+    /// | workers | 1 | 2 | 4 | 8 | 32 |
+    /// |---|---|---|---|---|---|
+    /// | sweep_us | 217 ms | 206 | 188 | 165 | 168 |
+    ///
+    /// That is 1.3x at eight workers and a plateau after -- far short of what
+    /// "a linear scan with an independent body" predicts, and close enough to
+    /// the shape of the 2026-08-14 parallel-marking result to be worth naming.
+    ///
+    /// **But the box was at 90% CPU from unrelated work when it was taken**,
+    /// and host contention suppresses precisely the thing being measured: added
+    /// workers compete with the load rather than with each other. So this is a
+    /// LOWER BOUND on the speedup and not a measurement of it. Anyone moving
+    /// the default needs this on an idle machine first; if it still reads 1.3x
+    /// there, the phase is bandwidth bound and the switch should be deleted
+    /// rather than defaulted on.
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
     fn measure_the_sharded_sweep() {
@@ -20022,6 +20882,347 @@ pub(crate) mod tests {
         // The element that DID get a wrapper is still readable: the refusal
         // must not have disturbed the earlier store.
         assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
+    }
+
+    /// A pause target brings a percentage floor with it; an explicit zero
+    /// refuses one.
+    ///
+    /// The floor exists for the cycle the feedback loop is blind to -- the
+    /// first, which has no pause to measure yet and which the occupancy clause
+    /// otherwise lets run to 75% of `-Xmx`. See
+    /// `ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET` for the measurement.
+    #[test]
+    fn a_pause_target_defaults_a_percentage_floor_under_itself() {
+        // No target, nothing named: the clause is off, exactly as before
+        // pause targets existed.
+        assert_eq!(alloc_trigger_percent_for(None, 0), 0);
+        // A target, nothing named: the floor.
+        assert_eq!(
+            alloc_trigger_percent_for(None, 200),
+            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+        );
+        assert_eq!(
+            alloc_trigger_percent_for(None, 1),
+            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+        );
+        // AN EXPLICIT ZERO IS A REFUSAL, not an absence: it is how an operator
+        // asks for the target alone, and it is the arm every measurement of
+        // the target on its own was taken with.
+        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
+        // And an explicit percentage wins over the floor in both directions.
+        assert_eq!(alloc_trigger_percent_for(Some(12), 200), 12);
+        assert_eq!(alloc_trigger_percent_for(Some(50), 200), 50);
+        assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
+    }
+
+    /// A pause target is a CEILING: a pause under it must not move anything.
+    ///
+    /// This is the property the first two versions of the controller did not
+    /// have, and the one that makes a non-zero default defensible. A loop that
+    /// solves `pause == target` reaches it from BELOW too -- it grows the
+    /// budget until pauses lengthen to meet the target -- which on
+    /// `G1ChurnPauseProbe` at `-Xmx2048m` turned a natural 175 ms worst pause
+    /// into 203 ms and charged 17% of wall for it.
+    #[test]
+    fn a_pause_under_the_target_does_not_engage_the_clause() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(200);
+        // Ten cycles, every one comfortably inside the target.
+        for _ in 0..10 {
+            heap.refresh_pause_target_budget(150_000_000, 100 * MIB, 400 * MIB);
+        }
+        let (_, affordable, budget, unreachable) = heap.pause_target_state();
+        assert_eq!(affordable, 0, "nothing constrained the heap");
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and the trigger clause is still whatever the percentage form gave              it -- which, under a target, is the default floor"
+        );
+        assert_eq!(unreachable, 0);
+    }
+
+    /// A pause that OVERRAN tightens; a pause that comes back under relaxes,
+    /// but never back into the span that overran.
+    ///
+    /// The cap is the `ssthresh` of this loop. Without it the relax path walks
+    /// the span straight back to where the last long pause happened, overruns,
+    /// and cuts -- a cycle that on `G1ChurnPauseProbe 50 1800` at `-Xmx2048m`
+    /// cost 13% of wall and left the worst pause where it started.
+    #[test]
+    fn an_overrun_tightens_and_a_short_pause_relaxes_but_not_back_into_it() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(4096 * MIB);
+        heap.set_pause_target_ms(100);
+
+        // 200 ms over a 500 MiB span: twice the target, so half the span.
+        heap.refresh_pause_target_budget(200_000_000, 100 * MIB, 400 * MIB);
+        let (_, affordable, budget, _) = heap.pause_target_state();
+        assert_eq!(affordable, (250 * MIB) as u64, "twice over means half the span");
+        assert_eq!(budget, 150 * MIB, "budget is affordable - live");
+
+        // Inside the hysteresis band (over three quarters of the target,
+        // under it): hold.
+        heap.refresh_pause_target_budget(90_000_000, 100 * MIB, 150 * MIB);
+        assert_eq!(
+            heap.pause_target_state().1,
+            (250 * MIB) as u64,
+            "a pause between three quarters of the target and the target holds"
+        );
+
+        // Under three quarters: relax by a quarter -- but the last overrun was
+        // a 500 MiB span, so the cap is seven-eighths of that, 437.5 MiB. A
+        // quarter on 250 is 312.5, which is under the cap, so it applies.
+        heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 150 * MIB);
+        assert_eq!(
+            heap.pause_target_state().1,
+            (250 * MIB + 250 * MIB / 4) as u64,
+            "a comfortable pause relaxes by a quarter while under the cap"
+        );
+
+        // Keep relaxing: the cap binds before capacity does, and the span
+        // sticks at seven-eighths of the overrun span rather than climbing
+        // back to it.
+        for _ in 0..20 {
+            heap.refresh_pause_target_budget(70_000_000, 100 * MIB, 150 * MIB);
+        }
+        let capped = heap.pause_target_state().1;
+        assert_eq!(
+            capped,
+            (500 * MIB / 8 * 7) as u64,
+            "relaxation stops at seven-eighths of the span that overran"
+        );
+
+        // A pause at or below a QUARTER of the target says the workload
+        // changed: the memory is dropped and the loop relaxes freely again,
+        // all the way to releasing the constraint.
+        for _ in 0..200 {
+            heap.refresh_pause_target_budget(20_000_000, 100 * MIB, 150 * MIB);
+        }
+        let (_, released, budget, _) = heap.pause_target_state();
+        assert_eq!(released, 0, "relaxing to capacity releases the constraint");
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and hands the clause back to the percentage form"
+        );
+    }
+
+    /// No target means the pause-target loop does not touch the budget, and a
+    /// cycle that measured nothing does not either.
+    #[test]
+    fn the_pause_target_loop_is_inert_without_a_target_or_a_measurement() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_pause_target_ms(0);
+        heap.alloc_trigger_bytes.store(12345, Ordering::Relaxed);
+        heap.refresh_pause_target_budget(500_000_000, 1024, 1024);
+        assert_eq!(
+            heap.alloc_trigger_bytes.load(Ordering::Relaxed),
+            12345,
+            "with no target the percent clause keeps the budget it was given"
+        );
+
+        // A target, and an overrun, but a cycle that walked nothing: there is
+        // no span to scale, and inventing one would size the next budget off a
+        // cycle that did not happen.
+        heap.set_pause_target_ms(100);
+        heap.refresh_pause_target_budget(500_000_000, 0, 0);
+        assert_eq!(heap.alloc_trigger_bytes.load(Ordering::Relaxed), 12345);
+        assert_eq!(heap.pause_target_state().1, 0, "and nothing was learned");
+        // Likewise a pause the clock could not resolve -- it is the divisor.
+        heap.refresh_pause_target_budget(0, 1024 * 1024, 1024 * 1024);
+        assert_eq!(heap.pause_target_state().1, 0);
+    }
+
+    /// The tightening is rate-limited to half per cycle, so one anomalous
+    /// pause cannot collapse the budget.
+    #[test]
+    fn one_anomalous_pause_cannot_collapse_the_budget() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(4096 * MIB);
+        heap.set_pause_target_ms(100);
+        // Constrain to 250 MiB by overrunning once at 2x.
+        heap.refresh_pause_target_budget(200_000_000, 100 * MIB, 400 * MIB);
+        let settled = heap.pause_target_state().1;
+        assert_eq!(settled, (250 * MIB) as u64);
+
+        // A host hiccup: one pause TEN TIMES the target over the same span.
+        // The raw correction would be a tenth; the limit makes it a half.
+        heap.refresh_pause_target_budget(1_000_000_000, 100 * MIB, 400 * MIB);
+        assert_eq!(
+            heap.pause_target_state().1,
+            settled / 2,
+            "a 10x outlier must halve the span, not divide it by ten"
+        );
+    }
+
+    /// Going inert must RESET the loop, or one bad early cycle locks it out of
+    /// the run.
+    ///
+    /// The tighten arm never widens and the relax arm is capped by
+    /// `pause_overrun_span`, so a stale `pause_affordable_span` is a ceiling on
+    /// everything the loop can ever believe again. Observed at `-Xmx4096m`
+    /// with a 100 ms target: a startup cycle overran by 3% while walking a
+    /// ~5 MiB span, pinning the affordable span at 4.8 MiB; that is below the
+    /// live set, so the clause went inert; being inert means unconstrained; and
+    /// every following 733 ms cycle could only clamp back down to the stale
+    /// 4.8 MiB. The run never recovered.
+    #[test]
+    fn going_inert_resets_the_loop_so_a_bad_early_cycle_is_not_permanent() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(4096 * MIB);
+        heap.set_pause_target_ms(100);
+
+        // A startup cycle: a tiny span, barely over the target. It seeds the
+        // affordable span at something far too small to be useful.
+        heap.refresh_pause_target_budget(103_000_000, 1 * MIB, 4 * MIB);
+        let seeded = heap.pause_target_state().1;
+        assert!(seeded > 0 && seeded < (6 * MIB) as u64, "a tiny seed: {seeded}");
+
+        // Now the real live set exists, and it is bigger than that seed, so
+        // the clause goes inert -- and must forget, not remember.
+        heap.refresh_pause_target_budget(60_000_000, 60 * MIB, 10 * MIB);
+        let (_, after_inert, budget, unreachable) = heap.pause_target_state();
+        assert_eq!(after_inert, 0, "going inert must clear the affordable span");
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and hand the clause back to the percentage form"
+        );
+        assert!(unreachable > 0);
+
+        // The next overrun re-seeds from this cycle's own span rather than
+        // being clamped down to the stale 4.8 MiB it would have kept.
+        heap.refresh_pause_target_budget(700_000_000, 60 * MIB, 1200 * MIB);
+        let (_, reseeded, budget, _) = heap.pause_target_state();
+        assert!(
+            reseeded > (100 * MIB) as u64,
+            "a 1260 MiB span at 7x the target affords ~180 MiB, not 4.8: {reseeded}"
+        );
+        assert!(
+            budget > ZGC_ALLOC_TRIGGER_FLOOR,
+            "and the loop is controlling again rather than sitting inert"
+        );
+    }
+
+    /// A budget the loop wants to make SMALL is floored, not abandoned.
+    ///
+    /// The two situations look alike and are opposite. When the live set alone
+    /// overruns the target, no budget helps and the clause must go inert (the
+    /// test below). When the live set is CHEAP and the loop simply wants a
+    /// tight budget, going inert loses control entirely -- measured on
+    /// `G1ChurnPauseProbe 50 1800` at `-Xmx4096m`, a tightening step that
+    /// crossed the floor dropped the constraint and the next cycle ran
+    /// unconstrained to 670 ms, against a 100 ms target it had been holding.
+    #[test]
+    fn a_budget_below_the_floor_is_floored_not_abandoned() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(100);
+        // A 10 MiB live set, and a cycle four times over the target: the
+        // affordable span converges to a quarter of the 48 MiB span, i.e.
+        // 12 MiB -- barely more than the live set, so the budget the loop
+        // wants is 2 MiB.
+        for _ in 0..40 {
+            heap.refresh_pause_target_budget(400_000_000, 10 * MIB, 38 * MIB);
+        }
+        let (_, affordable, budget, unreachable) = heap.pause_target_state();
+        assert!(
+            affordable > (10 * MIB) as u64,
+            "the live set is cheap, so the target is still achievable: {affordable}"
+        );
+        assert_eq!(
+            budget, ZGC_ALLOC_TRIGGER_FLOOR,
+            "a budget the loop wants smaller than the floor is FLOORED --              abandoning the constraint here would hand the next cycle the whole              heap to walk"
+        );
+        assert_eq!(
+            unreachable, 0,
+            "and this is not the unachievable case -- that one is about the              LIVE SET overrunning the target, not about a tight budget"
+        );
+    }
+
+    /// The target being unachievable at this live set must leave the clause
+    /// inert, and say so.
+    #[test]
+    fn an_unachievable_target_goes_inert_and_is_counted() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(1);
+        // A 900 MiB live set against a 1 ms target: no budget makes this fit.
+        // Rate-limited, so it takes several cycles to get down there -- which
+        // is the point of the limit.
+        for _ in 0..24 {
+            heap.refresh_pause_target_budget(200_000_000, 900 * MIB, 100 * MIB);
+        }
+        let (_, _, budget, gave_up) = heap.pause_target_state();
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "an unachievable target must go INERT -- back to the percentage              form -- not tight: the pause length is set by the live set, so a              small budget buys pauses of the same length hundreds of times              more often"
+        );
+        assert!(
+            gave_up > 0,
+            "and it must be COUNTED -- a loop holding the target and a loop \
+             that has given up are different answers"
+        );
+    }
+
+    /// Three unreachable verdicts and the loop stops trying for the run.
+    ///
+    /// Re-engaging repeats the discovery, and the discovery costs one
+    /// UNCONSTRAINED cycle each time. Measured at `-Xmx4096m` against a 100 ms
+    /// target the retry loop cost 56 cycles and +101% wall for a p50 of
+    /// 103.8 ms -- worse on both axes than never trying.
+    #[test]
+    fn three_unreachable_verdicts_stop_the_loop_for_the_run() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(1024 * MIB);
+        heap.set_pause_target_ms(1);
+        // A 900 MiB live set against a 1 ms target: unachievable, every time.
+        // Each attempt takes several cycles to walk down to the verdict, and
+        // the reset makes the next attempt start fresh.
+        for _ in 0..200 {
+            heap.refresh_pause_target_budget(200_000_000, 900 * MIB, 100 * MIB);
+        }
+        let (target, affordable, budget, gave_up) = heap.pause_target_state();
+        assert_eq!(target, 0, "the loop disables itself rather than retrying forever");
+        assert_eq!(affordable, 0);
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "and the clause is back to the percentage form"
+        );
+        assert!(
+            (3..10).contains(&gave_up),
+            "it should stop at the third verdict, not keep counting: {gave_up}"
+        );
+        // And it stays stopped: further cycles change nothing.
+        heap.refresh_pause_target_budget(900_000_000, 900 * MIB, 100 * MIB);
+        assert_eq!(heap.pause_target_state().3, gave_up, "no further verdicts");
+    }
+
+    /// A pause target nobody can act on must leave the clause inert, not
+    /// overflow the arithmetic.
+    ///
+    /// Both operands come from outside the collector: the target from a flag,
+    /// the pause from a clock that a host suspend can stretch arbitrarily. The
+    /// product is taken in `u128` for exactly this reason.
+    #[test]
+    fn an_absurd_pause_target_or_pause_cannot_overflow_the_budget() {
+        const MIB: usize = 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(64 * MIB);
+        // ~584 years, in milliseconds. No pause can overrun it, so the
+        // one-sided loop never engages.
+        heap.set_pause_target_ms(u64::MAX / 2_000_000);
+        heap.refresh_pause_target_budget(1_000_000, 8 * MIB, 8 * MIB);
+        assert_eq!(heap.pause_target_state().1, 0);
+        assert_eq!(heap.pause_target_state().2, heap.alloc_trigger_percent_bytes);
+        // And the other operand: a pause the clock reports as ~292 years,
+        // against an ordinary target.
+        let heap = ZgcRealHeap::with_capacity(64 * MIB);
+        heap.set_pause_target_ms(100);
+        heap.refresh_pause_target_budget(u64::MAX / 2, 8 * MIB, 8 * MIB);
+        let (_, _, budget, unreachable) = heap.pause_target_state();
+        assert_eq!(
+            budget, heap.alloc_trigger_percent_bytes,
+            "an absurdly expensive pause goes inert rather than wrapping"
+        );
+        assert!(unreachable > 0, "and reports that it could not meet the target");
     }
 
     /// The allocation-rate clause of `needs_gc` fires on GARBAGE, well below

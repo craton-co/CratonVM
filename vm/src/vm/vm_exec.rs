@@ -3918,7 +3918,7 @@ fn safe_native_call_impl(
             .swap(false, std::sync::atomic::Ordering::Relaxed);
     let mut requested_gc = false;
     if native_array_gc && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared) {
-        crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(shared, thread, "vm-exec");
         requested_gc = true;
     }
     // Native-alloc young-pressure relief: when a native allocation wrapper
@@ -3985,7 +3985,7 @@ fn safe_native_call_impl(
                 || shared.mem.heap.hard_alloc_failure())
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
-            crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(shared, thread, "vm-exec");
             pressure_gc = true;
         }
         // Clear even when the gates said no: the flag was stale (another
@@ -11195,9 +11195,10 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                             Some(obj) => obj,
                             None => {
                                 self.thread.tlab.retire();
-                                crate::runtime::interpreter::maybe_gc_forced_pub(
+                                crate::runtime::interpreter::maybe_gc_forced_pub_at(
                                     self.shared,
                                     self.thread,
+                                    "vm-exec-alloc-retry",
                                 );
                                 self.shared.mem.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
                                     MethodCallFailed::InternalError(crate::error::VmError::Runtime(
@@ -12790,7 +12791,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // a death spiral, and OOM is the honest answer. Reporting `false` there
         // rather than `true` is what keeps this from becoming that spiral.
         self.thread.tlab.retire();
-        crate::runtime::interpreter::maybe_gc_forced_pub(self.shared, self.thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(self.shared, self.thread, "vm-exec");
         if crate::runtime::interpreter::gc_overhead_limit_exceeded(self.shared) {
             return false;
         }
@@ -14016,8 +14017,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `young_spill_pressure` so the NEXT `safe_native_call` boundary —
         // where every argument is pinned and remappable — runs the
         // orchestrated GC this method cannot (see `safe_native_call_impl`).
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        // The shape planner, not a bare legacy size -- see
+        // `plan_tlab_object_shape`.
+        let (requested_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+            class_id,
+            slots,
+            crate::runtime::interpreter::tlab_site::NATIVE,
+        );
         if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
             if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
                 self.thread,
@@ -17067,7 +17073,10 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
                     | MethodHandleKind::InvokeSpecial
             );
             if !kind_admitted {
-                tracing::debug!(
+                // See the sibling site in `runtime/offload.rs`: `debug!` is
+                // compiled out in release, so this decision was
+                // unreachable by any RUST_LOG directive.
+                tracing::info!(
                     target: "gpu.offload",
                     handle_kind = ?lcs.impl_handle.kind,
                     target_class = %lcs.impl_handle.class_name,

@@ -150,6 +150,31 @@ fn dump(label: &str, c: &Census, top: usize) {
 pub fn report_at_exit() {
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
+    // C1→C2 supersede engagement. `unchanged`/`first-publish` are the two
+    // outcomes that cannot invalidate anything, and `ic_evictions` is what the
+    // epoch bump actually costs — the number of `Jit` invoke-cache entries it
+    // threw away process-wide. Printed together because the second is the only
+    // thing that makes the first two worth acting on.
+    let (first_publish, unchanged, changed) =
+        crate::runtime::interpreter::jit_bridge::supersede_census();
+    if crate::runtime::env_cache::dbg_jitc() && first_publish + unchanged + changed > 0 {
+        eprintln!(
+            "[c2-supersede] publishes: first_publish={first_publish} unchanged={unchanged} changed={changed}; ic_evictions_from_epoch={}",
+            cratonvm_classloading::epoch_stale_evictions(),
+        );
+        let (ft_n, ft_us, ok_n, ok_us) =
+            crate::runtime::interpreter::jit_bridge::c2_compile_census();
+        eprintln!(
+            "[c2-supersede] compiles: lowered={ok_n} ({} ms) fell_through_to_single_pass={ft_n} ({} ms)",
+            ok_us / 1000,
+            ft_us / 1000,
+        );
+        let (held, spent) = cratonvm_jit::deferred_new_retry_census();
+        eprintln!(
+            "[c2-supersede] deferred-new retries: held={held} spent={spent} re_offered={}",
+            crate::runtime::interpreter::jit_bridge::deferred_new_reoffered(),
+        );
+    }
     if direct_binds_enabled() {
         eprintln!(
             "[direct-binds] Integer.intValue: sites_bound={} served={} declined_to_dispatch={}",

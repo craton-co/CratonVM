@@ -68,6 +68,7 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
+    compact_tlab_body_size, single_layout_domain,
     foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
     next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
     register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
@@ -101,6 +102,7 @@ pub use subsystem_config::{
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
+    plausible_object_header_at,
     primitive_array_kind_tags_byte, ArrayElementType, ObjectHeader, ObjectKind,
     ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, ARRAY_STORE_OUT_OF_MEMORY, AUTOBOX_CLASS_ID,
     FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
@@ -697,6 +699,199 @@ pub mod scalar_deopt_census {
 /// 9.8 us for it is not.
 ///
 /// Off unless `CRATONVM_GPU_TIME_DISPATCH=1`, the same switch as its twin.
+/// How many methods `--gpu` denied JIT admission.
+///
+/// AUDIT 2026-09-03. `vm::runtime::offload_jit_gate` refuses JIT and OSR
+/// admission to any method whose body contains an offload-eligible
+/// `invokestatic`, so the interpreter hook can still see that site. The
+/// consequence is that the WHOLE caller runs interpreted -- its loops, its
+/// arithmetic, everything -- and that is the largest cost `--gpu` imposes on
+/// a CPU-bound program. Measured on `GpuHookOverheadBench`, the same method:
+///
+/// ```text
+///   no --gpu (JIT admitted)                            10 ns/call
+///   --gpu, site promoted, hook reached only 514 times  6,139 ns/call
+/// ```
+///
+/// 600x, against 0.48 us for the hook itself and 0.75 for the lost invoke
+/// cache. Nothing counted it until this census existed.
+/// WHICH call actually started a collection.
+///
+/// AUDIT 2026-09-03. `[GC] zgc-trigger` counts the four branches of
+/// `needs_gc`, plus the arena's hard refusal. On kfusion under `--gpu` all
+/// five read ZERO on a run that collected 13 times, so every one of those
+/// cycles entered through a door none of them watches.
+///
+/// There are three doors, and none counted itself:
+///
+/// * `maybe_gc` — the allocation-path check. Fires on `needs_gc()` OR on
+///   the `gc_requested` latch, and the latch is invisible to the trigger
+///   tallies, so a cycle can start here with every trigger at zero.
+/// * `maybe_gc_forced` — the safepoint's forced path, taken when the
+///   boundary's gates say collect.
+/// * `force_gc_from_native` — `System.gc()` / `Runtime.gc()`.
+///
+/// Counting the door is what separates "the heap decided" from "someone
+/// asked", which is the question left after the trigger census came back
+/// empty.
+pub mod gc_entry_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MAYBE_GC_NEEDS: AtomicU64 = AtomicU64::new(0);
+    static MAYBE_GC_REQUESTED: AtomicU64 = AtomicU64::new(0);
+    static FORCED: AtomicU64 = AtomicU64::new(0);
+    static FROM_NATIVE: AtomicU64 = AtomicU64::new(0);
+
+    /// `maybe_gc` collected because `needs_gc()` said so.
+    #[inline]
+    pub fn note_maybe_gc_needs() {
+        MAYBE_GC_NEEDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `maybe_gc` collected because the `gc_requested` latch was set —
+    /// the case no trigger tally can see.
+    #[inline]
+    pub fn note_maybe_gc_requested() {
+        MAYBE_GC_REQUESTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `maybe_gc_forced` ran, tagged with the call site that asked.
+    ///
+    /// `maybe_gc_forced_pub` has 24 call sites across seven files -- the
+    /// safepoint gate, five in the JIT helpers, four on the deopt-resume
+    /// path, and more -- so a bare count says a collection was FORCED
+    /// without saying by whom, which is the question left when every
+    /// trigger tally reads zero.
+    #[inline]
+    pub fn note_forced_at(site: &'static str) {
+        FORCED.fetch_add(1, Ordering::Relaxed);
+        let mut v = FORCED_SITES.lock().unwrap_or_else(|p| p.into_inner());
+        match v.iter_mut().find(|(s, _)| *s == site) {
+            Some((_, n)) => *n += 1,
+            None => v.push((site, 1)),
+        }
+    }
+
+    static FORCED_SITES: std::sync::Mutex<Vec<(&'static str, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// `(site, count)` for every forced collection, busiest first.
+    pub fn forced_sites() -> Vec<(&'static str, u64)> {
+        let mut v = FORCED_SITES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// `System.gc()` / `Runtime.gc()`.
+    #[inline]
+    pub fn note_from_native() {
+        FROM_NATIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(maybe_gc_needs, maybe_gc_requested, forced, from_native)`.
+    pub fn totals() -> (u64, u64, u64, u64) {
+        (
+            MAYBE_GC_NEEDS.load(Ordering::Relaxed),
+            MAYBE_GC_REQUESTED.load(Ordering::Relaxed),
+            FORCED.load(Ordering::Relaxed),
+            FROM_NATIVE.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub mod gpu_jit_gate_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    static ADMITTED: AtomicU64 = AtomicU64::new(0);
+
+    /// One verdict, counted per DISTINCT method: the gate caches its
+    /// verdicts, so this counts first judgements rather than consultations,
+    /// which is the number that says how much of the program moved off the
+    /// JIT.
+    #[inline]
+    pub fn note_verdict(blocked: bool) {
+        if blocked {
+            BLOCKED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            ADMITTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Why a method was blocked. The two reasons are very different in
+    /// reach, and the count alone cannot tell them apart.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum BlockReason {
+        /// The method writes a primitive array, so compiling it would
+        /// invalidate the input-residency cache with no hook to notice.
+        /// This is the BROAD reason: it catches any numeric kernel that
+        /// stores to an `int[]`/`long[]`/`float[]`/`double[]`, whether or
+        /// not it has anything to do with offload.
+        /// `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` trades the cache for the
+        /// compilation instead.
+        WritesPrimitiveArray,
+        /// The method calls an offload-eligible `invokestatic`, so
+        /// compiling it would hide that site from the interpreter hook.
+        /// This is the NARROW reason, and the one the gate is named for.
+        CallsEligibleKernel,
+    }
+
+    /// Names of the methods this gate denied, with the reason.
+    ///
+    /// A count says how MANY; only the names say whether the ones blocked
+    /// are the ones a workload spends its time in. kfusion blocks 7 of 301
+    /// methods -- 2.3%, which sounds negligible and would be the whole
+    /// story if those 7 are its integration loop.
+    ///
+    /// Bounded: a program with thousands of blocked methods has a
+    /// different problem, and the list is a diagnostic rather than a log.
+    static BLOCKED_NAMES: std::sync::Mutex<Vec<(String, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_NAMED: usize = 64;
+
+    /// Record one blocked method by name. Called only on a first verdict.
+    pub fn note_blocked_name(name: String, reason: BlockReason) {
+        let mut v = BLOCKED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+        if v.len() >= MAX_NAMED {
+            return;
+        }
+        let tag = match reason {
+            BlockReason::WritesPrimitiveArray => "writes-primitive-array",
+            BlockReason::CallsEligibleKernel => "calls-eligible-kernel",
+        };
+        v.push((name, tag));
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let blocked = BLOCKED.load(Ordering::Relaxed);
+        let admitted = ADMITTED.load(Ordering::Relaxed);
+        if blocked + admitted == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu jit gate: methods judged={} blocked_from_jit={blocked}                  admitted={admitted} ({:.1}% denied JIT, so the whole caller runs                  interpreted and its offload sites stay visible to the hook)",
+                blocked + admitted,
+                100.0 * blocked as f64 / (blocked + admitted) as f64,
+            );
+            let names = BLOCKED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, reason) in names.iter() {
+                eprintln!("[cratonvm] gpu jit gate:   blocked {name}  ({reason})");
+            }
+            if blocked as usize > names.len() {
+                eprintln!(
+                    "[cratonvm] gpu jit gate:   ... and {} more not listed",
+                    blocked as usize - names.len()
+                );
+            }
+        });
+    }
+}
+
 pub mod gpu_refusal_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

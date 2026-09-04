@@ -150,6 +150,32 @@ impl ZSweepShard {
     }
 }
 
+/// One word range's share of the complement sweep, plus the two edges the
+/// join needs to stitch it to its neighbours.
+///
+/// Separate from [`ZSweepShard`] because the complement is a CHAIN and a shard
+/// cannot close its own ends: the free span below its first survivor reaches
+/// back into the previous shard, which is still running. `ZSweepShard` carries
+/// what is genuinely per-shard (counters, dead lists, the large-object end's
+/// individual holes) and this wraps it with what is not.
+#[derive(Default)]
+pub(crate) struct ZComplementShard {
+    /// Counters, dead lists, and the HIGH-end per-object holes.
+    pub(crate) sh: ZSweepShard,
+    /// Free spans strictly BETWEEN two survivors this shard saw itself,
+    /// arena-relative and ascending.
+    pub(crate) spans: Vec<(usize, usize)>,
+    /// The base of the first LOW survivor, or `None` if the shard saw none.
+    /// The span below it belongs to the join.
+    pub(crate) first_live: Option<usize>,
+    /// Absolute end of the last live extent. Meaningful only when
+    /// [`Self::first_live`] is set.
+    pub(crate) last_end: usize,
+    /// The last survivor's header could not be sized, so its extent runs to
+    /// the next live base -- possibly in the next shard.
+    pub(crate) ends_unsizable: bool,
+}
+
 /// The per-cycle constants `sweep_one` reads. Gathered once, outside the loop,
 /// so no worker re-reads an atomic or an environment-derived flag per object.
 pub(crate) struct ZSweepCfg {
@@ -379,6 +405,7 @@ impl ZgcRealHeap {
         &self,
         registered: &ZObjectStartsSnapshot,
         cfg: &ZSweepCfg,
+        workers: usize,
     ) -> Option<(ZSweepShard, Vec<(usize, usize)>, usize)> {
         let marks = self.mark_bits.as_ref()?;
         if registered.words.is_empty() {
@@ -387,19 +414,97 @@ impl ZgcRealHeap {
         let base = cfg.arena_base;
         let low_end = base.checked_add(cfg.low_cursor)?;
         let high_floor = base.saturating_add(cfg.high_floor);
+        let words = registered.words.len().min(marks.word_count());
 
-        let mut sh = ZSweepShard::default();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        // Absolute end of the last live extent seen: everything between this
-        // and the next live base is free.
-        let mut prev_end = base;
-        // A live object whose size its header could not justify. Its extent
-        // runs to the next live base, whatever that turns out to be.
-        let mut unsizable_live = false;
+        // ONE BODY, TWO ARMS -- and the serial arm goes through the same join,
+        // so it is not a shortcut past it. `sweep_one` established the rule for
+        // the header-walk sweep (see this module's header) and the complement
+        // pass needs it more, not less: the seam logic is the part a divergence
+        // would hide, and a serial arm that skipped it would test nothing.
+        let mut shards: Vec<ZComplementShard> = if workers > 1 {
+            let per = words.div_ceil(workers);
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                for i in 0..workers {
+                    let w0 = i * per;
+                    if w0 >= words {
+                        break;
+                    }
+                    let w1 = (w0 + per).min(words);
+                    handles.push(scope.spawn(move || {
+                        self.sweep_bitmap_range(registered, cfg, marks, w0, w1, base, high_floor)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("zgc complement sweep worker panicked"))
+                    .collect()
+            })
+        } else {
+            vec![self.sweep_bitmap_range(registered, cfg, marks, 0, words, base, high_floor)]
+        };
+
+        let (mut sh, mut spans, mut new_cursor) =
+            Self::join_complement(&mut shards, base, low_end);
 
         let skips = self.jit_tlab_skip_regions();
-        let words = registered.words.len().min(marks.word_count());
-        for w in 0..words {
+        if !skips.is_empty() {
+            Self::withhold_skip_regions(&mut spans, &skips, base);
+            // ...AND THE CURSOR, not just the free list.
+            //
+            // Clipping the spans keeps a published tail off the free list, and
+            // that is only half of it: this pass also LOWERS the bump cursor
+            // onto the bytes above the last survivor, and a tail is above the
+            // last survivor by definition -- it holds no live object. Retracting
+            // through one hands its owner's next bump straight to the bump
+            // path as fresh space. The floor is the same one the slide applies
+            // (`jit_tlab_skip_floor`), for the same reason.
+            new_cursor = new_cursor
+                .max(self.jit_tlab_skip_floor(base, low_end))
+                .min(low_end);
+        }
+        // THE PRUNE, in one `fetch_and` per 512 arena bytes rather than one
+        // `remove` per dead object. It has to run against the LIVE registry
+        // rather than the snapshot the walk above read, because an object
+        // allocated black after that snapshot was taken is registered, marked,
+        // and must stay registered -- `starts &= marks` keeps exactly those.
+        //
+        // Serial, and left that way deliberately: it is one `fetch_and` per 512
+        // arena bytes over a span the bounded passes have already narrowed to
+        // the bumped ends, which is nothing beside the per-object work above.
+        self.registry.retain_marked(marks)?;
+        sh.dead_in_runs = sh.dead_count;
+        Some((sh, spans, new_cursor - base))
+    }
+
+    /// The complement pass over ONE word range. The shared body of the serial
+    /// and sharded arms.
+    ///
+    /// Emits only the free spans strictly BETWEEN two live objects it saw
+    /// itself. The gap that reaches back past `w0` belongs to no shard --
+    /// resolving it needs the previous shard's last live extent, which is not
+    /// known until that shard finishes -- so it is described rather than
+    /// emitted, in [`ZComplementShard::first_live`], and
+    /// [`ZgcRealHeap::join_complement`] closes it.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_bitmap_range(
+        &self,
+        registered: &ZObjectStartsSnapshot,
+        cfg: &ZSweepCfg,
+        marks: &super::starts::ZObjectStartBits,
+        w0: usize,
+        w1: usize,
+        base: usize,
+        high_floor: usize,
+    ) -> ZComplementShard {
+        let mut out = ZComplementShard::default();
+        let sh = &mut out.sh;
+        // Valid only once `first_live` is set; the join supplies everything
+        // below it.
+        let mut prev_end = 0usize;
+        let mut unsizable_live = false;
+
+        for w in w0..w1 {
             let start_w = registered.words[w];
             if start_w == 0 {
                 continue; // 512 arena bytes holding no allocation base
@@ -417,7 +522,7 @@ impl ZgcRealHeap {
                 if addr >= high_floor {
                     // The large-object end keeps the per-object protocol: its
                     // free list is not the one this pass rebuilds.
-                    self.sweep_one_high(addr, cfg, &mut sh);
+                    self.sweep_one_high(addr, cfg, sh);
                     continue;
                 }
                 sh.dead_count += 1;
@@ -467,13 +572,18 @@ impl ZgcRealHeap {
                 if addr >= high_floor {
                     continue; // accounted, but not part of the low complement
                 }
-                if unsizable_live {
-                    // The previous survivor ends at or before this base.
-                    unsizable_live = false;
-                    prev_end = prev_end.max(addr);
-                }
-                if addr > prev_end {
-                    spans.push((prev_end - base, addr - prev_end));
+                if out.first_live.is_none() {
+                    // The gap below this one crosses `w0`. The join owns it.
+                    out.first_live = Some(addr);
+                } else {
+                    if unsizable_live {
+                        // The previous survivor ends at or before this base.
+                        unsizable_live = false;
+                        prev_end = prev_end.max(addr);
+                    }
+                    if addr > prev_end {
+                        out.spans.push((prev_end - base, addr - prev_end));
+                    }
                 }
                 match size {
                     Some(size) => prev_end = prev_end.max(addr.saturating_add(size)),
@@ -484,36 +594,70 @@ impl ZgcRealHeap {
                 }
             }
         }
+        out.last_end = prev_end;
+        out.ends_unsizable = unsizable_live;
+        out
+    }
 
-        if unsizable_live {
+    /// Stitch the shards' complements into the one ascending, merged sequence a
+    /// serial walk would have produced, and return the bump cursor with it.
+    ///
+    /// # What a shard cannot know
+    ///
+    /// The complement is a CHAIN: a free span runs from the end of one live
+    /// extent to the base of the next, and at `w0` the previous live extent is
+    /// in another shard, still running. So a shard emits its interior spans and
+    /// describes its two edges -- the base of its first survivor and the end of
+    /// its last -- and this pass walks the shards in address order closing each
+    /// seam with the span `[chain, first_live)`.
+    ///
+    /// Two details carry across a seam and neither is optional:
+    ///
+    ///  * **An unsizable survivor.** A live object whose header could not be
+    ///    sized has no known extent, so it runs to the next live base -- which
+    ///    may be in the next shard. `ends_unsizable` carries the pending
+    ///    resolution over, and `chain` is raised to the next `first_live`
+    ///    exactly as the serial walk raises `prev_end`.
+    ///  * **A shard with no survivor at all** contributes nothing and must not
+    ///    advance `chain`. Its whole range is free, and the next shard's seam
+    ///    span covers it, because that span runs from `chain` to wherever the
+    ///    next survivor actually is.
+    ///
+    /// A shard's HIGH-end spans travel in `ZSweepShard::spans` instead and are
+    /// concatenated by `absorb`, which is correct for them: they are individual
+    /// per-object holes routed by offset, not a chain.
+    fn join_complement(
+        shards: &mut [ZComplementShard],
+        base: usize,
+        low_end: usize,
+    ) -> (ZSweepShard, Vec<(usize, usize)>, usize) {
+        let mut out = ZSweepShard::default();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut chain = base;
+        let mut pending_unsizable = false;
+        for shard in shards.iter_mut() {
+            if let Some(first) = shard.first_live {
+                if pending_unsizable {
+                    pending_unsizable = false;
+                    chain = chain.max(first);
+                }
+                if first > chain {
+                    spans.push((chain - base, first - chain));
+                }
+                spans.append(&mut shard.spans);
+                chain = shard.last_end;
+                pending_unsizable = shard.ends_unsizable;
+            }
+            // ASCENDING, because the coalescer requires it: `shards` is in
+            // range order and the high-end spans inside each are too.
+            out.absorb(&mut shard.sh);
+        }
+        if pending_unsizable {
             // Nothing past the last survivor can be justified, so nothing past
             // it is reclaimed this cycle.
-            prev_end = low_end;
+            chain = low_end;
         }
-        let mut new_cursor = prev_end.min(low_end);
-        if !skips.is_empty() {
-            Self::withhold_skip_regions(&mut spans, &skips, base);
-            // ...AND THE CURSOR, not just the free list.
-            //
-            // Clipping the spans keeps a published tail off the free list, and
-            // that is only half of it: this pass also LOWERS the bump cursor
-            // onto the bytes above the last survivor, and a tail is above the
-            // last survivor by definition -- it holds no live object. Retracting
-            // through one hands its owner's next bump straight to the bump
-            // path as fresh space. The floor is the same one the slide applies
-            // (`jit_tlab_skip_floor`), for the same reason.
-            new_cursor = new_cursor
-                .max(self.jit_tlab_skip_floor(base, low_end))
-                .min(low_end);
-        }
-        // THE PRUNE, in one `fetch_and` per 512 arena bytes rather than one
-        // `remove` per dead object. It has to run against the LIVE registry
-        // rather than the snapshot the walk above read, because an object
-        // allocated black after that snapshot was taken is registered, marked,
-        // and must stay registered -- `starts &= marks` keeps exactly those.
-        self.registry.retain_marked(marks)?;
-        sh.dead_in_runs = sh.dead_count;
-        Some((sh, spans, new_cursor - base))
+        (out, spans, chain.min(low_end))
     }
 
     // `jit_tlab_skip_regions` USED TO BE STUBBED HERE, returning empty, with a
@@ -689,23 +833,25 @@ impl ZgcRealHeap {
 
     /// How many threads the sweep should use. `1` is serial.
     ///
-    /// # IT IS CURRENTLY UNREACHABLE, and that is a defect
+    /// # It reaches the complement sweep since 2026-09-04
     ///
-    /// [`Self::sweep_bitmap`] is default-on and wins the arm selection in
-    /// `collect_garbage` before the worker count is ever consulted, so
-    /// `CRATONVM_ZGC_PARSWEEP=<n>` parses, clamps, reports, and does nothing.
-    /// A switch that answers is worse than one that is absent: it makes "I
-    /// measured the sharded sweep" a sentence someone can say about a run that
-    /// never sharded.
+    /// It did not before. [`Self::sweep_bitmap`] is default-on and wins the arm
+    /// selection in `collect_garbage`, and the worker count was consulted only
+    /// by the arms that lost -- so `CRATONVM_ZGC_PARSWEEP=<n>` parsed, clamped,
+    /// reported, and did nothing. A switch that answers is worse than one that
+    /// is absent: it made "I measured the sharded sweep" a sentence someone
+    /// could say about a run that never sharded, and it made
+    /// `a_sharded_sweep_leaves_the_arena_exactly_as_the_serial_one_does` green
+    /// and vacuous, because both of its arms ran the same serial code.
     ///
-    /// The complement sweep is not trivially shardable -- it chains `prev_end`
-    /// across the whole address space to compute the free list as one merged,
-    /// ordered sequence, and a shard boundary falls in the middle of that
-    /// chain. Sharding it means giving each worker its own `[prev_end, first
-    /// live base)` seam and joining the seams, which is a real change rather
-    /// than a loop split. Until that is done the honest options are to make
-    /// this switch also disable the bitmap sweep, or to delete it; it is left
-    /// here, documented, rather than quietly.
+    /// The complement was not trivially shardable, which is why it stayed that
+    /// way: it chains `prev_end` across the whole address space to produce the
+    /// free list as one merged, ordered sequence, and a shard boundary falls in
+    /// the middle of that chain. Each shard now emits only the spans strictly
+    /// between survivors it saw itself and describes its two edges, and
+    /// `ZgcRealHeap::join_complement` walks the shards in address order closing
+    /// each seam. `the_worker_count_reaches_the_complement_sweep` is what stops
+    /// the switch going quietly inert again.
     ///
     /// # Why this is default-off, on a phase that should parallelise
     ///

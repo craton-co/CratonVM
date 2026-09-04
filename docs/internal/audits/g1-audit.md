@@ -1395,3 +1395,510 @@ like a 82%-vs-45% win and was noise, and §15 recorded a counter that looked lik
 a refutation and was dead storage. Both were caught by asking for a second,
 independent reading — reps in the first case, the verifier's own type maps in
 the second. The instruments that can answer were already in the tree both times.
+
+## 17. The real-application soak: a false-positive latch, and the obligation that is actually blocking (2026-09-03)
+
+*`fix/g1-coverage-reason-census-20260903`. §16.3 said the open question was
+sample size and that a real soak needs applications rather than probes. This is
+that soak, on H2 and its own test suite. It found two things the probes could
+not, and the second one only became visible after the first was fixed.*
+
+### 17.1 §16 holds at scale
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, oracle armed — **612
+compiled frames and 14 798 in-band words**, against 14 frames on the probes:
+
+| counter | raw | verifier-confirmed |
+|---|---:|---:|
+| `never_mapped` | 400 | **0** (`not_oop=302`, `unknown=98`) |
+| `wrong_map` | 1 874 | **0** |
+
+Forty-four times the frame sample and still not one confirmed refutation. §16's
+conclusion — the raw counters measure dead pointers in reusable slots, which a
+precise map is right to omit — is not a small-sample artefact.
+
+### 17.2 A latch that fired on shape, on every real workload
+
+With the precise-only switches and the oracle on, H2 reported
+`root coverage: incomplete` on **100.00%** of pauses. The same class with the
+switches off reports **0.00%**. Enabling the suppression was *causing* the
+incompleteness.
+
+The cause is one ungated latch. At the audit site two refutation latches sit
+side by side:
+
+* the `fully_shadow_covered` one is gated on `verdict == Oop`, and its comment
+  gives the reason — "latching on the raw counter would have suppressed every
+  collection on every workload measured, since 5-6% of in-band words trip it";
+* the `fully_oop_covered` one, three lines above, was **not gated**. It latched
+  on the raw counter.
+
+`note_coverage_oracle_refutation` is process-wide, so 400 raw hits on H2 — all
+`verifier_oop=0` — latched the refutation for the rest of the run and every
+subsequent pause reported incomplete. The argument the tree had already written
+for the second latch applies verbatim to the first; it now has it.
+
+### 17.3 The reason was computed and thrown away
+
+`root_coverage_incomplete_reason()` returns WHICH obligation failed, and
+`record_g1_pause_coverage` was handed only `is_some()`. So a reader of
+`incomplete=58 (100.00%)` could not tell an unregistered JIT frame from an
+unpublished bounds table from an OSR shadow — which is why §14 read 0% on
+probes and §17 read 100% on H2 with no way to see that the two were different
+obligations.
+
+The `[GC] g1 root coverage:` line now carries the per-reason census, appended
+rather than on its own line so the rate cannot be read without it.
+
+### 17.4 What is actually blocking, named
+
+With the latch fixed, the same H2 run says:
+
+```
+g1 root coverage: pauses=243 incomplete=197 (81.07%)
+                  reasons: compiled-frame-oop-not-published=197
+```
+
+`UNPUBLISHED_FRAME_OOP`: a live compiled frame's own spill band holds a
+young-heap address the shadow stack never published, so nothing can rewrite
+that slot after a relocation. Not the coverage bit, not map selection, not the
+bounds table — a *shadow-stack publication* gap, and the one obligation
+`arch-2026-07-26/moving-young-corruption-rootcause.md` is named after.
+
+The pause count rising 33 → 243 in the same wall time is the other half of the
+same story: the old latch was refusing evacuation, so the run made less
+progress per pause.
+
+That is where precise root coverage actually stands on real code, and it is a
+more specific answer than §14, §15 or §16 could give. The defaults stay
+opt-in; `compiled-frame-oop-not-published` at 81% is the number the next
+attempt should drive down, and it is a shadow-stack question rather than a
+codegen or collector one.
+
+### 17.5 Two instruments, both of which had to be fixed to see this
+
+Neither result was visible before this section: the latch made every real
+workload report the same wrong reason, and the discarded reason code made the
+report unreadable even when it was right. §16.4 said a counter that flags a
+possible defect is not evidence of one; §17 adds the converse — an instrument
+that reports a real obligation under a wrong label hides the one finding worth
+having.
+
+## 18. The shadow-stack gap was mostly my own envelope (2026-09-03)
+
+*`fix/moving-young-band-object-screen-20260903`. §17.4 named
+`compiled-frame-oop-not-published` at 81% as what is actually blocking precise
+root coverage on real code. Most of it was an artefact of the change §14 made.*
+
+### 18.1 The detector has no object screen, and could not have one
+
+`band_has_unpublished_word_with_map` decides a stack word is an unpublished oop
+on one test:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) { return true; }
+```
+
+`is_relocatable` is `gen_heap::addr_is_movable` — an **address-range check**.
+No `is_object_address`, no header validation, unlike every sibling instrument
+in this file, all of which require `heap.is_object_address(qword).is_some()`
+before believing a word.
+
+It cannot simply be given one: there is no heap handle in
+`refresh_moving_young_coverage_for_current_thread`, and — the harder half —
+the range it tests covered G1's whole **reservation**, where reading a header
+faults on pages that were never committed.
+
+§14 published that reservation, on the argument that a superset is the safe
+direction. It is, for this classification. But it is also the reason this test
+lit up for G1 at all: every reserved-but-uncommitted byte is address space that
+cannot hold an object and can only turn coincidental stack words into
+"unpublished oops".
+
+### 18.2 The fix, and what it is worth
+
+G1 now publishes the **committed prefix** into `MOVABLE_BOUNDS`, republished as
+the prefix grows — exactly as `publish_jit_read_bounds` beside it already does.
+Still a superset of what can hold an object, so §14's safety argument is intact,
+and now tight enough that a header screen would be safe to add later.
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, precise-only switches and the
+oracle on, six reps each:
+
+| | incomplete rate per rep | median |
+|---|---|---:|
+| reservation (§14) | 2.94, 3.85, 16.95, 40.38, 72.41, 83.62 % | **28.7 %** |
+| committed prefix | 2.78, 2.78, 3.39, 4.08, 4.27, 21.43 % | **3.7 %** |
+
+The absolute counts fall the same way: 1–97 incomplete pauses become 1–5.
+
+**Read those spreads before the medians.** This workload is extremely unstable —
+the same binary and configuration produced 34 and 243 pauses on consecutive
+runs, and rates from 2.9% to 83.6% on the unchanged arm. Six reps are enough to
+say the arms differ by roughly an order of magnitude and not enough to put a
+figure on it. §12.3's lesson applies here too, and the instability is itself the
+finding that blocks a real soak of this metric: nobody can drive
+`compiled-frame-oop-not-published` down until the measurement is stable enough
+to tell progress from variance.
+
+### 18.3 What is left, honestly
+
+A residue survives the fix — 1 to 5 pauses per run still report
+`compiled-frame-oop-not-published`, and a second reason,
+`innermost-rbp-belongs-to-unguarded-callee`, appears alongside it. Those are
+the ones that may be real, and the object screen §18.1 describes is what would
+tell: with the range now bounded by the commit, a header check is safe to add,
+and it is the next step rather than a further narrowing of the bounds.
+
+**One segfault**, on the fixed arm, during the spread runs above. It did not
+reproduce: 0 crashes in 14 subsequent reps on that arm (8 without the oracle, 6
+with) and 0 in 14 on the unchanged arm. It is recorded rather than explained,
+and it matches the rare tight-heap crash class G1-11 already documents at
+roughly 1-in-32 on plain `dev`.
+
+## 19. The band test's object screen — and what it did NOT find (2026-09-03)
+
+*`fix/band-test-object-screen-20260903`. §18.3 named the object screen as the
+next step, once the envelope was bounded by the commit and a header read was
+safe. It is in. It does not move the number, and that is the result.*
+
+### 19.1 What was added
+
+`cratonvm_types::plausible_object_header_at` — the heap-free half of
+`G1Collector::is_object_address`. That function is a range check followed by
+exactly these header tests (kind tag decodes, element-type tag decodes, not a
+filler, plausible `num_slots`/`array_length`), and only the range half needs a
+collector. `band_word_is_an_object` applies it in
+`band_has_unpublished_word_with_map`, so the band test now asks "is there an
+unpublished OBJECT here" rather than "is there a word whose value lands in the
+heap's range" — the question every sibling instrument in that file already asks.
+
+Safe only because §18 bounded `MOVABLE_BOUNDS` to the committed prefix; under
+the previous reservation-wide envelope this dereference could touch a page that
+was never mapped.
+
+`CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN=1` restores the range-only test,
+and that is the fail-OPEN direction — more words flagged, more cycles refusing
+to move — so it is the safe lever if a missed root is ever suspected here.
+
+**It is a filter, not a proof, and its test says so.** The kind and
+element-type tags are a few bits each, so some arbitrary words decode to a
+valid pair by chance; `the_object_header_screen_separates_headers_from_numbers`
+asserts a rejection RATE over a spread rather than a verdict on one hand-picked
+word, which would have been a coin toss dressed as a property.
+
+### 19.2 The measurement, which is a null result
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, precise-only switches and
+oracle on, four reps each:
+
+| screen | incomplete rate per rep | median |
+|---|---|---:|
+| off (range only) | 5.41, 3.80, 2.25, 25.00 % | 4.6 % |
+| on | 3.45, 45.83, 3.57, 2.50 % | 3.5 % |
+
+Both arms carry one outlier and the medians are inside the noise. **The screen
+does not reduce the residue.**
+
+That is worth having. After §18 the residual `compiled-frame-oop-not-published`
+reports are NOT non-header junk — they are words that pass a header screen. So
+the residue is either genuine unpublished roots, or dead slots still pointing at
+real objects, and telling those apart needs a liveness question rather than a
+shape one. The screen is landed because it makes the instrument ask the right
+question for whoever asks it next, not because it improved today's number.
+
+### 19.3 Where this leaves the shadow-stack question
+
+Four sections in, the honest state:
+
+* §14 — the coverage proof was vacuous under G1 (no movable envelope). Fixed.
+* §17 — a refutation latch fired on shape, reporting 100% incomplete on every
+  real workload for the wrong reason. Fixed; the reason census now names the
+  obligation.
+* §18 — most of the named obligation was the reservation-wide envelope that
+  §14 itself published. Fixed; median 28.7% → 3.7%.
+* §19 — the remaining few percent survive an object screen, so they are not
+  shape artefacts.
+
+What has NOT been established at any point is that the residue is a real
+missed root. Every instrument aimed at it so far has answered a question about
+shape, and every time the shape answer has turned out to be dominated by
+artefacts. The next step is the liveness question — the verifier type maps, as
+§16 used for `never_mapped` — applied to the band words, and it needs a
+workload whose coverage rate is stable enough to measure against, which
+`TestMVStoreTool` is not (§18.2).
+
+## 20. The liveness screen — and the crash §19 shipped (2026-09-03)
+
+*`fix/band-test-liveness-screen-20260903`. §19.3 named the liveness question as
+the next step. Adding it surfaced a defect §19 had already merged.*
+
+### 20.1 First: §19 shipped a segfault, and this is how
+
+§19's object screen dereferences a band word to read its header:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) && band_word_is_an_object(w) {
+```
+
+Its safety comment argued the word is inside the published movable range, which
+§18 bounds by the committed prefix. **That argument holds for one of the two
+callers.** `band_has_unpublished_word_with_map` takes
+`is_relocatable: impl Fn(usize) -> bool` as a PARAMETER; production passes
+`gen_heap::addr_is_movable`, but the map-less wrapper takes whatever the caller
+supplies, and every unit test in this file supplies a closure over synthetic
+values like `0xbeef_0000`. Reading a header from one of those is a segfault, and
+`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`
+duly crashed the whole `cratonvm-vm` test binary.
+
+**How it reached `dev`**: §19 was gated on the types and gc suites and
+`cargo check --workspace --all-targets`. A `check` compiles tests without
+running them, and the crashing test lives in `cratonvm-vm`, whose test suite was
+not run. The lesson is narrow and worth stating: a change to a function in
+`vm/src/` is not gated by the gc suite, and `check` is not `test`.
+
+The fix is a `readable: bool` parameter — only the caller knows whether the
+words its predicate accepts may be dereferenced. `true` for the
+`addr_is_movable` caller, `false` for the generic one, which reverts to §18's
+behaviour there. The four band tests pass again and the full 2613-test
+`cratonvm-vm` suite is green.
+
+### 20.2 The liveness screen
+
+§19 established the survivors of the object screen are header-shaped, so shape
+cannot separate a real missed root from a dead slot still pointing at a live
+object. The class file's own type maps can, for the java-locals band —
+`verifier_local_verdict`, the same oracle §16 used.
+
+**One direction only, and that is the whole safety argument.** Reporting an
+unpublished oop makes the cycle refuse to move, so DISCARDING a report is the
+direction that permits movement. A word is discarded only on a positive
+`NotOop` — the verifier saying this local definitely holds no reference at this
+bci. `Unknown` (an inlined frame, a slot outside the locals band, no type maps
+for the method) KEEPS the report, because "could not ask" must never read as
+"answered no".
+
+That is §16's asymmetry pointed the other way, and deliberately so: there the
+consequence of being wrong was a missed refutation, here it is a missed root.
+
+### 20.3 Status
+
+The screen is in and sound by construction; it is not yet measured. §18.2's
+finding stands in the way — `TestMVStoreTool`'s coverage rate swings from 2.9%
+to 83.6% on an unchanged arm, so a residue of a few percent cannot be shown to
+move against it. Whoever measures this needs a workload with a stable rate
+first; that is now the blocking item for the whole §14-§20 line of work, ahead
+of any further screening.
+
+## 21. A workload whose coverage rate can actually be measured (2026-09-03)
+
+*`perf/g1-coverage-stable-probe-20260903`. §20.3 made this the blocking item
+for the whole §14-§20 line: the screens are sound by construction but
+unmeasurable, because the only workload exercising enough compiled frames swung
+its coverage rate by 80 points between identical runs.*
+
+### 21.1 What was wrong with both ends
+
+| | frames | rate spread, identical runs | reliable? |
+|---|---:|---|---|
+| `HumongousChurn` &co. | ~14 | n/a — reports 0% | yes |
+| `TestMVStoreTool` (H2) | 612 | **2.9% - 83.6%** | no (`rc=1`) |
+
+The probes are stable and have no obligation to report; H2 has plenty and
+cannot be measured. Neither is a surface for a few-percent effect.
+
+### 21.2 `probes/CoverageBench.java`
+
+The shape follows from what the metric needs, and each part is there for one
+reason:
+
+* **Ten distinct hot methods**, each holding three or more REFERENCE LOCALS
+  live across an allocating call. That is what puts oops in a compiled frame's
+  spill band at a safepoint, which is the thing the coverage verifier has an
+  opinion about — one method with a deep loop gives one frame, ten called in
+  rotation give ten.
+* **Determinism**: no clock, no IO, no identity hashing, no threads. The
+  retained set is walked BY INDEX rather than by chasing `next`, so the access
+  pattern does not depend on where the collector put anything.
+* **A constant live set**, so pause boundaries do not drift as the run
+  proceeds, and escaping garbage through a rotating window so the allocation is
+  real.
+
+### 21.3 It is stable, and the run has to be long
+
+Four to six identical runs per configuration, `-Xmx32m`, precise-only switches
+and oracle on:
+
+| rounds | frames | pauses | incomplete rate | spread |
+|---:|---:|---:|---|---:|
+| 4 000 | 6 | 2 | 50.00 x6 | 0 (too small to mean anything) |
+| 40 000 | 302-659 | 64-137 | 87.50, 90.62, 92.31, 92.70, 98.44, 98.53 % | 11 pts |
+| **150 000** | **1283-2207** | 260-456 | **96.92, 97.48, 97.59, 97.80 %** | **0.88 pts** |
+
+`checksum` is identical across every run of a configuration and `rc=0`
+throughout — neither is true of the H2 class.
+
+**The pause COUNT still varies about twofold**, because when the JIT compiles
+each method shifts the allocation rate. The RATE does not, once the run is long
+enough for the compiled steady state to dominate the early pauses. That is the
+distinction that makes this measurable: the metric is a ratio, and the ratio
+converges even though its denominator does not.
+
+At 150 000 rounds this gives 1283-2207 compiled frames — two to three times the
+H2 sample — with a spread under one point, against H2's eighty. A change worth
+one or two points is now visible; against `TestMVStoreTool` it never was.
+
+### 21.4 What it says, and the work it unblocks
+
+`incomplete = 97.5%`, reason `compiled-frame-oop-not-published`, stably. So the
+obligation §17.4 named is not an artefact of H2 — a deterministic workload with
+no IO and a constant live set reproduces it at the same rate every time.
+
+That is the number for the §20.2 liveness screen to be measured against, and
+for whatever follows it. The recommended invocation:
+
+```
+CRATONVM_GC_PRECISE_ONLY_ROOTS=1 CRATONVM_G1_PRECISE_ONLY_ROOTS=1 \
+CRATONVM_DBG_VERIFY_OOP_MAPS=1 \
+cratonvm -Xmx32m -XX:+UseG1GC --verbose:gc -cp probes CoverageBench 20000 150000 512
+```
+
+Four reps, compare medians, and treat anything under a point as noise.
+
+## 22. The liveness screen, measured — a null result that explains itself (2026-09-03)
+
+*`perf/band-liveness-screen-measured-20260903`. §21 built the stable workload
+so §20.2's screen could finally be measured. It was, and it does nothing —
+but the debug dump says why, and the reason is more useful than the screen.*
+
+### 22.1 The measurement
+
+The screen had no kill switch, so it could not be A/B'd in one binary — every
+other screen in this file has one and this now does too
+(`CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN`, fail-OPEN like the object
+screen's).
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| screen | incomplete rate per rep | median |
+|---|---|---:|
+| off | 98.29, 96.92, 98.69, 99.60 % | **98.49 %** |
+| on | 97.31, 99.60, 100.00, 96.67 % | **98.46 %** |
+
+`checksum=262248526` and `rc=0` on all eight. The medians differ by 0.03
+points inside a ~3-point spread: **the screen changes nothing.**
+
+(The spread is wider than §21.3's 0.88 points because these runs alternate arms
+on a busier host. It is still a usable surface — H2's was eighty.)
+
+### 22.2 Why, and it is not what the screen was built for
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` on the same workload dumps every word the
+band test reports. Of 93:
+
+| region | count | `in_map` |
+|---|---:|---|
+| `java-local` | 67 | **true** |
+| `reserved-locals-tail` | 26 | false |
+
+Two things follow.
+
+The screen cannot fire on the majority: they are java locals, which is exactly
+the population `verifier_local_verdict` CAN answer for — and it answers `Oop`
+or `Unknown`, not `NotOop`, because they really are references. The screen
+keeps them, correctly. It was built on §19's finding that the residue is
+header-shaped; it turns out the residue is not just header-shaped but genuinely
+live.
+
+And the more interesting half: **`in_map=true`**. The active oop map already
+names those 67 slots. So `scan_active_oop_map_at_rbp` visits them and
+`remap_active_jit_frames` rewrites them — the precise mechanism covers them.
+The band test reports them anyway, because its question is whether the SHADOW
+STACK published the word, and it asks that of slots the oop map has already
+accounted for.
+
+### 22.3 The next hypothesis, stated but not acted on
+
+A word the ACTIVE OOP MAP names may not need shadow-stack publication to be
+rewritable, because the oop-map path rewrites it. If that holds,
+`band_has_unpublished_word_with_map` should not report an `in_map` word at all,
+and 67 of 93 reports on this workload would go away.
+
+It is written here rather than implemented because it is one dump on one
+workload, and this document now records two changes landed on that much
+evidence and withdrawn (§15 → §16, and the §19 screen whose crash §20 fixed).
+The test is cheap and specific: suppress `in_map` words, run §21's four reps,
+and see whether the rate falls by roughly the two-thirds the dump predicts. If
+it does not, the dump was not representative and nothing was lost.
+
+### 22.4 The screen stays
+
+Landed despite the null result, for the reason §19's object screen was: it
+makes the instrument ask a sound question, and it is the only thing standing
+between a future `NotOop` word and a spurious refusal to move. It costs a
+verifier lookup on a diagnostic path that only runs under the precise-only
+switches, and `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN=1` removes it.
+
+## 23. The in-map suppression test — a real effect, a wrong prediction, and new variance (2026-09-04)
+
+*`perf/band-in-map-suppression-test-20260904`. §22.3 named this test and
+declined to run it on one dump's evidence. Run now, behind
+`CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` (opt-in, default off).*
+
+### 23.1 The result
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| skip in-map | incomplete rate per rep | median | spread |
+|---|---|---:|---:|
+| off | 98.05, 98.25, 97.30, 98.22 % | **98.14 %** | 0.95 pts |
+| on | 84.15, 46.39, 92.50, 89.05 % | **86.60 %** | **46 pts** |
+
+`checksum=262248526` and `rc=0` on all eight.
+
+The effect is real — about **11.5 points** — and it is nothing like the
+prediction.
+
+### 23.2 The prediction was wrong in kind, not just in size
+
+§22.3 said "expect roughly a two-thirds fall", reasoning from the dump's 67 of
+93 WORDS being `in_map`. That inference does not hold: the rate is per PAUSE,
+and a pause is incomplete if ANY of its words is unpublished. Removing
+two-thirds of the words removes a pause from the count only when it removes
+ALL of that pause's words. A per-word proportion cannot be read as a per-pause
+one, and the 11.5 points measured against 65 predicted is the size of that
+mistake.
+
+Worth stating plainly because the surrounding sections are about instruments
+that answer a different question from the one asked of them, and this is the
+same error committed in the reasoning rather than in the code.
+
+### 23.3 The variance is the more interesting half
+
+The OFF arm spans 0.95 points — §21's stability holds. The ON arm spans 46,
+and its pause counts jump too (526-1013 against 259-462).
+
+That is not measurement noise; it is the suppression changing what the
+collector does. Fewer reported words means more cycles permitted to move,
+which changes the pause pattern, which changes the workload's behaviour — so
+the ON arm is not the same experiment run twice. §21's workload is stable for
+observing a metric, not for a change that alters the collector's decisions,
+and this is the first change in this line that does.
+
+Anything built on this needs its own stability answer first. A rate quoted from
+the ON arm today means nothing narrower than "between 46 and 93%".
+
+### 23.4 What it does not settle
+
+The claim §22.3 rests on — that a slot the active oop map names is rewritten by
+`remap_active_jit_frames` and so needs no shadow-stack publication — is neither
+confirmed nor refuted by an 11.5-point drop in a self-reported metric. What
+would confirm it is the stale-after-remap detector: with the suppression on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` should show no NEW stale word in an
+`in_map` slot. That is the next test, it is cheap, and it is a soundness
+question rather than a rate one — which is the right order after §22 showed
+four rate-screens in a row moved almost nothing.
+
+The flag ships opt-in and stays that way until that question is answered.

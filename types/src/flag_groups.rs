@@ -472,6 +472,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fwdwalk", on_key: Some("CRATONVM_DBG_FWDWALK"), off_key: None, off_word: None, since: "2026-08-07" },
     E { group: Group::DBG, token: "fwdguard", on_key: Some("CRATONVM_DBG_FWDGUARD"), off_key: None, off_word: None, since: "2026-06-09" },
     E { group: Group::DBG, token: "g1-dbg-gray-prov", on_key: Some("CRATONVM_G1_DBG_GRAY_PROV"), off_key: None, off_word: None, since: "2026-08-30" },
+    E { group: Group::GC, token: "g1-late-header-write", on_key: Some("CRATONVM_G1_LATE_HEADER_WRITE"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "g1-mark-oob-failsafe", on_key: Some("CRATONVM_G1_MARK_OOB_FAILSAFE"), off_key: None, off_word: None, since: "2026-08-30" },
     E { group: Group::DBG, token: "g1-dbg-headers", on_key: Some("CRATONVM_G1_DBG_HEADERS"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::DBG, token: "g1-dbg-pins", on_key: Some("CRATONVM_G1_DBG_PINS"), off_key: None, off_word: None, since: "2026-07-10" },
@@ -709,6 +710,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "moving-young-band-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_DBG"), off_key: None, off_word: None, since: "2026-07-26" },
+    E { group: Group::GC, token: "moving-young-band-skip-in-map", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "moving-young-coverage-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_COVERAGE_DBG"), off_key: None, off_word: None, since: "2026-07-01" },
     E { group: Group::DBG, token: "moving-young-fallbacks", on_key: Some("CRATONVM_MOVING_YOUNG_FALLBACKS"), off_key: None, off_word: None, since: "2026-07-01" },
     E { group: Group::DBG, token: "moving-young-no-band-verify", on_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY"), off_key: None, off_word: None, since: "2026-07-26" },
@@ -988,6 +990,17 @@ pub const INVENTORY: &[E] = &[
     // has no observable semantics, so the only honest way to price it is one
     // binary run both ways in the same minutes.
     E { group: Group::JIT, token: "gpu-dispatch-memo", on_key: Some("CRATONVM_GPU_DISPATCH_MEMO"), off_key: None, off_word: Some("0"), since: "2026-08-29" },
+    // Consecutive below-min-work refusals after which a CALL SITE is allowed
+    // into the invoke cache. Requires `invoke-cache-pc-key`: without it a
+    // "site" is a method reference and promoting one caller deoptimises its
+    // siblings (measured 18x on GpuHookOverheadBench).
+    E { group: Group::GC, token: "gpu-min-work-giveup", on_key: Some("CRATONVM_GPU_MIN_WORK_GIVEUP"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Adds the call site's bytecode offset to the invoke-cache key, so two
+    // sites invoking the same method stop sharing one entry.
+    E { group: Group::JIT, token: "invoke-cache-pc-key", on_key: Some("CRATONVM_INVOKE_CACHE_PC_KEY"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Invoke-cache hit/miss counts at exit; the acceptance criterion for
+    // `invoke-cache-pc-key`.
+    E { group: Group::DBG, token: "invoke-cache-stats", on_key: Some("CRATONVM_INVOKE_CACHE_STATS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "gpu-if-convert", on_key: Some("CRATONVM_GPU_IF_CONVERT"), off_key: None, off_word: None, since: "2026-08-29" },
     E { group: Group::JIT, token: "gpu-if-convert-max-ops", on_key: Some("CRATONVM_GPU_IF_CONVERT_MAX_OPS"), off_key: None, off_word: None, since: "2026-08-29" },
     E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None, since: "2026-08-05" },
@@ -1005,6 +1018,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "frame-bands", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_BANDS"), off_word: None, since: "2026-08-20" },
     E { group: Group::JIT, token: "oopmap-coverage-presence-only", on_key: Some("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "moving-young-bounds-guard", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD"), off_word: None, since: "2026-08-20" },
+    E { group: Group::GC, token: "moving-young-band-object-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN"), off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "moving-young-band-liveness-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN"), off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
@@ -1239,6 +1254,10 @@ pub const INVENTORY: &[E] = &[
     // that one only adds the third consumer. One switch for both would have
     // made them indistinguishable in a bisect.
     E { group: Group::JIT, token: "this-nonnull", on_key: Some("CRATONVM_JIT_THIS_NONNULL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // The optimizing tier's half of the same fact, reached by a different
+    // route (the graph's `receiver_param`, not a bytecode dataflow). Separate
+    // so a bisect can say which tier moved.
+    E { group: Group::JIT, token: "ir-this-nonnull", on_key: Some("CRATONVM_JIT_IR_THIS_NONNULL"), off_key: None, off_word: None, since: "2026-09-03" },
     // Drops the getfield receiver TEST/JZ where the dataflow proves it dead.
     E { group: Group::JIT, token: "receiver-null-elim", on_key: Some("CRATONVM_JIT_RECEIVER_NULL_ELIM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     // DEFAULT-ON since its soak. Still the only switch in this backend whose
@@ -1372,6 +1391,10 @@ pub const INVENTORY: &[E] = &[
     // lever. Added a wave after the declaration sweep closed at zero
     // offenders, which is exactly how the count creeps back up.
     E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0"), since: "2026-08-01" },
+    E { group: Group::JIT, token: "deferred-new-retry-blind", on_key: Some("CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
+    E { group: Group::JIT, token: "supersede-epoch-skip-useless", on_key: Some("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::JIT, token: "leak-code", on_key: Some("CRATONVM_JIT_LEAK_CODE"), off_key: None, off_word: None, since: "2026-07-27" },
@@ -1568,13 +1591,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },
     // `invoke-fast-door` — off routes every monomorphic virtual cache hit
     // through the general `execute_invokevirtual_cached` dispatcher.
-    E { group: Group::JIT, token: "invoke-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_INVOKE_FAST_DOOR"), off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "invoke-fast-door", on_key: Some("CRATONVM_JIT_INVOKE_FAST_DOOR"), off_key: Some("CRATONVM_JIT_NO_INVOKE_FAST_DOOR"), off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "door-receiver-record", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD"), off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "door-recv-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECV_MEMO"), off_word: None, since: "2026-09-04" },
     // `nonvirtual-fast-door` — off routes every monomorphic `invokestatic`
     // and `invokespecial` cache hit through the general dispatcher.
     E { group: Group::JIT, token: "nonvirtual-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"), off_word: None, since: "2026-09-02" },
     // `frame-slot-reuse` — off routes every frame's buffers back through
     // the thread pools on return instead of retiring the frame in place.
     E { group: Group::JIT, token: "frame-slot-reuse", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_SLOT_REUSE"), off_word: None, since: "2026-09-02" },
+    // `frame-emplace` — off builds the frame on the Rust stack and moves it
+    // into the slot instead of constructing it there.
+    E { group: Group::JIT, token: "frame-emplace", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_EMPLACE"), off_word: None, since: "2026-09-03" },
     // `iface-select-memo` — off makes every `invokeinterface` cache hit
     // retake the class-manager read lock and rewalk the receiver hierarchy
     // to re-verify maximally-specific selection.
@@ -1728,6 +1756,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "verify-types", on_key: Some("CRATONVM_JIT_VERIFY_TYPES"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None, since: "2026-06-14" },
     E { group: Group::JIT, token: "xt-helper-window-discharge", on_key: Some("CRATONVM_XT_HELPER_WINDOW_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "xt-pinned-peer-depth", on_key: Some("CRATONVM_XT_PINNED_PEER_DEPTH"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "xt-pinned-peer-publish-only", on_key: Some("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-interior", on_key: Some("CRATONVM_XT_HELPER_WINDOW_INTERIOR"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-pin", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None, since: "2026-07-02" },
@@ -1752,6 +1783,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inline-oop-coverage", on_key: Some("CRATONVM_JIT_INLINE_OOP_COVERAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "local-mask-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "wide-local-oop-maps", on_key: Some("CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::JIT, token: "arm64-safepoints", on_key: Some("CRATONVM_JIT_ARM64_SAFEPOINTS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-gc-point-maps", on_key: Some("CRATONVM_JIT_IR_GC_POINT_MAPS"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::JIT, token: "zero-spid", on_key: Some("CRATONVM_JIT_ZERO_SPID"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None, since: "2026-07-31" },
@@ -1920,6 +1952,16 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::GC, token: "sync-young-wipe", on_key: Some("CRATONVM_GC_SYNC_YOUNG_WIPE"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "jit-ref-store-gates", on_key: Some("CRATONVM_GC_JIT_REF_STORE_GATES"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Opt-IN: the interpreter's TLAB fast path plans the COMPACT body shape,
+    // the one the JIT's inline `new` and the TLAB-miss path already use. Off by
+    // default because the single previous attempt at this unification
+    // miscompiled `probes/FjpProbe.java`; see `compact_tlab_alloc_enabled`.
+    E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Bisection levers for the shape above: which sites may plan compact, and
+    // which classes actually did. Both exist because the first miscompile it
+    // exposed cost a rebuild per hypothesis until they did not.
+    E { group: Group::GC, token: "compact-tlab-sites", on_key: Some("CRATONVM_COMPACT_TLAB_SITES"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
     E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None, since: "2026-06-05" },
@@ -2031,6 +2073,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-minors-per-major", on_key: Some("CRATONVM_ZGC_GEN_MINORS_PER_MAJOR"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-alloc-trigger", on_key: Some("CRATONVM_ZGC_ALLOC_TRIGGER"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::GC, token: "zgc-pause-target-ms", on_key: Some("CRATONVM_ZGC_PAUSE_TARGET_MS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::GC, token: "zgc-bitmap-bounds", on_key: Some("CRATONVM_ZGC_BITMAP_BOUNDS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
     // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run
