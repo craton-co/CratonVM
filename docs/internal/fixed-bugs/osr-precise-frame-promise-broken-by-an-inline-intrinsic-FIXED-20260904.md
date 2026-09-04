@@ -104,6 +104,7 @@ be catchable.
 | check | result |
 |---|---|
 | `test_npe_from_body` ALONE (`-- --exact`) | ok, 3 of 3 |
+| `regression-suite/run.sh` (incl. `RJitLambdaNpeSupersede`) | 90 passed, 0 failed |
 | `lambda_jit_tierup_tests`, all 12 | 12 passed |
 | `pgo02_guarded_virtual_inline` | ok |
 | `jit_guarded_inline_native_shadow` | ok |

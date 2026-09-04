@@ -34,6 +34,41 @@ and recorded at
 This page's own warning is what caught it: **run this test alone.** A full-file
 run was green on the broken binary, exactly as it was for the defect above.
 
+`773ae4fcf` reached the same regression from the other end, through the suite
+vector rather than the unit test, and its evidence is kept here because it is
+the part neither line produced twice:
+
+```text
+$ cratonvm -cp build RJitLambdaNpeSupersede
+Exception in thread "main" java/lang/NullPointerException: ... "<local0>" is null
+
+$ CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1 cratonvm -cp build RJitLambdaNpeSupersede
+PASS RJitLambdaNpeSupersede (3 checks)
+```
+
+Bisected by build, five arms: PASS at `ec96716a8`, FAIL at `ded395383`,
+`b111a3514`, `842e6d0f9` and `04a5d4d02`. `ded395383` is dev's own line with no
+feature branch merged into it, which is what rules out everything landed beside
+it. `069e67b43` is the commit in that window, and the kill switch names it.
+
+**Its reading of the mechanism was wrong, and the difference matters for
+anyone touching the intrinsic.** That page said the intrinsic "is a second
+producer of the implicit trap signals, and it was not taught to drop them". It
+is not a producer of them at all: the BOX_UNBOX lowering in
+`jit/src/x64/bytecode_walk.rs` ends its null-receiver and guard edges with
+`self.deopt_stubs.push((p, pc, 6))` and touches no `JIT_SIGNALS` field. The
+`take_jit_pending_exception` discipline is intact and was never involved.
+
+Two measurements say so independently of reading the source.
+`CRATONVM_JIT_OSR_EXC_TABLE=0` and `CRATONVM_DEOPT_REAL=0` each make the vector
+clean while leaving the intrinsic fully on — neither flag can reach a signal
+drain. And the fix that repairs it refuses the intrinsic **only at sites inside
+a `try`**, leaving it live everywhere else; a leaked signal would not care where
+the site was.
+
+A kill switch that removes a symptom identifies an ingredient, not a mechanism.
+This one had three, and the one they share is the OSR admission.
+
 **REGRESSED 2026-09-04, and the cause is named.** `069e67b43` turned the
 box/unbox intrinsic default-ON, and this vector is a boxing lambda
 (`Function<String, Integer>`, so every `apply` is an `Integer.intValue()`).
