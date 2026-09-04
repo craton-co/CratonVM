@@ -554,11 +554,11 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
                 break;
             }
         }
-        // iastore / lastore / fastore / dastore, plus bastore (0x54) and
-        // sastore (0x56) since `short[]`/`byte[]` became cacheable.
+        // iastore / lastore / fastore / dastore, plus bastore (0x54),
+        // castore (0x55) and sastore (0x56) since `short[]`/`byte[]`
+        // and then `char[]` became cacheable.
         // Reached only on a real instruction boundary, so an operand
         // byte that happens to equal one of these cannot false-positive.
-        // 0x55 (castore) is excluded on purpose — see the doc above.
         if (0x4f..=0x52).contains(&op) || op == 0x54 || op == 0x56 || op == 0x55 {
             writes_array = true;
         }
