@@ -29,7 +29,7 @@
 //!     --test transfer_bandwidth_it -- --nocapture --ignored
 //! ```
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu-driver")]
 
 use cratonvm_cuda_bridge::{DeviceBuffer, DeviceContext, DeviceModule, PinnedHostBuffer};
 use std::time::Instant;
