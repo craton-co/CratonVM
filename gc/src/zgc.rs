@@ -7266,6 +7266,31 @@ impl ZgcRealHeap {
     }
 
     /// Snapshot of the pinned addresses, for the relocation-set filter.
+    ///
+    /// # A CRITICAL PIN DOES NOT KEEP ANYTHING ALIVE, and it should
+    ///
+    /// This is the only reader, and its one caller is inside `relocate_stw`.
+    /// So `pin_critical` makes an object IMMOVABLE and nothing else: the mark
+    /// phase never sees these addresses, so an object whose only reference is
+    /// the raw pointer a native is holding is unreachable, gets swept,
+    /// free-listed, and -- since the reserve/commit store shipped -- has its
+    /// granules handed back to the OS. The native's next write then faults on
+    /// `PROT_NONE` rather than scribbling on stale bytes.
+    ///
+    /// On a DEFAULT run the pin is inert entirely, because relocation is
+    /// opt-in (`CRATONVM_ZGC_RELOCATE`): nothing consults this at all.
+    /// `GetPrimitiveArrayCritical`'s contract is that the array stays valid
+    /// until `Release`, which is a liveness promise and not just an immovability
+    /// one, so these addresses belong in the root set as well as in the
+    /// relocation filter.
+    ///
+    /// Not fixed here because the fix wants its own change and its own test --
+    /// see
+    /// `docs/known-issues/h2/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md`,
+    /// which records the crash that led here and what it does and does not
+    /// establish. JNI's own array path does NOT depend on this: it hands out a
+    /// detached copy and mints a global ref as the keep-alive
+    /// (`vm/src/native/jni.rs`).
     fn critical_pin_addrs(&self) -> Vec<usize> {
         let pins = self.counters.critical_pins.lock();
         if pins.is_empty() {
@@ -15054,7 +15079,7 @@ pub(crate) mod tests {
         assert_eq!(owned.committed_bytes(), owned.len());
         assert!(owned.commit_range(0, owned.len()));
         assert_eq!(
-            owned.decommit_range(0, 4 * 1024 * 1024),
+            owned.decommit_range(0, 4 * 1024 * 1024, "test"),
             0,
             "the owned store has nothing to give back and must say so"
         );
