@@ -888,6 +888,12 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// Edge copies that read their source out of a register, and edge copies
+    /// that published their phi's register from RAX. Both are ENGAGEMENT
+    /// counts: a zero says the wiring never fired, which is a different
+    /// finding from "it fired and did not pay".
+    phi_copy_reg_reads: usize,
+    phi_copy_reg_publishes: usize,
     /// Number of input references to each node, over every input of every
     /// node. Filled by `prepare_fusion_tables` before the first block lowers.
     use_count: Vec<u32>,
@@ -1312,6 +1318,8 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
             gp_reg_live: Vec::new(),
+            phi_copy_reg_reads: 0,
+            phi_copy_reg_publishes: 0,
             use_count: Vec::new(),
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
@@ -2021,7 +2029,7 @@ impl<'a> Lowerer<'a> {
         // Gather (phi_slot, value_id) pairs first to avoid borrowing `self`
         // immutably while emitting (which borrows `self` mutably).
         let gathered = self.gather_phi_copies(pred_block, succ_block);
-        let copies: Vec<(i32, i32)> = gathered.iter().map(|&(_, dst, src)| (dst, src)).collect();
+        let copies: Vec<(i32, i32)> = gathered.iter().map(|c| (c.dst, c.src_slot)).collect();
 
         // Phi copies are a PARALLEL assignment, not a sequence.
         //
@@ -2060,8 +2068,25 @@ impl<'a> Lowerer<'a> {
                 return;
             }
         };
+        // Which node does each frame word in this edge belong to? Two maps,
+        // because one word can be a source here and a destination there, and
+        // the reserved scratch is in neither — a `Save`'s destination and a
+        // `Restore`'s source therefore find nothing and stay memory, which is
+        // what they must be.
+        let (src_node_of, phi_of_dst) = if ir_phi_copy_regs_enabled() {
+            let mut s: HashMap<i32, NodeId> = HashMap::new();
+            let mut d: HashMap<i32, NodeId> = HashMap::new();
+            for c in &gathered {
+                s.insert(c.src_slot, c.src);
+                d.insert(c.dst, c.phi);
+            }
+            (s, d)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) = self.emit_copy_op(op) {
+            if let Err(bailout) = self.emit_copy_op(op, &src_node_of, &phi_of_dst, &mut published) {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -2074,13 +2099,23 @@ impl<'a> Lowerer<'a> {
         // the first published edge (in emission order) still take the home
         // word; every edge publishes, so the register is valid on entry to the
         // block whichever predecessor ran.
+        //
+        // 2026-09-04: a GP phi whose copy went through RAX is published *there*,
+        // from RAX, and appears in `published`. The reload below is what is
+        // left for everything else — the FP half, and any phi whose copy the
+        // resolver dropped as a self-copy (nothing was emitted, so nothing
+        // could publish, and on the first edge in emission order the register
+        // may not be live yet).
         if ir_phi_residency_enabled() {
-            for &(phi, dst, _) in &gathered {
-                if self.assigned_gpr(phi).is_some() {
-                    self.publish_gp_from_slot(phi, dst);
-                } else if self.assigned_xmm(phi).is_some() {
-                    let is_double = self.graph.nodes[phi as usize].ty == IrType::Double;
-                    self.publish_fp_from_slot(phi, dst, is_double);
+            for c in &gathered {
+                if published.contains(&c.phi) {
+                    continue;
+                }
+                if self.assigned_gpr(c.phi).is_some() {
+                    self.publish_gp_from_slot(c.phi, c.dst);
+                } else if self.assigned_xmm(c.phi).is_some() {
+                    let is_double = self.graph.nodes[c.phi as usize].ty == IrType::Double;
+                    self.publish_fp_from_slot(c.phi, c.dst, is_double);
                 }
             }
         }
@@ -2093,7 +2128,13 @@ impl<'a> Lowerer<'a> {
     /// emits at most one live save at a time and always consumes it before
     /// starting another cycle, so a single word suffices no matter how many
     /// disjoint cycles the edge contains.
-    fn emit_copy_op(&mut self, op: CopyOp) -> CompileResult<()> {
+    fn emit_copy_op(
+        &mut self,
+        op: CopyOp,
+        src_node_of: &HashMap<i32, NodeId>,
+        phi_of_dst: &HashMap<i32, NodeId>,
+        published: &mut Vec<NodeId>,
+    ) -> CompileResult<()> {
         let scratch = self.phi_copy_scratch_slot_off;
         let (src, dst) = match op {
             CopyOp::Move { from, to } => (frame_word_off(from)?, frame_word_off(to)?),
@@ -2108,8 +2149,46 @@ impl<'a> Lowerer<'a> {
                 format!("[rbp - {dst}] <- [rbp - {src}]"),
             ));
         }
-        self.load_to_rax(src);
+        // ── Read: from the source's register when it has one ──────────
+        //
+        // Safe for the same reason the memory schedule is safe, and by the same
+        // argument. `resolve_parallel_copy` orders the ops so that every source
+        // is READ before anything writes it; a register is updated at exactly
+        // the instruction that writes the word (below), so a register and its
+        // home word go stale at the same point, and an order that protects one
+        // protects the other. A cycle's `Save` copies the pre-value out at the
+        // same instant either way.
+        let mut from_reg = false;
+        if ir_phi_copy_regs_enabled() {
+            if let Some(&sid) = src_node_of.get(&src) {
+                if let Some(r) = self.resident_gpr(sid) {
+                    self.emit_mov_reg_reg64(RAX, r);
+                    from_reg = true;
+                    self.phi_copy_reg_reads += 1;
+                }
+            }
+        }
+        if !from_reg {
+            self.load_to_rax(src);
+        }
         self.store_rax(dst);
+        // ── Publish: from RAX, which provably holds the value ─────────
+        //
+        // The reload this replaces was the second half of the store-then-load
+        // pair: `store [dst], rax` and then, a couple of instructions later,
+        // `mov reg, [dst]` — the same word, written and read back across a
+        // store-forwarding stall, once per phi per edge, i.e. once per loop
+        // iteration for every loop-carried value.
+        if ir_phi_copy_regs_enabled() {
+            if let Some(&phi) = phi_of_dst.get(&dst) {
+                if let Some(dst_reg) = self.assigned_gpr(phi) {
+                    self.emit_mov_reg_reg64(dst_reg, RAX);
+                    self.mark_gp_reg_live(phi);
+                    published.push(phi);
+                    self.phi_copy_reg_publishes += 1;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5424,7 +5503,11 @@ impl<'a> Lowerer<'a> {
     /// succ_block` carries: one per value phi of the successor's merge whose
     /// input for this edge is a real node. Pure; `emit_phi_copies` emits
     /// exactly these and `edge_has_phi_copies` asks whether there are any.
-    fn gather_phi_copies(&self, pred_block: usize, succ_block: usize) -> Vec<(NodeId, i32, i32)> {
+    fn gather_phi_copies(
+        &self,
+        pred_block: usize,
+        succ_block: usize,
+    ) -> Vec<PhiCopy> {
         let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
         if !matches!(
             self.graph.nodes[merge_ctrl as usize].op,
@@ -5432,7 +5515,7 @@ impl<'a> Lowerer<'a> {
         ) {
             return Vec::new();
         }
-        let mut out: Vec<(NodeId, i32, i32)> = Vec::new();
+        let mut out: Vec<PhiCopy> = Vec::new();
         for id in 0..self.graph.nodes.len() {
             let node = &self.graph.nodes[id];
             if !matches!(node.op, Op::Phi) {
@@ -5455,7 +5538,12 @@ impl<'a> Lowerer<'a> {
                 }
                 if let Some(&val_id) = node.inputs.get(k + 1) {
                     if val_id != NO_NODE {
-                        out.push((id as NodeId, self.slot_of(id as NodeId), self.slot_of(val_id)));
+                        out.push(PhiCopy {
+                            phi: id as NodeId,
+                            dst: self.slot_of(id as NodeId),
+                            src: val_id,
+                            src_slot: self.slot_of(val_id),
+                        });
                     }
                 }
             }
@@ -7469,7 +7557,26 @@ impl<'a> Lowerer<'a> {
         // Guarded on the home slot existing, which is belt-and-braces: a node
         // the colourer gave no home was never promotable in the first place
         // (`plan_register_residency` requires one).
-        if self.assigned_gpr(id).is_some() {
+        //
+        // 2026-09-04: **a value already live in its register is not published
+        // again.** A phi is the case that matters, and it is not a small one.
+        // A phi appears in its header block's node list like any other value,
+        // so this site ran for it once per iteration and reloaded the register
+        // out of the home word — while the edge copies had already put the
+        // value there. The disassembly of `FieldLoop.sum` showed both halves of
+        // the resulting loop-carried chain: `mov [rbp-78h],rax` on the back
+        // edge, and `mov rbx,[rbp-78h]` at the top of the next iteration,
+        // waiting on it.
+        //
+        // Skipping is safe for the same reason every read of `gp_reg_live` is:
+        // the allocator gives a register to one value at a time over its live
+        // range, so nothing between the publish and here can have written it.
+        // It applies ONLY to this re-publish. An edge copy must always write
+        // the phi's register — that is the copy — and `emit_phi_copies` does so
+        // whether or not the register was already live.
+        if self.assigned_gpr(id).is_some()
+            && !(ir_skip_live_republish_enabled() && self.resident_gpr(id).is_some())
+        {
             if let Some(off) = self.node_slot.get(id as usize).copied().flatten() {
                 let slot = off.get() as i32;
                 self.publish_gp_from_slot(id, slot);
@@ -9047,6 +9154,26 @@ fn frame_word_loc(off: i32) -> CompileResult<ValueLoc> {
 
 /// Inverse of [`frame_word_loc`].
 ///
+/// One phi's incoming value on one edge: which phi, where its home word is,
+/// and **which node** the value comes from as well as where that node's home
+/// word is.
+///
+/// The source NODE is the addition. Without it an edge copy can only be
+/// expressed as memory-to-memory — `load rax, [src]; store [dst], rax` — and
+/// that is what put a store and a load of the same word two instructions apart
+/// at the top of every loop this backend compiles (`JIT_OPTIMIZATION.md`, "the
+/// residual 1.36x: latency, not volume"). With the node in hand, a source that
+/// is already register-resident is read from its register, and a destination
+/// that is register-resident is published from RAX rather than reloaded out of
+/// the word just written.
+#[derive(Clone, Copy)]
+struct PhiCopy {
+    phi: NodeId,
+    dst: i32,
+    src: NodeId,
+    src_slot: i32,
+}
+
 /// A [`ValueLoc::Reg`] is unreachable from this backend — it keeps every value
 /// in its home frame word and has no register allocation to disagree with — but
 /// it is representable in the shared type, so it is refused rather than
@@ -11641,6 +11768,55 @@ fn plan_register_residency(
     let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
+
+    // ── Could the home slot be dropped? A census, before building it ──
+    //
+    // `docs/feature-designs/ir-optional-home-slot.md` argues that a value which
+    // lives in a register for its whole range needs no frame word, and rests
+    // that on `LiveModel::pinned` covering every deopt-named value. **On this
+    // path it does not**: `release_deopt_pins` above deliberately releases
+    // exactly those pins, and pays for it by keeping every home the COLOURER
+    // planned. So a promoted value here may very well be named by a deopt
+    // frame, and its home is what that frame reads.
+    //
+    // Which makes the size of the opportunity an empirical question rather than
+    // a design one, and this counts it before anything is built:
+    //
+    //   `home_droppable`  promoted, and named by no safepoint and not a phi
+    //   `blocked_deopt`   promoted, but some safepoint's locals/stack names it
+    //   `blocked_phi`     promoted, but its home is written by the edge copies
+    //
+    // A `home_droppable` of zero on real bytecode refutes the design as
+    // written, and says the next move is deopt metadata that can name a
+    // register — not a refactor of the lowering arms.
+    let (home_droppable, blocked_deopt, blocked_phi) = {
+        let mut deopt_named = vec![false; n];
+        for sp in &graph.safepoints {
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if let Some(cell) = deopt_named.get_mut(v as usize) {
+                    *cell = true;
+                }
+            }
+        }
+        let (mut ok, mut deopt, mut phi) = (0usize, 0usize, 0usize);
+        for id in 0..n {
+            if gp_reg_of.get(id).copied().flatten().is_none() {
+                continue;
+            }
+            if graph
+                .nodes
+                .get(id)
+                .is_some_and(|node| matches!(node.op, Op::Phi))
+            {
+                phi += 1;
+            } else if deopt_named.get(id).copied().unwrap_or(false) {
+                deopt += 1;
+            } else {
+                ok += 1;
+            }
+        }
+        (ok, deopt, phi)
+    };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
@@ -11660,6 +11836,10 @@ fn plan_register_residency(
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
              spilled={skip_spilled} no_alloc={skip_no_alloc}"
+        );
+        eprintln!(
+            "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
+            graph.safepoints.len(),
         );
     }
     if promoted == 0 {
@@ -12799,6 +12979,21 @@ pub(crate) fn lower_inner_with_scopes(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
+    // ENGAGEMENT, not effect. Both numbers answer "did the wiring fire on this
+    // method", which is the question a null timing result cannot answer on its
+    // own -- and this session spent three A/B arms on `CratonBench` before
+    // noticing that the optimizing tier plans no residency there at all, so
+    // both arms had been running identical machine code.
+    if ls_active
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+    {
+        eprintln!(
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
+            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+        );
+    }
+
     // Carry the identity the prologue encoded, so publication can bind it to
     // the artifact this buffer becomes.
     let compile_id = lowerer.compile_id;
@@ -13036,6 +13231,30 @@ pub(crate) fn lower_inner_with_scopes(
 /// promoted phi's register at every incoming edge; off, phis stay home-bound
 /// as they were before 2026-09-02 and the residency census reports them
 /// under `phi=`.
+/// A definition whose value is already live in its register is not published
+/// again -- **default OFF**, opt in with `CRATONVM_JIT_IR_SKIP_REPUBLISH=1`.
+///
+/// Off is the historical unconditional reload of the home word at every
+/// definition site, phis included.
+fn ir_skip_live_republish_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SKIP_REPUBLISH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// An edge's phi copies move register to register where both ends are
+/// resident -- **default OFF**, opt in with `CRATONVM_JIT_IR_PHI_COPY_REGS=1`.
+///
+/// Off is the historical memory-to-memory copy through RAX followed by a
+/// reload of the word just written.
+fn ir_phi_copy_regs_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_REGS") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 fn ir_phi_residency_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_RESIDENCY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -17514,7 +17733,7 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op)
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 
