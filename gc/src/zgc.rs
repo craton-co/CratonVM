@@ -16148,39 +16148,52 @@ pub(crate) mod tests {
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
     ///
-    /// # MEASURED, AND IT IS SLOWER. The switch buys nothing.
+    /// # MEASURED ON A QUIET BOX: it does not scale, and the run-to-run
+    /// variation is larger than the effect
     ///
-    /// Azure `vm1`, 8 cores, load 1.76 and nothing else building -- a genuinely
-    /// quiet box, which two earlier attempts on a 90%-loaded machine were not.
-    /// 768 MiB heap, 8.26M dead objects, best `sweep_us` of three reps, and the
-    /// reps agree to within 4% so the ordering is real:
+    /// Azure `vm1`, 8 cores, no other build running. 768 MiB heap, 8.26M dead
+    /// objects. THREE separate executions of this bench, three reps each, best
+    /// `sweep_us` per arm:
     ///
-    /// | workers | 1 | 2 | 4 | 8 |
+    /// | run | 1 worker | 2 | 4 | 8 |
     /// |---|---|---|---|---|
-    /// | best sweep_us | **78 ms** | 92 | 86 | 93 |
-    /// | speedup | 1.00x | 0.85x | 0.91x | 0.84x |
+    /// | A | 78 ms | 92 | 86 | 93 |
+    /// | B | 67 ms | 63 | 60 | 60 |
+    /// | C | 68 ms | 66 | 55 | (polluted) |
     ///
-    /// Whole-collection time agrees: 314 ms serial against 324 / 323 / 332.
-    /// Sharding is a REGRESSION at every worker count, not a disappointing
-    /// speedup.
+    /// Run A says sharding is a 15% REGRESSION. Runs B and C say it is a
+    /// 6-24% gain. Same box, same binary, same population, opposite signs --
+    /// because the serial arm alone moves 78 -> 67 ms and the two-worker arm
+    /// 92 -> 63 ms BETWEEN executions, which is larger than any difference
+    /// between arms within one.
     ///
-    /// A 32-core Windows host read the same way (1.00 / 0.93 / 1.00 / 0.97 /
-    /// 1.01 at 1/2/4/8/32), so it is not one machine's memory controller.
+    /// # The methodological trap, because it caught me
     ///
-    /// # Why, and why the argument for sharding was wrong
+    /// Within a single execution the three reps are tight -- run A's serial arm
+    /// read 78/80/83, a 4% spread -- and that tightness is exactly what makes
+    /// the number look trustworthy. It is not. Three reps inside one process
+    /// share a page cache, an allocator state and a set of THP mappings; they
+    /// are one sample reported three times, not three samples. The error term
+    /// that matters is across executions, and it is ~20%.
     ///
-    /// `sweep_workers` argued the sweep "should scale" because it is a linear
-    /// scan with an independent body, bandwidth bound rather than latency
-    /// bound. Bandwidth bound is precisely the reason it does NOT scale: the
-    /// per-object work is a header zero-write, so the phase is a streaming
-    /// write over half a gigabyte that already saturates the memory path from
-    /// one core. Adding workers adds thread spawn and join, cross-shard cache
-    /// traffic, and a seam join, against a resource that was already full.
+    /// A first version of this comment claimed "MEASURED, AND IT IS SLOWER" on
+    /// the strength of run A alone. That was wrong, and it was wrong in the
+    /// direction that would have justified deleting a working feature.
     ///
-    /// This is the same shape as the 2026-08-14 parallel STW marking result
-    /// that `Z_CONC_START_PERCENT_DEFAULT` records -- and the second time an
-    /// "embarrassingly parallel" argument about this collector has been refuted
-    /// by measuring it.
+    /// # What can be said
+    ///
+    /// The sweep does NOT parallelise usefully: the best any arm managed
+    /// against its own run's serial baseline was 1.24x at four workers, on
+    /// eight cores, for a phase whose body is independent per object. That is
+    /// consistent with it being bandwidth bound -- the per-object work is a
+    /// header zero-write, a streaming write over half a gigabyte -- and it is
+    /// nowhere near enough to move a default. It is NOT, on this evidence, a
+    /// regression either, so the switch is worth keeping default-off rather
+    /// than deleting.
+    ///
+    /// What would settle it: many more executions (ten-plus per arm,
+    /// interleaved rather than grouped, so a drift in machine state cannot
+    /// align with an arm), or a host with a memory-bandwidth counter.
     ///
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
