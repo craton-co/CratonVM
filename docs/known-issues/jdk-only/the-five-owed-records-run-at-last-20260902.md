@@ -9,6 +9,44 @@ It is **not** a verdict on those records. It is the run they asked for, plus the
 row counts, so their owners can adjudicate row by row against their own
 expectation tables — which is work this page deliberately does not do.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-02, and superseded on 2026-09-03: all
+> five are now closed.** This page said *"Nothing is closed. The five stay OWED
+> in `types/tests/unverified_records.rs`"*, and deliberately did not adjudicate
+> them — *"work this page deliberately does not do"*. That work has since been
+> done, record by record, against each one's own expectation table:
+>
+> ```text
+> W7-24   discharged 2026-09-02   the door defect was real and the fix was right
+> W7-57   discharged 2026-09-03   sweep holds; filterOutFlushFailureWins still red
+> W7-58   discharged 2026-09-03   bb_state's direct-buffer arm confirmed live
+> W7-70   discharged 2026-09-03   fixed on both shipping arms, LIVE on --synthetic-jdk
+> W7-81   discharged 2026-09-03   both echo tokens read the "after" column
+> ```
+>
+> **The arm lesson at the top of this page paid off twice more.** It says a
+> record that tells you which arm to use is telling you its result is
+> arm-specific. Re-running the same three probes on all four arms is what
+> separated W7-70's live byte loss (`--synthetic-jdk` only) from its repaired
+> shipping arms, and what showed W7-58's `getIntLE`/`putIntLE` residuals to be
+> `--synthetic-jdk`-only — neither of which is visible from one arm.
+>
+> **Its row counts have also been superseded, and by more than drift.** This
+> page reported W7-57's probe at *129 rows vs HotSpot 120, 35 differing*. The
+> same probe on the same tree today gives 13 differing under `--synthetic-jdk`
+> and 6 on both shipping arms. Most of that is merged `dev` work between the two
+> dates, not a mode effect — which is the standing caution that a row count is
+> only a result against a named binary.
+>
+> **Why this page was on the ratchet at all, which is worth one line.** It is a
+> MEASURED page and always was. It matched an unverified marker because its
+> third line names the file `types/tests/unverified_records.rs`, and the matcher
+> tests lowercase substrings — so the identifier `unverified_records` reads as
+> the word "unverified". The marker list was deliberately widened to substrings
+> after it saw 5 records out of a real population of 61; narrowing it again to
+> dodge one filename would trade a false positive for the blindness that caused
+> the original defect. The false positive is the cheaper of the two, and this
+> note is the correct way to clear it.
 ## First, the arm. I got it wrong once and the records had already said so
 
 The obvious run — a default build, compatible mode and `--jdk-only` — tests the

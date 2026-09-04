@@ -4116,6 +4116,70 @@ mod intrinsic_census_virtual_tests {
 // Kill switch: `CRATONVM_JIT_NO_INVOKE_FAST_DOOR=1`. Engagement:
 // `CRATONVM_DBG=invokestats` counts these hits with the cache hits.
 
+thread_local! {
+    /// One-entry memo for [`record_receiver_memoized`]:
+    /// `(class_id, name_ptr, descriptor_ptr, handle)`.
+    ///
+    /// Thread-local rather than a `JvmThread` field only to keep the change
+    /// small — the door always runs on the current thread, so the two are
+    /// equivalent here.
+    static DOOR_RECV_MEMO: std::cell::RefCell<
+        Option<(u32, usize, usize, cratonvm_jit::profile::ReceiverRecorder)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Record the door's receiver, paying the profile-store lookup once per CALLER
+/// METHOD instead of once per call.
+///
+/// The door records against the caller's method, which cannot change while that
+/// frame is live, so a single memo entry hits on essentially every call in a
+/// hot loop. It is validated by POINTER equality on the two `Arc<str>` keys —
+/// three integer compares — where the unmemoized path hashed both strings and
+/// took two locks. Measured at +44% CPU on interpreted dispatch before this.
+///
+/// The pointers are compared, never dereferenced, and the `Arc`s they name are
+/// kept alive by the live frame whose method they belong to. A miss (different
+/// caller, or first call) does the full lookup and replaces the entry, so the
+/// memo can never answer for the wrong method.
+#[inline]
+fn record_receiver_memoized(
+    shared: &SharedVm,
+    class_id: u32,
+    method_name: &std::sync::Arc<str>,
+    descriptor: &std::sync::Arc<str>,
+    site_pc: usize,
+    receiver_class_id: u32,
+) {
+    if crate::runtime::env_cache::no_door_recv_memo() {
+        // The unmemoized path this replaced: full lookup, every call.
+        shared.jit.profile_store.record_receiver_borrowed(
+            class_id,
+            method_name,
+            descriptor,
+            site_pc,
+            receiver_class_id,
+        );
+        return;
+    }
+    let name_ptr = std::sync::Arc::as_ptr(method_name) as *const u8 as usize;
+    let desc_ptr = std::sync::Arc::as_ptr(descriptor) as *const u8 as usize;
+    DOOR_RECV_MEMO.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some((c, n, d, rec)) = slot.as_ref() {
+            if *c == class_id && *n == name_ptr && *d == desc_ptr {
+                rec.record(site_pc, receiver_class_id);
+                return;
+            }
+        }
+        let rec = shared
+            .jit
+            .profile_store
+            .receiver_recorder_borrowed(class_id, method_name, descriptor);
+        rec.record(site_pc, receiver_class_id);
+        *slot = Some((class_id, name_ptr, desc_ptr, rec));
+    });
+}
+
 /// See the module note above `execute_invokevirtual_fast_door`.
 #[inline]
 pub(super) fn execute_invokevirtual_fast_door(
@@ -4177,6 +4241,33 @@ pub(super) fn execute_invokevirtual_fast_door(
         || shared.classes.is_annotation_proxy_class(actual_class_id)
     {
         return None;
+    }
+    // RECORD THE RECEIVER, exactly as `execute_invokevirtual_cached` does at
+    // its own Step 5.
+    //
+    // This door serves the WARM MONOMORPHIC hit -- which is nearly every hit.
+    // Without this it recorded nothing, so `profile_store` saw only the calls
+    // the door DECLINED: a sample biased by construction, and biased towards
+    // the receivers the door is worst at. `classify_receiver_shape` and
+    // `CallSiteEvidence` then read that sample, and the single-pass backend
+    // pre-populates virtual-call MICs from it, so a site whose common receiver
+    // never appears in the profile can be devirtualised on a rare one.
+    //
+    // Measured: `org.h2.test.store.TestRandomMapOps --Xmx 256m` returned the
+    // wrong answer (`AssertionError: (1810, null)`, seed 0, op 1033, every run
+    // in 12-23 s) with this door on. It needed BOTH ingredients -- the door,
+    // and `CRATONVM_TIER_PGO_RECEIVERS` (default ON since 2026-09-02) -- and
+    // switching either off made it clean, which is what named the interaction.
+    //
+    // The cost is the general path's cost: one `is_receiver_profiling_enabled`
+    // load, and on the profiled arm a borrowed record. A door that skips the
+    // bookkeeping its slow path owes is not a fast path, it is a different
+    // answer.
+    if crate::jit::profile::is_receiver_profiling_enabled()
+        && !crate::runtime::env_cache::no_door_receiver_record()
+    {
+        let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+        record_receiver_memoized(shared, cid, mn, md, site_pc, actual_class_id.as_u32());
     }
     if is_interface && actual_class_id != cached.declaring_class_id {
         let memo_hit = !iface_select_memo_disabled()

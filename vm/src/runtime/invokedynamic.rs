@@ -2119,7 +2119,7 @@ fn allocate_lambda_proxy_from_values(
         Some(obj) => obj,
         None => {
             thread.tlab.retire();
-            super::interpreter::maybe_gc_forced_pub(shared, thread);
+            super::interpreter::maybe_gc_forced_pub_at(shared, thread, "invokedynamic");
             match shared
                 .mem
                 .heap

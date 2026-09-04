@@ -15,6 +15,61 @@ and **the check was mutation-verified on each of the three** — see §8.1.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03.** Status was *"No `cargo`, no VM, no
+> fixture"*, with the registry census taken *"by `grep` over
+> `native-builtins/src/`, NOT from a `--dump-native-registry` run"*. It has now
+> been taken from a `--dump-native-registry` run.
+>
+> ```text
+> cargo test -p cratonvm-native-builtins t27_tls    97 passed; 0 failed; 1 ignored
+> ```
+>
+> **§0.1's four doors are all registered, and in this lane's own file.** The
+> record's claim was that `invalidate`, `getPeerHost`, `getPeerPort` and
+> `getSessionContext` had *no real-JDK-mode registration anywhere in the crate*,
+> and that the failure mode is `AbstractMethodError` rather than a wrong value.
+> Compatible mode, from the dump:
+>
+> ```text
+> invalidate         javax/net/ssl/SSLSession   owns_slot=True   t27_tls.rs:20096
+> getPeerHost        javax/net/ssl/SSLSession   owns_slot=True   t27_tls.rs:20139
+> getPeerPort        javax/net/ssl/SSLSession   owns_slot=True   t27_tls.rs:20191
+> getSessionContext  javax/net/ssl/SSLSession   owns_slot=True   t27_tls.rs:20321
+>
+> 4/4 registered, none missing
+> ```
+>
+> A registration on an INTERFACE is normally unreachable — no dispatch door asks
+> an interface about an instance method. It is reachable here for the reason
+> this family depends on: the carrier is MINTED under the literal name
+> `javax/net/ssl/SSLSession` (`try_alloc_concurrent_synthetic(ctx,
+> "javax/net/ssl/SSLSession", …)`), so the interface name IS the receiver's
+> runtime class.
+>
+> **The twin in this record's title shows up in the dump, in the other mode.**
+> Under `--synthetic-jdk`, `native-builtins/src/tls.rs` takes the slot from
+> `t27_tls.rs` on three of the four:
+>
+> ```text
+>                    compatible                --synthetic-jdk
+> invalidate         t27_tls.rs   owns=True    tls.rs:1301  owns=True  (t27_tls owns=False)
+> getPeerHost        t27_tls.rs   owns=True    tls.rs:1371  owns=True  (t27_tls owns=False)
+> getPeerPort        t27_tls.rs   owns=True    tls.rs:1384  owns=True  (t27_tls owns=False)
+> getSessionContext  t27_tls.rs   owns=True    t27_tls.rs   owns=True
+> ```
+>
+> Recorded as a fact, not a verdict: `register()` is last-write-wins, so which
+> file answers these three depends on the mode, and **this record's fix owns the
+> slot only on the shipping arms.** Whether `tls.rs`'s three are equivalent is
+> NOT adjudicated here.
+>
+> **What this does NOT verify.** The HotSpot column came from
+> `scratchpad/f18/F18SessionContract.java`, which did not survive its session,
+> so the oracle side is unre-measurable and was taken as given. The dump proves
+> registration and ownership; it does not prove any of the four returns the
+> right VALUE — no fixture exercised them here, and 4/4 registered is exactly
+> the state that stops `AbstractMethodError` and says nothing else.
+
 ## 0. Verdict
 
 1. **Four of `javax.net.ssl.SSLSession`'s twenty abstract methods had no

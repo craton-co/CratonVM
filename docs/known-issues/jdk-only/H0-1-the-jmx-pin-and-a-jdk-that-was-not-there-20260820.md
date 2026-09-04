@@ -10,6 +10,50 @@ Lane H0 (orchestrator), 2026-08-20. Branch `claude/jdk-only-mode-handoff-09b48c`
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04.** Status was **FIXED-UNVERIFIED** —
+> *"No binary carrying them has been built or run"* — with §6 explicitly a
+> control at `26e4b5db4` that these changes *"must stay verdict-neutral
+> against, not evidence about them"*.
+>
+> **§3, the `ObjectName` conversion, is byte-identical to the oracle in both
+> modes.** `probes/ONProbe.java` reads the accessors whose answers a
+> layout-indexed-by-number would confuse:
+>
+> ```text
+>                             HotSpot 25 / compatible / --jdk-only  (all identical)
+> A getCanonicalName          java.lang:name=G1 Young Generation,type=GarbageCollector
+> A getKeyPropertyListString  type=GarbageCollector,name=G1 Young Generation
+> A toString                  java.lang:type=GarbageCollector,name=G1 Young Generation
+> A getCanonicalKeyPropList   name=G1 Young Generation,type=GarbageCollector
+> B getCanonicalName          d:a=1,b=2,c=3
+> B getKeyPropertyListString  b=2,a=1,c=3
+> B toString                  d:b=2,a=1,c=3
+> ```
+>
+> **The three orderings disagreeing with each other is the result**, not the
+> individual values. `getCanonicalName` sorts the keys, `getKeyPropertyListString`
+> preserves insertion order, and `toString` preserves the original spelling —
+> case B shows all three diverging on the same input. A conversion that indexed a
+> real layout by number would collapse at least two of them onto one answer, and
+> a probe reading only `toString` would not notice.
+>
+> **§6's verdict-neutrality holds.** The changes' own vectors, and the arm the
+> control measures:
+>
+> ```text
+> RJdkJmx                  PASS (67 checks)    compatible and --jdk-only
+> RImmutableFactoryTypes   PASS (219 checks)   compatible and --jdk-only
+> full suite               --jdk-only 129 passed / 0 failed
+> ```
+>
+> **What this does NOT verify.** §2's *"the two registrars are pinned"* is a
+> source claim about registration order; the dump was not taken for it here and
+> no probe distinguishes which registrar answered. §1 — the oracle JDK not being
+> where the handoff says — is a correction about this host's paths and needs no
+> VM. §§7-8, the out-of-file edits and nominations, are untouched. §6's control
+> was measured at `26e4b5db4`; the run above is on today's tree, so it shows the
+> arm is green now, not that this lane's changes are what kept it green.
+
 ## 1. The oracle JDK is not where the handoff says it is
 
 `HANDOFF-20260819.md` opened with:

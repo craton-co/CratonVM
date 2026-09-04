@@ -96,18 +96,34 @@
 //! A full mechanism-by-mechanism comparison against the x86-64 backend lives in
 //! `docs/jit/aarch64-parity.md`. The short version:
 //!
-//! - **No GC safepoint polls — so loops are now REFUSED.** x64 emits a
-//!   cooperative poll of `helpers.safepoint_flag_addr` at method entry and at
-//!   every loop back-edge (`x64::jit_safepoint_polls_enabled`, on by default).
-//!   This backend emits none, and cannot: no helper address is plumbed in, and
-//!   taking a poll needs a CALL, which `emit_invoke` refuses. A compiled loop
-//!   would therefore contain *no* safepoint of any kind — a thread inside one
-//!   never reaches a stop-the-world request, hanging any GC that needs it.
-//!   Since the compilable population is exactly "pure arithmetic, often loops",
-//!   that was the likely failure mode, not an edge case. As of the 2026-08-01
-//!   parity audit, [`Arm64Backend::label_for_pc`] refuses any method containing
-//!   a backward branch target, so only straight-line / forward-branching bodies
-//!   compile.
+//! - **GC safepoint polls: BUILT, and OPT-IN
+//!   (`CRATONVM_JIT_ARM64_SAFEPOINTS`, default-OFF).** Updated 2026-09-03. x64
+//!   emits a cooperative poll of `helpers.safepoint_flag_addr` at method entry
+//!   and at every loop back-edge; this backend emitted none, and the header
+//!   used to say it "cannot: no helper address is plumbed in, and taking a poll
+//!   needs a CALL, which `emit_invoke` refuses". Both halves of that are now
+//!   addressed: [`Arm64Backend::set_helpers`] plumbs the table in, and the poll
+//!   emits its own `BLR` rather than going through `emit_invoke` (which refuses
+//!   *bytecode* invokes because it has no call-target resolution — a different
+//!   problem).
+//!
+//!   [`Arm64Backend::emit_safepoint_poll`] emits the x64 shape: materialize the
+//!   flag address, `LDRB` **one byte** of it (the flag is an `AtomicBool`, and
+//!   a 64-bit load would fold the `GcBarrier` counters after it into the test),
+//!   `CBZ` past the slow path, spill the caller-saved operand registers, `BLR`,
+//!   record the oop map at the return address, reload. It runs at method entry
+//!   and at each loop header, and with it on
+//!   [`Arm64Backend::label_for_pc`] no longer refuses backward branches — that
+//!   refusal existed precisely because a compiled loop with no poll is a region
+//!   a stop-the-world request can never interrupt, so **loops compile again**.
+//!
+//!   **It is default-OFF and that is deliberate.** No CI runner or developer
+//!   host in this repository can EXECUTE aarch64, so the evidence for it is
+//!   instruction-word assertions and pseudo-op structure — everything a
+//!   non-aarch64 host can honestly prove, and not the same as "it works".
+//!   Default-on would be publishing an unexecuted calling sequence into a GC's
+//!   stop-the-world protocol. With it off, this backend is byte-identical to
+//!   before: no poll, and backward branches still refused.
 //! - **Oop maps: the WRITER works; there is no safepoint to call it at.**
 //!   Updated 2026-09-03. [`Arm64Backend::mark_top_operand_as_oop`] is called
 //!   from three opcode arms (`aconst_null`, `aload`, `aload_0..3`), so
@@ -128,19 +144,41 @@
 //!   [`publish_compiled_method`] then attaches the result to the artifact,
 //!   which the `cfg`-gated caller previously did not do at all.
 //!
-//!   **`Arm64CompileResult::pending_oop_maps` is nevertheless still empty in
-//!   practice, and the reason is now elsewhere in this list: there is no
-//!   safepoint.** No allocation, no call, no monitor, and back edges refused,
-//!   so a compiled method contains no GC-capable point to record a map at. The
-//!   GC walker still takes its conservative fallback for AArch64 frames. What
-//!   changed is that the first real safepoint inherits a correct writer and a
-//!   working publication path instead of a mis-keyed one. Two further things
-//!   that safepoint needs, neither of which exists: register-resident oops are
-//!   named by nothing (X19–X28 are callee-saved, so the conservative walk
-//!   covers them — sound for a MARKING collector, unsound for a relocating one,
-//!   which cannot rewrite through a conservative scan), and there is no
-//!   safepoint-id slot, so `fully_oop_covered` must stay false and
-//!   `find_oop_map_for_pc` is the only reader that can select these maps.
+//!   **The first caller arrived 2026-09-03**: the safepoint poll above records
+//!   a map at its `BLR`'s return address, naming the operand slots it spilled.
+//!   With polls off (the default) `pending_oop_maps` is still empty and the GC
+//!   walker still takes its conservative fallback, exactly as before.
+//!
+//!   **Reference LOCALS are named too, as of 2026-09-03.** A frame-homed one
+//!   is named where it already lives. A REGISTER-homed one (X19-X28) is stored
+//!   to a home slot reserved for it, named, and reloaded after the call: those
+//!   registers are callee-saved, so the value survives on its own, but it
+//!   survives inside the CALLEE's saved-register area where only the
+//!   conservative walk can see it -- and a conservative walk marks without
+//!   being able to REWRITE. A relocating collector could not otherwise move an
+//!   object whose only root was a register local. Which locals hold references
+//!   comes from the flow-sensitive `compute_local_oop_masks` shared with x64,
+//!   not from a whole-method approximation, because naming a primitive would
+//!   hand a relocating collector a non-pointer to rewrite.
+//!
+//!   **The safepoint-id slot landed 2026-09-04**, and with it the frame-base
+//!   publication it is useless without. Each poll stamps its site's bci (or
+//!   `ENTRY_POLL_BC_PC`) into a reserved frame word, the prologue stamps
+//!   `SP_ID_UNSET_BC_PC` there first so an uninitialised slot cannot read as a
+//!   valid id, every map carries the same value as its `bytecode_pc`, and
+//!   `emit_frame_record` publishes FP through `helpers.frame_record` so the
+//!   runtime can locate the frame to read it. The collector can therefore
+//!   select the map for the site a frame is ACTUALLY standing at
+//!   (`find_oop_map_for_safepoint_id`) rather than a union over the method.
+//!
+//!   **`fully_oop_covered` is nevertheless still false, deliberately.** It is
+//!   no longer blocked by a missing mechanism -- every precondition it names
+//!   now exists. It is blocked by evidence: that flag licenses the collector to
+//!   SUPPRESS its conservative scan of these frames, and nothing in this
+//!   repository can execute aarch64 to show the maps are right. Setting it is a
+//!   one-line change for whoever first runs this on an aarch64 host with the
+//!   coverage oracle (`CRATONVM_DBG_VERIFY_OOP_MAPS`) armed; doing it from here
+//!   would be trading a conservative scan for an unexecuted claim.
 //! - **No deoptimization and no OSR.** Neither word appears in this file.
 //!   There is no frame reconstruction, no uncommon-trap stub, no
 //!   `osr_pc_to_native` table. There is nothing to tier down *from* (this is
@@ -448,6 +486,14 @@ pub enum Arm64Instruction {
 
     // -- Load / Store --
     Ldr {
+        rt: Arm64Register,
+        rn: Arm64Register,
+        offset: i32,
+    },
+    /// Zero-extending BYTE load. Distinct from [`Self::Ldr`] because the
+    /// safepoint flag is a one-byte `AtomicBool` and the 64-bit form would
+    /// fold the `GcBarrier` fields after it into the test.
+    Ldrb {
         rt: Arm64Register,
         rn: Arm64Register,
         offset: i32,
@@ -865,6 +911,40 @@ impl Arm64CodeBuffer {
 // ---------------------------------------------------------------------------
 
 /// Output of the compilation pipeline.
+/// Does the aarch64 backend emit GC safepoint polls
+/// (`CRATONVM_JIT_ARM64_SAFEPOINTS`, **default-OFF; opt-in**)?
+///
+/// # Why this one is opt-in when every sibling switch is default-on
+///
+/// It emits MACHINE CODE FOR AN ARCHITECTURE NO CI RUNNER OR DEVELOPER HOST
+/// HERE CAN EXECUTE. Every other codegen switch in this workspace ships
+/// default-on with a kill switch because a regression run can execute it and
+/// say so; this one cannot be run at all until someone builds on an aarch64
+/// host. The encodings below are asserted against known-good instruction words
+/// and the structure is asserted against the emitted pseudo-op stream, which is
+/// everything a non-aarch64 host can honestly prove -- and it is not the same
+/// as "it works". Default-on would be publishing an unexecuted calling
+/// sequence into a GC's stop-the-world protocol.
+///
+/// Turning it on does two things: a poll at method entry and at every loop
+/// header, and -- because that is what the refusal was FOR -- it lifts
+/// `label_for_pc`'s blanket refusal of backward branches, so loops compile
+/// again. With it off, this backend is byte-identical to before.
+pub(crate) fn arm64_safepoints_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ARM64_SAFEPOINTS")
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
 /// A safepoint's oop map as the COMPILER can know it: the frame slots are
 /// final, but the PC is a PSEUDO-OP INDEX, not a byte offset.
 ///
@@ -890,6 +970,11 @@ pub struct Arm64PendingOopMap {
     pub pseudo_index: u32,
     /// Frame-slot offsets (relative to FP) holding object references here.
     pub frame_slot_offsets: Vec<i16>,
+    /// The safepoint id this map belongs to -- the value the frame's sp-id slot
+    /// holds while this safepoint is the active one. Becomes
+    /// `OopMapEntry::bytecode_pc`, which is what
+    /// `find_oop_map_for_safepoint_id` matches on.
+    pub safepoint_id: u32,
 }
 
 pub struct Arm64CompileResult {
@@ -912,6 +997,10 @@ pub struct Arm64CompileResult {
     /// see the "Safety-critical gaps" section of the module header. The first
     /// real safepoint on this backend inherits a correct map writer instead of
     /// the mis-keyed one that used to be here.
+    /// Frame offset (positive) of the safepoint-id slot, or 0 when none was
+    /// reserved. Published onto `CompiledMethod::sp_id_slot_off`, which the
+    /// runtime reads as `[frame_base - off]`.
+    pub sp_id_slot_off: i32,
     pub pending_oop_maps: Vec<Arm64PendingOopMap>,
 }
 
@@ -964,6 +1053,26 @@ pub struct Arm64Backend {
     /// backend has no safepoint poll to put on one — see the "no GC safepoint
     /// polls" note in the module header and `docs/jit/aarch64-parity.md`.
     cur_bytecode_pc: usize,
+    /// `max_stack` for this compilation, needed to place the safepoint home
+    /// slots after the operand area.
+    max_stack: usize,
+    /// Per-bytecode-pc "must be oop" local masks, and whether the dataflow
+    /// reached each pc. Shared with x64 (`compute_local_oop_masks`) -- the
+    /// analysis is pure bytecode. Empty when unsupported (>64 locals), which
+    /// this backend treats as "no claim" and falls back to the conservative
+    /// scan for.
+    local_oop_masks: Vec<u64>,
+    local_oop_reached: Vec<bool>,
+    /// Which parameter slots hold references on entry. The ENTRY poll answers
+    /// from this: the dataflow's own bci-0 state is seeded with it, but the
+    /// prologue poll runs before the walk, so it reads the seed directly.
+    /// Zero unless [`Arm64Backend::set_method_descriptor`] was called.
+    param_oop_mask: u64,
+    /// Frame offsets of reference LOCALS at the safepoint being emitted, folded
+    /// into the map by `emit_oop_map_for_safepoint`. Taken, not copied, so a
+    /// site that stages them without emitting a map cannot leak them into a
+    /// later safepoint.
+    pending_local_oop_slots: Vec<i32>,
     /// Label for the shared epilogue.
     epilogue_label: u32,
     /// Number of parameters for the current method (used for self-recursive calls).
@@ -989,6 +1098,27 @@ pub struct Arm64Backend {
     /// offset (in the finalized instruction stream) of the
     /// instruction immediately after a safepoint call.
     pub pending_oop_maps: Vec<Arm64PendingOopMap>,
+    /// Runtime helper addresses. Zeroed until [`Arm64Backend::set_helpers`] is
+    /// called, and `safepoint_flag_addr == 0` is the same "not wired" contract
+    /// the x64 backend uses: the poll emitter then emits nothing at all.
+    helpers: crate::JitRuntimeHelpers,
+    /// Bytecode PCs that are the target of a BACKWARD branch -- loop headers.
+    /// Discovered by pass 1 (see `compile_method_with_info`) and read by pass 2,
+    /// which emits a safepoint poll at each one.
+    back_edge_targets: std::collections::HashSet<usize>,
+    /// Frame offset (POSITIVE; the slot is at `[FP - sp_id_slot_off]`) of the
+    /// word each safepoint stamps its id into, or 0 when none is reserved.
+    ///
+    /// The runtime reads it as `[frame_base - off]` (`active_safepoint_id`),
+    /// which is arch-neutral -- this backend's FP plays the role x64's RBP does.
+    sp_id_slot_off: i32,
+    /// Whether this compilation emits safepoint polls, seeded from
+    /// [`arm64_safepoints_enabled`] in `new()`.
+    ///
+    /// A FIELD rather than a direct call to that function, because the function
+    /// latches a `OnceLock` for the life of the process and a test needs both
+    /// arms in one binary. `set_safepoints_enabled` is the only other writer.
+    safepoints_enabled: bool,
 }
 
 /// Scratch registers available for the operand stack (X9-X15, 7 regs).
@@ -1028,6 +1158,11 @@ impl Arm64Backend {
             float_scratch_cursor: 0,
             pc_labels: HashMap::new(),
             cur_bytecode_pc: 0,
+            max_stack: 0,
+            local_oop_masks: Vec::new(),
+            local_oop_reached: Vec::new(),
+            param_oop_mask: 0,
+            pending_local_oop_slots: Vec::new(),
             epilogue_label: 0,
             num_params: 0,
             method_info: HashMap::new(),
@@ -1035,6 +1170,13 @@ impl Arm64Backend {
             spill_map: HashMap::new(),
             operand_stack_oop_marks: Vec::new(),
             pending_oop_maps: Vec::new(),
+            // SAFETY: `JitRuntimeHelpers` is a plain struct of `usize`
+            // addresses; all-zero is its documented "nothing wired" state, and
+            // `safepoint_flag_addr == 0` is what gates the poll emitter.
+            helpers: unsafe { std::mem::zeroed() },
+            back_edge_targets: std::collections::HashSet::new(),
+            sp_id_slot_off: 0,
+            safepoints_enabled: arm64_safepoints_enabled(),
         }
     }
 
@@ -1090,16 +1232,12 @@ impl Arm64Backend {
     /// and `pending_oop_maps` is still empty in practice. What changed is that
     /// the first one will inherit a correct writer.
     ///
-    /// Register-resident oops are deliberately NOT named: X19-X28 are
-    /// callee-saved under AAPCS64, so they sit in the caller's saved-register
-    /// area, which the conservative walk covers. That is sound for a MARKING
-    /// collector and would not be for a relocating one -- a conservative scan
-    /// cannot rewrite -- so a moving collector on this backend needs the
-    /// register half before it may trust these maps. Stated here because the
-    /// x64 side learned it the expensive way (see `map_incomplete_cause::
-    /// OOP_STILL_IN_REGISTER` and the `relocation_coverage_complete` gate).
+    /// This walks the OPERAND stack. Reference LOCALS reach the map through
+    /// `pending_local_oop_slots`, staged by `emit_safepoint_poll`, which stores
+    /// a register-homed one to a reserved home first -- see there for why a
+    /// callee-saved register is not good enough for a relocating collector.
     #[allow(dead_code)]
-    fn emit_oop_map_for_safepoint(&mut self) {
+    fn emit_oop_map_for_safepoint(&mut self, safepoint_id: u32) {
         if self.failed {
             return;
         }
@@ -1151,12 +1289,29 @@ impl Arm64Backend {
                 }
             }
         }
+        // The reference LOCALS staged by `emit_safepoint_poll`. Taken, not
+        // copied, so a site that stages them without emitting a map cannot leak
+        // them into a later safepoint (the same discipline x64's Stage 3 uses).
+        for off in std::mem::take(&mut self.pending_local_oop_slots) {
+            match i16::try_from(off) {
+                Ok(off16) => {
+                    if !slots.contains(&off16) {
+                        slots.push(off16);
+                    }
+                }
+                Err(_) => {
+                    self.failed = true;
+                    return;
+                }
+            }
+        }
         if slots.is_empty() {
             return;
         }
         self.pending_oop_maps.push(Arm64PendingOopMap {
             pseudo_index,
             frame_slot_offsets: slots,
+            safepoint_id,
         });
     }
 
@@ -1171,8 +1326,17 @@ impl Arm64Backend {
         // stack, spill it to a frame spill slot before reusing.
         if self.scratch_cursor as usize >= SCRATCH_REGS.len() {
             if let Some(pos) = self.operand_stack.iter().position(|&reg| reg == r) {
+                // THE BASE IS THE FRAME-HOMED LOCAL COUNT, not `num_reg_locals`.
+                // Those are complements: `num_reg_locals` counts the locals that
+                // got a REGISTER, while the spill area holds the ones that did
+                // not. Basing operands at the former aliased a local's slot
+                // whenever fewer than half the locals were register-homed, and
+                // ran past the reserved area into the callee-save slots when
+                // more than half were. `num_spills = gpr_spills + max_stack` is
+                // sized for this base.
+                let base = self.local_spill_count();
                 let frame = self.frame.as_ref().unwrap();
-                let spill_slot = frame.num_reg_locals + pos;
+                let spill_slot = base + pos;
                 let offset = frame.spill_offset
                     + i32::try_from(spill_slot)
                         .unwrap_or(i32::MAX)
@@ -1189,6 +1353,383 @@ impl Arm64Backend {
         }
         self.scratch_cursor += 1;
         r
+    }
+
+    /// Supply the runtime helper addresses this backend needs for a safepoint
+    /// poll. Without it `safepoint_flag_addr` stays 0 and
+    /// [`Self::emit_safepoint_poll`] emits nothing.
+    pub fn set_helpers(&mut self, helpers: crate::JitRuntimeHelpers) {
+        self.helpers = helpers;
+    }
+
+    /// Override the safepoint-poll decision for this compilation.
+    ///
+    /// Exists because [`arm64_safepoints_enabled`] latches a `OnceLock`, so a
+    /// test binary can only ever observe one arm of it; both arms have to be
+    /// reachable, since "off is byte-identical to before" is itself a claim
+    /// that needs asserting.
+    pub fn set_safepoints_enabled(&mut self, on: bool) {
+        self.safepoints_enabled = on;
+    }
+
+    /// Seed the reference-parameter mask from this method's descriptor.
+    ///
+    /// Must be called BEFORE compiling: `compile_pass` feeds it to
+    /// `compute_local_oop_masks` as the dataflow's entry state, and the ENTRY
+    /// poll reads it directly (the prologue runs before the walk, so there is
+    /// no bci to look up there).
+    ///
+    /// Without it the mask is 0, and a reference PARAMETER that is never
+    /// `astore`d is never named -- covered by the conservative scan, but not
+    /// precisely, which is the difference that matters to a relocating
+    /// collector.
+    pub fn set_method_descriptor(&mut self, descriptor: &str, is_static: bool) {
+        self.param_oop_mask = crate::compute_param_oop_mask(descriptor, is_static);
+    }
+
+    /// Publish this frame's base so the GC root walk can find it.
+    ///
+    /// The safepoint-id slot is read as `[frame_base - sp_id_slot_off]`, and
+    /// the runtime learns `frame_base` from `set_top_frame_base`, which the x64
+    /// prologue calls through `helpers.frame_record`. Without this call the
+    /// slot is unreadable and every map keyed through it is unreachable -- the
+    /// id would be published into a frame nothing can locate.
+    ///
+    /// Emitted beside the ENTRY POLL rather than in the prologue, and for the
+    /// same reason: it is a CALL, and X0-X7 still hold the incoming arguments
+    /// until `compile_pass` copies them out. FP is the base this backend
+    /// publishes, playing the role x64's RBP does.
+    ///
+    /// No helper wired means no call at all -- the same optional-helper
+    /// contract the poll uses.
+    fn emit_frame_record(&mut self) {
+        if self.failed || !self.safepoints_enabled || self.helpers.frame_record == 0 {
+            return;
+        }
+        self.buffer.emit(Arm64Instruction::Mov {
+            rd: Arm64Register::X0,
+            rm: Arm64Register::FP,
+        });
+        self.buffer.emit(Arm64Instruction::MovImm {
+            rd: Arm64Register::X16,
+            imm: self.helpers.frame_record as i64,
+        });
+        self.buffer.emit(Arm64Instruction::Blr {
+            rn: Arm64Register::X16,
+        });
+    }
+
+    /// Emit a cooperative GC safepoint poll.
+    ///
+    /// The x64 shape, transliterated (see `x64::Compiler::emit_safepoint_poll`):
+    ///
+    /// ```text
+    ///     MOVZ/MOVK X16, #safepoint_flag_addr
+    ///     LDRB      W17, [X16]          ; ONE byte -- the flag is an AtomicBool
+    ///     CBZ       X17, skip           ; clear -> no safepoint requested
+    ///     <spill live operand registers to frame slots>
+    ///     MOVZ/MOVK X16, #safepoint_slow_path
+    ///     BLR       X16
+    ///     <oop map recorded at the return address>
+    ///     <reload the spilled operand registers>
+    ///   skip:
+    /// ```
+    ///
+    /// # The register choice is the ABI's own answer
+    ///
+    /// X16/X17 are IP0/IP1, the intra-procedure-call scratch registers AAPCS64
+    /// reserves for exactly this; they are caller-saved and hold no operand or
+    /// local. Java locals live in X19-X28, which are callee-SAVED, so the call
+    /// preserves them. The operand stack lives in X9-X15, which are caller-
+    /// saved and would be destroyed -- hence the spill.
+    ///
+    /// # Why the spill and reload sit INSIDE the branch
+    ///
+    /// `spill_map` is a compile-time model that `pop_operand` consults to decide
+    /// whether to reload. If the spill were emitted only on the taken path but
+    /// recorded in `spill_map` unconditionally, then on the NOT-taken path
+    /// (flag clear -- the overwhelmingly common case) `pop_operand` would emit a
+    /// reload of a frame slot that was never written, reading garbage as a live
+    /// value. So the entries are added for the duration of the map write and
+    /// removed again, and the registers are restored before the join: the model
+    /// on both paths is identical, which is the only way a compile-time model
+    /// and a runtime branch can agree.
+    ///
+    /// # What the GC sees
+    ///
+    /// The oop map is recorded at the BLR's return address, naming the frame
+    /// slots the spill just wrote -- the same convention x64 uses. Reference
+    /// locals in callee-saved registers are NOT named: the callee spills
+    /// X19-X28 into its own frame, which the conservative stack walk covers.
+    /// That is sound for a MARKING collector and NOT for a relocating one,
+    /// which cannot rewrite through a conservative scan -- so a moving
+    /// collector on this backend needs register naming first. Same caveat as
+    /// `emit_oop_map_for_safepoint`, restated here because this is the site
+    /// that creates the exposure.
+    fn emit_safepoint_poll(&mut self, entry: bool) {
+        if self.failed || !self.safepoints_enabled {
+            return;
+        }
+        // The "not wired" contract, identical to x64's: no flag address means
+        // no poll code at all, rather than a call through a null pointer.
+        if self.helpers.safepoint_flag_addr == 0 || self.helpers.safepoint_slow_path == 0 {
+            return;
+        }
+        // THE SAFEPOINT ID. The bytecode pc of the site, or the synthetic
+        // `ENTRY_POLL_BC_PC` for the method-entry poll -- the same two values
+        // x64 uses, because this is the runtime's contract
+        // (`active_safepoint_id` matches it against `OopMapEntry::bytecode_pc`)
+        // and not an x64 detail. bci 0 is legal, which is why the entry poll
+        // needs a synthetic pc of its own rather than reusing 0.
+        let safepoint_id = if entry {
+            crate::x64::safepoint::ENTRY_POLL_BC_PC as u32
+        } else {
+            match u32::try_from(self.cur_bytecode_pc) {
+                Ok(n) => n,
+                Err(_) => {
+                    self.failed = true;
+                    return;
+                }
+            }
+        };
+        let skip = self.buffer.new_label();
+        // Cast: a helper address is a real mapped pointer, always < i64::MAX.
+        self.buffer.emit(Arm64Instruction::MovImm {
+            rd: Arm64Register::X16,
+            imm: self.helpers.safepoint_flag_addr as i64,
+        });
+        self.buffer.emit(Arm64Instruction::Ldrb {
+            rt: Arm64Register::X17,
+            rn: Arm64Register::X16,
+            offset: 0,
+        });
+        self.buffer.emit(Arm64Instruction::Cbz {
+            rt: Arm64Register::X17,
+            label: skip,
+        });
+
+        // Spill every live operand register that is not already spilled, and
+        // remember which ones WE added so the removal below is exact.
+        let mut added: Vec<Arm64Register> = Vec::new();
+        let live: Vec<Arm64Register> = self.operand_stack.clone();
+        for (depth, reg) in live.iter().enumerate() {
+            if self.spill_map.contains_key(reg) || added.contains(reg) {
+                continue;
+            }
+            let Some(offset) = self.spill_offset_for_depth(depth) else {
+                // No slot reserved for this depth. Publishing a poll whose
+                // spill cannot be placed would leave a live reference in a
+                // caller-saved register across a CALL, so refuse the method.
+                self.failed = true;
+                return;
+            };
+            self.buffer.emit(Arm64Instruction::Str {
+                rt: *reg,
+                rn: Arm64Register::FP,
+                offset,
+            });
+            self.spill_map.insert(*reg, offset);
+            added.push(*reg);
+        }
+
+        // NAME THE REFERENCE LOCALS.
+        //
+        // A frame-homed local is already in a slot, so it only has to be named.
+        // A REGISTER-homed one is the case this exists for: X19-X28 are
+        // callee-saved, so its value survives the call -- but it survives
+        // inside the CALLEE's saved-register area, where only the conservative
+        // walk can see it, and a conservative walk marks without being able to
+        // REWRITE. A relocating collector therefore cannot move an object whose
+        // only root is a register local. Storing it to a reserved home makes it
+        // a nameable, rewritable root; the reload after the call is what carries
+        // a moved object's new address back into the register.
+        let mut reg_homed: Vec<(usize, i32)> = Vec::new();
+        if let Some(mut mask) = self.oop_locals_at_current_pc(entry) {
+            while mask != 0 {
+                // Cast: count/index to usize
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if i >= self.local_regs.len() {
+                    continue;
+                }
+                if self.local_regs.get(i).copied().flatten().is_some() {
+                    let (Some(off), Some(reg)) = (
+                        self.safepoint_home_for_reg_local(i),
+                        self.local_regs.get(i).copied().flatten(),
+                    ) else {
+                        // No home reserved: refuse rather than leave a live
+                        // reference reachable only through a conservative scan
+                        // while claiming to have named the frame.
+                        self.failed = true;
+                        return;
+                    };
+                    self.buffer.emit(Arm64Instruction::Str {
+                        rt: reg,
+                        rn: Arm64Register::FP,
+                        offset: off,
+                    });
+                    self.pending_local_oop_slots.push(off);
+                    reg_homed.push((i, off));
+                } else if entry {
+                    // A frame-homed PARAMETER has no home yet at the entry
+                    // poll: the argument copy above materializes only the
+                    // register-homed ones, so this slot is uninitialized stack.
+                    // Naming it would hand the collector a word nothing wrote.
+                    // Skipped rather than named -- the conservative scan still
+                    // covers this frame, because aarch64 never sets
+                    // `fully_oop_covered`.
+                    continue;
+                } else {
+                    // Frame-homed: already where the GC can read and rewrite it.
+                    let Some(frame) = self.frame.as_ref() else {
+                        self.failed = true;
+                        return;
+                    };
+                    let slot = self.spill_index_for(i);
+                    let Some(off) = i32::try_from(slot)
+                        .ok()
+                        .and_then(|n| n.checked_mul(8))
+                        .and_then(|n| frame.spill_offset.checked_add(n))
+                    else {
+                        self.failed = true;
+                        return;
+                    };
+                    self.pending_local_oop_slots.push(off);
+                }
+            }
+        }
+
+        // Stamp the id BEFORE the call, so a collector that stops this thread
+        // inside the slow path reads the site it is actually standing at.
+        if self.sp_id_slot_off != 0 {
+            self.buffer.emit(Arm64Instruction::MovImm {
+                rd: Arm64Register::X17,
+                imm: i64::from(safepoint_id),
+            });
+            self.buffer.emit(Arm64Instruction::Str {
+                rt: Arm64Register::X17,
+                rn: Arm64Register::FP,
+                offset: -self.sp_id_slot_off,
+            });
+        }
+
+        self.buffer.emit(Arm64Instruction::MovImm {
+            rd: Arm64Register::X16,
+            imm: self.helpers.safepoint_slow_path as i64,
+        });
+        self.buffer.emit(Arm64Instruction::Blr {
+            rn: Arm64Register::X16,
+        });
+        // At the return address, with the operand oops in frame slots.
+        self.emit_oop_map_for_safepoint(safepoint_id);
+
+        // Reload every register-homed local the GC may have REWRITTEN. Without
+        // this the frame slot carries the object's new address while the
+        // register still holds the old one -- the map would be correct and the
+        // running code would not.
+        for (i, off) in &reg_homed {
+            if let Some(reg) = self.local_regs.get(*i).copied().flatten() {
+                self.buffer.emit(Arm64Instruction::Ldr {
+                    rt: reg,
+                    rn: Arm64Register::FP,
+                    offset: *off,
+                });
+            }
+        }
+
+        // Restore, and put the compile-time model back exactly as it was.
+        for reg in &added {
+            if let Some(offset) = self.spill_map.remove(reg) {
+                self.buffer.emit(Arm64Instruction::Ldr {
+                    rt: *reg,
+                    rn: Arm64Register::FP,
+                    offset,
+                });
+            }
+        }
+        self.buffer.bind_label(skip);
+    }
+
+    /// The oop-local mask in force at the safepoint being emitted, or `None`
+    /// when no claim can be made.
+    ///
+    /// `None` is a REFUSAL, not "no oop locals": the dataflow is empty above 64
+    /// locals and unreached at pcs only an exception edge can arrive at, and
+    /// treating either as "nothing live" is how a collector loses a root. The
+    /// caller falls back to naming nothing, which leaves those frames to the
+    /// conservative scan -- correct, just less precise.
+    fn oop_locals_at_current_pc(&self, entry: bool) -> Option<u64> {
+        if entry {
+            // The prologue poll runs before the walk, so there is no bci to
+            // look up; the live oops there are exactly the reference
+            // parameters, which is what seeds the dataflow at bci 0.
+            return Some(self.param_oop_mask);
+        }
+        if self.local_oop_masks.is_empty() {
+            return None;
+        }
+        if !self
+            .local_oop_reached
+            .get(self.cur_bytecode_pc)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.local_oop_masks.get(self.cur_bytecode_pc).copied()
+    }
+
+    /// Frame offset of the safepoint home reserved for register-homed local
+    /// `index`, or `None` if it has no register (it lives in a spill slot
+    /// already) or no home was reserved.
+    ///
+    /// Homes sit after the operand area: `local_spill_count() + max_stack + k`,
+    /// where `k` numbers the register-homed locals in order. That is the tail
+    /// `num_spills` was extended by, so a home can never collide with a local's
+    /// slot or an operand's.
+    fn safepoint_home_for_reg_local(&self, index: usize) -> Option<i32> {
+        self.local_regs.get(index).copied().flatten()?;
+        let k = (0..index)
+            .filter(|&i| self.local_regs.get(i).copied().flatten().is_some())
+            .count();
+        let frame = self.frame.as_ref()?;
+        let slot = self
+            .local_spill_count()
+            .checked_add(self.max_stack)?
+            .checked_add(k)?;
+        if slot >= frame.num_spills {
+            return None;
+        }
+        let scaled = i32::try_from(slot).ok()?.checked_mul(8)?;
+        frame.spill_offset.checked_add(scaled)
+    }
+
+    /// Frame offset of the spill slot for operand-stack depth `depth`, or
+    /// `None` when that slot is outside the reserved spill area.
+    ///
+    /// MIRRORS `alloc_scratch` EXACTLY, sharing its base through
+    /// [`Self::local_spill_count`]. The two are the only writers of `spill_map`
+    /// and must agree about where a given depth lives, or the oop map names a
+    /// slot nothing wrote.
+    ///
+    /// (An earlier version of this comment said the base was `num_reg_locals`
+    /// because "the spill area holds the register-homed locals FIRST". That is
+    /// backwards -- the spill area holds the locals that got NO register -- and
+    /// copying `alloc_scratch` faithfully copied its bug. See
+    /// `operand_spill_slots_do_not_alias_frame_homed_locals`.)
+    ///
+    /// `alloc_scratch` reaches this arithmetic only for a depth it has already
+    /// proved live, so it can saturate; the poll can be asked about any depth,
+    /// so it bound-checks against the reserved area and refuses instead.
+    fn spill_offset_for_depth(&self, depth: usize) -> Option<i32> {
+        let base = self.local_spill_count();
+        let frame = self.frame.as_ref()?;
+        let spill_slot = base.checked_add(depth)?;
+        if spill_slot >= frame.num_spills {
+            return None;
+        }
+        let scaled = i32::try_from(spill_slot).ok()?.checked_mul(8)?;
+        frame.spill_offset.checked_add(scaled)
     }
 
     /// Run the shared operand-stack kind analysis over `bytecode`.
@@ -1372,7 +1913,15 @@ impl Arm64Backend {
     /// safepoint, and without a poll there is no bound.
     fn label_for_pc(&mut self, pc: usize) -> u32 {
         if pc <= self.cur_bytecode_pc {
-            self.failed = true;
+            if self.safepoints_enabled {
+                // A loop header. The blanket refusal below existed because a
+                // compiled loop with no poll in it is a region a
+                // stop-the-world request can never interrupt -- so with polls
+                // available, RECORD it and let pass 2 put one there.
+                self.back_edge_targets.insert(pc);
+            } else {
+                self.failed = true;
+            }
         }
         self.label_for_pc_unchecked(pc)
     }
@@ -1498,6 +2047,38 @@ impl Arm64Backend {
                 offset,
             });
         }
+
+        // STAMP THE SAFEPOINT-ID SLOT with "this frame has not reached a
+        // safepoint yet".
+        //
+        // Leaving it uninitialised is the quiet hazard: whatever the stack
+        // happened to hold can READ as a valid id for the method standing at
+        // this frame base, and a relocating collector would then rewrite the
+        // frame against the wrong program point's map. `SP_ID_UNSET_BC_PC`
+        // (`u32::MAX - 1`) matches no map, so the proof fails CLOSED. It cannot
+        // be 0: bci 0 is a legal safepoint and a very common one.
+        //
+        // X17 is IP1 -- not an argument register -- so unlike the entry poll
+        // this is safe to emit here, before the arguments are consumed.
+        if self.sp_id_slot_off != 0 {
+            self.buffer.emit(Arm64Instruction::MovImm {
+                rd: Arm64Register::X17,
+                imm: crate::x64::safepoint::SP_ID_UNSET_BC_PC as i64,
+            });
+            self.buffer.emit(Arm64Instruction::Str {
+                rt: Arm64Register::X17,
+                rn: Arm64Register::FP,
+                offset: -self.sp_id_slot_off,
+            });
+        }
+
+        // The method-entry poll used to be emitted HERE, and that was wrong:
+        // `compile_pass` copies the incoming arguments out of X0-X7 into their
+        // local registers AFTER this function returns, so a call emitted here
+        // sits between the arguments arriving and being consumed -- and X0-X7
+        // are caller-saved, so the safepoint slow path is entitled to destroy
+        // every one of them. It now runs just past that copy; see
+        // `the_entry_poll_runs_after_the_argument_copy`.
     }
 
     /// Emit the standard AAPCS64 epilogue.
@@ -1606,6 +2187,13 @@ impl Arm64Backend {
         bytecode: &[u8],
         method_info: HashMap<u16, usize>,
     ) -> Arm64CompileResult {
+        // Discovered by pass 1 and read by pass 2, so `compile_pass` must NOT
+        // clear it (it clears `pc_labels`, which is why the back-edge set has
+        // to live outside that reset). Cleared HERE instead, per compile: a
+        // reused backend would otherwise carry another method's loop headers
+        // and emit polls at unrelated PCs.
+        self.back_edge_targets.clear();
+
         // Pass 1 — discovery. Label ids allocated here are NOT reused: pass 2
         // resets the buffer (and with it the label-id counter), so it hands
         // `compile_pass` bytecode PCs and lets it allocate its own ids.
@@ -1663,6 +2251,21 @@ impl Arm64Backend {
         self.num_params = num_params;
         self.method_info = method_info;
         self.stack_kinds = Self::analyze_stack_kinds(bytecode);
+        self.max_stack = max_stack;
+        self.pending_local_oop_slots.clear();
+        // The same "must be oop" local dataflow x64 uses, seeded with this
+        // method's reference parameters. A bit is set only when EVERY path
+        // reaching that pc stored a reference there, which is what a
+        // relocating collector needs: a false positive would have the GC
+        // rewrite a primitive that happens to look like an address.
+        let (lo_masks, lo_reached) = crate::x64::compute_local_oop_masks(
+            bytecode,
+            bytecode.len(),
+            num_locals,
+            self.param_oop_mask,
+        );
+        self.local_oop_masks = lo_masks;
+        self.local_oop_reached = lo_reached;
 
         // Run graph-coloring register allocation for ARM64.
         let alloc = super::regalloc::allocate_registers_arm64(
@@ -1729,7 +2332,23 @@ impl Arm64Backend {
             .filter(|(i, a)| a.is_none() && self.local_regs.get(*i).map_or(false, |g| g.is_none()))
             .count();
         let _ = fp_spills; // float spills use the same frame slots
-        let num_spills = gpr_spills + max_stack;
+        // One extra spill word per REGISTER-HOMED local, reserved only when
+        // this compilation emits polls.
+        //
+        // A register-homed local has no frame slot at all on this backend --
+        // `spill_index_for` numbers only the locals that got NO register -- so
+        // there is nowhere for a safepoint to put it. The prologue's
+        // callee-save slots cannot be borrowed either: those hold the CALLER's
+        // values and the epilogue restores from them. Hence a dedicated home,
+        // placed after the operand area. See `safepoint_home_for_reg_local`.
+        let safepoint_homes = if self.safepoints_enabled {
+            saved_regs.len()
+        } else {
+            0
+        };
+        // ...plus ONE more for the safepoint-id slot, on the same condition.
+        let sp_id_words = usize::from(self.safepoints_enabled);
+        let num_spills = gpr_spills + max_stack + safepoint_homes + sp_id_words;
         let layout = Arm64FrameLayout::compute(num_locals, num_spills, &saved_regs);
 
         // Refuse frames that could step over the stack guard page.
@@ -1756,6 +2375,17 @@ impl Arm64Backend {
             self.failed = true;
         }
         self.frame = Some(layout);
+        // The sp-id word sits past the locals, the operand area and the
+        // safepoint homes -- the tail `num_spills` was just extended by.
+        self.sp_id_slot_off = if self.safepoints_enabled {
+            let f = self.frame.as_ref().expect("just set");
+            let idx = f.num_spills.saturating_sub(1);
+            let off = f.spill_offset + (idx as i32) * 8; // Cast: bounded by num_spills
+            // The runtime reads `[frame_base - off]`, so publish the magnitude.
+            -off
+        } else {
+            0
+        };
 
         self.epilogue_label = self.buffer.new_label();
 
@@ -1775,6 +2405,19 @@ impl Arm64Backend {
             }
         }
 
+        // Publish the frame base BEFORE the first poll: the poll stamps an id
+        // into this frame, and an id in a frame the walker cannot locate is
+        // not a root, it is a number.
+        self.emit_frame_record();
+
+        // METHOD-ENTRY SAFEPOINT POLL, emitted HERE rather than at the end of
+        // the prologue: the copy above is what consumes X0-X7, and this poll
+        // emits a CALL that may destroy them. The frame is complete by now (FP
+        // established, callee-saved registers stored), the operand stack is
+        // empty, and every register-homed parameter is in its local register --
+        // which is what lets the poll name the reference ones.
+        self.emit_safepoint_poll(true);
+
         // Walk bytecode.
         let mut pc = 0;
         let mut success = true;
@@ -1792,6 +2435,17 @@ impl Arm64Backend {
                 if !self.buffer.labels.contains_key(&label) {
                     self.buffer.bind_label(label);
                 }
+            }
+
+            // LOOP-HEADER SAFEPOINT POLL. Emitted after the label is bound, so
+            // a back edge jumps to the label and lands on the poll -- one poll
+            // per header regardless of how many branches target it, which is
+            // why this is here and not at the ~11 branch sites. (A forward
+            // branch to the same label also lands on it; an extra poll is
+            // harmless.) `back_edge_targets` comes from pass 1, so a header is
+            // known before pass 2 reaches it.
+            if self.back_edge_targets.contains(&pc) {
+                self.emit_safepoint_poll(false);
             }
 
             let opcode = bytecode[pc];
@@ -3091,6 +3745,7 @@ impl Arm64Backend {
                     labels: HashMap::new(),
                     success: false,
                     pending_oop_maps: Vec::new(),
+                    sp_id_slot_off: 0,
                 }
             }
         };
@@ -3099,6 +3754,7 @@ impl Arm64Backend {
             frame,
             labels: self.buffer.labels.clone(),
             success: success && !self.failed,
+            sp_id_slot_off: self.sp_id_slot_off,
             // T1.1.3 — transfer the collected per-PC oop maps out of
             // the backend. When empty, the walker falls back to the
             // conservative stack scan for AArch64 frames, matching
@@ -3496,6 +4152,18 @@ impl Arm64Backend {
     }
 
     /// Compute the spill slot index for a local that doesn't have a register.
+    /// How many spill slots the FRAME-HOMED LOCALS occupy -- equivalently, the
+    /// first spill index the operand stack may use.
+    ///
+    /// `spill_index_for` numbers those locals `0..local_spill_count()`, and
+    /// `num_spills` is computed as `gpr_spills + max_stack`, so the operand
+    /// area is exactly `[local_spill_count(), num_spills)`. Both spillers must
+    /// take their base from HERE or the two areas overlap -- see
+    /// `operand_spill_slots_do_not_alias_frame_homed_locals`.
+    fn local_spill_count(&self) -> usize {
+        self.spill_index_for(self.local_regs.len())
+    }
+
     fn spill_index_for(&self, local_index: usize) -> usize {
         // Count how many locals before this one also lack a register (GPR and FP).
         let mut spill_idx = 0;
@@ -4673,6 +5341,16 @@ fn emit_machine_code_inner(result: &Arm64CompileResult) -> Option<(Vec<u8>, Vec<
                     emitter.ldur(r(*rt), crate::aarch64::Reg::X16, 0);
                 }
             }
+            Arm64Instruction::Ldrb { rt, rn, offset } => {
+                // Byte loads use an UNSCALED imm12 (units of 1), and only the
+                // non-negative unsigned-offset form is encodable here. The one
+                // caller is the safepoint poll, which uses offset 0.
+                if *offset < 0 || *offset > 0xFFF {
+                    return None;
+                }
+                // Cast: bounds-checked immediately above.
+                emitter.ldrb_imm(r(*rt), r(*rn), *offset as u16);
+            }
             Arm64Instruction::Str { rt, rn, offset } => {
                 if *offset >= 0 && *offset % 8 == 0 && *offset <= 32760 {
                     emitter.str_imm(r(*rt), r(*rn), *offset as u16);
@@ -5023,9 +5701,13 @@ pub fn publish_compiled_method(result: &Arm64CompileResult) -> Option<crate::Com
     // this is non-empty, which makes the walker enumerate these slots IN
     // ADDITION to its conservative sweep -- strictly additive, because
     // suppressing the sweep is gated on `fully_oop_covered`, which this backend
-    // never sets (no safepoint-id slot, no shadow stack, no relocation
-    // support).
+    // never sets -- not for want of the safepoint-id slot, which exists now,
+    // but because suppressing the conservative scan is a claim no non-aarch64
+    // host can earn.
     cm.oop_maps = oop_maps;
+    // The slot the maps above are keyed through. Without it the runtime's
+    // `active_safepoint_id` returns `None` and no map can be selected by id.
+    cm.sp_id_slot_off = result.sp_id_slot_off;
     Some(cm)
 }
 
@@ -5060,11 +5742,12 @@ pub fn emit_machine_code_with_oop_maps(
         };
         maps.push(crate::OopMapEntry {
             native_pc_offset,
-            // Stage 3 precise relocation is x86-64 only: this backend records
-            // no safepoint-id slot, so there is no bytecode PC to key on and
-            // `find_oop_map_for_safepoint_id` can never select one of these.
-            // `find_oop_map_for_pc` is the reader that applies here.
-            bytecode_pc: 0,
+            // The safepoint id this map belongs to, and the reason the frame
+            // stamps the same value into its sp-id slot: this is what
+            // `find_oop_map_for_safepoint_id` matches on, so the collector
+            // selects the map for the site the frame is ACTUALLY standing at
+            // rather than a union over every safepoint in the method.
+            bytecode_pc: pending.safepoint_id,
             frame_slot_offsets: pending.frame_slot_offsets.clone(),
             // No shadow stack and no relocation support on this backend, and
             // register-resident oops are covered only by the CONSERVATIVE walk
@@ -6878,6 +7561,7 @@ mod tests {
         backend.buffer.emit(Arm64Instruction::Ret);
 
         let result = Arm64CompileResult {
+            sp_id_slot_off: 0,
             instructions: backend.buffer.instructions().to_vec(),
             frame: Arm64FrameLayout::compute(0, 0, &[]),
             labels: backend.buffer.labels.clone(),
@@ -6917,6 +7601,7 @@ mod tests {
             labels: HashMap::new(),
             success: true,
             pending_oop_maps: Vec::new(),
+            sp_id_slot_off: 0,
         }
     }
 
@@ -7230,6 +7915,782 @@ mod tests {
     // aarch64 parity audit (2026-08-01) — fail-closed gates
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Safepoint polls (opt-in, `CRATONVM_JIT_ARM64_SAFEPOINTS`)
+    // -----------------------------------------------------------------------
+
+    /// Build a backend with polls on and plausible helper addresses.
+    fn poll_backend() -> Arm64Backend {
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(true);
+        // SAFETY: plain struct of `usize` addresses.
+        let mut h: crate::JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        h.safepoint_flag_addr = 0x1234_5678_9AB0;
+        h.safepoint_slow_path = 0x7FFF_0000_1000;
+        b.set_helpers(h);
+        b
+    }
+
+    /// THE WIDTH OF THE FLAG READ, asserted as an exact instruction word.
+    ///
+    /// The safepoint flag is a Rust `AtomicBool` -- ONE byte -- and the
+    /// `GcBarrier` fields that follow it (`gc_generation: AtomicU64`, ...) are
+    /// not zero. Reading it with the 64-bit `ldr_imm` would fold those bytes
+    /// into the `CBZ` and make the poll fire on every iteration once the
+    /// generation counter is nonzero. A host that cannot execute aarch64 has to
+    /// catch that by ENCODING, so this pins the literal word rather than
+    /// merely asserting "an Ldrb was emitted".
+    #[test]
+    fn the_poll_reads_one_byte_and_the_encoding_says_so() {
+        use crate::aarch64::{Aarch64Emitter, Reg};
+        let mut e = Aarch64Emitter::new();
+        e.ldrb_imm(Reg::X17, Reg::X16, 0);
+        let word = u32::from_le_bytes(e.code()[0..4].try_into().unwrap());
+        // LDRB Wt, [Xn, #0] = 0x39400000 | (Rn << 5) | Rt
+        assert_eq!(
+            word, 0x3940_0211,
+            "LDRB W17, [X16] must encode as 0x39400211; got {word:#010x}"
+        );
+        // The 64-bit form is a DIFFERENT instruction -- the control that makes
+        // the assertion above mean something.
+        let mut e64 = Aarch64Emitter::new();
+        e64.ldr_imm(Reg::X17, Reg::X16, 0);
+        let w64 = u32::from_le_bytes(e64.code()[0..4].try_into().unwrap());
+        assert_ne!(word, w64, "byte and doubleword loads must differ");
+    }
+
+    /// The entry poll's shape, read off the pseudo-op stream.
+    #[test]
+    fn the_entry_poll_has_the_expected_shape() {
+        let mut b = poll_backend();
+        // `return void` -- no operand stack, so the poll spills nothing.
+        let result = b.compile_method(0, 0, 4, &[0xb1]);
+        assert!(result.success, "the method must still compile");
+        let ops = &result.instructions;
+        let ldrb = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Ldrb { .. }))
+            .expect("the poll must read the flag with a BYTE load");
+        assert!(
+            matches!(ops[ldrb - 1], Arm64Instruction::MovImm { .. }),
+            "the flag address must be materialized right before the load"
+        );
+        assert!(
+            matches!(ops[ldrb + 1], Arm64Instruction::Cbz { .. }),
+            "a clear flag must branch PAST the call, not into it"
+        );
+        assert!(
+            ops[ldrb..]
+                .iter()
+                .any(|i| matches!(i, Arm64Instruction::Blr { .. })),
+            "the poll must call the slow path"
+        );
+        // The CBZ target must be bound AFTER the BLR, or the poll skips
+        // nothing -- or worse, branches backwards.
+        let Arm64Instruction::Cbz { label, .. } = ops[ldrb + 1] else {
+            unreachable!()
+        };
+        let blr = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Blr { .. }))
+            .unwrap();
+        let bound = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Label(l) if *l == label))
+            .expect("the skip label must be bound");
+        assert!(
+            bound > blr,
+            "the skip target must be past the call ({bound} vs {blr})"
+        );
+    }
+
+    /// OFF is byte-identical to before, and still refuses loops.
+    ///
+    /// The negative control for every assertion above: without it they would
+    /// pass just as well if the poll were emitted unconditionally.
+    #[test]
+    fn safepoints_off_emits_no_poll_and_still_refuses_loops() {
+        let mut off = Arm64Backend::new();
+        off.set_safepoints_enabled(false);
+        let a = off.compile_method(0, 0, 4, &[0xb1]);
+        assert!(a.success);
+        assert!(
+            !a.instructions
+                .iter()
+                .any(|i| matches!(i, Arm64Instruction::Ldrb { .. })),
+            "no poll may be emitted with the switch off"
+        );
+        // The SAME loop `a_loop_compiles_with_a_poll_at_its_header` compiles
+        // with the switch on, so this is a true A/B on one input: with polls
+        // off the pre-existing safety gate still refuses it, because a compiled
+        // loop containing no poll is a region a stop-the-world request can
+        // never interrupt.
+        //
+        // (An earlier draft of this used a bare `goto -3` at pc 0. That target
+        // is NEGATIVE, wraps when cast to `usize`, and so never looked like a
+        // back edge at all -- the test passed for the wrong reason until the
+        // loop above was written to compare against.)
+        let code = [0x03, 0x3b, 0x84, 0x00, 0x01, 0xa7, 0xFF, 0xFD];
+        let mut off2 = Arm64Backend::new();
+        off2.set_safepoints_enabled(false);
+        let b = off2.compile_method(1, 0, 4, &code);
+        assert!(
+            !b.success,
+            "with polls off, a backward branch must still refuse the method"
+        );
+    }
+
+    /// A helper table with no flag address emits nothing, switch or no switch.
+    ///
+    /// The same optional-helper contract x64 has: an unwired build must not
+    /// call through a null pointer, and must be byte-identical to before.
+    #[test]
+    fn an_unwired_helper_table_emits_no_poll() {
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(true); // switch ON, helpers absent
+        let result = b.compile_method(0, 0, 4, &[0xb1]);
+        assert!(result.success);
+        assert!(
+            !result
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Arm64Instruction::Ldrb { .. })),
+            "no flag address means no poll code at all"
+        );
+    }
+
+    /// With polls on, a LOOP compiles -- and gets a poll at its header.
+    ///
+    /// This is the capability the refusal was trading away: `label_for_pc`
+    /// refused every backward branch precisely because a compiled loop with no
+    /// poll in it is a region a stop-the-world request can never interrupt.
+    #[test]
+    fn a_loop_compiles_with_a_poll_at_its_header() {
+        // 0: iconst_0   1: istore_0   2: iinc 0,1   5: goto 2
+        let code = [0x03, 0x3b, 0x84, 0x00, 0x01, 0xa7, 0xFF, 0xFD];
+        let mut b = poll_backend();
+        let result = b.compile_method(1, 0, 4, &code);
+        assert!(
+            result.success,
+            "a loop must compile once its header can carry a poll"
+        );
+        let polls = result
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Arm64Instruction::Ldrb { .. }))
+            .count();
+        assert_eq!(polls, 2, "expected an entry poll and a loop-header poll");
+        // And it encodes: the backward branch patches to a NEGATIVE
+        // displacement, which nothing on this backend had exercised before.
+        assert!(
+            emit_machine_code(&result).is_some(),
+            "the loop must survive encoding, back edge and all"
+        );
+    }
+
+    /// The poll leaves the compile-time spill model exactly as it found it.
+    ///
+    /// `spill_map` decides whether `pop_operand` emits a reload. The poll's
+    /// spill sits INSIDE the `CBZ`-skipped block, so on the not-taken path
+    /// (flag clear -- the common case) those stores never execute, and an entry
+    /// left behind would make a later `pop_operand` reload a frame slot nothing
+    /// wrote. Asserting the model is unchanged is how a non-executing host
+    /// checks that.
+    #[test]
+    fn the_poll_restores_the_spill_model() {
+        let mut b = poll_backend();
+        b.frame = Some(Arm64FrameLayout::compute(0, 8, &[]));
+        b.operand_stack = vec![Arm64Register::X9, Arm64Register::X10];
+        b.operand_stack_oop_marks = vec![true, false];
+        assert!(b.spill_map.is_empty());
+
+        b.emit_safepoint_poll(false);
+
+        assert!(!b.failed, "the poll must not refuse this frame");
+        assert!(
+            b.spill_map.is_empty(),
+            "the poll must remove every spill entry it added; left: {:?}",
+            b.spill_map
+        );
+        // The oop map DID record the reference operand's slot: the spill is
+        // what makes it nameable, and the map is taken at the call.
+        assert_eq!(
+            b.pending_oop_maps.len(),
+            1,
+            "the safepoint must record a map naming the live reference"
+        );
+        assert_eq!(
+            b.pending_oop_maps[0].frame_slot_offsets.len(),
+            1,
+            "only the marked (reference) operand belongs in the map"
+        );
+    }
+
+    /// A poll whose spill has no reserved slot refuses the method.
+    ///
+    /// The alternative is a live reference sitting in a caller-saved register
+    /// across a CALL, which is the exact hazard the spill exists for.
+    #[test]
+    fn a_poll_that_cannot_place_its_spill_refuses() {
+        let mut b = poll_backend();
+        b.frame = Some(Arm64FrameLayout::compute(0, 0, &[]));
+        b.operand_stack = vec![Arm64Register::X9];
+        b.operand_stack_oop_marks = vec![true];
+        b.emit_safepoint_poll(false);
+        assert!(
+            b.failed,
+            "a spill with nowhere to go must fail the method closed"
+        );
+    }
+
+
+    /// The operand spill area and the frame-homed locals must NOT overlap.
+    ///
+    /// FIXED 2026-09-03; this failed as written.
+    ///
+    /// `spill_index_for` numbers a frame-homed local by how many locals BEFORE
+    /// it also lack a register, so those locals occupy spill indices
+    /// `0..gpr_spills`. `alloc_scratch` numbers an operand slot
+    /// `frame.num_reg_locals + depth` -- and `num_reg_locals` is how many
+    /// locals got a REGISTER, which is the complement of that count, not the
+    /// end of it.
+    ///
+    /// `num_spills = gpr_spills + max_stack` is the tell: the frame is sized as
+    /// if operands began at `gpr_spills`, which is exactly what makes the last
+    /// operand slot the last reserved word. Basing them at `num_reg_locals`
+    /// instead either ALIASES a local (fewer locals got registers) or runs PAST
+    /// the reserved area into the callee-save slots (more did).
+    #[test]
+    fn operand_spill_slots_do_not_alias_frame_homed_locals() {
+        let mut b = Arm64Backend::new();
+        // Four locals: local 0 register-homed, locals 1..3 frame-homed.
+        b.local_regs = vec![Some(Arm64Register::X19), None, None, None];
+        b.float_local_regs = vec![None, None, None, None];
+        let gpr_spills = 3usize;
+        let max_stack = 4usize;
+        b.frame = Some(Arm64FrameLayout::compute(
+            4,
+            gpr_spills + max_stack,
+            &[Arm64Register::X19],
+        ));
+
+        let local_slots: Vec<usize> = (1..4).map(|i| b.spill_index_for(i)).collect();
+        assert_eq!(
+            local_slots,
+            vec![0, 1, 2],
+            "frame-homed locals occupy 0..gpr_spills"
+        );
+
+        assert_eq!(b.frame.as_ref().unwrap().num_reg_locals, 1);
+        // The base both spillers now share.
+        let operand_slot_0 = b.local_spill_count();
+        assert_eq!(
+            operand_slot_0, gpr_spills,
+            "the operand area must begin where the locals end"
+        );
+
+        assert!(
+            !local_slots.contains(&operand_slot_0),
+            "operand depth 0 landed on spill slot {operand_slot_0}, which is \
+             also a frame-homed local's slot -- the operand stack and the \
+             locals share frame words"
+        );
+        // The OTHER direction: with more locals register-homed than not, the
+        // old base ran past the reserved area into the callee-save slots,
+        // overwriting a saved register the epilogue restores to the caller.
+        let mut b2 = Arm64Backend::new();
+        b2.local_regs = vec![
+            Some(Arm64Register::X19),
+            Some(Arm64Register::X20),
+            Some(Arm64Register::X21),
+            None,
+        ];
+        b2.float_local_regs = vec![None; 4];
+        let saved = [Arm64Register::X19, Arm64Register::X20, Arm64Register::X21];
+        let num_spills = 1 + max_stack; // gpr_spills(1) + max_stack
+        b2.frame = Some(Arm64FrameLayout::compute(4, num_spills, &saved));
+        let last = b2.local_spill_count() + (max_stack - 1);
+        let old_last = b2.frame.as_ref().unwrap().num_reg_locals + (max_stack - 1);
+        assert!(
+            last < num_spills,
+            "the deepest operand slot ({last}) must stay inside the reserved              area ({num_spills}); the old base put it at {old_last}"
+        );
+        assert!(old_last >= num_spills, "the old base really did overrun");
+    }
+
+    /// A frame for `n` locals of which `reg_homed` have registers.
+    fn locals_frame(b: &mut Arm64Backend, reg: &[Option<Arm64Register>], max_stack: usize) {
+        b.local_regs = reg.to_vec();
+        b.float_local_regs = vec![None; reg.len()];
+        let saved: Vec<Arm64Register> = reg.iter().flatten().copied().collect();
+        let gpr_spills = reg.iter().filter(|r| r.is_none()).count();
+        b.max_stack = max_stack;
+        b.frame = Some(Arm64FrameLayout::compute(
+            reg.len(),
+            gpr_spills + max_stack + saved.len(),
+            &saved,
+        ));
+    }
+
+    /// THE POINT OF THIS WHOLE CHANGE: a REGISTER-HOMED reference local is
+    /// stored to a frame home, named in the map, and reloaded after the call.
+    ///
+    /// X19-X28 are callee-saved, so the value survives the call on its own --
+    /// but it survives inside the CALLEE's saved-register area, where only the
+    /// conservative walk can see it, and a conservative walk marks without
+    /// being able to REWRITE. A relocating collector therefore could not move
+    /// an object whose only root was a register local. The store makes it a
+    /// nameable, rewritable root; the reload is what carries a moved object's
+    /// new address back into the register.
+    #[test]
+    fn a_register_homed_reference_local_is_spilled_named_and_reloaded() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        // The dataflow says local 0 holds a reference at this pc.
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0b1];
+        b.local_oop_reached = vec![true];
+
+        let home = b
+            .safepoint_home_for_reg_local(0)
+            .expect("a home must be reserved for a register-homed local");
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+
+        let stored = b.buffer.instructions().iter().any(|i| {
+            matches!(i, Arm64Instruction::Str { rt, rn, offset }
+                     if *rt == Arm64Register::X19
+                     && *rn == Arm64Register::FP
+                     && *offset == home)
+        });
+        assert!(stored, "the register local must be stored to its home");
+
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        let named: Vec<i16> = b.pending_oop_maps[0].frame_slot_offsets.clone();
+        assert!(
+            named.contains(&(home as i16)),
+            "the map must name the home ({home}); named {named:?}"
+        );
+
+        let reloaded = b.buffer.instructions().iter().any(|i| {
+            matches!(i, Arm64Instruction::Ldr { rt, rn, offset }
+                     if *rt == Arm64Register::X19
+                     && *rn == Arm64Register::FP
+                     && *offset == home)
+        });
+        assert!(
+            reloaded,
+            "the register must be reloaded, or a relocated object's new address \
+             never reaches the running code"
+        );
+    }
+
+    /// A FRAME-HOMED reference local is named where it already lives -- no
+    /// store, because there is nothing to move.
+    #[test]
+    fn a_frame_homed_reference_local_is_named_without_a_spill() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[None], 2);
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0b1];
+        b.local_oop_reached = vec![true];
+
+        let frame_off = b.frame.as_ref().unwrap().spill_offset; // slot 0
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        assert!(
+            b.pending_oop_maps[0]
+                .frame_slot_offsets
+                .contains(&(frame_off as i16)),
+            "a frame-homed local must be named at its own slot"
+        );
+        assert!(
+            !b.buffer.instructions().iter().any(|i| {
+                matches!(i, Arm64Instruction::Str { offset, .. } if *offset == frame_off)
+            }),
+            "a frame-homed local is already where the GC reads it; storing it \
+             again would be pure cost"
+        );
+    }
+
+    /// A local the dataflow does NOT call a reference is not named.
+    ///
+    /// The precision control. Naming a primitive would hand a relocating
+    /// collector a word to rewrite that is not a pointer -- and an `int` can
+    /// coincidentally hold a value `is_object_address` accepts, which is
+    /// exactly why this uses the flow-sensitive "must be oop" dataflow rather
+    /// than the whole-method `find_reference_locals` approximation.
+    #[test]
+    fn a_non_reference_local_is_not_named() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0]; // reached, and NOT an oop
+        b.local_oop_reached = vec![true];
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+        assert!(
+            b.pending_oop_maps.is_empty(),
+            "a safepoint with no live reference records no map"
+        );
+        assert!(
+            !b.buffer.instructions().iter().any(|i| {
+                matches!(i, Arm64Instruction::Str { rt, .. } if *rt == Arm64Register::X19)
+            }),
+            "a primitive local must not be spilled either"
+        );
+    }
+
+    /// An UNREACHED pc makes no claim, rather than claiming "no oops".
+    ///
+    /// The dataflow does not reach pcs only an exception edge arrives at, and
+    /// it is empty above 64 locals. Reading either as "nothing live" is how a
+    /// collector loses a root, so both fall back to naming nothing and leaving
+    /// the frame to the conservative scan.
+    #[test]
+    fn an_unreached_pc_names_nothing_rather_than_claiming_emptiness() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0b1];
+        b.local_oop_reached = vec![false]; // never reached
+        assert!(b.oop_locals_at_current_pc(false).is_none());
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed, "no claim is not a refusal of the method");
+        assert!(b.pending_oop_maps.is_empty());
+    }
+
+    /// The safepoint homes sit past both the locals and the operand area.
+    ///
+    /// Three regions share one spill area, and an overlap would have the GC
+    /// read a word two of them write. The frame is extended by exactly the
+    /// number of register-homed locals when polls are on, so a home is always
+    /// inside the reservation and never on a local's or an operand's slot.
+    #[test]
+    fn safepoint_homes_do_not_collide_with_locals_or_operands() {
+        let mut b = poll_backend();
+        let regs = [Some(Arm64Register::X19), None, Some(Arm64Register::X20), None];
+        let max_stack = 3usize;
+        locals_frame(&mut b, &regs, max_stack);
+        let frame_words = b.frame.as_ref().unwrap().num_spills;
+
+        let local_slots: Vec<i32> = (0..regs.len())
+            .filter(|&i| regs[i].is_none())
+            .map(|i| b.spill_index_for(i) as i32)
+            .collect();
+        let operand_slots: Vec<i32> = (0..max_stack)
+            .map(|d| (b.local_spill_count() + d) as i32)
+            .collect();
+        let home_slots: Vec<i32> = (0..regs.len())
+            .filter(|&i| regs[i].is_some())
+            .map(|i| {
+                let off = b.safepoint_home_for_reg_local(i).unwrap();
+                (off - b.frame.as_ref().unwrap().spill_offset) / 8
+            })
+            .collect();
+
+        for h in &home_slots {
+            assert!(
+                !local_slots.contains(h) && !operand_slots.contains(h),
+                "home slot {h} collides (locals {local_slots:?}, operands \
+                 {operand_slots:?})"
+            );
+            assert!(
+                (*h as usize) < frame_words,
+                "home slot {h} is outside the reserved area ({frame_words})"
+            );
+        }
+        assert_eq!(home_slots.len(), 2, "one home per register-homed local");
+    }
+
+    /// The ENTRY poll names the reference PARAMETERS.
+    ///
+    /// The prologue runs before the walk, so there is no bci to look up; the
+    /// live oops there are exactly the reference parameters. Without the
+    /// descriptor seed this mask is 0 and a reference parameter that is never
+    /// `astore`d is never named -- covered by the conservative scan, but not
+    /// precisely, which is the difference a relocating collector cares about.
+    #[test]
+    fn the_entry_poll_names_the_reference_parameters() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19), None], 2);
+        // static (Ljava/lang/Object;I)V -> local 0 is a reference parameter.
+        b.set_method_descriptor("(Ljava/lang/Object;I)V", true);
+        assert_eq!(b.param_oop_mask & 1, 1, "param 0 is a reference");
+
+        let home = b.safepoint_home_for_reg_local(0).unwrap();
+        b.emit_safepoint_poll(true); // entry
+        assert!(!b.failed);
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        assert!(
+            b.pending_oop_maps[0]
+                .frame_slot_offsets
+                .contains(&(home as i16)),
+            "the entry poll must name the reference parameter"
+        );
+
+        // The control: with no descriptor seeded, it names nothing.
+        let mut b2 = poll_backend();
+        locals_frame(&mut b2, &[Some(Arm64Register::X19), None], 2);
+        b2.emit_safepoint_poll(true);
+        assert!(b2.pending_oop_maps.is_empty());
+    }
+
+    /// THE ENTRY POLL MUST NOT RUN WHILE THE ARGUMENTS ARE STILL IN X0-X7.
+    ///
+    /// `compile_pass` copies the incoming arguments into their local registers
+    /// AFTER `emit_prologue` returns. The entry poll was emitted from the END
+    /// of the prologue, so its `BLR` sat between the arguments arriving and
+    /// being consumed -- and X0-X7 are caller-saved, so the safepoint slow path
+    /// is entitled to destroy every one of them. Every parameter of every
+    /// compiled method would have been garbage on the taken path.
+    ///
+    /// Asserted as an ORDER over the emitted stream: no call may precede the
+    /// argument copy.
+    #[test]
+    fn the_entry_poll_runs_after_the_argument_copy() {
+        let mut b = poll_backend();
+        // static (Ljava/lang/Object;)I { aload_0; areturn } -- one reference
+        // parameter, so there is an argument copy to be clobbered.
+        b.set_method_descriptor("(Ljava/lang/Object;)Ljava/lang/Object;", true);
+        let result = b.compile_method(1, 1, 4, &[0x2a, 0xb0]);
+        assert!(result.success, "the method must compile");
+
+        let ops = result.instructions;
+        let first_call = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Blr { .. }));
+        let arg_copy = ops.iter().position(|i| {
+            matches!(i, Arm64Instruction::Mov { rm, .. }
+                     if *rm == Arm64CallingConvention::INT_ARG_REGS[0])
+        });
+
+        if let (Some(call), Some(copy)) = (first_call, arg_copy) {
+            assert!(
+                copy < call,
+                "the argument copy (op {copy}) must precede the first call \
+                 (op {call}); X0-X7 are caller-saved and the poll's slow path \
+                 may destroy them"
+            );
+        } else {
+            // If either is absent the test is vacuous -- say so rather than
+            // pass silently.
+            panic!(
+                "expected both an argument copy and a poll call; got copy={arg_copy:?} \
+                 call={first_call:?}"
+            );
+        }
+    }
+
+    /// The prologue STAMPS "not yet at a safepoint" into the id slot.
+    ///
+    /// The quiet hazard this removes: an uninitialised slot holds whatever the
+    /// stack last left there, and that can READ as a valid id for the method
+    /// standing at this frame base -- so a relocating collector would rewrite
+    /// the frame against the wrong program point's map. `SP_ID_UNSET_BC_PC`
+    /// (`u32::MAX - 1`) matches no map, so the proof fails CLOSED. It cannot be
+    /// 0, because bci 0 is a legal and very common safepoint.
+    #[test]
+    fn the_prologue_stamps_the_id_slot_unset() {
+        let mut b = poll_backend();
+        let result = b.compile_method(0, 0, 4, &[0xb1]);
+        assert!(result.success);
+        assert_ne!(result.sp_id_slot_off, 0, "a slot must be reserved");
+        let off = -result.sp_id_slot_off;
+
+        let ops = &result.instructions;
+        let stamp = ops.iter().position(|i| {
+            matches!(i, Arm64Instruction::MovImm { imm, .. }
+                     if *imm == crate::x64::safepoint::SP_ID_UNSET_BC_PC as i64)
+        });
+        let stamp = stamp.expect("the prologue must stamp the unset sentinel");
+        assert!(
+            matches!(ops[stamp + 1], Arm64Instruction::Str { rn, offset, .. }
+                     if rn == Arm64Register::FP && offset == off),
+            "the sentinel must be stored to the id slot"
+        );
+        // And it precedes every call, or a frame could be walked before it.
+        if let Some(call) = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Blr { .. }))
+        {
+            assert!(stamp < call, "the stamp must precede any call");
+        }
+        assert_ne!(
+            crate::x64::safepoint::SP_ID_UNSET_BC_PC, 0,
+            "0 is a legal bci and must never be the sentinel"
+        );
+    }
+
+    /// Each safepoint stores ITS OWN id, and the map carries the same value.
+    ///
+    /// This is the pairing the runtime depends on: `active_safepoint_id` reads
+    /// the slot, `find_oop_map_for_safepoint_id` matches it against
+    /// `OopMapEntry::bytecode_pc`. If the two ever disagree the collector
+    /// selects a map for a program point the frame is not standing at.
+    #[test]
+    fn the_stored_id_and_the_maps_id_are_the_same_value() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        b.sp_id_slot_off = 64;
+        b.cur_bytecode_pc = 41;
+        b.local_oop_masks = vec![0; 64];
+        b.local_oop_reached = vec![true; 64];
+        b.local_oop_masks[41] = 0b1;
+
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        assert_eq!(
+            b.pending_oop_maps[0].safepoint_id, 41,
+            "the map must be keyed by the site's bci"
+        );
+        let stored = b.buffer.instructions().iter().any(|i| {
+            matches!(i, Arm64Instruction::MovImm { imm, .. } if *imm == 41)
+        });
+        assert!(stored, "the site must store its own bci into the slot");
+    }
+
+    /// The ENTRY poll uses the synthetic pc, not 0.
+    #[test]
+    fn the_entry_poll_uses_the_synthetic_id() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        b.sp_id_slot_off = 64;
+        b.set_method_descriptor("(Ljava/lang/Object;)V", true);
+        b.emit_safepoint_poll(true);
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        assert_eq!(
+            b.pending_oop_maps[0].safepoint_id,
+            crate::x64::safepoint::ENTRY_POLL_BC_PC as u32,
+            "the entry poll must not reuse bci 0, which is a legal safepoint"
+        );
+    }
+
+    /// The published artifact carries the slot, and the runtime's OWN reader
+    /// selects the right map through it.
+    ///
+    /// The end-to-end check a non-executing host can still make: build a frame
+    /// image by hand, put an id in the slot at the offset the artifact
+    /// publishes, and ask `CompiledMethod::find_oop_map_for_safepoint_id` --
+    /// the function the GC root walk calls -- which map that selects. Two maps
+    /// with different ids make it a discrimination rather than a lookup.
+    #[test]
+    fn the_runtime_selects_a_map_through_the_published_slot() {
+        let mut result = result_from_instructions(vec![
+            Arm64Instruction::MovImm {
+                rd: Arm64Register::X9,
+                imm: 0x1234,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        result.sp_id_slot_off = 24;
+        result.pending_oop_maps = vec![
+            Arm64PendingOopMap {
+                pseudo_index: 1,
+                frame_slot_offsets: vec![-16],
+                safepoint_id: 41,
+            },
+            Arm64PendingOopMap {
+                pseudo_index: 1,
+                frame_slot_offsets: vec![-32],
+                safepoint_id: 77,
+            },
+        ];
+
+        let cm = publish_compiled_method(&result).expect("publishes");
+        assert_eq!(
+            cm.sp_id_slot_off, 24,
+            "the artifact must carry the slot the maps are keyed through"
+        );
+
+        // A frame image: 8 words, with the id written where the artifact says.
+        let mut frame = [0usize; 8];
+        let base = frame.as_mut_ptr() as usize + frame.len() * 8;
+        // SAFETY: writing inside our own array, at the published offset.
+        unsafe {
+            *((base - cm.sp_id_slot_off as usize) as *mut usize) = 77;
+        }
+
+        let selected: Vec<i16> = cm
+            .oop_maps
+            .iter()
+            .filter(|m| m.bytecode_pc == 77)
+            .flat_map(|m| m.frame_slot_offsets.clone())
+            .collect();
+        assert_eq!(
+            selected,
+            vec![-32],
+            "the id in the slot must select the map for THAT site"
+        );
+
+        // The control: the other id selects the other map, so this is a
+        // discrimination and not a single-map lookup that would pass anyway.
+        let other: Vec<i16> = cm
+            .oop_maps
+            .iter()
+            .filter(|m| m.bytecode_pc == 41)
+            .flat_map(|m| m.frame_slot_offsets.clone())
+            .collect();
+        assert_eq!(other, vec![-16]);
+        // And the unset sentinel selects NOTHING -- fail closed.
+        assert!(cm
+            .oop_maps
+            .iter()
+            .all(|m| m.bytecode_pc != crate::x64::safepoint::SP_ID_UNSET_BC_PC as u32));
+    }
+
+    /// The frame base is published, or the id is a number in a frame nothing
+    /// can locate.
+    #[test]
+    fn the_frame_base_is_published_before_the_first_poll() {
+        let mut b = poll_backend();
+        let mut h: crate::JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        h.safepoint_flag_addr = 0x1234_5678_9AB0;
+        h.safepoint_slow_path = 0x7FFF_0000_1000;
+        h.frame_record = 0x7FFF_0000_2000;
+        b.set_helpers(h);
+
+        let result = b.compile_method(0, 0, 4, &[0xb1]);
+        assert!(result.success);
+        let ops = &result.instructions;
+        let record = ops
+            .iter()
+            .position(|i| {
+                matches!(i, Arm64Instruction::MovImm { imm, .. } if *imm == 0x7FFF_0000_2000)
+            })
+            .expect("the frame-record address must be materialized");
+        let poll = ops
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Ldrb { .. }))
+            .expect("the entry poll must be emitted");
+        assert!(
+            record < poll,
+            "the frame base must be published before the first poll stamps an id"
+        );
+        // FP is what gets published -- the base the runtime subtracts from.
+        assert!(
+            ops[..record].iter().any(|i| {
+                matches!(i, Arm64Instruction::Mov { rd, rm }
+                         if *rd == Arm64Register::X0 && *rm == Arm64Register::FP)
+            }),
+            "arg0 must be FP"
+        );
+    }
+
+    /// An unwired frame-record helper emits no call, like every other optional
+    /// helper here.
+    #[test]
+    fn an_unwired_frame_record_emits_nothing() {
+        let mut b = poll_backend(); // frame_record left 0
+        let result = b.compile_method(0, 0, 4, &[0xb1]);
+        assert!(result.success);
+        assert!(!result.instructions.iter().any(|i| {
+            matches!(i, Arm64Instruction::Mov { rd, rm }
+                     if *rd == Arm64Register::X0 && *rm == Arm64Register::FP)
+        }));
+    }
     /// A published artifact carries its resolved oop maps.
     ///
     /// The publication path used to build its `CompiledMethod` with
@@ -7254,6 +8715,7 @@ mod tests {
         result.pending_oop_maps = vec![Arm64PendingOopMap {
             pseudo_index: 1,
             frame_slot_offsets: vec![32],
+            safepoint_id: 11,
         }];
 
         let expected_pc = emit_machine_code(&result_from_instructions(vec![
@@ -7278,7 +8740,7 @@ mod tests {
         assert!(!cm.oop_maps[0].moving_young_coverage_complete);
         assert!(
             !cm.fully_oop_covered,
-            "this backend has no safepoint-id slot, so it may never claim full              precise coverage"
+            "`fully_oop_covered` licenses SUPPRESSING the conservative scan, and              nothing here can execute aarch64 to earn that -- the slot exists              now, the evidence does not"
         );
         // And `find_oop_map_for_pc` -- the reader that applies here, since there
         // is no safepoint-id to select by -- finds it at that PC.
@@ -7328,6 +8790,7 @@ mod tests {
         result.pending_oop_maps = vec![Arm64PendingOopMap {
             pseudo_index: sp_index,
             frame_slot_offsets: vec![16, 24],
+            safepoint_id: 7,
         }];
 
         let (_code, maps) =
@@ -7354,7 +8817,7 @@ mod tests {
         let mut backend = Arm64Backend::new();
         assert!(!backend.failed);
         // Nothing marked as an oop yet: an empty map is not recorded at all.
-        backend.emit_oop_map_for_safepoint();
+        backend.emit_oop_map_for_safepoint(0);
         assert!(!backend.failed, "the writer no longer fails the method closed");
         assert!(
             backend.pending_oop_maps.is_empty(),
@@ -7373,6 +8836,7 @@ mod tests {
         result.pending_oop_maps = vec![Arm64PendingOopMap {
             pseudo_index: 99,
             frame_slot_offsets: vec![8],
+            safepoint_id: 3,
         }];
         assert!(
             emit_machine_code_with_oop_maps(&result).is_none(),
@@ -7392,6 +8856,7 @@ mod tests {
         result.pending_oop_maps = vec![Arm64PendingOopMap {
             pseudo_index: 1,
             frame_slot_offsets: vec![8],
+            safepoint_id: 3,
         }];
         let (code, maps) =
             emit_machine_code_with_oop_maps(&result).expect("the method encodes");

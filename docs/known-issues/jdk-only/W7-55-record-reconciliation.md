@@ -112,6 +112,65 @@ happened before it started.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. Both items §7 flagged "to whoever
+> schedules the next run" have now been run.** This is a bookkeeping record —
+> *"It closes nothing in the VM and opens nothing in the VM"* — so what it owed
+> was never a defect measurement. It owed the two build-and-run gaps it named.
+>
+> **§7 item 1: *"No `--features synthetic-jdk` binary has ever been built"***.
+> One was, on 2026-09-03, and four probes were run on it:
+>
+> ```text
+> CloseFlushSwallowProbe    --synthetic-jdk   9 failed / 13 differing   (shipping arms: 4 / 6)
+> DirectByteBufferStateProbe --synthetic-jdk  30 differing              (shipping arms: 23)
+> ```
+>
+> The class of claim §7 describes — *"scoped to that configuration and have
+> therefore never been observed at all, only reasoned about"* — now has
+> observations, and they were not decorative: `W7-70`'s headline defect
+> (`PrintStream.close()` losing bytes on disk) is fixed on both shipping arms
+> and **still live under `--synthetic-jdk`**, which is a divergence only that
+> binary can see.
+>
+> **§7 item 2: *"The Linux and non-Windows arms of `native-io/src/process.rs`
+> have never been compiled"***. They have now, on Linux:
+>
+> ```text
+> cargo test -p cratonvm-native-io process    25 passed; 0 failed
+> cargo test --workspace                      17,974 passed
+> ```
+>
+> W6-10's five widened signatures type-check on this host. §7's stated hazard —
+> *"a type error there is invisible until someone builds on a different host"* —
+> did not materialise.
+>
+> **A qualification to §3's headline, which this campaign is in a position to
+> make.** §3's finding is that all thirty wrong status lines erred the same way,
+> *"claimed more open work than exists"*, with **0** in the direction of
+> claiming a fix that had not landed — and it draws from that the conclusion
+> that the cost is *"purely wasted effort rather than a correctness risk"*.
+>
+> That measured whether the PATCH was in the tree. It could not measure whether
+> the patch WORKS, because nothing was run. Running them changes the picture:
+>
+> ```text
+> H13-2 §2   ca8f03069 is an ancestor of HEAD; the defect reproduces
+> G9-1       fixes landed; final-sigma still wrong in 3 of 768 checks
+> W7-58      fix landed; bb_state's direct-buffer arm confirmed live
+> G10-1      code landed; one doubleValue row still returns a non-double
+> ```
+>
+> Each of those is "fixed in source, still broken in fact". §3's asymmetry
+> survives on its own terms — no record claimed an *unlanded* patch had landed —
+> but "under-retire, never overclaim" holds for patch presence and **not** for
+> defect closure, and the second is what a reader of a status line assumes.
+>
+> **What this does NOT verify.** §§1-6 are git and source archaeology over 58
+> records and none of it was re-derived; the thirty corrected status lines were
+> not re-audited. The ADDENDUM's rotted-anchor table is a 2026-08-12 measurement
+> and its line numbers have certainly moved again. §7's other seven questions are
+> untouched.
+
 ## 1. The defect being fixed
 
 `docs/known-issues/jdk-only/` is the campaign's evidence base and its work
