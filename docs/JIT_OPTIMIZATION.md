@@ -1030,12 +1030,53 @@ the interpreter's negative "no compiled body" memo is driven by
 safe and worthless is not a reason to move a default.
 
 The residual worth having is the one this uncovered by accident: **a C2 task
-that bails in `ir_lower` still runs the whole IR pipeline, recompiles via
-single-pass, republishes an equivalent body, and pays an invalidation.** The
-compile is the expensive part, not the epoch. Six of nine supersedes in
-CratonBench are that shape. Fixing it means not enqueuing (or not completing)
-a C2 task whose lowering will bail — which needs the bail to be predictable
-before the pipeline runs, and it currently is not.
+that declines after entering the IR pipeline still recompiles via single-pass,
+republishes an equivalent body, and pays an invalidation.** The compile is the
+expensive part, not the epoch — timed at 36 ms across 6 such tasks in one
+CratonBench run, against 2 ms for the 3 that produced an IR body. That residual
+is now fixed; see below.
+
+### The deferred-`new` retry was spent blind
+
+Naming the decline routes (`[ir] IrBuilder::build refused at ir.rs:N`,
+`[ir] ir_lower::lower_inner refused (<reason>)`) moved the diagnosis twice.
+
+The residual above was written as "bails in `ir_lower`". It mostly does not.
+Five of the six fall-throughs bail one stage earlier, in `IrBuilder::build`, at
+the `0xbb` arm — a `new` whose class had no `new_info` row. That is the
+documented `JitNewSite::Deferred` path: the resolver never runs a user
+`ClassLoader.loadClass` from inside a compile, so a `new` of a not-yet-loaded
+class defers, and the builder refuses the whole method.
+
+That refusal is transient by design, and there is a one-shot memo
+(`note_deferred_new_bail` / `take_deferred_new_retry`) to give such a method one
+more optimizing attempt once the class loads. **The grant never checked whether
+it had.** It flipped its `0` to `1` on the next supersede attempt regardless, so
+on CratonBench each of the five `java/util/regex/Pattern` methods bailed
+*twice* — once for real, once on a retry spent while the class was still
+unloaded — and then had no retry left for the moment it did load. The doc
+comment even described the failure ("a class that is still not loaded on the
+retry bails again") without treating it as one.
+
+The memo now records the deferred sites as `(holder_class_id, cp_idx)` and the
+grant asks the resolver whether they resolve *now*; if not it holds the retry
+rather than burning it. Measured on CratonBench:
+
+| | before | after |
+|---|---:|---:|
+| C2 tasks that fell through to single-pass | 6 (36 ms) | **1 (6 ms)** |
+| C2 tasks that produced an IR body | 3 (2 ms) | 3 (2 ms) |
+| supersede publishes with a changed body | 8 | **3** |
+| deferred-`new` retries held / spent | 0 / 6 | **5 / 1** |
+
+The gate discriminates rather than refusing everything — it held five and
+granted one — and `lowered=3` is unchanged, so no method lost its optimized
+body. All seven CratonBench checksums are identical.
+
+**This is not a throughput claim.** The saving is ~30 ms of *background compile*
+CPU per run; the benchmark wall times moved by more than that in both
+directions, which is run-to-run noise on this host, not a result.
+`CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` restores the blind grant.
 
 ### Summary table
 
@@ -1061,6 +1102,7 @@ before the pipeline runs, and it currently is not.
 | IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
 | Skip the supersede-epoch bump when it cannot invalidate anything | off (measured worthless: 9 IC evictions/run) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
+| Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
@@ -1162,18 +1204,78 @@ tiering inversion on this shape was never a null-check problem.
         resident=3 (fp=0 gp=3) demoted=0 splits=4 scan_spills=1 scan_reloads=1
 ```
 
-It runs, and it holds **three** of nine promoted candidates while **four are
-lost to live-range splits** — against a peak of eleven live values and a file
-of five GP registers (`IR_LOWER_LS_GPRS`). So the residual inversion has two
-named causes, in this order:
+It runs, and it holds **three** of nine promoted candidates — against a peak of
+eleven live values and a file of five GP registers (`IR_LOWER_LS_GPRS`).
 
-1. **Split handling in `allocate_linear_scan`.** Four candidates in a
-   twenty-three-node graph were split out of a register. A split value keeping
-   a register for its dominant range is the difference between this loop's
-   values living in `rbx`/`r12` and living in `[rbp-90h]`.
-2. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
+**Where the other six go was, until 2026-09-03, misreported.** The consumer's
+skip census read `split_or_spilled=5` beside the allocator's `splits=4`, and
+the two together said "four candidates lost to live-range splits". They were
+not. Printing the segment shapes showed four of the five refusals had **empty
+segment lists** — nodes the scan produced no interval for, which is every
+control and memory node in the graph, `Start` and `Proj` included — and one
+genuinely spilled. **There was no split value on this method to reclaim.**
+
+That miscount cost a day: split residency was designed, built, tested and
+measured against it, and its engagement counter read zero, which is how the
+mislabel was found. The census now separates `no_alloc`, `spilled` and
+`split_or_spilled`, so the next reader gets three numbers that mean three
+different things.
+
+So the named causes of the residual inversion are, in order:
+
+1. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
    the counter compare, the backedge and the safepoint poll over four
    iterations; the optimizing tier pays all three every iteration.
+2. **The loop's values are ENTRY PARAMETERS, and entry parameters cannot be
+   promoted at all.** Traced 2026-09-03, and it is the end of the chain.
+
+`single_use` was the largest bucket (13) and looked like the answer: it refuses
+any value read fewer than twice, counting **static** graph edges. Printing the
+shape first — the lesson from the split miscount immediately above — gave:
+
+```text
+single_use n3 op=Param(0) static_uses=1 loop_weight=10   <- the receiver
+single_use n4 op=Param(1) static_uses=1 loop_weight=10   <- the loop bound
+```
+
+One static use, ten loop-weighted. The rule compares a static count while the
+definition and the uses sit at different loop depths: `this` and `n` are
+defined once at method entry and read every iteration. `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`
+generalises the test to `uses_frequency >= 2 x definition_frequency`, which
+reduces exactly to `use_count >= 2` at depth 0.
+
+**It admits them past that gate and residency does not move** — `resident=3`
+either way; they land in `no_alloc`/`spilled` instead. The policy was never the
+binding constraint, because the allocator had already declined them.
+
+**`MachineModel::pin_entry_params` pins every `Param` to its incoming ABI
+register**, and `allocate_linear_scan` skips a pinned value outright
+(`regalloc.rs`, `live.pinned[id]`). The ABI registers are caller-saved and are
+not in `IR_LOWER_LS_GPRS` (RBX, R12–R15), so an entry parameter can never be
+promoted into the callee-saved file the loop needs. It reaches the loop through
+its frame slot, every iteration, by construction.
+
+The baseline tier does the one thing this tier does not — it copies parameters
+into callee-saved registers in the prologue:
+
+```text
+39: mov r15,rsi        ; this -> r15
+3c: mov r14,rdx        ; n    -> r14
+```
+
+**So the fix is a prologue copy, not an allocator heuristic.** The optimizing
+tier needs to move loop-live parameters out of their ABI registers into the
+allocatable callee-saved file at entry, and tell the allocator that is where
+they live. Until it does, no residency policy can reach them — which is why
+three successive candidates (splits, the null check, the single-use rule) each
+measured zero on this loop.
+
+The loop-weight rule is kept, default OFF, because it is a correct
+generalisation that will matter once the parameters can be promoted at all —
+and because its own measurement is on record as not moving this workload.
+
+What it is **not**: splits, register pressure at the file's edge, code size
+(the optimizing tier emits *less* code here), or the null check.
 
 Neither is the null check, and neither is code size — the optimizing tier emits
 *less* code for this method (1,030 bytes against 1,579).

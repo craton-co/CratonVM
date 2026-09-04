@@ -553,7 +553,24 @@ impl VmHeap {
                 VmHeap::G1(G1State::new(config))
             }
             #[cfg(feature = "zgc")]
-            GcBackend::Zgc => VmHeap::Zgc(ZgcRealHeap::new_shared(total_bytes)),
+            GcBackend::Zgc => {
+                let heap = ZgcRealHeap::new_shared(total_bytes);
+                // `-XX:MaxGCPauseMillis` reached ONLY G1 before 2026-09-03.
+                // On the DEFAULT collector an operator who asked for a pause
+                // target got no answer and no diagnostic; ZGC now sizes its
+                // allocation budget from it (`refresh_pause_target_budget`).
+                // Applied after construction, so it wins over
+                // `CRATONVM_ZGC_PAUSE_TARGET_MS`, which seeded the field --
+                // an explicit flag must never be overridden by an A/B switch.
+                //
+                // `0` is refused by the CLI parser (`-XX:MaxGCPauseMillis=0`
+                // is warned about and dropped), so `Some(0)` cannot arrive
+                // here to mean "off"; that spelling belongs to the env var.
+                if let Some(ms) = overrides.max_gc_pause_ms {
+                    heap.set_pause_target_ms(ms.max(1));
+                }
+                VmHeap::Zgc(heap)
+            }
         }
     }
 
@@ -3279,6 +3296,17 @@ impl VmHeap {
                 h.allocated_bytes(),
                 h.heap_capacity(),
             );
+            // WHY those collections happened. `needs_gc` has four
+            // independent reasons and the count alone cannot separate
+            // them, which is what made "13 collections against 2" on the
+            // same workload unattributable. A cycle can satisfy more than
+            // one, so these do not have to sum to `collections`.
+            {
+                let (stress, threshold, headroom, budget, hard) = h.trigger_tallies();
+                eprintln!(
+                    "[GC] zgc-trigger: stress={stress} live_bytes_threshold={threshold}                      headroom_low={headroom} alloc_budget={budget}                      hard_alloc_refusals={hard}"
+                );
+            }
             // Phase 2.2's tracked number, on its own line so a suite runner can
             // extract it per class with one grep.
             //

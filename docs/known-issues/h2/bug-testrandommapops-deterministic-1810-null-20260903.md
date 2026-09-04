@@ -37,6 +37,53 @@ carefully enumerates what it DECLINES so the general path keeps owning those
 cases; it said nothing about what it still owes on the cases it ACCEPTS, and
 the receiver profile was the thing it owed.
 
+## What the fix COSTS, measured — and a correction
+
+The commit that made this fix said *"the cost is the general path's cost"*. That
+was an assertion, not a measurement. Measured now, it is substantial, and the
+first attempt to measure it was VACUOUS in a way worth recording.
+
+**The vacuous arm first.** A 20M-iteration virtual-call probe showed the two
+arms within 0.5% CPU — and meant nothing. `CRATONVM_DBG=invokestats` reported
+`cache_hit=4`: the loops were JIT-compiled almost immediately, so 20 million
+calls never reached the interpreter door at all. **This door only exists in
+INTERPRETED dispatch**, so pricing it requires `CRATONVM_DISABLE_JIT=1`, where
+the same probe reports `cache_hit=1800001`. A perf arm for a door has to show
+the door was used.
+
+**The cost of the recording**, `CRATONVM_DISABLE_JIT=1`, paired and alternating,
+5 pairs, idle host, CPU user time:
+
+| arm | CPU |
+|---|---|
+| fix on (records the receiver) | 2.22 2.28 2.29 2.23 2.23 |
+| `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD=1` | 1.57 1.53 1.54 1.58 1.60 |
+
+**~44% more CPU**, 5 of 5 pairs, no overlap between the arms.
+
+**Is the door still worth it?** Three arms in one window (host at load 4-6.5, so
+absolute numbers are inflated; the arms interleave so the comparison holds):
+
+| arm | CPU | vs no door |
+|---|---|---|
+| `CRATONVM_JIT=-invoke-fast-door` | 6.40 6.29 6.16 | 1.0x |
+| **door + fix (correct)** | 3.63 3.69 3.41 | **1.75x faster** |
+| door, unfixed (wrong answers) | 2.56 2.25 2.73 | 2.5x faster |
+
+So: **keep the door.** Correct, it still beats no-door by 1.75x. But its
+advertised win was inflated — roughly 40% of it was the bookkeeping it was not
+doing, and a speedup measured against a path that skipped required work is not
+the speedup it looked like.
+
+**The named optimisation.** `record_receiver_borrowed` does
+`get_or_insert_borrowed(class_id, &Arc<str>, &Arc<str>)` — a hash lookup on two
+`Arc<str>` keys — and then `slot.lock()`, PER CALL. That is precisely what this
+door's own module comment boasts of avoiding for the invocation counter ("one
+relaxed `fetch_add` instead of a sharded lock and a hash lookup"). The profile
+key is the CALLER's method, which does not change within a frame, so memoising
+the caller's profile slot once per frame entry would remove the hash lookup from
+the per-call path and should recover a good part of the 44%. Not attempted here.
+
 ## The repro
 
 ```

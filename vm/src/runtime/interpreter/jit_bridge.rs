@@ -7969,6 +7969,13 @@ pub(super) fn try_jit_compile_callee_slow(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
         )
     {
         shared
@@ -8252,6 +8259,40 @@ static SUPERSEDE_FIRST_PUBLISH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static SUPERSEDE_UNCHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUPERSEDE_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wall time spent in C2 tasks, split by whether the optimizing pipeline
+/// produced the body or threw its work away and let single-pass do it.
+///
+/// This is the number that decides whether the fall-through is worth
+/// preventing. The epoch bump it also pays was already measured at ~9
+/// invoke-cache evictions per run, i.e. nothing; the COMPILE is the part that
+/// could plausibly cost something, so it is timed rather than assumed.
+static C2_FELL_THROUGH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_FELL_THROUGH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_LOWERED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_LOWERED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_c2_compile(fell_through: bool, micros: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (n, t) = if fell_through {
+        (&C2_FELL_THROUGH_COUNT, &C2_FELL_THROUGH_US)
+    } else {
+        (&C2_LOWERED_COUNT, &C2_LOWERED_US)
+    };
+    n.fetch_add(1, Relaxed);
+    t.fetch_add(micros, Relaxed);
+}
+
+/// `(fell_through_count, fell_through_us, lowered_count, lowered_us)`.
+pub fn c2_compile_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        C2_FELL_THROUGH_COUNT.load(Relaxed),
+        C2_FELL_THROUGH_US.load(Relaxed),
+        C2_LOWERED_COUNT.load(Relaxed),
+        C2_LOWERED_US.load(Relaxed),
+    )
+}
 
 pub(super) fn note_supersede_outcome(outcome: SupersedeOutcome) {
     let counter = match outcome {
@@ -8545,6 +8586,13 @@ pub(super) fn background_compile_task(
         optimized,
     )
     .is_some();
+    // Read on the SAME thread, immediately after the compile: did this C2 task
+    // run the whole optimizing pipeline and then produce a single-pass body?
+    let fell_through = cratonvm_jit::last_compile_fell_through_to_single_pass();
+    let compile_us = start.elapsed().as_micros() as u64;
+    if published && optimized {
+        note_c2_compile(fell_through, compile_us);
+    }
     // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
     // C1 entry in `jit_cache` (JitCache::put overwrites by key). Bump the
     // global supersede epoch so per-thread invoke-cache `Jit` entries (which
@@ -8640,6 +8688,11 @@ pub(super) fn background_compile_task(
                 outcome.as_str(),
                 bumped,
             );
+            if fell_through {
+                eprintln!(
+                    "[cratonvm-jitc]   …the optimizing pipeline ran and then handed this method to the single-pass backend ({compile_us} us total)",
+                );
+            }
             // When a replacement is the same LENGTH but not the same bytes,
             // say how far apart it actually is. A handful of scattered bytes
             // is a relocation (an embedded absolute address that moved),
@@ -8671,14 +8724,22 @@ pub(super) fn background_compile_task(
     // that bail happens INSIDE a C2 task, which then falls through to the
     // single-pass backend — so the C1->C2 promotion below, which is only for a
     // C1 publish, is not the door this can use. `take_deferred_new_retry`
-    // consumes the memo, so a class still not loaded on the retry settles on
-    // single-pass exactly as before.
+    // consumes the memo only when the deferred `new` sites RESOLVE now: a class
+    // still unloaded holds the retry rather than burning it on an attempt that
+    // would bail identically.
     let deferred_new_retry = published
         && crate::runtime::env_cache::c2_supersede()
         && cratonvm_jit::take_deferred_new_retry(
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
         );
     let c2_upgrade_candidate = (published
         && !optimized

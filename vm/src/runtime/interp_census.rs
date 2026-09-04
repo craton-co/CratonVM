@@ -162,6 +162,15 @@ pub fn report_at_exit() {
             "[c2-supersede] publishes: first_publish={first_publish} unchanged={unchanged} changed={changed}; ic_evictions_from_epoch={}",
             cratonvm_classloading::epoch_stale_evictions(),
         );
+        let (ft_n, ft_us, ok_n, ok_us) =
+            crate::runtime::interpreter::jit_bridge::c2_compile_census();
+        eprintln!(
+            "[c2-supersede] compiles: lowered={ok_n} ({} ms) fell_through_to_single_pass={ft_n} ({} ms)",
+            ok_us / 1000,
+            ft_us / 1000,
+        );
+        let (held, spent) = cratonvm_jit::deferred_new_retry_census();
+        eprintln!("[c2-supersede] deferred-new retries: held={held} spent={spent}");
     }
     if direct_binds_enabled() {
         eprintln!(

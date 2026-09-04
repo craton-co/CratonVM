@@ -1627,3 +1627,140 @@ artefacts. The next step is the liveness question — the verifier type maps, as
 §16 used for `never_mapped` — applied to the band words, and it needs a
 workload whose coverage rate is stable enough to measure against, which
 `TestMVStoreTool` is not (§18.2).
+
+## 20. The liveness screen — and the crash §19 shipped (2026-09-03)
+
+*`fix/band-test-liveness-screen-20260903`. §19.3 named the liveness question as
+the next step. Adding it surfaced a defect §19 had already merged.*
+
+### 20.1 First: §19 shipped a segfault, and this is how
+
+§19's object screen dereferences a band word to read its header:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) && band_word_is_an_object(w) {
+```
+
+Its safety comment argued the word is inside the published movable range, which
+§18 bounds by the committed prefix. **That argument holds for one of the two
+callers.** `band_has_unpublished_word_with_map` takes
+`is_relocatable: impl Fn(usize) -> bool` as a PARAMETER; production passes
+`gen_heap::addr_is_movable`, but the map-less wrapper takes whatever the caller
+supplies, and every unit test in this file supplies a closure over synthetic
+values like `0xbeef_0000`. Reading a header from one of those is a segfault, and
+`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`
+duly crashed the whole `cratonvm-vm` test binary.
+
+**How it reached `dev`**: §19 was gated on the types and gc suites and
+`cargo check --workspace --all-targets`. A `check` compiles tests without
+running them, and the crashing test lives in `cratonvm-vm`, whose test suite was
+not run. The lesson is narrow and worth stating: a change to a function in
+`vm/src/` is not gated by the gc suite, and `check` is not `test`.
+
+The fix is a `readable: bool` parameter — only the caller knows whether the
+words its predicate accepts may be dereferenced. `true` for the
+`addr_is_movable` caller, `false` for the generic one, which reverts to §18's
+behaviour there. The four band tests pass again and the full 2613-test
+`cratonvm-vm` suite is green.
+
+### 20.2 The liveness screen
+
+§19 established the survivors of the object screen are header-shaped, so shape
+cannot separate a real missed root from a dead slot still pointing at a live
+object. The class file's own type maps can, for the java-locals band —
+`verifier_local_verdict`, the same oracle §16 used.
+
+**One direction only, and that is the whole safety argument.** Reporting an
+unpublished oop makes the cycle refuse to move, so DISCARDING a report is the
+direction that permits movement. A word is discarded only on a positive
+`NotOop` — the verifier saying this local definitely holds no reference at this
+bci. `Unknown` (an inlined frame, a slot outside the locals band, no type maps
+for the method) KEEPS the report, because "could not ask" must never read as
+"answered no".
+
+That is §16's asymmetry pointed the other way, and deliberately so: there the
+consequence of being wrong was a missed refutation, here it is a missed root.
+
+### 20.3 Status
+
+The screen is in and sound by construction; it is not yet measured. §18.2's
+finding stands in the way — `TestMVStoreTool`'s coverage rate swings from 2.9%
+to 83.6% on an unchanged arm, so a residue of a few percent cannot be shown to
+move against it. Whoever measures this needs a workload with a stable rate
+first; that is now the blocking item for the whole §14-§20 line of work, ahead
+of any further screening.
+
+## 21. A workload whose coverage rate can actually be measured (2026-09-03)
+
+*`perf/g1-coverage-stable-probe-20260903`. §20.3 made this the blocking item
+for the whole §14-§20 line: the screens are sound by construction but
+unmeasurable, because the only workload exercising enough compiled frames swung
+its coverage rate by 80 points between identical runs.*
+
+### 21.1 What was wrong with both ends
+
+| | frames | rate spread, identical runs | reliable? |
+|---|---:|---|---|
+| `HumongousChurn` &co. | ~14 | n/a — reports 0% | yes |
+| `TestMVStoreTool` (H2) | 612 | **2.9% - 83.6%** | no (`rc=1`) |
+
+The probes are stable and have no obligation to report; H2 has plenty and
+cannot be measured. Neither is a surface for a few-percent effect.
+
+### 21.2 `probes/CoverageBench.java`
+
+The shape follows from what the metric needs, and each part is there for one
+reason:
+
+* **Ten distinct hot methods**, each holding three or more REFERENCE LOCALS
+  live across an allocating call. That is what puts oops in a compiled frame's
+  spill band at a safepoint, which is the thing the coverage verifier has an
+  opinion about — one method with a deep loop gives one frame, ten called in
+  rotation give ten.
+* **Determinism**: no clock, no IO, no identity hashing, no threads. The
+  retained set is walked BY INDEX rather than by chasing `next`, so the access
+  pattern does not depend on where the collector put anything.
+* **A constant live set**, so pause boundaries do not drift as the run
+  proceeds, and escaping garbage through a rotating window so the allocation is
+  real.
+
+### 21.3 It is stable, and the run has to be long
+
+Four to six identical runs per configuration, `-Xmx32m`, precise-only switches
+and oracle on:
+
+| rounds | frames | pauses | incomplete rate | spread |
+|---:|---:|---:|---|---:|
+| 4 000 | 6 | 2 | 50.00 x6 | 0 (too small to mean anything) |
+| 40 000 | 302-659 | 64-137 | 87.50, 90.62, 92.31, 92.70, 98.44, 98.53 % | 11 pts |
+| **150 000** | **1283-2207** | 260-456 | **96.92, 97.48, 97.59, 97.80 %** | **0.88 pts** |
+
+`checksum` is identical across every run of a configuration and `rc=0`
+throughout — neither is true of the H2 class.
+
+**The pause COUNT still varies about twofold**, because when the JIT compiles
+each method shifts the allocation rate. The RATE does not, once the run is long
+enough for the compiled steady state to dominate the early pauses. That is the
+distinction that makes this measurable: the metric is a ratio, and the ratio
+converges even though its denominator does not.
+
+At 150 000 rounds this gives 1283-2207 compiled frames — two to three times the
+H2 sample — with a spread under one point, against H2's eighty. A change worth
+one or two points is now visible; against `TestMVStoreTool` it never was.
+
+### 21.4 What it says, and the work it unblocks
+
+`incomplete = 97.5%`, reason `compiled-frame-oop-not-published`, stably. So the
+obligation §17.4 named is not an artefact of H2 — a deterministic workload with
+no IO and a constant live set reproduces it at the same rate every time.
+
+That is the number for the §20.2 liveness screen to be measured against, and
+for whatever follows it. The recommended invocation:
+
+```
+CRATONVM_GC_PRECISE_ONLY_ROOTS=1 CRATONVM_G1_PRECISE_ONLY_ROOTS=1 \
+CRATONVM_DBG_VERIFY_OOP_MAPS=1 \
+cratonvm -Xmx32m -XX:+UseG1GC --verbose:gc -cp probes CoverageBench 20000 150000 512
+```
+
+Four reps, compare medians, and treat anything under a point as noise.
