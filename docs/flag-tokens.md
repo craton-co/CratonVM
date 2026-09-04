@@ -924,7 +924,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-135 tokens.
+136 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -991,6 +991,7 @@ export inherited from a parent shell.
 | `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
 | `gpu-dispatch-streams` | `CRATONVM_GPU_DISPATCH_STREAMS` |
 | `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
+| `jit-gpu-array-barrier` | `CRATONVM_JIT_GPU_ARRAY_BARRIER` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |
 | `gpu-host-callback` | `CRATONVM_GPU_HOST_CALLBACK` |
