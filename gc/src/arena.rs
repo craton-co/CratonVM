@@ -1422,11 +1422,18 @@ impl Arena {
     /// **The caller must have proved the span holds nothing live and is on no
     /// free list.** Both callers satisfy that by construction: they pass space
     /// a cursor has just retracted past, which is un-bumped by definition.
-    fn decommit_span(&mut self, lo: usize, hi: usize) -> usize {
+    ///
+    /// `site` names WHICH of those proofs was made. It is remembered with the
+    /// span and printed by the crash handler when a fault lands inside it
+    /// (`crate::reservation::recent_decommit_covering`), because the two
+    /// families fail differently: a span released from the FREE LIST that was
+    /// still reachable is a missing root, while one released behind a RETRACTED
+    /// CURSOR that was still reachable is a sweep that mis-sized the live set.
+    fn decommit_span(&mut self, lo: usize, hi: usize, site: &'static str) -> usize {
         if hi <= lo {
             return 0;
         }
-        self.data.decommit_range(lo, hi - lo)
+        self.data.decommit_range(lo, hi - lo, site)
     }
 
     fn is_high(&self, offset: usize) -> bool {
@@ -1669,7 +1676,7 @@ impl Arena {
         self.pre_retract_low = self.pre_retract_low.min(old_high);
         // As the low retraction: `[old_high, high_cursor)` is un-bumped again
         // and off the free list, so its whole granules go back to the OS.
-        self.decommit_span(old_high, self.high_cursor);
+        self.decommit_span(old_high, self.high_cursor, "high-cursor-retract");
         if give < block.size {
             self.push_high(FreeBlock {
                 offset: block.offset + give,
@@ -2876,7 +2883,7 @@ impl Arena {
         let reclaimed = old_cursor - new_cursor;
         self.cursor = new_cursor;
         self.pre_retract_high = self.pre_retract_high.max(old_cursor);
-        self.decommit_span(new_cursor, old_cursor);
+        self.decommit_span(new_cursor, old_cursor, "low-cursor-retract");
         reclaimed
     }
 
@@ -2912,7 +2919,7 @@ impl Arena {
         // to the OS: without it a process that peaks and then idles holds its
         // peak forever, because `retract_cursor_into_free_tail` moved a number
         // and nothing else.
-        self.decommit_span(off, old_cursor);
+        self.decommit_span(off, old_cursor, "free-tail-retract");
         size
     }
 
@@ -2932,7 +2939,7 @@ impl Arena {
     /// and zero on a heap whose middle is smaller than a granule.
     pub fn decommit_unbumped_middle(&mut self) -> usize {
         let (lo, hi) = (self.cursor, self.high_cursor);
-        self.decommit_span(lo, hi)
+        self.decommit_span(lo, hi, "unbumped-middle")
     }
 
     /// Hand the whole granules inside every FREE-LIST block back to the OS.
@@ -2986,7 +2993,7 @@ impl Arena {
         let mut released = 0usize;
         let low: Vec<(usize, usize)> = self.low_blocks_sorted();
         for (off, size) in low {
-            released += self.decommit_span(off, off + size);
+            released += self.decommit_span(off, off + size, "free-list-low");
         }
         let high: Vec<(usize, usize)> = self
             .free_high
@@ -2994,7 +3001,7 @@ impl Arena {
             .map(|b| (b.offset, b.size))
             .collect();
         for (off, size) in high {
-            released += self.decommit_span(off, off + size);
+            released += self.decommit_span(off, off + size, "free-list-high");
         }
         released
     }
