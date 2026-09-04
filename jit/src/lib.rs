@@ -1636,6 +1636,23 @@ pub struct OopMapEntry {
     /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
     /// a proof into a guess, so the report must not spend it.
     pub stack_marks_exact: bool,
+    /// §25.3's probe — how many oop homes the SHADOW PUSH paired with this
+    /// safepoint published, captured just before `emit_shadow_reload` pops
+    /// them.
+    ///
+    /// Shadow publication is CALL-SCOPED (§25.2): `emit_shadow_push` runs
+    /// before the call and `emit_shadow_reload` pops right after it returns.
+    /// The band verifier's obligation is not scoped that way, so a frame
+    /// stopped at a safepoint that published nothing reports every movable word
+    /// it holds as un-rewritable — even the ones this map names. That is the
+    /// shape §22.2 measured (67 of 93 reported words `in_map=true`) and could
+    /// not explain.
+    ///
+    /// `0` says this safepoint pushed nothing. It does not by itself say
+    /// whether that is because the site is poll-shaped, because the gate was
+    /// off, or because no oop was live — those are separated by the
+    /// `shadow_incomplete_cause` counters.
+    pub shadow_pushed: u16,
 }
 
 impl OopMapEntry {
@@ -1654,6 +1671,7 @@ impl OopMapEntry {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         }
     }
 
@@ -2548,6 +2566,21 @@ pub struct FrameLayout {
     /// Prologue save area for the caller's callee-saved GPRs.
     pub callee_saved_lo: i32,
     pub callee_saved_hi: i32,
+    /// Is that save area at the SHALLOW end of the frame (nearest the frame
+    /// pointer) rather than the deep end?
+    ///
+    /// x86-64 puts it deepest, which lets the band verifier treat
+    /// `callee_saved_lo` as a half-line -- everything at or beyond it is a
+    /// register image or past the frame. AArch64's prologue puts the saved
+    /// FP/LR pair and the callee-saved GPRs immediately below the frame
+    /// pointer and the spill area BELOW them, so that half-line would exclude
+    /// the entire spill area -- exactly where the oop maps point, leaving the
+    /// verifier unable to see the words it exists to check.
+    ///
+    /// `false` (the derived default) is the x86-64 geometry, so no existing
+    /// producer changes. A backend that sets it gets the RANGE exclusion
+    /// (`is_register_image`) and not the half-line.
+    pub callee_saved_shallow: bool,
     /// Prologue save area for the caller's callee-saved XMMs.
     pub xmm_saved_lo: i32,
     pub xmm_saved_hi: i32,
@@ -12966,7 +12999,12 @@ mod atomic_accessor_intrinsic_tests {
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the shape must match, or this test cannot tell the gate from a              matcher that stopped matching"
         );
-        if std::env::var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
+        // Through the flag boundary, not `std::env` directly: a test that reads
+        // the environment raw is measuring the developer's ambient shell rather
+        // than the VM's latched configuration, which is the hazard
+        // `flag_declaration_guard` exists to name — and reading it raw here is
+        // what left `check-surface.sh` red on dev.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
             // Someone is running the root-cause work with the family on.
             return;
         }
@@ -38810,7 +38848,12 @@ mod layout_constant_inventory {
         // it reconstructs both cell addresses to assert both stores are
         // emitted, which is the assertion that would have caught the
         // compact-only arm before a run-time census had to.
-        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
+        //
+        // 2026-09-04: the layout-epoch guard's regression test adds three more
+        // `HEADER_SIZE` uses (17 -> 20), all of them reading back the compact
+        // cell it just proved is or is not written. No new EMISSION site: the
+        // guard itself bakes an epoch address and a count, not a displacement.
+        ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {

@@ -82,6 +82,10 @@ const SKIPPED_DIRS: &[&str] = &["target", ".git", "apps", "node_modules"];
 /// that call site — "it was easier" is not a reason.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "CRATONVM_REGEN_DEAD_CITATION_BASELINE",
+        "kind 3: a TEST HARNESS switch, read by `types/tests/doc_citation_paths.rs`          to rewrite its own checked-in baseline instead of asserting against it.          It never reaches a running VM, so there is no `VmFlags` snapshot to          serve it and no `CRATONVM_<GROUP>=token` spelling that would mean          anything; declaring it would put a name in the operator-facing          inventory that an operator can never usefully set.",
+    ),
+    (
         "CRATONVM_",
         "kind 1: the bare prefix, never a variable. Two test helpers named \
          `with_env` (`vm/src/config.rs`, `libcratonvm/src/lib.rs`) \
@@ -103,7 +107,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "CRATONVM_REGEN_DEAD_CITATION_BASELINE",
-        "kind 4: a TEST-HARNESS regeneration switch, not a VM knob.          `types/tests/doc_citation_paths.rs` reads it with a raw          `std::env::var_os` to rewrite the dead-citation baseline, and a run          that regenerates then FAILS on purpose — a regenerating run has          verified nothing, and a CI job that exported the variable would          otherwise pass while checking nothing. Nothing under any `src/`          reads it, so declaring it would put one test binary's maintenance          switch on the runtime flag surface and hand it a `CRATONVM_DBG=`          token the VM would never consult. Same argument as          `CRATONVM_RATCHET_ROWS` below.",
+        "kind 4: a TEST-HARNESS regeneration switch, not a VM knob.          `types/tests/doc_citation_paths.rs` reads it with a raw          `std::env::var_os` to rewrite the dead-citation baseline and then          FAIL on purpose, because a regenerating run verifies nothing.          Nothing under any `src/` reads it, so declaring it would put one          test binary's maintenance switch on the runtime flag surface and          hand it a `CRATONVM_<GROUP>=` token the VM would never consult.",
     ),
     (
         "CRATONVM_RATCHET_ROWS",
@@ -361,6 +365,77 @@ fn every_cratonvm_literal_is_declared_or_explicitly_exempt() {
          a row to `ALLOWED` in this file with the reason.\n\n  {}",
         offenders.len(),
         offenders.join("\n  ")
+    );
+}
+
+/// The reverse of `every_cratonvm_literal_is_declared_or_explicitly_exempt`: a
+/// key that is DECLARED but that no Rust source reads any more.
+///
+/// A knob whose last reader was deleted or renamed still appears in
+/// `docs/CONFIG.md` and in the generated tables, where it reads as a supported
+/// lever an operator can set — and setting it does nothing. That is worse than
+/// an undeclared flag, which at least still works.
+///
+/// This existed only in `tools/flag-census/check-surface.sh`, which runs on the
+/// Linux CI leg *after* a push has already landed on `dev`. The `pre-push` hook
+/// runs this file, so putting the check here is what makes it a gate rather
+/// than a report — and it is free: `scan()` has already walked every source for
+/// the test above.
+///
+/// Found by it on the day it was written: `CRATONVM_JIT_IR_GATED_REF_STORE`,
+/// left behind when its reader was renamed to `CRATONVM_JIT_IR_REF_STORE` on
+/// 2026-09-02. It had been advertised as a working switch ever since.
+#[test]
+fn every_declared_flag_still_has_a_reader() {
+    let sites = scan();
+    // A name counts as READ only where it is read — not where it is DECLARED.
+    // `scan()` walks every Rust source, and `flag_groups.rs` is one: each
+    // `E { .. on_key: Some("CRATONVM_X") .. }` row puts that literal in a Rust
+    // file, so without this filter every declared flag looks like it has a
+    // reader and this test passes for all possible inputs.
+    //
+    // That is not hypothetical. Written without it, this test passed with
+    // `CRATONVM_JIT_IR_GATED_REF_STORE` — a knob with no reader at all —
+    // deliberately re-added to the inventory. A guard that cannot fail is worse
+    // than no guard: it reports the property it does not check.
+    const DECLARATION_SITES: &[&str] = &["types/src/flag_groups.rs"];
+    let read: BTreeSet<&str> = sites
+        .iter()
+        .filter(|(_, where_read)| {
+            where_read
+                .iter()
+                .any(|site| !DECLARATION_SITES.iter().any(|d| site.starts_with(d)))
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let mut dead: Vec<&str> = declared()
+        .into_iter()
+        .filter(|name| !read.contains(name))
+        // A GROUP variable (`CRATONVM_JIT`, `CRATONVM_GC`, ...) is parsed by the
+        // flag machinery from its own table rather than named as a literal at a
+        // read site, and the five scalars are read through typed accessors. Both
+        // are declared-by-construction, so absence from the literal scan says
+        // nothing about them.
+        .filter(|name| !Group::ALL.iter().any(|g| g.var() == *name))
+        .filter(|name| !SCALARS.contains(name))
+        .collect();
+    dead.sort_unstable();
+    assert!(
+        dead.is_empty(),
+        "{} declared CRATONVM_* variable(s) are read by no Rust source.
+
+         A knob whose last reader was deleted or renamed still appears in          docs/CONFIG.md and in the generated tables, where it reads as a          supported lever — and setting it does nothing.
+
+         Remove the row from `types/src/flag_groups.rs::INVENTORY` and the name          from `types/tests/flag-surface.txt`, then regenerate both docs:
+            python tools/flag-census/render-inventory.py .
+            bash   tools/flag-census/render-tokens.sh
+
+         If the reader was RENAMED, declare the new name rather than deleting          the knob.
+
+  {}",
+        dead.len(),
+        dead.join("
+  "),
     );
 }
 

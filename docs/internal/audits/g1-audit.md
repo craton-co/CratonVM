@@ -2049,3 +2049,129 @@ looked obvious and were wrong, two of them after being implemented. The cost of
 the fifth is one more build; the cost of writing down four eliminated
 candidates and the one fact that survived them is a paragraph. On this
 question's track record the paragraph is the better trade.
+
+## 26. The safepoint-kind probe refutes §25, and finds the real cause (2026-09-04)
+
+§25 ended by proposing a probe: for each reporting frame, record whether the
+resolved `sp_id` belongs to a call-shaped safepoint (shadow push live) or a
+poll-shaped one (push absent or already reloaded). If the reports concentrated
+on poll-shaped safepoints, the answer would be that shadow publication is
+call-scoped while the band verifier's obligation is not.
+
+It does not. The probe added `OopMapEntry::shadow_pushed`, captured in
+`emit_oop_map_for_safepoint` **before** `emit_shadow_reload` takes
+`pending_shadow` — after that call the count is zero by construction, which is
+the one way this probe could have lied. On `CoverageBench 20000 150000 512` at
+`-Xmx32m`, 288 reports over 266 pauses:
+
+| method | `sp_id` | `in_map` | `shadow_pushed` | n |
+| --- | --- | --- | --- | --- |
+| `alloc` | 2 | false | 0/0 | 233 |
+| `m06` | 12 | true | 2/3 | 24 |
+| `main` | 217 | true | 3/3 | 30 |
+
+Nothing reports `0/N`. The `in_map=true` safepoints are call-shaped and the
+push did publish — three of three mapped slots for `main`. §25's hypothesis is
+refuted.
+
+### 26.1 What the same line said instead
+
+Every one of the 288 reports carried `published=0`. That was read for two
+sessions as a publication fact — the shadow push declined these oops, so look
+at `collect_live_oop_homes`. It is not a publication fact.
+`published_shadow_values(None)` returns an empty set, so `published=0` means
+either "the window resolved and held nothing" or "the window did not resolve at
+all", and those point at opposite repairs. `Option` had folded ten distinct
+refusals and a genuinely empty stack into one indistinguishable `None` — the
+UNKNOWN-vs-ZERO conflation, this time inside the instrument rather than the
+subject.
+
+`shadow_window_from_frame_why` now names the refusal and
+`shadow_window_from_frame` is its only reason-discarding caller, so the
+diagnostic cannot drift from the path actually taken. Re-run:
+
+```
+211 alloc win=unresolved(thread-null-or-misaligned) push=0/0
+ 30 main  win=unresolved(?)                         push=3/3
+  6 m06   win=unresolved(?)                         push=2/3
+```
+
+`(?)` is `.err().unwrap_or(...)` on an `Ok` — recomputed against their own
+frames, `main` and `m06` resolve the window fine. They were being verified
+against a window that failed to resolve somewhere else.
+
+### 26.2 The cause
+
+`ir_lower::finish_lazy_thread_fetch` erases the thread-pointer fetch whenever a
+method publishes nothing (`!shadow_pushed_any`), so a leaf with no oops to push
+leaves `[rbp - shadow_thread_slot_off]` zero **by design**. That is a correct
+optimisation. The band verifier's use of it was not: it resolved the thread's
+shadow window from the **innermost** frame alone, and when that frame was such
+a leaf — `CoverageBench.alloc`, whose map names nothing — the window came back
+`None`, and every oop in every outer frame read as unpublished.
+
+228 of 229 pauses declined relocation on that basis, while `main` had in fact
+pushed three of its three mapped slots.
+
+The three reporting groups are one mechanism, not three: `alloc` is the frame
+that loses the window, `main` and `m06` are the frames billed for it.
+
+### 26.3 The repair, and what it is worth
+
+The shadow stack is per-**thread**; the frame slot was only ever a cache, and
+`shadow_window_from_frame_why` already refused any cached pointer that was not
+`current_jit_thread_ptr()`. So when a thread is installed, ask it directly.
+Both paths now end in one shared `shadow_window_at`, so a window reached either
+way is held to identical `ShadowStack` invariants. The frame path remains for
+the no-installed-thread case (unit tests, threads that never entered JIT code).
+
+Kill switch `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW`, so this is one
+binary's A/B and not two builds. ABBA-interleaved, `CoverageBench` at
+`-Xmx32m`, `incomplete` rate:
+
+| configuration | fix off | fix on |
+| --- | --- | --- |
+| default | 99.5 – 100 % | 18.1 – 26.8 % |
+| precise-only roots | 97.8 – 100 % | 18.0 – 28.4 % |
+
+Checksum identical in every completed run of every arm.
+
+### 26.4 The cost, stated plainly
+
+Making the proof succeed makes G1 actually relocate, and at the tightest heap
+that reaches a pre-existing degradation this workload never used to arrive at:
+
+```
+degraded=evacuation-failure-self-forwarded,evacuation-failure-drain-wedged
+```
+
+`EVACUATION_FAILURE_UNRESOLVED` is documented in `gc_metrics.rs` as "the one G1
+state that silently converts most of the heap into kept, mostly-garbage
+regions" — which at `-Xmx32m` is an `OutOfMemoryError`. Fatal-OOM rates:
+
+| configuration | heap | fix off | fix on |
+| --- | --- | --- | --- |
+| precise-only roots | 32 m | 0/40 | 5/40 |
+| precise-only roots | 48 m | 0/10 | 0/10 |
+| precise-only roots | 64 m | 0/10 | 0/10 |
+| default | 32 m | 0/20 | 0/20 |
+
+So the regression is confined to the **opt-in** precise-only mode at the
+tightest heap, where the suppression really fires and G1's pin set really goes
+empty. The shipping configuration takes the coverage gain and shows no failure
+in 20 runs per arm. The rate is also load-dependent — an earlier sample on a
+busier host read 4/16 where a later one read 1/24 — so treat the 5/40 as an
+order of magnitude, not a measurement.
+
+This is the "a crash under YOUR feature may be a known dev defect your feature
+merely ENABLES" shape: the wedge is pre-existing, instrumented, and named in
+dev; the fix's contribution is arriving at it. The next question for the
+precise-only default belongs to `retry_after_evacuation_failure`, not here.
+
+### 26.5 The residual this leaves
+
+`m06` reports `2/3` — its map names three slots and only two homes were
+collected. That is an independent per-slot gap in `collect_live_oop_homes`,
+untouched by the window repair and now the only remaining lead from §25's
+question. It accounts for 6 to 24 reports per run against `alloc`'s 211, so it
+is worth pursuing only after the ~20 % residual incomplete rate is attributed.

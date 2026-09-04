@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-334 tokens.
+336 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -684,13 +684,14 @@ export inherited from a parent shell.
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
-| `ir-gated-ref-store` | `CRATONVM_JIT_IR_GATED_REF_STORE` |
 | `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
 | `ir-receiver-guard-cse` | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` |
 | `ir-residency-pays` | `CRATONVM_JIT_IR_RESIDENCY_PAYS` |
 | `ir-fused-branch` | `CRATONVM_JIT_IR_FUSED_BRANCH` |
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
+| `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -724,6 +725,7 @@ export inherited from a parent shell.
 | `deferred-new-retry-blind` | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND` |
 | `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `ir-param-copy` | `CRATONVM_JIT_IR_PARAM_COPY` |
+| `ir-rpo-layout` | `CRATONVM_JIT_IR_RPO_LAYOUT` |
 | `supersede-epoch-skip-useless` | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
@@ -922,7 +924,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-134 tokens.
+135 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -934,6 +936,7 @@ export inherited from a parent shell.
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `moving-young-band-object-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN` |
 | `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
+| `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |

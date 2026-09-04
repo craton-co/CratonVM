@@ -45,6 +45,28 @@ push-time gate that costs minutes gets `--no-verify`d permanently and is worse
 than no gate. Everything here is a source scan and a table comparison — no VM
 boots, no fixtures, no network, no non-determinism.
 
+Those three targets cover the flag surface in **both** directions:
+
+* a flag **read but not declared** — `every_cratonvm_literal_is_declared_or_explicitly_exempt`;
+* a flag **declared but no longer read** — `every_declared_flag_still_has_a_reader`,
+  added 2026-09-04. A knob whose last reader was deleted or renamed still
+  appears in `docs/CONFIG.md` and in the generated tables, where it reads as a
+  supported lever that does nothing. This half previously lived only in
+  `tools/flag-census/check-surface.sh`, which runs on the Linux CI leg *after*
+  the push — so it reported the problem and could not prevent it. It costs
+  nothing extra here: the scan it needs has already been walked for the first
+  check.
+
+  It found `CRATONVM_JIT_IR_GATED_REF_STORE` on the day it was written, left
+  behind when its reader was renamed to `CRATONVM_JIT_IR_REF_STORE`.
+
+Note what "read" means: a name counts as read only where it is **read**, not
+where it is declared. `flag_groups.rs` is itself a Rust source, so every
+`on_key: Some("CRATONVM_X")` puts that literal in the scan — and without
+excluding the declaration site the reverse check passes for every possible
+input. It did, on first writing, with a knob that had no reader at all
+deliberately re-added.
+
 For the same reason the scope is the flag surface and nothing else. **It is not
 a substitute for running the tests your change actually touches.**
 

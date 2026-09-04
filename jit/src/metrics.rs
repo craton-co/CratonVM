@@ -3352,10 +3352,11 @@ pub static SP_REF_STORE_BAIL: [std::sync::atomic::AtomicU64; 3] = [
 pub const SP_REF_STORE_BAIL_NAMES: [&str; 3] = [
     "receiver-unproven",
     "satb-marking-armed",
-    // Retired the same day it was first measured: the arm emits BOTH store
-    // shapes and picks per object, so a legacy receiver is no longer a reason
-    // to leave it. The slot stays so the indices around it do not move.
-    "receiver-not-compact-RETIRED",
+    // Was "receiver-not-compact", retired the same day it was first measured
+    // when the arm grew both store shapes. Re-used 2026-09-04 for the layout
+    // epoch guard, which is the other way a baked compact offset stops being
+    // usable.
+    "layout-replaced",
 ];
 
 /// Executions of the two OTHER single-pass inline reference-store arms —
@@ -3449,6 +3450,32 @@ pub fn sp_ref_store_bails() -> Vec<(&'static str, u64)> {
         .map(|(n, c)| (*n, c.load(std::sync::atomic::Ordering::Relaxed)))
         .filter(|(_, v)| *v > 0)
         .collect()
+}
+
+/// Which SHAPE an inline reference store actually wrote — trace-only.
+///
+/// `IR_REF_STORE_INLINE_TAKEN` says the fast path ran; it does not say whether
+/// the receiver turned out compact or legacy, and that is the question the
+/// two-shape store exists to answer. The legacy arm was added on 2026-09-02
+/// because compact receivers were rare; the compact TLAB shape became the
+/// default on 2026-09-04, which inverts the premise. A pair of counters is the
+/// only way to know which arm is now carrying the workload, and whether the
+/// other still earns its place.
+pub static IR_REF_STORE_SHAPE_COMPACT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Inline reference stores that wrote the legacy 16-byte cell.
+/// See [`IR_REF_STORE_SHAPE_COMPACT`].
+pub static IR_REF_STORE_SHAPE_LEGACY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(compact, legacy)` shapes written by the optimizing tier's inline
+/// reference store.
+pub fn ir_ref_store_shape_counts() -> (u64, u64) {
+    (
+        IR_REF_STORE_SHAPE_COMPACT.load(std::sync::atomic::Ordering::Relaxed),
+        IR_REF_STORE_SHAPE_LEGACY.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// `(inline, helper)` dynamic path counts. `(0, 0)` means the trace was off.
