@@ -12930,6 +12930,21 @@ pub(crate) fn lower_inner_with_scopes(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
+    // ENGAGEMENT, not effect. Both numbers answer "did the wiring fire on this
+    // method", which is the question a null timing result cannot answer on its
+    // own -- and this session spent three A/B arms on `CratonBench` before
+    // noticing that the optimizing tier plans no residency there at all, so
+    // both arms had been running identical machine code.
+    if ls_active
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+    {
+        eprintln!(
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
+            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+        );
+    }
+
     // Carry the identity the prologue encoded, so publication can bind it to
     // the artifact this buffer becomes.
     let compile_id = lowerer.compile_id;
