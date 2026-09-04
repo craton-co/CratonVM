@@ -198,9 +198,38 @@ pub mod mic_prof {
     }
 
     #[inline]
+    #[cfg(target_arch = "x86_64")]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// The same counter off x86-64, where `_rdtsc` does not exist.
+    ///
+    /// AArch64's equivalent is the virtual counter `CNTVCT_EL0`, unprivileged
+    /// under Linux by default. It ticks at a fixed frequency rather than the
+    /// core clock, so these numbers are NOT comparable across architectures --
+    /// which is fine, because every consumer uses them as deltas within one
+    /// process. Anything else falls back to the monotonic clock so the counters
+    /// keep working rather than the crate refusing to build.
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cnt: u64;
+            // SAFETY: CNTVCT_EL0 is a read-only counter, unprivileged on Linux.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+            cnt
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        }
     }
 
     /// Counter families for the re-entrancy gate. Depth is tracked PER FAMILY,
@@ -7788,9 +7817,24 @@ fn compiled_frames_above() -> String {
         return "none: code-range table empty".to_string();
     }
     let mut rbp: usize;
+    // The frame-pointer register, by name. x86-64 calls it RBP; AAPCS64 calls
+    // it X29 and the chain has the same shape (saved FP at `[FP]`, return
+    // address at `[FP+8]`), so the walk below is unchanged. Any other
+    // architecture has no name for it here and the diagnostic says so rather
+    // than walking a garbage value.
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: reads a register. No memory is accessed by the asm itself.
     unsafe {
         std::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads a register. No memory is accessed by the asm itself.
+    unsafe {
+        std::arch::asm!("mov {}, x29", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return "none: no frame-pointer register known for this architecture".to_string();
     }
     let mut out: Vec<String> = Vec::new();
     let mut depth = 0usize;
@@ -9975,9 +10019,38 @@ pub mod gs_prof {
     }
 
     #[inline]
+    #[cfg(target_arch = "x86_64")]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// The same counter off x86-64, where `_rdtsc` does not exist.
+    ///
+    /// AArch64's equivalent is the virtual counter `CNTVCT_EL0`, unprivileged
+    /// under Linux by default. It ticks at a fixed frequency rather than the
+    /// core clock, so these numbers are NOT comparable across architectures --
+    /// which is fine, because every consumer uses them as deltas within one
+    /// process. Anything else falls back to the monotonic clock so the counters
+    /// keep working rather than the crate refusing to build.
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cnt: u64;
+            // SAFETY: CNTVCT_EL0 is a read-only counter, unprivileged on Linux.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+            cnt
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        }
     }
 
     pub struct CycGuard<'a> {

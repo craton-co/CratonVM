@@ -9677,6 +9677,93 @@ mod arm64_execution {
 
         TEST_SP_FLAG.store(0, Ordering::SeqCst);
     }
+
+    /// THE 32-BIT INT OPS ARE LOWERED AS 64-BIT, AND HERE IS THE PROOF.
+    ///
+    /// The module header has said so since the 2026-08-01 parity audit --
+    /// `iadd`/`isub`/`imul`/`ineg`/`ishl`/`ishr`/`iand`/`ior`/`ixor` share the
+    /// emitters of their `l*` counterparts, so JVM 32-bit wrapping never
+    /// happens -- but it was a CLAIM: nothing in this repository could execute
+    /// AArch64 to demonstrate it. This does.
+    ///
+    /// `iadd` of `Integer.MAX_VALUE + 1` must be `Integer.MIN_VALUE`
+    /// (JVMS 6.5 `iadd`: "the result is the 32 low-order bits of the true
+    /// mathematical result... overflow is not detected"). The X-form `ADD`
+    /// returns the mathematical result instead.
+    ///
+    /// This test pins the WRONG answer on purpose. It is the characterization
+    /// of a known miscompile, not an endorsement: when the W-form work lands it
+    /// will fail, and the fix is to flip it to
+    /// `iadd_wraps_at_32_bits_as_the_jvms_requires` below and delete that
+    /// test's `#[ignore]`. Fixing it properly is a backend-wide type-discipline
+    /// change (W-forms threaded through loads, compares, returns and `i2l`),
+    /// which the header asks not to attempt piecemeal.
+    #[test]
+    fn iadd_does_not_wrap_at_32_bits_and_this_is_a_bug() {
+        let _serial = exec_guard();
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(false);
+        let result = b.compile_method(2, 2, 4, &IADD);
+        assert!(result.success);
+        let cm = publish_compiled_method(&result).expect("publishes");
+
+        let got = call2(&cm, i64::from(i32::MAX), 1);
+        assert_eq!(
+            got,
+            i64::from(i32::MAX) + 1,
+            "the 64-bit ADD returns the mathematical result"
+        );
+        assert_ne!(
+            got,
+            i64::from(i32::MIN),
+            "...and NOT the wrapped `int` the JVMS requires -- this is the \
+             documented 32-bit lowering gap, now demonstrated rather than \
+             asserted"
+        );
+    }
+
+    /// What `iadd` must do once the W-form work lands.
+    ///
+    /// Kept executable and ignored rather than described in a comment, so the
+    /// fix has a test to turn green instead of one to write.
+    #[test]
+    #[ignore = "32-bit int ops are lowered as 64-bit; see \
+                iadd_does_not_wrap_at_32_bits_and_this_is_a_bug and the module \
+                header's `32-bit int ops` gap"]
+    fn iadd_wraps_at_32_bits_as_the_jvms_requires() {
+        let _serial = exec_guard();
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(false);
+        let result = b.compile_method(2, 2, 4, &IADD);
+        assert!(result.success);
+        let cm = publish_compiled_method(&result).expect("publishes");
+        assert_eq!(call2(&cm, i64::from(i32::MAX), 1), i64::from(i32::MIN));
+    }
+
+    /// The second face: `ishl` does not mask its shift amount to 5 bits.
+    ///
+    /// JVMS 6.5 `ishl`: the shift distance is "the value of the low 5 bits" of
+    /// the second operand, so `1 << 32` is `1`. A 64-bit `LSL` shifts by 32 and
+    /// yields 4294967296. An independent instruction from `iadd`, so this is a
+    /// second witness rather than the same one twice.
+    #[test]
+    fn ishl_does_not_mask_the_shift_to_five_bits_and_this_is_a_bug() {
+        let _serial = exec_guard();
+        // iload_0; iload_1; ishl; ireturn
+        let code = [0x1a, 0x1b, 0x78, 0xac];
+        let mut b = Arm64Backend::new();
+        b.set_safepoints_enabled(false);
+        let result = b.compile_method(2, 2, 4, &code);
+        assert!(result.success, "ishl must compile");
+        let cm = publish_compiled_method(&result).expect("publishes");
+
+        let got = call2(&cm, 1, 32);
+        assert_eq!(got, 1i64 << 32, "the 64-bit LSL shifts by the full 32");
+        assert_ne!(
+            got, 1,
+            "...and not by `32 & 31 == 0`, which is what the JVMS specifies"
+        );
+    }
 }
 
 }
