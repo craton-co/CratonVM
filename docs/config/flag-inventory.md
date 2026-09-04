@@ -90,7 +90,7 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,212 |
+| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,214 |
 | exact string literals (i.e. actually named by code, not prose) | 1,143 |
 | **declared** in `flag_groups::INVENTORY` + scalars + group variables | **1137** |
 | declared before this pass | 576 |
