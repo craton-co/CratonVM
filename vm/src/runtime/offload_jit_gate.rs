@@ -397,12 +397,15 @@ fn scan_invokestatic_cp_indices(code: &[u8]) -> Vec<u16> {
 /// checksums while the int one — whose writer this scan does refuse —
 /// stays correct.
 ///
-/// `castore` (0x55) is deliberately NOT here. It writes `char[]`, which
-/// `is_marshallable_array_element` does not admit, so no `char[]` is
-/// ever cached and refusing its writers would cost compilation to
-/// protect nothing. `bastore` covers `boolean[]` as well as `byte[]`
-/// and that IS an over-approximation, but the opcode cannot distinguish
-/// them, and over-refusing is the safe direction.
+/// `castore` (0x55) joined the set on 2026-09-03, when `char[]` became
+/// marshallable and therefore cacheable. It was correctly excluded
+/// before that -- no `char[]` was ever cached, so refusing its writers
+/// would have cost compilation to protect nothing -- and its inclusion
+/// now is the same obligation that `bastore`/`sastore` acquired when
+/// short[]/byte[] became offloadable. `bastore` still covers
+/// `boolean[]` as well as `byte[]`, which IS an over-approximation, but
+/// the opcode cannot distinguish them and over-refusing is the safe
+/// direction.
 ///
 /// The second is what closes the JIT half of Phase 10 #2. See
 /// [`method_writes_primitive_array`].
@@ -424,7 +427,7 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
         // Reached only on a real instruction boundary, so an operand
         // byte that happens to equal one of these cannot false-positive.
         // 0x55 (castore) is excluded on purpose — see the doc above.
-        if (0x4f..=0x52).contains(&op) || op == 0x54 || op == 0x56 {
+        if (0x4f..=0x52).contains(&op) || op == 0x54 || op == 0x56 || op == 0x55 {
             writes_array = true;
         }
         let len = match op {
@@ -740,6 +743,8 @@ mod tests {
             // Until then this scan was right to ignore them.
             (0x54, "bastore"),
             (0x56, "sastore"),
+            // Added 2026-09-03 with char[] marshalling.
+            (0x55, "castore"),
         ] {
             // aload_0; iconst_0; iconst_1; <astore>; return
             let code = [0x2a, 0x03, 0x04, op, 0xb1];
@@ -751,16 +756,18 @@ mod tests {
     }
 
     #[test]
-    fn array_store_scan_ignores_reference_and_char_stores() {
+    fn array_store_scan_ignores_reference_stores() {
         // What is left out, and why each one.
         //
         // `aastore` (0x53) stores references; the input cache holds only
         // primitive buffers.
         //
-        // `castore` (0x55) stores `char[]`, which
-        // `offload::is_marshallable_array_element` does not admit, so no
-        // `char[]` is ever cached and refusing its writers would cost
-        // compilation to protect nothing.
+        // `castore` (0x55) USED to be here for the same reason, and moved
+        // to the blocking set on 2026-09-03 when `char[]` became
+        // marshallable. That is the whole pattern: this list is not a
+        // fixed fact about opcodes, it is a shadow of
+        // `is_marshallable_array_element`, and it has to move whenever
+        // that does.
         //
         // This test used to also assert 0x54 and 0x56, on the reasoning
         // that "bastore/castore/sastore never reach the input cache,
@@ -774,7 +781,7 @@ mod tests {
         // HotSpot on the short and byte checksums at n=8192 over 2000
         // rounds while the int one, whose writer this scan does refuse,
         // stays correct.
-        for op in [0x53u8, 0x55] {
+        for op in [0x53u8] {
             let code = [0x2a, 0x03, 0x04, op, 0xb1];
             assert!(!method_writes_primitive_array(&code), "opcode {op:#x}");
         }

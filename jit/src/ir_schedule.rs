@@ -546,6 +546,48 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     layout.fallthrough_edges = layout.baseline_fallthrough_edges;
     layout.fallthrough_weight = layout.baseline_fallthrough_weight;
 
+    // Emission order is block INDEX order (`ir_lower` walks `schedule.blocks`
+    // front to back), and block indices are CREATION order — the order Step 1
+    // happened to walk control nodes in. Nothing made that a reverse postorder,
+    // so a block could be emitted before a block that dominates it, and a value
+    // read before the instruction that defines it.
+    //
+    // `verify_data_locations` catches exactly that and refuses the compile, so
+    // it was never wrong code — it was lost compiles, silently. Measured on
+    // 2026-09-04: `StringUTF16.compress` (def in block 4, use in block 1),
+    // `Pattern.range` (9 and 1), `Pattern.clazz`; and on an H2 test class the
+    // same refusal denies the optimizing tier to `java/lang/String.equals` and
+    // `java/lang/StringLatin1.equals`.
+    //
+    // The machinery to fix it was already here and switched off: `layout_hot_paths`
+    // defaults to false, so the DFS layout — whose whole point is that "for
+    // every edge u -> v reachable from the entry, pos(u) < pos(v) unless the
+    // edge is retreating" (this module's invariant 2) — never ran in
+    // production. A dominator is a DFS ancestor, so an RPO layout places it
+    // first and the def-before-use property follows.
+    //
+    // So: when hot-path layout is off, still lay the blocks out, just without
+    // the frequency priority. `dfs_layout(blocks, None)` is the plain DFS, and
+    // the same `validate_order` guards it. `CRATONVM_JIT_IR_RPO_LAYOUT=0`
+    // restores creation order.
+    if !opts.layout_hot_paths && rpo_layout_enabled() {
+        match layout_blocks_rpo(&blocks, &opts.protected_regions) {
+            Ok(order) => {
+                layout.fallthrough_edges = count_fallthrough_edges(&blocks, &order);
+                layout.fallthrough_weight = fallthrough_weight(&blocks, &freq, &order);
+                layout.applied = true;
+                RPO_LAYOUTS_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                apply_order(&mut blocks, &mut node_to_block, &mut freq, &order);
+            }
+            Err(bailout) => {
+                // Same policy as the hot-path arm: the method still compiles,
+                // it just keeps the order it had.
+                RPO_LAYOUTS_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                layout.rejected = Some(bailout.to_string());
+            }
+        }
+    }
+
     if opts.layout_hot_paths {
         match layout_blocks(&blocks, &freq, &opts.protected_regions) {
             Ok(order) => {
@@ -1658,6 +1700,60 @@ fn dfs_layout(blocks: &[Block], priority: Option<&[f64]>) -> DfsResult {
 /// Returns a structured [`Bailout`] rather than panicking or silently emitting a
 /// broken order when the result fails its own validation; the caller keeps the
 /// order it already had, which is always correct.
+/// Is the reverse-postorder block layout on? Default yes; `=0` restores the
+/// historical creation order, which is the arm every build before 2026-09-04
+/// shipped.
+fn rpo_layout_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RPO_LAYOUT")
+            .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
+/// Layouts applied, and layouts whose validation refused (leaving creation
+/// order). A reordering that never fires and one that always refuses look the
+/// same from outside.
+static RPO_LAYOUTS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RPO_LAYOUTS_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(applied, rejected)` counts for the reverse-postorder block layout.
+pub fn rpo_layout_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        RPO_LAYOUTS_APPLIED.load(Relaxed),
+        RPO_LAYOUTS_REJECTED.load(Relaxed),
+    )
+}
+
+/// [`layout_blocks`] without the frequency priority: a plain DFS, so the result
+/// is a reverse postorder and nothing else.
+///
+/// Kept separate from `layout_blocks` rather than folded in behind an
+/// `Option<&freq>` so the hot-path arm's behaviour is byte-identical to what it
+/// was; this one is reached only when that arm is off.
+pub fn layout_blocks_rpo(
+    blocks: &[Block],
+    protected_regions: &[Vec<usize>],
+) -> Result<Vec<usize>, Bailout> {
+    let n = blocks.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let dfs = dfs_layout(blocks, None);
+    if dfs.order.len() != n {
+        return Err(Bailout::with_context(
+            BailoutReason::Internal("rpo layout did not enumerate every block"),
+            format!("laid out {} of {} blocks", dfs.order.len(), n),
+        ));
+    }
+    let mut order = dfs.order.clone();
+    repair_regions(&mut order, protected_regions, n)?;
+    validate_order(blocks, &order, &dfs, protected_regions)?;
+    Ok(order)
+}
+
 pub fn layout_blocks(
     blocks: &[Block],
     freq: &BlockFrequencies,
@@ -2625,5 +2721,102 @@ mod tests {
             b.sort_unstable();
             assert_eq!(a, b, "block {} lost or gained a node", x.id);
         }
+    }
+
+    /// Blocks are indexed in CREATION order — the order Step 1 walked control
+    /// nodes in — and `ir_lower` emits `schedule.blocks` front to back. Nothing
+    /// made creation order a reverse postorder, so a block could be emitted
+    /// before the block that dominates it, and a value read before the
+    /// instruction defining it. `verify_data_locations` caught that and refused
+    /// the compile, which is why it cost lost compiles rather than wrong code.
+    ///
+    /// Here block 1 is reachable only through block 2, but is numbered first.
+    #[test]
+    fn rpo_layout_puts_a_dominator_before_the_block_it_dominates() {
+        let blocks = vec![
+            Block {
+                id: 0,
+                ctrl: 0,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: vec![2],
+                predecessors: Vec::new(),
+            },
+            Block {
+                id: 1,
+                ctrl: 1,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: Vec::new(),
+                predecessors: vec![2],
+            },
+            Block {
+                id: 2,
+                ctrl: 2,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: vec![1],
+                predecessors: vec![0],
+            },
+        ];
+        let order = layout_blocks_rpo(&blocks, &[]).expect("a three-block chain must lay out");
+        let pos = |b: usize| order.iter().position(|&x| x == b).expect("every block placed");
+        assert_eq!(pos(0), 0, "the entry block stays at position 0");
+        assert!(
+            pos(2) < pos(1),
+            "block 2 dominates block 1 and must be emitted first; got order {order:?}",
+        );
+    }
+
+    /// The layout is a permutation, not a filter: dropping or repeating a block
+    /// would silently delete or duplicate code.
+    #[test]
+    fn rpo_layout_is_a_permutation() {
+        let blocks = vec![
+            Block {
+                id: 0,
+                ctrl: 0,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: vec![1, 2],
+                predecessors: Vec::new(),
+            },
+            Block {
+                id: 1,
+                ctrl: 1,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: vec![3],
+                predecessors: vec![0],
+            },
+            Block {
+                id: 2,
+                ctrl: 2,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: vec![3],
+                predecessors: vec![0],
+            },
+            Block {
+                id: 3,
+                ctrl: 3,
+                nodes: Vec::new(),
+                terminator: None,
+                successors: Vec::new(),
+                predecessors: vec![1, 2],
+            },
+        ];
+        let order = layout_blocks_rpo(&blocks, &[]).expect("a diamond must lay out");
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3], "order {order:?} is not a permutation");
+        let pos = |b: usize| order.iter().position(|&x| x == b).unwrap();
+        assert!(pos(3) > pos(1) && pos(3) > pos(2), "the merge follows both arms");
+    }
+
+    /// An empty CFG is not an error, and must not be turned into one.
+    #[test]
+    fn rpo_layout_accepts_an_empty_block_list() {
+        assert_eq!(layout_blocks_rpo(&[], &[]).expect("empty is fine"), Vec::<usize>::new());
     }
 }

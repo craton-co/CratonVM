@@ -137,6 +137,12 @@ zgc = ["cratonvm-vm/zgc"]
 gpu = ["dep:cuda-bridge", "cratonvm-vm/gpu-offload"]
 # As above, plus the real CUDA driver bindings via cudarc.
 gpu-driver = ["gpu", "cuda-bridge/cuda"]
+# As `gpu-driver`, but on NVlabs' `cuda-core` (the host runtime that
+# cuda-oxide is built on) instead of cudarc. Mutually exclusive with
+# `gpu-driver`: cuda-bridge refuses both backends with a `compile_error!`.
+# Linux only for now -- `cuda-core` 0.3.1 does not compile on
+# Windows/MSVC; see docs/known-issues/gpu/cuda-core-msvc-enum-signedness.md.
+gpu-driver-oxide = ["gpu", "cuda-bridge/cuda-oxide"]
 
 # End-to-end integration tests under `tests/cli_*.rs` build the binary via
 # `env!("CARGO_BIN_EXE_cratonvm")`, copy committed `.class` fixtures from

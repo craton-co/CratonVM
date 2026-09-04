@@ -1031,14 +1031,15 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         (entry_cached.max_stack as usize).max(16) + 8,
     );
-    let mut frame = Frame::new_pooled_cached(
+    install_cached_frame(
+        shared,
+        thread,
         Arc::clone(&entry_cached),
         args_slice,
-        &mut thread.locals_pool,
-        &mut thread.stacks_pool,
+        monitor_obj,
+        None,
+        false,
     );
-    frame.monitor_on_exit = monitor_obj;
-    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
 
     // Populate invoke_cache so subsequent sibling-class misses from this
     // caller class take the cheaper thread-local path next time.
@@ -2458,23 +2459,15 @@ pub(super) fn execute_invokevirtual_cached(
                         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                         (cached.max_stack as usize).max(16) + 8,
                     );
-                    let mut frame = Frame::new_pooled_cached(
+                    install_cached_frame(
+                        shared,
+                        thread,
                         cached,
                         args_slice,
-                        &mut thread.locals_pool,
-                        &mut thread.stacks_pool,
+                        monitor_obj,
+                        Some("vcached"),
+                        false,
                     );
-                    frame.monitor_on_exit = monitor_obj;
-                    if crate::runtime::env_cache::frame_trace() {
-                        eprintln!(
-                            "[FRAME_PUSH/vcached] depth={} {}.{}{}",
-                            thread.frames.len(),
-                            frame.class_name(),
-                            frame.method_name(),
-                            frame.method_descriptor()
-                        );
-                    }
-                    push_frame_and_fire_entry(shared.vm_identity, thread, frame);
                     Ok(CachedCallResult::FramePushed)
                 }
                 Value::Object(None) => {
@@ -3025,23 +3018,15 @@ pub(super) fn execute_invokevirtual_cached(
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 (cached.max_stack as usize).max(16) + 8,
             );
-            let mut frame = Frame::new_pooled_cached(
+            install_cached_frame(
+                shared,
+                thread,
                 cached,
                 args_slice,
-                &mut thread.locals_pool,
-                &mut thread.stacks_pool,
+                monitor_obj,
+                Some("vcached2"),
+                false,
             );
-            frame.monitor_on_exit = monitor_obj;
-            if crate::runtime::env_cache::frame_trace() {
-                eprintln!(
-                    "[FRAME_PUSH/vcached2] depth={} {}.{}{}",
-                    thread.frames.len(),
-                    frame.class_name(),
-                    frame.method_name(),
-                    frame.method_descriptor()
-                );
-            }
-            push_frame_and_fire_entry(shared.vm_identity, thread, frame);
             Ok(CachedCallResult::FramePushed)
         }
         CachedInvokeTarget::Native {
@@ -4496,13 +4481,7 @@ pub(super) fn execute_invokevirtual_fast_door(
             cached.max_locals as usize,
             (cached.max_stack as usize).max(16) + 8,
         );
-        let frame = Frame::new_pooled_cached(
-            cached,
-            args_slice,
-            &mut thread.locals_pool,
-            &mut thread.stacks_pool,
-        );
-        push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+        install_cached_frame(shared, thread, cached, args_slice, None, None, false);
         return Some(Ok(CachedCallResult::FramePushed));
     }
 

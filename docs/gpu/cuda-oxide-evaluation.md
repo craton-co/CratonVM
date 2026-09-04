@@ -1,10 +1,54 @@
 # Evaluation: [cuda-oxide](https://nvlabs.github.io/cuda-oxide/) and CratonVM
 
-**Status:** evaluated; **not adopted** in the current GPU-offload work.
+**Status:** re-evaluated 2026-09-04. The *compiler* is still not adopted
+and still should not be. Its **host runtime** is now an opt-in second
+driver backend: `--features cuda-oxide` on `cratonvm-cuda-bridge`,
+`--features gpu-driver-oxide` on `cratonvm-cli`.
 
 This document exists so future readers don't re-litigate the question.
-If you came here asking "should we be using cuda-oxide?" — the short
-answer is **no, not today**. The long answer follows.
+The 2026-09-03 revision answered a flat "no" to a question that turned
+out to have two halves, and got one of them wrong. What follows keeps
+the half that was right and records the half that was missed.
+
+## The correction (2026-09-04)
+
+The previous revision said cuda-oxide "is **not** a competitor to
+cudarc … They solve different problems." That is true of the
+**compiler**, which is what was evaluated. It is not true of the
+**project**, and the difference was never checked.
+
+The repo ships `crates/cuda-host`, and `cuda-host` is built on
+[`cuda-core`](https://crates.io/crates/cuda-core) — "Idiomatic CUDA
+API", from NVlabs/cutile-rs. `cuda-core` is a host-side driver bridge:
+contexts, streams, events, modules, device buffers. That is exactly
+cudarc's job, from the same vendor as the compiler.
+
+The failure mode was inferring absence from a search that could not
+find it: the conclusion was drawn from the project's description
+("Rust-to-CUDA compiler") without listing its crates. `cuda-host`'s
+manifest names `cuda-core` on its second line.
+
+Three further claims in that revision were stale or wrong:
+
+| Claim (2026-09-03) | Actual (2026-09-04, measured) |
+| --- | --- |
+| "v0.1.0 (early 2026)" | Repo created 2026-04-22; `cuda-core` is 0.3.1, published 2026-09-04 |
+| "requires a nightly toolchain" | True of `rustc-codegen-cuda` and `cuda-host`. `cuda-core` carries **no** `#![feature(...)]` and builds on **stable** |
+| "ships its own device runtime … `DeviceBuffer`" | Correct, and that runtime is the useful part, not a reason to decline |
+
+## What is still true: don't use the compiler for Java
+
+The CratonVM problem is **Java bytecode → PTX**, and cuda-oxide's input
+is Rust source. Using it on the Java path would mean synthesising Rust
+per Java method and running rustc on every JIT invocation — strictly
+worse than lowering bytecode → PTX in the existing pipeline, which
+`jit-cuda` already does.
+
+That reasoning is unchanged and is why the backend uses
+`load_module_from_ptx_src` — cuda-core's runtime `cuModuleLoadData`
+wrapper — and not `#[cuda_module]`, cuda-oxide's headline API, which
+embeds artifact bundles compiled at **build** time. A kernel does not
+exist until the VM has seen the method.
 
 ## How GPU offload is wired (isolation contract)
 
@@ -13,93 +57,131 @@ The default `cargo build` produces a CPU-only JVM that is byte-identical
 to the pre-GPU codebase — no `cuda-bridge` link, no `--gpu*` CLI flags,
 no GPU branches in the interpreter.
 
-Three feature levels (Cargo features on `cratonvm-cli`):
+Feature levels (Cargo features on `cratonvm-cli`):
 
-| Build invocation                                  | What you get                                                                 |
-| ------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `cargo build`                                     | CPU JVM. No GPU code linked. No `--gpu*` flags.                              |
-| `cargo build --features gpu`                      | + `cuda-bridge` stub backend, `--gpu*` flags visible. Probe → `NoDriver`.    |
-| `cargo build --features gpu-driver`               | + real cudarc bindings to libcuda / nvcuda.dll.                              |
+| Build invocation | What you get |
+| --- | --- |
+| `cargo build` | CPU JVM. No GPU code linked. No `--gpu*` flags. |
+| `cargo build --features gpu` | + `cuda-bridge` stub backend, `--gpu*` flags visible. Probe → `NoDriver`. |
+| `cargo build --features gpu-driver` | + real bindings to libcuda / nvcuda.dll **via cudarc**. |
+| `cargo build --features gpu-driver-oxide` | + real bindings **via NVlabs `cuda-core`**. Linux only, see below. |
+
+The last two are mutually exclusive: both supply `cuda-bridge`'s
+`backend` module, and enabling both is refused with a `compile_error!`
+rather than resolved by precedence.
 
 Every GPU integration into a CPU-path crate (`cratonvm-vm`,
 `cratonvm-cli`, `cratonvm-jit-api`, `cratonvm-gc`) lives behind
 `#[cfg(feature = "...")]`. There is no runtime-gated-dead-code path
 through the hot interpreter loop.
 
-## What cuda-oxide is
+## What the second backend cost, and what it bought
 
-cuda-oxide is an experimental Rust-to-PTX compiler. It hooks into
-`rustc` as a custom codegen backend, lifts the program's MIR through a
-custom `pliron` IR (MLIR-style), and emits NVIDIA PTX. As of v0.1.0
-(early 2026) it is alpha, requires a nightly toolchain, and ships its
-own device runtime (`DeviceBuffer`, `DisjointSlice`, async
-`DeviceOperation` graphs).
+It was made possible by writing the backend contract down first
+(`cuda-bridge/src/backend_api.rs`, 2026-09-04). Before that the seam was
+an unwritten convention, and the two existing backends had already
+drifted — `from_ptx` took `&[&'static str]` in one and `&[&str]` in the
+other, invisible because only one module compiles per build.
 
-It is **not** a competitor to `cudarc`. cudarc loads PTX onto the
-device and launches it. cuda-oxide produces PTX from Rust source. They
-solve different problems.
+Adding a third backend forced two structural changes worth knowing about:
 
-## Why we are not adopting it
+- **`gpu-driver` (internal feature).** Most `#[cfg(feature = "cuda")]`
+  sites meant "is there a real device?", not "is this cudarc?". They now
+  test `gpu-driver`, which both real backends imply. Only the sites that
+  genuinely name cudarc types still test `cuda`.
+- **`backend::drv`.** `event.rs` and `stream.rs` were written directly
+  against `cudarc::driver::result::*`. They now call a small per-backend
+  `drv` module (event create/record/query/sync/destroy, stream
+  wait/sync/fork, host callback). This is where the crate's UAF and
+  cross-stream-ordering audits live, and duplicating them per vendor was
+  not acceptable.
 
-The CratonVM problem is **Java bytecode → PTX**. Neither cudarc nor
-cuda-oxide solves that directly.
+**The backends are now tested against the same device suite.** Five
+integration tests that exercise the bridge's own contract rather than
+cudarc — driver version, transfers, event latching, stream ordering,
+concurrent dispatch — moved from `cfg(feature = "cuda")` to
+`cfg(feature = "gpu-driver")` and run against both.
 
-- cuda-oxide's input is Rust source. To use it on the Java path we
-  would have to synthesise Rust source per Java method, parse it
-  through rustc on every JIT invocation, and have it lower through
-  `pliron` to PTX. That pipeline is strictly worse than lowering
-  bytecode → PTX directly in our existing IR pipeline.
-- cuda-oxide pins us to nightly Rust. The rest of the workspace
-  targets stable. The plan to keep cudarc on stable is deliberate.
-- cuda-oxide is v0.1.0. "Expect bugs, incomplete features, and API
-  breakage" — quoted from its own README. The cost of taking that
-  dependency on the critical path is high; the benefit is zero.
+That immediately paid for itself. `concurrent_dispatch_it`'s
+`one_context_many_threads` **failed** on the first oxide build with
+`got 0, want 4005` — the same defect class it was originally written to
+catch in cudarc. Two real ordering bugs, both mine:
+
+1. `to_host` enqueued `cuStreamWaitEvent` on one stream and then issued a
+   *synchronous* `cuMemcpyDtoH_v2`, which runs against the NULL stream. A
+   wait on a stream the copy never uses orders nothing.
+2. `zeros` used `cuMemsetD8_v2` and the backend declared allocation
+   "synchronous", making `record_alloc_event` a no-op. `cuMemsetD8` is
+   asynchronous w.r.t. the host for device memory, and the NULL stream's
+   implicit synchronisation reaches only *blocking* streams — while every
+   compute stream here comes from `fork`, i.e. `CU_STREAM_NON_BLOCKING`.
+   The zeroing could land after a kernel's stores and wipe them.
+
+Both are fixed; the suite is 10/10 on the oxide backend and 12/12 on
+cudarc (the extra two are the cudarc-only alloc-pool and graph-capture
+suites), and the concurrency test is 6/6 across repeats.
+
+## v1 limitations of the oxide backend
+
+Honest gaps, not hidden ones:
+
+- **No CUDA graph capture.** `graph.rs` stays cudarc-only; `cuda-core`
+  has no graph module. An oxide build has no capture/replay, which is a
+  throughput optimisation, not a correctness feature.
+- **No allocation pool.** `backend_cuda::AllocPool` has no twin, so
+  `set_retire_to_pool` is a no-op and allocations are freed at drop.
+  The exit census still counts every allocation as a pool MISS
+  (`cuMemAlloc=N pooled=0`). Leaving it uncounted would have printed
+  `cuMemAlloc=0` on a run that allocated heavily -- a zero from an
+  instrument that cannot fire, which reads as "no allocations" rather
+  than "no pool".
+- **Occupancy** uses the raw `cuOccupancyMaxPotentialBlockSize` symbol
+  through `cuda_core::sys`; cuda-core wraps the *cluster* occupancy
+  queries but not this one.
+- **Windows does not build.** `cuda-core` 0.3.1 has an upstream enum
+  signedness bug on MSVC — see
+  `docs/known-issues/gpu/cuda-core-msvc-enum-signedness-20260904.md`,
+  which includes the 13-edit fix and the evidence that it works on
+  sm_75 once applied.
 
 ## The seam we kept anyway
 
-We left one piece of optionality: the `GpuLowering` trait in
-`jit-api`. There is no in-workspace implementor today; `jit-cuda`
-exports concrete analyzer/lowering entry points directly and does not
-enable `jit-api/gpu-lowering`. The trait exists so that **if** in the
-future we want to compile Rust-authored device-side helpers (parallel
-GC mark, atomic helpers, math intrinsics) into PTX modules and link them
-alongside our own emitted kernels, we can plug an implementor in without
-touching the interpreter integration.
+The `GpuLowering` trait in `jit-api` still has no in-workspace
+implementor, and we still did **not** create a `CudaOxideLowering`
+skeleton — that would be the synthetic stub the wider GPU plan forbids.
+Nothing above changes that: this work adopted cuda-oxide's *host
+runtime*, not its compiler.
 
-We did **not** create a `CudaOxideLowering` skeleton. That would be
-the kind of synthetic stub the wider GPU plan explicitly forbids. An
-impl arrives if and when there is a concrete need.
+## When to re-evaluate the compiler
 
-## When to re-evaluate
+Unchanged from the previous revision. Reopen when **all** hold:
 
-Reopen this document and rerun the evaluation when **all** of these
-hold:
-
-1. cuda-oxide ships v0.5+ with a stability statement that covers the
-   surface we'd actually use (codegen, device runtime).
-2. cuda-oxide compiles on stable Rust (no nightly).
-3. We have a concrete CratonVM feature in flight that needs a
-   Rust-authored device-side helper — e.g. a parallel-GC mark routine
-   that genuinely benefits from being written in Rust rather than
-   emitted opcode-by-opcode from our own backend.
-
-Until all three are true: don't.
+1. cuda-oxide ships a stability statement covering the surface we'd use.
+2. It compiles on stable Rust.
+3. There is a concrete CratonVM feature needing a Rust-authored
+   device-side helper — e.g. a parallel-GC mark routine that genuinely
+   benefits from being written in Rust rather than emitted
+   opcode-by-opcode from our own backend.
 
 ## Quick reference
 
-|                      | **cudarc** (we use)                                                                  | **cuda-oxide** (we don't)                                                          |
-| -------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| What it is           | Safe Rust wrapper over CUDA Driver API + NVRTC + cuBLAS                              | rustc codegen backend that lowers Rust → PTX in-process                            |
-| Maturity             | Stable; used in burn / candle / dfdx                                                 | v0.1.0 alpha, "expect bugs, incomplete features, API breakage"                     |
-| Rust toolchain       | Stable                                                                               | Nightly                                                                            |
-| Input it consumes    | PTX text **you produce**, or live Rust via NVRTC                                     | Rust source via MIR                                                                |
-| Solves Java → PTX?   | No                                                                                   | No                                                                                 |
-| Useful to us for     | Device discovery, allocation, memcpy, kernel launch                                  | Nothing on the critical path. Possibly future Rust-side GPU helpers.               |
-| Risk of taking dep   | Low                                                                                  | High — pins us to nightly, breaks on rustc churn                                   |
+| | **cudarc** (default) | **cuda-core** (opt-in) | **cuda-oxide compiler** (not used) |
+| --- | --- | --- | --- |
+| What it is | Safe wrapper over the CUDA Driver API | Safe wrapper over the CUDA Driver API | rustc backend lowering Rust → PTX |
+| Vendor | community (coreylowman) | NVIDIA (NVlabs/cutile-rs) | NVIDIA (NVlabs/cuda-oxide) |
+| Rust toolchain | stable | stable | nightly |
+| Input it consumes | PTX text you produce | PTX text you produce | Rust source via MIR |
+| Solves Java → PTX? | No | No | No |
+| Graphs / alloc pool | yes / yes | no / no | n/a |
+| Platforms here | Linux + Windows | Linux (Windows: upstream bug) | n/a |
 
 ## Pointers
 
+- The backend: `cuda-bridge/src/backend_oxide.rs`
+- The contract: `cuda-bridge/src/backend_api.rs`
+- Windows bug: `docs/known-issues/gpu/cuda-core-msvc-enum-signedness-20260904.md`
 - Project page: <https://nvlabs.github.io/cuda-oxide/>
+- `cuda-core`: <https://crates.io/crates/cuda-core> · <https://github.com/nvlabs/cutile-rs>
 - cudarc on crates.io: <https://crates.io/crates/cudarc>
 - The GpuLowering trait: `jit-api/src/gpu_lowering.rs`
 - Our PTX emitter: `jit-cuda/src/emitter.rs`

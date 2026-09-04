@@ -31,7 +31,7 @@
 //!
 //! Requires the `cuda` feature and a real device.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu-driver")]
 
 use cratonvm_cuda_bridge::{
     DeviceBuffer, DeviceContext, DeviceModule, KernelArgs, LaunchConfig, Stream,

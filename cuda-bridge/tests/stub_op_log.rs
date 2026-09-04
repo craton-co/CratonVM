@@ -6,7 +6,7 @@
 //! These tests exercise the cross-module surfaces (`Stream`, `Event`,
 //! async memcpy, and `launch_on_stream`) against the stub-mode op log.
 //!
-//! The file is feature-gated with `#![cfg(not(feature = "cuda"))]` so
+//! The file is feature-gated with `#![cfg(not(feature = "gpu-driver"))]` so
 //! it is only compiled in stub mode — under the real `cuda` feature
 //! the op log doesn't exist and these surfaces hit the driver.
 //!
@@ -25,7 +25,7 @@
 //!   gated by a feature flag) is left to the discretion of Items
 //!   P2-1 / P2-2.
 
-#![cfg(not(feature = "cuda"))]
+#![cfg(not(feature = "gpu-driver"))]
 
 use cratonvm_cuda_bridge::{
     DeviceBuffer, DeviceContext, DeviceModule, Event, KernelArgs, LaunchConfig, Stream, StreamOp,

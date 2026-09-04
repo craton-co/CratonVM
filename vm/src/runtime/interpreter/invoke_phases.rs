@@ -54,11 +54,22 @@ pub const P_GUARDS: usize = 1;
 /// ZERO-argument call this phase should be near-empty; if it is not, the
 /// per-call part of argument handling is bigger than the per-argument part.
 pub const P_ARGS: usize = 2;
-/// `Frame::new_pooled_cached` — pool pops, locals init, the `code` and cached
-/// `Arc` clones, and building a **296-byte** `Frame`.
+/// Installing the callee's frame: pool pops, locals init, the `code` and
+/// cached `Arc` clones, and getting a `Frame` into the stack.
+///
+/// Originally `Frame::new_pooled_cached` alone, with `P_PUSH` measuring the
+/// move that followed. Since 2026-09-03 the general dispatchers install the
+/// frame **in place** — rebuilding the retired slot at this depth, or writing
+/// the struct into the next one — so there is no move to measure separately
+/// and no boundary to bracket. The two phases were re-scoped rather than
+/// merged, because what `P_PUSH` covered is exactly what has been removed and
+/// a phase silently absorbing another's cycles is worse than one reading zero:
+/// this is now everything up to the frame being live, and `P_PUSH` is the
+/// tail that runs after it. `CRATONVM_JIT_NO_FRAME_EMPLACE` restores the
+/// by-value build, and under it these two mean what they always did.
 pub const P_FRAME_BUILD: usize = 3;
-/// `push_frame_and_fire_entry` — moving those 296 bytes into the frame stack,
-/// plus two gated listener checks.
+/// The post-install tail: the synchronized callee's monitor handoff, the frame
+/// trace, the JVMTI `MethodEntry` event and the push-time diagnostics.
 pub const P_PUSH: usize = 4;
 
 /// The whole `ireturn`/`return` arm: popping the return value, the JVMTI

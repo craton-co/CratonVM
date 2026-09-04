@@ -68,7 +68,8 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
-    compact_tlab_body_size, single_layout_domain,
+    compact_tlab_body_size, layout_replace_epoch, layout_replace_epoch_guard,
+    single_layout_domain,
     foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
     next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
     register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
@@ -734,6 +735,74 @@ pub mod scalar_deopt_census {
 /// Counting the door is what separates "the heap decided" from "someone
 /// asked", which is the question left after the trigger census came back
 /// empty.
+/// Why an OSR compile was refused, per gate.
+///
+/// AUDIT 2026-09-04. `compile_osr_artifact` sets `osr_stage("entry")` and
+/// then has FOUR early gates that `return None` without setting a stage of
+/// their own, so every early refusal reports `stage=entry` and the four are
+/// indistinguishable. That is how a refusal can be real and unattributed:
+/// `gpu_jit_gate_census` counts 7 methods blocked, all one-shot
+/// `<clinit>`s, while `Integration.integrate` gets ZERO OSR enters under
+/// `--gpu` and 14 other methods still enter -- so something refuses it that
+/// nothing counts.
+///
+/// This distinguishes the two possibilities the gate census cannot:
+/// OSR was ATTEMPTED and refused by a named gate, or OSR was never
+/// attempted at all, in which case no gate ran and the method appears
+/// nowhere.
+pub mod osr_refusal_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFUSALS: std::sync::Mutex<Vec<(&'static str, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+    static NAMED: std::sync::Mutex<Vec<(String, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_NAMED: usize = 48;
+
+    /// One entry into `compile_osr_artifact`.
+    #[inline]
+    pub fn note_attempt() {
+        ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One refusal, tagged with the gate that returned `None`.
+    pub fn note_refusal(gate: &'static str, method: &str) {
+        let mut v = REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
+        match v.iter_mut().find(|(g, _)| *g == gate) {
+            Some((_, n)) => *n += 1,
+            None => v.push((gate, 1)),
+        }
+        drop(v);
+        let mut n = NAMED.lock().unwrap_or_else(|p| p.into_inner());
+        if n.len() < MAX_NAMED && !n.iter().any(|(m, g)| m == method && *g == gate) {
+            n.push((method.to_string(), gate));
+        }
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let attempts = ATTEMPTS.load(Ordering::Relaxed);
+        if attempts == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let mut v = REFUSALS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let refused: u64 = v.iter().map(|(_, n)| n).sum();
+            eprintln!(
+                "[cratonvm] osr refusals: attempts={attempts} refused_at_early_gate={refused}"
+            );
+            for (gate, n) in v {
+                eprintln!("[cratonvm] osr refusals:   {gate}: {n}");
+            }
+            for (m, g) in NAMED.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+                eprintln!("[cratonvm] osr refusals:   {g} <- {m}");
+            }
+        });
+    }
+}
+
 pub mod gc_entry_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -789,6 +858,71 @@ pub mod gc_entry_census {
     #[inline]
     pub fn note_from_native() {
         FROM_NATIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    static REFILL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFILL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_TOTAL_AT_EXIT: AtomicU64 = AtomicU64::new(0);
+
+    /// One `refill_tlab` call and whether it produced a chunk.
+    ///
+    /// The wedge break fires after 16,384 CONSECUTIVE failures, and the
+    /// counter only resets on a success -- so "does refill ever succeed"
+    /// decides whether the breaker is armed permanently or not at all. On
+    /// ZGC `refill_tlab` is opt-in (`CRATONVM_ZGC_JIT_TLAB`), so the
+    /// expectation is zero successes and the interesting number is how
+    /// many bytes flow past it.
+    #[inline]
+    pub fn note_refill(success: bool) {
+        REFILL_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if success {
+            REFILL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish `bytes_allocated_total` for the exit line. It is the wedge
+    /// break's RE-ARM metric (one break per 64 MB), so it, not the
+    /// collection count, is what sets how often the breaker can fire.
+    pub fn note_alloc_total(bytes: u64) {
+        ALLOC_TOTAL_AT_EXIT.store(bytes, Ordering::Relaxed);
+    }
+
+    static REFILL_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFILL_RETRY_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+
+    /// The refill RETRY that follows a wedge break, and whether the forced
+    /// collection actually bought a chunk.
+    ///
+    /// Counted apart from the first attempt because it is the only refill
+    /// that can succeed on this backend: the first one is asking a feature
+    /// that is off (`CRATONVM_ZGC_JIT_TLAB`), while the retry runs after a
+    /// coalescing collection. If it succeeds, the TLAB it seeds serves
+    /// allocations that bump `bytes_allocated_total`, which is the wedge
+    /// break's own re-arm -- 64 MB later the breaker fires again. That is a
+    /// LOOP, and this counter is what distinguishes it from a one-off.
+    #[inline]
+    pub fn note_refill_retry(success: bool) {
+        REFILL_RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if success {
+            REFILL_RETRY_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(retry_attempts, retry_successes)`.
+    pub fn refill_retry_totals() -> (u64, u64) {
+        (
+            REFILL_RETRY_ATTEMPTS.load(Ordering::Relaxed),
+            REFILL_RETRY_SUCCESSES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(attempts, successes, alloc_total)`.
+    pub fn refill_totals() -> (u64, u64, u64) {
+        (
+            REFILL_ATTEMPTS.load(Ordering::Relaxed),
+            REFILL_SUCCESSES.load(Ordering::Relaxed),
+            ALLOC_TOTAL_AT_EXIT.load(Ordering::Relaxed),
+        )
     }
 
     /// `(maybe_gc_needs, maybe_gc_requested, forced, from_native)`.
@@ -1200,6 +1334,66 @@ pub mod gpu_dispatch_memo_census {
 ///
 /// `live` at exit is the number that matters: on a program that releases
 /// every handle it takes, it should be zero.
+/// Whether the chunked (overlapped) writeback path was actually taken.
+///
+/// A chunking change is invisible to a value differential: the
+/// whole-array writeback is correct too, so `marshal-stress` passes
+/// identically whether chunking ran or silently never engaged. That is
+/// how `short[]`/`byte[]` sat outside the chunkable set from the day they
+/// became offloadable -- `take_chunkable_writeback` bailed on an array
+/// writeback it did not recognise, which cost the WHOLE dispatch its
+/// copy/compute overlap, and nothing reported it.
+///
+/// `refused` counts dispatches where a chunkable candidate existed but
+/// the path was declined (no stream pool, a non-tiling length, a
+/// `launch_chunked` error that fell back). `taken` and `refused` together
+/// say whether the feature is doing anything at all.
+pub mod gpu_chunk_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    static CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+    /// One dispatch used the chunked writeback, split into `chunks`.
+    #[inline]
+    pub fn note_taken(chunks: u64) {
+        TAKEN.fetch_add(1, Ordering::Relaxed);
+        CHUNKS.fetch_add(chunks, Ordering::Relaxed);
+    }
+
+    /// One dispatch had a chunkable writeback and did not use the path.
+    #[inline]
+    pub fn note_refused() {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(taken, refused, total_chunks)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            TAKEN.load(Ordering::Relaxed),
+            REFUSED.load(Ordering::Relaxed),
+            CHUNKS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when anything was chunkable.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (taken, refused, chunks) = totals();
+        if taken + refused == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu chunked writeback: taken={taken} refused={refused} \
+                 chunks={chunks}"
+            );
+        });
+    }
+}
+
 pub mod gpu_submission_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

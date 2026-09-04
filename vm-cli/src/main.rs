@@ -352,6 +352,16 @@ fresh-ctor={fresh_ctor} body={body}"
                 for (name, count) in cratonvm_jit::metrics::ir_ref_store_bails() {
                     eprintln!("[cratonvm]     ir ref-store bail {name}: {count}");
                 }
+                // WHICH shape those inline stores wrote. The legacy arm exists
+                // because compact receivers used to be rare; the compact TLAB
+                // shape is the default since 2026-09-04, so this pair is what
+                // says whether that arm still carries anything.
+                let (shape_c, shape_l) = cratonvm_jit::metrics::ir_ref_store_shape_counts();
+                if shape_c != 0 || shape_l != 0 {
+                    eprintln!(
+                        "[cratonvm]     ir ref-store shapes: compact={shape_c} legacy={shape_l}"
+                    );
+                }
             }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED
             // reading under a default configuration -- `c2_alloc_upgrade` is

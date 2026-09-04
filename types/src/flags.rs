@@ -1166,11 +1166,38 @@ pub struct GcFlags {
     /// out-of-line remembered-set call — against a SEPARATE published table, so
     /// the G1-2 gate is untouched.
     ///
-    /// Default OFF because it is a code-generation change on an experimental
-    /// collector and because the last inline barrier this JIT had
-    /// (`Compiler::inline_card_mark_available`, a different mechanism against a
-    /// different table) was disabled after a WildFly boot audit found a missed
-    /// dirty card. `=1` is how it gets measured before it becomes a default.
+    /// **Default ON since 2026-09-04**, opt out with
+    /// `CRATONVM_G1_INLINE_BARRIER=0` ([`parse::on_unless_zero`]).
+    ///
+    /// It was default OFF on the reasoning that this is a code-generation
+    /// change on an experimental collector, and because the last inline
+    /// barrier this JIT had (`Compiler::inline_card_mark_available`, a
+    /// different mechanism against a different table) was disabled after a
+    /// WildFly boot audit found a missed dirty card — with the note that "`=1`
+    /// is how it gets measured before it becomes a default". It was then never
+    /// measured, and its only engagement signal was one `tracing::info!` line
+    /// saying the arm had been emitted at least once.
+    ///
+    /// What it was measured at, once a census existed
+    /// (`g1-inline-post-write-barrier-measured-20260903.md`):
+    ///
+    /// * `bt16` under G1, one binary, order alternated: **0.82 s against
+    ///   2.22 s, 8 of 8 rounds**, ~2.7x, identical tree checksum in all
+    ///   sixteen runs.
+    /// * Run-time census: `skipped=29,961,707 called=2,785` — the filter's two
+    ///   tests answer "nothing to remember" 99.99% of the time, which is what a
+    ///   generational-shaped allocation pattern looks like to G1.
+    /// * A 228-program differential soak under G1, and the
+    ///   HotSpot-differential regression suite, both with the barrier on.
+    /// * `CRATONVM_GC_VERIFY_RSET` clean — the audit that would catch the
+    ///   failure mode the WildFly card miss was.
+    ///
+    /// Why the filter is sound rather than merely fast: both its tests are
+    /// transcriptions of `post_write_barrier_rset`'s own first two early-outs
+    /// (a null referent, and `src_region == dst_region`), so a skipped call is
+    /// a call that would have returned having done nothing, and everything else
+    /// reaches the collector's real barrier. The G1-2 gate is untouched: this
+    /// reads a SEPARATE published table and `JIT_REGION_BOUNDS` stays empty.
     pub g1_inline_barrier: bool,
     /// `CRATONVM_G1_MARK_LOCK_YIELD` — F-10. Make G1's concurrent marker
     /// release and re-take the regions lock every few objects instead of
@@ -1562,7 +1589,7 @@ impl GcFlags {
                 src,
                 "CRATONVM_G1_CARD_SCREEN_JIT_PINNED",
             ),
-            g1_inline_barrier: present(src, "CRATONVM_G1_INLINE_BARRIER"),
+            g1_inline_barrier: on_unless_zero(src, "CRATONVM_G1_INLINE_BARRIER"),
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
             g1_eden_stripes: usize_min1(src, "CRATONVM_G1_EDEN_STRIPES"),

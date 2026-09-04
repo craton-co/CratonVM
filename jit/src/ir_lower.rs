@@ -888,6 +888,12 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// Edge copies that read their source out of a register, and edge copies
+    /// that published their phi's register from RAX. Both are ENGAGEMENT
+    /// counts: a zero says the wiring never fired, which is a different
+    /// finding from "it fired and did not pay".
+    phi_copy_reg_reads: usize,
+    phi_copy_reg_publishes: usize,
     /// Number of input references to each node, over every input of every
     /// node. Filled by `prepare_fusion_tables` before the first block lowers.
     use_count: Vec<u32>,
@@ -1312,6 +1318,8 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
             gp_reg_live: Vec::new(),
+            phi_copy_reg_reads: 0,
+            phi_copy_reg_publishes: 0,
             use_count: Vec::new(),
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
@@ -1951,6 +1959,8 @@ impl<'a> Lowerer<'a> {
             // independent check of that, and must not be read as one.
             non_oop_stack_slots: self.prim_slot_offsets.clone(),
             stack_marks_exact: true,
+            // The IR tier emits no shadow push of its own.
+            shadow_pushed: 0,
         });
     }
 
@@ -2021,7 +2031,7 @@ impl<'a> Lowerer<'a> {
         // Gather (phi_slot, value_id) pairs first to avoid borrowing `self`
         // immutably while emitting (which borrows `self` mutably).
         let gathered = self.gather_phi_copies(pred_block, succ_block);
-        let copies: Vec<(i32, i32)> = gathered.iter().map(|&(_, dst, src)| (dst, src)).collect();
+        let copies: Vec<(i32, i32)> = gathered.iter().map(|c| (c.dst, c.src_slot)).collect();
 
         // Phi copies are a PARALLEL assignment, not a sequence.
         //
@@ -2060,8 +2070,25 @@ impl<'a> Lowerer<'a> {
                 return;
             }
         };
+        // Which node does each frame word in this edge belong to? Two maps,
+        // because one word can be a source here and a destination there, and
+        // the reserved scratch is in neither — a `Save`'s destination and a
+        // `Restore`'s source therefore find nothing and stay memory, which is
+        // what they must be.
+        let (src_node_of, phi_of_dst) = if ir_phi_copy_regs_enabled() {
+            let mut s: HashMap<i32, NodeId> = HashMap::new();
+            let mut d: HashMap<i32, NodeId> = HashMap::new();
+            for c in &gathered {
+                s.insert(c.src_slot, c.src);
+                d.insert(c.dst, c.phi);
+            }
+            (s, d)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) = self.emit_copy_op(op) {
+            if let Err(bailout) = self.emit_copy_op(op, &src_node_of, &phi_of_dst, &mut published) {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -2074,13 +2101,23 @@ impl<'a> Lowerer<'a> {
         // the first published edge (in emission order) still take the home
         // word; every edge publishes, so the register is valid on entry to the
         // block whichever predecessor ran.
+        //
+        // 2026-09-04: a GP phi whose copy went through RAX is published *there*,
+        // from RAX, and appears in `published`. The reload below is what is
+        // left for everything else — the FP half, and any phi whose copy the
+        // resolver dropped as a self-copy (nothing was emitted, so nothing
+        // could publish, and on the first edge in emission order the register
+        // may not be live yet).
         if ir_phi_residency_enabled() {
-            for &(phi, dst, _) in &gathered {
-                if self.assigned_gpr(phi).is_some() {
-                    self.publish_gp_from_slot(phi, dst);
-                } else if self.assigned_xmm(phi).is_some() {
-                    let is_double = self.graph.nodes[phi as usize].ty == IrType::Double;
-                    self.publish_fp_from_slot(phi, dst, is_double);
+            for c in &gathered {
+                if published.contains(&c.phi) {
+                    continue;
+                }
+                if self.assigned_gpr(c.phi).is_some() {
+                    self.publish_gp_from_slot(c.phi, c.dst);
+                } else if self.assigned_xmm(c.phi).is_some() {
+                    let is_double = self.graph.nodes[c.phi as usize].ty == IrType::Double;
+                    self.publish_fp_from_slot(c.phi, c.dst, is_double);
                 }
             }
         }
@@ -2093,7 +2130,13 @@ impl<'a> Lowerer<'a> {
     /// emits at most one live save at a time and always consumes it before
     /// starting another cycle, so a single word suffices no matter how many
     /// disjoint cycles the edge contains.
-    fn emit_copy_op(&mut self, op: CopyOp) -> CompileResult<()> {
+    fn emit_copy_op(
+        &mut self,
+        op: CopyOp,
+        src_node_of: &HashMap<i32, NodeId>,
+        phi_of_dst: &HashMap<i32, NodeId>,
+        published: &mut Vec<NodeId>,
+    ) -> CompileResult<()> {
         let scratch = self.phi_copy_scratch_slot_off;
         let (src, dst) = match op {
             CopyOp::Move { from, to } => (frame_word_off(from)?, frame_word_off(to)?),
@@ -2108,8 +2151,46 @@ impl<'a> Lowerer<'a> {
                 format!("[rbp - {dst}] <- [rbp - {src}]"),
             ));
         }
-        self.load_to_rax(src);
+        // ── Read: from the source's register when it has one ──────────
+        //
+        // Safe for the same reason the memory schedule is safe, and by the same
+        // argument. `resolve_parallel_copy` orders the ops so that every source
+        // is READ before anything writes it; a register is updated at exactly
+        // the instruction that writes the word (below), so a register and its
+        // home word go stale at the same point, and an order that protects one
+        // protects the other. A cycle's `Save` copies the pre-value out at the
+        // same instant either way.
+        let mut from_reg = false;
+        if ir_phi_copy_regs_enabled() {
+            if let Some(&sid) = src_node_of.get(&src) {
+                if let Some(r) = self.resident_gpr(sid) {
+                    self.emit_mov_reg_reg64(RAX, r);
+                    from_reg = true;
+                    self.phi_copy_reg_reads += 1;
+                }
+            }
+        }
+        if !from_reg {
+            self.load_to_rax(src);
+        }
         self.store_rax(dst);
+        // ── Publish: from RAX, which provably holds the value ─────────
+        //
+        // The reload this replaces was the second half of the store-then-load
+        // pair: `store [dst], rax` and then, a couple of instructions later,
+        // `mov reg, [dst]` — the same word, written and read back across a
+        // store-forwarding stall, once per phi per edge, i.e. once per loop
+        // iteration for every loop-carried value.
+        if ir_phi_copy_regs_enabled() {
+            if let Some(&phi) = phi_of_dst.get(&dst) {
+                if let Some(dst_reg) = self.assigned_gpr(phi) {
+                    self.emit_mov_reg_reg64(dst_reg, RAX);
+                    self.mark_gp_reg_live(phi);
+                    published.push(phi);
+                    self.phi_copy_reg_publishes += 1;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2772,6 +2853,34 @@ impl<'a> Lowerer<'a> {
         true
     }
 
+    /// Guard a baked COMPACT CELL OFFSET against a layout replacement, and
+    /// return the patch site the caller routes to its helper.
+    ///
+    /// The optimizing tier's twin of `x64::objects::emit_layout_epoch_guard`,
+    /// and it exists for the same reason: an emitter that bakes
+    /// `HEADER_SIZE + packed_body_offset` as an immediate is making a
+    /// compile-time claim about a layout the class manager can replace at run
+    /// time. The two ALLOCATION emitters have guarded that since
+    /// perf/halfgap-20260717 and call an unguarded baked layout "confirmed heap
+    /// corruption"; the field-access emitters had no guard at all.
+    ///
+    /// Four instructions against the process-wide replacement epoch, which only
+    /// a REPLACEMENT bumps — never a new class registration — so a workload
+    /// that never swaps a layout keeps every inline arm.
+    fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
+        let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
+        if addr.is_null() {
+            return None;
+        }
+        self.emit_mov_reg_imm64(R11, addr as u64);
+        // MOV ECX, dword [R11]
+        self.buf.emit(&[0x41, 0x8B, 0x0B]);
+        // CMP ECX, imm32
+        self.buf.emit(&[0x81, 0xF9]);
+        self.buf.emit(&(expected as i32).to_le_bytes());
+        Some(self.emit_jcc_rel32(0x85)) // JNE -> the caller's slow path
+    }
+
     /// Receiver alignment + containment in one of the three published
     /// `JIT_READ_BOUNDS` regions, with RAX holding the receiver. Failures push
     /// their patch offsets onto `slow`.
@@ -2941,6 +3050,10 @@ impl<'a> Lowerer<'a> {
         let mut bail_recv: Vec<usize> = Vec::new();
         let mut bail_pre: Vec<usize> = Vec::new();
         let mut bail_barrier: Vec<usize> = Vec::new();
+        // `cell_off` below is a compile-time claim about this class's compact
+        // layout; the receiver checks that follow are not the only way this arm
+        // must be able to decline.
+        bail_recv.extend(self.emit_layout_epoch_guard());
         if !trusted_oop_receiver {
             self.emit_receiver_align_and_containment(&mut bail_recv);
         }
@@ -3030,6 +3143,7 @@ impl<'a> Lowerer<'a> {
         // Cast: a compact field offset plus the header is bounded by the
         // object size.
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_COMPACT);
         self.buf.emit(&[0x48, 0x89, 0x90]); // MOV [RAX + disp32], RDX
         self.buf.emit(&cell_off.to_le_bytes());
         let stored = self.emit_jmp_rel32();
@@ -3041,6 +3155,7 @@ impl<'a> Lowerer<'a> {
         // makes `field_index * SLOT_SIZE` addressable, since for a legacy
         // object `num_slots` counts exactly these cells.
         self.patch_rel32_to_here(legacy_shape);
+        self.emit_ref_store_path_trace(&crate::metrics::IR_REF_STORE_SHAPE_LEGACY);
         let legacy_off = (HEADER_SIZE + field_index as usize * SLOT_SIZE) as i32;
         self.emit_mov_reg_imm64(R10, u64::from(cratonvm_types::FIELD_CELL_TAG_OBJECT));
         self.buf.emit(&[0x4C, 0x89, 0x90]); // MOV [RAX + disp32], R10
@@ -3242,6 +3357,8 @@ impl<'a> Lowerer<'a> {
 
         let cell_off = (HEADER_SIZE + c_off as usize) as i32;
         let mut slow: Vec<usize> = Vec::new();
+        // `cell_off` is a compile-time claim about this class's compact layout.
+        slow.extend(self.emit_layout_epoch_guard());
 
         self.gp_load_value(RAX, base);
         // 2026-09-02: a receiver this block already proved (null-tested and,
@@ -5390,7 +5507,11 @@ impl<'a> Lowerer<'a> {
     /// succ_block` carries: one per value phi of the successor's merge whose
     /// input for this edge is a real node. Pure; `emit_phi_copies` emits
     /// exactly these and `edge_has_phi_copies` asks whether there are any.
-    fn gather_phi_copies(&self, pred_block: usize, succ_block: usize) -> Vec<(NodeId, i32, i32)> {
+    fn gather_phi_copies(
+        &self,
+        pred_block: usize,
+        succ_block: usize,
+    ) -> Vec<PhiCopy> {
         let merge_ctrl = self.schedule.blocks[succ_block].ctrl;
         if !matches!(
             self.graph.nodes[merge_ctrl as usize].op,
@@ -5398,7 +5519,7 @@ impl<'a> Lowerer<'a> {
         ) {
             return Vec::new();
         }
-        let mut out: Vec<(NodeId, i32, i32)> = Vec::new();
+        let mut out: Vec<PhiCopy> = Vec::new();
         for id in 0..self.graph.nodes.len() {
             let node = &self.graph.nodes[id];
             if !matches!(node.op, Op::Phi) {
@@ -5421,7 +5542,12 @@ impl<'a> Lowerer<'a> {
                 }
                 if let Some(&val_id) = node.inputs.get(k + 1) {
                     if val_id != NO_NODE {
-                        out.push((id as NodeId, self.slot_of(id as NodeId), self.slot_of(val_id)));
+                        out.push(PhiCopy {
+                            phi: id as NodeId,
+                            dst: self.slot_of(id as NodeId),
+                            src: val_id,
+                            src_slot: self.slot_of(val_id),
+                        });
                     }
                 }
             }
@@ -7435,7 +7561,26 @@ impl<'a> Lowerer<'a> {
         // Guarded on the home slot existing, which is belt-and-braces: a node
         // the colourer gave no home was never promotable in the first place
         // (`plan_register_residency` requires one).
-        if self.assigned_gpr(id).is_some() {
+        //
+        // 2026-09-04: **a value already live in its register is not published
+        // again.** A phi is the case that matters, and it is not a small one.
+        // A phi appears in its header block's node list like any other value,
+        // so this site ran for it once per iteration and reloaded the register
+        // out of the home word — while the edge copies had already put the
+        // value there. The disassembly of `FieldLoop.sum` showed both halves of
+        // the resulting loop-carried chain: `mov [rbp-78h],rax` on the back
+        // edge, and `mov rbx,[rbp-78h]` at the top of the next iteration,
+        // waiting on it.
+        //
+        // Skipping is safe for the same reason every read of `gp_reg_live` is:
+        // the allocator gives a register to one value at a time over its live
+        // range, so nothing between the publish and here can have written it.
+        // It applies ONLY to this re-publish. An edge copy must always write
+        // the phi's register — that is the copy — and `emit_phi_copies` does so
+        // whether or not the register was already live.
+        if self.assigned_gpr(id).is_some()
+            && !(ir_skip_live_republish_enabled() && self.resident_gpr(id).is_some())
+        {
             if let Some(off) = self.node_slot.get(id as usize).copied().flatten() {
                 let slot = off.get() as i32;
                 self.publish_gp_from_slot(id, slot);
@@ -9013,6 +9158,26 @@ fn frame_word_loc(off: i32) -> CompileResult<ValueLoc> {
 
 /// Inverse of [`frame_word_loc`].
 ///
+/// One phi's incoming value on one edge: which phi, where its home word is,
+/// and **which node** the value comes from as well as where that node's home
+/// word is.
+///
+/// The source NODE is the addition. Without it an edge copy can only be
+/// expressed as memory-to-memory — `load rax, [src]; store [dst], rax` — and
+/// that is what put a store and a load of the same word two instructions apart
+/// at the top of every loop this backend compiles (`JIT_OPTIMIZATION.md`, "the
+/// residual 1.36x: latency, not volume"). With the node in hand, a source that
+/// is already register-resident is read from its register, and a destination
+/// that is register-resident is published from RAX rather than reloaded out of
+/// the word just written.
+#[derive(Clone, Copy)]
+struct PhiCopy {
+    phi: NodeId,
+    dst: i32,
+    src: NodeId,
+    src_slot: i32,
+}
+
 /// A [`ValueLoc::Reg`] is unreachable from this backend — it keeps every value
 /// in its home frame word and has no register allocation to disagree with — but
 /// it is representable in the shared type, so it is refused rather than
@@ -9177,17 +9342,28 @@ fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()
     // scheduled order, then its terminator. This is exactly `lower_inner`'s
     // `for block_idx in 0..blocks.len() { lower_block(block_idx) }`.
     let mut emit_index: Vec<Option<usize>> = vec![None; graph.nodes.len()];
+    // Which laid-out block each node lands in. Used only to describe a failure:
+    // "def after use" means one thing when both sit in a single block (an
+    // intra-block scheduling order) and quite another when they do not (a block
+    // LAYOUT that put a definition's block after its user's).
+    let mut block_of: Vec<Option<usize>> = vec![None; graph.nodes.len()];
     let mut seq = 0usize;
-    for block in &schedule.blocks {
+    for (bpos, block) in schedule.blocks.iter().enumerate() {
         for &node_id in &block.nodes {
             if let Some(cell) = emit_index.get_mut(node_id as usize) {
                 *cell = Some(seq);
+            }
+            if let Some(cell) = block_of.get_mut(node_id as usize) {
+                *cell = Some(bpos);
             }
             seq += 1;
         }
         if let Some(term) = block.terminator {
             if let Some(cell) = emit_index.get_mut(term as usize) {
                 *cell = Some(seq);
+            }
+            if let Some(cell) = block_of.get_mut(term as usize) {
+                *cell = Some(bpos);
             }
             seq += 1;
         }
@@ -9263,8 +9439,12 @@ fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()
                     BailoutReason::UnallocatedValue { node: input },
                     format!(
                         "n{input} ({:?}) is emitted at position {def_seq}, after its \
-                         use by n{user} ({:?}) at position {use_seq}",
-                        def.op, node.op
+                         use by n{user} ({:?}) at position {use_seq} \
+                         [def in laid-out block {:?}, use in {:?}]",
+                        def.op,
+                        node.op,
+                        block_of.get(input as usize).copied().flatten(),
+                        block_of.get(user as usize).copied().flatten(),
                     ),
                 ));
             }
@@ -11592,6 +11772,55 @@ fn plan_register_residency(
     let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
+
+    // ── Could the home slot be dropped? A census, before building it ──
+    //
+    // `docs/feature-designs/ir-optional-home-slot.md` argues that a value which
+    // lives in a register for its whole range needs no frame word, and rests
+    // that on `LiveModel::pinned` covering every deopt-named value. **On this
+    // path it does not**: `release_deopt_pins` above deliberately releases
+    // exactly those pins, and pays for it by keeping every home the COLOURER
+    // planned. So a promoted value here may very well be named by a deopt
+    // frame, and its home is what that frame reads.
+    //
+    // Which makes the size of the opportunity an empirical question rather than
+    // a design one, and this counts it before anything is built:
+    //
+    //   `home_droppable`  promoted, and named by no safepoint and not a phi
+    //   `blocked_deopt`   promoted, but some safepoint's locals/stack names it
+    //   `blocked_phi`     promoted, but its home is written by the edge copies
+    //
+    // A `home_droppable` of zero on real bytecode refutes the design as
+    // written, and says the next move is deopt metadata that can name a
+    // register — not a refactor of the lowering arms.
+    let (home_droppable, blocked_deopt, blocked_phi) = {
+        let mut deopt_named = vec![false; n];
+        for sp in &graph.safepoints {
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if let Some(cell) = deopt_named.get_mut(v as usize) {
+                    *cell = true;
+                }
+            }
+        }
+        let (mut ok, mut deopt, mut phi) = (0usize, 0usize, 0usize);
+        for id in 0..n {
+            if gp_reg_of.get(id).copied().flatten().is_none() {
+                continue;
+            }
+            if graph
+                .nodes
+                .get(id)
+                .is_some_and(|node| matches!(node.op, Op::Phi))
+            {
+                phi += 1;
+            } else if deopt_named.get(id).copied().unwrap_or(false) {
+                deopt += 1;
+            } else {
+                ok += 1;
+            }
+        }
+        (ok, deopt, phi)
+    };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
@@ -11611,6 +11840,10 @@ fn plan_register_residency(
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
              spilled={skip_spilled} no_alloc={skip_no_alloc}"
+        );
+        eprintln!(
+            "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
+            graph.safepoints.len(),
         );
     }
     if promoted == 0 {
@@ -11637,6 +11870,17 @@ fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
+    // Attribution, not duplication — the same split `verify_or_bail` makes:
+    // `record_bailout` owns the process-wide category counters, and this
+    // attaches the bailout to *this* method in the per-compilation report.
+    //
+    // Without it the report's `bailouts` field is STRUCTURALLY empty for every
+    // lowering refusal: a census over CratonBench read `bailouts:[]` on all 105
+    // compilations, including the 17 that fell through to single-pass, so the
+    // one record that names both the method and the reason named neither. The
+    // counters were moving the whole time, which is what made the hole hard to
+    // see — the totals looked alive while every per-method row was blank.
+    crate::metrics::note_current_bailout(&bailout, "lower");
     None
 }
 
@@ -12739,6 +12983,21 @@ pub(crate) fn lower_inner_with_scopes(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
+    // ENGAGEMENT, not effect. Both numbers answer "did the wiring fire on this
+    // method", which is the question a null timing result cannot answer on its
+    // own -- and this session spent three A/B arms on `CratonBench` before
+    // noticing that the optimizing tier plans no residency there at all, so
+    // both arms had been running identical machine code.
+    if ls_active
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+    {
+        eprintln!(
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
+            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+        );
+    }
+
     // Carry the identity the prologue encoded, so publication can bind it to
     // the artifact this buffer becomes.
     let compile_id = lowerer.compile_id;
@@ -12906,6 +13165,7 @@ pub(crate) fn lower_inner_with_scopes(
         spill_hi: spill_cap_off,
         callee_saved_lo: spill_cap_off,
         callee_saved_hi: frame_size,
+        callee_saved_shallow: false,
         // Named separately as well as covered by the band above, so
         // `FrameLayout::region_name` reports `xmm-saved` rather than the
         // catch-all — a frame dump that cannot tell a register image from an
@@ -12976,6 +13236,30 @@ pub(crate) fn lower_inner_with_scopes(
 /// promoted phi's register at every incoming edge; off, phis stay home-bound
 /// as they were before 2026-09-02 and the residency census reports them
 /// under `phi=`.
+/// A definition whose value is already live in its register is not published
+/// again -- **default OFF**, opt in with `CRATONVM_JIT_IR_SKIP_REPUBLISH=1`.
+///
+/// Off is the historical unconditional reload of the home word at every
+/// definition site, phis included.
+fn ir_skip_live_republish_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SKIP_REPUBLISH") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// An edge's phi copies move register to register where both ends are
+/// resident -- **default OFF**, opt in with `CRATONVM_JIT_IR_PHI_COPY_REGS=1`.
+///
+/// Off is the historical memory-to-memory copy through RAX followed by a
+/// reload of the word just written.
+fn ir_phi_copy_regs_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_REGS") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 fn ir_phi_residency_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_RESIDENCY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -13022,8 +13306,15 @@ fn ir_receiver_guard_cse_enabled() -> bool {
     }
 }
 
-/// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
-/// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
+/// Inline TLAB bump for the optimizing tier's `Op::New` — **OPT-IN**, on with
+/// `CRATONVM_JIT_IR_INLINE_TLAB=1`.
+///
+/// This line said "**default ON**, opt out with `=0`" for two days after the
+/// body below was flipped to opt-in, which is worse than either state: a reader
+/// checking whether a feature is live got the wrong answer from the only
+/// sentence written to tell them. The mismatch cost a census here — a repro run
+/// came back 0/10 and looked like a fix, when the sequence under test had
+/// simply never executed.
 ///
 /// Off restores `emit_new_object_stub` alone, which is what this arm emitted
 /// before the bump existed, so the two are A/B-able in one binary. That is not
@@ -13037,6 +13328,20 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 /// `the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab`,
 /// which now passes because the bump exists rather than because the gate is
 /// shut.
+///
+/// **The two gates are in series, so the SIGSEGV that keeps the outer one shut
+/// cannot occur in any default build.** Both must be set for the bump to run:
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` to let an allocation-bearing method reach
+/// this tier, and this one to emit the bump rather than the stub. Measured
+/// 2026-09-04 on dev with engagement confirmed (`inline_tlab_bump=1
+/// stub_only=0`, the census in `runtime_lowering::ir_alloc_site_counts`):
+/// `RJitMapTierDiff` passes **0 failures in 30 runs** — 10 on a quiet host and
+/// 20 under six spinners — against the 4-in-10 recorded on 2026-09-02.
+///
+/// That is a reason to re-examine the outer gate, NOT to open it here: its
+/// second stated reason is a perf trade (a promoted allocation lowering through
+/// the stub buys a more optimized body at the price of a cheaper allocation)
+/// that is still unpriced.
 fn ir_inline_tlab_enabled() -> bool {
     // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
     //
@@ -13745,6 +14050,152 @@ mod tests {
         assert!(
             contains_seq(&with, &(COMPACT_REF_PUTFIELD_HELPER as u64).to_le_bytes()),
             "the gated arm must keep `jit_putfield_object` as its fallback"
+        );
+    }
+
+    /// The baked compact cell offset is guarded against a layout REPLACEMENT,
+    /// and the guard is proven to fire.
+    ///
+    /// Every emitter that bakes `HEADER_SIZE + packed_body_offset` claims at
+    /// compile time something the class manager can change at run time. The two
+    /// ALLOCATION emitters have guarded that since perf/halfgap-20260717, whose
+    /// comment calls an unguarded baked layout "confirmed heap corruption"; the
+    /// FIELD-ACCESS emitters had no guard at all until 2026-09-04, and the
+    /// compact TLAB default made their unguarded path the common one.
+    ///
+    /// Asserted by EXECUTION, not by inspecting bytes: the compiled body is run
+    /// against a receiver, then the process-wide replacement epoch is bumped by
+    /// actually replacing a layout, and the same body is run again. The first
+    /// run must store inline; the second must reach the helper. A guard that
+    /// compares against a counter nothing ever bumps would pass an
+    /// inspection-only test and protect nothing.
+    #[test]
+    fn a_replaced_layout_routes_the_gated_store_to_the_helper() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        static HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+            HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+        static PRE_GATE: AtomicU64 = AtomicU64::new(0);
+        static POST_GATE: AtomicU64 = AtomicU64::new(1);
+        static READ_BOUNDS: [AtomicUsize; 6] = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+
+        let graph = ref_or_wide_putfield_graph(b'L', 0x19, IrType::Ref);
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → slot
+        helpers.read_bounds_addr = READ_BOUNDS.as_ptr() as usize; // Cast: static address
+        helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize; // Cast: static address
+        helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize; // Cast: static
+        helpers.ref_store_post_young_floor = 0;
+        helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+        let mut compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+        compact.insert((3usize, true), (0u32, true, b'L'));
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
+        let compiled = lower_inner(
+            &graph,
+            &schedule,
+            2,
+            4,
+            &helpers,
+            &empty_hints,
+            &[],
+            None,
+            &no_direct,
+            &no_ic,
+            &compact,
+        )
+        .expect("the gated reference store must compile");
+
+        // A young, compact receiver with one slot.
+        let mut obj = Box::new([0u64; 8]);
+        // SAFETY: `obj` is 64 bytes, 8-byte aligned; both writes land inside it.
+        unsafe {
+            let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+            *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+            std::ptr::write_unaligned(
+                p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
+                4u32,
+            );
+        }
+        let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+        let page = obj_addr & !0xFFF;
+        READ_BOUNDS[0].store(page, Ordering::Release);
+        READ_BOUNDS[1].store(page + 0x10000, Ordering::Release);
+        let val = Box::new([0u64; 8]);
+        let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+        HELPER_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: JIT-compiled code from valid bytecode in an executable mmap;
+        // the receiver is a live buffer shaped like an object header and the
+        // marker helper stores nothing.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            HELPER_CALLS.load(Ordering::SeqCst),
+            0,
+            "before any replacement the guard must pass and the store stay inline"
+        );
+        assert_eq!(
+            obj[cratonvm_types::HEADER_SIZE / 8] as usize, // Cast: stored pointer word
+            val_addr,
+            "the inline store must have written the compact cell"
+        );
+
+        // Now REPLACE a layout. Not by poking the counter -- by doing the thing
+        // that bumps it, so the test cannot pass against a guard wired to a
+        // number nothing in the VM ever moves.
+        let before = cratonvm_types::layout_replace_epoch();
+        // A REPLACEMENT is a second `register_class_layout` for a class_id that
+        // already has one; a first registration deliberately does not count.
+        let cid = 900_001u32;
+        let mk = |body: u32| {
+            std::sync::Arc::new(cratonvm_types::CompactLayout {
+                field_offsets: vec![0],
+                is_ref: vec![false],
+                field_kinds: vec![cratonvm_types::FieldStorageKind::Int],
+                ref_offsets: Vec::new(),
+                body_size: body,
+            })
+        };
+        let (l1, l2) = (mk(4), mk(8));
+        cratonvm_types::register_class_layout(cratonvm_types::FIRST_LAYOUT_DOMAIN, cid, l1);
+        cratonvm_types::register_class_layout(cratonvm_types::FIRST_LAYOUT_DOMAIN, cid, l2);
+        assert!(
+            cratonvm_types::layout_replace_epoch() > before,
+            "replacing a registered layout must bump the process-wide epoch, or \
+             the guard below is comparing against a constant"
+        );
+
+        obj[cratonvm_types::HEADER_SIZE / 8] = 0;
+        HELPER_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: as above.
+        unsafe {
+            compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+        }
+        assert_eq!(
+            HELPER_CALLS.load(Ordering::SeqCst),
+            1,
+            "a replaced layout must route the already-compiled site to the \
+             always-correct helper — its baked cell offset now describes a \
+             layout the object no longer has"
+        );
+        assert_eq!(
+            obj[cratonvm_types::HEADER_SIZE / 8],
+            0,
+            "and the inline store must not have run"
         );
     }
 
@@ -17287,7 +17738,7 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op)
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 
