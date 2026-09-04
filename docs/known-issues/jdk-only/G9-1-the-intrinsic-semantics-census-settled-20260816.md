@@ -46,6 +46,54 @@ Probes (scratchpad, not committed): `charsweep.exe` / `CharSweep.java`,
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04, and the vector REFUTES part of what it
+> was written to confirm.** Status was **FIXED-UNVERIFIED-ON-CRATONVM**.
+>
+> **`RJdkG9Skew` is not in the regression suite** — this record writes it out in
+> full and it was never added, so `regression-suite/src/RJdkG9Skew.java` does not
+> exist and no suite run has ever executed it. Extracted from this record and
+> kept as `probes/RJdkG9Skew.java`.
+>
+> ```text
+>                       checks   fails   self-diff over 2 runs
+> HotSpot 25              768      0       0
+> CratonVM compatible     768      3       0
+> CratonVM --jdk-only     768      3       0
+> ```
+>
+> **765 of 768 agree. The three that fail are one defect — FINAL SIGMA:**
+>
+> ```text
+> sig.bulk.final        "AΣ".toLowerCase(ROOT)              want 97,962        got 97,963
+> sig.unassigned.a7ce   "AΣ꟎".toLowerCase(ROOT)        want 97,962,42958  got 97,963,42958
+> sig.unassigned.16ea0  "AΣ"+U+16EA0 .toLowerCase(ROOT)     want 97,962,55323,56992
+>                                                            got 97,963,55323,56992
+> ```
+>
+> 962 is U+03C2 FINAL SIGMA, 963 is U+03C3 medial. A sigma at end-of-word must
+> lower-case to the final form; we give the medial form in all three.
+>
+> **The record's own controls localise it, and they all pass.** Every row that
+> WANTS 963 is correct — `sig.assigned.a7d3` (A7D3 is an assigned lowercase
+> letter, so the sigma stays medial), `sig.cased.after` (the sigma is not final).
+> So the rule is not simply absent. And `sig.bulk.pair` — `"ΣΣ"` → `963,962` —
+> **passes**, so final-sigma is produced correctly when the preceding character
+> is a sigma and wrongly when it is `A`. That contrast is in the data and is the
+> place to start; it is NOT diagnosed here.
+>
+> **This contradicts a stated premise.** The record's own comment on the
+> `sig.bulk.*` rows reads *"No skewed code point: the bulk path, which was
+> already right."* `sig.bulk.final` is a bulk-path row and it fails, so the bulk
+> path is not right — for this input it never was, or has since regressed.
+> Whichever it is, the sentence cannot stand as written.
+>
+> **What this does NOT verify.** This is one of the vectors this record names,
+> not its whole census; the other 765 checks passing says the rest of the
+> measured surface holds on these inputs and nothing about inputs the vector does
+> not contain. §§ that are source or oracle censuses were not re-derived. The
+> three failures are identical in both modes, so nothing here is mode-specific,
+> and no claim is made about `--synthetic-jdk`, which was not run.
+
 ## 0. The headline
 
 | subject | before | after | how |

@@ -62,6 +62,63 @@ JDK 25.0.3.9, and each is reproducible.
 >   so a *third* answer fails. It would not have failed the pre-fix binary (that
 >   one threw earlier), so it is cover against future rot, not a RED.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-04. The Falsifier was run as written, all
+> three rows, and the change SHOULD STAY.** The status block says *"Not rebuilt
+> in this lane: no claim is made that the change compiles or that the vector
+> passes."* Both claims now have a measurement.
+>
+> **Row 1 — the vector gets past `parallelStreams():209`.**
+>
+> ```text
+> HotSpot 25            PASS RJdkForkJoin (46 checks)
+> CratonVM --jdk-only   PASS RJdkForkJoin (46 checks)
+> CratonVM compatible   PASS RJdkForkJoin (46 checks)
+> ```
+>
+> The `NoClassDefFoundError` naming
+> `…$DefaultCommonPoolForkJoinWorkerThreadFactory` is gone.
+>
+> **Rows 2 and 3 — `probes/FjpCommonFactoryProbe.java`**, written to print
+> exactly the two expressions the Falsifier names:
+>
+> ```text
+>                       getFactory().getClass().getName()                    == defaultFJWTF
+> HotSpot 25            ForkJoinPool$DefaultForkJoinWorkerThreadFactory        true
+> CratonVM --jdk-only   ForkJoinPool$DefaultForkJoinWorkerThreadFactory        true
+> CratonVM --real-jdk   ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory   false
+> CratonVM compatible   ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory   false
+> ```
+>
+> **This record staked the fix on the third row**: *"If Compatible moves, this
+> lane's ordering argument is wrong and the change should be reverted, not
+> patched"* — the point of putting the recovery after
+> `try_alloc_concurrent_synthetic` being that Compatible never reaches it.
+> **Compatible did not move.** It reports the common-pool factory and `false`,
+> identical to `--real-jdk`, so the ordering argument holds. The factory is also
+> not null in any arm, which rules out the record's other stated failure mode
+> ("the factory comes back null ... the resolution context is the problem").
+>
+> **The recovery path is visible in the transcript, not merely inferred.** The
+> strict arm logs the refusal first and then answers correctly:
+>
+> ```text
+> WARN refusing to fabricate a compatibility stand-in …
+>   class="java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory"
+>   requested_by="native-builtins/src/phases_late/concurrent.rs:8833"
+> ```
+>
+> That is this record's own file and line reaching the recovery, so the arm
+> under test is the arm described.
+>
+> **What this does NOT verify.** The `DelayedWorkQueue` row is noted in the
+> record as *"right today ... a package-private JDK-internal name with no test
+> pinning it"*; nothing here pins it either, and it was not re-run. The
+> Compatible half of the fix that this record deliberately did NOT make — the
+> "Out-of-file decision required" section, a human's call — is untouched and
+> remains open; the `false` above is that decision still pending, not a defect
+> this note clears. 46 checks against the record's earlier counts is shared
+> vector growth, not a result.
 ## The failure
 
 ```
