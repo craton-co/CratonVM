@@ -7526,6 +7526,64 @@ impl ZgcRealHeap {
     /// un-retired chunk tail is invisible to it rather than fatal. Retiring
     /// from a mutator query would also be actively wrong: it would close every
     /// thread's buffer on a conservative-root probe.
+    /// Resolve `addr` to the base of the object it points INTO, for PINNING a
+    /// frozen peer's conservative roots.
+    ///
+    /// Deliberately more permissive than [`Self::is_heap_addr`] in exactly two
+    /// ways, both of which that method rejects for good reasons that do not
+    /// apply here:
+    ///
+    /// 1. **Misalignment is accepted.** `VmHeap::is_heap_addr`'s ZGC arm drops
+    ///    `addr & 0x7 != 0` to converge on the contract Generational and G1
+    ///    already had. That is right for deciding whether an ambiguous operand
+    ///    word is a reference; it is wrong for deciding whether an object may
+    ///    MOVE. A compiled loop's cursor into a `char[]` or `byte[]` is
+    ///    routinely misaligned, and if its base is not pinned the array is
+    ///    relocated out from under the register holding it.
+    ///
+    /// 2. **One-past-the-end is accepted** (`addr <= end`, not `addr < end`).
+    ///    A loop cursor that has advanced past the last element names no byte
+    ///    of the object, so `is_heap_addr` correctly answers `None` -- and the
+    ///    object it was walking still must not move.
+    ///
+    /// Over-approximating here is the SAFE direction: the result is used to
+    /// withhold a page from relocation, so a false positive costs one page of
+    /// compaction and a false negative costs a use-after-free. That asymmetry
+    /// is the whole argument, and it is the one
+    /// `coverage_incompleteness_is_page_pinnable` already makes for pinning by
+    /// raw address value: "it does not matter whether the address is a base, an
+    /// interior pointer or a `long` that happens to look like one, because the
+    /// page it falls in is not evacuated either way".
+    ///
+    /// Measured motivation: with the helper-window discharge on, this workload
+    /// SIGSEGVs on a page-ALIGNED fault -- the signature of reading a span
+    /// `compact_low_to` vacated and zeroed -- and six repairs aimed at frame
+    /// slots, oop maps and remap paths changed nothing, because a derived
+    /// pointer has no base anywhere in the frame to find, pin or rewrite.
+    pub fn resolve_interior_for_pin(&self, addr: usize) -> Option<ObjectRef> {
+        if addr == 0 {
+            return None;
+        }
+        if self.registry.contains(addr) {
+            // SAFETY: the registry contains only live allocation bases.
+            return Some(unsafe { ObjectRef::from_raw(addr as *mut u8) });
+        }
+        if !self.registry.has_spill() && (addr < self.arena_base || addr > self.arena_end) {
+            return None;
+        }
+        let base = self.registry.nearest_base_at_or_below(addr)?;
+        // SAFETY: `nearest_base_at_or_below` yields a live registered base.
+        let header = unsafe { &*(base as *const ObjectHeader) };
+        let size = Self::alloc_size(header)?;
+        let end = base.checked_add(size)?;
+        // `<=`, not `<`: one-past-the-end still names the object for pinning.
+        if addr >= base && addr <= end {
+            // SAFETY: the registry contains only live bases.
+            return Some(unsafe { ObjectRef::from_raw(base as *mut u8) });
+        }
+        None
+    }
+
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         // Fast path: an exact object base (the overwhelmingly common probe).
         if self.registry.contains(addr) {

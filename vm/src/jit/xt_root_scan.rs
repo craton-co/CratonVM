@@ -217,6 +217,17 @@ where
     Some(slots)
 }
 
+/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=1` -- resolve a frozen peer's words
+/// with `resolve_interior_for_pin` rather than `is_heap_addr`.
+///
+/// The difference is the two cases `is_heap_addr` drops and a frozen peer's
+/// registers hold: a MISALIGNED interior pointer and a ONE-PAST-THE-END cursor.
+/// Both leave an object unpinned, and relocation then moves it out from under
+/// the register that names it.
+pub fn helper_window_pin_resolve_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE").is_some()
+}
+
 pub fn helper_window_discharge_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_DISCHARGE").is_some()
 }

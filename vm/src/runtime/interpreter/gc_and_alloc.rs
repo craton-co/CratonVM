@@ -665,7 +665,29 @@ pub(super) fn stw_take_over_and_wait(
         let interior = xt::helper_window_discharge_enabled()
             || cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_INTERIOR")
                 .is_some();
-        let (windows, _roots) = if interior {
+        // `is_heap_addr` is still not permissive enough to PIN with, and the
+        // two words it drops are exactly the two a frozen peer's registers
+        // hold. Its ZGC arm rejects a MISALIGNED address (a compiled loop's
+        // cursor into a `char[]` or `byte[]`) and its extent test is `addr <
+        // end`, so a ONE-PAST-THE-END cursor resolves to no base at all.
+        // Either leaves an object nothing pins, and relocation then moves it
+        // out from under the register naming it -- the page-ALIGNED SIGSEGV of
+        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902`, page-
+        // aligned because `compact_low_to` zeroes the span it vacates.
+        //
+        // `resolve_interior_for_pin` accepts both. Over-approximating is the
+        // SAFE direction here and the asymmetry is stark: a false positive
+        // costs one page of compaction, a false negative costs a
+        // use-after-free.
+        let pin_resolve = xt::helper_window_pin_resolve_enabled();
+        let (windows, _roots) = if pin_resolve {
+            xt::helper_window_pass(
+                &taken,
+                &|a| shared.mem.heap.resolve_interior_for_pin(a),
+                xt_roots,
+                &blocked_os_tids,
+            )
+        } else if interior {
             xt::helper_window_pass(
                 &taken,
                 &|a| shared.mem.heap.is_heap_addr(a),
