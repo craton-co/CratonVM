@@ -1,6 +1,40 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
 
+## RESOLVED 2026-09-04 -- two complementary fixes, and the crash was never a GC root
+
+| configuration | SIGSEGV | ref-array OOM | completes | `actual` |
+|---|---|---|---|---|
+| credit, no arena fix | 2-3 of 4 | 0 | when it survives | 99 96x |
+| arena fix, no credit | 0 | **6264** | **no** | -- |
+| **both** | **0 of 5** | **0** | **yes, 555-728 s** | **99953-99978** |
+
+Against this page's opening state: `98304` with **1497** ref-array
+`OutOfMemoryError`s in ~1519 s. Regression suite 88/88. Compaction fully intact
+(25 cycles, 545893 objects relocated).
+
+**Two independent defects, one symptom each.**
+
+1. **The OOM** is what this page is about, and the repair is the ZGC pinned-peer
+   credit plus the blocked-peer shadow-stack scan: a blocked peer's coverage can
+   be discharged by pinning, so relocation is no longer refused on nearly every
+   cycle. `CRATONVM_XT_PINNED_PEER_DEPTH=1` + `CRATONVM_XT_PEER_SHADOW_SCAN=1`.
+
+2. **The SIGSEGV** that discharge exposed is a separate, older collector bug and
+   has nothing to do with JIT roots: `relocate_stw`'s slide writes into a
+   granule the arena DECOMMITTED, because the destination search screens by page
+   and liveness and never by commit state. `Arena::ensure_committed_span` fixes
+   it. Full evidence on
+   `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+
+The credit never corrupted anything. It raises compaction, compaction runs
+slides, and slides are what land in a decommitted granule -- which is why the
+crash tracked the credit so convincingly, and why seven repairs aimed at stale
+references in compiled frames all changed nothing.
+
+**Neither fix alone retires this page.** Without the arena fix the class
+crashes; without the credit it logs 6264 OOMs and never finishes.
+
 ## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
 
 The `--jdk-only` corpus hit this class, so it got the three arms. Both CratonVM
