@@ -1399,8 +1399,41 @@ treats a loop's live set as one decision. That is a larger change than any of
 the four, and it is the first one whose expected effect is above the noise
 floor rather than under it.
 
-**Do not test it by building it.** The same trick used here works: make the
-BASELINE spill its loop-carried values and see whether it lands on 1.61.
+#### Confirmed: register residency is 1.57x of it
+
+Tested the same way, by taking the advantage away from the fast arm.
+`CRATONVM_JIT_LOCAL_REGS=0` truncates the baseline's local-colouring pool to
+empty, so every Java local lives in the frame — the optimizing tier's situation,
+imposed on the tier that normally wins.
+
+| arm | median | vs baseline |
+|---|---|---|
+| baseline | 1.33 | — |
+| baseline, same config (control) | 1.27 | — |
+| **baseline, `CRATONVM_JIT_LOCAL_REGS=0`** | **2.04** | **1.57x** |
+| baseline, no locals **and** no unroll | 2.28 | 1.75x |
+| optimizing tier | 3.09 | 2.38x |
+
+(A busier host than the unrolling table above, so the absolute numbers are
+larger; only the within-run ratios are being read, and the control pair agrees
+to 5%.)
+
+**Spilling the loop-carried values alone costs the baseline 1.57x** — the
+single largest factor found, and it moves the baseline most of the way to the
+optimizing tier without touching anything else. Adding the unroll loss brings
+it to 1.75x of a 2.38x gap: about **two thirds of the inversion**, with
+register residency the dominant share and unrolling roughly 1.12x on top.
+
+A residual of ~1.36x is still unaccounted for. It is not any of the four
+candidates, not unrolling, and not the null check; it is whatever else the
+optimizing tier's 95-instruction body does that the baseline's does not, and
+naming it wants the same treatment — find a switch that removes it from the
+fast arm before building it into the slow one.
+
+**So the recommendation stands and now has a number behind it.** Getting a
+loop's live set into registers *as a group* is worth about 1.57x on this shape.
+That is an order of magnitude above the measurement floor that swallowed all
+four single-value fixes, which is exactly why it is the one worth building.
 
 The loop-weight rule is kept, default OFF, because it is a correct
 generalisation that will matter once the parameters can be promoted at all —
