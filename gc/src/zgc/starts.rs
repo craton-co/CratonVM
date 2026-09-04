@@ -566,6 +566,134 @@ impl ZObjectStartBits {
         }
     }
 
+    /// The word range covering the arena addresses `[lo, hi)`, clamped to this
+    /// bitmap. Half-open, and the end rounds UP so a partially covered word is
+    /// included.
+    #[inline]
+    pub(crate) fn word_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        let end = self.base.saturating_add(self.span);
+        let lo = lo.clamp(self.base, end);
+        let hi = hi.clamp(lo, end);
+        let first = (lo - self.base) >> 9;
+        let last = ((hi - self.base) + 511) >> 9;
+        (first.min(self.nwords), last.min(self.nwords))
+    }
+
+    /// Copy only the words covering `ranges`, leaving every other word zero.
+    ///
+    /// # Why a bitmap pass may skip most of the heap
+    ///
+    /// This bitmap is sized by CAPACITY -- one bit per 8 arena bytes, so
+    /// `-Xmx / 512` bytes of words -- and the snapshot the mark phase takes was
+    /// copying all of it, once per collection. At `-Xmx4g` that is 8.4 million
+    /// atomic loads into a fresh 64 MiB `Vec`, and it is paid whether the heap
+    /// holds ten objects or ten million.
+    ///
+    /// Measured on `G1ChurnPauseProbe 50 1800`, comparing cycles at the SAME
+    /// registered-object count so the only variable is the heap flag:
+    /// `snapshot_us` 11-13 ms at `-Xmx2048m` against 21-23 ms at `-Xmx4096m`.
+    /// Exactly the ratio of the two capacities, and the reason a pause target
+    /// that holds at 2 GiB is unreachable at 4 GiB: this is a floor no
+    /// allocation budget can lower.
+    ///
+    /// The arena is TWO-ENDED. Small objects and TLAB chunks bump up from
+    /// `base`, allocations at or above `ZGC_LARGE_OBJECT_MIN` bump down from
+    /// capacity, and the middle between the two cursors has never been handed
+    /// out -- so no object starts there and no bit in it can be set. Copying it
+    /// transfers zeroes. `ranges` is the caller's statement of where the two
+    /// ends currently are; everything else is skipped.
+    ///
+    /// The result is still FULL LENGTH, so word indices and
+    /// [`Self::word_base`] mean exactly what they meant before and no consumer
+    /// changes. `vec![0u64; n]` takes a zero-page mapping rather than memsetting
+    /// (the same reason [`Self::words`] is raw), so the skipped middle costs
+    /// address space and not time.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// "Nothing is allocated in the middle" is the whole argument, and a
+    /// caller that passes wrong bounds silently loses objects -- the snapshot
+    /// is the mark phase's oracle, so a base missing from it is a live object
+    /// the marker will not visit. Debug builds therefore VERIFY it rather than
+    /// trusting it: [`Self::debug_assert_clear_outside`] walks the skipped
+    /// words and asserts every one is zero.
+    pub(crate) fn snapshot_words_within(&self, ranges: &[(usize, usize)]) -> Vec<u64> {
+        let mut words = vec![0u64; self.nwords];
+        for &(lo, hi) in ranges {
+            let (first, last) = self.word_range(lo, hi);
+            for w in first..last {
+                // SAFETY: `word_range` clamps to `nwords`.
+                words[w] = unsafe { (*self.words.add(w)).load(Ordering::Acquire) };
+            }
+        }
+        self.debug_assert_clear_outside(ranges);
+        words
+    }
+
+    /// Clear only the words covering `ranges`. The twin of
+    /// [`Self::snapshot_words_within`], with the same argument and the same
+    /// verification: a word outside the ranges is already zero, so storing a
+    /// zero into it is work that buys nothing.
+    ///
+    /// **STOP-THE-WORLD ONLY**, for the reason [`Self::clear_all`] gives.
+    pub(crate) fn clear_within(&self, ranges: &[(usize, usize)]) {
+        self.debug_assert_clear_outside(ranges);
+        for &(lo, hi) in ranges {
+            let (first, last) = self.word_range(lo, hi);
+            for w in first..last {
+                // SAFETY: `word_range` clamps to `nwords`.
+                unsafe { (*self.words.add(w)).store(0, Ordering::Relaxed) };
+            }
+        }
+        if self.overflow_len.load(Ordering::Acquire) != 0 {
+            self.overflow.lock().clear();
+            self.overflow_len.store(0, Ordering::Release);
+        }
+        std::sync::atomic::fence(Ordering::Release);
+    }
+
+    /// Every word OUTSIDE `ranges` must be zero. Debug builds only: it is the
+    /// O(capacity) walk the bounded passes exist to avoid, so running it in
+    /// release would give back exactly what they saved.
+    ///
+    /// This is the one check that can catch a caller whose bounds are wrong,
+    /// and the failure it prevents is silent: the snapshot is the mark phase's
+    /// oracle, so a base outside the bounds is a live object the marker never
+    /// visits and the sweep then frees.
+    #[inline]
+    pub(crate) fn debug_assert_clear_outside(&self, ranges: &[(usize, usize)]) {
+        #[cfg(debug_assertions)]
+        {
+            let mut covered = vec![false; self.nwords];
+            for &(lo, hi) in ranges {
+                let (first, last) = self.word_range(lo, hi);
+                for c in covered.iter_mut().take(last).skip(first) {
+                    *c = true;
+                }
+            }
+            for (w, c) in covered.iter().enumerate() {
+                if *c {
+                    continue;
+                }
+                // SAFETY: `w < nwords`.
+                let bits = unsafe { (*self.words.add(w)).load(Ordering::Acquire) };
+                assert_eq!(
+                    bits,
+                    0,
+                    "{}: word {w} (arena {:#x}..{:#x}) is outside the live bounds \
+                     {ranges:?} but holds start bits -- a bounded bitmap pass \
+                     would drop them, and for the object-start registry that is \
+                     a live object the marker never visits",
+                    self.label,
+                    self.word_base(w),
+                    self.word_base(w) + 512,
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = ranges;
+    }
+
     /// Clear **every** bit, in one pass over the words.
     ///
     /// # Why this is the whole argument for a side bitmap
@@ -918,6 +1046,35 @@ impl ZObjectStarts {
     /// (8 bytes per live object plus load factor) for any occupancy above ~1.5%,
     /// and it keeps the O(1) membership the mark phase's wild-child screen
     /// needs.
+    /// [`Self::snapshot`], copying only the words that can hold a bit.
+    ///
+    /// `ranges` are arena address ranges the caller knows bound every live
+    /// allocation -- on this heap, the low bump region and the large-object
+    /// end, with the never-bumped middle between them. See
+    /// [`ZObjectStartBits::snapshot_words_within`] for the measurement that
+    /// motivates it and the invariant it rests on.
+    ///
+    /// Falls back to the full copy on the `Hash` arm, which has no geometry to
+    /// bound.
+    pub(crate) fn snapshot_within(&self, ranges: &[(usize, usize)]) -> ZObjectStartsSnapshot {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => {
+                let words = bits.snapshot_words_within(ranges);
+                let extra = if bits.overflow_len.load(Ordering::Acquire) != 0 {
+                    bits.overflow.lock().clone()
+                } else {
+                    FxHashSet::default()
+                };
+                ZObjectStartsSnapshot {
+                    words,
+                    base: bits.base,
+                    extra,
+                }
+            }
+            ZObjectStartsKind::Hash(_) => self.snapshot(),
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> ZObjectStartsSnapshot {
         match &self.kind {
             ZObjectStartsKind::Bits(bits) => {

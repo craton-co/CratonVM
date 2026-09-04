@@ -1256,11 +1256,53 @@ So the named causes of the residual inversion are, in order:
 1. **The optimizing tier does not unroll.** The baseline's 4x unroll amortises
    the counter compare, the backedge and the safepoint poll over four
    iterations; the optimizing tier pays all three every iteration.
-2. **Six of nine promoted candidates never reach a register**, and with the
-   census fixed the question "why" is finally answerable rather than
-   guessable. Start with `single_use`, which is by far the largest bucket
-   (13 on this method) and is a policy — `ir_residency_pays_enabled` refuses a
-   value read fewer than twice — not a limitation.
+2. **The loop's values are ENTRY PARAMETERS, and entry parameters cannot be
+   promoted at all.** Traced 2026-09-03, and it is the end of the chain.
+
+`single_use` was the largest bucket (13) and looked like the answer: it refuses
+any value read fewer than twice, counting **static** graph edges. Printing the
+shape first — the lesson from the split miscount immediately above — gave:
+
+```text
+single_use n3 op=Param(0) static_uses=1 loop_weight=10   <- the receiver
+single_use n4 op=Param(1) static_uses=1 loop_weight=10   <- the loop bound
+```
+
+One static use, ten loop-weighted. The rule compares a static count while the
+definition and the uses sit at different loop depths: `this` and `n` are
+defined once at method entry and read every iteration. `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`
+generalises the test to `uses_frequency >= 2 x definition_frequency`, which
+reduces exactly to `use_count >= 2` at depth 0.
+
+**It admits them past that gate and residency does not move** — `resident=3`
+either way; they land in `no_alloc`/`spilled` instead. The policy was never the
+binding constraint, because the allocator had already declined them.
+
+**`MachineModel::pin_entry_params` pins every `Param` to its incoming ABI
+register**, and `allocate_linear_scan` skips a pinned value outright
+(`regalloc.rs`, `live.pinned[id]`). The ABI registers are caller-saved and are
+not in `IR_LOWER_LS_GPRS` (RBX, R12–R15), so an entry parameter can never be
+promoted into the callee-saved file the loop needs. It reaches the loop through
+its frame slot, every iteration, by construction.
+
+The baseline tier does the one thing this tier does not — it copies parameters
+into callee-saved registers in the prologue:
+
+```text
+39: mov r15,rsi        ; this -> r15
+3c: mov r14,rdx        ; n    -> r14
+```
+
+**So the fix is a prologue copy, not an allocator heuristic.** The optimizing
+tier needs to move loop-live parameters out of their ABI registers into the
+allocatable callee-saved file at entry, and tell the allocator that is where
+they live. Until it does, no residency policy can reach them — which is why
+three successive candidates (splits, the null check, the single-use rule) each
+measured zero on this loop.
+
+The loop-weight rule is kept, default OFF, because it is a correct
+generalisation that will matter once the parameters can be promoted at all —
+and because its own measurement is on record as not moving this workload.
 
 What it is **not**: splits, register pressure at the file's edge, code size
 (the optimizing tier emits *less* code here), or the null check.

@@ -8948,6 +8948,64 @@ impl ZgcRealHeap {
         }
     }
 
+    /// The arena address ranges that can hold an object start: the low bump
+    /// region and the large-object end, with the never-bumped middle between
+    /// them excluded.
+    ///
+    /// This is what makes the per-cycle bitmap passes cost what the heap USES
+    /// rather than what `-Xmx` reserves. The object-start registry and the mark
+    /// bits are both sized by capacity -- one bit per 8 arena bytes -- and the
+    /// snapshot the mark phase takes was copying all of it every cycle. At
+    /// `-Xmx4g` that is 8.4 million atomic loads into a fresh 64 MiB `Vec`,
+    /// paid whether the heap holds ten objects or ten million.
+    ///
+    /// Measured on `G1ChurnPauseProbe 50 1800`, comparing cycles at the SAME
+    /// registered-object count so the only variable is the heap flag:
+    /// `snapshot_us` 11-13 ms at `-Xmx2048m` against 21-23 ms at `-Xmx4096m`.
+    /// Exactly the ratio of the capacities. That is a pause floor no allocation
+    /// budget can lower, and it is why a pause target that holds at 2 GiB was
+    /// unreachable at 4 GiB (see `refresh_pause_target_budget`).
+    ///
+    /// # The middle is provably empty
+    ///
+    /// `Arena` is two-ended: small objects and TLAB chunks bump UP from offset
+    /// 0, allocations at or above `ZGC_LARGE_OBJECT_MIN` bump DOWN from
+    /// capacity, and the span between the two cursors has never been handed
+    /// out. No allocation starts there, so no start bit in it is set, so
+    /// copying it transfers zeroes.
+    ///
+    /// This is also what pays for `Arena::retract_cursor_to`. Retraction lowers
+    /// the low cursor onto the last survivor after every sweep; without bounded
+    /// passes that only helped the allocator find contiguous space, because the
+    /// bitmap work stayed sized by capacity either way. With them, retraction
+    /// SHRINKS THE PAUSE: the tail of garbage a burst allocated is handed back,
+    /// and the next cycle's snapshot, clear and complement sweep all stop at
+    /// the new cursor.
+    ///
+    /// Takes the arena lock. The caller is at a safepoint, so the two cursors
+    /// cannot move while the ranges are in use.
+    fn live_bitmap_bounds(&self) -> [(usize, usize); 2] {
+        let base = self.arena_base;
+        let (low_end, high_start, end) = {
+            let arena = self.arena.lock();
+            (
+                // HIGH-WATER, not the cursor. `Arena::retract_cursor_to`
+                // lowers the cursor onto the last survivor after every sweep,
+                // and the MARK bitmap has bits above the new cursor -- set
+                // during the cycle, when it was still high. A clear bounded by
+                // the cursor leaves them, and the next cycle then reads a mark
+                // set carrying a previous cycle's bits. `Arena::low_high_water`
+                // is the bound both bitmaps need; the debug verifier in
+                // `ZObjectStartBits::debug_assert_clear_outside` is what caught
+                // the cursor being the wrong one.
+                base + arena.low_high_water(),
+                base + arena.high_cursor(),
+                base + arena.capacity(),
+            )
+        };
+        [(base, low_end), (high_start, end)]
+    }
+
     /// Clear **every** mark bit in the heap.
     ///
     /// One linear pass over `capacity / 512` bytes on the bitmap arm; on the
@@ -8966,7 +9024,23 @@ impl ZgcRealHeap {
         // by its thread -- and a missed one is an object swept while live.
         match &self.mark_bits {
             Some(bits) => {
-                bits.clear_all();
+                // BOUNDED, for the reason `live_bitmap_bounds` gives: a word
+                // in the never-bumped middle is already zero and storing a
+                // zero into it is work that buys nothing. Cheaper than the
+                // snapshot's saving (a linear store, not an atomic load) but
+                // paid on the same per-cycle schedule.
+                if zgc_bitmap_bounds_enabled() {
+                    bits.clear_within(&self.live_bitmap_bounds());
+                    // Both bitmaps over this arena are clear now, so the
+                    // retraction history has done its job: the next cycle's
+                    // bound starts from the retracted cursor rather than from
+                    // wherever this one peaked. Reset AFTER the clear -- doing
+                    // it earlier hands the clear a bound that does not cover
+                    // the bits it has to reach.
+                    self.arena.lock().reset_low_high_water();
+                } else {
+                    bits.clear_all();
+                }
                 true
             }
             None => false,
@@ -10467,6 +10541,31 @@ fn zgc_alloc_trigger_percent() -> usize {
         {
             Some(p) => p.min(100),
             None => 0,
+        }
+    })
+}
+
+/// `CRATONVM_ZGC_BITMAP_BOUNDS` -- restrict the per-cycle object-start and
+/// mark-bit passes to the arena's two BUMPED ends instead of its whole
+/// capacity. **Default on**; `0`/`off`/`false`/`no` restores the
+/// whole-capacity passes byte for byte, which is the A/B arm.
+///
+/// See [`ZgcRealHeap::live_bitmap_bounds`] for the measurement (a
+/// capacity-proportional `snapshot_us` of 11-13 ms at `-Xmx2048m` against
+/// 21-23 ms at `-Xmx4096m`, at the same object count) and for why the middle
+/// between the two cursors is provably empty.
+fn zgc_bitmap_bounds_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ZGC_BITMAP_BOUNDS") {
+            Ok(value) => {
+                let value = value.trim();
+                !matches!(
+                    value,
+                    "0" | "false" | "False" | "FALSE" | "off" | "Off" | "OFF" | "no" | "No" | "NO"
+                )
+            }
+            Err(_) => true,
         }
     })
 }
@@ -12691,7 +12790,15 @@ impl GarbageCollector for ZgcRealHeap {
         // bytes rather than 8+ bytes per live object, so it is also strictly
         // cheaper than the set clone at any occupancy above ~1.5%.
         let tlab_us = clock.lap();
-        let registered: ZObjectStartsSnapshot = self.registry.snapshot();
+        let registered: ZObjectStartsSnapshot = if zgc_bitmap_bounds_enabled() {
+            // BOUNDED to the two ends the arena has actually bumped. See
+            // `live_bitmap_bounds` for the measurement and for why the middle
+            // is provably empty; `CRATONVM_ZGC_BITMAP_BOUNDS=0` restores the
+            // whole-capacity copy.
+            self.registry.snapshot_within(&self.live_bitmap_bounds())
+        } else {
+            self.registry.snapshot()
+        };
         // COUNTED, not collected. `bases()` here allocated one `usize` per
         // registered object -- 87 MB on the 10.8M-object arm, inside the pause,
         // which the 2026-08-17 anatomy measured as 13% of it. Every phase below

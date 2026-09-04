@@ -2069,6 +2069,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-gen-nursery-percent", on_key: Some("CRATONVM_ZGC_GEN_NURSERY_PERCENT"), off_key: None, off_word: Some("0"), since: "2026-08-17" },
     E { group: Group::GC, token: "zgc-alloc-trigger", on_key: Some("CRATONVM_ZGC_ALLOC_TRIGGER"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::GC, token: "zgc-pause-target-ms", on_key: Some("CRATONVM_ZGC_PAUSE_TARGET_MS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
+    E { group: Group::GC, token: "zgc-bitmap-bounds", on_key: Some("CRATONVM_ZGC_BITMAP_BOUNDS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // G2e/G2f (2026-08-17, widened to every cycle 2026-08-18). Default-ON kill
     // switches over the sweep's two per-dead-object costs, in the shape `zgc-relocate` established:
     // `0` restores the previous behaviour byte for byte, so the A/B is a re-run
