@@ -130,6 +130,8 @@ Honest gaps, not hidden ones:
   throughput optimisation, not a correctness feature.
 - **No allocation pool.** `backend_cuda::AllocPool` has no twin, so
   `set_retire_to_pool` is a no-op and allocations are freed at drop.
+  Measured 2026-09-04 and it costs nothing detectable -- see the
+  performance section below.
   The exit census still counts every allocation as a pool MISS
   (`cuMemAlloc=N pooled=0`). Leaving it uncounted would have printed
   `cuMemAlloc=0` on a run that allocated heavily -- a zero from an
@@ -143,6 +145,48 @@ Honest gaps, not hidden ones:
   `docs/known-issues/gpu/cuda-core-msvc-enum-signedness-20260904.md`,
   which includes the 13-edit fix and the evidence that it works on
   sm_75 once applied.
+
+## Performance: measured, and no difference resolved
+
+Both backends were A/B'd on this box (Windows 11, CUDA 13.3, RTX 2060)
+with `bench-gpu/backend-ab.sh`.
+
+| Bench | rounds | oxide vs cudarc | control (cudarc vs itself) |
+| --- | ---: | --- | --- |
+| `GpuTransferFloor` 2^24 | 8 | +3.1% | +1.7%, 17% spread |
+| `GpuAllocChurn` 2^20 | 21 | **+0.4%, 95% CI [-4.4%, +5.1%]** | +1.8%, CI [-1.9%, +5.5%] |
+
+Both confidence intervals include zero -- as the control's must, which is
+what says the method is calibrated rather than merely quiet. **The two
+backends are equivalent to within about +/-5% here.** Checksums are
+bit-identical across backends on every bench, and against HotSpot on
+`ci-gate.sh` (4/4 both) and `runtime-stress.sh` (8/8 both).
+
+Three traps this measurement walked into, all caught by the control arm,
+and all worth knowing before anyone re-runs it:
+
+1. **A vacuous instrument.** The first attempt used `GpuWarm`, whose
+   `warm_ms` is an INTEGER and read 1-2 ms at these sizes. Millisecond
+   quantization was the entire signal: the control arm and the real arm
+   both came out at exactly `2.000`. `GpuTransferFloor` and
+   `GpuAllocChurn` report `best_ms` as a double.
+
+2. **A false positive pointing the way the mechanism predicts.** cudarc
+   pools device allocations and this backend does not, so `GpuAllocChurn`
+   was written to force an allocation per call. A single unpaired run
+   showed oxide **34% slower** -- exactly the predicted direction. Paired
+   against a rotated control it came back +0.4%. The mechanism is real;
+   the effect is not, at this shape and size. Had the run stopped at the
+   smoke test it would have "confirmed" the alloc pool.
+
+3. **An order effect read as drift.** At 8 rounds each successive slot in
+   a round looked slower (1.338 / 1.381 / 1.402 ms). At 21 rounds -- seven
+   complete rotations of the three-arm order, so every arm spends equal
+   time in every slot -- it vanished (1.353 / 1.376 / 1.354 ms).
+
+What this does NOT cover: CUDA graph capture (cudarc-only, so there is
+nothing to compare), and any difference smaller than roughly 5%, which
+this shared box cannot resolve.
 
 ## The seam we kept anyway
 

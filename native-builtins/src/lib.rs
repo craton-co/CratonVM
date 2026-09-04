@@ -28382,8 +28382,26 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     // means exactly that state — no Java sink and no file descriptor — and
     // returning quietly left `checkError()` FALSE forever. MEASURED on a
     // `PrintWriter` after `close()`: HotSpot true, this VM false.
+    // ONLY that state, though. Two very different situations reach this line,
+    // and until now both set `trouble`:
+    //
+    //  * no Java sink and no fd — the closed stream above. HotSpot sets it.
+    //  * a sink that REFUSED the write — an `Error` or `RuntimeException`,
+    //    which `catch (IOException x)` does not name. HotSpot PROPAGATES that
+    //    out of `print` and never runs the `catch`, so `trouble` stays clear.
+    //    This VM cannot propagate it (W7-70 established that making these
+    //    natives propagate deletes the console fallback), so it falls through
+    //    to here — but inventing a `trouble` HotSpot would not set turns a
+    //    KEPT divergence into a second, louder one.
+    //
+    // The sink FIELD separates them, which is why both `close()` natives now
+    // null it. MEASURED — `CloseFlushSwallowProbe`'s
+    // `psRouteErrorWriteDidNotRecordTrouble` and its `pw` twin.
     if let Some(Value::Object(Some(this))) = args.first().copied() {
-        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        let has_sink = matches!(ctx.get_field_by_name(this, "out"), Value::Object(Some(_)));
+        if !has_sink {
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        }
     }
 }
 
@@ -28507,8 +28525,26 @@ fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str)
     // means exactly that state — no Java sink and no file descriptor — and
     // returning quietly left `checkError()` FALSE forever. MEASURED on a
     // `PrintWriter` after `close()`: HotSpot true, this VM false.
+    // ONLY that state, though. Two very different situations reach this line,
+    // and until now both set `trouble`:
+    //
+    //  * no Java sink and no fd — the closed stream above. HotSpot sets it.
+    //  * a sink that REFUSED the write — an `Error` or `RuntimeException`,
+    //    which `catch (IOException x)` does not name. HotSpot PROPAGATES that
+    //    out of `print` and never runs the `catch`, so `trouble` stays clear.
+    //    This VM cannot propagate it (W7-70 established that making these
+    //    natives propagate deletes the console fallback), so it falls through
+    //    to here — but inventing a `trouble` HotSpot would not set turns a
+    //    KEPT divergence into a second, louder one.
+    //
+    // The sink FIELD separates them, which is why both `close()` natives now
+    // null it. MEASURED — `CloseFlushSwallowProbe`'s
+    // `psRouteErrorWriteDidNotRecordTrouble` and its `pw` twin.
     if let Some(Value::Object(Some(this))) = args.first().copied() {
-        cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        let has_sink = matches!(ctx.get_field_by_name(this, "out"), Value::Object(Some(_)));
+        if !has_sink {
+            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+        }
     }
 }
 
@@ -29737,6 +29773,16 @@ fn native_printwriter_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if ctx.fd_table().flush(fd).is_err() {
             cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
         }
+    }
+    // `out = null`, the second half of the JDK's `if (out != null) { out.close();
+    // out = null; }`. It is the state every later `ensureOpen()` reads, and
+    // omitting it left "this writer is closed" with no representation at all on
+    // the `PrintWriter` side, which has no `closing` field to fall back on.
+    //
+    // NOT for a console writer: that branch deliberately does not close the
+    // sink, so it is not closed, and nulling would strand `System.out`.
+    if !is_console && sink.is_some() {
+        ctx.set_field_by_name(this, "out", Value::Object(None));
     }
     Ok(None)
 }
