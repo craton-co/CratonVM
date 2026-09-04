@@ -1240,6 +1240,13 @@ pub const INVENTORY: &[E] = &[
     // from the one above on purpose: one switch covering both emitters could not
     // separate "the plan is wrong" from "this emitter is wrong".
     E { group: Group::JIT, token: "ir-ref-store", on_key: Some("CRATONVM_JIT_IR_REF_STORE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    // Opt-IN: copy a loop-live int/long PARAMETER into a callee-saved register
+    // at entry, which the optimizing tier otherwise cannot do (entry params are
+    // pinned to caller-saved ABI registers and the allocator skips a pinned
+    // value). Declared here by a passing change: it was read by
+    // `ir_param_prologue_copy_enabled` and declared nowhere, so it was served
+    // by a live getenv rather than the latched snapshot.
+    E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     // Diagnostic-only: the DYNAMIC split between the gated arm's inline path
     // and its helper fallback. The compile-time census counts emitted
     // sequences, which is not the same fact.
@@ -1956,7 +1963,12 @@ pub const INVENTORY: &[E] = &[
     // the one the JIT's inline `new` and the TLAB-miss path already use. Off by
     // default because the single previous attempt at this unification
     // miscompiled `probes/FjpProbe.java`; see `compact_tlab_alloc_enabled`.
-    E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON opt-out since 2026-09-03: `compact_tlab_alloc_enabled` reads
+    // `0`. It shipped opt-in the same day and earned the default with a
+    // 228-program differential soak per collector, 89/89 on the
+    // HotSpot-differential regression suite with the shape enabled, and a real
+    // application allocating 87.5 MB less.
+    E { group: Group::GC, token: "compact-tlab-alloc", on_key: Some("CRATONVM_COMPACT_TLAB_ALLOC"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     // Bisection levers for the shape above: which sites may plan compact, and
     // which classes actually did. Both exist because the first miscompile it
     // exposed cost a rebuild per hypothesis until they did not.

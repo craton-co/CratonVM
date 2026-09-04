@@ -3839,23 +3839,57 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
     true
 }
 
-/// `CRATONVM_COMPACT_TLAB_ALLOC=1` — let the interpreter's TLAB fast path
-/// allocate the COMPACT body shape for classes that have one, instead of the
-/// uniform 16-byte-cell layout it has always written.
+/// The interpreter's TLAB fast path allocates the COMPACT body shape for
+/// classes that have one, instead of the uniform 16-byte-cell layout it wrote
+/// for years — **default ON since 2026-09-03**, opt out with
+/// `CRATONVM_COMPACT_TLAB_ALLOC=0`.
 ///
-/// **Default OFF.** Not because the shape is wrong — the JIT's inline `new` has
-/// emitted exactly this shape for months, and `gen_heap::alloc_object` (the
-/// TLAB-miss path) plans it too, so the same class already gets both shapes
-/// today depending on which allocator ran. It is off because the one previous
-/// attempt to change this path, on the ZGC arm on 2026-09-02, MISCOMPILED
-/// `probes/FjpProbe.java` — wrong per-task sums, no collection involved — and
-/// the comment it left says the unification has to happen at every allocation
-/// site at once with that probe in the gate. This lands the unification and the
-/// gate; the default is the measurement's to earn.
+/// # Why this is the right shape
+///
+/// It is the shape everything else already uses. The JIT's inline `new`
+/// (`emit_inline_tlab_new`) has emitted compact bodies for months, and
+/// `gen_heap::alloc_object` — the TLAB-miss and large-object path — plans them
+/// too. Only this path did not, so the same class got one shape or the other
+/// depending on which allocator happened to serve it, and every compact fast
+/// path in the JIT needed a second legacy-shaped arm to cope. Three of those
+/// arms were added in the week before this flipped.
+///
+/// # What earned the default
+///
+/// It shipped OFF first, because the one previous attempt at this unification
+/// miscompiled `probes/FjpProbe.java` and the comment it left demanded the
+/// change be made at every allocation site at once with that probe in the gate.
+/// The switch then reproduced that miscompile deterministically, which is how
+/// its root cause was found: the `Integer`/`Long` boxing fast paths wrote a raw
+/// 16-byte `Value` cell under a SAFETY comment asserting the object was
+/// legacy-layout — an assumption about which allocator the site calls, not a
+/// property of the object.
+///
+/// With that fixed, the evidence for turning it on:
+///
+/// * `regression-suite/run.sh` 89/89 with the shape enabled, on the default
+///   collector, under `-XX:+UseGenerationalGC` and under `-XX:+UseG1GC` — a
+///   HotSpot-differential oracle, not a self-comparison.
+/// * A 228-program differential soak per collector: every workload run twice
+///   with the shape off to establish it is reproducible at all, then once with
+///   it on, comparing exit status and stdout byte for byte. 164 deterministic
+///   programs agree on Generational; the two that differ are a clock probe and
+///   `RandomLeak`, which prints `javaHeapUsed` and reports **35% less heap**
+///   (14.7 MB against 9.6 MB) for identical program output.
+/// * `org.h2.test.unit.TestCache`, a real application: `rc=0`, 1,872,185 of
+///   2,508,687 objects compacted, **87.5 MB less allocated**.
+/// * Throughput is a wash — eight alternated rounds, medians 16.6 s either way.
+///   The prize here is memory, and `header-shrink.md` always said it would be.
+///
+/// `=0` restores the legacy shape exactly, and remains the first thing to set
+/// if an object is ever suspected of being read at the wrong offset.
 pub(crate) fn compact_tlab_alloc_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_COMPACT_TLAB_ALLOC").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_COMPACT_TLAB_ALLOC").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
