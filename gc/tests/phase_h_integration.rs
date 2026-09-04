@@ -346,30 +346,22 @@ fn rh7_oopmap_scaffolding_retains_references() {
     let mut cm = CompiledMethod::new(buf);
     assert!(!cm.has_precise_oop_maps());
 
-    cm.push_oop_map(OopMapEntry {
-        bytecode_pc: 0,
-        native_pc_offset: 0x40,
-        frame_slot_offsets: vec![-16, -24],
-        moving_young_coverage_complete: false,
-        live_frame_hi: 0,
-        local_oop_mask: None,
-        num_locals: 0,
-        inline_local_scopes: Vec::new(),
-        non_oop_stack_slots: Vec::new(),
-        stack_marks_exact: false,
-    });
-    cm.push_oop_map(OopMapEntry {
-        bytecode_pc: 0,
-        native_pc_offset: 0x80,
-        frame_slot_offsets: vec![-16],
-        moving_young_coverage_complete: false,
-        live_frame_hi: 0,
-        local_oop_mask: None,
-        num_locals: 0,
-        inline_local_scopes: Vec::new(),
-        non_oop_stack_slots: Vec::new(),
-        stack_marks_exact: false,
-    });
+    // `OopMapEntry::new` plus the two fields this test is about, rather than a
+    // struct literal naming every one.
+    //
+    // The literal was the reason this file stopped compiling: it named all ten
+    // fields, so every field ADDED to `OopMapEntry` broke a test that has no
+    // opinion about it -- `shadow_pushed` was simply the latest. The
+    // constructor already supplies the documented defaults, and a test that
+    // asserts about `push_oop_map` / `has_precise_oop_maps` /
+    // `find_oop_map_for_pc` should say only what it means: a PC and the slots
+    // recorded at it.
+    let mut at_0x40 = OopMapEntry::new(0x40);
+    at_0x40.frame_slot_offsets = vec![-16, -24];
+    cm.push_oop_map(at_0x40);
+    let mut at_0x80 = OopMapEntry::new(0x80);
+    at_0x80.frame_slot_offsets = vec![-16];
+    cm.push_oop_map(at_0x80);
     assert!(cm.has_precise_oop_maps());
 
     assert!(cm.find_oop_map_for_pc(0x40).is_some());
