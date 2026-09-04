@@ -11310,14 +11310,6 @@ fn plan_register_residency(
                     use_count.get(id).copied().unwrap_or(0),
                 ) =>
                 {
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
-                        eprintln!(
-                            "[ir-ls] single_use n{id} op={:?} static_uses={} loop_weight={}",
-                            graph.nodes.get(id).map(|nd| &nd.op),
-                            use_count.get(id).copied().unwrap_or(0),
-                            live.weight.get(id).copied().unwrap_or(0),
-                        );
-                    }
                     skip_single_use += 1;
                     continue;
                 }
