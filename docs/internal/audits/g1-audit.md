@@ -1839,3 +1839,213 @@ makes the instrument ask a sound question, and it is the only thing standing
 between a future `NotOop` word and a spurious refusal to move. It costs a
 verifier lookup on a diagnostic path that only runs under the precise-only
 switches, and `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN=1` removes it.
+
+## 23. The in-map suppression test — a real effect, a wrong prediction, and new variance (2026-09-04)
+
+*`perf/band-in-map-suppression-test-20260904`. §22.3 named this test and
+declined to run it on one dump's evidence. Run now, behind
+`CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` (opt-in, default off).*
+
+### 23.1 The result
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| skip in-map | incomplete rate per rep | median | spread |
+|---|---|---:|---:|
+| off | 98.05, 98.25, 97.30, 98.22 % | **98.14 %** | 0.95 pts |
+| on | 84.15, 46.39, 92.50, 89.05 % | **86.60 %** | **46 pts** |
+
+`checksum=262248526` and `rc=0` on all eight.
+
+The effect is real — about **11.5 points** — and it is nothing like the
+prediction.
+
+### 23.2 The prediction was wrong in kind, not just in size
+
+§22.3 said "expect roughly a two-thirds fall", reasoning from the dump's 67 of
+93 WORDS being `in_map`. That inference does not hold: the rate is per PAUSE,
+and a pause is incomplete if ANY of its words is unpublished. Removing
+two-thirds of the words removes a pause from the count only when it removes
+ALL of that pause's words. A per-word proportion cannot be read as a per-pause
+one, and the 11.5 points measured against 65 predicted is the size of that
+mistake.
+
+Worth stating plainly because the surrounding sections are about instruments
+that answer a different question from the one asked of them, and this is the
+same error committed in the reasoning rather than in the code.
+
+### 23.3 The variance is the more interesting half
+
+The OFF arm spans 0.95 points — §21's stability holds. The ON arm spans 46,
+and its pause counts jump too (526-1013 against 259-462).
+
+That is not measurement noise; it is the suppression changing what the
+collector does. Fewer reported words means more cycles permitted to move,
+which changes the pause pattern, which changes the workload's behaviour — so
+the ON arm is not the same experiment run twice. §21's workload is stable for
+observing a metric, not for a change that alters the collector's decisions,
+and this is the first change in this line that does.
+
+Anything built on this needs its own stability answer first. A rate quoted from
+the ON arm today means nothing narrower than "between 46 and 93%".
+
+### 23.4 What it does not settle
+
+The claim §22.3 rests on — that a slot the active oop map names is rewritten by
+`remap_active_jit_frames` and so needs no shadow-stack publication — is neither
+confirmed nor refuted by an 11.5-point drop in a self-reported metric. What
+would confirm it is the stale-after-remap detector: with the suppression on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` should show no NEW stale word in an
+`in_map` slot. That is the next test, it is cheap, and it is a soundness
+question rather than a rate one — which is the right order after §22 showed
+four rate-screens in a row moved almost nothing.
+
+The flag ships opt-in and stays that way until that question is answered.
+
+## 24. The in-map hypothesis is refuted (2026-09-04)
+
+*`fix/band-in-map-suppression-refuted-20260904`. §23.4 named the soundness test
+and said it was the right order after four rate-screens moved almost nothing.
+Run now, and it kills the hypothesis outright.*
+
+### 24.1 The test and the answer
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1`, three reps per arm:
+
+| skip in-map | stale words after remap | of those, `region=java-local` |
+|---|---:|---:|
+| off | 2, 8, 18 | 0, 4, 10 |
+| **on** | **260, 545, 319** | **54, 140, 70** |
+
+Twenty to forty times as many stale words, and java-local stale words going
+from single digits to 54-140. The other regions move with them
+(`safepoint-gpr-spill-image` 161, `operand-spill` 143, `callee-saved-gpr-image`
+97 in one run).
+
+**The claim §22.3 rested on is false.** A slot the active oop map names is NOT
+thereby rewritten after a move: suppressing those words leaves hundreds of
+references the collector moved and nothing updated. Whatever `in_map`
+guarantees, it is not "the precise path covers this slot", and the
+shadow-publication requirement the band test enforces is not redundant for
+them.
+
+The flag stays — it is the lever that produced this answer and would re-test it
+if the mechanism changes — now documented as refuted, and it is fail-OPEN, so
+off is safe.
+
+### 24.2 The checksums were right the whole time
+
+`checksum=262248526` on every completed run in BOTH arms, including the one
+carrying 545 stale references. A stale reference is only a wrong answer if
+something dereferences it, and this workload did not.
+
+That is §15's lesson arriving a second time, and it is worth the repetition:
+had this experiment been judged on output correctness — the obvious way to
+check "did suppressing this break anything" — it would have passed three times
+out of three and the hypothesis would have been confirmed. The detector is the
+only thing that saw it.
+
+(One `off` run exited `rc=127` and is excluded; the other two agree.)
+
+### 24.3 Where the §14-§24 line stands
+
+Ten sections, and the honest ledger:
+
+* **Fixed and measured**: the vacuous coverage proof (§14), a refutation latch
+  firing on shape (§17), the reservation-wide envelope (§18, median 28.7% →
+  3.7%).
+* **Landed, sound, no measurable effect**: the object screen (§19) and the
+  liveness screen (§20/§22).
+* **Refuted**: the map-selection gap (§16), and now the in-map hypothesis
+  (§24).
+* **Built**: a stable workload (§21) and a per-reason census (§17.3), without
+  which none of the above could have been told apart.
+
+`compiled-frame-oop-not-published` at ~98% remains, and after §24 it is no
+longer safe to assume it is instrument error: the one hypothesis that would
+have explained most of it away has been tested and is wrong. The next question
+is why those slots are not published — a shadow-stack question in the JIT's
+publication path, not another screen in the collector's verifier.
+
+## 25. Why those slots are not published — four dead ends and one structural fact (2026-09-04)
+
+*`docs/shadow-publication-investigation-20260904`. §24.3 left the question as
+"why are those slots not published", a JIT publication question rather than a
+collector one. This is the investigation. It does not answer it, but it
+eliminates four candidate answers with evidence and narrows the remainder to
+one testable question — which is worth writing down so nobody walks the same
+four.*
+
+### 25.1 What was ruled out
+
+**The `published` set is not per-frame.** `moving_young_unpublished_frame_oop_present`
+computes `published` once, from the innermost frame, and reuses it for every
+parent in the RBP-chain walk — which looks like the bug until you read
+`shadow_window_from_frame`: the window is `[BASE, TOP)` of the whole thread
+`ShadowStack`, not a slice belonging to one frame. Every frame's entries are in
+it.
+
+**There is no compile-time/scan-time gate skew.** The shadow push publishes
+locals only under `complete = moving_young_enabled()`, which reads as a
+compile-time decision baked into each method — but
+`conservative_roots::moving_young_enabled` is a `OnceLock` that also publishes
+its value to `gc_quiescence`, so codegen and the collector cannot disagree
+within a process.
+
+**The frame slot is not a stale copy of a register-homed local.**
+`emit_pre_safepoint_spill_impl` flushes every register-resident local to its
+canonical frame slot before the safepoint, unconditionally:
+
+```rust
+for idx in 0..self.local_assignments.len() {
+    if let Some(reg) = self.local_assignments[idx] { ... emit_store_local(off, reg) }
+}
+```
+
+so the slot the band verifier reads holds the value that was current at the
+safepoint.
+
+**The shadow stack does not overflow.** `DEFAULT_SHADOW_SLOTS` is 256 Ki and an
+overflow prints `[JIT] shadow-stack overflow: N push(es) bailed`. It appears in
+none of the captured runs.
+
+### 25.2 The structural fact
+
+`emit_shadow_push` runs in `emit_pre_safepoint_spill_impl`, **before the call**.
+`emit_shadow_reload` runs in `emit_oop_map_for_safepoint`, **right after the
+call returns**, and it POPS.
+
+So a frame's oops are on the shadow stack **only for the duration of a call**.
+That is coherent for a frame suspended inside a call — every parent in the
+chain, and an innermost frame that entered the runtime through an allocation or
+poll helper. It is not coherent for a frame stopped at a safepoint that is not
+a call.
+
+### 25.3 The question that is left, and how to answer it
+
+The contradiction §22.2 measured is that 67 of 93 reported words are
+`in_map=true`: the active oop map, resolved through the frame's own `sp_id`
+slot, names them. The map and the shadow push are driven by the SAME
+enumeration (`for_each_oop_local_at_current_pc`) at the same pc, so a slot in
+one should be in the other — unless the frame is at a safepoint whose push
+never ran or has already been popped.
+
+The next probe is therefore about the safepoint KIND, not about more screening:
+for each reporting frame, record whether its resolved `sp_id` belongs to a
+call-shaped safepoint (push live) or a poll-shaped one (push absent or already
+reloaded). If the reports concentrate on poll-shaped safepoints, the answer is
+that shadow publication is call-scoped while the band verifier's obligation is
+not, and the fix is in that pairing rather than in either side alone.
+
+That probe is a few lines in `report_unpublished_band_words`, which already has
+`cm` and the resolved `sp_id` in hand.
+
+### 25.4 Why this is written up unanswered
+
+Four sections of this document (§16, §19, §22, §24) record hypotheses that
+looked obvious and were wrong, two of them after being implemented. The cost of
+the fifth is one more build; the cost of writing down four eliminated
+candidates and the one fact that survived them is a paragraph. On this
+question's track record the paragraph is the better trade.

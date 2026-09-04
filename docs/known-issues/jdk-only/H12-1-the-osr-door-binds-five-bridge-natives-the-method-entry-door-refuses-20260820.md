@@ -34,6 +34,57 @@ asked for.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. The acceptance measurement passes,
+> and the door is closed in strict mode only.** Status was *"MEASURED (the
+> defect) / FIXED-UNVERIFIED (the fix) … no binary carrying it has been built or
+> run."*
+>
+> `probes/OsrDoor.java` is the INDEPENDENT REPRODUCTION probe transcribed from
+> this record: one `static long hot()` called **exactly once**, containing a
+> 300,000-iteration loop over `Thread.currentThread().hashCode()`. Called once so
+> the MethodEntry door cannot tier it; 300,000 iterations so OSR must.
+>
+> ```text
+> CRATONVM_INTRINSIC_STATS=1 cratonvm <mode> -cp . OsrDoor
+>
+> mode                    Thread.currentThread direct calls      OSR    single-pass
+>                          recorded (fe59bf9d9)   measured now
+> --jdk-only                  298,000                   0         1        0/0
+> --real-jdk                  298,000             298,000         1        0/0
+> --jdk-only --nojit                0                   0         0        0/0
+> ```
+>
+> **`--jdk-only` goes to zero and `--real-jdk` is unchanged — to the digit.**
+> That is exactly the acceptance both this record and `H20-1` §4 specify.
+>
+> **The fix closes the bind, not the door.** `OSR 1` is still reported under
+> `--jdk-only`: the method is still OSR-compiled, and what stopped is the
+> binding of the `bridge` native. That distinction is the whole point of
+> `H20-1`'s title — filtering downstream "would have traded an open door for a
+> wild jump" — and the counters show the open door closed without the jump.
+>
+> **Determinism was checked, and a single run would have understated it.** Three
+> runs per arm: `--jdk-only` 0/0/0, `--real-jdk` 298,000/298,000/298,000. The
+> FIRST `--real-jdk` run of the session reported 297,000. One run of a debug
+> binary is not the number; three are, and three reproduce this record's figure
+> exactly.
+>
+> **One difference from the recorded table, named and NOT explained.** This
+> record's `--jdk-only` row shows single-pass **`0/7`** — *"seven `invokestatic`
+> sites examined in strict mode, seven refused"* — and it leans on that
+> denominator to make its point that auditing only the MethodEntry door reads as
+> reassuring. Today that column reads **`0/0`** in every arm: zero sites
+> examined, not seven refused. Whether the single-pass ladder no longer reaches
+> those sites, or the tiering path changed underneath, is **not determined
+> here**. The 298,000/0 result does not depend on it, but the record's §3 point
+> about the two doors disagreeing is now resting on a denominator that has moved.
+>
+> **What this does NOT verify.** §4 is titled *"What I could NOT witness: a
+> wrong value"* and that is still true — this probe's answer agrees with HotSpot
+> in every arm, so the exposure was latent before and is closed now, but no
+> miscompile was ever witnessed and none is witnessed here. §§7-9 (the H12-C arm
+> for lane H10, the out-of-file edits, the nominations) are untouched.
+
 ## 0. What the assignment said, and the one word in it that was wrong
 
 `HANDOFF-20260820.md` §7 item 4 calls this blocking:

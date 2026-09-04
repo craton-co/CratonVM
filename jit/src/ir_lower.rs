@@ -11637,6 +11637,17 @@ fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
+    // Attribution, not duplication — the same split `verify_or_bail` makes:
+    // `record_bailout` owns the process-wide category counters, and this
+    // attaches the bailout to *this* method in the per-compilation report.
+    //
+    // Without it the report's `bailouts` field is STRUCTURALLY empty for every
+    // lowering refusal: a census over CratonBench read `bailouts:[]` on all 105
+    // compilations, including the 17 that fell through to single-pass, so the
+    // one record that names both the method and the reason named neither. The
+    // counters were moving the whole time, which is what made the hole hard to
+    // see — the totals looked alive while every per-method row was blank.
+    crate::metrics::note_current_bailout(&bailout, "lower");
     None
 }
 
@@ -13022,8 +13033,15 @@ fn ir_receiver_guard_cse_enabled() -> bool {
     }
 }
 
-/// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
-/// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
+/// Inline TLAB bump for the optimizing tier's `Op::New` — **OPT-IN**, on with
+/// `CRATONVM_JIT_IR_INLINE_TLAB=1`.
+///
+/// This line said "**default ON**, opt out with `=0`" for two days after the
+/// body below was flipped to opt-in, which is worse than either state: a reader
+/// checking whether a feature is live got the wrong answer from the only
+/// sentence written to tell them. The mismatch cost a census here — a repro run
+/// came back 0/10 and looked like a fix, when the sequence under test had
+/// simply never executed.
 ///
 /// Off restores `emit_new_object_stub` alone, which is what this arm emitted
 /// before the bump existed, so the two are A/B-able in one binary. That is not
@@ -13037,6 +13055,20 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 /// `the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab`,
 /// which now passes because the bump exists rather than because the gate is
 /// shut.
+///
+/// **The two gates are in series, so the SIGSEGV that keeps the outer one shut
+/// cannot occur in any default build.** Both must be set for the bump to run:
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` to let an allocation-bearing method reach
+/// this tier, and this one to emit the bump rather than the stub. Measured
+/// 2026-09-04 on dev with engagement confirmed (`inline_tlab_bump=1
+/// stub_only=0`, the census in `runtime_lowering::ir_alloc_site_counts`):
+/// `RJitMapTierDiff` passes **0 failures in 30 runs** — 10 on a quiet host and
+/// 20 under six spinners — against the 4-in-10 recorded on 2026-09-02.
+///
+/// That is a reason to re-examine the outer gate, NOT to open it here: its
+/// second stated reason is a perf trade (a promoted allocation lowering through
+/// the stub buys a more optimized body at the price of a cheaper allocation)
+/// that is still unpriced.
 fn ir_inline_tlab_enabled() -> bool {
     // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
     //
