@@ -1265,6 +1265,66 @@ pub mod gpu_dispatch_memo_census {
 ///
 /// `live` at exit is the number that matters: on a program that releases
 /// every handle it takes, it should be zero.
+/// Whether the chunked (overlapped) writeback path was actually taken.
+///
+/// A chunking change is invisible to a value differential: the
+/// whole-array writeback is correct too, so `marshal-stress` passes
+/// identically whether chunking ran or silently never engaged. That is
+/// how `short[]`/`byte[]` sat outside the chunkable set from the day they
+/// became offloadable -- `take_chunkable_writeback` bailed on an array
+/// writeback it did not recognise, which cost the WHOLE dispatch its
+/// copy/compute overlap, and nothing reported it.
+///
+/// `refused` counts dispatches where a chunkable candidate existed but
+/// the path was declined (no stream pool, a non-tiling length, a
+/// `launch_chunked` error that fell back). `taken` and `refused` together
+/// say whether the feature is doing anything at all.
+pub mod gpu_chunk_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    static CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+    /// One dispatch used the chunked writeback, split into `chunks`.
+    #[inline]
+    pub fn note_taken(chunks: u64) {
+        TAKEN.fetch_add(1, Ordering::Relaxed);
+        CHUNKS.fetch_add(chunks, Ordering::Relaxed);
+    }
+
+    /// One dispatch had a chunkable writeback and did not use the path.
+    #[inline]
+    pub fn note_refused() {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(taken, refused, total_chunks)`.
+    #[must_use]
+    pub fn totals() -> (u64, u64, u64) {
+        (
+            TAKEN.load(Ordering::Relaxed),
+            REFUSED.load(Ordering::Relaxed),
+            CHUNKS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One line on the exit path, when anything was chunkable.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let (taken, refused, chunks) = totals();
+        if taken + refused == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu chunked writeback: taken={taken} refused={refused} \
+                 chunks={chunks}"
+            );
+        });
+    }
+}
+
 pub mod gpu_submission_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

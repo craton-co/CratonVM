@@ -69,6 +69,18 @@ impl ParamKind {
                 FieldType::Double => ParamKind::F64Array,
                 FieldType::Short => ParamKind::I16Array,
                 FieldType::Byte => ParamKind::I8Array,
+                // char[] reuses `I16Array` deliberately. Every
+                // `ParamKind::*Array` lowers to one `PtxParamKind::U64Ptr`
+                // (see `lowering.rs`), so the kind carries no element
+                // signedness at all -- `caload` emits a zero-extending
+                // 16-bit load and `saload` a sign-extending one, chosen by
+                // OPCODE, and `castore`/`sastore` are the same 16-bit
+                // store. A separate variant would duplicate every match
+                // arm in the emitter to express a distinction the PTX does
+                // not have. The host side still distinguishes them: the
+                // marshaller dispatches on the runtime `ArrayElementType`,
+                // which is `Char` here and `Short` above.
+                FieldType::Char => ParamKind::I16Array,
                 _ => return None,
             },
             FieldType::Object(_) => return None,

@@ -1598,6 +1598,50 @@ four zeros a second way — shortening a serial chain by one link out of several
 does not speed it up. Both readings say the same thing: **the live set has to
 move as a group, or not at all.**
 
+#### Moving it as a group is an architecture change, not another heuristic
+
+Attempted, and this is where the incremental route ends. A fifth change — a
+register-to-register publish, taking the register at a resident definition
+whenever `last_home_store` proves one already holds the value, position-checked
+so any intervening emission falls back to the load — produced **byte-identical
+code** on this method: same 1,030 bytes, same 95 loop instructions, same 22
+frame loads. The precondition never held. It was withdrawn rather than landed.
+
+That failure is the informative one, because of what the census says alongside
+it. Residency IS working: `resident=3 (gp=3)`, and `rbx`, `r12` and `r13`
+appear eleven times in the loop body. Three values are genuinely being read out
+of registers — **and the body still has 22 frame loads and is still a
+store-then-load chain.**
+
+The reason is structural. `lower_data_node` gives every node a frame slot
+(`alloc_slot(id)`) and writes it; the residency file is a **read cache layered
+on top of that**. So a value costs its store whether or not it is resident, the
+store-then-load pair survives residency, and no policy change on the cache can
+remove a store the model emits unconditionally.
+
+**So "move the live set as a group" means making the home slot OPTIONAL** — a
+value that lives in a register for its whole range and is named by no deopt
+frame and no safepoint map should not have a home at all. That is a change to
+the lowering model, with the deopt and oop-map obligations to discharge for
+every value that loses its slot, and it is the first item on this list that
+cannot be tried behind a flag in an afternoon.
+
+The five zeros are the case for doing it properly rather than continuing:
+split residency, the null-check port, the loop-weighted use count, the
+parameter prologue copy and the direct publish each addressed a symptom of the
+frame-slot-first model, and the model absorbed all five.
+
+That change is designed, sized and not built:
+[`feature-designs/ir-optional-home-slot.md`](feature-designs/ir-optional-home-slot.md).
+It records the three obligations already verified (deopt and safepoints are
+covered by `pinned`; references are excluded for oop-map reasons; the read side
+is 84 cached against 13 direct), the coupling that sets its shape (dropping the
+store needs a register-to-register publish, which needs the arms to say where
+their result is, and 50 of them say it only by writing memory), and a
+fail-closed route for the one hazard — `slot_of` on a homeless value fails the
+compile rather than reading a stale word, so the first run names the sites to
+convert instead of a whitelist being guessed.
+
 **So the recommendation stands and now has a number behind it.** Getting a
 loop's live set into registers *as a group* is worth about 1.57x on this shape.
 That is an order of magnitude above the measurement floor that swallowed all

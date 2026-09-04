@@ -1968,3 +1968,84 @@ longer safe to assume it is instrument error: the one hypothesis that would
 have explained most of it away has been tested and is wrong. The next question
 is why those slots are not published — a shadow-stack question in the JIT's
 publication path, not another screen in the collector's verifier.
+
+## 25. Why those slots are not published — four dead ends and one structural fact (2026-09-04)
+
+*`docs/shadow-publication-investigation-20260904`. §24.3 left the question as
+"why are those slots not published", a JIT publication question rather than a
+collector one. This is the investigation. It does not answer it, but it
+eliminates four candidate answers with evidence and narrows the remainder to
+one testable question — which is worth writing down so nobody walks the same
+four.*
+
+### 25.1 What was ruled out
+
+**The `published` set is not per-frame.** `moving_young_unpublished_frame_oop_present`
+computes `published` once, from the innermost frame, and reuses it for every
+parent in the RBP-chain walk — which looks like the bug until you read
+`shadow_window_from_frame`: the window is `[BASE, TOP)` of the whole thread
+`ShadowStack`, not a slice belonging to one frame. Every frame's entries are in
+it.
+
+**There is no compile-time/scan-time gate skew.** The shadow push publishes
+locals only under `complete = moving_young_enabled()`, which reads as a
+compile-time decision baked into each method — but
+`conservative_roots::moving_young_enabled` is a `OnceLock` that also publishes
+its value to `gc_quiescence`, so codegen and the collector cannot disagree
+within a process.
+
+**The frame slot is not a stale copy of a register-homed local.**
+`emit_pre_safepoint_spill_impl` flushes every register-resident local to its
+canonical frame slot before the safepoint, unconditionally:
+
+```rust
+for idx in 0..self.local_assignments.len() {
+    if let Some(reg) = self.local_assignments[idx] { ... emit_store_local(off, reg) }
+}
+```
+
+so the slot the band verifier reads holds the value that was current at the
+safepoint.
+
+**The shadow stack does not overflow.** `DEFAULT_SHADOW_SLOTS` is 256 Ki and an
+overflow prints `[JIT] shadow-stack overflow: N push(es) bailed`. It appears in
+none of the captured runs.
+
+### 25.2 The structural fact
+
+`emit_shadow_push` runs in `emit_pre_safepoint_spill_impl`, **before the call**.
+`emit_shadow_reload` runs in `emit_oop_map_for_safepoint`, **right after the
+call returns**, and it POPS.
+
+So a frame's oops are on the shadow stack **only for the duration of a call**.
+That is coherent for a frame suspended inside a call — every parent in the
+chain, and an innermost frame that entered the runtime through an allocation or
+poll helper. It is not coherent for a frame stopped at a safepoint that is not
+a call.
+
+### 25.3 The question that is left, and how to answer it
+
+The contradiction §22.2 measured is that 67 of 93 reported words are
+`in_map=true`: the active oop map, resolved through the frame's own `sp_id`
+slot, names them. The map and the shadow push are driven by the SAME
+enumeration (`for_each_oop_local_at_current_pc`) at the same pc, so a slot in
+one should be in the other — unless the frame is at a safepoint whose push
+never ran or has already been popped.
+
+The next probe is therefore about the safepoint KIND, not about more screening:
+for each reporting frame, record whether its resolved `sp_id` belongs to a
+call-shaped safepoint (push live) or a poll-shaped one (push absent or already
+reloaded). If the reports concentrate on poll-shaped safepoints, the answer is
+that shadow publication is call-scoped while the band verifier's obligation is
+not, and the fix is in that pairing rather than in either side alone.
+
+That probe is a few lines in `report_unpublished_band_words`, which already has
+`cm` and the resolved `sp_id` in hand.
+
+### 25.4 Why this is written up unanswered
+
+Four sections of this document (§16, §19, §22, §24) record hypotheses that
+looked obvious and were wrong, two of them after being implemented. The cost of
+the fifth is one more build; the cost of writing down four eliminated
+candidates and the one fact that survived them is a paragraph. On this
+question's track record the paragraph is the better trade.
