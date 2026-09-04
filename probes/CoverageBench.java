@@ -137,7 +137,11 @@ public class CoverageBench {
             // Walk the retained set by index, not by chasing `next`, so the
             // access pattern does not depend on where the collector placed
             // anything.
-            Node n = retained[(r * 7919) % liveNodes];
+            // `(long)` deliberately: at `int` width `r * 7919` overflows past
+            // ~271k rounds and the index goes negative, which reads as a VM
+            // ArrayIndexOutOfBounds rather than as the probe's own arithmetic.
+            // Unchanged below that bound, so published checksums still hold.
+            Node n = retained[(int) (((long) r * 7919L) % liveNodes)];
             for (int k = 0; k < 10; k++) {
                 checksum += dispatch(k, n, r);
             }

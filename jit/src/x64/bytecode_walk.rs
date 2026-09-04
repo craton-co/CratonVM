@@ -2268,6 +2268,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_int_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2644,6 +2645,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_long_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2677,6 +2679,7 @@ impl Compiler {
                             self.emit_int_astore_regs();
                         }
                     }
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2711,6 +2714,7 @@ impl Compiler {
                             self.emit_long_astore_regs();
                         }
                     }
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2726,6 +2730,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_byte_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2741,6 +2746,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -2756,6 +2762,7 @@ impl Compiler {
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
+                    self.emit_gpu_input_cache_barrier();
                     pc += 1;
                 }
 
@@ -7668,6 +7675,33 @@ impl Compiler {
                             // --- done ---
                             self.patch_rel32_to_here(zero_len_skip);
 
+                            // The GPU input-residency barrier, for the
+                            // DESTINATION array.
+                            //
+                            // This intrinsic writes a primitive array with
+                            // `REP MOVSB` and no `*astore` opcode anywhere in
+                            // the method, so `offload_jit_gate`'s bytecode
+                            // scan -- which looks only for those seven
+                            // opcodes -- never saw it. A method whose only
+                            // array write is a `System.arraycopy` was
+                            // therefore admitted to the JIT even while the
+                            // gate was refusing every ordinary array writer,
+                            // and its inline copy left the device mirror
+                            // stale with nothing to notice. That predates the
+                            // barrier and is not what the gate was widened
+                            // for; it is the same root cause reached by a
+                            // path the gate could not see.
+                            //
+                            // Reloaded into RAX from the pinned frame slot
+                            // rather than kept in a register: RSI/RDI were
+                            // just popped and RAX/RCX/RDX are the copy's own
+                            // scratch. Emitted on the zero-length path too --
+                            // it costs one over-eviction in a case that wrote
+                            // nothing, and keeping the label single-exit is
+                            // worth more than the branch that would avoid it.
+                            self.emit_load_local(RAX, s_dst);
+                            self.emit_gpu_input_cache_barrier();
+
                             // Every bail branch (null, non-array,
                             // reference-element array, mismatched kind, or
                             // out-of-bounds) is a NORMAL, valid outcome for
@@ -7856,6 +7890,19 @@ impl Compiler {
                             }
                             // POP RDI  (5F)
                             self.buf.emit_byte(0x5F);
+
+                            // The GPU input-residency barrier. Same story as
+                            // the `System.arraycopy` intrinsic above: this
+                            // writes the whole array with `REP STOS` and no
+                            // `*astore` opcode, so the gate's scan never saw
+                            // the method as an array writer at all.
+                            //
+                            // The array base is still in R8, where this arm
+                            // parked it before RAX became the STOS source.
+                            // MOV RAX, R8  (4C 89 C0)
+                            self.buf.emit(&[0x4C, 0x89, 0xC0]);
+                            self.emit_gpu_input_cache_barrier();
+
                             // void return — nothing pushed onto the operand
                             // stack.
                         } else if callee_entry == crate::JitIntrinsic::ArraysEquals1.as_entry()

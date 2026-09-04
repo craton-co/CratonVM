@@ -557,11 +557,42 @@ fn monitor_ptr_from_mark(mark: u64) -> Option<*const Monitor> {
     }
     let p = ObjectHeader::inflated_monitor(mark) as *const Monitor;
     if p.is_null() {
-        None
-    } else {
-        Some(p)
+        return None;
     }
+    // A published monitor pointer came from `Arc::as_ptr`, so it is aligned to
+    // `align_of::<Monitor>()` -- at least 8 here, which is one bit more than
+    // the two the tag borrows. A word that is INFLATED-tagged but only
+    // 4-aligned therefore cannot be one, and dereferencing it is a wild read.
+    //
+    // This is not hypothetical alignment pedantry. A conservative root scan
+    // that accepts a false object base hands the marker sixteen arbitrary heap
+    // bytes as a header; one word in four has `0b10` in its low bits and is
+    // read as an inflated monitor from then on. Measured 2026-09-03 in the
+    // Spring Framework suite under `-XX:+UseGenerationalGC`: `mark = 0xd5ee`,
+    // a plain small integer, dereferenced as a `Monitor` at `0xd5ec + 0x46`.
+    // The alignment test alone refuses it, and refusing costs the caller
+    // nothing -- `displaced_hash_from_mark` answers `0`, the same answer it
+    // already gives for every non-INFLATED word.
+    if (p as usize) & (std::mem::align_of::<Monitor>() - 1) != 0 {
+        return None;
+    }
+    // Nothing legitimate is allocated in the first page. A small integer that
+    // happens to be 8-aligned would pass the test above; this catches it.
+    if (p as usize) < 0x1_0000 {
+        return None;
+    }
+    Some(p)
 }
+
+// The tag steals the low two bits of the mark word, so a `Monitor` whose
+// alignment were below 4 could not round-trip through one at all -- and the
+// refusal above is only a useful screen while the alignment is strictly
+// greater than the tag width. Both are properties of the struct, so pin them
+// here rather than in a comment.
+const _: () = assert!(
+    std::mem::align_of::<Monitor>() >= 8,
+    "an INFLATED mark word borrows the low 2 bits; `monitor_ptr_from_mark`      screens a garbage pointer by requiring 8-byte alignment, which needs      `Monitor` to actually have it"
+);
 
 /// Borrow the `Monitor` an `INFLATED` mark word points at.
 ///

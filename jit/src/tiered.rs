@@ -1295,6 +1295,15 @@ pub fn dump_method_stats_to_stderr() {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        // The OSR ADMISSION census, which until now printed from exactly one
+        // place: `craton_gpu.rs`'s exit summary. An instrument that only
+        // reports under `--gpu` is not an instrument — the refusal tally and
+        // the optimizing-tier reach it now carries were both unreadable on
+        // every ordinary run, which is the same "a zero from a one-door
+        // counter" failure the counters themselves exist to prevent. It
+        // self-gates on `attempts == 0`, so a run that never OSR-compiled
+        // prints nothing.
+        cratonvm_types::osr_refusal_census::exit_summary();
         // Why the compiled frames in this run's stack traces did or did not
         // carry a line. Unconditional and including zeros, for the reason the
         // rows above are: `(Unknown Source)` is what a trace prints for FOUR

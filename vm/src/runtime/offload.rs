@@ -6460,6 +6460,90 @@ pub(crate) mod input_cache {
     /// submitted pays one load and a not-taken branch per array store.
     static ADDR_FILTER: AtomicU64 = AtomicU64::new(0);
 
+    /// Buckets a COMPILED array store wrote, awaiting eviction.
+    ///
+    /// # Why the compiled tiers need a side table at all
+    ///
+    /// Every interpreted write path calls [`invalidate`] and is done.
+    /// Neither compiled tier can: the single-pass backend lowers all
+    /// seven primitive `*astore` opcodes inline and the IR backend
+    /// lowers `Op::ArrayStore` to a raw `MOV`, so `jit_iastore` --
+    /// which does invalidate -- is not reached from either. Until
+    /// 2026-09-04 what stood in for a barrier was
+    /// `runtime::offload_jit_gate` refusing to COMPILE any method
+    /// containing one of those opcodes, which on kfusion cost the whole
+    /// TornadoVM vector/image accessor family its compilation whether or
+    /// not a kernel ever offloaded.
+    ///
+    /// Making the compiled store call `invalidate` would mean flushing
+    /// caller-saved registers on the hot path to fund a call taken
+    /// essentially never. Instead it sets one byte here -- see
+    /// `cratonvm_jit::gpu_barrier` for the eleven-instruction sequence --
+    /// and [`drain_compiled_writes`] does the eviction from Rust before
+    /// anything can READ the cache.
+    ///
+    /// Indexed by the same `(addr >> 3) & 63` bucket [`addr_bit`] uses,
+    /// so a dirty bucket names at most the entries that filter bit
+    /// already names; a collision costs a re-upload. Bytes rather than
+    /// bits because a byte store needs no read-modify-write and no
+    /// variable-count shift, which is what keeps the emitted sequence
+    /// free of a third scratch register.
+    ///
+    /// Process-global, like [`ADDR_FILTER`]: the drain sweeps every VM's
+    /// table, so a bucket set by one VM can only over-evict in another,
+    /// never under-evict.
+    static DIRTY: [std::sync::atomic::AtomicU8; 64] =
+        [const { std::sync::atomic::AtomicU8::new(0) }; 64];
+
+    /// Address of [`ADDR_FILTER`], for the compiled barrier to test.
+    pub(crate) fn filter_addr() -> usize {
+        &ADDR_FILTER as *const AtomicU64 as usize
+    }
+
+    /// Address of [`DIRTY`]`[0]`, for the compiled barrier to mark.
+    pub(crate) fn dirty_addr() -> usize {
+        DIRTY.as_ptr() as usize
+    }
+
+    /// Evict every entry a compiled array store marked dirty.
+    ///
+    /// Called before every read of the cache, which is what makes the
+    /// deferral invisible: the window between a compiled store and this
+    /// drain contains no consultation of the cache, so no stale buffer
+    /// can be handed out inside it. Also called at the top of
+    /// [`remap_and_sweep`] -- there, before the table is re-keyed, while
+    /// its keys are still the addresses the compiled store bucketed.
+    ///
+    /// Cheap when nothing is dirty, which is every call in a run whose
+    /// compiled code never stored into a cached array: one pass over a
+    /// single cache line of bytes, no lock.
+    pub(crate) fn drain_compiled_writes() {
+        use std::sync::atomic::AtomicU8;
+        let any = DIRTY.iter().any(|b: &AtomicU8| b.load(Ordering::Acquire) != 0);
+        if !any {
+            return;
+        }
+        let mut buckets = 0u64;
+        for (i, b) in DIRTY.iter().enumerate() {
+            if b.swap(0, Ordering::AcqRel) != 0 {
+                buckets |= 1u64 << i;
+            }
+        }
+        let mut tables = map().lock();
+        let mut removed = false;
+        for table in tables.values_mut() {
+            let before = table.len();
+            table.retain(|obj, _| buckets & addr_bit(*obj) == 0);
+            removed |= table.len() != before;
+        }
+        if removed {
+            rebuild_filter(&tables);
+        }
+        cratonvm_types::gpu_jit_gate_census::note_compiled_write_drain(
+            buckets.count_ones() as u64,
+        );
+    }
+
     fn map() -> &'static Mutex<FxHashMap<usize, FxHashMap<ObjectRef, Entry>>> {
         CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
     }
@@ -6490,6 +6574,7 @@ pub(crate) mod input_cache {
     /// different array kind across a GC; we treat that as a miss
     /// and the caller re-uploads).
     pub(crate) fn get_i32(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i32>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Int || e.len != len {
@@ -6513,6 +6598,7 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_i64(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i64>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Long || e.len != len {
@@ -6536,6 +6622,7 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_f32(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f32>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Float || e.len != len {
@@ -6559,6 +6646,7 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_f64(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f64>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Double || e.len != len {
@@ -6582,6 +6670,7 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_i16(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i16>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Short || e.len != len {
@@ -6605,6 +6694,7 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_i8(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i8>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Byte || e.len != len {
@@ -6617,6 +6707,7 @@ pub(crate) mod input_cache {
         }
     }
     pub(crate) fn get_u16(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<u16>>> {
+        drain_compiled_writes();
         let g = map().lock();
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Char || e.len != len {
@@ -6843,6 +6934,14 @@ pub(crate) mod input_cache {
         pointer_map: &cratonvm_types::PointerMap,
         heap: &crate::memory::vm_heap::VmHeap,
     ) {
+        // BEFORE the re-key, not after: a compiled store bucketed the
+        // array by the address it had when it ran, and this function is
+        // about to replace that address with the one the collector moved
+        // it to. Draining afterwards would look for a bucket that no
+        // longer matches any key and silently keep a stale entry.
+        // Mutators are stopped here, so nothing can dirty a bucket
+        // between the drain and the re-key.
+        drain_compiled_writes();
         let mut tables = map().lock();
         // Only this VM's table: `heap` belongs to `vm`, and asking it
         // about another VM's addresses would report every one of them

@@ -33,11 +33,18 @@
 //!   taken at initial mark, so the producer set is bounded and the remark
 //!   pause — which quiesces the only producer — is final by construction.
 //!   One pass, one pause, done.
-//! * ZGC has **no write barrier at all**. It marks on *read*, in the load
-//!   barrier, so **every mutator thread is a producer** and stays one until
-//!   it is stopped. "All queues are empty" is a *fixed point*, not a
+//! * OpenJDK's ZGC has **no write barrier at all**. It marks on *read*, in the
+//!   load barrier, so **every mutator thread is a producer** and stays one
+//!   until it is stopped. "All queues are empty" is a *fixed point*, not a
 //!   completion: the very next `getfield` any thread executes can publish
 //!   new mark work.
+//!
+//! **`ZgcRealHeap` is not that.** It publishes from an SATB PRE-WRITE barrier
+//! (`satb_pre_barrier`) and never arms its load barrier outside unit tests, so
+//! its producer set is bounded like G1's rather than unbounded like ZGC's. The
+//! restart loop below is therefore justified by a mechanism this backend does
+//! not run; see `zgc::mark`'s header for what that does and does not imply
+//! about whether the loop is needed.
 //!
 //! So the mark-end safepoint is a **decision point**, not a conclusion. With
 //! mutators stopped and every per-thread mark buffer flushed,

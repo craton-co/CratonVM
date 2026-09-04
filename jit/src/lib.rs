@@ -90,6 +90,7 @@ pub mod bailout;
 pub mod compile_gate;
 pub mod deopt;
 pub mod escape_analysis;
+pub mod gpu_barrier;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
@@ -12597,42 +12598,40 @@ pub fn box_unbox_intrinsic_sites() -> (usize, usize) {
 /// on ONE binary, which is the only kind of A/B this tree accepts for a perf
 /// claim — a control built from a different commit has manufactured a
 /// double-digit "regression" on phases containing neither call.
-/// # DEFAULT-OFF since 2026-09-02: it SIGSEGVs under a relocating collector
+/// # It was DEFAULT-OFF for two days, and the crash was not its fault
 ///
-/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` on the shipped default dies
-/// of `SIGSEGV` in 25-183 s, **11 runs out of 11**, at a fault address that is
-/// always a page boundary -- the shape of a read through a reference into a
-/// page the collector has already vacated. Two switches each remove it, 3 runs
-/// of 1200 s clean apiece:
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` with this family on died of
+/// `SIGSEGV` at a fault address that was always a page boundary, `rdi` equal to
+/// it and the fault pc inside libc -- 11/11 when the page was written, and 3/3
+/// in 7 s once an unrelated wrong-answer defect stopped ending the run first.
+/// Two switches each removed it: `CRATONVM_ZGC_RELOCATE=0` and this family off.
+/// The page read that pair as "it takes BOTH relocation and this intrinsic",
+/// and concluded the inline sequence held a receiver across a relocation.
 ///
-/// * `CRATONVM_ZGC_RELOCATE=0` -- no relocation, no crash;
-/// * `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` -- this family off, no crash.
+/// **It did not.** A third switch removes it too, and names the mechanism:
+/// `CRATONVM_GC_RESERVE=0`, 3/3 clean against a 3/3 positive control in the
+/// same batch. gdb puts the fault in `ZgcRealHeap::compact_high_region`'s
+/// `memmove`. The collector's relocation slides pick a destination inside FREE
+/// space and copy into it without going through `Arena::hand_out`, and
+/// `Arena::decommit_free_blocks` had already returned those granules to the OS
+/// -- so the first slide after a give-back wrote into `PROT_NONE`. Both slides
+/// now commit first (`Arena::commit_for_relocation`).
 ///
-/// A `git bisect` over the 200 commits between the last known-good tip and the
-/// crashing one (both endpoints re-verified in the SAME build profile, and only
-/// `SIGSEGV` counted as bad, because the `NullPointerException` and the
-/// fragmentation `OutOfMemoryError` on this workload both PRE-DATE the range)
-/// lands on `a910b7d9c` -- a MERGE whose two parents are both good, and whose
-/// relocation files are byte-identical to one of them. So the defect is the
-/// INTERACTION between this intrinsic and dev's relocation, not either alone.
+/// This family's part was to change the allocation shape enough to make the
+/// high slide run. That is why turning it off hid the crash, and why turning it
+/// off was never a fix. The three-way switch table is the lesson: a pair of
+/// switches that each remove a crash does not identify a mechanism, it
+/// identifies two ingredients -- and a third switch can turn out to be under
+/// both of them.
 ///
-/// The inline sequence pops the receiver off the simulated operand stack and
-/// then dereferences it three times -- the class-id guard at `[RAX]`, the
-/// GC-flags byte, and the payload load -- with no call and therefore no
-/// safepoint in between. That is sound only while the receiver in hand cannot
-/// go stale; under a moving collector it evidently can. Root-causing that is
-/// the follow-up, and it wants the receiver kept as a NAMED root across the
-/// sequence rather than held only in `RAX`.
-///
-/// Correctness first: the family is now opt-in, and the perf win it was
-/// measured for is recoverable the moment the sequence is made relocation-safe.
-/// Set `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn it back on for that work.
-///
+/// Default ON again since 2026-09-04, with the fix, measured at zero SIGSEGV
+/// over six runs of the workload that crashed 11/11.
 /// `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off, so a script
 /// that already sets it keeps working and keeps meaning the same thing.
 fn box_unbox_intrinsic_disabled() -> bool {
-    // Test-only force, consulted BEFORE the cache. The family is opt-in since
-    // it was found to SIGSEGV under relocation, so the matcher's own tests --
+    // Test-only force, consulted BEFORE the cache. The family was opt-in for
+    // two days after it was found to SIGSEGV under relocation, so the matcher's
+    // own tests --
     // which assert the POSITIVE case and say outright that every negative
     // below it is vacuous without it -- cannot reach it through the
     // environment: `OnceLock` fixes the answer at the first read, whichever
@@ -12650,8 +12649,28 @@ fn box_unbox_intrinsic_disabled() -> bool {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
             return true;
         }
-        // Default OFF: enabled only when explicitly asked for.
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_none()
+        // DEFAULT ON AGAIN (2026-09-04). The mitigation this replaced existed
+        // for exactly one reason -- the SIGSEGV recorded in `fixed-bugs/
+        // zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+        // -- and that crash was not this intrinsic's. It was
+        // `ZgcRealHeap`'s relocation slides writing into arena granules
+        // `Arena::decommit_free_blocks` had already returned to the OS; the
+        // slides now commit their destination first
+        // (`Arena::commit_for_relocation`). The intrinsic's part was to change
+        // the allocation shape enough to make the high slide run, which is why
+        // turning it off hid the crash and why turning it off was never a fix.
+        //
+        // Measured after that fix, on the workload that crashed 11/11 and then
+        // 3/3 in 7 s: `CRATONVM_JIT=box-unbox-intrinsic`, SIX runs (three to a
+        // 1200 s cap, three to 400 s), **zero SIGSEGV**. What those runs end on
+        // instead -- a `NullPointerException` at a later seed -- appears
+        // identically with the family OFF, and is the pre-existing failure
+        // `known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
+        // records.
+        //
+        // `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still
+        // means the same thing, so any script that sets it is unaffected.
+        false
     })
 }
 
@@ -12730,10 +12749,11 @@ pub fn try_resolve_box_unbox_intrinsic(
 ///
 /// Whether the family is ENABLED and whether a triple is one of the two it
 /// serves are separate questions, and only the second is what those tests are
-/// about. Keeping them separate means the tests go on guarding the match when
-/// the default flips back — which is the plan, once the relocation defect in
-/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-/// is closed.
+/// about. Keeping them separate meant the tests went on guarding the match
+/// across the default's two flips — off on 2026-09-02 for a crash that was the
+/// collector's, and on again on 2026-09-04 once
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+/// closed it.
 pub(crate) fn box_unbox_intrinsic_shape(
     class: &str,
     name: &str,
@@ -12980,20 +13000,22 @@ mod atomic_accessor_intrinsic_tests {
         }
     }
 
-    /// The family is OPT-IN, and the production entry point is what enforces
-    /// it.
+    /// The family is DEFAULT-ON, and the production entry point is what
+    /// decides it.
     ///
     /// The matcher tests above deliberately call `box_unbox_intrinsic_shape`,
-    /// which has no gate — so without this, flipping the default back would
-    /// change nothing any test can see, and so would flipping it back by
-    /// accident. This is the one place the DEFAULT is asserted.
+    /// which has no gate — so without this, flipping the default would change
+    /// nothing any test can see, in either direction. This is the one place the
+    /// DEFAULT is asserted, and that is the point: a flip has to be deliberate.
     ///
-    /// It will need inverting when
-    /// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-    /// is closed and the family goes default-on again. That is the point: the
-    /// flip should have to be deliberate.
+    /// INVERTED 2026-09-04. It read "opt-in until the relocation defect is
+    /// closed" for two days. The defect was closed, and it was not this
+    /// family's: `ZgcRealHeap`'s relocation slides were writing into arena
+    /// granules `Arena::decommit_free_blocks` had returned to the OS. See
+    /// `box_unbox_intrinsic_disabled`, and
+    /// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
     #[test]
-    fn box_unbox_is_opt_in_until_the_relocation_defect_is_closed() {
+    fn box_unbox_is_default_on_and_the_off_switch_still_works() {
         const CID: u32 = 12345;
         assert!(
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
@@ -13004,13 +13026,13 @@ mod atomic_accessor_intrinsic_tests {
         // than the VM's latched configuration, which is the hazard
         // `flag_declaration_guard` exists to name — and reading it raw here is
         // what left `check-surface.sh` red on dev.
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_BOX_UNBOX_INTRINSIC").is_some() {
-            // Someone is running the root-cause work with the family on.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+            // Someone is running with the family deliberately off.
             return;
         }
         assert!(
-            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_none(),
-            "the BOX_UNBOX family must stay opt-in while it SIGSEGVs under a              relocating collector (11/11 on H2 TestRandomMapOps)"
+            try_resolve_box_unbox_intrinsic("java/lang/Long", "longValue", "()J", CID).is_some(),
+            "the BOX_UNBOX family is default-ON since the ZGC slide fix; a              refusal here means the default was flipped without inverting this test"
         );
     }
 
@@ -30211,6 +30233,12 @@ mod tests {
     /// five days after their capability landed, and `getstatic`/`checkcast`
     /// sat until 2026-08-11 while they held down Tomcat's WebSocket send path.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_admits_exactly_the_opcodes_whose_lowerings_publish() {
         // Publishes via `emit_post_invoke_exception_check` (reason-9) on every
         // throwing path, or cannot throw at all.
@@ -30263,6 +30291,12 @@ mod tests {
     /// `checkcast` must therefore no longer refuse a compile, while a protected
     /// `arraylength` still must.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
         // One protected range covering the whole body.
@@ -30310,6 +30344,12 @@ mod tests {
     /// admission withdrawn the same bytes MUST refuse, and refuse at the `new`.
     /// Without it a gate that had quietly become unconditional would read green.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_admits_a_protected_throw_new_and_refuses_it_when_withdrawn() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
         // pc 0: new #0        (3 bytes)
@@ -30864,6 +30904,12 @@ mod tests {
     /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
     /// appearing in the code identifies which helper the site calls.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn self_recursive_nontail_site_routes_through_dispatch() {
         use std::sync::Arc;
 
@@ -31103,6 +31149,12 @@ mod tests {
     // IR-lowering success path bumps. The counter is thread-local and each cargo
     // `#[test]` runs on its own thread, so parallel compile tests can't perturb it.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn step3_optimize_toggle_routes_c1_singlepass_and_c2_ir() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -31186,6 +31238,12 @@ mod tests {
     // `ir_vs_singlepass.rs` proves the *executed* result is correct; this
     // proves the IR path — not single-pass — produced the body.)
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn step3_getfield_int_routes_through_ir() {
         use std::sync::Arc;
 
@@ -32449,6 +32507,12 @@ mod tests {
     // gate. Without it the builder bails on the `invokespecial`, keeping `new`
     // scalar replacement off by default.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
         use std::sync::Arc;
         // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
@@ -32600,6 +32664,12 @@ mod tests {
     // helper unwired must still bail (a hand-built test table must never get a
     // CALL to address 0).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn deferred_new_site_compiles_when_cp_helper_is_wired() {
         use std::sync::Arc;
         // `static int f() { new Cold(); pop; return 0; }`
@@ -32708,6 +32778,12 @@ mod tests {
     // not prove the IR path fired. `IR_LOWER_COMPILES` proves it does (==1 with
     // the flag) and does not (==0 without — the builder bails on the invoke).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32831,6 +32907,12 @@ mod tests {
     /// result-equality alone (the integration harness) would not prove the IR
     /// path ran.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32958,6 +33040,12 @@ mod tests {
     /// the fall-through), so result-equality alone would not prove the IR path
     /// ran — `IR_LOWER_COMPILES` does.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_long_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -33027,6 +33115,12 @@ mod tests {
     /// equality alone would not prove the IR path ran — `IR_LOWER_COMPILES`
     /// proves it (==1 with the flag, ==0 without → vacuous single-pass fallback).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_fp_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -33106,6 +33200,12 @@ mod tests {
     /// Guards against a vacuous validation: single-pass ALSO dispatches
     /// invokevirtual, so result-equality alone would not prove the IR path ran.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_virtual_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -37125,6 +37225,12 @@ mod tests {
     // ── return_type tests ───────────────────────────────────────────
 
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn recursive_compile_cycle_routes_parent_direct_call_through_dispatch() {
         // Held for the whole test: the recursive-cycle set this clears and
         // then asserts on is process-global. See
@@ -37298,6 +37404,12 @@ mod tests {
     /// The bind used to `continue` straight past the registration at the end
     /// of the scan loop, so this asserted 0 before the fix.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn statically_bound_direct_callee_call_still_registers_invoke_info() {
         // The other clearer of the process-global recursive-cycle set;
         // see `jit_recursive_cycle_test_lock`.
@@ -38708,7 +38820,7 @@ mod layout_constant_inventory {
 
     /// `(file, counts)` where `counts[i]` is the number of code uses of
     /// `LAYOUT_CONSTANTS[i]` in that file.
-    const INVENTORY: [(&str, [usize; 8]); 2] = [
+    const INVENTORY: [(&str, [usize; 8]); 3] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
         // two offset closures — `legacy()` (header-plus-cell, then the ref or
         // int-category payload offset inside that cell: one use of each) and
@@ -38854,12 +38966,22 @@ mod layout_constant_inventory {
         // cell it just proved is or is not written. No new EMISSION site: the
         // guard itself bakes an epoch address and a count, not a displacement.
         ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
+        // x64/objects.rs, added 2026-09-04. It bakes object-header
+        // displacements exactly as the two files above do -- the compact and
+        // legacy reference-store cell addresses, the array header, the inline
+        // TLAB `new` -- and was covered by NEITHER tripwire: the `x64.rs` scan
+        // matches only the `<CONST> as <ty>` cast form, and this inventory
+        // listed two files. The gap was found the honest way, by adding a
+        // legacy emission site there on 2026-09-02 and having to record it by
+        // hand in `header-shrink.md` because nothing counted it.
+        ("objects.rs", [8, 0, 3, 0, 2, 0, 2, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
         match file {
             "lib.rs" => include_str!("lib.rs"),
             "ir_lower.rs" => include_str!("ir_lower.rs"),
+            "objects.rs" => include_str!("x64/objects.rs"),
             other => panic!("no source registered for {other}"),
         }
     }
@@ -39279,6 +39401,10 @@ mod code_cache_lifetime_tests {
     /// newest range for an address must still win, so a recycled address
     /// symbolizes as what is mapped there NOW.
     #[test]
+    // x86-64 only: it registers x86-64 compiled bodies by address; the aarch64
+    // path publishes different artifacts. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn the_newest_registration_for_an_address_wins() {
         let buf = ExecutableBuffer::new(64).expect("alloc executable");
         let entry = buf.as_ptr() as usize;

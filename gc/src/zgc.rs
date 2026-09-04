@@ -3687,6 +3687,31 @@ impl ZgcRealHeap {
         // probe. Registering on demand rather than pre-registering the whole
         // grid keeps the table to the pages that actually hold old objects with
         // written fields.
+        // ONE lookup, not two. `register_old_page` already returns the set it
+        // found or created; asking the table for the same page again -- which
+        // `ZRememberedTable::remember(page_id, ..)` does -- is a second
+        // `RwLock` reader acquire and a second FxHash probe on the hot path of
+        // every old-generation reference store in the VM.
+        //
+        // `card_object_two_lookups` below keeps the old shape so the A/B in
+        // `measure_the_card_barrier` is a call apart rather than a rebuild.
+        let set = self
+            .remembered
+            .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
+        set.remember(offset);
+    }
+
+    /// [`Self::card_object`] as it was before 2026-09-04: register, then look
+    /// the same page up a second time to set the bit. Kept only as the A/B arm
+    /// for `measure_the_card_barrier`; nothing on a live path calls it.
+    #[cfg(test)]
+    fn card_object_two_lookups(&self, obj_addr: usize) {
+        let base = self.arena_base;
+        if base == 0 || obj_addr < base {
+            return;
+        }
+        let page = ((obj_addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+        let offset = (obj_addr - base) % Self::Z_LOGICAL_PAGE_BYTES;
         self.remembered
             .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
         self.remember_old_to_young(page, offset);
@@ -5464,16 +5489,37 @@ impl ZgcRealHeap {
             // every object start is `base + 8k`, so rounding the difference is
             // what keeps the destination on the same grid — and, because it
             // rounds the move DOWN, keeps `to >= from` without a second check.
-            let to = if immovable {
+            let mut to = if immovable {
                 pinned += 1;
                 from
             } else {
                 from + ((dest - size - from) & !7)
             };
+            // COMMIT THE DESTINATION FIRST. It is free space, and free space is
+            // exactly what `Arena::decommit_free_blocks` hands back to the OS —
+            // on the promise that everything which re-issues it goes through
+            // `hand_out`. A slide does not: it picks `to` arithmetically and
+            // memmoves. So the first slide after a give-back wrote into a
+            // `PROT_NONE` granule and died inside `memcpy`, which is what
+            // `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+            // recorded as "the fault address is always a page boundary, `rdi`
+            // equal to it, fault pc inside libc".
+            if to != from && !arena.commit_for_relocation(to - base, size) {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    addr = from,
+                    size,
+                    dest = to,
+                    "zgc relocate: the OS refused the HIGH slide's destination --                      leaving the survivor in place"
+                );
+                pinned += 1;
+                to = from;
+            }
             if to != from {
                 // SAFETY: `size` bytes are live at `from`; `to` is inside the
                 // high region, strictly above `from`, and `to + size <= dest <=
-                // high_hi`. The regions may overlap — `copy` is memmove, which
+                // high_hi`. The commit above proved `[to, to + size)` is mapped
+                // read-write. The regions may overlap — `copy` is memmove, which
                 // is correct in this direction.
                 unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                 pairs.push((from, to));
@@ -6181,16 +6227,32 @@ impl ZgcRealHeap {
                         }
                     }
                     match chosen {
-                        Some(to) => {
+                        Some(to) if arena.commit_for_relocation(to - base, size) => {
                             debug_assert!(to < from, "the slide must never move an object UP");
                             // SAFETY: `size` bytes are live at `from`, `to` is
-                            // inside the arena and strictly below `from`, and the
-                            // regions may overlap -- `copy` is memmove, correct in
-                            // that direction.
+                            // inside the arena and strictly below `from`, the
+                            // guard above proved `[to, to + size)` is mapped
+                            // read-write, and the regions may overlap -- `copy`
+                            // is memmove, correct in that direction.
                             unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                             pairs.push((from, to));
                             moved += 1;
                             dest = to + size;
+                        }
+                        // The destination is free space the give-back returned
+                        // to the OS and the OS would not take back. Same answer
+                        // as "nowhere below it": the object stays put. See
+                        // `Arena::commit_for_relocation` for why a slide has to
+                        // ask at all.
+                        Some(from_stay) => {
+                            tracing::warn!(
+                                target: "cratonvm::gc::guard",
+                                addr = from,
+                                size,
+                                dest = from_stay,
+                                "zgc relocate: the OS refused the LOW slide's destination --                                  leaving the survivor in place"
+                            );
+                            dest = from + size;
                         }
                         // Nowhere below it inside a selected page: it stays put,
                         // and the cursor continues above it so a later survivor
@@ -10612,16 +10674,33 @@ fn zgc_alloc_trigger_percent() -> usize {
 /// Split out because both inputs are `OnceLock`-cached env reads, so a test
 /// cannot vary them in-process -- and the interesting cases here are the
 /// combinations, not the parsing.
-fn alloc_trigger_percent_for(explicit: Option<usize>, pause_target_ms: u64) -> usize {
-    match explicit {
-        // AN EXPLICIT ZERO IS A REFUSAL, not an absence. It is how an operator
-        // says "the target alone", and it is the arm every measurement of the
-        // target on its own was taken with; collapsing it into "unset" would
-        // make that arm unreachable and the comparison unrepeatable.
-        Some(p) => p,
-        None if pause_target_ms != 0 => ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET,
-        None => 0,
-    }
+fn alloc_trigger_percent_for(explicit: Option<usize>, _pause_target_ms: u64) -> usize {
+    // WITHDRAWN AS A DEFAULT ON 2026-09-04, the day it shipped. It stays
+    // available as `CRATONVM_ZGC_ALLOC_TRIGGER=<percent>`; only the implicit
+    // floor under a pause target is gone.
+    //
+    // The floor does what it was measured to do -- it caps the first cycle,
+    // which the controller is blind to -- but making it a DEFAULT changed how
+    // often the collector runs on every ZGC workload, and
+    // `org.h2.test.db.TestLargeBlob` does not survive that:
+    //
+    //   pause target on (floor active)   34 GC cycles   SIGSEGV in libc
+    //   pause target off (no floor)       0 GC cycles   PASS
+    //
+    // Same binary, same class, one switch, and reproduced 3 times out of 4 with
+    // the floor on against 0 of 3 with it off. The fault is inside a
+    // `FileChannelImpl.implWrite` -> `IOUtil.write` -> `DirectByteBuffer` path,
+    // which is the shape of a native operation whose backing store a collection
+    // reclaimed underneath it.
+    //
+    // THE CRASH IS ALMOST CERTAINLY OLDER THAN THIS FLAG. Without the floor
+    // that test never collects at all, so nothing was exercising the path; the
+    // floor is a reproducer, not the defect. But a default that turns a passing
+    // test into a native crash is not one to ship while the underlying bug is
+    // open, and "it only surfaces a pre-existing bug" is not a reason to leave
+    // it on -- it is a reason to go and fix that bug with the reproducer this
+    // gave us.
+    explicit.unwrap_or(0)
 }
 
 /// `CRATONVM_ZGC_BITMAP_BOUNDS` -- restrict the per-cycle object-start and
@@ -16230,7 +16309,16 @@ pub(crate) mod tests {
         const CAPACITY: usize = 768 * 1024 * 1024;
         const LIVE_EVERY: usize = 16;
 
-        let rounds: usize = std::env::var("SWEEP_BENCH_ROUNDS")
+        // `flags::runtime_var`, not `std::env::var`. `check-surface.sh` refuses
+        // the latter anywhere in core runtime code -- VM flags must come from
+        // the immutable snapshot, and ordinary variables reach live-read
+        // semantics through the same boundary -- and that check runs BEFORE the
+        // `cargo clippy --workspace --all-targets` step in the same CI job. A
+        // bare `env::var` here therefore does not just fail its own gate: it
+        // fails the step in front of the one that compiles test targets, which
+        // is the masking this file's own header records costing the repository
+        // a compile gate for weeks.
+        let rounds: usize = cratonvm_types::flags::runtime_var("SWEEP_BENCH_ROUNDS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(10);
@@ -21007,35 +21095,164 @@ pub(crate) mod tests {
         assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
     }
 
-    /// A pause target brings a percentage floor with it; an explicit zero
-    /// refuses one.
+    /// A pause target does NOT bring a percentage floor with it -- the floor is
+    /// opt-in, and only an explicit percentage arms it.
     ///
-    /// The floor exists for the cycle the feedback loop is blind to -- the
-    /// first, which has no pause to measure yet and which the occupancy clause
-    /// otherwise lets run to 75% of `-Xmx`. See
-    /// `ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET` for the measurement.
+    /// It WAS a default for a few hours on 2026-09-04, and
+    /// `alloc_trigger_percent_for`'s own comment records why it is not any
+    /// more: it changed how often the collector runs on every ZGC workload, and
+    /// `org.h2.test.db.TestLargeBlob` went from 0 collections and a PASS to 34
+    /// collections and a SIGSEGV. The mechanism the floor implements is sound
+    /// and still reachable; the DEFAULT was not safe to ship.
     #[test]
-    fn a_pause_target_defaults_a_percentage_floor_under_itself() {
-        // No target, nothing named: the clause is off, exactly as before
-        // pause targets existed.
+    fn a_pause_target_does_not_imply_a_percentage_floor() {
+        // Nothing named, no target: off, as before pause targets existed.
         assert_eq!(alloc_trigger_percent_for(None, 0), 0);
-        // A target, nothing named: the floor.
+        // Nothing named, WITH a target: still off. This is the line that
+        // changed, and the one a future "surely the floor should be automatic"
+        // has to argue past.
         assert_eq!(
             alloc_trigger_percent_for(None, 200),
-            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+            0,
+            "a pause target must not arm the allocation floor by itself: doing              so turned TestLargeBlob from 0 collections and a PASS into 34 and              a SIGSEGV"
         );
-        assert_eq!(
-            alloc_trigger_percent_for(None, 1),
-            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
-        );
-        // AN EXPLICIT ZERO IS A REFUSAL, not an absence: it is how an operator
-        // asks for the target alone, and it is the arm every measurement of
-        // the target on its own was taken with.
-        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
-        // And an explicit percentage wins over the floor in both directions.
-        assert_eq!(alloc_trigger_percent_for(Some(12), 200), 12);
-        assert_eq!(alloc_trigger_percent_for(Some(50), 200), 50);
+        assert_eq!(alloc_trigger_percent_for(None, 1), 0);
+        // An explicit percentage still wins, with or without a target -- the
+        // pairing is available, it is just not implicit.
+        assert_eq!(alloc_trigger_percent_for(Some(25), 200), 25);
         assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
+        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
+    }
+
+    /// COMPONENT MEASUREMENT for the young cycle's old-generation pre-mark
+    /// (review item E1), taken BEFORE deciding whether to build the bitmap
+    /// that would replace it.
+    ///
+    /// A young cycle pre-marks the old generation by walking EVERY registered
+    /// object and reading `gc_age()` out of its header -- `registered
+    /// .for_each_base(|base| header_mut(base).gc_age() >= promo_age)` in
+    /// `collect_garbage`. The age lives nowhere but the header, so the walk is
+    /// a scattered 64-byte line read per object; the whole-heap arm next to it
+    /// was already reduced to one linear store over `capacity / 512` bytes
+    /// (`mark_clear_all`).
+    ///
+    /// The candidate fix is a third bitmap over the same geometry, set on
+    /// promotion, so the pre-mark becomes `marks |= old` -- a word-wise OR
+    /// instead of a walk. That is real work with real risk (a bit that goes
+    /// stale against promotion or the sweep retains a dead object), so the
+    /// question this answers first is whether the walk is expensive enough to
+    /// be worth it. Both shapes are timed here over the same population:
+    /// the header walk, and `mark_clear_all` as the closest existing
+    /// bitmap-wide pass.
+    ///
+    ///   cargo test -p cratonvm-gc --features zgc --release --lib -- --ignored     ///     --nocapture measure_the_young_premark_walk
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_young_premark_walk() {
+        const CAPACITY: usize = 512 * 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAPACITY);
+        heap.set_tlab_enabled(false);
+        let mut n = 0usize;
+        while heap.allocated_bytes() < CAPACITY * 6 / 10 {
+            heap.alloc_object(ClassId::new(11), 3);
+            n += 1;
+        }
+        let registered = heap.registry.snapshot();
+        let count = registered.base_count();
+        println!("[e1] capacity={CAPACITY} objects={n} registered={count}");
+        let promo = heap.promotion_age();
+
+        let mut walk = f64::MAX;
+        let mut clear = f64::MAX;
+        // Interleaved, three pairs, best of each -- see `measure_the_card_barrier`.
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut old = 0usize;
+            registered.for_each_base(|base| {
+                if heap.header_ref(base as *mut u8).gc_age() >= promo {
+                    old += 1;
+                }
+            });
+            let us = t.elapsed().as_micros() as f64;
+            std::hint::black_box(old);
+            walk = walk.min(us);
+
+            let t = std::time::Instant::now();
+            heap.mark_clear_all();
+            clear = clear.min(t.elapsed().as_micros() as f64);
+        }
+        println!(
+            "[e1] header walk {:.1} ms ({:.1} ns/object)   bitmap-wide pass {:.1} ms                ratio {:.1}x",
+            walk / 1000.0,
+            walk * 1000.0 / count.max(1) as f64,
+            clear / 1000.0,
+            walk / clear.max(1.0),
+        );
+        println!(
+            "[e1] read the RATIO: it is what an old-generation bitmap would buy,              and the walk only runs on a young cycle (CRATONVM_ZGC_GENERATIONAL)."
+        );
+    }
+
+    /// COMPONENT MEASUREMENT for the card barrier's per-store cost.
+    ///
+    /// `card_object` runs on every reference store into an OLD object once
+    /// anything has been promoted, and it used to ask the remembered-set table
+    /// for the same page twice: `register_old_page` takes an `RwLock` reader
+    /// and an FxHash probe to find or create the set, and then
+    /// `ZRememberedTable::remember(page_id, ..)` takes another of each to find
+    /// the set it just returned. Reusing the handle removes one of each.
+    ///
+    /// Both arms in one process, so this is not a cross-binary comparison.
+    /// Ignored: wants `--release` and a quiet box.
+    ///
+    ///   cargo test -p cratonvm-gc --features zgc --release --lib -- --ignored     ///     --nocapture measure_the_card_barrier
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_card_barrier() {
+        const STORES: u32 = 3_000_000;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        // A spread of old objects across several logical pages, so the table
+        // holds more than one entry and the hash probe is not a single-key
+        // degenerate case.
+        let mut objs: Vec<usize> = Vec::new();
+        for _ in 0..64 {
+            objs.push(heap.alloc_object(ClassId::new(7), 3).as_ptr() as usize);
+        }
+        // Warm both arms so neither pays the create path in its timed loop.
+        for &o in &objs {
+            heap.card_object(o);
+            heap.card_object_two_lookups(o);
+        }
+        println!("{:>14}  {:>12}  {:>12}", "arm", "total_ms", "ns/store");
+        let mut run = |name: &str, two: bool| -> f64 {
+            let t = std::time::Instant::now();
+            for i in 0..STORES {
+                let o = objs[(i as usize) % objs.len()];
+                if two {
+                    heap.card_object_two_lookups(o);
+                } else {
+                    heap.card_object(o);
+                }
+            }
+            let el = t.elapsed();
+            let ns = el.as_nanos() as f64 / STORES as f64;
+            println!("{name:>14}  {:>12.1}  {ns:>12.2}", el.as_secs_f64() * 1e3);
+            ns
+        };
+        // Interleaved and repeated: a fixed arm order manufactures a winner
+        // when the machine drifts, which is the mistake `measure_the_sharded_sweep`
+        // records paying for.
+        let mut one_best = f64::MAX;
+        let mut two_best = f64::MAX;
+        for _ in 0..3 {
+            two_best = two_best.min(run("two lookups", true));
+            one_best = one_best.min(run("one lookup", false));
+        }
+        println!(
+            "[card-barrier] best: two={two_best:.2} ns/store  one={one_best:.2} ns/store               speedup={:.2}x",
+            two_best / one_best.max(f64::MIN_POSITIVE)
+        );
     }
 
     /// A pause target is a CEILING: a pause under it must not move anything.
