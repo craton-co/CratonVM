@@ -5049,6 +5049,11 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
     // parameters added since carry the COMPACT body shape, which a zero-slot
     // object does not have -- giving them anything else would be asserting a
     // layout the test does not check.
+    //
+    // Both trailing arguments were added to `init_object_header` without
+    // updating this call, so `cargo test -p cratonvm-vm` did not compile
+    // at all for a time -- the library still built, so only a test run
+    // showed it.
     super::init_object_header(ptr, ClassId::new(0), 0, 0, 0);
 
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`.
