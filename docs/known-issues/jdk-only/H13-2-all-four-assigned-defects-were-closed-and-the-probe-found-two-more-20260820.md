@@ -125,6 +125,63 @@ resolved with `dirname $(dirname $(command -v javap))`
 > The probe now catches that throw, and the runner refuses to run at all if
 > `javac` fails.
 
+> **§2 FIXED 2026-09-04 — and the cause is three arms past where this record,
+> and the code's own doc comment, both place it.**
+>
+> ```text
+> CustomProviderSpiProbe   IDENTICAL to HotSpot, compatible and --jdk-only
+> ProviderLookupProbe      still identical (no regression)
+> MacSurfaceProbe          still identical (no regression)
+> ```
+>
+> A provider written to the documented JCA contract — a class `extends
+> MessageDigestSpi`, registered with `put("MessageDigest.X", …)` — now resolves
+> through all three `getInstance` overloads, and the SPI actually computes.
+>
+> **Two wrong diagnoses first, both plausible, both refuted by measurement.**
+> §2.2 attributes it to `engine_delegate_shape`'s `_ => None` arm — the missing
+> `(Spi, String, Provider)` arity. That arity is present
+> (`engine_delegate_shape_with_provider`, with its `java/security/MessageDigest`
+> row), `ca8f03069` is an ancestor of `HEAD`, and the call site reaches it. The
+> second guess was the `Delegate` constructor being `private`. Neither was it.
+>
+> **What found it was making the refusals speak.** `build_third_party_engine`
+> had FOUR bare `Ok(None)` returns — the `[_ => default]` shape §2.2 names as
+> the defect it exists to remove, reproduced inside the fix for it. Each now
+> logs, and one run said:
+>
+> ```text
+> WARN jca chain: the engine superclass is not loadable
+>      provider="L7P" type_str="MessageDigest" algo="L7DIGEST"
+>      required_super="java/security/MessageDigest"
+> ```
+>
+> `class_id_by_name` answers only for a class the manager already HOLDS, and an
+> engine's `getInstance` is a REGISTERED NATIVE — calling it never pulls
+> `java.security.MessageDigest` into the class manager. So the lookup missed on
+> LOAD ORDER, and the refusal behind it reported the provider's algorithm as
+> absent: a fact about what had been loaded, presented as a fact about the
+> provider. **The fix loads the engine superclass and asks again** before
+> refusing, and the final refusal names itself.
+>
+> This is why the shape looked provider-specific: BouncyCastle's providers
+> extend the ENGINE, and by the time such a call is made something else has
+> usually loaded the engine class already.
+>
+> **`Delegate.of` is now preferred over the private constructor** on the 3-arity
+> path. That was written for the wrong reason and is kept for a right one: `of`
+> is the JDK's own entry point and picks `CloneableDelegate` when the SPI is
+> `Cloneable`, which closes §2.3's first stated residual — *"an SPI that also
+> implements `Cloneable` yields a digest whose `clone()` throws where HotSpot
+> clones."*
+>
+> **What is NOT claimed.** §2.3's SECOND residual stands: the `Provider` is
+> still a MADE object, so `md.getProvider() == myProvider` is `false` where
+> HotSpot says `true` (§4). Only `MessageDigest` was exercised; the same
+> load-order refusal presumably affected `Signature`, `KeyFactory` and the other
+> engines routed through `build_third_party_engine`, and none of those was
+> tested. §4's three residuals are untouched.
+
 ## 0. What moves, in one table
 
 | Change | Strict (`--jdk-only`) | Compatible | Shadow census |

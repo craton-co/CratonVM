@@ -73,6 +73,52 @@ proves where a body is, never that it runs (HANDOFF §5).
 > oracle and were not re-derived; that scratchpad did not survive its session.
 > The defect above is named, NOT localised to a function.
 
+> **FIXED 2026-09-04 — and NOT where this record says.** §"one divergent row"
+> attributes `dv.9007199254740993.1` to `doubleValue()`. It is not a
+> `BigDecimal` defect at all.
+>
+> **The split that decided it.** `probes/BdBitsProbe.java` prints the same value
+> through two independent routes — the raw IEEE-754 bits and `Double.toString`:
+>
+> ```text
+>                          HotSpot 25              CratonVM (before the fix)
+> bd.doubleValue.rawBits   430999999999999a        430999999999999a   <- IDENTICAL
+> bd.doubleValue.toString  9.007199254740992E14    9.007199254740993E14
+> parseDouble.rawBits      430999999999999a        430999999999999a
+> literal.rawBits          430999999999999a        430999999999999a
+> ```
+>
+> `doubleValue()` was always right. So were `Double.parseDouble` and a plain
+> `double` literal. **`Double.toString` was wrong**, which means the defect was
+> never one `BigDecimal` row — it was every `double` whose shortest decimal
+> lands on a tie.
+>
+> **The cause was a false premise, written down in the code.**
+> `types/src/float_format.rs` opened with *"Rust's `Display` … produces the
+> shortest round-tripping decimal digits — **which agree with Java's**"*. They
+> agree on length, and whenever one candidate is strictly closer to the value.
+> They disagree on the TIE. `0x4309_9999_9999_999a` is exactly
+> `900719925474099.25`; both `900719925474099.2` and `...3` round-trip to it, so
+> both are shortest, and `Double.toString` is specified to take *"the one whose
+> least significant digit is even"*. Ryū takes the other.
+>
+> **The fix** adds Java's tie-break in `java_shortest_sci_f64` / `_f32`, in two
+> stages so the hot path pays at most one extra `format!`: render one digit more
+> than the shortest form and stop unless it is `'5'` (an exact tie terminates
+> there), then confirm against the full exact expansion. The module doc no
+> longer claims the digits agree.
+>
+> ```text
+> RJdkBigNum   671 checks, 0 differing lines   (was 1)
+> BdBitsProbe  identical to HotSpot
+> types tests  11 passed, including a 20,000-value round-trip sweep
+> ```
+>
+> **What is NOT claimed.** The tie-break is proven on the one value this record
+> found, on the six-value non-tie control, and by the sweep asserting every
+> output still parses back to the same bits. It is not proven exhaustively
+> against HotSpot over the whole `double` range — no such sweep was run.
+
 ## 1. Verdict
 
 | | |

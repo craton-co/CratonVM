@@ -689,6 +689,15 @@ struct ZgcCounters {
     /// nothing. Counted at the POLL, not at the collection, so a trigger that
     /// fires and is then overtaken by another clause still shows.
     alloc_trigger_fires: AtomicUsize,
+    /// Microseconds the LAST collection spent in the sweep phase.
+    ///
+    /// The same figure `[GC] zgc-pause:` reports as `sweep_us`, kept where a
+    /// test can read it. `measure_the_sharded_sweep` needs the PHASE and not
+    /// the whole collection: the mark is serial in every arm, so timing the
+    /// collection dilutes whatever the sweep does by a constant, and the
+    /// alternative -- scraping the log line -- makes a measurement depend on
+    /// logging being on.
+    last_sweep_us: AtomicU64,
     /// Cycles in which the PAUSE TARGET was unreachable: the live set alone
     /// projects a pause past the target, or what the target leaves after it is
     /// below `ZGC_ALLOC_TRIGGER_FLOOR`.
@@ -1979,6 +1988,7 @@ impl ZgcRealHeap {
                 mark_park_timeouts: AtomicUsize::new(0),
                 gen_nursery_overshoot_max: AtomicUsize::new(0),
                 alloc_trigger_fires: AtomicUsize::new(0),
+                last_sweep_us: AtomicU64::new(0),
                 pause_target_unreachable: AtomicUsize::new(0),
                 gen_zero_bytes_skipped: AtomicUsize::new(0),
                 gen_dead_runs: AtomicUsize::new(0),
@@ -4697,6 +4707,12 @@ impl ZgcRealHeap {
         self.remembered
             .get(page)
             .is_some_and(|set| set.is_remembered(offset))
+    }
+
+    /// Microseconds the last collection spent sweeping -- `[GC] zgc-pause:`'s
+    /// `sweep_us`, for a test that wants the phase rather than the pause.
+    pub fn last_sweep_us(&self) -> u64 {
+        self.counters.last_sweep_us.load(Ordering::Relaxed)
     }
 
     /// Generational counters -- `(young_cycles, minors_since_major,
@@ -13788,6 +13804,9 @@ impl GarbageCollector for ZgcRealHeap {
             .store(bits_clear, Ordering::Release);
 
         let sweep_us = clock.lap();
+        self.counters
+            .last_sweep_us
+            .store(sweep_us.min(u64::MAX as u128) as u64, Ordering::Relaxed);
         // RE-DERIVE THE ALLOCATION BUDGET from what this pause actually cost.
         // Before the logging block, and outside it, so the loop runs on a
         // quiet run too -- see `gc_started` above.
@@ -16148,52 +16167,60 @@ pub(crate) mod tests {
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
     ///
-    /// # MEASURED ON A QUIET BOX: it does not scale, and the run-to-run
-    /// variation is larger than the effect
+    /// # MEASURED, PAIRED, TEN ROUNDS: a real but small gain
     ///
-    /// Azure `vm1`, 8 cores, no other build running. 768 MiB heap, 8.26M dead
-    /// objects. THREE separate executions of this bench, three reps each, best
-    /// `sweep_us` per arm:
+    /// Azure `vm1`, 8 cores, 768 MiB heap, 8.26M dead objects, ten interleaved
+    /// rounds. `sweep_us` only, and the headline is the MEDIAN OF PER-ROUND
+    /// RATIOS against the serial arm measured in the same round:
     ///
-    /// | run | 1 worker | 2 | 4 | 8 |
-    /// |---|---|---|---|---|
-    /// | A | 78 ms | 92 | 86 | 93 |
-    /// | B | 67 ms | 63 | 60 | 60 |
-    /// | C | 68 ms | 66 | 55 | (polluted) |
+    /// | workers | n | min | median | max | paired vs serial |
+    /// |---|---|---|---|---|---|
+    /// | 1 | 10 | 68282 | 71799 | 76509 | 1.00x |
+    /// | 2 | 10 | 65934 | 68894 | 109387 | 1.04x [0.67-1.13] |
+    /// | 4 | 10 | 61209 | 64562 | 67877 | **1.12x [1.06-1.20]** |
+    /// | 8 | 10 | 59833 | 63607 | 65625 | **1.15x [1.09-1.22]** |
     ///
-    /// Run A says sharding is a 15% REGRESSION. Runs B and C say it is a
-    /// 6-24% gain. Same box, same binary, same population, opposite signs --
-    /// because the serial arm alone moves 78 -> 67 ms and the two-worker arm
-    /// 92 -> 63 ms BETWEEN executions, which is larger than any difference
-    /// between arms within one.
+    /// The serial arm's own samples still wandered 11% of their median, which
+    /// is why the paired column exists -- and why it is the one to read. At
+    /// four and eight workers the paired RANGE EXCLUDES 1.0: the sharded arm
+    /// won in every one of ten rounds, so the gain is a property of the change
+    /// and not of when it was sampled. At two workers the range spans 1.0
+    /// (0.67-1.13, with one 109 ms outlier), so two workers buys nothing
+    /// demonstrable.
     ///
-    /// # The methodological trap, because it caught me
+    /// # What it does NOT support
     ///
-    /// Within a single execution the three reps are tight -- run A's serial arm
-    /// read 78/80/83, a 4% spread -- and that tightness is exactly what makes
-    /// the number look trustworthy. It is not. Three reps inside one process
-    /// share a page cache, an allocator state and a set of THP mappings; they
-    /// are one sample reported three times, not three samples. The error term
-    /// that matters is across executions, and it is ~20%.
+    /// 1.15x on eight cores, for a phase whose per-object body is independent.
+    /// The sweep is bandwidth bound -- the body is a header zero-write, a
+    /// streaming write over half a gigabyte -- so eight workers contend for a
+    /// memory path that one already most of the way saturates. Anyone reading
+    /// this as "it parallelises" should note that perfect scaling would be 8x
+    /// and this is 1.15x.
     ///
-    /// A first version of this comment claimed "MEASURED, AND IT IS SLOWER" on
-    /// the strength of run A alone. That was wrong, and it was wrong in the
-    /// direction that would have justified deleting a working feature.
+    /// In absolute terms it is ~8 ms off a ~72 ms sweep, inside a pause whose
+    /// other phases are serial. Whether that is worth eight threads per
+    /// collection is a policy call this measurement informs and does not make;
+    /// the switch stays default-off until a workload-level arm (a real
+    /// `sweep_us` on a suite, not this isolated phase) says the pause moved.
     ///
-    /// # What can be said
+    /// # Two earlier readings of this same bench were wrong
     ///
-    /// The sweep does NOT parallelise usefully: the best any arm managed
-    /// against its own run's serial baseline was 1.24x at four workers, on
-    /// eight cores, for a phase whose body is independent per object. That is
-    /// consistent with it being bandwidth bound -- the per-object work is a
-    /// header zero-write, a streaming write over half a gigabyte -- and it is
-    /// nowhere near enough to move a default. It is NOT, on this evidence, a
-    /// regression either, so the switch is worth keeping default-off rather
-    /// than deleting.
+    /// Recorded because the errors are the reusable part. A single execution
+    /// read 78/92/86/93 us and was reported as "sharding is a 15% REGRESSION";
+    /// two more executions read the opposite way. The reps WITHIN each
+    /// execution were tight -- 78/80/83, a 4% spread -- and that tightness is
+    /// what made the number look trustworthy. It was not: three reps inside one
+    /// process share a page cache, an allocator state and a set of THP
+    /// mappings, so they are one sample reported three times. The error term
+    /// that matters is across executions, and it was ~20% -- larger than the
+    /// effect being chased.
     ///
-    /// What would settle it: many more executions (ten-plus per arm,
-    /// interleaved rather than grouped, so a drift in machine state cannot
-    /// align with an arm), or a host with a memory-bandwidth counter.
+    /// The bench was grouped by arm until 2026-09-04, which is what let a drift
+    /// in machine state align with an arm and be read as that arm's effect. It
+    /// now interleaves, rotates the starting arm each round, and reports paired
+    /// ratios. The absolute microseconds above are still contended (another
+    /// session was building during the run); the paired ratios are not, which
+    /// is the whole point of the shape.
     ///
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
@@ -16202,49 +16229,118 @@ pub(crate) mod tests {
         // lines, small enough to run on a laptop.
         const CAPACITY: usize = 768 * 1024 * 1024;
         const LIVE_EVERY: usize = 16;
-        const REPS: usize = 3;
 
+        let rounds: usize = std::env::var("SWEEP_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10);
         let cores = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(1);
-        println!("[sweep-bench] capacity={CAPACITY} cores={cores} reps={REPS}");
-        for workers in [1usize, 2, 4, 8, cores] {
-            let mut best = u128::MAX;
-            let mut reclaimed = 0usize;
-            for _ in 0..REPS {
-                let heap = ZgcRealHeap::with_capacity(CAPACITY);
-                heap.set_tlab_enabled(false);
-                heap.set_sweep_workers(workers);
-                let mut roots: Vec<ObjectRef> = Vec::new();
-                let mut n = 0usize;
-                // Fill to ~70% of capacity with 3-field objects, keeping one in
-                // sixteen alive -- a live set of a few percent, which is the
-                // shape a whole-heap cycle actually meets.
-                while heap.allocated_bytes() < CAPACITY * 7 / 10 {
-                    let o = heap.alloc_object(ClassId::new(11), 3);
-                    if n % LIVE_EVERY == 0 {
-                        roots.push(o);
-                    }
-                    n += 1;
+        let mut arms: Vec<usize> = vec![1, 2, 4, 8, cores];
+        arms.sort_unstable();
+        arms.dedup();
+
+        /// One sample: a fresh heap, filled, collected, and the SWEEP phase's
+        /// own microseconds -- not the whole collection, whose serial mark
+        /// dilutes the ratio by a constant.
+        fn one(capacity: usize, live_every: usize, workers: usize) -> (u64, usize) {
+            let heap = ZgcRealHeap::with_capacity(capacity);
+            heap.set_tlab_enabled(false);
+            heap.set_sweep_workers(workers);
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            let mut n = 0usize;
+            // Fill to ~70% of capacity with 3-field objects, keeping one in
+            // sixteen alive -- a live set of a few percent, which is the shape
+            // a whole-heap cycle actually meets.
+            while heap.allocated_bytes() < capacity * 7 / 10 {
+                let o = heap.alloc_object(ClassId::new(11), 3);
+                if n % live_every == 0 {
+                    roots.push(o);
                 }
-                let started = std::time::Instant::now();
-                {
-                    // SAFETY: single-threaded unit test.
-                    let stw = unsafe { StopTheWorldToken::new() };
-                    heap.collect_garbage(&stw, &mut roots, &NoMonitors);
-                }
-                best = best.min(started.elapsed().as_micros());
-                reclaimed = heap.gen_sweep_cost_stats().2;
+                n += 1;
             }
+            {
+                // SAFETY: single-threaded unit test.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            }
+            (heap.last_sweep_us(), heap.gen_sweep_cost_stats().2)
+        }
+
+        println!(
+            "[sweep-bench] capacity={CAPACITY} cores={cores} rounds={rounds} \
+             arms={arms:?} (SWEEP_BENCH_ROUNDS to change)"
+        );
+        // `samples[arm][round]`.
+        let mut samples: Vec<Vec<u64>> = vec![Vec::with_capacity(rounds); arms.len()];
+        let mut dead = 0usize;
+        for round in 0..rounds {
+            // INTERLEAVED, AND ROTATED. One sample of every arm per round, and
+            // the starting arm advances each round, so no arm is always
+            // measured in the same position. Grouping every rep of one arm
+            // together -- which this bench did until 2026-09-04 -- lets a drift
+            // in machine state align with an arm and be read as its effect.
+            for k in 0..arms.len() {
+                let idx = (k + round) % arms.len();
+                let (us, d) = one(CAPACITY, LIVE_EVERY, arms[idx]);
+                samples[idx].push(us);
+                dead = d;
+            }
+        }
+
+        let med = |v: &mut Vec<u64>| -> u64 {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        println!("[sweep-bench] dead_objects={dead}");
+        println!(
+            "[sweep-bench] {:>7} {:>4} {:>8} {:>8} {:>8} {:>16}",
+            "workers", "n", "min", "median", "max", "paired vs serial"
+        );
+        for (i, &w) in arms.iter().enumerate() {
+            // PAIRED, round by round. The serial arm and this arm were measured
+            // in the same round, minutes apart at most, so a drift that moves
+            // both cancels in the ratio -- which the unpaired minima do not.
+            // The median of the per-round ratios is the number to read.
+            let mut ratios: Vec<f64> = (0..samples[i].len())
+                .filter(|&r| samples[i][r] > 0)
+                .map(|r| samples[0][r] as f64 / samples[i][r] as f64)
+                .collect();
+            ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (lo, mid, hi) = (
+                ratios.first().copied().unwrap_or(0.0),
+                ratios.get(ratios.len() / 2).copied().unwrap_or(0.0),
+                ratios.last().copied().unwrap_or(0.0),
+            );
+            let mut v = samples[i].clone();
+            let m = med(&mut v);
             println!(
-                "[sweep-bench] workers={workers:2}  best_collection_us={best:>9}  \
-                 dead_objects={reclaimed}"
+                "[sweep-bench] {:>7} {:>4} {:>8} {:>8} {:>8}   {:.2}x  [{:.2}-{:.2}]",
+                w,
+                v.len(),
+                v.first().copied().unwrap_or(0),
+                m,
+                v.last().copied().unwrap_or(0),
+                mid,
+                lo,
+                hi,
             );
         }
+        // The drift this design exists to survive, made visible: if the serial
+        // arm's own samples wander by more than the differences between arms,
+        // no unpaired comparison of those arms means anything.
+        let mut serial = samples[0].clone();
+        let s_med = med(&mut serial);
         println!(
-            "[sweep-bench] NOTE: this is the whole collection, not the sweep \
-             alone -- the mark is serial in every arm, so the sweep's own \
-             speedup is larger than the ratio above."
+            "[sweep-bench] serial arm drift across rounds: {}..{} us (median {}), \
+             spread {:.0}% of median -- read the PAIRED column, not the minima",
+            serial.first().copied().unwrap_or(0),
+            serial.last().copied().unwrap_or(0),
+            s_med,
+            100.0 * (serial.last().copied().unwrap_or(0) - serial.first().copied().unwrap_or(0))
+                as f64
+                / s_med.max(1) as f64,
         );
     }
 

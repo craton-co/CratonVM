@@ -14,7 +14,7 @@
 //! whole file compiles to nothing — see the `cfg` below — rather than
 //! failing on a machine that was never going to have one.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu-driver")]
 
 /// The driver reports a version, and it is one this workspace's table
 /// understands.
