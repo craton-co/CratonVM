@@ -1582,7 +1582,7 @@ pub fn create_exception_object_for_class(
         None => {
             // Young gen full — force a GC cycle and retry.
             thread.tlab.retire();
-            super::interpreter::maybe_gc_forced_pub(shared, thread);
+            super::interpreter::maybe_gc_forced_pub_at(shared, thread, "exceptions");
             // GC-overhead limit: if the heap is GC-thrashing, fail fast with OOM
             // so the caller falls back to the pre-allocated singleton (this very
             // path is what builds a fresh exception — looping here would

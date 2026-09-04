@@ -4089,6 +4089,87 @@ pub(super) fn try_osr(
     }
 }
 
+/// Re-offer every HELD deferred-`new` retry whose class has since loaded.
+///
+/// Holding a retry rather than burning it on an attempt that would bail keeps
+/// the method's one chance alive, but a kept chance nobody offers again is the
+/// same outcome as a spent one. This is what offers it.
+///
+/// Cost when nothing has loaded is one acquire load: `class_definition_epoch`
+/// is bumped by every class definition, so an unchanged epoch means no `new`
+/// site anywhere can have become resolvable since the last sweep. That is the
+/// whole rate limit — deliberately not a time or count budget, because those
+/// silence a trigger whose rate depends on the workload rather than on whether
+/// there is anything to do.
+pub(super) fn resweep_held_deferred_new_retries(shared: &SharedVm, on_class_definition: bool) {
+    if !crate::runtime::env_cache::c2_supersede() {
+        return;
+    }
+    // One relaxed load, and almost always zero.
+    if cratonvm_jit::held_deferred_new_count() == 0 {
+        return;
+    }
+    // The epoch gate is for the COMPILE door, which fires constantly and where
+    // an unchanged epoch means no `new` site can have become resolvable since
+    // the last look. The class-definition caller IS the event, so it never
+    // needs the gate — and must not take it, or two callers racing on the swap
+    // would let one of them skip the definition that mattered.
+    if !on_class_definition {
+        let epoch = crate::classloading::class_definition_epoch();
+        if LAST_DEFERRED_NEW_SWEEP_EPOCH.swap(epoch, std::sync::atomic::Ordering::AcqRel) == epoch {
+            return;
+        }
+    }
+    let held = cratonvm_jit::held_deferred_new_methods();
+    if held.is_empty() {
+        return;
+    }
+    for (class_name, method_name, descriptor) in held {
+        let granted = cratonvm_jit::take_deferred_new_retry(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
+        );
+        if granted {
+            DEFERRED_NEW_REOFFERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new RE-OFFERED {class_name}.{method_name}{descriptor} — its class has loaded"
+                );
+            }
+            shared
+                .jit
+                .tiered_manager
+                .request_deferred_new_retry(&crate::jit::tiered::MethodKey::new(
+                    &*class_name,
+                    &*method_name,
+                    &*descriptor,
+                ));
+        }
+    }
+}
+
+/// The class-definition epoch the sweep above last ran at.
+static LAST_DEFERRED_NEW_SWEEP_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Retries handed back out by the sweep. A sweep that re-offers nothing is a
+/// sweep that is not running, or one running where no class ever loads after.
+static DEFERRED_NEW_REOFFERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many held deferred-`new` retries the sweep has re-offered.
+pub fn deferred_new_reoffered() -> u64 {
+    DEFERRED_NEW_REOFFERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
 /// `new`/`anewarray` CP index in `holder_cid`'s constant pool to a
 /// [`cratonvm_jit::JitNewSite`] — `Resolved { class_id, num_fields,
@@ -7969,6 +8050,13 @@ pub(super) fn try_jit_compile_callee_slow(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
         )
     {
         shared
@@ -7980,6 +8068,11 @@ pub(super) fn try_jit_compile_callee_slow(
                 &*cached.method_descriptor,
             ));
     }
+    // …and the other half: every method whose retry is HELD because its class
+    // was not loaded. Nothing brings such a method back on its own — it already
+    // has a body, so it is never compiled again, and the door above is only ever
+    // walked by the method being compiled right now.
+    resweep_held_deferred_new_retries(shared, false);
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -8252,6 +8345,40 @@ static SUPERSEDE_FIRST_PUBLISH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static SUPERSEDE_UNCHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SUPERSEDE_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wall time spent in C2 tasks, split by whether the optimizing pipeline
+/// produced the body or threw its work away and let single-pass do it.
+///
+/// This is the number that decides whether the fall-through is worth
+/// preventing. The epoch bump it also pays was already measured at ~9
+/// invoke-cache evictions per run, i.e. nothing; the COMPILE is the part that
+/// could plausibly cost something, so it is timed rather than assumed.
+static C2_FELL_THROUGH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_FELL_THROUGH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_LOWERED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_LOWERED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn note_c2_compile(fell_through: bool, micros: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (n, t) = if fell_through {
+        (&C2_FELL_THROUGH_COUNT, &C2_FELL_THROUGH_US)
+    } else {
+        (&C2_LOWERED_COUNT, &C2_LOWERED_US)
+    };
+    n.fetch_add(1, Relaxed);
+    t.fetch_add(micros, Relaxed);
+}
+
+/// `(fell_through_count, fell_through_us, lowered_count, lowered_us)`.
+pub fn c2_compile_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        C2_FELL_THROUGH_COUNT.load(Relaxed),
+        C2_FELL_THROUGH_US.load(Relaxed),
+        C2_LOWERED_COUNT.load(Relaxed),
+        C2_LOWERED_US.load(Relaxed),
+    )
+}
 
 pub(super) fn note_supersede_outcome(outcome: SupersedeOutcome) {
     let counter = match outcome {
@@ -8545,6 +8672,13 @@ pub(super) fn background_compile_task(
         optimized,
     )
     .is_some();
+    // Read on the SAME thread, immediately after the compile: did this C2 task
+    // run the whole optimizing pipeline and then produce a single-pass body?
+    let fell_through = cratonvm_jit::last_compile_fell_through_to_single_pass();
+    let compile_us = start.elapsed().as_micros() as u64;
+    if published && optimized {
+        note_c2_compile(fell_through, compile_us);
+    }
     // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
     // C1 entry in `jit_cache` (JitCache::put overwrites by key). Bump the
     // global supersede epoch so per-thread invoke-cache `Jit` entries (which
@@ -8640,6 +8774,11 @@ pub(super) fn background_compile_task(
                 outcome.as_str(),
                 bumped,
             );
+            if fell_through {
+                eprintln!(
+                    "[cratonvm-jitc]   …the optimizing pipeline ran and then handed this method to the single-pass backend ({compile_us} us total)",
+                );
+            }
             // When a replacement is the same LENGTH but not the same bytes,
             // say how far apart it actually is. A handful of scattered bytes
             // is a relocation (an embedded absolute address that moved),
@@ -8671,14 +8810,22 @@ pub(super) fn background_compile_task(
     // that bail happens INSIDE a C2 task, which then falls through to the
     // single-pass backend — so the C1->C2 promotion below, which is only for a
     // C1 publish, is not the door this can use. `take_deferred_new_retry`
-    // consumes the memo, so a class still not loaded on the retry settles on
-    // single-pass exactly as before.
+    // consumes the memo only when the deferred `new` sites RESOLVE now: a class
+    // still unloaded holds the retry rather than burning it on an attempt that
+    // would bail identically.
     let deferred_new_retry = published
         && crate::runtime::env_cache::c2_supersede()
         && cratonvm_jit::take_deferred_new_retry(
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
+            &|holder, cp_idx| {
+                let cm = shared.classes.class_manager.read();
+                matches!(
+                    resolve_jit_new_site(&cm, ClassId::new(holder), cp_idx),
+                    Some(cratonvm_jit::JitNewSite::Resolved { .. })
+                )
+            },
         );
     let c2_upgrade_candidate = (published
         && !optimized
@@ -12025,5 +12172,22 @@ mod supersede_classification_tests {
         note_supersede_outcome(SupersedeOutcome::Changed);
         let (f1, u1, c1) = supersede_census();
         assert_eq!((f1 - f0, u1 - u0, c1 - c0), (1, 1, 2));
+    }
+}
+
+/// Re-offer held deferred-`new` retries in every live VM, called immediately
+/// after a class-manager write guard releases its lock.
+///
+/// That is the moment a `new` site can have become resolvable, and it is the
+/// only moment: a method holding a retry already has a body, so nothing
+/// compiles it again and no compile-door sweep will ever look at it. Placed
+/// beside `drain_pending_class_hooks` for the same reason that call is there —
+/// the write lock is gone, so taking a fresh read lock here is safe.
+pub fn resweep_deferred_new_after_class_definition() {
+    if cratonvm_jit::held_deferred_new_count() == 0 {
+        return;
+    }
+    for shared in crate::vm::vm_init::live_hook_vms_for_jit() {
+        resweep_held_deferred_new_retries(&shared, true);
     }
 }

@@ -5660,12 +5660,22 @@ impl<'a> Lowerer<'a> {
                 // local_offset(i) = (i + 1) * 8
                 let param_offset = ((*idx as i32) + 1) * 8;
                 self.load_to_rax(param_offset);
-                self.store_rax(slot);
                 // An FP parameter is a loop invariant often enough to be worth
                 // a register; the copy comes from the home word this just
                 // wrote, because the prologue delivered it through a GPR.
-                if matches!(node.ty, IrType::Float | IrType::Double) {
-                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                //
+                // An INT or LONG parameter is exactly as much a loop invariant,
+                // and got nothing until 2026-09-03. `gp_store_value` writes the
+                // home word and then copies RAX into the register, so the
+                // publish here is register-to-register — no reload of a word
+                // this arm just wrote.
+                if matches!(node.ty, IrType::Int | IrType::Long) {
+                    self.gp_store_value(id, slot, RAX);
+                } else {
+                    self.store_rax(slot);
+                    if matches!(node.ty, IrType::Float | IrType::Double) {
+                        self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                    }
                 }
             }
             Op::Add => {
@@ -10826,6 +10836,88 @@ fn verify_mir_allocation(
 ///
 /// Off restores the previous emission exactly: a `TEST`/`JZ` at every
 /// `getfield` whose receiver the per-block CSE has not already proven.
+/// Does a register for `id` pay for itself, counting loop frequency?
+///
+/// The publish is one memory→register load at the definition; each read it
+/// replaces is one memory→register load at its own site. So the trade is
+/// `uses_frequency >= 2 × definition_frequency`, and the static `use_count >= 2`
+/// is that same test with every frequency pinned to 1.
+///
+/// `live.weight[id]` is already the loop-frequency-weighted use count. The
+/// definition's frequency is derived from `live.loop_depth` and `live.span`,
+/// both public, using the same `LOOP_WEIGHT_PER_DEPTH` model — so the two sides
+/// of the comparison come from one model rather than two.
+///
+/// Falls back to the static rule whenever the loop model cannot place the
+/// definition, which keeps a graph the scheduler left unusual on the old
+/// behaviour rather than on a guess.
+fn ir_residency_pays_here(
+    live: &crate::regalloc::LiveModel,
+    schedule: &Schedule,
+    id: usize,
+    static_uses: u32,
+) -> bool {
+    if !ir_residency_loop_weight_enabled() {
+        return static_uses >= 2;
+    }
+    let Some(def_pos) = live.pos_of.get(id).copied().flatten() else {
+        return static_uses >= 2;
+    };
+    // Which block holds the definition? `span[b]` is that block's
+    // (first position, outgoing-edge position).
+    let mut def_depth: Option<u32> = None;
+    for b in 0..schedule.blocks.len() {
+        if let Some(&(lo, hi)) = live.span.get(b) {
+            if lo <= def_pos && def_pos <= hi {
+                def_depth = live.loop_depth.get(b).copied();
+                break;
+            }
+        }
+    }
+    let Some(depth) = def_depth else {
+        return static_uses >= 2;
+    };
+    let def_freq = u64::from(
+        crate::regalloc::LOOP_WEIGHT_PER_DEPTH
+            .checked_pow(depth)
+            .unwrap_or(crate::regalloc::MAX_LOOP_DEPTH_WEIGHT)
+            .min(crate::regalloc::MAX_LOOP_DEPTH_WEIGHT),
+    );
+    let uses_freq = live.weight.get(id).copied().unwrap_or(0);
+    uses_freq >= def_freq.saturating_mul(2)
+}
+
+/// Weigh the residency trade by loop frequency instead of a static use count —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`.
+///
+/// Off is the static `use_count >= 2` this file has always used.
+fn ir_residency_loop_weight_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LS_LOOP_WEIGHT").is_some()
+    })
+}
+
+/// Copy a loop-live int/long PARAMETER into a callee-saved register at entry —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_PARAM_COPY=1`.
+///
+/// The optimizing tier cannot promote an entry parameter at all: they are
+/// pinned to their incoming ABI registers, which are caller-saved and outside
+/// this file, and the allocator skips a pinned value. The baseline tier copies
+/// them into callee-saved registers in its prologue and reads them from there;
+/// this is that copy.
+///
+/// Off is exactly the previous emission: the parameter reaches every use
+/// through its frame slot.
+fn ir_param_prologue_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_PARAM_COPY").is_some()
+    })
+}
+
 fn ir_this_nonnull_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -11178,6 +11270,10 @@ fn plan_register_residency(
     // and `skip_phi` in particular is the one that decides whether this file
     // can ever reach a LOOP COUNTER -- which is a phi, at every loop header.
     let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
+    // Split apart from `skip_split` on 2026-09-03: see the refusal below.
+    let (mut skip_no_alloc, mut skip_spilled) = (0usize, 0usize);
+    // Parameters copied into a callee-saved register by the prologue.
+    let mut param_copies = 0usize;
     // 2026-09-02, measured: promotion is not free, and two populations pay for
     // it without ever collecting.
     //
@@ -11219,7 +11315,32 @@ fn plan_register_residency(
                 // for, and its "definition" is an edge copy that is already
                 // paying the store.
                 Some(Op::Phi) => {}
-                _ if use_count.get(id).copied().unwrap_or(0) < 2 => {
+                // The `< 2` rule below counts STATIC graph edges. That is the
+                // right comparison only when the definition and the uses run
+                // equally often, and in a loop they do not: a value defined at
+                // method entry and read once per iteration is one publish
+                // against N reads, and the static count sees 1 and refuses.
+                //
+                // Measured on the loop the 2026-09-03 tier comparison found
+                // inverted: `Param(0)` (the receiver) and `Param(1)` (the loop
+                // bound) both read `static_uses=1 loop_weight=10` — refused by
+                // a rule that could not see the ten. The disassembly showed
+                // exactly that, `mov rax,[rbp-58h]` and `mov rcx,[rbp-60h]`
+                // reloaded every iteration, while the baseline tier held both
+                // in callee-saved registers.
+                //
+                // The loop-aware form compares the uses' frequency against the
+                // DEFINITION's: residency pays when the reads happen at least
+                // twice as often as the single publish. It reduces exactly to
+                // `use_count >= 2` when everything sits at depth 0, so a
+                // method with no loop is byte-identical.
+                _ if !ir_residency_pays_here(
+                    &live,
+                    schedule,
+                    id,
+                    use_count.get(id).copied().unwrap_or(0),
+                ) =>
+                {
                     skip_single_use += 1;
                     continue;
                 }
@@ -11230,11 +11351,32 @@ fn plan_register_residency(
         // spill, a reload, a home-slot stretch in the middle — is refused
         // rather than emitted: this wiring has no reload machinery, so a value
         // whose register goes away partway through must not be read from one.
+        //
+        // **The NO-SEGMENT case is counted separately, and that distinction is
+        // not cosmetic.** A node the scan produced no interval for was never a
+        // candidate — every control and memory node in the graph lands here,
+        // `Start` and `Proj` included — and folding it into the split count
+        // makes the file look like it is losing values to register pressure
+        // when it is only being handed nodes that hold no value at all.
+        //
+        // It read that way for real. On the loop the 2026-09-03 tier
+        // comparison found inverted, this line reported
+        // `split_or_spilled=5` beside the allocator's `splits=4`, and the two
+        // together said: four candidates lost to live-range splits. They were
+        // not. Four of the five had EMPTY segment lists and one was genuinely
+        // spilled; the method had no split value for the file to reclaim at
+        // all. A day of work aimed at split residency followed from that
+        // reading, and its engagement counter read zero — which is how the
+        // miscount was found.
         let reg = match segs.as_slice() {
+            [] => {
+                skip_no_alloc += 1;
+                continue;
+            }
             [seg] => match seg.reg {
                 Some(reg) => reg,
                 None => {
-                    skip_split += 1;
+                    skip_spilled += 1;
                     continue;
                 }
             },
@@ -11383,6 +11525,70 @@ fn plan_register_residency(
         }
     }
 
+    // ── Entry parameters, which the allocator cannot reach ───────────
+    //
+    // `MachineModel::pin_entry_params` pins every `Param` to its INCOMING ABI
+    // register, and `allocate_linear_scan` skips a pinned value outright. Those
+    // ABI registers are caller-saved and are not in `IR_LOWER_LS_GPRS`, so a
+    // parameter can never be promoted into the callee-saved file however the
+    // heuristics are tuned — it reaches a loop through its frame slot, every
+    // iteration, by construction.
+    //
+    // That is what the 2026-09-03 disassembly of the inverted `fieldloop`
+    // showed: `mov rcx,[rbp-60h]` reloading the loop bound on every iteration,
+    // while the baseline tier had copied it into a callee-saved register in its
+    // prologue (`mov r14,rdx`) and read it from there.
+    //
+    // So the copy is made here instead, out of a register the ALLOCATOR DID NOT
+    // USE. That is the whole safety argument: an unassigned register in this
+    // file is written by nothing else — only the residency machinery publishes
+    // into it — and every register in the file is callee-saved, so a call
+    // cannot destroy it either. The parameter is SSA and never redefined, so
+    // one publish at entry is good for the whole method.
+    //
+    // `IrType::Ref` is excluded for the reason the bank match above gives, and
+    // it is not a tuning choice: `OopMapEntry` names frame slots only, so a
+    // reference in a register is invisible to a root walk and cannot be
+    // updated on evacuation. The receiver therefore stays in its frame slot,
+    // and closing that needs oop maps that can name a register.
+    if ir_param_prologue_copy_enabled() {
+        let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
+        taken.sort_unstable();
+        taken.dedup();
+        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+            .iter()
+            .copied()
+            .filter(|r| !taken.contains(r))
+            .collect();
+        for id in 0..n {
+            if free.is_empty() {
+                break;
+            }
+            if gp_reg_of.get(id).copied().flatten().is_some() {
+                continue;
+            }
+            let Some(node) = graph.nodes.get(id) else {
+                continue;
+            };
+            if !matches!(node.op, Op::Param(_)) {
+                continue;
+            }
+            if !matches!(node.ty, IrType::Int | IrType::Long) {
+                continue;
+            }
+            // Worth a register only if the reads outnumber the one publish.
+            // Loop-weighted, because a parameter's uses are typically inside a
+            // loop its definition is not.
+            if live.weight.get(id).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            if let Some(reg) = free.pop() {
+                gp_reg_of[id] = Some(reg);
+                param_copies += 1;
+            }
+        }
+    }
+
     let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
@@ -11403,7 +11609,8 @@ fn plan_register_residency(
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
-             const={skip_const} single_use={skip_single_use}"
+             const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
+             spilled={skip_spilled} no_alloc={skip_no_alloc}"
         );
     }
     if promoted == 0 {
@@ -11430,6 +11637,17 @@ fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
+    // Attribution, not duplication — the same split `verify_or_bail` makes:
+    // `record_bailout` owns the process-wide category counters, and this
+    // attaches the bailout to *this* method in the per-compilation report.
+    //
+    // Without it the report's `bailouts` field is STRUCTURALLY empty for every
+    // lowering refusal: a census over CratonBench read `bailouts:[]` on all 105
+    // compilations, including the 17 that fell through to single-pass, so the
+    // one record that names both the method and the reason named neither. The
+    // counters were moving the whole time, which is what made the hole hard to
+    // see — the totals looked alive while every per-method row was blank.
+    crate::metrics::note_current_bailout(&bailout, "lower");
     None
 }
 
@@ -11695,6 +11913,35 @@ pub fn lower_with_scalar_deopt(
     )
 }
 
+thread_local! {
+/// The reason the most recent `lower_inner` on this thread refused.
+///
+/// A bail that names itself is the difference between "the optimizing tier
+/// declined" and a fact you can act on: the C2 task pays for an IR build,
+/// optimize and schedule before any of these fire, and whether that cost can be
+/// avoided up front depends entirely on WHICH of them fired.
+///
+/// Thread-local and overwritten per compile; read it immediately after the
+/// lowering call, on the same thread.
+static LOWER_BAIL_REASON: std::cell::Cell<Option<&'static str>> =
+    const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn note_lower_bail(reason: &'static str) {
+    LOWER_BAIL_REASON.with(|c| c.set(Some(reason)));
+}
+
+/// Clear the reason before a lowering attempt, so a stale one cannot be read
+/// as this attempt's.
+pub(crate) fn clear_lower_bail() {
+    LOWER_BAIL_REASON.with(|c| c.set(None));
+}
+
+/// The reason the last lowering attempt on this thread refused, if it did.
+pub fn last_lower_bail() -> Option<&'static str> {
+    LOWER_BAIL_REASON.with(|c| c.get())
+}
+
 /// Shared lowering body: profile-guided branch hints, the optional
 /// guard-surviving scalar-replacement map, and the two per-call-site lowering
 /// tables all flow in here. `pub(crate)` so the production compile path
@@ -11834,6 +12081,7 @@ pub(crate) fn lower_inner_with_scopes(
             .iter()
             .any(|node| matches!(node.op, Op::New { .. }))
     {
+        note_lower_bail("new-without-alloc-helper");
         return None;
     }
     // cov-06. Same reasoning, split per `Op::NewArray` shape: a PRIMITIVE
@@ -11846,6 +12094,7 @@ pub(crate) fn lower_inner_with_scopes(
         .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type != 0))
         && helpers.newarray == 0
     {
+        note_lower_bail("newarray-primitive-without-helper");
         return None;
     }
     if graph
@@ -11854,6 +12103,7 @@ pub(crate) fn lower_inner_with_scopes(
         .any(|node| matches!(node.op, Op::NewArray { element_type, .. } if element_type == 0))
         && helpers.anewarray_object == 0
     {
+        note_lower_bail("anewarray-without-helper");
         return None;
     }
     // cov-01. The same reasoning as the two guards above, for the three
@@ -11944,6 +12194,7 @@ pub(crate) fn lower_inner_with_scopes(
                 .iter()
                 .any(|n| matches!(n.op, Op::Store(MemKind::Int)));
         if needs_getfield_helper || needs_putfield_helper {
+            note_lower_bail("getfield-or-putfield-helper-required");
             return None;
         }
     }
@@ -11970,6 +12221,7 @@ pub(crate) fn lower_inner_with_scopes(
         )
     }) && helpers.getfield == 0
     {
+        note_lower_bail("wide-load-without-getfield-helper");
         return None;
     }
     if helpers.dispatch_threw == 0
@@ -11980,6 +12232,7 @@ pub(crate) fn lower_inner_with_scopes(
             )
         })
     {
+        note_lower_bail("wide-load-shape-unsupported");
         return None;
     }
     // COV-03 — every non-int field STORE is helper-only, and each width has its
@@ -11997,6 +12250,7 @@ pub(crate) fn lower_inner_with_scopes(
             _ => false,
         };
         if missing {
+            note_lower_bail("putfield-helper-missing-for-width");
             return None;
         }
     }
@@ -12026,6 +12280,7 @@ pub(crate) fn lower_inner_with_scopes(
                 .and_then(|&o| graph.nodes.get(o as usize))
                 .map_or(true, |o| !matches!(o.op, Op::Const(_)))
     }) {
+        note_lower_bail("non-const-store-operand");
         return None;
     }
 
@@ -12353,6 +12608,7 @@ pub(crate) fn lower_inner_with_scopes(
                 lowerer.shadow_pushes, lowerer.shadow_reloads
             );
         }
+        note_lower_bail("shadow-push-reload-imbalance");
         return None;
     }
 
@@ -12777,8 +13033,15 @@ fn ir_receiver_guard_cse_enabled() -> bool {
     }
 }
 
-/// Inline TLAB bump for the optimizing tier's `Op::New` — **default ON**, opt
-/// out with `CRATONVM_JIT_IR_INLINE_TLAB=0`.
+/// Inline TLAB bump for the optimizing tier's `Op::New` — **OPT-IN**, on with
+/// `CRATONVM_JIT_IR_INLINE_TLAB=1`.
+///
+/// This line said "**default ON**, opt out with `=0`" for two days after the
+/// body below was flipped to opt-in, which is worse than either state: a reader
+/// checking whether a feature is live got the wrong answer from the only
+/// sentence written to tell them. The mismatch cost a census here — a repro run
+/// came back 0/10 and looked like a fix, when the sequence under test had
+/// simply never executed.
 ///
 /// Off restores `emit_new_object_stub` alone, which is what this arm emitted
 /// before the bump existed, so the two are A/B-able in one binary. That is not
@@ -12792,6 +13055,20 @@ fn ir_receiver_guard_cse_enabled() -> bool {
 /// `the_optimizing_tier_stays_shut_to_allocation_while_it_has_no_inline_tlab`,
 /// which now passes because the bump exists rather than because the gate is
 /// shut.
+///
+/// **The two gates are in series, so the SIGSEGV that keeps the outer one shut
+/// cannot occur in any default build.** Both must be set for the bump to run:
+/// `CRATONVM_JIT_C2_ALLOC_UPGRADE=1` to let an allocation-bearing method reach
+/// this tier, and this one to emit the bump rather than the stub. Measured
+/// 2026-09-04 on dev with engagement confirmed (`inline_tlab_bump=1
+/// stub_only=0`, the census in `runtime_lowering::ir_alloc_site_counts`):
+/// `RJitMapTierDiff` passes **0 failures in 30 runs** — 10 on a quiet host and
+/// 20 under six spinners — against the 4-in-10 recorded on 2026-09-02.
+///
+/// That is a reason to re-examine the outer gate, NOT to open it here: its
+/// second stated reason is a perf trade (a promoted allocation lowering through
+/// the stub buys a more optimized body at the price of a cheaper allocation)
+/// that is still unpriced.
 fn ir_inline_tlab_enabled() -> bool {
     // 2026-09-02, the eight-finding pass: BACK TO OPT-IN, with a repro.
     //

@@ -235,6 +235,30 @@ pub(crate) fn emit_new_object_stub(
 static INLINE_TLAB_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STUB_ONLY_SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Why the IR inline-TLAB bump last declined, and how often each reason fired.
+static INLINE_TLAB_DECLINES: std::sync::Mutex<Option<Vec<(&'static str, u64)>>> =
+    std::sync::Mutex::new(None);
+
+fn note_inline_tlab_decline(why: &'static str) {
+    let Ok(mut g) = INLINE_TLAB_DECLINES.lock() else {
+        return;
+    };
+    let v = g.get_or_insert_with(Vec::new);
+    match v.iter_mut().find(|(k, _)| *k == why) {
+        Some((_, n)) => *n += 1,
+        None => v.push((why, 1)),
+    }
+}
+
+/// `(reason, count)` for every inline-TLAB decline this process has seen.
+pub fn inline_tlab_declines() -> Vec<(&'static str, u64)> {
+    INLINE_TLAB_DECLINES
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
 pub(crate) fn note_stub_only_alloc() {
     STUB_ONLY_SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -323,11 +347,28 @@ pub(crate) fn emit_inline_tlab_new_ir(
     stub_target: usize,
     frame_record: usize,
 ) -> bool {
-    if plan.thread_slot_off <= 0
-        || plan.post_init == 0
-        || stub_target == 0
-        || plan.cursor_off == plan.end_off
-    {
+    // Name the refusal. This bump is default-ON, carries a documented SIGSEGV
+    // risk, and is the stated reason `c2_alloc_upgrade_enabled` stays shut —
+    // and a census across all five collectors found it emitting ZERO sites in
+    // every one of them, with the allocation lowering through the stub instead.
+    // A silent `false` is how a feature gets held responsible for blocking
+    // another one while never executing.
+    let declined = if plan.thread_slot_off <= 0 {
+        Some("no frame thread slot")
+    } else if plan.post_init == 0 {
+        Some("helpers.tlab_post_init is null")
+    } else if stub_target == 0 {
+        Some("helpers.new_object is null")
+    } else if plan.cursor_off == plan.end_off {
+        Some("TLAB cursor and end share an offset")
+    } else {
+        None
+    };
+    if let Some(why) = declined {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!("[cratonvm-jitc] ir inline-TLAB bump DECLINED: {why}");
+        }
+        note_inline_tlab_decline(why);
         return false;
     }
 

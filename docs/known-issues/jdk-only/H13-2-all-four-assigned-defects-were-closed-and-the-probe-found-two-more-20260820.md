@@ -26,6 +26,105 @@ resolved with `dirname $(dirname $(command -v javap))`
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04.** §2 and §3 were **MEASURED** defects
+> with **FIXED-UNVERIFIED** repairs — *"no binary carrying `ca8f03069` or
+> `b773038e2` has been built or run, and this lane is forbidden to build."* Both
+> commits are in this tree and a binary built from it now runs the probe this
+> record is named for.
+>
+> `probes/ProviderLookupProbe.java` was not in the checkout; it was recovered
+> from `6ddce7ecc` (under `fixed-suite-bugs/repros/` in the internal tree) and its blob
+> confirmed present in this repo's object store, so it is committed content, not
+> someone's uncommitted local edit.
+>
+> ```text
+>                          lines   differing from HotSpot 25
+> HotSpot 25 (oracle)        33     —
+> CratonVM compatible        33     0
+> CratonVM --jdk-only        33     0
+> HotSpot self-diff, 2 runs         0   (the probe is deterministic)
+> ```
+>
+> **§3's distinction — EXISTENCE versus OWNERSHIP — is the one to read**, since
+> that is what `b773038e2` repaired, and it is byte-identical to the oracle on
+> both arms:
+>
+> ```text
+> MessageDigest.getInstance(SHA-256, ghost)     NoSuchProviderException: no such provider: …
+> MessageDigest.getInstance(NoSuchAlgo, SUN)    NoSuchAlgorithmException: … for provider SUN
+> MessageDigest.getInstance(SHA-256, SUN)       OK
+> MessageDigest.getInstance(SHA-256, "")        IllegalArgumentException: missing provider
+> ```
+>
+> A provider that exists but does not own the algorithm now answers
+> `NoSuchAlgorithmException` naming the provider, and an unregistered name
+> answers `NoSuchProviderException` — the two outcomes the record says were
+> being conflated.
+>
+> **§2 IS NOT VERIFIED BY THE ABOVE — and on a second probe it is REFUTED.**
+> `ProviderLookupProbe` registers no custom provider at all: every one of its
+> rows goes through `SUN` or an unregistered ghost name, so a green there says
+> nothing about §2.2's arity/wrapper mechanism. §2.3 states the falsifier
+> plainly — *"Build, then run the §2.1 probe. If
+> `MessageDigest.getInstance("H13MD","H13Prov")` still throws, the delegate did
+> not construct."*
+>
+> `probes/CustomProviderSpiProbe.java` was written for exactly that and **the
+> falsifier fires**, identically in Compatible and `--jdk-only`:
+>
+> ```text
+>                                              HotSpot 25            CratonVM (both arms)
+> Security.addProvider(L7P) position>0         true                  true
+> provider.getService(MessageDigest,L7DIGEST)  non-null              non-null
+> MessageDigest.getInstance(L7DIGEST)          OK provider=L7P       NoSuchAlgorithmException
+> MessageDigest.getInstance(L7DIGEST, "L7P")   OK provider=L7P       NoSuchAlgorithmException
+> MessageDigest.getInstance(L7DIGEST, provObj) OK provider=L7P       NoSuchAlgorithmException
+> ```
+>
+> **The refusal keys on the SPI SHAPE, not on the registration shape**, and the
+> probe carries the control that shows it. Three registrations, one VM:
+>
+> ```text
+> L7DIGEST  legacy put() string   + bare MessageDigestSpi   REFUSED (3 overloads)
+> L7SVC     putService(Service)   + bare MessageDigestSpi   REFUSED (2 overloads)
+> L7SUB     legacy put() string   + extends MessageDigest   MATCHES HotSpot
+> ```
+>
+> `L7SUB` is the BouncyCastle route §2.2 says was always fine — it satisfies
+> `is_subclass` and never needs a `Delegate`. It passes, so the provider chain
+> does enumerate a runtime-added provider and the probe is not simply broken.
+> Both bare-SPI registrations fail, so the two registration APIs are not the
+> variable. What is left is the `Delegate` wrapping path — §2.2's mechanism.
+>
+> **Narrowed, not localised, and the difference is stated on purpose.**
+> `ca8f03069` and `b773038e2` are both ancestors of `HEAD`;
+> `engine_delegate_shape_with_provider` is present at
+> `native-builtins/src/jca/provider_chain.rs:1624` **with** its
+> `java/security/MessageDigest` row and the 3-arg descriptor; the call site
+> reaches it; and `java.security.MessageDigest$Delegate` really is in the image
+> (`javap -p` on `java.base.jmod` confirms the `(MessageDigestSpi, String,
+> Provider)` shape). So the fix is in the tree and something ahead of or inside
+> its arm still returns `Ok(None)` — `third_party_service_class`,
+> `build_jca_impl`, or the `new_object_initialized` itself. **Which one was NOT
+> determined here**, and no warning is logged on the path, so the next reader
+> gets a silent `Ok(None)` and should instrument those three before assuming any
+> of them.
+>
+> **What else this note does not cover.** §4's three residuals are stated as
+> measured-and-not-fixed and are untouched; §1's four assigned defects were
+> already MEASURED and are not re-derived. `md.getProvider() == myProvider` —
+> §2.3's own second residual — could not be reached at all, because the
+> `getInstance` before it throws.
+
+> **Probe caution, recorded because it produced two wrong readings first.** The
+> first extended run reported the discriminator rows as agreeing with HotSpot.
+> They had not run: `javac` had failed on a protected `putService`, the previous
+> `.class` files were still on disk, and the runner scored them. The second run
+> then threw out of an unguarded `getInstance` before the discriminator, leaving
+> those rows UNTESTED while a line-diff rendered them as ordinary missing lines.
+> The probe now catches that throw, and the runner refuses to run at all if
+> `javac` fails.
+
 ## 0. What moves, in one table
 
 | Change | Strict (`--jdk-only`) | Compatible | Shadow census |

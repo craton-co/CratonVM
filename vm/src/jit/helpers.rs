@@ -1288,7 +1288,46 @@ pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
 /// address if a collection intervened, because the slot it comes out of is
 /// rooted and remapped (`memory/roots.rs` §10, `memory/gc.rs` §10).
 pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
-    thread.jit_pending_exception.take()
+    let exc = thread.jit_pending_exception.take();
+    if exc.is_some() {
+        drain_superseded_implicit_signals();
+    }
+    exc
+}
+
+/// Drop the implicit-trap flags when a real exception is being delivered.
+///
+/// An implicit signal (`npe`, `aioobe`, `arithmetic`) is a REQUEST for a
+/// throwable, not a throwable. Once another exception is in flight, that request
+/// can never be granted: the frame whose trap raised it is unwinding, and no
+/// door downstream owns the flag. Leaving it set is not inert -- the next
+/// unrelated JIT call drains it and builds a fresh exception at a site that
+/// never faulted.
+///
+/// The shape that found this (2026-09-03, see
+/// `known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`): the
+/// lambda direct arm finishes a deopted body in the interpreter and returns a
+/// zero with the real NPE parked in `jit_pending_exception`, exactly as its
+/// contract says. Compiled code then evaluates the second operand of the same
+/// expression before its post-invoke guard fires, dereferences the SAME null and
+/// raises a second trap. The first exception is delivered and caught; the second
+/// flag survives two iterations and surfaces as a `NullPointerException` for a
+/// receiver that was never null.
+///
+/// This is the same rule [`take_all_jit_signals`] already applies by taking
+/// everything at once -- stated for the other consumption point, so the two
+/// cannot disagree about whether a signal outlives the exception that overtook
+/// it. The deopt flag is deliberately NOT dropped: it describes the compiled
+/// frame's fate, which an exception does not settle.
+fn drain_superseded_implicit_signals() {
+    if take_jit_pending_npe() {
+        // The snapshot was taken for a raise that will never happen; a later
+        // drain would attach frames the raising code has long since left.
+        let _ = take_jit_pending_npe_action();
+        let _ = take_jit_pending_npe_compiled_frames();
+    }
+    let _ = take_jit_pending_aioobe();
+    let _ = take_jit_pending_arithmetic();
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -4520,7 +4559,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // moving collector rewrites object addresses. (Resolves the prior
         // FIXME that called `heap.collect_garbage` with an unchecked
         // StopTheWorldToken.)
-        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
     }
     // GC-overhead limit: if forced GCs keep freeing almost nothing, the heap is
     // full of live objects — surface OOM now instead of limping on slivers
@@ -5106,7 +5145,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -5168,7 +5207,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         None => {
             if let Some((thread, _guard)) = jit_thread_mut() {
                 thread.tlab.retire();
-                crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
             }
             if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
                 if let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) {
@@ -6025,7 +6064,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -19069,7 +19108,7 @@ fn call_integer_native_raw_inner(
                         && (vm.mem.heap.needs_gc_for_jit_allocation()
                             || vm.mem.heap.old_gen_needs_gc())
                     {
-                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
                     }
                     vm.mem.heap.clear_young_spill_pressure();
                 }

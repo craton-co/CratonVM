@@ -9,6 +9,57 @@ read-from-source was read from source. The two are kept apart on purpose.
 Follows W7-52-formatter-close-and-locale.md, which found the shape and counted
 the population but deliberately did not sweep it.
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-03.** This record's status was "source
+> landed, UNVERIFIED against a VM"; it now has a CratonVM column, from
+> `probes/CloseFlushSwallowProbe.java` in all three modes against Temurin
+> 25.0.3+9-LTS on the same host.
+>
+> ```text
+>                    checks failed   lines differing from HotSpot
+> compatible               4                     6
+> --jdk-only               4                     6
+> --synthetic-jdk          9                    13
+> ```
+>
+> **The sweep holds. One site in the census does not**, and it is this record's
+> own shape — a delegated failure dropped on close:
+>
+> ```text
+> filterOutFlushFailureWins   HotSpot java.lang.Error: flush-boom   CratonVM none
+> ```
+>
+> `FilterOutputStream.close()` must let the flush failure win and suppress only
+> a close failure into it. Ours absorbs it. That is a real, still-open site of
+> the 51 this record swept, and it fails identically in all three modes, so it
+> is not a mode artefact.
+>
+> Two further sites fail **only** under `--synthetic-jdk` and belong to this
+> record's family too:
+>
+> ```text
+> propertiesStoreStreamPropagatesFlushIOException   IOException   ->  none
+> propertiesStoreWriterPropagatesFlushIOException   IOException   ->  none
+> zipOutClosePropagatesError    Error: zip-close-boom  ->  NPE "this.names is null"
+> ```
+>
+> The `zipOutClose` row is worse than a swallow: an internal
+> `NullPointerException` from our own `ZipOutputStream` state replaces the
+> caller's error, so the caller is told the wrong thing rather than nothing.
+>
+> **What this does NOT verify.** The census itself — the 51 sites and the count
+> that was off by five — is a source walk and was not re-walked; this note
+> verifies BEHAVIOUR on the probe's assertions only. The probe covers a sample
+> of the swept sites, not all 51, so "the sweep holds" is bounded by what the
+> probe dispatched. A site the probe never touches is neither confirmed nor
+> refuted here. The `--synthetic-jdk` rows are additionally bounded by that
+> mode's own unrelated breakage: the same run logs a missing
+> `java/io/FileDescriptor.initIDs()V` and a GC array-receiver guard.
+>
+> Supersedes the interim ratchet note that read "129 rows vs HotSpot 120, 35
+> differing". That was a 2026-09-02 measurement on an OLDER binary under
+> `--synthetic-jdk` only; 35 -> 13 is mostly merged `dev` work, and the
+> mode-attributable gap is 13 vs 6 on one tree.
 ## The shape
 
 A native stands in for a JDK method whose whole job is to hand the call on —

@@ -715,6 +715,158 @@ pub mod scalar_deopt_census {
 ///
 /// 600x, against 0.48 us for the hook itself and 0.75 for the lost invoke
 /// cache. Nothing counted it until this census existed.
+/// WHICH call actually started a collection.
+///
+/// AUDIT 2026-09-03. `[GC] zgc-trigger` counts the four branches of
+/// `needs_gc`, plus the arena's hard refusal. On kfusion under `--gpu` all
+/// five read ZERO on a run that collected 13 times, so every one of those
+/// cycles entered through a door none of them watches.
+///
+/// There are three doors, and none counted itself:
+///
+/// * `maybe_gc` — the allocation-path check. Fires on `needs_gc()` OR on
+///   the `gc_requested` latch, and the latch is invisible to the trigger
+///   tallies, so a cycle can start here with every trigger at zero.
+/// * `maybe_gc_forced` — the safepoint's forced path, taken when the
+///   boundary's gates say collect.
+/// * `force_gc_from_native` — `System.gc()` / `Runtime.gc()`.
+///
+/// Counting the door is what separates "the heap decided" from "someone
+/// asked", which is the question left after the trigger census came back
+/// empty.
+pub mod gc_entry_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MAYBE_GC_NEEDS: AtomicU64 = AtomicU64::new(0);
+    static MAYBE_GC_REQUESTED: AtomicU64 = AtomicU64::new(0);
+    static FORCED: AtomicU64 = AtomicU64::new(0);
+    static FROM_NATIVE: AtomicU64 = AtomicU64::new(0);
+
+    /// `maybe_gc` collected because `needs_gc()` said so.
+    #[inline]
+    pub fn note_maybe_gc_needs() {
+        MAYBE_GC_NEEDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `maybe_gc` collected because the `gc_requested` latch was set —
+    /// the case no trigger tally can see.
+    #[inline]
+    pub fn note_maybe_gc_requested() {
+        MAYBE_GC_REQUESTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `maybe_gc_forced` ran, tagged with the call site that asked.
+    ///
+    /// `maybe_gc_forced_pub` has 24 call sites across seven files -- the
+    /// safepoint gate, five in the JIT helpers, four on the deopt-resume
+    /// path, and more -- so a bare count says a collection was FORCED
+    /// without saying by whom, which is the question left when every
+    /// trigger tally reads zero.
+    #[inline]
+    pub fn note_forced_at(site: &'static str) {
+        FORCED.fetch_add(1, Ordering::Relaxed);
+        let mut v = FORCED_SITES.lock().unwrap_or_else(|p| p.into_inner());
+        match v.iter_mut().find(|(s, _)| *s == site) {
+            Some((_, n)) => *n += 1,
+            None => v.push((site, 1)),
+        }
+    }
+
+    static FORCED_SITES: std::sync::Mutex<Vec<(&'static str, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// `(site, count)` for every forced collection, busiest first.
+    pub fn forced_sites() -> Vec<(&'static str, u64)> {
+        let mut v = FORCED_SITES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// `System.gc()` / `Runtime.gc()`.
+    #[inline]
+    pub fn note_from_native() {
+        FROM_NATIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    static REFILL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFILL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_TOTAL_AT_EXIT: AtomicU64 = AtomicU64::new(0);
+
+    /// One `refill_tlab` call and whether it produced a chunk.
+    ///
+    /// The wedge break fires after 16,384 CONSECUTIVE failures, and the
+    /// counter only resets on a success -- so "does refill ever succeed"
+    /// decides whether the breaker is armed permanently or not at all. On
+    /// ZGC `refill_tlab` is opt-in (`CRATONVM_ZGC_JIT_TLAB`), so the
+    /// expectation is zero successes and the interesting number is how
+    /// many bytes flow past it.
+    #[inline]
+    pub fn note_refill(success: bool) {
+        REFILL_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if success {
+            REFILL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish `bytes_allocated_total` for the exit line. It is the wedge
+    /// break's RE-ARM metric (one break per 64 MB), so it, not the
+    /// collection count, is what sets how often the breaker can fire.
+    pub fn note_alloc_total(bytes: u64) {
+        ALLOC_TOTAL_AT_EXIT.store(bytes, Ordering::Relaxed);
+    }
+
+    static REFILL_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFILL_RETRY_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+
+    /// The refill RETRY that follows a wedge break, and whether the forced
+    /// collection actually bought a chunk.
+    ///
+    /// Counted apart from the first attempt because it is the only refill
+    /// that can succeed on this backend: the first one is asking a feature
+    /// that is off (`CRATONVM_ZGC_JIT_TLAB`), while the retry runs after a
+    /// coalescing collection. If it succeeds, the TLAB it seeds serves
+    /// allocations that bump `bytes_allocated_total`, which is the wedge
+    /// break's own re-arm -- 64 MB later the breaker fires again. That is a
+    /// LOOP, and this counter is what distinguishes it from a one-off.
+    #[inline]
+    pub fn note_refill_retry(success: bool) {
+        REFILL_RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if success {
+            REFILL_RETRY_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(retry_attempts, retry_successes)`.
+    pub fn refill_retry_totals() -> (u64, u64) {
+        (
+            REFILL_RETRY_ATTEMPTS.load(Ordering::Relaxed),
+            REFILL_RETRY_SUCCESSES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(attempts, successes, alloc_total)`.
+    pub fn refill_totals() -> (u64, u64, u64) {
+        (
+            REFILL_ATTEMPTS.load(Ordering::Relaxed),
+            REFILL_SUCCESSES.load(Ordering::Relaxed),
+            ALLOC_TOTAL_AT_EXIT.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(maybe_gc_needs, maybe_gc_requested, forced, from_native)`.
+    pub fn totals() -> (u64, u64, u64, u64) {
+        (
+            MAYBE_GC_NEEDS.load(Ordering::Relaxed),
+            MAYBE_GC_REQUESTED.load(Ordering::Relaxed),
+            FORCED.load(Ordering::Relaxed),
+            FROM_NATIVE.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub mod gpu_jit_gate_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

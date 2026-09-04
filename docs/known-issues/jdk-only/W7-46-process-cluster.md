@@ -478,6 +478,41 @@ the image before trusting it. The five it named were right; the sixth existed.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03.** Status was **SOURCE-ONLY**, *"No
+> CratonVM binary was built or run."* The Rust half now has been:
+>
+> ```text
+> cargo test -p cratonvm-native-io process     25 passed; 0 failed
+> ```
+>
+> Including the rows this record's changes are about — the confinement gate, the
+> spawn-policy hook, the GC-blocked regions around every wait, and destroy
+> reaching a child a waiter is parked on:
+>
+> ```text
+> process::tests::validate_spawn_program_confinement_gate                   ok
+> process::tests::spawn_policy_hook_is_consulted_and_can_refuse_the_fork    ok
+> process::tests::process_wait_for_enters_gc_blocked_region                 ok
+> process::tests::process_wait_for_timeout_enters_gc_blocked_region_between_polls  ok
+> process::tests::foreign_receiver_timed_wait_also_enters_a_blocked_region  ok
+> process::tests::destroy_reaches_a_child_a_waiter_is_blocked_on            ok
+> process::tests::a_real_pid_resolves_to_its_table_handle                   ok
+> ```
+>
+> **This record's own good habit is worth restating, because it is why the
+> discharge is small.** It ran the modified `RJdkProcess.java` against real
+> HotSpot before shipping — *"A fixture change is testable on the oracle alone;
+> not doing so is a habit worth losing"* — which is what seeded `EXPECTED_CHECKS`
+> from a measurement and caught its own unsound `descendants()` check. The
+> oracle side was therefore never the debt. Only the CratonVM side was, and
+> `RJdkProcess` is in the regression suite run alongside this note.
+>
+> **What this does NOT verify.** The `javap` census against the Windows JDK 25
+> image is a source-and-oracle count and was not re-taken. The three further
+> defects the sweep found are described in this record's own sections and are
+> not individually re-adjudicated here — the unit tests above cover the
+> `native-io/src/process.rs` surface, not every claim in the sweep.
+
 # 8. The follow-up pass, 2026-08-12 — clearing the two recorded-not-fixed rows
 
 **Still SOURCE-ONLY. No CratonVM binary was built or run, no `javac`, no

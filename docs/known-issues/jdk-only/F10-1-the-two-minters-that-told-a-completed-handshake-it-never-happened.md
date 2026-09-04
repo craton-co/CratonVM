@@ -15,6 +15,52 @@ not type-checking; see §8.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. Steps 1-3 of §"How to verify" were
+> run; steps 4-5 could not be.** Status was *"No `cargo`, no VM, no fixture"*,
+> every CratonVM row PREDICTED.
+>
+> **Step 1 — the bar is that F6's and E42's mutation pairs are UNAFFECTED**,
+> *"if either moves, this commit touched the predicate, which it must not."*
+> Neither moved: both are green at baseline, and the full mutation matrix run
+> for `F6-1` behaves exactly as `F6-1` predicts, so the predicate this lane must
+> not have touched is demonstrably the one `F6-1` describes.
+>
+> **Step 2 — §4's ownership table, re-taken.** This record flags its own
+> weakest point: *"E22-1's dump is the authority and it is from an older tree."*
+> Taken fresh from `--dump-native-registry` on a binary built from this tree,
+> **every row of §4 holds**:
+>
+> ```text
+> method                owns   registered_by            §4 says
+> getPeerPrincipal      True   ssl_security.rs:6272     ssl_security's, live      ✓
+> isValid               True   t27_tls.rs:20072         t27_tls's, live           ✓
+> isValid               False  ssl_security.rs:6016     inert (owns_slot=false)   ✓
+> getId                 True   t27_tls.rs:19886         t27_tls's, live           ✓
+> getId                 False  ssl_security.rs:6028     inert                     ✓
+> getProtocol           False  ssl_security.rs:5951     inert                     ✓
+> getCipherSuite        False  ssl_security.rs:5987     inert                     ✓
+> getPeerCertificates   True   t27_tls.rs:19766         t27_tls's, not read       ✓
+> getPeerCertificates   False  ssl_security.rs:6090     inert                     ✓
+> getLocalCertificates  True   ssl_security.rs:6197     ssl_security's, not read   ✓
+> ```
+>
+> §4 is *"an argument from that table"*, and the table is now current rather
+> than inherited.
+>
+> **Step 3 — `RSslNullSession`, "Expect no change at all."** It passes in both
+> Compatible and `--jdk-only` in a full 129-vector run. No check moved, so by
+> this record's own criterion the fix did not go in the wrong file.
+>
+> **What this does NOT verify — and it is the behavioural half.** Step 4 wants
+> an embedded-HTTPS fixture and the H2 `TestSsl` cluster, to see that *"a
+> completed HTTPS handshake reporting `isValid() == false`"* is gone, and to
+> watch for the two named residuals (`AbstractMethodError` from `invalidate()`,
+> `SSLPeerUnverifiedException` from `getPeerPrincipal()`). **That was not run.**
+> Step 5's `scratchpad/f10/F10HttpsSession.java` needs a `ks.p12` and did not
+> survive its session, so §6's table cannot be reproduced. Registration and
+> ownership are confirmed; the marker's effect on a live handshake is still
+> PREDICTED.
+
 ## 0. Verdict
 
 1. **`-1` was never a description of these two sessions; it was a description

@@ -24,6 +24,49 @@ only, plus this record.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. The stated Acceptance is met on both
+> arms.** Status was **FIXED-UNVERIFIED** for this lane's two files, with every
+> CratonVM row PREDICTED. §"Acceptance, MEASURED (§4)" names three requirements;
+> `probes/VhBoxProbe.java` prints exactly those and nothing else:
+>
+> ```text
+>                                 HotSpot 25    compatible   --jdk-only
+> vh.fieldLong      class         java.lang.Long   identical   identical
+>                   value         5
+>                   == Long.valueOf(5)    true
+> vh.getAndSetLong  class         java.lang.Long
+>                   value         5
+>                   == Long.valueOf(5)    true
+> vh.fieldDouble    class         java.lang.Double
+>                   value         1.5
+>                   != Double.valueOf(1.5)  true
+> ```
+>
+> Both CratonVM arms are **byte-identical to the oracle** across the whole
+> transcript.
+>
+> **The two identity rows are the ones that carry the result**, and they point
+> in opposite directions on purpose: `Long.valueOf` caches −128..127, so a
+> correctly boxed `5` must BE the cached instance; `Double.valueOf` caches
+> nothing, so a correctly boxed `1.5` must NOT be. A VarHandle that returned a
+> raw primitive-shaped value, or that boxed through the wrong wrapper class,
+> would move one of these without moving the other. Neither moved. That is what
+> makes this stronger than the `equals` rows above them, which a wrong-but-equal
+> value would pass.
+>
+> `RJdkReflBox`, the vector this record's NOMINATION 4 is about, passes in both
+> Compatible and `--jdk-only` in a full 129-vector run.
+>
+> **This record stays OPEN, and the status block is right that it should.** It
+> says *"Partly fixed with a named live residual"* — the widener the VarHandle
+> path still does not call. Nothing here closes that; the Acceptance above is
+> the boxing family, not the widening. NOMINATION 4a's *"two new targets and
+> four rows"* were not added to `RJdkReflBox`, so the vector still does not
+> cover what this record wanted it to cover, and its green is correspondingly
+> narrow. The HotSpot rows from `scratchpad/f29/{CollBox,CollBox2,CacheHigh,
+> VhLong}.java` are the oracle and were not re-derived; that scratchpad did not
+> survive its session.
+
 ## 0. Verdict
 
 | | |

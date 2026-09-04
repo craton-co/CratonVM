@@ -341,6 +341,9 @@ pub struct Arena {
     /// rest of the run, which is what makes the region test on a free block
     /// (`offset >= high_cursor`) permanently correct.
     high_cursor: usize,
+    /// The cursor value the most recent retractions moved away from, maxed --
+    /// see [`Self::low_high_water`], which is the only reader.
+    pre_retract_high: usize,
     /// Reclaimed regions at or above [`Self::high_cursor`] — the large-object
     /// end's free list.
     ///
@@ -741,6 +744,7 @@ impl Arena {
             free_pushed: 0,
             coalesce_threshold: COALESCE_THRESHOLD_MIN,
             high_cursor: capacity,
+            pre_retract_high: 0,
             free_high: Vec::new(),
             high_max: 0,
             high_pushed: 0,
@@ -2340,6 +2344,38 @@ impl Arena {
         self.cursor
     }
 
+    /// The highest the low bump cursor has been since
+    /// [`Self::reset_low_high_water`], which is the span any bitmap over this
+    /// arena may have bits set in.
+    ///
+    /// # Why the cursor alone is not that bound
+    ///
+    /// [`Self::retract_cursor_to`] LOWERS the cursor onto the last survivor
+    /// after every sweep, and it is the only thing that does. A bitmap pass
+    /// bounded by the cursor after a retraction therefore skips the span the
+    /// retraction just gave back -- and the MARK bitmap has bits there, set
+    /// during the cycle when the cursor was still high. Clearing bounded by
+    /// the new cursor leaves them set, and the next cycle then reads a mark
+    /// set carrying a previous cycle's bits: it retains whatever they name.
+    ///
+    /// `pre_retract_high` is what makes the two agree. It is maxed with the
+    /// cursor a retraction moved away FROM, so `cursor.max(pre_retract_high)`
+    /// is exactly the high-water mark, and it costs a compare on the
+    /// retraction path rather than anything on the bump path.
+    pub(crate) fn low_high_water(&self) -> usize {
+        self.cursor.max(self.pre_retract_high)
+    }
+
+    /// Forget the retraction history, so the next
+    /// [`Self::low_high_water`] starts from the current cursor.
+    ///
+    /// Called once per collection, AFTER every bitmap over this arena has been
+    /// cleared -- calling it earlier would hand a later pass a bound that no
+    /// longer covers the bits it has to reach.
+    pub(crate) fn reset_low_high_water(&mut self) {
+        self.pre_retract_high = 0;
+    }
+
     /// `vacated` is the third argument and the reason it exists is the whole
     /// of `Follow-up 2026-08-29` on
     /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`:
@@ -2792,6 +2828,7 @@ impl Arena {
         let old_cursor = self.cursor;
         let reclaimed = old_cursor - new_cursor;
         self.cursor = new_cursor;
+        self.pre_retract_high = self.pre_retract_high.max(old_cursor);
         self.decommit_span(new_cursor, old_cursor);
         reclaimed
     }
@@ -2817,6 +2854,7 @@ impl Arena {
         }
         let old_cursor = self.cursor;
         self.cursor = off;
+        self.pre_retract_high = self.pre_retract_high.max(old_cursor);
         // GIVE THE PAGES BACK. `[off, old_cursor)` was just proved free (it was
         // one free-list block ending exactly at the cursor) and has been
         // removed from the list, so it is un-bumped space that nothing can
