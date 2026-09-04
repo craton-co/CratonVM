@@ -22307,6 +22307,9 @@ fn try_compile_inner(
         // `emit_safepoint_poll` emits nothing — the same optional-helper
         // contract x64 uses, so an unwired build is byte-identical.
         backend.set_helpers(*helpers);
+        // Seeds the reference-parameter mask, which the entry poll names its
+        // live oops from and the local dataflow starts at bci 0 with.
+        backend.set_method_descriptor(&cached.method_descriptor, cached.is_static);
         let result = backend.compile_method_with_info(
             cached.max_locals as usize,
             num_params,

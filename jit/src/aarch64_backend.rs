@@ -149,13 +149,23 @@
 //!   With polls off (the default) `pending_oop_maps` is still empty and the GC
 //!   walker still takes its conservative fallback, exactly as before.
 //!
-//!   One prerequisite is still missing and matters only to a RELOCATING
-//!   collector: register-resident oops are named by nothing. X19–X28 are
-//!   callee-saved, so a reference local sits in the callee's saved-register
-//!   area, which the conservative walk covers — sound for a MARKING collector,
-//!   and NOT for one that must rewrite, since a conservative scan cannot. There
-//!   is also no safepoint-id slot, so `fully_oop_covered` must stay false and
-//!   `find_oop_map_for_pc` is the only reader that can select these maps.
+//!   **Reference LOCALS are named too, as of 2026-09-03.** A frame-homed one
+//!   is named where it already lives. A REGISTER-homed one (X19-X28) is stored
+//!   to a home slot reserved for it, named, and reloaded after the call: those
+//!   registers are callee-saved, so the value survives on its own, but it
+//!   survives inside the CALLEE's saved-register area where only the
+//!   conservative walk can see it -- and a conservative walk marks without
+//!   being able to REWRITE. A relocating collector could not otherwise move an
+//!   object whose only root was a register local. Which locals hold references
+//!   comes from the flow-sensitive `compute_local_oop_masks` shared with x64,
+//!   not from a whole-method approximation, because naming a primitive would
+//!   hand a relocating collector a non-pointer to rewrite.
+//!
+//!   What remains before a MOVING collector could run here: there is still no
+//!   safepoint-id slot, so `fully_oop_covered` stays false and
+//!   `find_oop_map_for_pc` is the only reader that can select these maps; and
+//!   an `astore` between two safepoints leaves the home slot stale, which is
+//!   harmless only because each poll rewrites it before its own map is taken.
 //! - **No deoptimization and no OSR.** Neither word appears in this file.
 //!   There is no frame reconstruction, no uncommon-trap stub, no
 //!   `osr_pc_to_native` table. There is nothing to tier down *from* (this is
@@ -1021,6 +1031,26 @@ pub struct Arm64Backend {
     /// backend has no safepoint poll to put on one — see the "no GC safepoint
     /// polls" note in the module header and `docs/jit/aarch64-parity.md`.
     cur_bytecode_pc: usize,
+    /// `max_stack` for this compilation, needed to place the safepoint home
+    /// slots after the operand area.
+    max_stack: usize,
+    /// Per-bytecode-pc "must be oop" local masks, and whether the dataflow
+    /// reached each pc. Shared with x64 (`compute_local_oop_masks`) -- the
+    /// analysis is pure bytecode. Empty when unsupported (>64 locals), which
+    /// this backend treats as "no claim" and falls back to the conservative
+    /// scan for.
+    local_oop_masks: Vec<u64>,
+    local_oop_reached: Vec<bool>,
+    /// Which parameter slots hold references on entry. The ENTRY poll answers
+    /// from this: the dataflow's own bci-0 state is seeded with it, but the
+    /// prologue poll runs before the walk, so it reads the seed directly.
+    /// Zero unless [`Arm64Backend::set_method_descriptor`] was called.
+    param_oop_mask: u64,
+    /// Frame offsets of reference LOCALS at the safepoint being emitted, folded
+    /// into the map by `emit_oop_map_for_safepoint`. Taken, not copied, so a
+    /// site that stages them without emitting a map cannot leak them into a
+    /// later safepoint.
+    pending_local_oop_slots: Vec<i32>,
     /// Label for the shared epilogue.
     epilogue_label: u32,
     /// Number of parameters for the current method (used for self-recursive calls).
@@ -1100,6 +1130,11 @@ impl Arm64Backend {
             float_scratch_cursor: 0,
             pc_labels: HashMap::new(),
             cur_bytecode_pc: 0,
+            max_stack: 0,
+            local_oop_masks: Vec::new(),
+            local_oop_reached: Vec::new(),
+            param_oop_mask: 0,
+            pending_local_oop_slots: Vec::new(),
             epilogue_label: 0,
             num_params: 0,
             method_info: HashMap::new(),
@@ -1168,14 +1203,10 @@ impl Arm64Backend {
     /// and `pending_oop_maps` is still empty in practice. What changed is that
     /// the first one will inherit a correct writer.
     ///
-    /// Register-resident oops are deliberately NOT named: X19-X28 are
-    /// callee-saved under AAPCS64, so they sit in the caller's saved-register
-    /// area, which the conservative walk covers. That is sound for a MARKING
-    /// collector and would not be for a relocating one -- a conservative scan
-    /// cannot rewrite -- so a moving collector on this backend needs the
-    /// register half before it may trust these maps. Stated here because the
-    /// x64 side learned it the expensive way (see `map_incomplete_cause::
-    /// OOP_STILL_IN_REGISTER` and the `relocation_coverage_complete` gate).
+    /// This walks the OPERAND stack. Reference LOCALS reach the map through
+    /// `pending_local_oop_slots`, staged by `emit_safepoint_poll`, which stores
+    /// a register-homed one to a reserved home first -- see there for why a
+    /// callee-saved register is not good enough for a relocating collector.
     #[allow(dead_code)]
     fn emit_oop_map_for_safepoint(&mut self) {
         if self.failed {
@@ -1229,6 +1260,22 @@ impl Arm64Backend {
                 }
             }
         }
+        // The reference LOCALS staged by `emit_safepoint_poll`. Taken, not
+        // copied, so a site that stages them without emitting a map cannot leak
+        // them into a later safepoint (the same discipline x64's Stage 3 uses).
+        for off in std::mem::take(&mut self.pending_local_oop_slots) {
+            match i16::try_from(off) {
+                Ok(off16) => {
+                    if !slots.contains(&off16) {
+                        slots.push(off16);
+                    }
+                }
+                Err(_) => {
+                    self.failed = true;
+                    return;
+                }
+            }
+        }
         if slots.is_empty() {
             return;
         }
@@ -1249,8 +1296,17 @@ impl Arm64Backend {
         // stack, spill it to a frame spill slot before reusing.
         if self.scratch_cursor as usize >= SCRATCH_REGS.len() {
             if let Some(pos) = self.operand_stack.iter().position(|&reg| reg == r) {
+                // THE BASE IS THE FRAME-HOMED LOCAL COUNT, not `num_reg_locals`.
+                // Those are complements: `num_reg_locals` counts the locals that
+                // got a REGISTER, while the spill area holds the ones that did
+                // not. Basing operands at the former aliased a local's slot
+                // whenever fewer than half the locals were register-homed, and
+                // ran past the reserved area into the callee-save slots when
+                // more than half were. `num_spills = gpr_spills + max_stack` is
+                // sized for this base.
+                let base = self.local_spill_count();
                 let frame = self.frame.as_ref().unwrap();
-                let spill_slot = frame.num_reg_locals + pos;
+                let spill_slot = base + pos;
                 let offset = frame.spill_offset
                     + i32::try_from(spill_slot)
                         .unwrap_or(i32::MAX)
@@ -1284,6 +1340,21 @@ impl Arm64Backend {
     /// that needs asserting.
     pub fn set_safepoints_enabled(&mut self, on: bool) {
         self.safepoints_enabled = on;
+    }
+
+    /// Seed the reference-parameter mask from this method's descriptor.
+    ///
+    /// Must be called BEFORE compiling: `compile_pass` feeds it to
+    /// `compute_local_oop_masks` as the dataflow's entry state, and the ENTRY
+    /// poll reads it directly (the prologue runs before the walk, so there is
+    /// no bci to look up there).
+    ///
+    /// Without it the mask is 0, and a reference PARAMETER that is never
+    /// `astore`d is never named -- covered by the conservative scan, but not
+    /// precisely, which is the difference that matters to a relocating
+    /// collector.
+    pub fn set_method_descriptor(&mut self, descriptor: &str, is_static: bool) {
+        self.param_oop_mask = crate::compute_param_oop_mask(descriptor, is_static);
     }
 
     /// Emit a cooperative GC safepoint poll.
@@ -1333,7 +1404,7 @@ impl Arm64Backend {
     /// collector on this backend needs register naming first. Same caveat as
     /// `emit_oop_map_for_safepoint`, restated here because this is the site
     /// that creates the exposure.
-    fn emit_safepoint_poll(&mut self) {
+    fn emit_safepoint_poll(&mut self, entry: bool) {
         if self.failed || !self.safepoints_enabled {
             return;
         }
@@ -1382,6 +1453,64 @@ impl Arm64Backend {
             added.push(*reg);
         }
 
+        // NAME THE REFERENCE LOCALS.
+        //
+        // A frame-homed local is already in a slot, so it only has to be named.
+        // A REGISTER-homed one is the case this exists for: X19-X28 are
+        // callee-saved, so its value survives the call -- but it survives
+        // inside the CALLEE's saved-register area, where only the conservative
+        // walk can see it, and a conservative walk marks without being able to
+        // REWRITE. A relocating collector therefore cannot move an object whose
+        // only root is a register local. Storing it to a reserved home makes it
+        // a nameable, rewritable root; the reload after the call is what carries
+        // a moved object's new address back into the register.
+        let mut reg_homed: Vec<(usize, i32)> = Vec::new();
+        if let Some(mut mask) = self.oop_locals_at_current_pc(entry) {
+            while mask != 0 {
+                // Cast: count/index to usize
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if i >= self.local_regs.len() {
+                    continue;
+                }
+                if self.local_regs.get(i).copied().flatten().is_some() {
+                    let (Some(off), Some(reg)) = (
+                        self.safepoint_home_for_reg_local(i),
+                        self.local_regs.get(i).copied().flatten(),
+                    ) else {
+                        // No home reserved: refuse rather than leave a live
+                        // reference reachable only through a conservative scan
+                        // while claiming to have named the frame.
+                        self.failed = true;
+                        return;
+                    };
+                    self.buffer.emit(Arm64Instruction::Str {
+                        rt: reg,
+                        rn: Arm64Register::FP,
+                        offset: off,
+                    });
+                    self.pending_local_oop_slots.push(off);
+                    reg_homed.push((i, off));
+                } else {
+                    // Frame-homed: already where the GC can read and rewrite it.
+                    let Some(frame) = self.frame.as_ref() else {
+                        self.failed = true;
+                        return;
+                    };
+                    let slot = self.spill_index_for(i);
+                    let Some(off) = i32::try_from(slot)
+                        .ok()
+                        .and_then(|n| n.checked_mul(8))
+                        .and_then(|n| frame.spill_offset.checked_add(n))
+                    else {
+                        self.failed = true;
+                        return;
+                    };
+                    self.pending_local_oop_slots.push(off);
+                }
+            }
+        }
+
         self.buffer.emit(Arm64Instruction::MovImm {
             rd: Arm64Register::X16,
             imm: self.helpers.safepoint_slow_path as i64,
@@ -1391,6 +1520,20 @@ impl Arm64Backend {
         });
         // At the return address, with the operand oops in frame slots.
         self.emit_oop_map_for_safepoint();
+
+        // Reload every register-homed local the GC may have REWRITTEN. Without
+        // this the frame slot carries the object's new address while the
+        // register still holds the old one -- the map would be correct and the
+        // running code would not.
+        for (i, off) in &reg_homed {
+            if let Some(reg) = self.local_regs.get(*i).copied().flatten() {
+                self.buffer.emit(Arm64Instruction::Ldr {
+                    rt: reg,
+                    rn: Arm64Register::FP,
+                    offset: *off,
+                });
+            }
+        }
 
         // Restore, and put the compile-time model back exactly as it was.
         for reg in &added {
@@ -1405,22 +1548,81 @@ impl Arm64Backend {
         self.buffer.bind_label(skip);
     }
 
+    /// The oop-local mask in force at the safepoint being emitted, or `None`
+    /// when no claim can be made.
+    ///
+    /// `None` is a REFUSAL, not "no oop locals": the dataflow is empty above 64
+    /// locals and unreached at pcs only an exception edge can arrive at, and
+    /// treating either as "nothing live" is how a collector loses a root. The
+    /// caller falls back to naming nothing, which leaves those frames to the
+    /// conservative scan -- correct, just less precise.
+    fn oop_locals_at_current_pc(&self, entry: bool) -> Option<u64> {
+        if entry {
+            // The prologue poll runs before the walk, so there is no bci to
+            // look up; the live oops there are exactly the reference
+            // parameters, which is what seeds the dataflow at bci 0.
+            return Some(self.param_oop_mask);
+        }
+        if self.local_oop_masks.is_empty() {
+            return None;
+        }
+        if !self
+            .local_oop_reached
+            .get(self.cur_bytecode_pc)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.local_oop_masks.get(self.cur_bytecode_pc).copied()
+    }
+
+    /// Frame offset of the safepoint home reserved for register-homed local
+    /// `index`, or `None` if it has no register (it lives in a spill slot
+    /// already) or no home was reserved.
+    ///
+    /// Homes sit after the operand area: `local_spill_count() + max_stack + k`,
+    /// where `k` numbers the register-homed locals in order. That is the tail
+    /// `num_spills` was extended by, so a home can never collide with a local's
+    /// slot or an operand's.
+    fn safepoint_home_for_reg_local(&self, index: usize) -> Option<i32> {
+        self.local_regs.get(index).copied().flatten()?;
+        let k = (0..index)
+            .filter(|&i| self.local_regs.get(i).copied().flatten().is_some())
+            .count();
+        let frame = self.frame.as_ref()?;
+        let slot = self
+            .local_spill_count()
+            .checked_add(self.max_stack)?
+            .checked_add(k)?;
+        if slot >= frame.num_spills {
+            return None;
+        }
+        let scaled = i32::try_from(slot).ok()?.checked_mul(8)?;
+        frame.spill_offset.checked_add(scaled)
+    }
+
     /// Frame offset of the spill slot for operand-stack depth `depth`, or
     /// `None` when that slot is outside the reserved spill area.
     ///
-    /// MIRRORS `alloc_scratch` EXACTLY, including the `num_reg_locals` base:
-    /// the spill area holds the register-homed locals FIRST and the operand
-    /// slots after them, so dropping that term would alias an operand onto a
-    /// local's slot and corrupt both. The two are the only writers of
-    /// `spill_map` and they must agree about where a given depth lives, or the
-    /// oop map names a slot nothing wrote.
+    /// MIRRORS `alloc_scratch` EXACTLY, sharing its base through
+    /// [`Self::local_spill_count`]. The two are the only writers of `spill_map`
+    /// and must agree about where a given depth lives, or the oop map names a
+    /// slot nothing wrote.
+    ///
+    /// (An earlier version of this comment said the base was `num_reg_locals`
+    /// because "the spill area holds the register-homed locals FIRST". That is
+    /// backwards -- the spill area holds the locals that got NO register -- and
+    /// copying `alloc_scratch` faithfully copied its bug. See
+    /// `operand_spill_slots_do_not_alias_frame_homed_locals`.)
     ///
     /// `alloc_scratch` reaches this arithmetic only for a depth it has already
     /// proved live, so it can saturate; the poll can be asked about any depth,
     /// so it bound-checks against the reserved area and refuses instead.
     fn spill_offset_for_depth(&self, depth: usize) -> Option<i32> {
+        let base = self.local_spill_count();
         let frame = self.frame.as_ref()?;
-        let spill_slot = frame.num_reg_locals.checked_add(depth)?;
+        let spill_slot = base.checked_add(depth)?;
         if spill_slot >= frame.num_spills {
             return None;
         }
@@ -1748,7 +1950,7 @@ impl Arm64Backend {
         // after FP is established and the callee-saved registers are stored, so
         // the frame the poll's CALL runs on top of is complete and walkable.
         // The operand stack is empty here, so the poll spills nothing.
-        self.emit_safepoint_poll();
+        self.emit_safepoint_poll(true);
     }
 
     /// Emit the standard AAPCS64 epilogue.
@@ -1921,6 +2123,21 @@ impl Arm64Backend {
         self.num_params = num_params;
         self.method_info = method_info;
         self.stack_kinds = Self::analyze_stack_kinds(bytecode);
+        self.max_stack = max_stack;
+        self.pending_local_oop_slots.clear();
+        // The same "must be oop" local dataflow x64 uses, seeded with this
+        // method's reference parameters. A bit is set only when EVERY path
+        // reaching that pc stored a reference there, which is what a
+        // relocating collector needs: a false positive would have the GC
+        // rewrite a primitive that happens to look like an address.
+        let (lo_masks, lo_reached) = crate::x64::compute_local_oop_masks(
+            bytecode,
+            bytecode.len(),
+            num_locals,
+            self.param_oop_mask,
+        );
+        self.local_oop_masks = lo_masks;
+        self.local_oop_reached = lo_reached;
 
         // Run graph-coloring register allocation for ARM64.
         let alloc = super::regalloc::allocate_registers_arm64(
@@ -1987,7 +2204,21 @@ impl Arm64Backend {
             .filter(|(i, a)| a.is_none() && self.local_regs.get(*i).map_or(false, |g| g.is_none()))
             .count();
         let _ = fp_spills; // float spills use the same frame slots
-        let num_spills = gpr_spills + max_stack;
+        // One extra spill word per REGISTER-HOMED local, reserved only when
+        // this compilation emits polls.
+        //
+        // A register-homed local has no frame slot at all on this backend --
+        // `spill_index_for` numbers only the locals that got NO register -- so
+        // there is nowhere for a safepoint to put it. The prologue's
+        // callee-save slots cannot be borrowed either: those hold the CALLER's
+        // values and the epilogue restores from them. Hence a dedicated home,
+        // placed after the operand area. See `safepoint_home_for_reg_local`.
+        let safepoint_homes = if self.safepoints_enabled {
+            saved_regs.len()
+        } else {
+            0
+        };
+        let num_spills = gpr_spills + max_stack + safepoint_homes;
         let layout = Arm64FrameLayout::compute(num_locals, num_spills, &saved_regs);
 
         // Refuse frames that could step over the stack guard page.
@@ -2060,7 +2291,7 @@ impl Arm64Backend {
             // harmless.) `back_edge_targets` comes from pass 1, so a header is
             // known before pass 2 reaches it.
             if self.back_edge_targets.contains(&pc) {
-                self.emit_safepoint_poll();
+                self.emit_safepoint_poll(false);
             }
 
             let opcode = bytecode[pc];
@@ -3765,6 +3996,18 @@ impl Arm64Backend {
     }
 
     /// Compute the spill slot index for a local that doesn't have a register.
+    /// How many spill slots the FRAME-HOMED LOCALS occupy -- equivalently, the
+    /// first spill index the operand stack may use.
+    ///
+    /// `spill_index_for` numbers those locals `0..local_spill_count()`, and
+    /// `num_spills` is computed as `gpr_spills + max_stack`, so the operand
+    /// area is exactly `[local_spill_count(), num_spills)`. Both spillers must
+    /// take their base from HERE or the two areas overlap -- see
+    /// `operand_spill_slots_do_not_alias_frame_homed_locals`.
+    fn local_spill_count(&self) -> usize {
+        self.spill_index_for(self.local_regs.len())
+    }
+
     fn spill_index_for(&self, local_index: usize) -> usize {
         // Count how many locals before this one also lack a register (GPR and FP).
         let mut spill_idx = 0;
@@ -7698,7 +7941,7 @@ mod tests {
         b.operand_stack_oop_marks = vec![true, false];
         assert!(b.spill_map.is_empty());
 
-        b.emit_safepoint_poll();
+        b.emit_safepoint_poll(false);
 
         assert!(!b.failed, "the poll must not refuse this frame");
         assert!(
@@ -7730,13 +7973,306 @@ mod tests {
         b.frame = Some(Arm64FrameLayout::compute(0, 0, &[]));
         b.operand_stack = vec![Arm64Register::X9];
         b.operand_stack_oop_marks = vec![true];
-        b.emit_safepoint_poll();
+        b.emit_safepoint_poll(false);
         assert!(
             b.failed,
             "a spill with nowhere to go must fail the method closed"
         );
     }
 
+
+    /// The operand spill area and the frame-homed locals must NOT overlap.
+    ///
+    /// FIXED 2026-09-03; this failed as written.
+    ///
+    /// `spill_index_for` numbers a frame-homed local by how many locals BEFORE
+    /// it also lack a register, so those locals occupy spill indices
+    /// `0..gpr_spills`. `alloc_scratch` numbers an operand slot
+    /// `frame.num_reg_locals + depth` -- and `num_reg_locals` is how many
+    /// locals got a REGISTER, which is the complement of that count, not the
+    /// end of it.
+    ///
+    /// `num_spills = gpr_spills + max_stack` is the tell: the frame is sized as
+    /// if operands began at `gpr_spills`, which is exactly what makes the last
+    /// operand slot the last reserved word. Basing them at `num_reg_locals`
+    /// instead either ALIASES a local (fewer locals got registers) or runs PAST
+    /// the reserved area into the callee-save slots (more did).
+    #[test]
+    fn operand_spill_slots_do_not_alias_frame_homed_locals() {
+        let mut b = Arm64Backend::new();
+        // Four locals: local 0 register-homed, locals 1..3 frame-homed.
+        b.local_regs = vec![Some(Arm64Register::X19), None, None, None];
+        b.float_local_regs = vec![None, None, None, None];
+        let gpr_spills = 3usize;
+        let max_stack = 4usize;
+        b.frame = Some(Arm64FrameLayout::compute(
+            4,
+            gpr_spills + max_stack,
+            &[Arm64Register::X19],
+        ));
+
+        let local_slots: Vec<usize> = (1..4).map(|i| b.spill_index_for(i)).collect();
+        assert_eq!(
+            local_slots,
+            vec![0, 1, 2],
+            "frame-homed locals occupy 0..gpr_spills"
+        );
+
+        assert_eq!(b.frame.as_ref().unwrap().num_reg_locals, 1);
+        // The base both spillers now share.
+        let operand_slot_0 = b.local_spill_count();
+        assert_eq!(
+            operand_slot_0, gpr_spills,
+            "the operand area must begin where the locals end"
+        );
+
+        assert!(
+            !local_slots.contains(&operand_slot_0),
+            "operand depth 0 landed on spill slot {operand_slot_0}, which is \
+             also a frame-homed local's slot -- the operand stack and the \
+             locals share frame words"
+        );
+        // The OTHER direction: with more locals register-homed than not, the
+        // old base ran past the reserved area into the callee-save slots,
+        // overwriting a saved register the epilogue restores to the caller.
+        let mut b2 = Arm64Backend::new();
+        b2.local_regs = vec![
+            Some(Arm64Register::X19),
+            Some(Arm64Register::X20),
+            Some(Arm64Register::X21),
+            None,
+        ];
+        b2.float_local_regs = vec![None; 4];
+        let saved = [Arm64Register::X19, Arm64Register::X20, Arm64Register::X21];
+        let num_spills = 1 + max_stack; // gpr_spills(1) + max_stack
+        b2.frame = Some(Arm64FrameLayout::compute(4, num_spills, &saved));
+        let last = b2.local_spill_count() + (max_stack - 1);
+        let old_last = b2.frame.as_ref().unwrap().num_reg_locals + (max_stack - 1);
+        assert!(
+            last < num_spills,
+            "the deepest operand slot ({last}) must stay inside the reserved              area ({num_spills}); the old base put it at {old_last}"
+        );
+        assert!(old_last >= num_spills, "the old base really did overrun");
+    }
+
+    /// A frame for `n` locals of which `reg_homed` have registers.
+    fn locals_frame(b: &mut Arm64Backend, reg: &[Option<Arm64Register>], max_stack: usize) {
+        b.local_regs = reg.to_vec();
+        b.float_local_regs = vec![None; reg.len()];
+        let saved: Vec<Arm64Register> = reg.iter().flatten().copied().collect();
+        let gpr_spills = reg.iter().filter(|r| r.is_none()).count();
+        b.max_stack = max_stack;
+        b.frame = Some(Arm64FrameLayout::compute(
+            reg.len(),
+            gpr_spills + max_stack + saved.len(),
+            &saved,
+        ));
+    }
+
+    /// THE POINT OF THIS WHOLE CHANGE: a REGISTER-HOMED reference local is
+    /// stored to a frame home, named in the map, and reloaded after the call.
+    ///
+    /// X19-X28 are callee-saved, so the value survives the call on its own --
+    /// but it survives inside the CALLEE's saved-register area, where only the
+    /// conservative walk can see it, and a conservative walk marks without
+    /// being able to REWRITE. A relocating collector therefore could not move
+    /// an object whose only root was a register local. The store makes it a
+    /// nameable, rewritable root; the reload is what carries a moved object's
+    /// new address back into the register.
+    #[test]
+    fn a_register_homed_reference_local_is_spilled_named_and_reloaded() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        // The dataflow says local 0 holds a reference at this pc.
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0b1];
+        b.local_oop_reached = vec![true];
+
+        let home = b
+            .safepoint_home_for_reg_local(0)
+            .expect("a home must be reserved for a register-homed local");
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+
+        let stored = b.buffer.instructions().iter().any(|i| {
+            matches!(i, Arm64Instruction::Str { rt, rn, offset }
+                     if *rt == Arm64Register::X19
+                     && *rn == Arm64Register::FP
+                     && *offset == home)
+        });
+        assert!(stored, "the register local must be stored to its home");
+
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        let named: Vec<i16> = b.pending_oop_maps[0].frame_slot_offsets.clone();
+        assert!(
+            named.contains(&(home as i16)),
+            "the map must name the home ({home}); named {named:?}"
+        );
+
+        let reloaded = b.buffer.instructions().iter().any(|i| {
+            matches!(i, Arm64Instruction::Ldr { rt, rn, offset }
+                     if *rt == Arm64Register::X19
+                     && *rn == Arm64Register::FP
+                     && *offset == home)
+        });
+        assert!(
+            reloaded,
+            "the register must be reloaded, or a relocated object's new address \
+             never reaches the running code"
+        );
+    }
+
+    /// A FRAME-HOMED reference local is named where it already lives -- no
+    /// store, because there is nothing to move.
+    #[test]
+    fn a_frame_homed_reference_local_is_named_without_a_spill() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[None], 2);
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0b1];
+        b.local_oop_reached = vec![true];
+
+        let frame_off = b.frame.as_ref().unwrap().spill_offset; // slot 0
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        assert!(
+            b.pending_oop_maps[0]
+                .frame_slot_offsets
+                .contains(&(frame_off as i16)),
+            "a frame-homed local must be named at its own slot"
+        );
+        assert!(
+            !b.buffer.instructions().iter().any(|i| {
+                matches!(i, Arm64Instruction::Str { offset, .. } if *offset == frame_off)
+            }),
+            "a frame-homed local is already where the GC reads it; storing it \
+             again would be pure cost"
+        );
+    }
+
+    /// A local the dataflow does NOT call a reference is not named.
+    ///
+    /// The precision control. Naming a primitive would hand a relocating
+    /// collector a word to rewrite that is not a pointer -- and an `int` can
+    /// coincidentally hold a value `is_object_address` accepts, which is
+    /// exactly why this uses the flow-sensitive "must be oop" dataflow rather
+    /// than the whole-method `find_reference_locals` approximation.
+    #[test]
+    fn a_non_reference_local_is_not_named() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0]; // reached, and NOT an oop
+        b.local_oop_reached = vec![true];
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed);
+        assert!(
+            b.pending_oop_maps.is_empty(),
+            "a safepoint with no live reference records no map"
+        );
+        assert!(
+            !b.buffer.instructions().iter().any(|i| {
+                matches!(i, Arm64Instruction::Str { rt, .. } if *rt == Arm64Register::X19)
+            }),
+            "a primitive local must not be spilled either"
+        );
+    }
+
+    /// An UNREACHED pc makes no claim, rather than claiming "no oops".
+    ///
+    /// The dataflow does not reach pcs only an exception edge arrives at, and
+    /// it is empty above 64 locals. Reading either as "nothing live" is how a
+    /// collector loses a root, so both fall back to naming nothing and leaving
+    /// the frame to the conservative scan.
+    #[test]
+    fn an_unreached_pc_names_nothing_rather_than_claiming_emptiness() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19)], 2);
+        b.cur_bytecode_pc = 0;
+        b.local_oop_masks = vec![0b1];
+        b.local_oop_reached = vec![false]; // never reached
+        assert!(b.oop_locals_at_current_pc(false).is_none());
+        b.emit_safepoint_poll(false);
+        assert!(!b.failed, "no claim is not a refusal of the method");
+        assert!(b.pending_oop_maps.is_empty());
+    }
+
+    /// The safepoint homes sit past both the locals and the operand area.
+    ///
+    /// Three regions share one spill area, and an overlap would have the GC
+    /// read a word two of them write. The frame is extended by exactly the
+    /// number of register-homed locals when polls are on, so a home is always
+    /// inside the reservation and never on a local's or an operand's slot.
+    #[test]
+    fn safepoint_homes_do_not_collide_with_locals_or_operands() {
+        let mut b = poll_backend();
+        let regs = [Some(Arm64Register::X19), None, Some(Arm64Register::X20), None];
+        let max_stack = 3usize;
+        locals_frame(&mut b, &regs, max_stack);
+        let frame_words = b.frame.as_ref().unwrap().num_spills;
+
+        let local_slots: Vec<i32> = (0..regs.len())
+            .filter(|&i| regs[i].is_none())
+            .map(|i| b.spill_index_for(i) as i32)
+            .collect();
+        let operand_slots: Vec<i32> = (0..max_stack)
+            .map(|d| (b.local_spill_count() + d) as i32)
+            .collect();
+        let home_slots: Vec<i32> = (0..regs.len())
+            .filter(|&i| regs[i].is_some())
+            .map(|i| {
+                let off = b.safepoint_home_for_reg_local(i).unwrap();
+                (off - b.frame.as_ref().unwrap().spill_offset) / 8
+            })
+            .collect();
+
+        for h in &home_slots {
+            assert!(
+                !local_slots.contains(h) && !operand_slots.contains(h),
+                "home slot {h} collides (locals {local_slots:?}, operands \
+                 {operand_slots:?})"
+            );
+            assert!(
+                (*h as usize) < frame_words,
+                "home slot {h} is outside the reserved area ({frame_words})"
+            );
+        }
+        assert_eq!(home_slots.len(), 2, "one home per register-homed local");
+    }
+
+    /// The ENTRY poll names the reference PARAMETERS.
+    ///
+    /// The prologue runs before the walk, so there is no bci to look up; the
+    /// live oops there are exactly the reference parameters. Without the
+    /// descriptor seed this mask is 0 and a reference parameter that is never
+    /// `astore`d is never named -- covered by the conservative scan, but not
+    /// precisely, which is the difference a relocating collector cares about.
+    #[test]
+    fn the_entry_poll_names_the_reference_parameters() {
+        let mut b = poll_backend();
+        locals_frame(&mut b, &[Some(Arm64Register::X19), None], 2);
+        // static (Ljava/lang/Object;I)V -> local 0 is a reference parameter.
+        b.set_method_descriptor("(Ljava/lang/Object;I)V", true);
+        assert_eq!(b.param_oop_mask & 1, 1, "param 0 is a reference");
+
+        let home = b.safepoint_home_for_reg_local(0).unwrap();
+        b.emit_safepoint_poll(true); // entry
+        assert!(!b.failed);
+        assert_eq!(b.pending_oop_maps.len(), 1);
+        assert!(
+            b.pending_oop_maps[0]
+                .frame_slot_offsets
+                .contains(&(home as i16)),
+            "the entry poll must name the reference parameter"
+        );
+
+        // The control: with no descriptor seeded, it names nothing.
+        let mut b2 = poll_backend();
+        locals_frame(&mut b2, &[Some(Arm64Register::X19), None], 2);
+        b2.emit_safepoint_poll(true);
+        assert!(b2.pending_oop_maps.is_empty());
+    }
     /// A published artifact carries its resolved oop maps.
     ///
     /// The publication path used to build its `CompiledMethod` with
