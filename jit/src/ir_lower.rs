@@ -11592,6 +11592,55 @@ fn plan_register_residency(
     let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
+
+    // ── Could the home slot be dropped? A census, before building it ──
+    //
+    // `docs/feature-designs/ir-optional-home-slot.md` argues that a value which
+    // lives in a register for its whole range needs no frame word, and rests
+    // that on `LiveModel::pinned` covering every deopt-named value. **On this
+    // path it does not**: `release_deopt_pins` above deliberately releases
+    // exactly those pins, and pays for it by keeping every home the COLOURER
+    // planned. So a promoted value here may very well be named by a deopt
+    // frame, and its home is what that frame reads.
+    //
+    // Which makes the size of the opportunity an empirical question rather than
+    // a design one, and this counts it before anything is built:
+    //
+    //   `home_droppable`  promoted, and named by no safepoint and not a phi
+    //   `blocked_deopt`   promoted, but some safepoint's locals/stack names it
+    //   `blocked_phi`     promoted, but its home is written by the edge copies
+    //
+    // A `home_droppable` of zero on real bytecode refutes the design as
+    // written, and says the next move is deopt metadata that can name a
+    // register — not a refactor of the lowering arms.
+    let (home_droppable, blocked_deopt, blocked_phi) = {
+        let mut deopt_named = vec![false; n];
+        for sp in &graph.safepoints {
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if let Some(cell) = deopt_named.get_mut(v as usize) {
+                    *cell = true;
+                }
+            }
+        }
+        let (mut ok, mut deopt, mut phi) = (0usize, 0usize, 0usize);
+        for id in 0..n {
+            if gp_reg_of.get(id).copied().flatten().is_none() {
+                continue;
+            }
+            if graph
+                .nodes
+                .get(id)
+                .is_some_and(|node| matches!(node.op, Op::Phi))
+            {
+                phi += 1;
+            } else if deopt_named.get(id).copied().unwrap_or(false) {
+                deopt += 1;
+            } else {
+                ok += 1;
+            }
+        }
+        (ok, deopt, phi)
+    };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
             "[ir-ls] nodes={n} positions={} peak_live={} deopt_pins_released={released} \
@@ -11611,6 +11660,10 @@ fn plan_register_residency(
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
              spilled={skip_spilled} no_alloc={skip_no_alloc}"
+        );
+        eprintln!(
+            "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
+            graph.safepoints.len(),
         );
     }
     if promoted == 0 {
