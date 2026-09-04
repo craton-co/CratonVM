@@ -1905,6 +1905,72 @@ and do not read `compiles: c2=N` as "N optimizing-tier compiles": on `sieve` it
 says `c2=3` while the IR backend lowered nothing, because that counter is fed by
 the tier manager's nomination and not by the backend that ran.
 
+#### The OSR door: the go/no-go, and the blocker that is actually in the way
+
+The reach census named the OSR door as the largest cause and the only one no
+flag can reach. The first question is whether there is anything at the far end
+of a route through it, and `ir_compatible_sized` is pure and `scan` is already
+in hand at that door, so the question costs nothing to ask. Per CratonBench
+phase, over the methods actually compiled there:
+
+| phase | OSR compiles | pass `ir_compatible` |
+|---|---|---|
+| arithmetic | 1 | **1** |
+| hashmap | 1 | **1** |
+| sieve | 2 | **2** |
+| matrix | 1 | 0 (`multianewarray`) |
+| bintrees | 1 | **1** |
+| stringregex | 1 | **1** |
+
+**Six of seven**, and they include `arithmetic` and `hashmap` — the two phases
+where the optimizing tier is offered nothing whatsoever today. Read it as an
+UPPER BOUND: `ir_compatible` is the first of four gates, and `sieve` in
+particular would still be refused further down for its bulk byte-array zero
+fill. But the route is not empty, which is what a go/no-go needed.
+
+**The design that fits this codebase.** Do NOT teach `osr_trampoline` the IR
+frame. It takes some twenty layout parameters (`osr_local_assignments`,
+`osr_callee_saved_base`, `osr_xmm_saved_base`, …) because it builds the
+single-pass frame from OUTSIDE, and that arrangement depends on a property the
+optimizing tier does not have: a fixed per-method local→home map. IR locals are
+SSA values on colour-assigned slots that differ from bci to bci.
+
+Instead, have `ir_lower` emit its own OSR entry stub per eligible bci. It
+already holds everything needed and the trampoline holds none of it:
+
+* the frame — it built it, bookkeeping slots and save bands included;
+* where local `i` lives at bci `b` — the safepoint snapshot at `b` names the
+  node, and `node_slot` / `gp_reg_of` name its location. This is the same
+  information `build_deopt_points` already reads, used in the opposite
+  direction;
+* the native offset of `b` — `bci_native`.
+
+The VM side then needs only "is there an entry for this bci" and a
+three-argument call, instead of twenty layout fields. Entry bcis must have an
+EMPTY operand stack (a javac loop header does), and a `Ref` local must be
+seeded exactly where that bci's oop map says it lives.
+
+**The blocker, named precisely, because it is not the frame.** The optimizing
+tier's inputs — the invoke plans, `checkcast_info`, the `new`-site resolutions,
+the inline sites — are assembled inside `try_compile_inner`, and the OSR door
+does not go through it. `compile_osr_artifact` assembles a DIFFERENT set for the
+single-pass backend and calls `x64::compile_with_param_slots` directly. So the
+work is not "emit an entry stub"; it is "give this door the optimizing tier's
+input pipeline", and the honest way to do that is to route OSR through the
+common funnel rather than beside it.
+
+That refactor pays for itself twice. The same divergence has already produced
+three bugs this file records — the permanent bail-list, the bisect levers and
+the code-cache cap were each hand-copied to this door after a bug, and the
+`compile_gate::admit` token exists to stop a fourth. A door that goes through
+the funnel cannot drift from it again.
+
+**Not started, deliberately.** Entering a compiled body part-way with a
+hand-seeded frame is the failure mode that produces a plausible wrong number
+rather than a crash, and this section already records what happens when that
+class of work is begun without the instrument first. The census above is the
+instrument; the go is now on the record with a number behind it.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
