@@ -1692,6 +1692,88 @@ A timing arm on this host without a same-config control is not a measurement.
 The `C1/C1B` and `C2/CTRL` pairs above exist for that reason and should be kept
 in any re-run.
 
+#### The census refuted the design, and named the site that was worth fixing
+
+Built the instrument before the feature, and it is the reason there is no sixth
+zero to report. `plan_register_residency` now counts, over the values it
+actually gave a register to, how many could lose their home word:
+
+```text
+[ir-ls] resident=3 (fp=0 gp=3)
+[ir-ls] home: droppable=0 blocked_deopt=1 blocked_phi=2 safepoints=16
+```
+
+**Zero of three**, on the loop this whole section is about. The design's safety
+argument — that `pinned` covers every deopt-named value, so a promoted value is
+named by no frame state — is true in `regalloc.rs` and false where it is used:
+`plan_register_residency` calls `release_deopt_pins` deliberately and pays for
+it by keeping every home the colourer planned. A 50-arm refactor of the
+lowering arms would have had nothing to act on.
+
+`blocked_phi=2` is the useful half. **The loop-carried values ARE the phis**,
+and a phi's home is written by `emit_copy_op`, which was memory to memory:
+`load rax, [src]`, `store [dst], rax`, and then `emit_phi_copies` reloaded the
+word it had just written to publish the phi's register. Then, because a phi
+appears in its header block's node list like any other value, the generic
+publish site reloaded it **again, once per iteration** — which is the other
+half of the loop-carried chain, `mov [rbp-78h],rax` on the back edge and `mov
+rbx,[rbp-78h]` at the top of the next iteration waiting on it.
+
+Two changes at that one site (`CRATONVM_JIT_IR_PHI_COPY_REGS=1`,
+`CRATONVM_JIT_IR_SKIP_REPUBLISH=1`, both default OFF). The disassembly confirms
+both fire: `FieldLoop.sum` goes 1030 → 1026 → 1018 bytes as they are turned on,
+the preheader's two publishes become `mov rbx,rax` / `mov r12,rax`, and **both
+loop-body reloads disappear** — the phis are read straight out of `rbx` and
+`r12`.
+
+**And it measures zero.** Interleaved arms, user CPU time, a second arm of the
+control configuration as the floor:
+
+| probe | floor (ctl vs ctl2) | on vs ctl | P(on < control) |
+|---|---|---|---|
+| `FieldLoop.sum` (2 loop-carried) | 0.86% | +0.86% | 0.529 |
+| `FieldLoop.sumWide` (5 loop-carried) | 0.00% | +1.27% | 0.516 |
+
+`P(on < control)` is over all 15x30 arm pairs; 0.50 is no effect. Two
+instructions out of a thirty-two instruction body, in a loop with enough
+independent work to overlap them, is below what this host can resolve.
+
+**Half of it is inert on this shape, and the counter says which half.**
+`[ir-ls] phi copies: reg_reads=0 reg_publishes=4` — four publishes (two phis
+times two edges) and not one register read, because the sources of those copies
+are the `Add` results, which are single-use and therefore never promoted. The
+read half waits on a shape where a phi's incoming value is itself resident.
+
+Correctness is established rather than assumed: `probes/PhiSwapLoop.java`
+(two-cycle, three-cycle, mixed GP/FP) matches HotSpot with the flags on and
+off, the 2,489 `cratonvm-jit` tests pass with both flags on, and the regression
+suite is 90/90 in both arms.
+
+**The CratonBench arms were vacuous, and the check that caught it is worth
+copying.** `sieve`, `matrix` and `arithmetic` were run the same way and came
+back at 0.407, 0.475 and 0.549 — until `CRATONVM_DBG=ir-linear-scan` was read
+on each of them:
+
+```text
+fib:    ir-ls=3
+sieve:  ir-ls=0
+```
+
+**The IR tier plans no residency at all on those kernels**, so both arms ran
+identical machine code and the three numbers describe nothing. `osr_entered=504`
+with `osr: admitted=2` says where the time actually goes. That reach question —
+how much of a real workload the optimizing tier's body reaches in the first
+place — is a prerequisite for any further measurement in this section, and it
+had not been asked.
+
+**What is sequenced next, and why it is now sequenced rather than assumed.**
+`FrameValue::Register`, `RegisterLong` and `RegisterRef` already exist and are
+tested, so deopt metadata CAN name a register — but the IR tier's
+`emit_deopt_stub` passes only `rbp` to `ir_deopt_entry` and reserves no
+`SavedRegisters` region, so nothing would fill one. Dropping the home of a
+deopt-named value needs that region reserved and the callee-saved file spilled
+into it first. `blocked_deopt` is the counter that says what that would buy.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

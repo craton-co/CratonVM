@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-335 tokens.
+337 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -691,6 +691,8 @@ export inherited from a parent shell.
 | `ir-fused-branch` | `CRATONVM_JIT_IR_FUSED_BRANCH` |
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
+| `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -923,7 +925,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-134 tokens.
+135 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -935,6 +937,7 @@ export inherited from a parent shell.
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `moving-young-band-object-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN` |
 | `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
+| `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |

@@ -1,9 +1,13 @@
 # Making the IR tier's home slot optional
 
-**Status: designed, not built.** The obligations below were verified against the
-tree on 2026-09-04; the sizing is a count, not an estimate. This page exists
-because five incremental attempts at the same goal each measured zero, and the
-reason was structural rather than five separate mistakes.
+**Status: REFUTED by its own census, 2026-09-04, and superseded — see "What
+the census said" below.** The safety argument in "What is already safe" is
+wrong on the path that matters, and the change it proposed cannot fire on real
+bytecode. The page is kept because the refutation is the useful part, and
+because the census that produced it is a two-line instrument anyone can re-run.
+
+The original framing follows unchanged; read it as the hypothesis, not as the
+conclusion.
 
 ## Why
 
@@ -92,6 +96,73 @@ method falls back to the interpreter, which is a coverage loss and never a wrong
 answer, and a census counts the refusals by call site. The first run then names
 exactly which of the 13 sites need converting to `gp_load_value`, and they can be
 converted one at a time with the count going to zero as evidence.
+
+## What the census said
+
+The design rested on one claim, in "What is already safe": that `pinned` covers
+every deopt-named value, so **a non-pinned value is named by no deopt frame**.
+That is true where it was checked, in `regalloc.rs`.
+
+It is false where it is used. `plan_register_residency` calls
+`live.release_deopt_pins(graph)` deliberately, and pays for the release by
+keeping every home the COLOURER planned — `plan_slots` keeps every pin, and
+`alloc_slot_checked` reads its answer. So a value that has a register here may
+very well be named by a deopt frame, and its home word is what that frame
+reads. The comment beside the `SlotClass::Pinned` check says so in passing:
+after the release that class covers "exactly the deopt-named values — i.e., on
+a bytecode graph, nearly all of them".
+
+Which turns the size of the opportunity into an empirical question. Counting it
+took two lines of `plan_register_residency` and one `eprintln`, and on
+`FieldLoop.sum` — the loop this whole section is about — it reads:
+
+```text
+[ir-ls] resident=3 (fp=0 gp=3)
+[ir-ls] home: droppable=0 blocked_deopt=1 blocked_phi=2 safepoints=16
+```
+
+**Zero of three.** Two of the resident values are phis, whose homes are written
+by the edge copies rather than by a definition arm, and the third is named by
+one of the sixteen safepoints. There is no population for the 50-arm refactor
+to act on, and building it would have produced a sixth measured zero — the one
+outcome this page was written to avoid.
+
+## What replaced it
+
+`blocked_phi=2` is not a disappointment; it is the address of the problem. The
+loop-carried values ARE the phis, and a phi's home is written by
+`emit_copy_op`, which was memory to memory — `load rax, [src]` then
+`store [dst], rax` — after which `emit_phi_copies` RELOADED the word it had
+just written in order to publish the phi's register. Then, because a phi
+appears in its header block's node list like any other value, the generic
+publish site reloaded it AGAIN, once per iteration.
+
+Two changes, both at that one site rather than at fifty:
+
+* `gather_phi_copies` reports the source NODE beside its frame word, so an edge
+  copy reads a resident source from its register and publishes its phi's
+  register from RAX at the store, instead of reloading the word two
+  instructions later. The ordering argument is the one the memory schedule
+  already rests on: `resolve_parallel_copy` reads every source before anything
+  writes it, and a register is updated at exactly the instruction that writes
+  the word, so the two go stale together.
+* A value already live in its register is not published again. This applies
+  ONLY to the re-publish at a definition's own position — an edge copy must
+  always write the phi's register, because that is the copy.
+
+On `FieldLoop.sum` the body loses both loop-carried reloads (`mov
+rbx,[rbp-78h]` and `mov r12,[rbp-80h]` at the top of every iteration, each
+waiting on the back edge's store of the same word) and the method loses 12
+bytes, 1030 → 1018.
+
+**What the deopt finding leaves open.** `FrameValue::Register`,
+`RegisterLong` and `RegisterRef` already exist and are tested, so deopt
+metadata CAN name a register — but the IR tier's `emit_deopt_stub` passes only
+`rbp` to `ir_deopt_entry` and reserves no `SavedRegisters` region, so nothing
+would fill one. Dropping the home of a deopt-named value therefore needs that
+region reserved and the file spilled into it first. That is a real piece of
+work with a real prize behind it, and it is now a *sequenced* one rather than
+an assumption.
 
 ## How to know it worked
 

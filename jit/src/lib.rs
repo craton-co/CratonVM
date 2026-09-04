@@ -1636,6 +1636,23 @@ pub struct OopMapEntry {
     /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
     /// a proof into a guess, so the report must not spend it.
     pub stack_marks_exact: bool,
+    /// §25.3's probe — how many oop homes the SHADOW PUSH paired with this
+    /// safepoint published, captured just before `emit_shadow_reload` pops
+    /// them.
+    ///
+    /// Shadow publication is CALL-SCOPED (§25.2): `emit_shadow_push` runs
+    /// before the call and `emit_shadow_reload` pops right after it returns.
+    /// The band verifier's obligation is not scoped that way, so a frame
+    /// stopped at a safepoint that published nothing reports every movable word
+    /// it holds as un-rewritable — even the ones this map names. That is the
+    /// shape §22.2 measured (67 of 93 reported words `in_map=true`) and could
+    /// not explain.
+    ///
+    /// `0` says this safepoint pushed nothing. It does not by itself say
+    /// whether that is because the site is poll-shaped, because the gate was
+    /// off, or because no oop was live — those are separated by the
+    /// `shadow_incomplete_cause` counters.
+    pub shadow_pushed: u16,
 }
 
 impl OopMapEntry {
@@ -1654,6 +1671,7 @@ impl OopMapEntry {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         }
     }
 
@@ -38825,7 +38843,12 @@ mod layout_constant_inventory {
         // it reconstructs both cell addresses to assert both stores are
         // emitted, which is the assertion that would have caught the
         // compact-only arm before a run-time census had to.
-        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
+        //
+        // 2026-09-04: the layout-epoch guard's regression test adds three more
+        // `HEADER_SIZE` uses (17 -> 20), all of them reading back the compact
+        // cell it just proved is or is not written. No new EMISSION site: the
+        // guard itself bakes an epoch address and a count, not a displacement.
+        ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
     ];
 
     fn source(file: &str) -> &'static str {
