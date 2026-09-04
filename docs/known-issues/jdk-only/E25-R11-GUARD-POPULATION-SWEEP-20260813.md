@@ -30,6 +30,95 @@ they are named for, under any input: rows 1, 32, 33, 34.**
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04.** Status was **FIXED-UNVERIFIED**:
+> *"This lane did not build or run CratonVM, and did not run `cargo`."* Both
+> have now been done.
+>
+> **TASK 1 — the seventeenth `Mac` method, and the ownership check.** Measured
+> with `probes/MacSurfaceProbe.java` against Temurin 25.0.3+9 on the same host.
+> Both CratonVM arms are **byte-identical to the oracle**:
+>
+> ```text
+> Mac.getInstance("HmacSHA256", providerObj)   OK alg=HmacSHA256 provider=SunJCE len=32
+> Mac.getInstance("HmacSHA1",   providerObj)   OK alg=HmacSHA1   provider=SunJCE len=20
+> Mac.getInstance("NoSuchMac",  providerObj)   NoSuchAlgorithmException … for provider SunJCE
+> Mac.getInstance("HmacSHA256", "SUN")         NoSuchAlgorithmException … for provider SUN
+> Mac.getInstance("HmacSHA256", "SunJCE")      OK
+> Mac.getInstance("HmacSHA256", "Ghost")       NoSuchProviderException: no such provider: Ghost
+> HmacSHA256 digest  e04e1ddd…095a395c        (identical to HotSpot, byte for byte)
+> ```
+>
+> The `"SUN"` row is the one the guard was added for: `SUN` **exists** and owns
+> no `Mac` algorithm, so EXISTENCE would have answered success and OWNERSHIP
+> answers `NoSuchAlgorithmException` naming the provider. `"Ghost"` still gives
+> `NoSuchProviderException`, so the two failure modes are distinguished rather
+> than merged. And the digest matching proves the SPI is reached, not merely
+> resolved.
+>
+> **NOM E25-1, the BLOCKING nomination, HAS LANDED.** *"The tree is RED until
+> this lands"* — it is not red for this reason any more. The row was **flipped,
+> not deleted**:
+>
+> ```text
+> native-builtins/src/phases_late.rs:9532-9536
+>   ("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;", true, "")
+>
+> cargo test -p cratonvm-native-builtins every_public_mac_method_is_registered   1 passed
+> ```
+>
+> **`cargo test --workspace`, this record's own named command: 17,974 passed,
+> 16 failed.** None of the 16 is this record's: the only file this branch
+> changes outside `docs/` and `probes/` is `types/tests/unverified_records.rs`,
+> so every one of them is pristine `origin/dev`'s. (One of the 16,
+> `cratonvm-gc`'s `a_long_mark_step_admits_a_waiting_writer_before_it_finishes`,
+> passes 3/3 when run alone — it is load, not code.)
+>
+> **§3/§4 rows 32 and 33 are now STALE, and stale in this record's favour.**
+> Both were listed as guards that *"cannot go red for the property they are
+> named for, under any input"* because a `#[cfg(feature = "synthetic-jdk")]` kept
+> them out of the default build. Both cfgs are gone, and `vm/tests/jck_conformance.rs`
+> credits this sweep by name for it:
+>
+> > *"# Two layers, and why the file-level `#[cfg]` came off (2026-08-13) … (E25
+> > sweep,"*
+>
+> ```text
+> row 32  jck_conformance.rs                    ran 3 tests in the default build (was: zero)
+> row 33  wp7_2_jdbc_core_types_reachable.rs    ran 10 tests (was: zero) -- and one FAILS
+> ```
+>
+> **Row 33's newly-live guard immediately caught a real defect**, which is the
+> sweep's whole thesis arriving as data rather than argument:
+>
+> ```text
+> connection_methods_carry_signatures … FAILED
+>   connection_methods_have_signatures returned -100 (expected 1) —
+>   `Connection.class.getDeclaredMethods()` regressed
+> ```
+>
+> **Row 32 is only HALF repaired, and the record's own words say which half.**
+> It described *"two dark layers over a gate"*. The outer layer is gone; the
+> inner two are not. `jck_regression_gate` — the thing whose message claims it
+> *"enforces the committed baseline"* — is still `#[cfg(feature =
+> "synthetic-jdk")]` and is **not** among the three tests that now run, and
+> behind that it still opens with `if !class_files_available() { … return; }`
+> (`:676`). So the harness compiles in; the gate it is named for still does not
+> run in the default build.
+>
+> **What this does NOT verify.** The sweep is 61 rows; four were re-examined
+> here (1, 32, 33, 34) and the other 57 were not. Row 34's test runs and passes,
+> which is consistent with this record's claim that it is tautological and is not
+> evidence against it — nothing here re-derives that argument. The remaining 12
+> nominations in §6 are untouched. §§1 and 3's HotSpot transcripts are the oracle
+> and were not re-taken.
+>
+> **One caution about the command this record names.** The first
+> `cargo test --workspace` run returned `cc` link failures across the tree,
+> which reads exactly like a broken build. `/data` was at **100%** and the
+> linker had died with `Bus error` — a full filesystem hitting a mapped write.
+> After freeing space the same command gave the 17,974/16 above. A disk-full
+> result and a compile failure are indistinguishable in `cargo`'s output.
+
 ## 1. TASK 1 — the seventeenth method, and its contract
 
 ### 1.1 `javap`, taken here, not recalled
