@@ -132,10 +132,6 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// the neighbour's.
 const ALLOWED: &[(&str, &str)] = &[
     (
-        "docs/known-issues/jdk-only/E25-R11-GUARD-POPULATION-SWEEP-20260813.md",
-        "status block says: **Status:** FIXED-UNVERIFIED (registration + two guards in the owned file);",
-    ),
-    (
         "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
         "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
     ),
