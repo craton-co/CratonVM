@@ -1589,6 +1589,7 @@ pub const INVENTORY: &[E] = &[
     // through the general `execute_invokevirtual_cached` dispatcher.
     E { group: Group::JIT, token: "invoke-fast-door", on_key: Some("CRATONVM_JIT_INVOKE_FAST_DOOR"), off_key: Some("CRATONVM_JIT_NO_INVOKE_FAST_DOOR"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "door-receiver-record", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD"), off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "door-recv-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_RECV_MEMO"), off_word: None, since: "2026-09-04" },
     // `nonvirtual-fast-door` — off routes every monomorphic `invokestatic`
     // and `invokespecial` cache hit through the general dispatcher.
     E { group: Group::JIT, token: "nonvirtual-fast-door", on_key: None, off_key: Some("CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR"), off_word: None, since: "2026-09-02" },
