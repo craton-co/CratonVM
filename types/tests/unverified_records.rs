@@ -192,14 +192,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED IN SOURCE, NOT VERIFIED BY AN ARM.** Lane H24, 2026-08-21.",
     ),
     (
-        "docs/known-issues/jdk-only/W5-1-loadlibrary-allowlist-too-wide.md",
-        "status block says: nothing here was built or run):**",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-14-fjp-common-factory-bound-by-name.md",
-        "status block says: call.** Not rebuilt in this lane: no claim is made that the change compiles or",
-    ),
-    (
         "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
         "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
     ),
