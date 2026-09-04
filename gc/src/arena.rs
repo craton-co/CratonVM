@@ -2960,6 +2960,52 @@ impl Arena {
     ///
     /// Equal to `capacity()` on the wholly-committed fallback store; below it,
     /// often far below, on a reserving one.
+    /// Ensure `[addr, addr + len)` is COMMITTED, for a caller that is about to
+    /// write there without going through [`Self::hand_out`].
+    ///
+    /// # The defect this closes
+    ///
+    /// `ZgcRealHeap::relocate_stw`'s slide picks a destination `to` and copies a
+    /// survivor into it, on a SAFETY argument that says `to` "is inside the
+    /// arena and strictly below `from`". Inside the arena is NOT committed: the
+    /// arena reserves address space and commits granules on demand, and
+    /// `decommit_unbumped_middle` / `decommit_free_blocks` hand granules back
+    /// while their addresses stay reserved. Sliding into one writes to unmapped
+    /// memory.
+    ///
+    /// Observed directly rather than reasoned about: a fault-time witness
+    /// (`crate::reloc_witness`) reports the faulting address INSIDE a granule
+    /// the collector decommitted, the access is a WRITE, the offset into the
+    /// granule is 0x0 in every crash, and the frame is
+    /// `relocate_stw+0x2ECE` -- the slide's own `ptr::copy`. Seven prior repairs
+    /// aimed at stale references in compiled frames all changed nothing,
+    /// because the defect is arena commit bookkeeping and not a GC root at all.
+    ///
+    /// Same shape as the `gen_evac` parallel-copy fault fixed 2026-09-02: a
+    /// path that bypasses `hand_out` commits nothing.
+    ///
+    /// Returns `false` when the range cannot be committed; the caller must then
+    /// leave the object where it is rather than write.
+    pub fn ensure_committed_span(&mut self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let base = self.data.as_ptr() as usize;
+        if addr < base {
+            return false;
+        }
+        let off = addr - base;
+        if off.saturating_add(len) > self.capacity() {
+            return false;
+        }
+        let ok = self.data.commit_range(off, len);
+        if ok {
+            crate::reloc_witness::note_arena_base(base);
+            crate::reloc_witness::note_committed(addr, addr + len);
+        }
+        ok
+    }
+
     pub fn committed_bytes(&self) -> usize {
         self.data.committed_bytes()
     }

@@ -5798,10 +5798,30 @@ impl ZgcRealHeap {
                     match chosen {
                         Some(to) => {
                             debug_assert!(to < from, "the slide must never move an object UP");
+                            // COMMIT THE DESTINATION FIRST. "Inside the arena" is
+                            // not "mapped": the arena commits granules on demand
+                            // and hands them back via `decommit_unbumped_middle` /
+                            // `decommit_free_blocks` while their addresses stay
+                            // reserved, so a destination chosen only by page and
+                            // liveness can name memory that was returned to the
+                            // OS. This copy then writes to it.
+                            //
+                            // Not inferred -- observed. The fault-time witness
+                            // reports the faulting address INSIDE a decommitted
+                            // granule, the access is a WRITE, `offset_into_span`
+                            // is 0x0 in every crash, and the frame is this one.
+                            //
+                            // A commit that fails leaves the object where it is:
+                            // a survivor that does not move costs compaction, and
+                            // writing to unmapped memory costs the process.
+                            if !arena.ensure_committed_span(to, size) {
+                                dest = from;
+                                continue;
+                            }
                             // SAFETY: `size` bytes are live at `from`, `to` is
-                            // inside the arena and strictly below `from`, and the
-                            // regions may overlap -- `copy` is memmove, correct in
-                            // that direction.
+                            // inside the arena, COMMITTED by the line above, and
+                            // strictly below `from`; the regions may overlap --
+                            // `copy` is memmove, correct in that direction.
                             unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                             pairs.push((from, to));
                             moved += 1;
