@@ -7140,6 +7140,9 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
                     self.emit_gpr_array_elem_store(*kind);
+                    // RAX still holds the array pointer -- the store above
+                    // addresses through it. See `crate::gpu_barrier`.
+                    self.emit_gpu_input_cache_barrier();
                     return;
                 }
                 let is_d = matches!(kind, MemKind::Double);
@@ -7152,6 +7155,10 @@ impl<'a> Lowerer<'a> {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x11, 0x44, sib, HEADER_SIZE as u8]);
+                // Same contract as the integral arm above: RAX is the array.
+                // The barrier clobbers R10/R11 and the flags only, so an
+                // XMM-resident value elsewhere in the frame is untouched.
+                self.emit_gpu_input_cache_barrier();
             }
             // arraylength (COV-02). inputs = [ctrl, mem, array]. One 32-bit
             // load at a fixed header offset behind the JVMS null check. No
@@ -8734,6 +8741,24 @@ impl<'a> Lowerer<'a> {
     /// `MemKind::Ref` is refused by the caller (no store barrier in this tier)
     /// and the FP kinds take the XMM path. One shared header displacement, for
     /// the reason given on [`Self::emit_gpr_array_elem_load`].
+    /// Emit the GPU input-residency barrier after an inline primitive
+    /// array store, if a `--gpu` run armed it.
+    ///
+    /// Assumes RAX holds the array pointer, which both `ArrayStore` arms
+    /// guarantee. Clobbers R10, R11 and the flags: R10 is already this
+    /// backend's guard scratch, R11 is never register-resident, and this
+    /// backend's linear-scan residency uses only callee-saved GPRs
+    /// (`IR_LOWER_LS_GPRS`), so nothing live is at risk.
+    ///
+    /// Emits nothing at all unless armed -- see [`crate::gpu_barrier`],
+    /// which is also where the reason a compiled store marks a bucket
+    /// instead of calling `input_cache::invalidate` is written down.
+    fn emit_gpu_input_cache_barrier(&mut self) {
+        if let Some(bytes) = crate::gpu_barrier::barrier_bytes() {
+            self.buf.emit(&bytes);
+        }
+    }
+
     fn emit_gpr_array_elem_store(&mut self, kind: MemKind) {
         let d = crate::x64::disp::disp8_const(HEADER_SIZE as i64) as u8;
         match kind {
