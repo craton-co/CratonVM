@@ -199,7 +199,8 @@ layout constants this crate could plausibly emit:
 | | `HEADER_SIZE` | `ARRAY_LENGTH_OFFSET` | `SLOT_SIZE` | `REF_ELEMENT_SIZE` | `MARK_WORD_OFFSET` | `IDENTITY_HASH_CODE_OFFSET` | `FIELD_CELL_PAYLOAD32_OFFSET` | `FIELD_CELL_PAYLOAD64_OFFSET` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `jit/src/lib.rs` | 7 | 1 | 4 | 1 | 0 | 0 | 2 | 2 |
-| `jit/src/ir_lower.rs` | 17 | 4 | 7 | 0 | 0 | 0 | 6 | 6 |
+| `jit/src/ir_lower.rs` | 20 | 4 | 7 | 0 | 0 | 0 | 6 | 6 |
+| `jit/src/x64/objects.rs` | 8 | 0 | 3 | 0 | 2 | 0 | 2 | 2 |
 
 (The `ir_lower.rs` row read `7 | 3 | …` when this section was written, went to
 `8` with the 2026-07-31 guarded inline compact `getfield`, to `10 | 4` with

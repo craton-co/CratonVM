@@ -689,6 +689,15 @@ struct ZgcCounters {
     /// nothing. Counted at the POLL, not at the collection, so a trigger that
     /// fires and is then overtaken by another clause still shows.
     alloc_trigger_fires: AtomicUsize,
+    /// Microseconds the LAST collection spent in the sweep phase.
+    ///
+    /// The same figure `[GC] zgc-pause:` reports as `sweep_us`, kept where a
+    /// test can read it. `measure_the_sharded_sweep` needs the PHASE and not
+    /// the whole collection: the mark is serial in every arm, so timing the
+    /// collection dilutes whatever the sweep does by a constant, and the
+    /// alternative -- scraping the log line -- makes a measurement depend on
+    /// logging being on.
+    last_sweep_us: AtomicU64,
     /// Cycles in which the PAUSE TARGET was unreachable: the live set alone
     /// projects a pause past the target, or what the target leaves after it is
     /// below `ZGC_ALLOC_TRIGGER_FLOOR`.
@@ -1979,6 +1988,7 @@ impl ZgcRealHeap {
                 mark_park_timeouts: AtomicUsize::new(0),
                 gen_nursery_overshoot_max: AtomicUsize::new(0),
                 alloc_trigger_fires: AtomicUsize::new(0),
+                last_sweep_us: AtomicU64::new(0),
                 pause_target_unreachable: AtomicUsize::new(0),
                 gen_zero_bytes_skipped: AtomicUsize::new(0),
                 gen_dead_runs: AtomicUsize::new(0),
@@ -3677,6 +3687,31 @@ impl ZgcRealHeap {
         // probe. Registering on demand rather than pre-registering the whole
         // grid keeps the table to the pages that actually hold old objects with
         // written fields.
+        // ONE lookup, not two. `register_old_page` already returns the set it
+        // found or created; asking the table for the same page again -- which
+        // `ZRememberedTable::remember(page_id, ..)` does -- is a second
+        // `RwLock` reader acquire and a second FxHash probe on the hot path of
+        // every old-generation reference store in the VM.
+        //
+        // `card_object_two_lookups` below keeps the old shape so the A/B in
+        // `measure_the_card_barrier` is a call apart rather than a rebuild.
+        let set = self
+            .remembered
+            .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
+        set.remember(offset);
+    }
+
+    /// [`Self::card_object`] as it was before 2026-09-04: register, then look
+    /// the same page up a second time to set the bit. Kept only as the A/B arm
+    /// for `measure_the_card_barrier`; nothing on a live path calls it.
+    #[cfg(test)]
+    fn card_object_two_lookups(&self, obj_addr: usize) {
+        let base = self.arena_base;
+        if base == 0 || obj_addr < base {
+            return;
+        }
+        let page = ((obj_addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+        let offset = (obj_addr - base) % Self::Z_LOGICAL_PAGE_BYTES;
         self.remembered
             .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
         self.remember_old_to_young(page, offset);
@@ -4697,6 +4732,12 @@ impl ZgcRealHeap {
         self.remembered
             .get(page)
             .is_some_and(|set| set.is_remembered(offset))
+    }
+
+    /// Microseconds the last collection spent sweeping -- `[GC] zgc-pause:`'s
+    /// `sweep_us`, for a test that wants the phase rather than the pause.
+    pub fn last_sweep_us(&self) -> u64 {
+        self.counters.last_sweep_us.load(Ordering::Relaxed)
     }
 
     /// Generational counters -- `(young_cycles, minors_since_major,
@@ -10633,16 +10674,33 @@ fn zgc_alloc_trigger_percent() -> usize {
 /// Split out because both inputs are `OnceLock`-cached env reads, so a test
 /// cannot vary them in-process -- and the interesting cases here are the
 /// combinations, not the parsing.
-fn alloc_trigger_percent_for(explicit: Option<usize>, pause_target_ms: u64) -> usize {
-    match explicit {
-        // AN EXPLICIT ZERO IS A REFUSAL, not an absence. It is how an operator
-        // says "the target alone", and it is the arm every measurement of the
-        // target on its own was taken with; collapsing it into "unset" would
-        // make that arm unreachable and the comparison unrepeatable.
-        Some(p) => p,
-        None if pause_target_ms != 0 => ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET,
-        None => 0,
-    }
+fn alloc_trigger_percent_for(explicit: Option<usize>, _pause_target_ms: u64) -> usize {
+    // WITHDRAWN AS A DEFAULT ON 2026-09-04, the day it shipped. It stays
+    // available as `CRATONVM_ZGC_ALLOC_TRIGGER=<percent>`; only the implicit
+    // floor under a pause target is gone.
+    //
+    // The floor does what it was measured to do -- it caps the first cycle,
+    // which the controller is blind to -- but making it a DEFAULT changed how
+    // often the collector runs on every ZGC workload, and
+    // `org.h2.test.db.TestLargeBlob` does not survive that:
+    //
+    //   pause target on (floor active)   34 GC cycles   SIGSEGV in libc
+    //   pause target off (no floor)       0 GC cycles   PASS
+    //
+    // Same binary, same class, one switch, and reproduced 3 times out of 4 with
+    // the floor on against 0 of 3 with it off. The fault is inside a
+    // `FileChannelImpl.implWrite` -> `IOUtil.write` -> `DirectByteBuffer` path,
+    // which is the shape of a native operation whose backing store a collection
+    // reclaimed underneath it.
+    //
+    // THE CRASH IS ALMOST CERTAINLY OLDER THAN THIS FLAG. Without the floor
+    // that test never collects at all, so nothing was exercising the path; the
+    // floor is a reproducer, not the defect. But a default that turns a passing
+    // test into a native crash is not one to ship while the underlying bug is
+    // open, and "it only surfaces a pre-existing bug" is not a reason to leave
+    // it on -- it is a reason to go and fix that bug with the reproducer this
+    // gave us.
+    explicit.unwrap_or(0)
 }
 
 /// `CRATONVM_ZGC_BITMAP_BOUNDS` -- restrict the per-cycle object-start and
@@ -13825,6 +13883,9 @@ impl GarbageCollector for ZgcRealHeap {
             .store(bits_clear, Ordering::Release);
 
         let sweep_us = clock.lap();
+        self.counters
+            .last_sweep_us
+            .store(sweep_us.min(u64::MAX as u128) as u64, Ordering::Relaxed);
         // RE-DERIVE THE ALLOCATION BUDGET from what this pause actually cost.
         // Before the logging block, and outside it, so the loop runs on a
         // quiet run too -- see `gc_started` above.
@@ -16185,26 +16246,61 @@ pub(crate) mod tests {
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
     ///
-    /// # A PROVISIONAL reading, and why it is not a result
+    /// # MEASURED, PAIRED, TEN ROUNDS: a real but small gain
     ///
-    /// First run after the complement was sharded (2026-09-04), 768 MiB heap,
-    /// 8.26M dead objects, best `sweep_us` of three reps:
+    /// Azure `vm1`, 8 cores, 768 MiB heap, 8.26M dead objects, ten interleaved
+    /// rounds. `sweep_us` only, and the headline is the MEDIAN OF PER-ROUND
+    /// RATIOS against the serial arm measured in the same round:
     ///
-    /// | workers | 1 | 2 | 4 | 8 | 32 |
+    /// | workers | n | min | median | max | paired vs serial |
     /// |---|---|---|---|---|---|
-    /// | sweep_us | 217 ms | 206 | 188 | 165 | 168 |
+    /// | 1 | 10 | 68282 | 71799 | 76509 | 1.00x |
+    /// | 2 | 10 | 65934 | 68894 | 109387 | 1.04x [0.67-1.13] |
+    /// | 4 | 10 | 61209 | 64562 | 67877 | **1.12x [1.06-1.20]** |
+    /// | 8 | 10 | 59833 | 63607 | 65625 | **1.15x [1.09-1.22]** |
     ///
-    /// That is 1.3x at eight workers and a plateau after -- far short of what
-    /// "a linear scan with an independent body" predicts, and close enough to
-    /// the shape of the 2026-08-14 parallel-marking result to be worth naming.
+    /// The serial arm's own samples still wandered 11% of their median, which
+    /// is why the paired column exists -- and why it is the one to read. At
+    /// four and eight workers the paired RANGE EXCLUDES 1.0: the sharded arm
+    /// won in every one of ten rounds, so the gain is a property of the change
+    /// and not of when it was sampled. At two workers the range spans 1.0
+    /// (0.67-1.13, with one 109 ms outlier), so two workers buys nothing
+    /// demonstrable.
     ///
-    /// **But the box was at 90% CPU from unrelated work when it was taken**,
-    /// and host contention suppresses precisely the thing being measured: added
-    /// workers compete with the load rather than with each other. So this is a
-    /// LOWER BOUND on the speedup and not a measurement of it. Anyone moving
-    /// the default needs this on an idle machine first; if it still reads 1.3x
-    /// there, the phase is bandwidth bound and the switch should be deleted
-    /// rather than defaulted on.
+    /// # What it does NOT support
+    ///
+    /// 1.15x on eight cores, for a phase whose per-object body is independent.
+    /// The sweep is bandwidth bound -- the body is a header zero-write, a
+    /// streaming write over half a gigabyte -- so eight workers contend for a
+    /// memory path that one already most of the way saturates. Anyone reading
+    /// this as "it parallelises" should note that perfect scaling would be 8x
+    /// and this is 1.15x.
+    ///
+    /// In absolute terms it is ~8 ms off a ~72 ms sweep, inside a pause whose
+    /// other phases are serial. Whether that is worth eight threads per
+    /// collection is a policy call this measurement informs and does not make;
+    /// the switch stays default-off until a workload-level arm (a real
+    /// `sweep_us` on a suite, not this isolated phase) says the pause moved.
+    ///
+    /// # Two earlier readings of this same bench were wrong
+    ///
+    /// Recorded because the errors are the reusable part. A single execution
+    /// read 78/92/86/93 us and was reported as "sharding is a 15% REGRESSION";
+    /// two more executions read the opposite way. The reps WITHIN each
+    /// execution were tight -- 78/80/83, a 4% spread -- and that tightness is
+    /// what made the number look trustworthy. It was not: three reps inside one
+    /// process share a page cache, an allocator state and a set of THP
+    /// mappings, so they are one sample reported three times. The error term
+    /// that matters is across executions, and it was ~20% -- larger than the
+    /// effect being chased.
+    ///
+    /// The bench was grouped by arm until 2026-09-04, which is what let a drift
+    /// in machine state align with an arm and be read as that arm's effect. It
+    /// now interleaves, rotates the starting arm each round, and reports paired
+    /// ratios. The absolute microseconds above are still contended (another
+    /// session was building during the run); the paired ratios are not, which
+    /// is the whole point of the shape.
+    ///
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
     fn measure_the_sharded_sweep() {
@@ -16212,49 +16308,127 @@ pub(crate) mod tests {
         // lines, small enough to run on a laptop.
         const CAPACITY: usize = 768 * 1024 * 1024;
         const LIVE_EVERY: usize = 16;
-        const REPS: usize = 3;
 
+        // `flags::runtime_var`, not `std::env::var`. `check-surface.sh` refuses
+        // the latter anywhere in core runtime code -- VM flags must come from
+        // the immutable snapshot, and ordinary variables reach live-read
+        // semantics through the same boundary -- and that check runs BEFORE the
+        // `cargo clippy --workspace --all-targets` step in the same CI job. A
+        // bare `env::var` here therefore does not just fail its own gate: it
+        // fails the step in front of the one that compiles test targets, which
+        // is the masking this file's own header records costing the repository
+        // a compile gate for weeks.
+        let rounds: usize = cratonvm_types::flags::runtime_var("SWEEP_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10);
         let cores = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(1);
-        println!("[sweep-bench] capacity={CAPACITY} cores={cores} reps={REPS}");
-        for workers in [1usize, 2, 4, 8, cores] {
-            let mut best = u128::MAX;
-            let mut reclaimed = 0usize;
-            for _ in 0..REPS {
-                let heap = ZgcRealHeap::with_capacity(CAPACITY);
-                heap.set_tlab_enabled(false);
-                heap.set_sweep_workers(workers);
-                let mut roots: Vec<ObjectRef> = Vec::new();
-                let mut n = 0usize;
-                // Fill to ~70% of capacity with 3-field objects, keeping one in
-                // sixteen alive -- a live set of a few percent, which is the
-                // shape a whole-heap cycle actually meets.
-                while heap.allocated_bytes() < CAPACITY * 7 / 10 {
-                    let o = heap.alloc_object(ClassId::new(11), 3);
-                    if n % LIVE_EVERY == 0 {
-                        roots.push(o);
-                    }
-                    n += 1;
+        let mut arms: Vec<usize> = vec![1, 2, 4, 8, cores];
+        arms.sort_unstable();
+        arms.dedup();
+
+        /// One sample: a fresh heap, filled, collected, and the SWEEP phase's
+        /// own microseconds -- not the whole collection, whose serial mark
+        /// dilutes the ratio by a constant.
+        fn one(capacity: usize, live_every: usize, workers: usize) -> (u64, usize) {
+            let heap = ZgcRealHeap::with_capacity(capacity);
+            heap.set_tlab_enabled(false);
+            heap.set_sweep_workers(workers);
+            let mut roots: Vec<ObjectRef> = Vec::new();
+            let mut n = 0usize;
+            // Fill to ~70% of capacity with 3-field objects, keeping one in
+            // sixteen alive -- a live set of a few percent, which is the shape
+            // a whole-heap cycle actually meets.
+            while heap.allocated_bytes() < capacity * 7 / 10 {
+                let o = heap.alloc_object(ClassId::new(11), 3);
+                if n % live_every == 0 {
+                    roots.push(o);
                 }
-                let started = std::time::Instant::now();
-                {
-                    // SAFETY: single-threaded unit test.
-                    let stw = unsafe { StopTheWorldToken::new() };
-                    heap.collect_garbage(&stw, &mut roots, &NoMonitors);
-                }
-                best = best.min(started.elapsed().as_micros());
-                reclaimed = heap.gen_sweep_cost_stats().2;
+                n += 1;
             }
+            {
+                // SAFETY: single-threaded unit test.
+                let stw = unsafe { StopTheWorldToken::new() };
+                heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+            }
+            (heap.last_sweep_us(), heap.gen_sweep_cost_stats().2)
+        }
+
+        println!(
+            "[sweep-bench] capacity={CAPACITY} cores={cores} rounds={rounds} \
+             arms={arms:?} (SWEEP_BENCH_ROUNDS to change)"
+        );
+        // `samples[arm][round]`.
+        let mut samples: Vec<Vec<u64>> = vec![Vec::with_capacity(rounds); arms.len()];
+        let mut dead = 0usize;
+        for round in 0..rounds {
+            // INTERLEAVED, AND ROTATED. One sample of every arm per round, and
+            // the starting arm advances each round, so no arm is always
+            // measured in the same position. Grouping every rep of one arm
+            // together -- which this bench did until 2026-09-04 -- lets a drift
+            // in machine state align with an arm and be read as its effect.
+            for k in 0..arms.len() {
+                let idx = (k + round) % arms.len();
+                let (us, d) = one(CAPACITY, LIVE_EVERY, arms[idx]);
+                samples[idx].push(us);
+                dead = d;
+            }
+        }
+
+        let med = |v: &mut Vec<u64>| -> u64 {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        println!("[sweep-bench] dead_objects={dead}");
+        println!(
+            "[sweep-bench] {:>7} {:>4} {:>8} {:>8} {:>8} {:>16}",
+            "workers", "n", "min", "median", "max", "paired vs serial"
+        );
+        for (i, &w) in arms.iter().enumerate() {
+            // PAIRED, round by round. The serial arm and this arm were measured
+            // in the same round, minutes apart at most, so a drift that moves
+            // both cancels in the ratio -- which the unpaired minima do not.
+            // The median of the per-round ratios is the number to read.
+            let mut ratios: Vec<f64> = (0..samples[i].len())
+                .filter(|&r| samples[i][r] > 0)
+                .map(|r| samples[0][r] as f64 / samples[i][r] as f64)
+                .collect();
+            ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (lo, mid, hi) = (
+                ratios.first().copied().unwrap_or(0.0),
+                ratios.get(ratios.len() / 2).copied().unwrap_or(0.0),
+                ratios.last().copied().unwrap_or(0.0),
+            );
+            let mut v = samples[i].clone();
+            let m = med(&mut v);
             println!(
-                "[sweep-bench] workers={workers:2}  best_collection_us={best:>9}  \
-                 dead_objects={reclaimed}"
+                "[sweep-bench] {:>7} {:>4} {:>8} {:>8} {:>8}   {:.2}x  [{:.2}-{:.2}]",
+                w,
+                v.len(),
+                v.first().copied().unwrap_or(0),
+                m,
+                v.last().copied().unwrap_or(0),
+                mid,
+                lo,
+                hi,
             );
         }
+        // The drift this design exists to survive, made visible: if the serial
+        // arm's own samples wander by more than the differences between arms,
+        // no unpaired comparison of those arms means anything.
+        let mut serial = samples[0].clone();
+        let s_med = med(&mut serial);
         println!(
-            "[sweep-bench] NOTE: this is the whole collection, not the sweep \
-             alone -- the mark is serial in every arm, so the sweep's own \
-             speedup is larger than the ratio above."
+            "[sweep-bench] serial arm drift across rounds: {}..{} us (median {}), \
+             spread {:.0}% of median -- read the PAIRED column, not the minima",
+            serial.first().copied().unwrap_or(0),
+            serial.last().copied().unwrap_or(0),
+            s_med,
+            100.0 * (serial.last().copied().unwrap_or(0) - serial.first().copied().unwrap_or(0))
+                as f64
+                / s_med.max(1) as f64,
         );
     }
 
@@ -20921,35 +21095,164 @@ pub(crate) mod tests {
         assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
     }
 
-    /// A pause target brings a percentage floor with it; an explicit zero
-    /// refuses one.
+    /// A pause target does NOT bring a percentage floor with it -- the floor is
+    /// opt-in, and only an explicit percentage arms it.
     ///
-    /// The floor exists for the cycle the feedback loop is blind to -- the
-    /// first, which has no pause to measure yet and which the occupancy clause
-    /// otherwise lets run to 75% of `-Xmx`. See
-    /// `ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET` for the measurement.
+    /// It WAS a default for a few hours on 2026-09-04, and
+    /// `alloc_trigger_percent_for`'s own comment records why it is not any
+    /// more: it changed how often the collector runs on every ZGC workload, and
+    /// `org.h2.test.db.TestLargeBlob` went from 0 collections and a PASS to 34
+    /// collections and a SIGSEGV. The mechanism the floor implements is sound
+    /// and still reachable; the DEFAULT was not safe to ship.
     #[test]
-    fn a_pause_target_defaults_a_percentage_floor_under_itself() {
-        // No target, nothing named: the clause is off, exactly as before
-        // pause targets existed.
+    fn a_pause_target_does_not_imply_a_percentage_floor() {
+        // Nothing named, no target: off, as before pause targets existed.
         assert_eq!(alloc_trigger_percent_for(None, 0), 0);
-        // A target, nothing named: the floor.
+        // Nothing named, WITH a target: still off. This is the line that
+        // changed, and the one a future "surely the floor should be automatic"
+        // has to argue past.
         assert_eq!(
             alloc_trigger_percent_for(None, 200),
-            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+            0,
+            "a pause target must not arm the allocation floor by itself: doing              so turned TestLargeBlob from 0 collections and a PASS into 34 and              a SIGSEGV"
         );
-        assert_eq!(
-            alloc_trigger_percent_for(None, 1),
-            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
-        );
-        // AN EXPLICIT ZERO IS A REFUSAL, not an absence: it is how an operator
-        // asks for the target alone, and it is the arm every measurement of
-        // the target on its own was taken with.
-        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
-        // And an explicit percentage wins over the floor in both directions.
-        assert_eq!(alloc_trigger_percent_for(Some(12), 200), 12);
-        assert_eq!(alloc_trigger_percent_for(Some(50), 200), 50);
+        assert_eq!(alloc_trigger_percent_for(None, 1), 0);
+        // An explicit percentage still wins, with or without a target -- the
+        // pairing is available, it is just not implicit.
+        assert_eq!(alloc_trigger_percent_for(Some(25), 200), 25);
         assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
+        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
+    }
+
+    /// COMPONENT MEASUREMENT for the young cycle's old-generation pre-mark
+    /// (review item E1), taken BEFORE deciding whether to build the bitmap
+    /// that would replace it.
+    ///
+    /// A young cycle pre-marks the old generation by walking EVERY registered
+    /// object and reading `gc_age()` out of its header -- `registered
+    /// .for_each_base(|base| header_mut(base).gc_age() >= promo_age)` in
+    /// `collect_garbage`. The age lives nowhere but the header, so the walk is
+    /// a scattered 64-byte line read per object; the whole-heap arm next to it
+    /// was already reduced to one linear store over `capacity / 512` bytes
+    /// (`mark_clear_all`).
+    ///
+    /// The candidate fix is a third bitmap over the same geometry, set on
+    /// promotion, so the pre-mark becomes `marks |= old` -- a word-wise OR
+    /// instead of a walk. That is real work with real risk (a bit that goes
+    /// stale against promotion or the sweep retains a dead object), so the
+    /// question this answers first is whether the walk is expensive enough to
+    /// be worth it. Both shapes are timed here over the same population:
+    /// the header walk, and `mark_clear_all` as the closest existing
+    /// bitmap-wide pass.
+    ///
+    ///   cargo test -p cratonvm-gc --features zgc --release --lib -- --ignored     ///     --nocapture measure_the_young_premark_walk
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_young_premark_walk() {
+        const CAPACITY: usize = 512 * 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAPACITY);
+        heap.set_tlab_enabled(false);
+        let mut n = 0usize;
+        while heap.allocated_bytes() < CAPACITY * 6 / 10 {
+            heap.alloc_object(ClassId::new(11), 3);
+            n += 1;
+        }
+        let registered = heap.registry.snapshot();
+        let count = registered.base_count();
+        println!("[e1] capacity={CAPACITY} objects={n} registered={count}");
+        let promo = heap.promotion_age();
+
+        let mut walk = f64::MAX;
+        let mut clear = f64::MAX;
+        // Interleaved, three pairs, best of each -- see `measure_the_card_barrier`.
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut old = 0usize;
+            registered.for_each_base(|base| {
+                if heap.header_ref(base as *mut u8).gc_age() >= promo {
+                    old += 1;
+                }
+            });
+            let us = t.elapsed().as_micros() as f64;
+            std::hint::black_box(old);
+            walk = walk.min(us);
+
+            let t = std::time::Instant::now();
+            heap.mark_clear_all();
+            clear = clear.min(t.elapsed().as_micros() as f64);
+        }
+        println!(
+            "[e1] header walk {:.1} ms ({:.1} ns/object)   bitmap-wide pass {:.1} ms                ratio {:.1}x",
+            walk / 1000.0,
+            walk * 1000.0 / count.max(1) as f64,
+            clear / 1000.0,
+            walk / clear.max(1.0),
+        );
+        println!(
+            "[e1] read the RATIO: it is what an old-generation bitmap would buy,              and the walk only runs on a young cycle (CRATONVM_ZGC_GENERATIONAL)."
+        );
+    }
+
+    /// COMPONENT MEASUREMENT for the card barrier's per-store cost.
+    ///
+    /// `card_object` runs on every reference store into an OLD object once
+    /// anything has been promoted, and it used to ask the remembered-set table
+    /// for the same page twice: `register_old_page` takes an `RwLock` reader
+    /// and an FxHash probe to find or create the set, and then
+    /// `ZRememberedTable::remember(page_id, ..)` takes another of each to find
+    /// the set it just returned. Reusing the handle removes one of each.
+    ///
+    /// Both arms in one process, so this is not a cross-binary comparison.
+    /// Ignored: wants `--release` and a quiet box.
+    ///
+    ///   cargo test -p cratonvm-gc --features zgc --release --lib -- --ignored     ///     --nocapture measure_the_card_barrier
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_card_barrier() {
+        const STORES: u32 = 3_000_000;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        // A spread of old objects across several logical pages, so the table
+        // holds more than one entry and the hash probe is not a single-key
+        // degenerate case.
+        let mut objs: Vec<usize> = Vec::new();
+        for _ in 0..64 {
+            objs.push(heap.alloc_object(ClassId::new(7), 3).as_ptr() as usize);
+        }
+        // Warm both arms so neither pays the create path in its timed loop.
+        for &o in &objs {
+            heap.card_object(o);
+            heap.card_object_two_lookups(o);
+        }
+        println!("{:>14}  {:>12}  {:>12}", "arm", "total_ms", "ns/store");
+        let mut run = |name: &str, two: bool| -> f64 {
+            let t = std::time::Instant::now();
+            for i in 0..STORES {
+                let o = objs[(i as usize) % objs.len()];
+                if two {
+                    heap.card_object_two_lookups(o);
+                } else {
+                    heap.card_object(o);
+                }
+            }
+            let el = t.elapsed();
+            let ns = el.as_nanos() as f64 / STORES as f64;
+            println!("{name:>14}  {:>12.1}  {ns:>12.2}", el.as_secs_f64() * 1e3);
+            ns
+        };
+        // Interleaved and repeated: a fixed arm order manufactures a winner
+        // when the machine drifts, which is the mistake `measure_the_sharded_sweep`
+        // records paying for.
+        let mut one_best = f64::MAX;
+        let mut two_best = f64::MAX;
+        for _ in 0..3 {
+            two_best = two_best.min(run("two lookups", true));
+            one_best = one_best.min(run("one lookup", false));
+        }
+        println!(
+            "[card-barrier] best: two={two_best:.2} ns/store  one={one_best:.2} ns/store               speedup={:.2}x",
+            two_best / one_best.max(f64::MIN_POSITIVE)
+        );
     }
 
     /// A pause target is a CEILING: a pause under it must not move anything.

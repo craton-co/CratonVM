@@ -24,6 +24,48 @@ Files changed: `native-builtins/src/net_phase_e.rs`,
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. The predicted "after" is measured, and
+> it is this record's own numbers to the digit.** Status was
+> *"DIAGNOSED-MEASURED / FIXED-IN-SOURCE, **AFTER NOT MEASURED**"* — the fix
+> *"written and formatted but has not been built"*.
+>
+> §1 measured the before-state precisely: `RJdkOptionalShape` died at
+> `httpmint` with `AbstractMethodError: java/net/http/HttpRequest.version()` and
+> produced **16** `CK` lines against HotSpot's `checks=1418`.
+>
+> ```text
+>                        CK lines   verdict                                differing
+> HotSpot 25                 29     PASS RJdkOptionalShape (1418 checks)       —
+> CratonVM --jdk-only        29     PASS RJdkOptionalShape (1418 checks)       0
+> CratonVM compatible        29     PASS RJdkOptionalShape (1418 checks)       0
+>
+> AbstractMethodError occurrences in the --jdk-only transcript:  0
+> ```
+>
+> **§1's two named landmarks both land exactly.** The record says the gap is the
+> whole `httpmint` family and that HotSpot's last family line is
+> `httpmint=268`; ours now reads `CK RJdkOptionalShape httpmint=268`, and the
+> total is `checks=1418` — the two figures §1 tabulated as the target.
+>
+> **§5.1's slot-map change is in the tree as described**, and the hazard it was
+> written against is closed by construction rather than by comment:
+>
+> ```text
+> RE5_REQUEST_NUM_FIELDS = 8                    net_phase_e.rs:13288  (was a bare 0..5)
+> RE5_REQUEST_EXPECT_CONTINUE = 5, BODY_PUBLISHER = 7   three new named slots
+> for slot in 0..RE5_REQUEST_NUM_FIELDS         net_phase_e.rs:14528  copy driven by the constant
+> cargo test -p cratonvm-native-builtins net_phase_e     83 passed; 0 failed
+> ```
+>
+> **What this does NOT verify.** §2's oracle — *"the seven accessors across
+> every builder shape"*, twenty builder shapes and sixteen builder refusals —
+> was measured with `scratchpad/` probes (`HttpProbe.java`, `HttpProbe2.java`)
+> that did not survive their session. `RJdkOptionalShape` exercises the
+> accessors its `httpmint` family reaches, which is not the same population; a
+> builder shape the vector never constructs is neither confirmed nor refuted
+> here. The `HttpHeaders` reader surface and the `BodyPublishers`
+> content-length rows are in that unmeasured remainder.
+
 ## 0. The headline
 
 `G13-1` measured `RJdkOptionalShape`'s failure and named the mechanism:

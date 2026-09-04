@@ -193,3 +193,30 @@ The `displaced_hash_from_mark` hardening is the same family as
 `is_object_address`'s own Family-A comment — "an interior 16-byte `Value` cell
 of a live `Object[]`" that decodes as a plausible header. Both are a
 conservative scan's false positive being trusted one layer down.
+
+## Independent pre-fix reproduction on two more codebases (2026-09-04)
+
+Two more full-suite, 3-GC-sharded runs, on a **pre-fix** binary (dev tip
+`d9d3eb336`, built 2026-09-03 ~19:56 UTC — after this fix's commit timestamp,
+but the fix was sitting on this unmerged branch, not yet in `dev`):
+
+| Suite | Generational CRASH | G1 CRASH | ZGC CRASH |
+|---|---:|---:|---:|
+| H2 Database (218 classes) | 14 | 2 | 5 |
+| Spring Boot (1991 classes) | **347 (17.4%)** | 0 | 1 |
+
+All 361 Generational crashes are `rc=139` with `addr2line` resolving the fault
+pc to `<cratonvm_gc::gen_heap::GenerationalHeap>::is_object_address` — same
+function, same defect, two more codebases that share no code with Spring
+Framework or with each other. This is independent, cross-project confirmation
+of the mechanism above, at a scale (361 crashes, two full suites) that
+complements the 140-class sample and the pending full Generational sweep.
+
+On the G1-affected-or-not question: this pre-fix binary shows a small,
+nonzero residual (2/218 on H2) rather than Spring Framework's 887/2848, and
+zero on Spring Boot (0/1991). That's consistent with **the same defect being
+present on unfixed G1 too, but far more workload-sensitive** than on
+Generational — rare enough to miss entirely on some suites — rather than
+evidence G1 needed a separate fix. Not proven either way; the isolated 13/140
+-class-style resample this doc already ran for Generational hasn't been
+repeated for G1 on H2/Spring Boot's specific classes.

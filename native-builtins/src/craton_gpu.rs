@@ -3263,6 +3263,9 @@ pub mod dispatch_timing {
         // Whether the submission registry drained. `live_at_exit` should
         // be 0 for a program that releases what it takes.
         cratonvm_types::gpu_submission_census::exit_summary();
+        // Whether the overlapped writeback path engaged. Silent unless
+        // something was chunkable at all.
+        cratonvm_types::gpu_chunk_census::exit_summary();
         // The transparent (`--gpu`) door's phase table, for the same
         // reason: it is self-gating and it counts the path `CALLS` cannot
         // see. See `gpu_offload_phase_census`.
@@ -3274,6 +3277,10 @@ pub mod dispatch_timing {
         // How much of the program `--gpu` moved off the JIT. See
         // `vm::runtime::offload_jit_gate`.
         cratonvm_types::gpu_jit_gate_census::exit_summary();
+        // The OSR side of the same question: the gate census counts
+        // `caller_blocks_jit` verdicts, this counts refusals actually taken
+        // at an OSR admission gate. They disagreed, which is the point.
+        cratonvm_types::osr_refusal_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;

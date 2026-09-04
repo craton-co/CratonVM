@@ -889,6 +889,9 @@ impl Compiler {
         val_slot: StackSlot,
         field_index: usize,
     ) {
+        // What DECLINING costs, at run time. The compile-time census counts
+        // declined SITES; this counts the stores they actually make.
+        self.emit_ref_store_path_trace(&crate::metrics::REF_STORE_FULL_HELPER_TAKEN);
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
@@ -937,6 +940,9 @@ impl Compiler {
         }
 
         let mut bail: Vec<usize> = Vec::new();
+        // The baked `cell_off` is a compile-time claim about this class's
+        // compact layout — see `emit_layout_epoch_guard`.
+        bail.extend(self.emit_layout_epoch_guard());
 
         self.load_slot_to_reg(RAX, obj_slot);
         if g1 {
@@ -1062,6 +1068,9 @@ impl Compiler {
         }
 
         let mut bail: Vec<usize> = Vec::new();
+        // The baked `cell_off` is a compile-time claim about this class's
+        // compact layout — see `emit_layout_epoch_guard`.
+        bail.extend(self.emit_layout_epoch_guard());
 
         self.load_slot_to_reg(RAX, obj_slot);
         // G1-2: receiver guard, consistent with the other two emitters. The
@@ -1648,6 +1657,40 @@ impl Compiler {
         self.buf.emit_byte(0x03); // ModRM mod=00 reg=000 rm=011 (R11)
     }
 
+    /// Guard a baked COMPACT CELL OFFSET against a layout replacement, and
+    /// return the patch site the caller must route to its helper.
+    ///
+    /// Every emitter that bakes `HEADER_SIZE + packed_body_offset` as an
+    /// immediate is making a compile-time claim about a layout that the class
+    /// manager can replace at run time — `recompute_subclass_layouts`, the
+    /// synthetic-stub→real-bytecode upgrade. The two ALLOCATION emitters have
+    /// guarded that since perf/halfgap-20260717, and the comment there calls an
+    /// unguarded baked layout "confirmed heap corruption". The FIELD-ACCESS
+    /// emitters never had one: they resolve their offset from a constant-pool
+    /// entry and have no class id to name a per-class counter with.
+    ///
+    /// So they guard on the process-wide replacement epoch instead — coarser,
+    /// and affordable because only a REPLACEMENT bumps it, never a new class
+    /// registration. Four instructions; a mismatch permanently routes the site
+    /// to the always-correct helper.
+    ///
+    /// Returns `None` when the caller should emit no guard at all, which today
+    /// never happens — the epoch address is a `'static` and always available —
+    /// but keeps the shape honest if that ever changes.
+    pub(super) fn emit_layout_epoch_guard(&mut self) -> Option<usize> {
+        let (addr, expected) = cratonvm_types::layout_replace_epoch_guard();
+        if addr.is_null() {
+            return None;
+        }
+        self.emit_mov_imm64_full(R11, addr as i64);
+        self.emit_mov_r32_mem_disp32(RCX, R11, 0);
+        // CMP ECX, imm32.
+        self.buf.emit_byte(0x81);
+        self.buf.emit_byte(0xF9);
+        self.buf.emit(&(expected as i32).to_le_bytes());
+        Some(self.emit_jcc_rel32_patch(0x85)) // JNE -> helper
+    }
+
     /// Emit a compact reference `putfield` whose barriers are **gated inline**
     /// rather than paid as a call.
     ///
@@ -1710,6 +1753,10 @@ impl Compiler {
         // helper label, which is exactly what they did before this split.
         let mut bail_recv: Vec<usize> = Vec::new();
         let mut bail_pre: Vec<usize> = Vec::new();
+        // The baked `cell_off` below is a compile-time claim about this class's
+        // compact layout. See `emit_layout_epoch_guard`.
+        let mut bail_layout: Vec<usize> = Vec::new();
+        bail_layout.extend(self.emit_layout_epoch_guard());
         self.load_slot_to_reg(RAX, obj_slot);
 
         // ── receiver validity ───────────────────────────────────────────
@@ -1841,7 +1888,7 @@ impl Compiler {
         // With the trace on, each bail set gets a one-instruction stub naming
         // it before joining the helper; without it they all land here directly
         // and cost nothing.
-        let bail_groups = [(bail_recv, 0usize), (bail_pre, 1)];
+        let bail_groups = [(bail_recv, 0usize), (bail_pre, 1), (bail_layout, 2)];
         let mut to_helper: Vec<usize> = Vec::new();
         if crate::x64::sp_ref_store_trace_enabled() {
             for (patches, reason) in bail_groups {

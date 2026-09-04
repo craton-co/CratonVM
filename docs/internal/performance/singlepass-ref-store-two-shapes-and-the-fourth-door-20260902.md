@@ -179,6 +179,32 @@ The throughput result above remains a ZGC result, and now for a stated reason:
 under Generational the stores this change would have moved were not on the
 helper to begin with.
 
+## Postscript, 2026-09-04: the premise inverted
+
+This page argued for the legacy store shape on the grounds that compact
+receivers were rare — `init_object_header` wrote legacy headers unconditionally,
+so a compact-only arm fired zero times out of 16,380,000.
+
+The compact TLAB shape became the DEFAULT on 2026-09-04, and a per-shape census
+added the same day says the situation is now exactly reversed:
+
+| configuration | workload | compact | legacy |
+|---|---|---|---|
+| default | `RefStoreLoopProbe` | **16,384,000** | 0 |
+| default | H2 `TestIntPerfectHash` | **199** | 0 |
+| `CRATONVM_COMPACT_TLAB_ALLOC=0` | `RefStoreLoopProbe` | 0 | **16,384,000** |
+
+So the legacy arm now carries none of the workload on either a probe or a real
+application. It has not stopped earning its place — it is what makes
+`CRATONVM_COMPACT_TLAB_ALLOC=0` a working revert lever, and it still serves any
+class with no registered layout — but it is the fallback now, not the hot path.
+Anyone reading the argument above should read it as the history of why the arm
+exists, not as a description of what it does today.
+
+Read the pair, never one number: `compact=N legacy=0` under the default and
+`compact=0 legacy=N` under the kill switch is what says the two-shape store is
+picking per object rather than always taking one branch.
+
 ## Levers
 
 - `CRATONVM_JIT_GATED_REF_STORE=0` — the single-pass gated arm off, at every

@@ -1902,3 +1902,377 @@ question rather than a rate one — which is the right order after §22 showed
 four rate-screens in a row moved almost nothing.
 
 The flag ships opt-in and stays that way until that question is answered.
+
+## 24. The in-map hypothesis is refuted (2026-09-04)
+
+*`fix/band-in-map-suppression-refuted-20260904`. §23.4 named the soundness test
+and said it was the right order after four rate-screens moved almost nothing.
+Run now, and it kills the hypothesis outright.*
+
+### 24.1 The test and the answer
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1`, three reps per arm:
+
+| skip in-map | stale words after remap | of those, `region=java-local` |
+|---|---:|---:|
+| off | 2, 8, 18 | 0, 4, 10 |
+| **on** | **260, 545, 319** | **54, 140, 70** |
+
+Twenty to forty times as many stale words, and java-local stale words going
+from single digits to 54-140. The other regions move with them
+(`safepoint-gpr-spill-image` 161, `operand-spill` 143, `callee-saved-gpr-image`
+97 in one run).
+
+**The claim §22.3 rested on is false.** A slot the active oop map names is NOT
+thereby rewritten after a move: suppressing those words leaves hundreds of
+references the collector moved and nothing updated. Whatever `in_map`
+guarantees, it is not "the precise path covers this slot", and the
+shadow-publication requirement the band test enforces is not redundant for
+them.
+
+The flag stays — it is the lever that produced this answer and would re-test it
+if the mechanism changes — now documented as refuted, and it is fail-OPEN, so
+off is safe.
+
+### 24.2 The checksums were right the whole time
+
+`checksum=262248526` on every completed run in BOTH arms, including the one
+carrying 545 stale references. A stale reference is only a wrong answer if
+something dereferences it, and this workload did not.
+
+That is §15's lesson arriving a second time, and it is worth the repetition:
+had this experiment been judged on output correctness — the obvious way to
+check "did suppressing this break anything" — it would have passed three times
+out of three and the hypothesis would have been confirmed. The detector is the
+only thing that saw it.
+
+(One `off` run exited `rc=127` and is excluded; the other two agree.)
+
+### 24.3 Where the §14-§24 line stands
+
+Ten sections, and the honest ledger:
+
+* **Fixed and measured**: the vacuous coverage proof (§14), a refutation latch
+  firing on shape (§17), the reservation-wide envelope (§18, median 28.7% →
+  3.7%).
+* **Landed, sound, no measurable effect**: the object screen (§19) and the
+  liveness screen (§20/§22).
+* **Refuted**: the map-selection gap (§16), and now the in-map hypothesis
+  (§24).
+* **Built**: a stable workload (§21) and a per-reason census (§17.3), without
+  which none of the above could have been told apart.
+
+`compiled-frame-oop-not-published` at ~98% remains, and after §24 it is no
+longer safe to assume it is instrument error: the one hypothesis that would
+have explained most of it away has been tested and is wrong. The next question
+is why those slots are not published — a shadow-stack question in the JIT's
+publication path, not another screen in the collector's verifier.
+
+## 25. Why those slots are not published — four dead ends and one structural fact (2026-09-04)
+
+*`docs/shadow-publication-investigation-20260904`. §24.3 left the question as
+"why are those slots not published", a JIT publication question rather than a
+collector one. This is the investigation. It does not answer it, but it
+eliminates four candidate answers with evidence and narrows the remainder to
+one testable question — which is worth writing down so nobody walks the same
+four.*
+
+### 25.1 What was ruled out
+
+**The `published` set is not per-frame.** `moving_young_unpublished_frame_oop_present`
+computes `published` once, from the innermost frame, and reuses it for every
+parent in the RBP-chain walk — which looks like the bug until you read
+`shadow_window_from_frame`: the window is `[BASE, TOP)` of the whole thread
+`ShadowStack`, not a slice belonging to one frame. Every frame's entries are in
+it.
+
+**There is no compile-time/scan-time gate skew.** The shadow push publishes
+locals only under `complete = moving_young_enabled()`, which reads as a
+compile-time decision baked into each method — but
+`conservative_roots::moving_young_enabled` is a `OnceLock` that also publishes
+its value to `gc_quiescence`, so codegen and the collector cannot disagree
+within a process.
+
+**The frame slot is not a stale copy of a register-homed local.**
+`emit_pre_safepoint_spill_impl` flushes every register-resident local to its
+canonical frame slot before the safepoint, unconditionally:
+
+```rust
+for idx in 0..self.local_assignments.len() {
+    if let Some(reg) = self.local_assignments[idx] { ... emit_store_local(off, reg) }
+}
+```
+
+so the slot the band verifier reads holds the value that was current at the
+safepoint.
+
+**The shadow stack does not overflow.** `DEFAULT_SHADOW_SLOTS` is 256 Ki and an
+overflow prints `[JIT] shadow-stack overflow: N push(es) bailed`. It appears in
+none of the captured runs.
+
+### 25.2 The structural fact
+
+`emit_shadow_push` runs in `emit_pre_safepoint_spill_impl`, **before the call**.
+`emit_shadow_reload` runs in `emit_oop_map_for_safepoint`, **right after the
+call returns**, and it POPS.
+
+So a frame's oops are on the shadow stack **only for the duration of a call**.
+That is coherent for a frame suspended inside a call — every parent in the
+chain, and an innermost frame that entered the runtime through an allocation or
+poll helper. It is not coherent for a frame stopped at a safepoint that is not
+a call.
+
+### 25.3 The question that is left, and how to answer it
+
+The contradiction §22.2 measured is that 67 of 93 reported words are
+`in_map=true`: the active oop map, resolved through the frame's own `sp_id`
+slot, names them. The map and the shadow push are driven by the SAME
+enumeration (`for_each_oop_local_at_current_pc`) at the same pc, so a slot in
+one should be in the other — unless the frame is at a safepoint whose push
+never ran or has already been popped.
+
+The next probe is therefore about the safepoint KIND, not about more screening:
+for each reporting frame, record whether its resolved `sp_id` belongs to a
+call-shaped safepoint (push live) or a poll-shaped one (push absent or already
+reloaded). If the reports concentrate on poll-shaped safepoints, the answer is
+that shadow publication is call-scoped while the band verifier's obligation is
+not, and the fix is in that pairing rather than in either side alone.
+
+That probe is a few lines in `report_unpublished_band_words`, which already has
+`cm` and the resolved `sp_id` in hand.
+
+### 25.4 Why this is written up unanswered
+
+Four sections of this document (§16, §19, §22, §24) record hypotheses that
+looked obvious and were wrong, two of them after being implemented. The cost of
+the fifth is one more build; the cost of writing down four eliminated
+candidates and the one fact that survived them is a paragraph. On this
+question's track record the paragraph is the better trade.
+
+## 26. The safepoint-kind probe refutes §25, and finds the real cause (2026-09-04)
+
+§25 ended by proposing a probe: for each reporting frame, record whether the
+resolved `sp_id` belongs to a call-shaped safepoint (shadow push live) or a
+poll-shaped one (push absent or already reloaded). If the reports concentrated
+on poll-shaped safepoints, the answer would be that shadow publication is
+call-scoped while the band verifier's obligation is not.
+
+It does not. The probe added `OopMapEntry::shadow_pushed`, captured in
+`emit_oop_map_for_safepoint` **before** `emit_shadow_reload` takes
+`pending_shadow` — after that call the count is zero by construction, which is
+the one way this probe could have lied. On `CoverageBench 20000 150000 512` at
+`-Xmx32m`, 288 reports over 266 pauses:
+
+| method | `sp_id` | `in_map` | `shadow_pushed` | n |
+| --- | --- | --- | --- | --- |
+| `alloc` | 2 | false | 0/0 | 233 |
+| `m06` | 12 | true | 2/3 | 24 |
+| `main` | 217 | true | 3/3 | 30 |
+
+Nothing reports `0/N`. The `in_map=true` safepoints are call-shaped and the
+push did publish — three of three mapped slots for `main`. §25's hypothesis is
+refuted.
+
+### 26.1 What the same line said instead
+
+Every one of the 288 reports carried `published=0`. That was read for two
+sessions as a publication fact — the shadow push declined these oops, so look
+at `collect_live_oop_homes`. It is not a publication fact.
+`published_shadow_values(None)` returns an empty set, so `published=0` means
+either "the window resolved and held nothing" or "the window did not resolve at
+all", and those point at opposite repairs. `Option` had folded ten distinct
+refusals and a genuinely empty stack into one indistinguishable `None` — the
+UNKNOWN-vs-ZERO conflation, this time inside the instrument rather than the
+subject.
+
+`shadow_window_from_frame_why` now names the refusal and
+`shadow_window_from_frame` is its only reason-discarding caller, so the
+diagnostic cannot drift from the path actually taken. Re-run:
+
+```
+211 alloc win=unresolved(thread-null-or-misaligned) push=0/0
+ 30 main  win=unresolved(?)                         push=3/3
+  6 m06   win=unresolved(?)                         push=2/3
+```
+
+`(?)` is `.err().unwrap_or(...)` on an `Ok` — recomputed against their own
+frames, `main` and `m06` resolve the window fine. They were being verified
+against a window that failed to resolve somewhere else.
+
+### 26.2 The cause
+
+`ir_lower::finish_lazy_thread_fetch` erases the thread-pointer fetch whenever a
+method publishes nothing (`!shadow_pushed_any`), so a leaf with no oops to push
+leaves `[rbp - shadow_thread_slot_off]` zero **by design**. That is a correct
+optimisation. The band verifier's use of it was not: it resolved the thread's
+shadow window from the **innermost** frame alone, and when that frame was such
+a leaf — `CoverageBench.alloc`, whose map names nothing — the window came back
+`None`, and every oop in every outer frame read as unpublished.
+
+228 of 229 pauses declined relocation on that basis, while `main` had in fact
+pushed three of its three mapped slots.
+
+The three reporting groups are one mechanism, not three: `alloc` is the frame
+that loses the window, `main` and `m06` are the frames billed for it.
+
+### 26.3 The repair, and what it is worth
+
+The shadow stack is per-**thread**; the frame slot was only ever a cache, and
+`shadow_window_from_frame_why` already refused any cached pointer that was not
+`current_jit_thread_ptr()`. So when a thread is installed, ask it directly.
+Both paths now end in one shared `shadow_window_at`, so a window reached either
+way is held to identical `ShadowStack` invariants. The frame path remains for
+the no-installed-thread case (unit tests, threads that never entered JIT code).
+
+Kill switch `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW`, so this is one
+binary's A/B and not two builds. ABBA-interleaved, `CoverageBench` at
+`-Xmx32m`, `incomplete` rate:
+
+| configuration | fix off | fix on |
+| --- | --- | --- |
+| default | 99.5 – 100 % | 18.1 – 26.8 % |
+| precise-only roots | 97.8 – 100 % | 18.0 – 28.4 % |
+
+Checksum identical in every completed run of every arm.
+
+### 26.4 The cost, stated plainly
+
+Making the proof succeed makes G1 actually relocate, and at the tightest heap
+that reaches a pre-existing degradation this workload never used to arrive at:
+
+```
+degraded=evacuation-failure-self-forwarded,evacuation-failure-drain-wedged
+```
+
+`EVACUATION_FAILURE_UNRESOLVED` is documented in `gc_metrics.rs` as "the one G1
+state that silently converts most of the heap into kept, mostly-garbage
+regions" — which at `-Xmx32m` is an `OutOfMemoryError`. Fatal-OOM rates:
+
+| configuration | heap | fix off | fix on |
+| --- | --- | --- | --- |
+| precise-only roots | 32 m | 0/40 | 5/40 |
+| precise-only roots | 48 m | 0/10 | 0/10 |
+| precise-only roots | 64 m | 0/10 | 0/10 |
+| default | 32 m | 0/20 | 0/20 |
+
+So the regression is confined to the **opt-in** precise-only mode at the
+tightest heap, where the suppression really fires and G1's pin set really goes
+empty. The shipping configuration takes the coverage gain and shows no failure
+in 20 runs per arm. The rate is also load-dependent — an earlier sample on a
+busier host read 4/16 where a later one read 1/24 — so treat the 5/40 as an
+order of magnitude, not a measurement.
+
+This is the "a crash under YOUR feature may be a known dev defect your feature
+merely ENABLES" shape: the wedge is pre-existing, instrumented, and named in
+dev; the fix's contribution is arriving at it. The next question for the
+precise-only default belongs to `retry_after_evacuation_failure`, not here.
+
+### 26.5 The residual this leaves
+
+`m06` reports `2/3` — its map names three slots and only two homes were
+collected. That is an independent per-slot gap in `collect_live_oop_homes`,
+untouched by the window repair and now the only remaining lead from §25's
+question. It accounts for 6 to 24 reports per run against `alloc`'s 211, so it
+is worth pursuing only after the ~20 % residual incomplete rate is attributed.
+
+## 27. The residual, closed — and §26.5 was wrong about where it was (2026-09-04)
+
+### 27.1 There is no `m06` gap
+
+§26.5 named `m06`'s `shadow_pushed=2/3` as "an independent per-slot gap in
+`collect_live_oop_homes`". It is not a gap, on two counts.
+
+It is not measurable: with the §26 window repair in place, `m06` reports **zero**
+unpublished band words across six runs (386 reports, every one of them
+`CoverageBench.alloc`). The `2/3` was recorded while the window was still
+unresolved, when `published` was empty and therefore EVERY movable word in every
+frame reported. `m06` was one of the frames being billed for `alloc`'s lost
+window, not a second defect beside it.
+
+And it would not have been evidence even if it had persisted: `shadow_pushed`
+counts HOMES — `ShadowHome::Reg` and `ShadowHome::Frame` alike — while the
+denominator counts only the map's `frame_slot_offsets`. A register-resident
+local is one home and one mapped frame slot, and `collect_live_oop_homes`
+deduplicates besides, so the two numbers partition different sets and need not
+be equal. Reading `2/3` as "one slot was missed" was reading a ratio between
+incomparable counts.
+
+Both errors have the same root: a number recorded under one condition was
+carried into a paragraph written under another.
+
+### 27.2 What the residual actually was
+
+Every remaining report was `CoverageBench.alloc` at offsets 16, 48 and 64, all
+`in_map=false` — the active map does not name them, correctly, because the
+dataflow does not consider them live. Decoding the reserved tail from the
+`sp_id_off=32` the report already printed:
+
+| offset | slot |
+| --- | --- |
+| 16 | java local 1 — `long[] a`, before its first assignment |
+| 48 | `shadow_savebase_slot_off` |
+| 64 | `phi_copy_scratch_slot_off` |
+
+All three are **uninitialised frame words**. The prologue zeroes
+`shadow_thread` and `shadow_savetop` and stops there, so `shadow_savebase`
+(written only by a shadow push) and `phi_copy_scratch` (written only by a
+cycle-breaking parallel copy) hold whatever the previous frame at that address
+left — and in an allocation-heavy workload that is a stale object pointer. The
+Java local is the same story from the other direction: definite assignment means
+nothing reads it before it is written, so nothing writes it either.
+
+The band verifier is right about all three. A movable-resident word that no map
+names and no push published is exactly what it exists to refuse.
+
+### 27.3 The repair
+
+Two prologue changes, each behind its own switch so they stay attributable:
+
+* `CRATONVM_JIT_NO_ZERO_RESERVED_TAIL` — also zero `shadow_savebase` and
+  `phi_copy_scratch`, inside the block that already establishes "the reserved
+  tail must read 0, not uninitialised stack".
+* `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` — zero local slots `num_params
+  ..num_locals`. Safe only because this tier publishes no `osr_pc_to_native`,
+  so `osr_enter` refuses and this prologue is the sole entry; an OSR trampoline
+  would jump past it into a frame whose locals the interpreter had already
+  filled. The edit that wires OSR into this tier must revisit this block, for
+  the same reason it must revisit the callee-saved save area.
+
+`CoverageBench` at `-Xmx32m`, ABBA-interleaved, incomplete rate:
+
+| arm | rate | offsets still reporting |
+| --- | --- | --- |
+| both off | 17.7 – 20.1 % | 16, 32, 48, 64 |
+| reserved tail only | 7.6 – 9.6 % | 16, 32 |
+| both on | **0.00 %** | none |
+
+Zero at `-Xmx32m`, `64m` and `256m`, and zero under the precise-only-roots arm.
+Checksum identical in every arm of every run. Taken with §26, the rate on this
+workload went 99.6 % → ~20 % → 0 %.
+
+### 27.4 Cost
+
+Extra prologue stores, so it has to be priced. `CoverageBench 20000 400000 512`,
+ABBA-interleaved, 20 runs per heap:
+
+| heap | on | off |
+| --- | --- | --- |
+| 256 m | 9989 ms | 10794 ms |
+| 48 m | 11907 ms | 12622 ms |
+
+Both medians favour ON, but an earlier 6-run sample at 256 m put ON 3.7 %
+SLOWER, and the per-run spread is 8.8 – 16.7 s. Two samples that disagree in
+sign mean the effect is below this host's noise floor. The honest claim is "no
+measurable cost", not the 5.7 – 7.5 % the medians would otherwise support.
+
+The first attempt at this measurement was worse than useless: every arm exited
+`rc=1` and I read the wall-clock anyway. `CoverageBench`'s `r * 7919` overflows
+`int` past ~271k rounds, so 400k rounds threw
+`ArrayIndexOutOfBoundsException` — the probe's own arithmetic, reported as if it
+were the VM's. Fixed in the probe with a `long` widening; the published
+checksum at 150k rounds is unchanged, so every earlier number still holds.
+
+### 27.5 Gates
+
+`cratonvm-jit` 2230 passed, `cratonvm-vm` 201 passed, regression suite 90 of 90.

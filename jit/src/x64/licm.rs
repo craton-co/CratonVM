@@ -904,8 +904,8 @@ pub fn g1_barrier_table_live(g1_barrier_addr: usize) -> bool {
 /// re-enabled by this and stays a constant `false`.
 pub fn g1_inline_barrier_enabled() -> bool {
     #[cfg(test)]
-    if G1_INLINE_BARRIER_FORCED.with(|c| c.get()) {
-        return true;
+    if let Some(forced) = G1_INLINE_BARRIER_FORCED.with(|c| c.get()) {
+        return forced;
     }
     cratonvm_types::flags().gc.g1_inline_barrier
 }
@@ -922,8 +922,16 @@ thread_local! {
     /// reason `RememberedSet::add_reference_in_generation_within` exists on the
     /// GC side. A thread-local override is visible only to the test that set
     /// it, and `cargo test` gives each test its own thread.
-    pub(crate) static G1_INLINE_BARRIER_FORCED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    ///
+    /// TRI-STATE since 2026-09-04: `Some(true)` forces the arm on, `Some(false)`
+    /// forces it off, `None` defers to the real flag. It used to be a bare
+    /// `bool` where `false` meant "defer", which was adequate only while the
+    /// real flag was opt-in — once the default flipped, "defer" and "off"
+    /// stopped being the same state and the off case became untestable. The
+    /// contract test needs both directions, because "no table" and "no helper"
+    /// are not the only ways this arm must decline.
+    pub(crate) static G1_INLINE_BARRIER_FORCED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Inline TLAB `new` — bump allocation emitted directly in compiled code.

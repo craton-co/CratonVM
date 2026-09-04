@@ -1743,7 +1743,8 @@ fn register_pe_memory_segment_on(r: &mut NativeMethodRegistry, ms: &str) {
         },
     );
 
-    // asByteBuffer() → a direct ByteBuffer over the segment's own memory.
+    // asByteBuffer() → a ByteBuffer over the segment's own memory: DIRECT for a
+    // native segment, HEAP for an `ofArray` one. See `pe_segment_as_byte_buffer`.
     r.register(
         ms,
         "asByteBuffer",
@@ -3669,7 +3670,8 @@ fn pe_segment_slice(
     Ok(Some(Value::Object(Some(slice))))
 }
 
-/// `MemorySegment.asByteBuffer()` — a direct `ByteBuffer` over the segment.
+/// `MemorySegment.asByteBuffer()` — a `ByteBuffer` over the segment: a DIRECT
+/// one for a native segment, a HEAP one for an `ofArray` segment.
 ///
 /// This is the JDK 25 bridge between `java.lang.foreign` and every existing
 /// NIO API, and the reason netty's non-`sun.misc.Unsafe` allocator could not
@@ -3708,6 +3710,78 @@ fn pe_segment_as_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         .into());
     }
+    // A HEAP segment does not become a direct buffer. `MemorySegment.ofArray`
+    // has no native address at all, and the direct path below was minting a
+    // `DirectByteBuffer` over `segment_address`, which is why
+    // `ofArray(byte[16]).asByteBuffer()` answered `isDirect() == true` and
+    // `hasArray() == false` where the oracle answers `false`/`true`.
+    //
+    // `HeapMemorySegmentImpl.makeByteBuffer()` is
+    // `newHeapByteBuffer(baseByte, (int) offset - BYTE_ARR_BASE, (int) byteSize(), this)`
+    // — a buffer whose `array()` is the segment's OWN backing array and whose
+    // `arrayOffset()` is where the segment starts in it. `ByteBuffer.wrap(base,
+    // start, size).slice()` produces exactly that shape (`wrap` sets
+    // position/limit, `slice` turns the remaining window into capacity and
+    // folds the position into `arrayOffset`), and it does so through two
+    // natives that are registered in every mode — unlike `slice(II)`, which
+    // this VM registers for `CharBuffer`/`IntBuffer`/`LongBuffer`/`FloatBuffer`
+    // and not for `ByteBuffer`.
+    //
+    // The JDK REFUSES a non-`byte[]` base rather than reinterpreting it, and
+    // the refusal is observable — `W7-58`'s probe measures
+    // `ofArray(int[8]).asByteBuffer()` as `UnsupportedOperationException` on
+    // HotSpot 25.
+    if let Some(view) = heap_segment_view(ctx, this) {
+        if view.elem_type != cratonvm_types::ArrayElementType::Byte {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Not an address to an heap-allocated byte array".to_string(),
+            }
+            .into());
+        }
+        let wrapped = ctx.invoke(
+            "java/nio/ByteBuffer",
+            "wrap",
+            "([BII)Ljava/nio/ByteBuffer;",
+            &[
+                Value::Object(Some(view.base)),
+                Value::Int(view.start as i32),
+                Value::Int(view.size as i32),
+            ],
+        )?;
+        let Some(Value::Object(Some(wrapped))) = wrapped else {
+            // `wrap` is a registered native in every mode, so this is
+            // unreachable; refuse by NAME rather than inventing a buffer.
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "ByteBuffer.wrap did not return a heap buffer".to_string(),
+            }
+            .into());
+        };
+        let sliced = ctx.invoke_virtual(wrapped, "slice", "()Ljava/nio/ByteBuffer;", &[])?;
+        if !view.read_only {
+            return Ok(sliced);
+        }
+        let Some(Value::Object(Some(buf))) = sliced else {
+            return Ok(sliced);
+        };
+        return ctx.invoke_virtual(buf, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;", &[]);
+    }
+
+    // A heap segment whose SHAPE `heap_segment_view` cannot validate is still a
+    // heap segment: `ofArray(int[8])` reaches here with a backing array and no
+    // usable byte view, and falling through to the direct path below would hand
+    // back a `DirectByteBuffer` over an address the segment does not own. The
+    // oracle refuses by name, so refuse by name.
+    if let Value::Object(Some(base)) = ctx.get_field(this, SEG_BACKING_ARRAY_FIELD) {
+        if ctx.object_is_array(base)
+            && ctx.heap_element_type_of(base) != cratonvm_types::ArrayElementType::Byte
+        {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: "Not an address to an heap-allocated byte array".to_string(),
+            }
+            .into());
+        }
+    }
+
     let addr = crate::panama_libffi::segment_address(ctx, this);
     let read_only = matches!(
         match ctx.get_field_by_name(this, "readOnly") {

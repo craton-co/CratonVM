@@ -105,7 +105,7 @@ impl DeviceModule {
         // Send + Sync` blocks across the bridge are sound only when the
         // driving thread has bound the device first; this prelude
         // enforces it for the launch path. Cheap per-thread TLS check.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu-driver")]
         ctx.inner().bind_to_thread()?;
 
         // ── 1. Snapshot the device-ptr args' last_write slots BEFORE
@@ -178,7 +178,7 @@ impl DeviceModule {
             Some(Arc::new(Event::new(ctx)?))
         };
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu-driver"))]
         {
             // Stub mode: no driver to call; just record the launch op.
             // `args` is consumed (dropped) at end of block to match the
@@ -192,7 +192,7 @@ impl DeviceModule {
             });
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu-driver")]
         {
             // AUDIT 2026-05-29 (HIGH-2 fix): launch on the user-supplied
             // `stream`, not `ctx.compute`. `backend_cuda` exposes the
@@ -214,7 +214,7 @@ impl DeviceModule {
             // `DeviceModule(backend::DeviceModuleInner)` exposes its sole
             // field with module-private visibility; `launch.rs` is a child
             // of the crate root and so sees it.
-            let module: &crate::backend_cuda::DeviceModuleInner = &self.0;
+            let module: &crate::backend::DeviceModuleInner = &self.0;
             module.launch_raw_on_stream(
                 ctx.inner(),
                 stream.cuda_stream_arc(),
@@ -280,7 +280,7 @@ impl DeviceModule {
 // ordering). The tests use the crate-private `for_test()` constructors
 // on `DeviceContext` / `DeviceModule` / `DeviceBuffer` so they can run
 // without a CUDA driver attached.
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 mod tests {
     use super::*;
     use crate::DeviceBuffer;

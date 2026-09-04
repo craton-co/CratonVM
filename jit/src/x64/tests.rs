@@ -5260,18 +5260,23 @@ alloc_result,
     let table = TABLE.as_ptr() as usize;
     let helper = 0x1234_5678usize;
 
-    // The flag is OFF by default, so even a fully wired backend emits nothing.
-    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(false));
+    // `CRATONVM_G1_INLINE_BARRIER=0` still suppresses the arm outright. This
+    // used to read "the flag is OFF by default, so even a fully wired backend
+    // emits nothing"; the default flipped on 2026-09-04, and the assertion that
+    // survives the flip is the one about the OFF setting, not about the
+    // default.
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(Some(false)));
     assert!(
         !build(table, helper).g1_inline_barrier_available(),
-        "CRATONVM_G1_INLINE_BARRIER is opt-in; a wired backend must still not emit \
-         the inline arm without it"
+        "`=0` must suppress the inline arm even on a fully wired backend — it is \
+         the revert lever for a barrier whose failure mode is a lost \
+         remembered-set edge"
     );
 
-    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(true));
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(Some(true)));
     assert!(
         build(table, helper).g1_inline_barrier_available(),
-        "flag + table + helper is the one combination that emits"
+        "flag + table + helper is the combination that emits"
     );
     assert!(
         !build(0, helper).g1_inline_barrier_available(),
@@ -5281,7 +5286,15 @@ alloc_result,
         !build(table, 0).g1_inline_barrier_available(),
         "no helper: the slow arm would CALL address zero"
     );
-    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(false));
+
+    // And with the override OUT of the way, the wired backend emits — which is
+    // what "default ON" means and is the half a forced-on assertion cannot show.
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(None));
+    assert!(
+        build(table, helper).g1_inline_barrier_available(),
+        "the arm is default ON since 2026-09-04: a wired backend emits it with no \
+         flag set at all"
+    );
 
     for w in TABLE.iter() {
         w.store(0, Ordering::Release);
@@ -5383,13 +5396,13 @@ alloc_result,
         false,
         Vec::new(),
     );
-    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(true));
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(Some(true)));
     assert!(compiler.g1_inline_barrier_available());
     assert!(
         !compiler.inline_card_mark_available(),
         "F-08 must not re-enable the generational inline card mark"
     );
-    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(false));
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(None));
     for w in TABLE.iter() {
         w.store(0, Ordering::Release);
     }
@@ -9535,6 +9548,12 @@ fn callee_saved_gpr_local_homes_are_default_on_with_precise_maps() {
 }
 
 #[test]
+// x86-64 only: `CompiledMethod::osr_enter` is itself
+// `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not merely
+// fail -- it does not COMPILE, and took the whole crate's test binary with
+// it. Found by actually building for aarch64 in an emulated container; a
+// cfg-gated API needs cfg-gated tests.
+#[cfg(target_arch = "x86_64")]
 fn test_osr_simple_loop() {
     // Test OSR entry: compile a simple sum loop and enter at the loop header
     // Same bytecode as above: sum(n) = 0 + 1 + ... + (n-1)
@@ -9605,6 +9624,12 @@ fn test_osr_simple_loop() {
 }
 
 #[test]
+// x86-64 only: `CompiledMethod::osr_enter` is itself
+// `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not merely
+// fail -- it does not COMPILE, and took the whole crate's test binary with
+// it. Found by actually building for aarch64 in an emulated container; a
+// cfg-gated API needs cfg-gated tests.
+#[cfg(target_arch = "x86_64")]
 fn test_osr_long_loop() {
     // long addOnly(long n) { long s=0; for(long i=0;i<n;i++) s+=i; return s; }
     // Locals: 0-1=n(long), 2-3=s(long), 4-5=i(long)

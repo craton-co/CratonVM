@@ -404,6 +404,7 @@ pub(super) fn compile_osr_artifact(
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
     let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
     osr_stage("entry");
+    cratonvm_types::osr_refusal_census::note_attempt();
     if crate::jit::tiered::is_osr_denied(&osr_key) {
         return None;
     }
@@ -428,6 +429,14 @@ pub(super) fn compile_osr_artifact(
     // committed on either of those grounds would cost throughput and buy
     // nothing.
     if cratonvm_jit::compile_gate::compiled_execution_forbidden(&class_name, &method_name) {
+        // Each early gate names itself before returning. Without this they
+        // all report `stage=entry` and a real refusal looks like a method
+        // that was never considered. See `osr_refusal_census`.
+        osr_stage("gate:compiled-execution-forbidden");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "compiled-execution-forbidden",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
@@ -445,6 +454,11 @@ pub(super) fn compile_osr_artifact(
         })
         .is_some_and(|method| method.is_synchronized())
     {
+        osr_stage("gate:synchronized");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "synchronized",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // Respect the JIT skip list for OSR — classes that are skipped from
@@ -469,6 +483,11 @@ pub(super) fn compile_osr_artifact(
         method_name_check,
         &method_descriptor,
     ) {
+        osr_stage("gate:gpu-offload");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "gpu-offload",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
     // Get method info from frame metadata
@@ -485,6 +504,11 @@ pub(super) fn compile_osr_artifact(
         method_name_check,
         &method_descriptor,
     ) {
+        osr_stage("gate:registered-native");
+        cratonvm_types::osr_refusal_census::note_refusal(
+            "registered-native",
+            &format!("{class_name}.{method_name}"),
+        );
         return None;
     }
 
@@ -641,6 +665,33 @@ pub(super) fn compile_osr_artifact(
                 }
             };
             osr_stage("past-jit-scan");
+            // ── Would the optimizing tier have taken this method? ─────────
+            //
+            // INERT here, and deliberately so: this door reaches
+            // `x64::compile_with_param_slots` and has no promotion to refuse.
+            // It is a COUNTER, the same shape the String-intrinsic pin already
+            // takes at this door and for the same reason -- a zero from a
+            // one-door instrument is indistinguishable from "there was nothing
+            // to ask about", and that is what made the reach of the optimizing
+            // tier unfalsifiable.
+            //
+            // `ir_compatible_sized` is the FIRST of four gates, so this is an
+            // UPPER BOUND on what an OSR route could deliver, which is exactly
+            // what a go/no-go on building that route needs. The conjunct that
+            // refuses is named on stderr by `ir_reject` under
+            // `CRATONVM_DBG_IR_COMPILES`, so the reasons come free.
+            //
+            // Pure and lock-free: `scan` is already in hand and
+            // `ir_compatible_sized` reads nothing else.
+            let osr_ir_eligible = cratonvm_jit::ir::ir_compatible_sized(&scan, code_len);
+            cratonvm_types::osr_refusal_census::note_ir_eligibility(osr_ir_eligible);
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] osr ir-eligibility: {} for {}.{}{} -- INERT at this door,                      which is single-pass only",
+                    if osr_ir_eligible { "ACCEPTED" } else { "refused" },
+                    class_name, method_name, method_descriptor,
+                );
+            }
             // This method's own exception table. Read ONCE, here, because both
             // of the RBC gates below need it: RBC.6 (immediately below) admits
             // a bare `athrow` only when it is EMPTY, and RBC.6b (further down)

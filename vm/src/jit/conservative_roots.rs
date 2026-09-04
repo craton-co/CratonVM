@@ -1232,7 +1232,21 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         publish_self_jit_depth(remaining);
     }
     if pruned > 0 {
-        tracing::debug!(
+        // `info!`, not `debug!`. Under `release_max_level_info` a
+        // `debug!` is compiled out of every release binary, so a count of
+        // LEAKED JIT entries -- an anomaly worth knowing about -- could
+        // never reach anyone running a released VM.
+        //
+        // Promoted only after measuring the rate, because the objection to
+        // promoting an anomaly line is that it might flood. It does not:
+        // across the 88-vector regression suite, `GcStress` under ZGC /
+        // Generational / G1 at -Xmx96m (3, 16 and several collections
+        // respectively), and the GPU runtime-stress and residency-gc gates,
+        // this fired ZERO times. That measures "does not flood"; it does
+        // not prove the line can fire, which is true of any rare-anomaly
+        // report and is still strictly better than invisible-by-
+        // construction.
+        tracing::info!(
             "pruned {} leaked JIT entry/entries (returned frames below scanner \
              SP {:#x}); quiescence healed to live count",
             pruned,
@@ -2938,20 +2952,48 @@ fn shadow_window_from_frame(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
 ) -> Option<(usize, usize)> {
+    shadow_window_from_frame_why(rbp, cm)
+        .or_else(|e| {
+            if band_thread_window_disabled() {
+                Err(e)
+            } else {
+                shadow_window_for_thread_why(cm)
+            }
+        })
+        .ok()
+}
+
+/// `shadow_window_from_frame`, but NAMING the refusal instead of erasing it.
+///
+/// §25.4. The band reporter printed `published=0` on all 272 of a run's reports
+/// and that read as "the shadow push declined to publish these oops" -- a
+/// codegen fact, pointing at `collect_live_oop_homes`. It was not: the window
+/// was never resolved, so `published_shadow_values` had nothing to read and
+/// returned an empty set. `Option` folds ten distinct refusals and a genuinely
+/// empty stack into one indistinguishable `None`, and those point at opposite
+/// repairs -- a missing reserved slot is a codegen gap, a foreign thread
+/// pointer is a frame mis-attribution, a size mismatch is a torn read.
+///
+/// The wrapper above is the only caller that discards the reason, so the
+/// diagnostic cannot drift away from the path actually taken.
+fn shadow_window_from_frame_why(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+) -> Result<(usize, usize), &'static str> {
     let thr_off = cm.shadow_thread_slot_off;
     if thr_off <= 0 || cm.shadow_off_in_thread <= 0 || rbp < thr_off as usize {
-        return None;
+        return Err("no-thread-slot");
     }
     let slot = rbp - thr_off as usize;
     if slot & 0x7 != 0 {
-        return None;
+        return Err("frame-slot-misaligned");
     }
     // SAFETY: `slot` is an aligned address inside this thread's own live
     // compiled frame, bounded by the same frame-size check the caller applied
     // before calling here.
     let thread_ptr = unsafe { (slot as *const usize).read() };
     if thread_ptr == 0 || thread_ptr & 0x7 != 0 {
-        return None;
+        return Err("thread-null-or-misaligned");
     }
     // That word is only a thread pointer when `cm` really describes the frame
     // at `rbp`. Callers are expected to have excluded the mis-attribution case
@@ -2964,11 +3006,61 @@ fn shadow_window_from_frame(
     // entered JIT code, where there is no frame to mis-attribute).
     let current = crate::jit::helpers::current_jit_thread_ptr() as usize;
     if current != 0 && thread_ptr != current {
-        return None;
+        return Err("foreign-thread");
     }
-    let ss = thread_ptr.checked_add(cm.shadow_off_in_thread as usize)?;
+    shadow_window_at(thread_ptr, cm.shadow_off_in_thread)
+}
+
+/// The thread's shadow window WITHOUT going through a frame slot.
+///
+/// §25.4's repair. `shadow_window_from_frame_why` reads the cached thread
+/// pointer out of `[rbp - shadow_thread_slot_off]`, and `ir_lower`'s
+/// `finish_lazy_thread_fetch` ERASES the fetch that fills that slot whenever
+/// the method publishes nothing (`!shadow_pushed_any`) -- so a leaf that has no
+/// oops to push leaves the slot zero BY DESIGN. That is a correct optimisation;
+/// the band verifier's use of it was not. It resolved the window from the
+/// INNERMOST frame alone, and when that frame was such a leaf the window came
+/// back `None`, `published_shadow_values` returned an empty set, and every oop
+/// in every OUTER frame read as unpublished. Measured on `CoverageBench`: 228
+/// of 229 pauses declined relocation with `compiled-frame-oop-not-published`
+/// while `main` had pushed 3 of its 3 mapped slots and `alloc` -- the innermost
+/// frame, whose map names nothing -- was the only reason the window was lost.
+///
+/// The shadow stack is per-THREAD, so the frame slot was only ever a cache.
+/// When a thread is installed, ask it directly. The frame path stays for the
+/// case that has no installed thread (unit tests, and threads that never
+/// entered JIT code), which is also the only case where the two could disagree
+/// -- `shadow_window_from_frame_why` refuses a `thread_ptr` that is not
+/// `current` anyway.
+fn shadow_window_for_thread_why(
+    cm: &cratonvm_jit::CompiledMethod,
+) -> Result<(usize, usize), &'static str> {
+    if cm.shadow_off_in_thread <= 0 {
+        return Err("no-shadow-offset");
+    }
+    let current = crate::jit::helpers::current_jit_thread_ptr() as usize;
+    if current == 0 {
+        return Err("no-installed-thread");
+    }
+    if current & 0x7 != 0 || current < 0x1_0000 {
+        return Err("thread-null-or-misaligned");
+    }
+    shadow_window_at(current, cm.shadow_off_in_thread)
+}
+
+/// The shared half: validate `thread_ptr + shadow_off` as a `ShadowStack` and
+/// return its `[base, top)` window. Both resolvers end here, so a window
+/// reached through the frame cache and one reached through the installed
+/// thread are held to identical invariants.
+fn shadow_window_at(
+    thread_ptr: usize,
+    shadow_off: i32,
+) -> Result<(usize, usize), &'static str> {
+    let ss = thread_ptr
+        .checked_add(shadow_off as usize)
+        .ok_or("shadow-addr-overflow")?;
     if ss & 0x7 != 0 {
-        return None;
+        return Err("shadow-addr-misaligned");
     }
     // `thread_ptr` came out of a raw frame slot and is trustworthy ONLY when
     // `cm` really describes the frame at `rbp`. It does not always: an
@@ -3000,22 +3092,25 @@ fn shadow_window_from_frame(
         Some(unsafe { (at as *const usize).read() })
     };
     if thread_ptr < 0x1_0000 {
-        return None;
+        return Err("thread-addr-low");
     }
-    let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)?;
-    let end = read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET)?;
-    let base = read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET)?;
+    let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)
+        .ok_or("top-unreadable")?;
+    let end = read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET)
+        .ok_or("end-unreadable")?;
+    let base = read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET)
+        .ok_or("base-unreadable")?;
     const SHADOW_BYTES: usize = cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS * 8;
     if base < 0x1_0000 || base & 0x7 != 0 || top & 0x7 != 0 || end & 0x7 != 0 {
-        return None;
+        return Err("fields-misaligned");
     }
     if end.checked_sub(base) != Some(SHADOW_BYTES) {
-        return None;
+        return Err("buffer-size-mismatch");
     }
     if top < base || top > end {
-        return None;
+        return Err("top-out-of-range");
     }
-    Some((base, top))
+    Ok((base, top))
 }
 
 /// Collect the values currently published on the shadow window `[base, top)`.
@@ -3150,7 +3245,13 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
             // its frames is live, and a resolved callee is kept alive by the
             // live frame whose return address resolved it.
             let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
-            let published = published_shadow_values(shadow_window_from_frame(rbp, cm));
+            // §25.4 -- keep the WINDOW, not just the values read out of it.
+            // `published_shadow_values(None)` and a genuinely empty window both
+            // return an empty set, so `published=0` alone cannot say whether
+            // publication was declined or the window could not be resolved at
+            // all. Those point at opposite repairs.
+            let window = shadow_window_from_frame(rbp, cm);
+            let published = published_shadow_values(window);
             let mut frames = 0usize;
             while frames < 4096 {
                 frames += 1;
@@ -3168,7 +3269,9 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 let live_hi = moving_young_frame_live_hi(rbp, cm);
                 if band_has_unpublished_young_word(rbp, frame_size, cm, live_hi, &published) {
                     if band_dbg() {
-                        report_unpublished_band_words(rbp, frame_size, cm, live_hi, &published);
+                        report_unpublished_band_words(
+                            rbp, frame_size, cm, live_hi, &published, window,
+                        );
                     }
                     unpublished = true;
                     break;
@@ -3249,7 +3352,21 @@ fn report_unpublished_band_words(
     cm: &cratonvm_jit::CompiledMethod,
     live_hi: Option<i32>,
     published: &std::collections::HashSet<usize>,
+    // The shadow window `published` was read out of, resolved from the
+    // INNERMOST frame of this chain. `None` means `shadow_window_from_frame`
+    // declined -- no reserved thread slot, a misaligned or foreign thread
+    // pointer -- which is a different fact from a window that resolved and held
+    // nothing, and the `published` set cannot tell the two apart.
+    window: Option<(usize, usize)>,
 ) {
+    let win = match window {
+        None => format!(
+            "unresolved(frame={} thread={})",
+            shadow_window_from_frame_why(rbp, cm).err().unwrap_or("ok"),
+            shadow_window_for_thread_why(cm).err().unwrap_or("ok"),
+        ),
+        Some((base, top)) => format!("0x{base:x}..0x{top:x}({})", top.saturating_sub(base) / 8),
+    };
     let map_slots = frame_active_map_slots(rbp, cm);
     let lo = rbp - frame_size;
     let mut addr = (lo + 7) & !7usize;
@@ -3324,6 +3441,40 @@ fn report_unpublished_band_words(
                     }
                 }
             };
+            // §25.3's PROBE -- the safepoint KIND, printed as
+            // `pushed/named` per map matching the resolved id.
+            //
+            // Four candidate explanations for an `in_map=true` word that the
+            // shadow push did not publish were eliminated in §25.1-.2, and the
+            // structural fact that survived is that publication is CALL-SCOPED:
+            // `emit_shadow_push` runs on the path into a call, and
+            // `emit_shadow_reload` pops the homes again at the top of
+            // `emit_oop_map_for_safepoint`. A safepoint that is not call-shaped
+            // -- a loop poll, a re-entry -- therefore carries a map naming N
+            // slots while nothing was ever pushed for it. The band verifier's
+            // obligation has no such scope: it asks about EVERY safepoint.
+            //
+            // `0/N` on the reporting safepoints is that answer, and it puts the
+            // repair in the PAIRING (publish for poll-shaped safepoints too, or
+            // let the verifier consult the map instead of the push) rather than
+            // in either side alone. A nonzero left-hand number refutes it and
+            // sends the search back to `collect_live_oop_homes`.
+            let shadow_pushed: String = match sp_id {
+                None => "n/a".to_string(),
+                Some(id) => {
+                    let v: Vec<String> = cm
+                        .oop_maps
+                        .iter()
+                        .filter(|m| m.bytecode_pc == id)
+                        .map(|m| format!("{}/{}", m.shadow_pushed, m.frame_slot_offsets.len()))
+                        .collect();
+                    if v.is_empty() {
+                        "none".to_string()
+                    } else {
+                        v.join(",")
+                    }
+                }
+            };
             // THE DISCRIMINATOR for a `no-map-for-id` frame, and the reason
             // this dump exists at all.
             //
@@ -3357,8 +3508,8 @@ fn report_unpublished_band_words(
                 );
             }
             eprintln!(
-                "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
-                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} \
+                "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} window={win} \
+                 sp_id={sp_id:?} sp_id_off={} in_map={in_map} shadow_pushed={shadow_pushed} \
                  live_hi={live_hi:?} layout={:?}",
                 cm.method_label,
                 cm.frame_layout.region_name(off),
@@ -3552,7 +3703,14 @@ fn band_slot_is_verifiable_with_map(
     live_hi: Option<i32>,
     map_slots: Option<&std::collections::HashSet<i32>>,
 ) -> bool {
-    if layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
+    // The half-line: on a frame whose callee-save area is DEEPEST (x86-64),
+    // everything at or beyond it is a register image or past the frame. A
+    // backend that puts that area next to the frame pointer instead says so,
+    // and gets the range exclusion below rather than this -- otherwise the
+    // half-line would swallow its whole spill area, which is precisely the
+    // region the oop maps describe.
+    if !layout.callee_saved_shallow && layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo
+    {
         return false;
     }
     if layout.is_register_image(off) {
@@ -3585,9 +3743,13 @@ fn band_slot_is_verifiable_with_map(
     // holds, the band test reporting the slot as "unpublished" is asking about
     // a mechanism (shadow-stack publication) that is not the one covering it.
     //
-    // OPT-IN, and it stays opt-in until measured: this is the fail-OPEN
-    // direction (fewer words reported => more cycles permitted to move), which
-    // is the direction a mistake here is a missed root.
+    // OPT-IN, and REFUTED — see §24 and the flag's own doc. The claim above is
+    // false in practice: with this on, the stale-after-remap detector reports
+    // 260-545 stale words per run against 2-18 with it off, 54-140 of them in
+    // java locals. Whatever `in_map` guarantees, it is not "the precise path
+    // rewrote this slot", and the shadow-publication requirement is not
+    // redundant for such words. The switch survives as the lever that measured
+    // that, and it is fail-OPEN, so off is safe.
     if band_skip_in_map_enabled() {
         if let Some(slots) = map_slots {
             if slots.contains(&off) {
@@ -3598,8 +3760,20 @@ fn band_slot_is_verifiable_with_map(
     true
 }
 
-/// `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP=1` — §22.3's experiment. See the
-/// note at its use for the claim it tests and why it is opt-in.
+/// `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP=1` — §22.3's experiment, and
+/// **REFUTED**. Do not enable it outside that experiment.
+///
+/// The claim was that a slot the active oop map names is rewritten by
+/// `remap_active_jit_frames`, so the shadow stack need not also publish it.
+/// The stale-after-remap detector says otherwise (§24): with this on,
+/// `CoverageBench` leaves 260-545 stale words per run against 2-18 with it off,
+/// 54-140 of them in `region=java-local` against 0-10. Those are references the
+/// collector moved and nothing rewrote — precisely the corruption the
+/// shadow-publication requirement exists to prevent.
+///
+/// Kept, rather than deleted, because it is the lever that produced that
+/// answer and the one that would re-test it if the underlying mechanism ever
+/// changes. It is fail-OPEN, so leaving it off is leaving it safe.
 fn band_skip_in_map_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3682,6 +3856,20 @@ fn band_liveness_screen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN")
+            .is_some()
+    })
+}
+
+/// Kill switch for §25.4's thread-pointer fallback, so its effect is one
+/// binary's A/B rather than two builds.
+///
+/// Off restores the pre-fix behaviour: the shadow window is resolved from the
+/// innermost frame's cached thread pointer alone, and a no-publish leaf there
+/// costs the whole chain its coverage proof.
+fn band_thread_window_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW")
             .is_some()
     })
 }
@@ -6687,7 +6875,31 @@ fn verify_oop_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some() {
+            return true;
+        }
+        // ARMED AUTOMATICALLY FOR THE AARCH64 SAFEPOINT PATH.
+        //
+        // That backend's `fully_oop_covered` is computed from an argument, not
+        // from a run: no host in this repository executes aarch64, so its maps
+        // have never been checked against a live frame. This oracle is the
+        // check -- it walks each frame against its OWN method's maps and
+        // refutes a coverage claim it can disprove
+        // (`incomplete_reason::COVERAGE_ORACLE_REFUTED`) -- and a claim that
+        // has never been executed should not be trusted on its first run
+        // merely because nobody remembered an environment variable.
+        //
+        // It costs a read-only walk per precise frame, on a path that is itself
+        // opt-in and experimental. `CRATONVM_JIT_ARM64_SAFEPOINTS=0` (the
+        // default) leaves this exactly as it was: off.
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ARM64_SAFEPOINTS")
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
     })
 }
 
@@ -9442,11 +9654,57 @@ mod tests {
         );
     }
 
+    /// Backing store for a band word that `is_relocatable` will vouch for.
+    ///
+    /// `band_word_is_an_object` DEREFERENCES any word the predicate accepts;
+    /// that is its documented contract, and in production the predicate is a
+    /// published-movable-range test, so the header is mapped. Three band
+    /// tests passed a bare integer (`0xdead_0000`) plus a closure claiming it
+    /// was relocatable, which breaks that precondition and reads unmapped
+    /// memory -- measured as `EXCEPTION_ACCESS_VIOLATION ... read at address
+    /// 0x00000000DEAD0008`, deterministic and reproducible in isolation. The
+    /// object screen (audit 16-18) was added after these tests were written.
+    ///
+    /// 32 bytes is `HEADER_SIZE`, which bounds what
+    /// `plausible_object_header_at` may read; the header is a plain `Object`
+    /// with one slot so the screen answers TRUE, which is what these tests
+    /// assume when they assert that a relocatable word diverts the cycle.
+    struct BandOop {
+        store: Box<[u64; 4]>,
+    }
+
+    impl BandOop {
+        fn new() -> Self {
+            let mut store: Box<[u64; 4]> = Box::new([0; 4]);
+            // SAFETY: `store` is 32 bytes, 8-aligned and exclusively owned
+            // here, so an `ObjectHeader` fits and is properly aligned.
+            unsafe {
+                std::ptr::write(
+                    store.as_mut_ptr() as *mut cratonvm_types::ObjectHeader,
+                    cratonvm_types::ObjectHeader::new(
+                        cratonvm_types::ClassId::new(1),
+                        cratonvm_types::ObjectKind::Object,
+                        cratonvm_types::ArrayElementType::Reference,
+                        0,
+                        1,
+                    ),
+                );
+            }
+            Self { store }
+        }
+
+        fn addr(&self) -> usize {
+            self.store.as_ptr() as usize
+        }
+    }
+
     fn frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published() {
         // A synthetic compiled-frame spill band. `hoisted` stands for any of
         // the three storage classes outside the local/operand model.
-        let published_oop = 0xdead_0000usize;
-        let hoisted_oop = 0xbeef_0000usize;
+        let published_store = BandOop::new();
+        let hoisted_store = BandOop::new();
+        let published_oop = published_store.addr();
+        let hoisted_oop = hoisted_store.addr();
         let band: Vec<usize> = vec![7, published_oop, 0x1234_5678, hoisted_oop, 0];
         let lo = band.as_ptr() as usize;
         let hi = lo + band.len() * 8;
@@ -9479,7 +9737,8 @@ mod tests {
     /// the measured reason moving-young engaged zero times on bt18.
     #[test]
     fn frame_band_scan_skips_register_images() {
-        let stale_oop = 0xbeef_0000usize;
+        let stale_store = BandOop::new();
+        let stale_oop = stale_store.addr();
         // [0] = a genuine slot, [1..3] = a register-image band, [4] = genuine.
         let band: Vec<usize> = vec![0, stale_oop, stale_oop, stale_oop, 0];
         let lo = band.as_ptr() as usize;
@@ -9512,6 +9771,61 @@ mod tests {
         );
     }
 
+
+    /// A SHALLOW callee-save area must not blind the verifier to the spill area.
+    ///
+    /// x86-64 puts the caller's saved registers at the DEEP end of the frame,
+    /// which is why `callee_saved_lo` can be read as a half-line: everything at
+    /// or beyond it is a register image or past the frame. AArch64's prologue
+    /// puts the saved FP/LR pair and the callee-saved GPRs immediately below the
+    /// frame pointer, with the spill area BELOW those -- so the same half-line
+    /// would exclude every spill word, which is exactly where that backend's
+    /// oop maps point. The verifier would then inspect nothing and report a
+    /// clean frame: a vacuous green, and the worst possible answer from a
+    /// completeness oracle.
+    ///
+    /// `callee_saved_shallow` selects the range exclusion instead. Both arms are
+    /// asserted on ONE layout so the difference is the flag and nothing else.
+    #[test]
+    fn a_shallow_callee_save_area_keeps_the_spill_region_verifiable() {
+        // Register images at [FP-8..FP-24); this frame's spill words deeper, at
+        // offsets 32 and 40.
+        let mut shallow = cratonvm_jit::FrameLayout {
+            callee_saved_lo: 8,
+            callee_saved_hi: 24,
+            spill_lo: 32,
+            spill_hi: 48,
+            ..Default::default()
+        };
+        shallow.callee_saved_shallow = true;
+
+        for off in [32, 40] {
+            assert!(
+                band_slot_is_verifiable(off, &shallow, None),
+                "spill word at {off} must stay verifiable on a shallow-save frame"
+            );
+        }
+        // ...and the register images are still excluded, by the RANGE.
+        for off in [8, 16] {
+            assert!(
+                !band_slot_is_verifiable(off, &shallow, None),
+                "the caller's saved registers at {off} are not this frame's words"
+            );
+        }
+
+        // The control: the same layout read with x86-64 geometry hides both
+        // spill words behind the half-line.
+        let deep = cratonvm_jit::FrameLayout {
+            callee_saved_shallow: false,
+            ..shallow
+        };
+        for off in [32, 40] {
+            assert!(
+                !band_slot_is_verifiable(off, &deep, None),
+                "the half-line is what would have swallowed the spill area"
+            );
+        }
+    }
     /// The scan must not divert on a frame full of primitives — otherwise
     /// moving-young could never engage at all and the fix would be a disguised
     /// default-off landing.
@@ -9522,8 +9836,10 @@ mod tests {
     /// every collection while being fully covered.
     #[test]
     fn frame_band_scan_ignores_reclaimed_spill_slots() {
-        let stale_oop = 0xbeef_0000usize;
-        let live_oop = 0xdead_0000usize;
+        let stale_store = BandOop::new();
+        let live_store = BandOop::new();
+        let stale_oop = stale_store.addr();
+        let live_oop = live_store.addr();
         let band: Vec<usize> = vec![0, stale_oop, live_oop, 0, 0];
         let lo = band.as_ptr() as usize;
         let hi = lo + band.len() * 8;
@@ -9831,7 +10147,15 @@ mod tests {
         let published = published_shadow_values(None);
         assert!(published.is_empty());
 
-        let band: Vec<usize> = vec![0x1111];
+        // Header-backed, for the same reason as the three band tests above:
+        // `band_word_is_an_object` screens the word the closure vouches for,
+        // and `0x1111` fails that screen on ALIGNMENT before it is ever
+        // dereferenced -- so this assertion had been failing on dev, hidden
+        // behind the crash in `frame_band_scan_ignores_reclaimed_spill_slots`
+        // that aborted the run before it was reached.
+        let live = BandOop::new();
+        let live_oop = live.addr();
+        let band: Vec<usize> = vec![live_oop];
         let lo = band.as_ptr() as usize;
         assert!(
             band_has_unpublished_word_with(
@@ -9840,7 +10164,7 @@ mod tests {
                 &cratonvm_jit::FrameLayout::default(),
                 None,
                 &published,
-                |w| w == 0x1111
+                |w| w == live_oop
             ),
             "a frame that published nothing cannot prove coverage of a live oop",
         );
@@ -10134,6 +10458,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.fully_oop_covered = true;
         cm.fully_shadow_covered = true;
@@ -10171,6 +10496,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         // The direct-call shape: shadow complete, frame-slot subset incomplete.
         cm.fully_shadow_covered = true;
@@ -10211,6 +10537,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.fully_shadow_covered = false;
         // `fully_oop_covered` true and shadow false is the inverse of the pair
@@ -10327,6 +10654,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
@@ -10339,6 +10667,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
@@ -10351,6 +10680,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -10410,6 +10740,7 @@ mod tests {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         });
         assert!(cm.has_precise_oop_maps());
 

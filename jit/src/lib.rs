@@ -90,6 +90,7 @@ pub mod bailout;
 pub mod compile_gate;
 pub mod deopt;
 pub mod escape_analysis;
+pub mod gpu_barrier;
 pub mod ir;
 pub mod ir_lower;
 pub mod ir_optimize;
@@ -1636,6 +1637,23 @@ pub struct OopMapEntry {
     /// (`Compiler::stack_oop_marks_exact`). False turns every entry above from
     /// a proof into a guess, so the report must not spend it.
     pub stack_marks_exact: bool,
+    /// §25.3's probe — how many oop homes the SHADOW PUSH paired with this
+    /// safepoint published, captured just before `emit_shadow_reload` pops
+    /// them.
+    ///
+    /// Shadow publication is CALL-SCOPED (§25.2): `emit_shadow_push` runs
+    /// before the call and `emit_shadow_reload` pops right after it returns.
+    /// The band verifier's obligation is not scoped that way, so a frame
+    /// stopped at a safepoint that published nothing reports every movable word
+    /// it holds as un-rewritable — even the ones this map names. That is the
+    /// shape §22.2 measured (67 of 93 reported words `in_map=true`) and could
+    /// not explain.
+    ///
+    /// `0` says this safepoint pushed nothing. It does not by itself say
+    /// whether that is because the site is poll-shaped, because the gate was
+    /// off, or because no oop was live — those are separated by the
+    /// `shadow_incomplete_cause` counters.
+    pub shadow_pushed: u16,
 }
 
 impl OopMapEntry {
@@ -1654,6 +1672,7 @@ impl OopMapEntry {
             inline_local_scopes: Vec::new(),
             non_oop_stack_slots: Vec::new(),
             stack_marks_exact: false,
+            shadow_pushed: 0,
         }
     }
 
@@ -2548,6 +2567,21 @@ pub struct FrameLayout {
     /// Prologue save area for the caller's callee-saved GPRs.
     pub callee_saved_lo: i32,
     pub callee_saved_hi: i32,
+    /// Is that save area at the SHALLOW end of the frame (nearest the frame
+    /// pointer) rather than the deep end?
+    ///
+    /// x86-64 puts it deepest, which lets the band verifier treat
+    /// `callee_saved_lo` as a half-line -- everything at or beyond it is a
+    /// register image or past the frame. AArch64's prologue puts the saved
+    /// FP/LR pair and the callee-saved GPRs immediately below the frame
+    /// pointer and the spill area BELOW them, so that half-line would exclude
+    /// the entire spill area -- exactly where the oop maps point, leaving the
+    /// verifier unable to see the words it exists to check.
+    ///
+    /// `false` (the derived default) is the x86-64 geometry, so no existing
+    /// producer changes. A backend that sets it gets the RANGE exclusion
+    /// (`is_register_image`) and not the half-line.
+    pub callee_saved_shallow: bool,
     /// Prologue save area for the caller's callee-saved XMMs.
     pub xmm_saved_lo: i32,
     pub xmm_saved_hi: i32,
@@ -12987,7 +13021,12 @@ mod atomic_accessor_intrinsic_tests {
             box_unbox_intrinsic_shape("java/lang/Long", "longValue", "()J", CID).is_some(),
             "the shape must match, or this test cannot tell the gate from a              matcher that stopped matching"
         );
-        if std::env::var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
+        // Through the flag boundary, not `std::env` directly: a test that reads
+        // the environment raw is measuring the developer's ambient shell rather
+        // than the VM's latched configuration, which is the hazard
+        // `flag_declaration_guard` exists to name — and reading it raw here is
+        // what left `check-surface.sh` red on dev.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC").is_some() {
             // Someone is running with the family deliberately off.
             return;
         }
@@ -30194,6 +30233,12 @@ mod tests {
     /// five days after their capability landed, and `getstatic`/`checkcast`
     /// sat until 2026-08-11 while they held down Tomcat's WebSocket send path.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_admits_exactly_the_opcodes_whose_lowerings_publish() {
         // Publishes via `emit_post_invoke_exception_check` (reason-9) on every
         // throwing path, or cannot throw at all.
@@ -30246,6 +30291,12 @@ mod tests {
     /// `checkcast` must therefore no longer refuse a compile, while a protected
     /// `arraylength` still must.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_gate_clears_getstatic_and_checkcast_but_not_arraylength() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
         // One protected range covering the whole body.
@@ -30293,6 +30344,12 @@ mod tests {
     /// admission withdrawn the same bytes MUST refuse, and refuse at the `new`.
     /// Without it a gate that had quietly become unconditional would read green.
     #[test]
+    // x86-64 only: the API under test (`first_unsupported_precise_frame_site`) is itself
+    // `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not
+    // merely fail -- it does not COMPILE, and took the whole crate's test
+    // binary with it. Found by actually building for aarch64 in an emulated
+    // container; a cfg-gated API needs cfg-gated tests.
+    #[cfg(target_arch = "x86_64")]
     fn rbc6_admits_a_protected_throw_new_and_refuses_it_when_withdrawn() {
         use cratonvm_reader::attribute::ExceptionTableEntry;
         // pc 0: new #0        (3 bytes)
@@ -30847,6 +30904,12 @@ mod tests {
     /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
     /// appearing in the code identifies which helper the site calls.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn self_recursive_nontail_site_routes_through_dispatch() {
         use std::sync::Arc;
 
@@ -31086,6 +31149,12 @@ mod tests {
     // IR-lowering success path bumps. The counter is thread-local and each cargo
     // `#[test]` runs on its own thread, so parallel compile tests can't perturb it.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn step3_optimize_toggle_routes_c1_singlepass_and_c2_ir() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -31169,6 +31238,12 @@ mod tests {
     // `ir_vs_singlepass.rs` proves the *executed* result is correct; this
     // proves the IR path — not single-pass — produced the body.)
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn step3_getfield_int_routes_through_ir() {
         use std::sync::Arc;
 
@@ -32432,6 +32507,12 @@ mod tests {
     // gate. Without it the builder bails on the `invokespecial`, keeping `new`
     // scalar replacement off by default.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
         use std::sync::Arc;
         // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
@@ -32583,6 +32664,12 @@ mod tests {
     // helper unwired must still bail (a hand-built test table must never get a
     // CALL to address 0).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn deferred_new_site_compiles_when_cp_helper_is_wired() {
         use std::sync::Arc;
         // `static int f() { new Cold(); pop; return 0; }`
@@ -32691,6 +32778,12 @@ mod tests {
     // not prove the IR path fired. `IR_LOWER_COMPILES` proves it does (==1 with
     // the flag) and does not (==0 without — the builder bails on the invoke).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32814,6 +32907,12 @@ mod tests {
     /// result-equality alone (the integration harness) would not prove the IR
     /// path ran.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -32941,6 +33040,12 @@ mod tests {
     /// the fall-through), so result-equality alone would not prove the IR path
     /// ran — `IR_LOWER_COMPILES` does.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_long_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -33010,6 +33115,12 @@ mod tests {
     /// equality alone would not prove the IR path ran — `IR_LOWER_COMPILES`
     /// proves it (==1 with the flag, ==0 without → vacuous single-pass fallback).
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_fp_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -33089,6 +33200,12 @@ mod tests {
     /// Guards against a vacuous validation: single-pass ALSO dispatches
     /// invokevirtual, so result-equality alone would not prove the IR path ran.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn ir_virtual_call_wiring_routes_through_ir_only_with_flag() {
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
@@ -37108,6 +37225,12 @@ mod tests {
     // ── return_type tests ───────────────────────────────────────────
 
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn recursive_compile_cycle_routes_parent_direct_call_through_dispatch() {
         // Held for the whole test: the recursive-cycle set this clears and
         // then asserts on is process-global. See
@@ -37281,6 +37404,12 @@ mod tests {
     /// The bind used to `continue` straight past the registration at the end
     /// of the scan loop, so this asserted 0 before the fix.
     #[test]
+    // x86-64 only: this asserts how `try_compile_inner` ROUTES a compile
+    // (single-pass vs IR vs dispatch), and on another architecture that
+    // function takes its `#[cfg(target_arch = "aarch64")]` branch and
+    // returns before any of that routing happens. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn statically_bound_direct_callee_call_still_registers_invoke_info() {
         // The other clearer of the process-global recursive-cycle set;
         // see `jit_recursive_cycle_test_lock`.
@@ -38691,7 +38820,7 @@ mod layout_constant_inventory {
 
     /// `(file, counts)` where `counts[i]` is the number of code uses of
     /// `LAYOUT_CONSTANTS[i]` in that file.
-    const INVENTORY: [(&str, [usize; 8]); 2] = [
+    const INVENTORY: [(&str, [usize; 8]); 3] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
         // two offset closures — `legacy()` (header-plus-cell, then the ref or
         // int-category payload offset inside that cell: one use of each) and
@@ -38831,13 +38960,28 @@ mod layout_constant_inventory {
         // it reconstructs both cell addresses to assert both stores are
         // emitted, which is the assertion that would have caught the
         // compact-only arm before a run-time census had to.
-        ("ir_lower.rs", [17, 4, 7, 0, 0, 0, 6, 6]),
+        //
+        // 2026-09-04: the layout-epoch guard's regression test adds three more
+        // `HEADER_SIZE` uses (17 -> 20), all of them reading back the compact
+        // cell it just proved is or is not written. No new EMISSION site: the
+        // guard itself bakes an epoch address and a count, not a displacement.
+        ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
+        // x64/objects.rs, added 2026-09-04. It bakes object-header
+        // displacements exactly as the two files above do -- the compact and
+        // legacy reference-store cell addresses, the array header, the inline
+        // TLAB `new` -- and was covered by NEITHER tripwire: the `x64.rs` scan
+        // matches only the `<CONST> as <ty>` cast form, and this inventory
+        // listed two files. The gap was found the honest way, by adding a
+        // legacy emission site there on 2026-09-02 and having to record it by
+        // hand in `header-shrink.md` because nothing counted it.
+        ("objects.rs", [8, 0, 3, 0, 2, 0, 2, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
         match file {
             "lib.rs" => include_str!("lib.rs"),
             "ir_lower.rs" => include_str!("ir_lower.rs"),
+            "objects.rs" => include_str!("x64/objects.rs"),
             other => panic!("no source registered for {other}"),
         }
     }
@@ -39257,6 +39401,10 @@ mod code_cache_lifetime_tests {
     /// newest range for an address must still win, so a recycled address
     /// symbolizes as what is mapped there NOW.
     #[test]
+    // x86-64 only: it registers x86-64 compiled bodies by address; the aarch64
+    // path publishes different artifacts. Gated so the crate's
+    // test run is green on aarch64 rather than carrying known reds.
+    #[cfg(target_arch = "x86_64")]
     fn the_newest_registration_for_an_address_wins() {
         let buf = ExecutableBuffer::new(64).expect("alloc executable");
         let entry = buf.as_ptr() as usize;

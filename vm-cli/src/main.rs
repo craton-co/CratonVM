@@ -295,6 +295,16 @@ bytes-saved={saved}"
             eprintln!(
                 "[cratonvm] compiled reference stores: gated={gated} declined={declined}"
             );
+            // What the DECLINED sites cost, only under the trace. Printed
+            // separately from the gated pair because it is the number that was
+            // missing: `declined=N` with no execution line reads exactly like a
+            // workload that never stored a reference.
+            {
+                let full = cratonvm_jit::metrics::ref_store_full_helper_count();
+                if full != 0 {
+                    eprintln!("[cratonvm]   ref-store full-helper executions: {full}");
+                }
+            }
             // The DYNAMIC split for that pair, only under
             // CRATONVM_DBG_SP_REF_STORE_TRACE=1. `gated=N` above counts emitted
             // sequences; this counts executions, and on the optimizing tier the
@@ -351,6 +361,16 @@ fresh-ctor={fresh_ctor} body={body}"
                 );
                 for (name, count) in cratonvm_jit::metrics::ir_ref_store_bails() {
                     eprintln!("[cratonvm]     ir ref-store bail {name}: {count}");
+                }
+                // WHICH shape those inline stores wrote. The legacy arm exists
+                // because compact receivers used to be rare; the compact TLAB
+                // shape is the default since 2026-09-04, so this pair is what
+                // says whether that arm still carries anything.
+                let (shape_c, shape_l) = cratonvm_jit::metrics::ir_ref_store_shape_counts();
+                if shape_c != 0 || shape_l != 0 {
+                    eprintln!(
+                        "[cratonvm]     ir ref-store shapes: compact={shape_c} legacy={shape_l}"
+                    );
                 }
             }
             // Optimizing-tier allocation. A zero on the left is the EXPECTED

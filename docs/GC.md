@@ -9,7 +9,7 @@ java-launcher-compatible:
 |---|---|---|
 | `-XX:+UseGenerationalGC` / `-XX:-UseZGC` | `GenerationalHeap` (`gc/src/gen_heap.rs`) | Semi-space young gen + free-list old gen with a concurrent old-gen mark-sweep cycle. Young collections are **moving by default**; each cycle diverts to the non-moving sweep only when its own root-coverage proof fails (see "Backend details" below). |
 | `-XX:+UseG1GC` | `G1Collector` (`gc/src/g1.rs`) | Region-based (region size targets ~2048 regions, clamped to 1-32 MB): young/mixed evacuation with remembered sets, SATB concurrent marking, humongous spans, region pinning. The heap is **reserved** at `-Xmx` and committed on demand. |
-| *(default)* / `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep over one arena, with a hash-set allocation registry. No colored pointers, no load barriers, no concurrency, no compaction. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) is a metadata-only simulation with no production consumer. |
+| *(default)* / `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, whole-heap mark-sweep over one arena with a bitmap allocation registry. No colored pointers, and **the load barrier is never armed** — `relocate_active` and `set_barrier_color(Some(..))` are written only by unit tests, so marking is published by an ordinary **SATB pre-write barrier** rather than on read. It is no longer accurate to call it non-moving, non-concurrent or non-compacting: a concurrent mark phase ships behind `CRATONVM_ZGC_CONC_START`, a stop-the-world sliding compactor behind `CRATONVM_ZGC_RELOCATE`, and a generational mode behind `CRATONVM_ZGC_GENERATIONAL` — all opt-in, so a DEFAULT run is still a non-moving whole-heap STW mark-sweep. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) has production consumers now — `forwarding::ZRelocationSet::select` ranks the slide's pages — though the barrier layer itself remains unreached. |
 
 Unrecognized `-XX:+Use*GC` selectors warn and fall back to Generational.
 Heap size comes from `-Xmx`/`-Xms` as usual — and under G1, since F-16, those
@@ -775,9 +775,7 @@ steady state. Measured at `-Xmx4096m`:
 
 The pairing is better than the target alone on BOTH axes: the floor stops the
 one cycle the controller is blind to, and paying for that cycle up front costs
-less than the controller's recovery from it. **Since 2026-09-03 it is the
-default** — a pause target brings a 25 % floor with it unless the operator
-names a percentage. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
+less than the controller's recovery from it. **It was made the default on 2026-09-03 and WITHDRAWN on 2026-09-04**, the day after: arming the floor implicitly changed how often the collector runs on every ZGC workload, and `org.h2.test.db.TestLargeBlob` went from 0 collections and a PASS to 34 collections and a SIGSEGV inside `FileChannelImpl.implWrite` -> `IOUtil.write` -> `DirectByteBuffer` (3 crashes in 4 runs with the floor on, 0 in 3 with it off, same binary). The crash is almost certainly older than the flag — without the floor that test never collects at all, so nothing exercised the path — but a default that turns a passing test into a native crash does not ship while that bug is open. Pair them explicitly with `CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` if you want it. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
 rather than an absence, and is how the "target alone" arm is measured; any
 other explicit value wins over the floor in both directions.
 

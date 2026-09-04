@@ -2081,6 +2081,32 @@ impl SharedVm {
         // value or its uniqueness — only when it becomes available.
         let vm_identity = NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed);
 
+        // Arm the compiled-tier GPU input-residency barrier, before any
+        // class is loaded and so before any method can be compiled. A
+        // method compiled ahead of this would carry no barrier and could
+        // stale a cache entry created later, which is the whole reason
+        // this sits at the top of VM construction rather than beside the
+        // offload registry it belongs to (that one is built lazily, on
+        // first dispatch, long after the first compile).
+        //
+        // Only under `--gpu`, and only on x86_64: `gpu_barrier` encodes
+        // x64, and an unarmed barrier is what keeps `offload_jit_gate`
+        // refusing array writers on every other target, exactly as it
+        // did before. `CRATONVM_JIT_GPU_ARRAY_BARRIER=0` is the kill
+        // switch and restores that behaviour here too.
+        #[cfg(all(feature = "gpu-offload", target_arch = "x86_64"))]
+        if config.gpu_offload_enabled
+            && cratonvm_types::flags::runtime_var("CRATONVM_JIT_GPU_ARRAY_BARRIER")
+                .ok()
+                .as_deref()
+                != Some("0")
+        {
+            cratonvm_jit::gpu_barrier::arm(
+                crate::runtime::offload::input_cache::filter_addr(),
+                crate::runtime::offload::input_cache::dirty_addr(),
+            );
+        }
+
         let mut native_methods = NativeMethodRegistry::new();
 
         // ── Capability policy, installed before ANY `register_*` pass ───────

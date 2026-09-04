@@ -1016,11 +1016,24 @@ bodies are equal modulo relocations and unequal as bytes. Detecting "unchanged"
 would mean building a relocation table for a case that should not be created in
 the first place.
 
-**And the cost it was going to save is not there.** `epoch_stale_evictions()`
-counts the invoke-cache entries the epoch actually throws away. Over a whole
-CratonBench run: **9**. Over the regex workload: **0**. The invalidation is
-global in reach but each call site evicts once and refills, so the seven
-"wasted" bumps cost nine IC refills, not thousands.
+**And the cost it was going to save is not there** — though not for the reason
+first written here. `epoch_stale_evictions()` counts the invoke-cache entries
+the epoch actually throws away. Over a whole CratonBench run: **9**. Over the
+regex workload: **0**.
+
+**That measurement does not generalize, and this document claimed it did.** On
+an H2 test class (`org.h2.test.db.TestAlter`, 612 compilations) the same counter
+reads **2,640** — roughly 290x the CratonBench figure, because the cost scales
+with live call sites and CratonBench has almost none. The original wording,
+"measured worthless: 9 IC evictions/run", was a micro-benchmark number presented
+as a property of the mechanism.
+
+The *conclusion* survives, on different evidence. On that same H2 run the
+supersede census reads `first_publish=0 unchanged=0 changed=75`: every publish
+replaced a genuinely different body, so every bump was owed, and
+`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` would have skipped **none** of them.
+The switch stays off because there is nothing for it to skip on a real workload,
+not because skipping would be cheap.
 
 So the suppression is implemented, correct, and **off by default**
 (`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1`). Two of the three outcomes
@@ -1143,6 +1156,138 @@ Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
 1502 bytes depending on inlining, and an exact-size probe reads a body that got
 7 bytes bigger as no body at all.
 
+### Why a method falls through: the refusals could not be counted
+
+`bailout.rs`'s own module doc names the gap: of the three ways the compiler says
+"I cannot compile this", `Option::None` from `IrBuilder::build` and
+`ir_lower::lower_inner` "carries no reason at all, so the per-method compiler
+report the review asks for (admitted/bailout counts by reason) cannot be
+produced." It could not, and nothing said so out loud — the per-compilation
+record has carried an empty `bailouts` array since it was added.
+
+Measured before touching anything: over CratonBench, **all 105** compilations
+reported `bailouts:[]`, including the 17 that fell through to single-pass. The
+process-wide category counters were moving the whole time, which is what made
+the hole hard to see — the totals looked alive while every per-method row was
+blank.
+
+Two halves were missing, and both are the same one-line split `verify_or_bail`
+already documents ("attribution, not duplication"): `record_bailout` owns the
+process-wide counters, `metrics::note_current_bailout` attaches the same bailout
+to *this* method. `ir_lower::refuse` did the first and not the second;
+`ir::ir_build_bail` did neither.
+
+With both wired, on `org.h2.test.db.TestAlter` (612 compilations, 50
+fall-throughs) **50 of 50 now name a reason**, where 6 did before:
+
+| reason | phase | count |
+|---|---|---|
+| `unsupported_shape` | build | 38 |
+| `unsupported_opcode` | build | 6 — five `0x53` (`aastore`), one `0x5c` (`dup2`) |
+| `unallocated_value` | lower | 4 |
+| `code_buffer_exhausted` | lower | 2 |
+
+Read with `CRATONVM_JIT_METRICS=1 CRATONVM_JIT_METRICS_OUT=<path>`, one JSON
+object per compilation.
+
+#### And ranked by site: one refusal is three quarters of them
+
+`unsupported_shape` was 38 of 50 with the site living only in a debug line
+nothing aggregates — 38 identical rows saying "the builder refused", naming
+nothing to fix. The site now rides in the bailout's context, which turns that
+into a work list. On `org.h2.test.db.TestAlter`, 44 build refusals:
+
+| refusal | count | share |
+|---|---:|---:|
+| `ir.rs:7150` — an invoke pc with no `invoke_info` entry | 33 | **75%** |
+| opcode `0x53` (`aastore`) | 5 | 11% |
+| `ir.rs:6888` — `new` with no `new_info` (the deferred-class path) | 3 | 6% |
+| `ir.rs:7094` — `invokespecial`, neither lowering applies | 2 | 4% |
+| opcode `0x5c` (`dup2`) | 1 | 2% |
+
+Three quarters of everything the IR builder turns away on a real workload is a
+single line: `self.invoke_info.get(&pc)` answering `None`. Its neighbour at
+7094 documents why that concentrates so hard — "one non-emittable invoke
+elsewhere in the method discarded the whole map" — so a single unlowerable call
+site refuses **every** call site in the method, and with it the method. That is
+the next thing to fix in this tier, and it is one map rather than a list of
+opcodes.
+
+By contrast the missing opcodes (`aastore`, `dup2`) are 6 of 44 together: real,
+but not where the methods are going.
+
+#### What the census then said: a block-placement defect, not a sizing one
+
+The investigation started from the hypothesis that large methods fail on code
+buffer capacity. That is real but rare — 2 of 50. The dominant lowering refusal
+is `unallocated_value`: **a value emitted after its own use**.
+
+    StringUTF16.compress   n21 (Call)    at position 15, used by n34 (Return) at 12
+    Pattern.range          n51 (Cmp(Ne)) at position 51, used by n57 (If)     at 21
+
+`verify_data_locations` models emission as blocks in index order, so a use at 21
+and a def at 51 means the definition's *block* is laid out after its user's.
+`ir_schedule`'s own module doc states the opposite as invariant 1 — the layout
+"keeps every definition before every use, so no live range inverts" — so this is
+a violated invariant, not a missing feature. **Fixed 2026-09-04; see below**,
+where the per-method effect is also stated more carefully than it was here: it
+costs `String.equals` and `StringLatin1.equals` one of their two compilations
+each, not the optimizing tier outright.
+
+Not caused by the 2026-09-02 switches: `CRATONVM_JIT_IR_FUSED_BRANCH=0` and
+`CRATONVM_JIT_IR_LINEAR_SCAN=0` each still produce exactly 3 on CratonBench.
+Left open — correcting global code motion is a change to every compiled method,
+and it wants its own branch and its own per-collector sweep.
+
+### The block order was creation order, and nothing made it a reverse postorder
+
+`ir_lower` emits `schedule.blocks` front to back, so block *index* order is
+emission order. Block indices are assigned in **creation** order — whatever
+order Step 1 happened to walk control nodes in — and nothing turned that into a
+reverse postorder. A block could therefore be emitted before a block that
+dominates it, and a value read before the instruction that defines it.
+
+`verify_data_locations` catches exactly that and refuses the compile, so it was
+never wrong code. It was lost compiles, silently, and until the bailout
+attribution above it could not even be counted.
+
+The machinery to fix it was already present and switched off. `layout_blocks`
+produces a DFS layout whose stated property (invariant 2 of `ir_schedule`'s
+module doc) is "for every edge `u → v` reachable from the entry, `pos(u) <
+pos(v)` unless the edge is retreating" — and a dominator is a DFS ancestor, so
+an RPO layout places it first and def-before-use follows. But it runs only under
+`ScheduleOptions::layout_hot_paths`, which is `false` in the production
+pipeline: `schedule()` is `schedule_with_options(graph, &ScheduleOptions::default())`.
+
+So when hot-path layout is off, the blocks are now still laid out — just without
+the frequency priority. `layout_blocks_rpo` is `dfs_layout(blocks, None)` behind
+the same `validate_order`, and a validation failure keeps creation order and
+compiles anyway, exactly as the hot-path arm already did.
+
+| | `CRATONVM_JIT_IR_RPO_LAYOUT=0` | default |
+|---|---|---|
+| CratonBench: `unallocated_value` | 3 | **0** |
+| CratonBench: fell through | 17 | **14** |
+| H2 `TestAlter`: `unallocated_value` | 4 | **0** |
+| H2 `TestAlter`: `code_buffer_exhausted` | 2 | **0** |
+| H2 `TestAlter`: fell through | 50 | **44** |
+
+Three H2 methods gain an optimizing-tier body they previously never got —
+`FutureTask.awaitDone`, `MVMap.<init>`, `TransactionStore.getEntryId` — and
+`String.equals` / `StringLatin1.equals` go from 1-of-2 compilations wasted to
+2-of-2 lowered. The `code_buffer_exhausted` pair disappearing was not predicted:
+a better block order emits less code, and those two methods were the ones on the
+edge of their estimate.
+
+**No throughput claim.** Six interleaved CratonBench rounds alternate in sign
+(on faster, off faster, on faster) while the absolute totals drift ~50% across
+rounds, which is this host under load, not a result. Checksums are identical in
+every run.
+
+Validated per collector, because reordering blocks moves oop-map and safepoint
+positions in every compiled method: regression-suite 90/90 on ZGC, G1 and
+Generational; `cratonvm-jit` 2225 passed.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -1166,8 +1311,9 @@ Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
 | IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
-| Skip the supersede-epoch bump when it cannot invalidate anything | off (measured worthless: 9 IC evictions/run) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
+| Skip the supersede-epoch bump when it cannot invalidate anything | off (nothing to skip: H2 shows 75/75 publishes genuinely changed) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
+| Reverse-postorder block layout (def before use) | **ON** | `CRATONVM_JIT_IR_RPO_LAYOUT=0` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
 | IR-tier gated inline reference stores | **ON** where a collector publishes a plan | `CRATONVM_JIT_IR_GATED_REF_STORE=0` |
@@ -1424,11 +1570,103 @@ optimizing tier without touching anything else. Adding the unroll loss brings
 it to 1.75x of a 2.38x gap: about **two thirds of the inversion**, with
 register residency the dominant share and unrolling roughly 1.12x on top.
 
-A residual of ~1.36x is still unaccounted for. It is not any of the four
-candidates, not unrolling, and not the null check; it is whatever else the
-optimizing tier's 95-instruction body does that the baseline's does not, and
-naming it wants the same treatment — find a switch that removes it from the
-fast arm before building it into the slow one.
+#### The residual 1.36x: latency, not volume
+
+Chased, and it is not what the rest of this section assumed. Both tiers were
+disassembled at MATCHED settings — baseline with `CRATONVM_JIT_LOCAL_REGS=0`
+and `CRATONVM_DISABLE_UNROLL=1`, so both spill and neither unrolls — and
+counted:
+
+| | baseline (matched) | optimizing |
+|---|---|---|
+| loop-body instructions | 108 | **95** |
+| distinct frame slots touched | 24 | **15** |
+| memory `mov`s in the body | 41 | **32** |
+| time | 2.23 | **3.01** |
+
+**The optimizing tier does less of everything and takes 1.36x longer.** So the
+residual is not instruction count, not memory-operation count, and not slot
+count — every volume measure points the wrong way. The
+"instructions per iteration" framing earlier in this section explains the
+unrolling fifth and nothing beyond it.
+
+`CRATONVM_JIT_KERNEL_REG_LOCALS=0`, which makes the baseline's operand-stack
+scratch cache inert, moved the matched arm not at all (2.23 against 2.23), so
+that is not it either.
+
+**It is a dependency chain.** A probe with four INDEPENDENT accumulators
+(`a+=this.fx; b+=this.fx; c+=this.fx; d+=this.fx;`) instead of one shrinks the
+gap from **1.36x to 1.18x**, with the two control arms landing on 1.41 and
+1.41. Independent work overlaps a stall; it cannot overlap extra instructions.
+That is the signature of a latency bottleneck, and the disassembly shows the
+mechanism: the optimizing tier's body is a chain of store-then-load pairs on
+the same slot two instructions apart —
+
+```text
+1f5: mov [rbp-88h],rax      ; store the loaded field
+1fc: mov rax,[rbp-78h]
+200: mov rcx,[rbp-88h]      ; reload it, two instructions later
+207: add eax,ecx
+209: mov [rbp-90h],rax      ; and the accumulator goes back to memory
+```
+
+— with the accumulator itself crossing the back edge through the frame, so
+every iteration waits on the previous one's store.
+
+The exact stall could not be named: this host is a VM without PMU passthrough
+(`perf stat` reports `<not supported>` for cycles and instructions), so
+store-forwarding latency is the likely mechanism rather than the measured one.
+
+**What this changes.** It strengthens the register-residency conclusion rather
+than competing with it: keeping a loop's live set in registers removes the
+memory round trip *and* the chain that round trip creates. And it explains the
+four zeros a second way — shortening a serial chain by one link out of several
+does not speed it up. Both readings say the same thing: **the live set has to
+move as a group, or not at all.**
+
+#### Moving it as a group is an architecture change, not another heuristic
+
+Attempted, and this is where the incremental route ends. A fifth change — a
+register-to-register publish, taking the register at a resident definition
+whenever `last_home_store` proves one already holds the value, position-checked
+so any intervening emission falls back to the load — produced **byte-identical
+code** on this method: same 1,030 bytes, same 95 loop instructions, same 22
+frame loads. The precondition never held. It was withdrawn rather than landed.
+
+That failure is the informative one, because of what the census says alongside
+it. Residency IS working: `resident=3 (gp=3)`, and `rbx`, `r12` and `r13`
+appear eleven times in the loop body. Three values are genuinely being read out
+of registers — **and the body still has 22 frame loads and is still a
+store-then-load chain.**
+
+The reason is structural. `lower_data_node` gives every node a frame slot
+(`alloc_slot(id)`) and writes it; the residency file is a **read cache layered
+on top of that**. So a value costs its store whether or not it is resident, the
+store-then-load pair survives residency, and no policy change on the cache can
+remove a store the model emits unconditionally.
+
+**So "move the live set as a group" means making the home slot OPTIONAL** — a
+value that lives in a register for its whole range and is named by no deopt
+frame and no safepoint map should not have a home at all. That is a change to
+the lowering model, with the deopt and oop-map obligations to discharge for
+every value that loses its slot, and it is the first item on this list that
+cannot be tried behind a flag in an afternoon.
+
+The five zeros are the case for doing it properly rather than continuing:
+split residency, the null-check port, the loop-weighted use count, the
+parameter prologue copy and the direct publish each addressed a symptom of the
+frame-slot-first model, and the model absorbed all five.
+
+That change is designed, sized and not built:
+[`feature-designs/ir-optional-home-slot.md`](feature-designs/ir-optional-home-slot.md).
+It records the three obligations already verified (deopt and safepoints are
+covered by `pinned`; references are excluded for oop-map reasons; the read side
+is 84 cached against 13 direct), the coupling that sets its shape (dropping the
+store needs a register-to-register publish, which needs the arms to say where
+their result is, and 50 of them say it only by writing memory), and a
+fail-closed route for the one hazard — `slot_of` on a homeless value fails the
+compile rather than reading a stale word, so the first run names the sites to
+convert instead of a whitelist being guessed.
 
 **So the recommendation stands and now has a number behind it.** Getting a
 loop's live set into registers *as a group* is worth about 1.57x on this shape.
@@ -1479,6 +1717,285 @@ disagreeing with itself by 13–22%, which was larger than every effect claimed.
 A timing arm on this host without a same-config control is not a measurement.
 The `C1/C1B` and `C2/CTRL` pairs above exist for that reason and should be kept
 in any re-run.
+
+#### The census refuted the design, and named the site that was worth fixing
+
+Built the instrument before the feature, and it is the reason there is no sixth
+zero to report. `plan_register_residency` now counts, over the values it
+actually gave a register to, how many could lose their home word:
+
+```text
+[ir-ls] resident=3 (fp=0 gp=3)
+[ir-ls] home: droppable=0 blocked_deopt=1 blocked_phi=2 safepoints=16
+```
+
+**Zero of three**, on the loop this whole section is about. The design's safety
+argument — that `pinned` covers every deopt-named value, so a promoted value is
+named by no frame state — is true in `regalloc.rs` and false where it is used:
+`plan_register_residency` calls `release_deopt_pins` deliberately and pays for
+it by keeping every home the colourer planned. A 50-arm refactor of the
+lowering arms would have had nothing to act on.
+
+`blocked_phi=2` is the useful half. **The loop-carried values ARE the phis**,
+and a phi's home is written by `emit_copy_op`, which was memory to memory:
+`load rax, [src]`, `store [dst], rax`, and then `emit_phi_copies` reloaded the
+word it had just written to publish the phi's register. Then, because a phi
+appears in its header block's node list like any other value, the generic
+publish site reloaded it **again, once per iteration** — which is the other
+half of the loop-carried chain, `mov [rbp-78h],rax` on the back edge and `mov
+rbx,[rbp-78h]` at the top of the next iteration waiting on it.
+
+Two changes at that one site (`CRATONVM_JIT_IR_PHI_COPY_REGS=1`,
+`CRATONVM_JIT_IR_SKIP_REPUBLISH=1`, both default OFF). The disassembly confirms
+both fire: `FieldLoop.sum` goes 1030 → 1026 → 1018 bytes as they are turned on,
+the preheader's two publishes become `mov rbx,rax` / `mov r12,rax`, and **both
+loop-body reloads disappear** — the phis are read straight out of `rbx` and
+`r12`.
+
+**And it measures zero.** Interleaved arms, user CPU time, a second arm of the
+control configuration as the floor:
+
+| probe | floor (ctl vs ctl2) | on vs ctl | P(on < control) |
+|---|---|---|---|
+| `FieldLoop.sum` (2 loop-carried) | 0.86% | +0.86% | 0.529 |
+| `FieldLoop.sumWide` (5 loop-carried) | 0.00% | +1.27% | 0.516 |
+
+`P(on < control)` is over all 15x30 arm pairs; 0.50 is no effect. Two
+instructions out of a thirty-two instruction body, in a loop with enough
+independent work to overlap them, is below what this host can resolve.
+
+**Half of it is inert on this shape, and the counter says which half.**
+`[ir-ls] phi copies: reg_reads=0 reg_publishes=4` — four publishes (two phis
+times two edges) and not one register read, because the sources of those copies
+are the `Add` results, which are single-use and therefore never promoted. The
+read half waits on a shape where a phi's incoming value is itself resident.
+
+Correctness is established rather than assumed: `probes/PhiSwapLoop.java`
+(two-cycle, three-cycle, mixed GP/FP) matches HotSpot with the flags on and
+off, the 2,489 `cratonvm-jit` tests pass with both flags on, and the regression
+suite is 90/90 in both arms.
+
+**The CratonBench arms were vacuous, and the check that caught it is worth
+copying.** `sieve`, `matrix` and `arithmetic` were run the same way and came
+back at 0.407, 0.475 and 0.549 — until `CRATONVM_DBG=ir-linear-scan` was read
+on each of them:
+
+```text
+fib:    ir-ls=3
+sieve:  ir-ls=0
+```
+
+**The IR tier plans no residency at all on those kernels**, so both arms ran
+identical machine code and the three numbers describe nothing. `osr_entered=504`
+with `osr: admitted=2` says where the time actually goes. That reach question —
+how much of a real workload the optimizing tier's body reaches in the first
+place — is a prerequisite for any further measurement in this section, and it
+had not been asked.
+
+**What is sequenced next, and why it is now sequenced rather than assumed.**
+`FrameValue::Register`, `RegisterLong` and `RegisterRef` already exist and are
+tested, so deopt metadata CAN name a register — but the IR tier's
+`emit_deopt_stub` passes only `rbp` to `ir_deopt_entry` and reserves no
+`SavedRegisters` region, so nothing would fill one. Dropping the home of a
+deopt-named value needs that region reserved and the callee-saved file spilled
+into it first. `blocked_deopt` is the counter that says what that would buy.
+
+#### The register image was built, and the home is gone for the values it covers
+
+The sequenced step, taken. `ir_deopt_entry` used to say "the IR lowerer keeps
+every live value in a frame slot, so no register file is needed; a
+register-allocating backend would spill GPRs/XMMs in the trampoline and pass
+them here instead" — and that sentence was the whole reason a resident value
+could never lose its home. Four switches, all default OFF:
+
+| switch | what it does |
+|---|---|
+| `CRATONVM_JIT_IR_DEOPT_REGS=1` | reserve 256 bytes, spill 16 GPRs + 16 XMMs at the stub, pass a `*const SavedRegisters` |
+| `CRATONVM_JIT_IR_DROP_PHI_HOME=1` | stop writing the home word of a value a deopt frame can name in its register |
+| `CRATONVM_JIT_IR_PHI_COPY_REGS=1` | (already present) edge copies move register to register |
+| `CRATONVM_JIT_IR_SKIP_REPUBLISH=1` | (already present) an already-live register is not re-published |
+
+**The naming rule is exclusive ownership, not residency**, and the distinction
+is the whole safety argument. A value owns its register over its LIVE RANGE,
+and `plan_register_residency` releases the deopt pins — so a bytecode local can
+still be named by a frame state long after its last IR use, by which time the
+allocator may have handed the register to something else. A value is therefore
+nameable only when no other value anywhere in the method holds the same
+register: then it holds from the definition to the end of the frame, and no
+mapping between `graph.safepoints` and allocator positions is needed at all.
+`slot_of` on a dropped home fails the compile; `home_read_refusals` counts it.
+
+**It engages, and the loop loses its last frame traffic.** On `FieldLoop.sum`:
+
+```text
+[ir-ls] deopt regs: nameable=2 frame_slots_named_by_register=7 regs_base=464
+[ir-ls] homes:      dropped_values=1 stores_skipped=2 read_refusals=0
+```
+
+Seven frame-state slots now describe a register, one loop-carried value has no
+frame word at all, and no reader refused. In the disassembly the counter is
+`rbx` throughout — no store on the back edge, no reload at the top, nothing.
+
+**A bug the executable test found, which is the reason to write that kind of
+test.** `deopt_regs_base` was computed arithmetically whether or not the region
+had been reserved, so with the flag OFF it came out non-zero — which the stub
+reads as "there is a region here" — and 32 spill stores went over the argument
+staging area and past it. `test_guard_deopt_reconstructs_live_frame` SIGSEGV'd.
+This is the mirror image of the hazard `deopt_spill_region_reserved` already
+records for the single-pass backend, where an unreserved region left the base at
+0 and the stores walked UP over the saved RBP and the return address.
+
+**And it measures nothing.** Interleaved, user CPU time, 15 rounds, with the
+control repeated:
+
+| arm | median | P(arm < control) |
+|---|---|---|
+| control | 0.79 | — |
+| control again | 0.85 | — |
+| phi copies only | 0.93 | 0.411 |
+| all four | 0.95 | 0.424 |
+
+The two controls differ by 7.6%, so the floor swallows everything; `P(all <
+phi)` — the home-drop on its own, against the arm it depends on — is 0.516,
+which is chance. The host was at load 5-9 throughout. The honest reading is
+that this is not resolvable here, not that it is a regression.
+
+**Two limits worth stating rather than discovering later.** With the flag on,
+every IR frame grows by 256 bytes and every deopt stub by 32 stores, which is
+why it is off. And no Java workload built for this reaches an IR-tier deopt at
+all — `deopts=0` everywhere, and the probe written to force one
+(`probes/DeoptRegLoop.java`, a null receiver inside a loop) was never offered to
+the IR backend. The register-naming path is proven by
+`a_deopt_frame_reads_a_register_the_stub_spilled`, which emits a body that puts
+a sentinel in RBX and in no frame word, jumps to the stub as a guard does, runs
+it, and asserts the reconstructed local is that sentinel. That is a stronger
+proof than a workload would have been, and it is currently the only one.
+
+#### How much of a real workload the optimizing tier reaches: the census
+
+**This is the prerequisite question, and it had never been asked.** Every
+measurement in this section — the 2.38x inversion, the four zeros, the five
+zeros, the register image — concerns the body the optimizing tier emits. None of
+them asked how often it emits one.
+
+`CRATONVM_DBG_IR_COMPILES=1` already answers it: the pipeline has four stages
+that can decline a method (`ir_compatible`, the admission conjunction,
+`IrBuilder::build`, `ir_lower`), and each reports which one it was. Run over
+CratonBench, one phase per process, with `CRATONVM_JIT=force-c2`:
+
+| phase | offered to the gate | admitted | reached lowering | why refused |
+|---|---|---|---|---|
+| arithmetic | **0** | 0 | 0 | never offered at all |
+| hashmap | **0** | 0 | 0 | never offered at all |
+| sieve | 2 | **0** | 0 | a bulk byte-array zero fill (`REP STOSB`) |
+| matrix | 1 | **0** | 0 | one `multianewarray` in the method |
+| fib | 1 | 1 | 1 | — |
+| bintrees | 4 | 4 | 4 | — |
+| stringregex | 91 | 65 | 52 | 22 `invokedynamic`, 12 String pin, 4 over the invoke cap, 1 precise frames |
+
+**On four of the seven kernels the optimizing tier lowers nothing at all**, and
+they are the loop-dominated four. That is the explanation for every zero this
+section records against a real workload, and it is a better explanation than any
+of the per-optimization ones: an A/B of an IR-tier switch on `sieve`, `matrix`,
+`arithmetic` or `hashmap` compares a binary against itself.
+
+Three distinct causes, and they want different answers:
+
+* **Never offered.** `arithmetic` and `hashmap` produce no `[ir]` line whatever
+  — the admission gate is not consulted once. Their hot code enters through OSR,
+  and `compile_osr_artifact` "reaches `x64::compile_with_param_slots` directly":
+  **the OSR door has never gone through the optimizing tier.** No flag changes
+  that.
+* **One instruction disqualifies the whole method.** `matmul` allocates its
+  result with a single `multianewarray` at the top and its hot triple loop is
+  refused along with it; `sieve` zero-fills a byte array once and pays the same.
+  Both refusals are of the form "the single-pass backend has an intrinsic here
+  and the IR tier has none", which is a fair trade when the intrinsic is hot and
+  the wrong one when it runs once per call against a loop that runs millions of
+  times. `CRATONVM_JIT_IR_OVER_INTRINSIC=1` already makes exactly this trade for
+  CALL-SITE intrinsics; neither of these two is covered by it.
+* **Attrition through the funnel.** Where the tier does work, it still loses most
+  of what it takes: `stringregex` goes 91 → 65 → 52 → **17 bodies**, and the
+  largest single loss at the builder is `new-site DEFERRED` — a class not yet
+  loaded when the compile ran, which `take_deferred_new_retry` grants exactly one
+  retry for.
+
+**What this changes about the work in this section.** The tier-inversion
+programme has been optimising a body that, on the kernels used to motivate it,
+is never emitted. Before another switch is added to `ir_lower`, the reach
+number is the one to move — and of the three causes, the OSR door is the largest
+and the only one no flag can reach.
+
+**Method note.** Read `[ir] admission` counts before believing a per-phase A/B,
+and do not read `compiles: c2=N` as "N optimizing-tier compiles": on `sieve` it
+says `c2=3` while the IR backend lowered nothing, because that counter is fed by
+the tier manager's nomination and not by the backend that ran.
+
+#### The OSR door: the go/no-go, and the blocker that is actually in the way
+
+The reach census named the OSR door as the largest cause and the only one no
+flag can reach. The first question is whether there is anything at the far end
+of a route through it, and `ir_compatible_sized` is pure and `scan` is already
+in hand at that door, so the question costs nothing to ask. Per CratonBench
+phase, over the methods actually compiled there:
+
+| phase | OSR compiles | pass `ir_compatible` |
+|---|---|---|
+| arithmetic | 1 | **1** |
+| hashmap | 1 | **1** |
+| sieve | 2 | **2** |
+| matrix | 1 | 0 (`multianewarray`) |
+| bintrees | 1 | **1** |
+| stringregex | 1 | **1** |
+
+**Six of seven**, and they include `arithmetic` and `hashmap` — the two phases
+where the optimizing tier is offered nothing whatsoever today. Read it as an
+UPPER BOUND: `ir_compatible` is the first of four gates, and `sieve` in
+particular would still be refused further down for its bulk byte-array zero
+fill. But the route is not empty, which is what a go/no-go needed.
+
+**The design that fits this codebase.** Do NOT teach `osr_trampoline` the IR
+frame. It takes some twenty layout parameters (`osr_local_assignments`,
+`osr_callee_saved_base`, `osr_xmm_saved_base`, …) because it builds the
+single-pass frame from OUTSIDE, and that arrangement depends on a property the
+optimizing tier does not have: a fixed per-method local→home map. IR locals are
+SSA values on colour-assigned slots that differ from bci to bci.
+
+Instead, have `ir_lower` emit its own OSR entry stub per eligible bci. It
+already holds everything needed and the trampoline holds none of it:
+
+* the frame — it built it, bookkeeping slots and save bands included;
+* where local `i` lives at bci `b` — the safepoint snapshot at `b` names the
+  node, and `node_slot` / `gp_reg_of` name its location. This is the same
+  information `build_deopt_points` already reads, used in the opposite
+  direction;
+* the native offset of `b` — `bci_native`.
+
+The VM side then needs only "is there an entry for this bci" and a
+three-argument call, instead of twenty layout fields. Entry bcis must have an
+EMPTY operand stack (a javac loop header does), and a `Ref` local must be
+seeded exactly where that bci's oop map says it lives.
+
+**The blocker, named precisely, because it is not the frame.** The optimizing
+tier's inputs — the invoke plans, `checkcast_info`, the `new`-site resolutions,
+the inline sites — are assembled inside `try_compile_inner`, and the OSR door
+does not go through it. `compile_osr_artifact` assembles a DIFFERENT set for the
+single-pass backend and calls `x64::compile_with_param_slots` directly. So the
+work is not "emit an entry stub"; it is "give this door the optimizing tier's
+input pipeline", and the honest way to do that is to route OSR through the
+common funnel rather than beside it.
+
+That refactor pays for itself twice. The same divergence has already produced
+three bugs this file records — the permanent bail-list, the bisect levers and
+the code-cache cap were each hand-copied to this door after a bug, and the
+`compile_gate::admit` token exists to stop a fourth. A door that goes through
+the funnel cannot drift from it again.
+
+**Not started, deliberately.** Entering a compiled body part-way with a
+hand-seeded frame is the failure mode that produces a plausible wrong number
+rather than a crash, and this section already records what happens when that
+class of work is begun without the instrument first. The census above is the
+instrument; the go is now on the record with a number behind it.
 
 ### Performance — current status
 
