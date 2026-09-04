@@ -1839,3 +1839,66 @@ makes the instrument ask a sound question, and it is the only thing standing
 between a future `NotOop` word and a spurious refusal to move. It costs a
 verifier lookup on a diagnostic path that only runs under the precise-only
 switches, and `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN=1` removes it.
+
+## 23. The in-map suppression test — a real effect, a wrong prediction, and new variance (2026-09-04)
+
+*`perf/band-in-map-suppression-test-20260904`. §22.3 named this test and
+declined to run it on one dump's evidence. Run now, behind
+`CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` (opt-in, default off).*
+
+### 23.1 The result
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| skip in-map | incomplete rate per rep | median | spread |
+|---|---|---:|---:|
+| off | 98.05, 98.25, 97.30, 98.22 % | **98.14 %** | 0.95 pts |
+| on | 84.15, 46.39, 92.50, 89.05 % | **86.60 %** | **46 pts** |
+
+`checksum=262248526` and `rc=0` on all eight.
+
+The effect is real — about **11.5 points** — and it is nothing like the
+prediction.
+
+### 23.2 The prediction was wrong in kind, not just in size
+
+§22.3 said "expect roughly a two-thirds fall", reasoning from the dump's 67 of
+93 WORDS being `in_map`. That inference does not hold: the rate is per PAUSE,
+and a pause is incomplete if ANY of its words is unpublished. Removing
+two-thirds of the words removes a pause from the count only when it removes
+ALL of that pause's words. A per-word proportion cannot be read as a per-pause
+one, and the 11.5 points measured against 65 predicted is the size of that
+mistake.
+
+Worth stating plainly because the surrounding sections are about instruments
+that answer a different question from the one asked of them, and this is the
+same error committed in the reasoning rather than in the code.
+
+### 23.3 The variance is the more interesting half
+
+The OFF arm spans 0.95 points — §21's stability holds. The ON arm spans 46,
+and its pause counts jump too (526-1013 against 259-462).
+
+That is not measurement noise; it is the suppression changing what the
+collector does. Fewer reported words means more cycles permitted to move,
+which changes the pause pattern, which changes the workload's behaviour — so
+the ON arm is not the same experiment run twice. §21's workload is stable for
+observing a metric, not for a change that alters the collector's decisions,
+and this is the first change in this line that does.
+
+Anything built on this needs its own stability answer first. A rate quoted from
+the ON arm today means nothing narrower than "between 46 and 93%".
+
+### 23.4 What it does not settle
+
+The claim §22.3 rests on — that a slot the active oop map names is rewritten by
+`remap_active_jit_frames` and so needs no shadow-stack publication — is neither
+confirmed nor refuted by an 11.5-point drop in a self-reported metric. What
+would confirm it is the stale-after-remap detector: with the suppression on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` should show no NEW stale word in an
+`in_map` slot. That is the next test, it is cheap, and it is a soundness
+question rather than a rate one — which is the right order after §22 showed
+four rate-screens in a row moved almost nothing.
+
+The flag ships opt-in and stays that way until that question is answered.

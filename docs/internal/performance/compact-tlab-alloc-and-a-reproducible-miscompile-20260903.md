@@ -99,7 +99,72 @@ re-planning, so the two cannot disagree by construction.
 | G1 | 499999500000 `OK`, compact=5024, 111,368 bytes saved |
 | ZGC | 499999500000 `OK`, compact=6540, 123,496 bytes saved |
 
-## Still default OFF, and here is why
+## Default ON since 2026-09-04
+
+The soak the previous section asked for was run, and it is the reason the
+default moved.
+
+### The differential soak
+
+231 programs from `apps/probes`, `probes/` and `bench/` compiled to 228
+runnable classes, run **per collector** with a three-run protocol: twice with
+the shape OFF, then once ON, comparing exit status and stdout byte for byte.
+
+The two-run version of this was wrong twice before it was right, and both
+mistakes are worth keeping:
+
+1. `rc=$?` after a **pipeline** captured `tr`'s status, not the VM's. It was
+   always 0, so rc divergence could never fire and a workload failing
+   identically in both arms was compared on output instead of excluded.
+2. Full stdout equality is the wrong oracle for a corpus that is mostly
+   benchmarks: 33 of 228 "diverged" on wall times and self-tuned iteration
+   counts. Masking timings by hand kept missing units (`ns/elem`) and can never
+   fix a probe that varies its own line count.
+
+The fix is the third run: **require the workload to agree with itself under a
+fixed configuration before letting it testify about a change.** No list to
+maintain, and a benchmark excludes itself by its own evidence.
+
+| collector | agree | divergent | non-deterministic | failed with switch off |
+|---|---|---|---|---|
+| Generational | 164 | 2 | 41 | 21 |
+| ZGC | 167 | 1 | 44 | 16 |
+| G1 | 165 | 1 | 41 | 21 |
+
+**496 deterministic program comparisons, zero semantic divergences.** All four
+flagged cases were examined:
+
+- `CpuClockCheck` (Gen) — a clock probe; `wall=500,0ms` against `wall=500,1ms`.
+  It slipped the stability filter because two OFF runs happened to round alike.
+- `TierOneArm` (ZGC) — `276 ns/op` against `401 ns/op`, with its actual result
+  `sink=1` identical.
+- `RandomLeak` (Gen and G1) — prints `javaHeapUsed`, and reports **14.7 MB
+  against 9.6 MB, a 35% reduction**, for byte-identical program output. That is
+  not a divergence, it is the change working.
+
+### The rest of the gate
+
+- `regression-suite/run.sh` **89/89 with the shape enabled** on the default
+  collector, under `-XX:+UseGenerationalGC` and under `-XX:+UseG1GC`. This is a
+  HotSpot-differential oracle, not a self-comparison, and it is the strongest
+  evidence here.
+- `FjpProbe` correct on all three collectors by default; `=0` restores the
+  legacy shape and the census reads `compact=0`.
+- Real applications from the H2 corpus: `TestCache` `rc=0` with **87.5 MB less
+  allocated** (1,872,185 of 2,508,687 objects compacted); `TestIntPerfectHash`,
+  `TestDataUtils` and `TestBitStream` all `rc=0`.
+- Throughput: a wash, eight alternated rounds, medians 16.6 s either way.
+
+### What is still not covered
+
+Spring, Tomcat, netty and Keycloak are not in this soak — their runners
+download fixtures this session could not fetch. The evidence above is 496
+program comparisons, a HotSpot-differential suite on three collectors, and
+four H2 applications. `CRATONVM_COMPACT_TLAB_ALLOC=0` restores the legacy
+shape exactly and is the first thing to set if an object is ever suspected of
+being read at the wrong offset.
+
+## The case for OFF, as it stood before the soak
 
 `CRATONVM_COMPACT_TLAB_ALLOC=1`. What the switch now has behind it:
 
