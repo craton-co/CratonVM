@@ -3687,6 +3687,31 @@ impl ZgcRealHeap {
         // probe. Registering on demand rather than pre-registering the whole
         // grid keeps the table to the pages that actually hold old objects with
         // written fields.
+        // ONE lookup, not two. `register_old_page` already returns the set it
+        // found or created; asking the table for the same page again -- which
+        // `ZRememberedTable::remember(page_id, ..)` does -- is a second
+        // `RwLock` reader acquire and a second FxHash probe on the hot path of
+        // every old-generation reference store in the VM.
+        //
+        // `card_object_two_lookups` below keeps the old shape so the A/B in
+        // `measure_the_card_barrier` is a call apart rather than a rebuild.
+        let set = self
+            .remembered
+            .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
+        set.remember(offset);
+    }
+
+    /// [`Self::card_object`] as it was before 2026-09-04: register, then look
+    /// the same page up a second time to set the bit. Kept only as the A/B arm
+    /// for `measure_the_card_barrier`; nothing on a live path calls it.
+    #[cfg(test)]
+    fn card_object_two_lookups(&self, obj_addr: usize) {
+        let base = self.arena_base;
+        if base == 0 || obj_addr < base {
+            return;
+        }
+        let page = ((obj_addr - base) / Self::Z_LOGICAL_PAGE_BYTES) as u64;
+        let offset = (obj_addr - base) % Self::Z_LOGICAL_PAGE_BYTES;
         self.remembered
             .register_old_page(page, Self::Z_LOGICAL_PAGE_BYTES);
         self.remember_old_to_young(page, offset);
@@ -21045,6 +21070,68 @@ pub(crate) mod tests {
         assert_eq!(alloc_trigger_percent_for(Some(12), 200), 12);
         assert_eq!(alloc_trigger_percent_for(Some(50), 200), 50);
         assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
+    }
+
+    /// COMPONENT MEASUREMENT for the card barrier's per-store cost.
+    ///
+    /// `card_object` runs on every reference store into an OLD object once
+    /// anything has been promoted, and it used to ask the remembered-set table
+    /// for the same page twice: `register_old_page` takes an `RwLock` reader
+    /// and an FxHash probe to find or create the set, and then
+    /// `ZRememberedTable::remember(page_id, ..)` takes another of each to find
+    /// the set it just returned. Reusing the handle removes one of each.
+    ///
+    /// Both arms in one process, so this is not a cross-binary comparison.
+    /// Ignored: wants `--release` and a quiet box.
+    ///
+    ///   cargo test -p cratonvm-gc --features zgc --release --lib -- --ignored     ///     --nocapture measure_the_card_barrier
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_card_barrier() {
+        const STORES: u32 = 3_000_000;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+        // A spread of old objects across several logical pages, so the table
+        // holds more than one entry and the hash probe is not a single-key
+        // degenerate case.
+        let mut objs: Vec<usize> = Vec::new();
+        for _ in 0..64 {
+            objs.push(heap.alloc_object(ClassId::new(7), 3).as_ptr() as usize);
+        }
+        // Warm both arms so neither pays the create path in its timed loop.
+        for &o in &objs {
+            heap.card_object(o);
+            heap.card_object_two_lookups(o);
+        }
+        println!("{:>14}  {:>12}  {:>12}", "arm", "total_ms", "ns/store");
+        let mut run = |name: &str, two: bool| -> f64 {
+            let t = std::time::Instant::now();
+            for i in 0..STORES {
+                let o = objs[(i as usize) % objs.len()];
+                if two {
+                    heap.card_object_two_lookups(o);
+                } else {
+                    heap.card_object(o);
+                }
+            }
+            let el = t.elapsed();
+            let ns = el.as_nanos() as f64 / STORES as f64;
+            println!("{name:>14}  {:>12.1}  {ns:>12.2}", el.as_secs_f64() * 1e3);
+            ns
+        };
+        // Interleaved and repeated: a fixed arm order manufactures a winner
+        // when the machine drifts, which is the mistake `measure_the_sharded_sweep`
+        // records paying for.
+        let mut one_best = f64::MAX;
+        let mut two_best = f64::MAX;
+        for _ in 0..3 {
+            two_best = two_best.min(run("two lookups", true));
+            one_best = one_best.min(run("one lookup", false));
+        }
+        println!(
+            "[card-barrier] best: two={two_best:.2} ns/store  one={one_best:.2} ns/store               speedup={:.2}x",
+            two_best / one_best.max(f64::MIN_POSITIVE)
+        );
     }
 
     /// A pause target is a CEILING: a pause under it must not move anything.
