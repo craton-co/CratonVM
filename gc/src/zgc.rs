@@ -7285,12 +7285,11 @@ impl ZgcRealHeap {
     /// relocation filter.
     ///
     /// Not fixed here because the fix wants its own change and its own test --
-    /// see
-    /// `docs/known-issues/h2/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md`,
-    /// which records the crash that led here and what it does and does not
-    /// establish. JNI's own array path does NOT depend on this: it hands out a
-    /// detached copy and mints a global ref as the keep-alive
-    /// (`vm/src/native/jni.rs`).
+    /// the one the current code would fail, which is
+    /// `docs/known-issues/gc-critical-pin-does-not-keep-the-object-alive-20260904.md`.
+    /// JNI's own array path does NOT depend on this: it hands out a detached
+    /// copy and mints a global ref as the keep-alive (`vm/src/native/jni.rs`),
+    /// which is why this has not been a crash.
     fn critical_pin_addrs(&self) -> Vec<usize> {
         let pins = self.counters.critical_pins.lock();
         if pins.is_empty() {

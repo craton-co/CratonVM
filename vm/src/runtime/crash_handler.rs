@@ -2748,8 +2748,9 @@ not an address\n",
         // pointer. A hit here turns that register dump into a named mechanism,
         // and the site names WHICH proof was wrong.
         //
-        // Built for the crash recorded in
-        // `docs/known-issues/h2/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md`.
+        // Built after a crash of this exact family was diagnosed through gdb
+        // instead, because the report had nothing to say about it --
+        // `docs/internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
         if fault_addr_is_real {
             let mut rbuf = [0u8; 16];
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  gc_decommits_total=0x");
