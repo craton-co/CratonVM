@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -133,24 +133,33 @@ fn run(mode: &str) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn class-loader unloading probe");
-    let start = Instant::now();
-    loop {
-        match child.try_wait().expect("poll class-loader unloading probe") {
-            Some(_) => break,
-            None if start.elapsed() < Duration::from_secs(180) => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            None => {
-                let _ = child.kill();
-                panic!("class-loader unloading probe timed out in {mode} mode");
-            }
-        }
-    }
-    let output = child.wait_with_output().expect("collect probe output");
+    // DRAIN WHILE WAITING. The loop this replaces polled `try_wait` and only
+    // read the pipes afterwards, through `wait_with_output` — so the child
+    // blocked in `write` once it had produced 64 KiB (the Linux pipe capacity)
+    // and could never exit. This probe calls `System.gc()` about 180 times, and
+    // its stderr was 101,808 bytes of `[GC]` lines against 124 bytes of stdout,
+    // so it crossed that limit on every run: the test reported a 180 s timeout
+    // in both jit and nojit modes, deterministically, on a quiet host, and the
+    // probe had nothing to do with it. Run with its output to a file the same
+    // probe finishes in under 20 s and prints `ok=true`.
+    //
+    // See `common::wait_draining`. The GC noise is separately gated now, but
+    // that is not what makes this safe — a test must not depend on the process
+    // it drives staying under 64 KiB.
+    let timed = common::wait_draining(child, Duration::from_secs(180));
+    let output = timed.output;
     let combined = format!(
         "{}\n--- STDERR ---\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    // Reported BEFORE the exit-status check, and carrying what the child
+    // managed to say. The bare `panic!("timed out")` this replaces is why the
+    // pipe deadlock read as a class-unloading defect for as long as it did.
+    assert!(
+        !timed.timed_out,
+        "class-loader unloading probe timed out in {mode} mode. Output captured before \
+         the cap:\n{combined}"
     );
     assert!(output.status.success(), "{mode} probe failed:\n{combined}");
     assert!(
