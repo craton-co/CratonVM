@@ -1256,10 +1256,22 @@ not a refusal.
 
 One binary, the flag the only difference, 1500 s cap:
 
-| arm | SIGSEGV | ref-array OOM | `actual` | outcome |
-|---|---|---|---|---|
-| guard ON | **0 / 4** | 8344, 9382 | — | did not complete |
-| guard OFF | 1 / 2 | **0** | **99966** | completed in 462 s |
+| arm | exit | ref-array OOM | `actual` |
+|---|---|---|---|
+| guard ON, run 1 | timeout 1501 s | 8344 | — |
+| guard ON, run 2 | timeout 1500 s | 9382 | — |
+| guard ON, run 3 | timeout 1500 s | 10118 | — |
+| guard ON, run 4 | timeout 1500 s | 11004 | — |
+| guard OFF, run 1 | **SIGSEGV** 306 s | 0 | — |
+| guard OFF, run 2 | completed 462 s | **0** | **99966** |
+
+Guard ON: **0 SIGSEGV in 4**, mean **9712** OOMs, NOT ONE RUN COMPLETED. The
+four counts rise monotonically (8344 -> 11004), so they are FLOORS -- what
+accumulated before the cap killed each run, not totals.
+
+The comparison is generous to the guard: its OOMs are what 1500 s produced,
+while the unguarded arm reached zero OOMs and finished in 462 s. There is no
+duration at which the unguarded arm produces one.
 
 So the guard WORKS as a crash fix, and it is not shippable: it trades the
 SIGSEGV for the exact `OutOfMemoryError` this page exists to remove. For scale,
