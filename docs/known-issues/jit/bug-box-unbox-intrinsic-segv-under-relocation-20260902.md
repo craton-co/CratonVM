@@ -294,7 +294,50 @@ not a fix anyone can ship: the same 4 runs log 8-9 k fragmentation
 `OutOfMemoryError`s and never complete, where the unguarded arm finishes in
 462 s with ZERO. Full numbers on the H2 page.
 
-### 2026-09-03 (final): four fixes, and the one that works says WHERE the defect is
+### 2026-09-04: FIVE remedies measured; the elimination inference was WRONG
+
+| remedy | what it covers | SIGSEGV | OOM |
+|---|---|---|---|
+| pin unnamed frame refs | this thread's frame slots (96 M pins) | no fix | -- |
+| rewrite unmapped dupes | this thread's frame slots (68 words) | no fix | -- |
+| `local_mask_unreached` fail-closed | this thread's safepoint maps | 3 / 4 | **0** |
+| **blocked-wake JIT remap** | **blocked PEERS' frames + regs + shadow** | **3 / 4** | **0** |
+| blanket guard | any thread in JIT | **0 / 4** | ~9700 |
+
+The entry below inferred, from "only the peer-covering remedy works", that the
+defect was a blocked peer resuming with un-remapped compiled state. That
+inference is REFUTED: `apply_pending_blocked_fixups` now remaps a waking
+thread's JIT frames, register image and shadow stack -- exactly that population
+-- and the crash is unchanged at 3 of 4, against a control at 2 of 2.
+
+The omission was real and is worth keeping (see below); it was not this crash.
+
+**What that leaves.** The blanket guard refuses when `is_active()` -- ANY thread
+in compiled code, including the INITIATOR and cooperatively PARKED peers, not
+just blocked ones. Four remedies have now covered: this thread's frame slots,
+this thread's safepoint maps, and blocked peers' full compiled state. The
+population none of them reaches is an OS-SUSPENDED in-JIT peer -- the `taken`
+threads of the xt scan, stopped mid-compiled-code by signal or `SuspendThread`,
+whose machine registers are captured by the scanner but which run no
+`apply_pointer_map_to_thread` of their own. That is the next place to look, and
+it is the last population the guard covers that nothing else does.
+
+**Two omissions closed on the way, both real, both free, neither this crash:**
+
+* `local_mask_unreached` -- a safepoint whose local-oop dataflow was never
+  reached shipped a map claiming complete coverage while naming none of its live
+  reference locals, `125` and dominant on this workload, while the SHADOW half
+  counted the same population and refused. Zero measured OOM cost.
+* the blocked-wake JIT remap -- `apply_pending_blocked_fixups` remapped
+  interpreter frames and nothing compiled, so a peer that blocked with compiled
+  frames below it resumed with every JIT oop at its pre-move address. The
+  STW-resume path has carried this block for the PARKED case since it was found
+  there. Zero measured OOM cost.
+
+Both are use-after-free shaped, both cost nothing, and both should land on their
+own merits rather than waiting on the crash they do not fix.
+
+### SUPERSEDED (2026-09-03): four fixes, and the one that works says WHERE the defect is
 
 | attempt | what it covers | SIGSEGV | OOM cost |
 |---|---|---|---|
