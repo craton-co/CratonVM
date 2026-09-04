@@ -3656,18 +3656,26 @@ pub(super) fn try_osr(
             //
             // x86-64 only: `osr_enter_planned` is `#[cfg(target_arch =
             // "x86_64")]`. Reaching here off x86-64 would mean an artifact
-            // published OSR entry points, and no other backend does -- so this
-            // is unreachable rather than merely unsupported, and says so.
+            // published OSR entry points, and no other backend does, so
+            // `should_try_osr` refuses long before here.
             #[cfg(target_arch = "x86_64")]
             {
                 unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
             }
+            // `None`, NOT `unreachable!()`. The reasoning above is sound and
+            // the panic was still the wrong answer twice over. `None` is this
+            // call's existing word for "no entry was taken" -- the caller
+            // matches `Ok(None) => return None` and the interpreter carries on
+            // in the frame it is already in -- so an argument that turns out to
+            // be wrong on some future backend degrades to running the loop
+            // interpreted instead of aborting the VM. And the panic-free gate
+            // over this module is a TEXT scanner: it does not evaluate `cfg`,
+            // so a site compiled out of every x86-64 build still counted
+            // against a budget of zero and turned the gate red for everyone.
             #[cfg(not(target_arch = "x86_64"))]
             {
                 let _ = (&osr_state, &plan, thread_ptr, vm_ptr);
-                unreachable!(
-                    "OSR entry reached on a backend that publishes no OSR entry                      points; `should_try_osr` should have refused long before here"
-                )
+                None
             }
         }));
         // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
