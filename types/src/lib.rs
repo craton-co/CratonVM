@@ -791,6 +791,42 @@ pub mod gc_entry_census {
         FROM_NATIVE.fetch_add(1, Ordering::Relaxed);
     }
 
+    static REFILL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFILL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_TOTAL_AT_EXIT: AtomicU64 = AtomicU64::new(0);
+
+    /// One `refill_tlab` call and whether it produced a chunk.
+    ///
+    /// The wedge break fires after 16,384 CONSECUTIVE failures, and the
+    /// counter only resets on a success -- so "does refill ever succeed"
+    /// decides whether the breaker is armed permanently or not at all. On
+    /// ZGC `refill_tlab` is opt-in (`CRATONVM_ZGC_JIT_TLAB`), so the
+    /// expectation is zero successes and the interesting number is how
+    /// many bytes flow past it.
+    #[inline]
+    pub fn note_refill(success: bool) {
+        REFILL_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if success {
+            REFILL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish `bytes_allocated_total` for the exit line. It is the wedge
+    /// break's RE-ARM metric (one break per 64 MB), so it, not the
+    /// collection count, is what sets how often the breaker can fire.
+    pub fn note_alloc_total(bytes: u64) {
+        ALLOC_TOTAL_AT_EXIT.store(bytes, Ordering::Relaxed);
+    }
+
+    /// `(attempts, successes, alloc_total)`.
+    pub fn refill_totals() -> (u64, u64, u64) {
+        (
+            REFILL_ATTEMPTS.load(Ordering::Relaxed),
+            REFILL_SUCCESSES.load(Ordering::Relaxed),
+            ALLOC_TOTAL_AT_EXIT.load(Ordering::Relaxed),
+        )
+    }
+
     /// `(maybe_gc_needs, maybe_gc_requested, forced, from_native)`.
     pub fn totals() -> (u64, u64, u64, u64) {
         (

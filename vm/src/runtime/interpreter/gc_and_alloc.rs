@@ -3817,6 +3817,7 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
         return false;
     }
     let alloc_total = shared.mem.bytes_allocated_total.load(Ordering::Relaxed);
+    cratonvm_types::gc_entry_census::note_alloc_total(alloc_total);
     let last = TLAB_LAST_BREAK_ALLOC_TOTAL.load(Ordering::Relaxed);
     if last != 0 && alloc_total.saturating_sub(last) < WEDGE_REARM_BYTES {
         return false;
@@ -4294,6 +4295,7 @@ pub(super) fn tlab_alloc_shaped_inner(
     thread.tlab.retire();
 
     let mut refill = shared.mem.heap.refill_tlab(requested);
+    cratonvm_types::gc_entry_census::note_refill(refill.is_some());
     if refill.is_none() {
         dbg_refill_fail(1, requested);
         // Second-wedge fix, stage-1 arm (perf/halfgap-20260717): the gate
