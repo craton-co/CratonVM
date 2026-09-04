@@ -16147,6 +16147,27 @@ pub(crate) mod tests {
     /// `--verbose:gc`'s `sweep_us` on a real workload before moving the
     /// default; this measures the phase in isolation, which is the best case
     /// for parallelism and therefore an upper bound.
+    ///
+    /// # A PROVISIONAL reading, and why it is not a result
+    ///
+    /// First run after the complement was sharded (2026-09-04), 768 MiB heap,
+    /// 8.26M dead objects, best `sweep_us` of three reps:
+    ///
+    /// | workers | 1 | 2 | 4 | 8 | 32 |
+    /// |---|---|---|---|---|---|
+    /// | sweep_us | 217 ms | 206 | 188 | 165 | 168 |
+    ///
+    /// That is 1.3x at eight workers and a plateau after -- far short of what
+    /// "a linear scan with an independent body" predicts, and close enough to
+    /// the shape of the 2026-08-14 parallel-marking result to be worth naming.
+    ///
+    /// **But the box was at 90% CPU from unrelated work when it was taken**,
+    /// and host contention suppresses precisely the thing being measured: added
+    /// workers compete with the load rather than with each other. So this is a
+    /// LOWER BOUND on the speedup and not a measurement of it. Anyone moving
+    /// the default needs this on an idle machine first; if it still reads 1.3x
+    /// there, the phase is bandwidth bound and the switch should be deleted
+    /// rather than defaulted on.
     #[test]
     #[ignore = "timing measurement; wants --release and a quiet box"]
     fn measure_the_sharded_sweep() {
