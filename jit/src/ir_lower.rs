@@ -11637,6 +11637,17 @@ fn refuse(bailout: Bailout) -> Option<CompiledMethod> {
         eprintln!("[ir-bailout] {bailout}");
     }
     record_bailout(&bailout);
+    // Attribution, not duplication — the same split `verify_or_bail` makes:
+    // `record_bailout` owns the process-wide category counters, and this
+    // attaches the bailout to *this* method in the per-compilation report.
+    //
+    // Without it the report's `bailouts` field is STRUCTURALLY empty for every
+    // lowering refusal: a census over CratonBench read `bailouts:[]` on all 105
+    // compilations, including the 17 that fell through to single-pass, so the
+    // one record that names both the method and the reason named neither. The
+    // counters were moving the whole time, which is what made the hole hard to
+    // see — the totals looked alive while every per-method row was blank.
+    crate::metrics::note_current_bailout(&bailout, "lower");
     None
 }
 

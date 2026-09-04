@@ -1016,11 +1016,24 @@ bodies are equal modulo relocations and unequal as bytes. Detecting "unchanged"
 would mean building a relocation table for a case that should not be created in
 the first place.
 
-**And the cost it was going to save is not there.** `epoch_stale_evictions()`
-counts the invoke-cache entries the epoch actually throws away. Over a whole
-CratonBench run: **9**. Over the regex workload: **0**. The invalidation is
-global in reach but each call site evicts once and refills, so the seven
-"wasted" bumps cost nine IC refills, not thousands.
+**And the cost it was going to save is not there** — though not for the reason
+first written here. `epoch_stale_evictions()` counts the invoke-cache entries
+the epoch actually throws away. Over a whole CratonBench run: **9**. Over the
+regex workload: **0**.
+
+**That measurement does not generalize, and this document claimed it did.** On
+an H2 test class (`org.h2.test.db.TestAlter`, 612 compilations) the same counter
+reads **2,640** — roughly 290x the CratonBench figure, because the cost scales
+with live call sites and CratonBench has almost none. The original wording,
+"measured worthless: 9 IC evictions/run", was a micro-benchmark number presented
+as a property of the mechanism.
+
+The *conclusion* survives, on different evidence. On that same H2 run the
+supersede census reads `first_publish=0 unchanged=0 changed=75`: every publish
+replaced a genuinely different body, so every bump was owed, and
+`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` would have skipped **none** of them.
+The switch stays off because there is nothing for it to skip on a real workload,
+not because skipping would be cheap.
 
 So the suppression is implemented, correct, and **off by default**
 (`CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1`). Two of the three outcomes
@@ -1143,6 +1156,62 @@ Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
 1502 bytes depending on inlining, and an exact-size probe reads a body that got
 7 bytes bigger as no body at all.
 
+### Why a method falls through: the refusals could not be counted
+
+`bailout.rs`'s own module doc names the gap: of the three ways the compiler says
+"I cannot compile this", `Option::None` from `IrBuilder::build` and
+`ir_lower::lower_inner` "carries no reason at all, so the per-method compiler
+report the review asks for (admitted/bailout counts by reason) cannot be
+produced." It could not, and nothing said so out loud — the per-compilation
+record has carried an empty `bailouts` array since it was added.
+
+Measured before touching anything: over CratonBench, **all 105** compilations
+reported `bailouts:[]`, including the 17 that fell through to single-pass. The
+process-wide category counters were moving the whole time, which is what made
+the hole hard to see — the totals looked alive while every per-method row was
+blank.
+
+Two halves were missing, and both are the same one-line split `verify_or_bail`
+already documents ("attribution, not duplication"): `record_bailout` owns the
+process-wide counters, `metrics::note_current_bailout` attaches the same bailout
+to *this* method. `ir_lower::refuse` did the first and not the second;
+`ir::ir_build_bail` did neither.
+
+With both wired, on `org.h2.test.db.TestAlter` (612 compilations, 50
+fall-throughs) **50 of 50 now name a reason**, where 6 did before:
+
+| reason | phase | count |
+|---|---|---|
+| `unsupported_shape` | build | 38 |
+| `unsupported_opcode` | build | 6 — five `0x53` (`aastore`), one `0x5c` (`dup2`) |
+| `unallocated_value` | lower | 4 |
+| `code_buffer_exhausted` | lower | 2 |
+
+Read with `CRATONVM_JIT_METRICS=1 CRATONVM_JIT_METRICS_OUT=<path>`, one JSON
+object per compilation.
+
+#### What the census then said: a block-placement defect, not a sizing one
+
+The investigation started from the hypothesis that large methods fail on code
+buffer capacity. That is real but rare — 2 of 50. The dominant lowering refusal
+is `unallocated_value`: **a value emitted after its own use**.
+
+    StringUTF16.compress   n21 (Call)    at position 15, used by n34 (Return) at 12
+    Pattern.range          n51 (Cmp(Ne)) at position 51, used by n57 (If)     at 21
+
+`verify_data_locations` models emission as blocks in index order, so a use at 21
+and a def at 51 means the definition's *block* is laid out after its user's.
+`ir_schedule`'s own module doc states the opposite as invariant 1 — the layout
+"keeps every definition before every use, so no live range inverts" — so this is
+a violated invariant, not a missing feature. On H2 it denies the optimizing tier
+to `java/lang/String.equals` and `java/lang/StringLatin1.equals`, among the
+hottest methods in any workload.
+
+Not caused by the 2026-09-02 switches: `CRATONVM_JIT_IR_FUSED_BRANCH=0` and
+`CRATONVM_JIT_IR_LINEAR_SCAN=0` each still produce exactly 3 on CratonBench.
+Left open — correcting global code motion is a change to every compiled method,
+and it wants its own branch and its own per-collector sweep.
+
 ### Summary table
 
 | Feature | Default | Opt-out / opt-in var |
@@ -1166,7 +1235,7 @@ Generational at 2/5 when the true figure was 4/4. The re-offered body is 1495 or
 | Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
 | IR-tier register residency (GP + FP files) | **ON** since 2026-09-02, phis included | `CRATONVM_JIT_IR_LINEAR_SCAN=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0` |
 | IR-tier constants as immediates | **ON** | `CRATONVM_JIT_IR_CONST_IMM=0` |
-| Skip the supersede-epoch bump when it cannot invalidate anything | off (measured worthless: 9 IC evictions/run) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
+| Skip the supersede-epoch bump when it cannot invalidate anything | off (nothing to skip: H2 shows 75/75 publishes genuinely changed) | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | Deferred-`new` retry held until the class resolves | **ON** | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND=1` |
 | IR-tier fused compare-and-branch, trampoline-free branches | **ON** | `CRATONVM_JIT_IR_FUSED_BRANCH=0` |
 | IR-tier receiver-guard CSE (once per receiver per block) | **ON** | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE=0` |
