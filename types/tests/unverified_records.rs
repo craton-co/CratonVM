@@ -180,10 +180,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: MEASURED (the defect) / FIXED-UNVERIFIED (the fix).** The divergence",
     ),
     (
-        "docs/known-issues/jdk-only/H13-2-all-four-assigned-defects-were-closed-and-the-probe-found-two-more-20260820.md",
-        "status block says: are **MEASURED** defects with **FIXED-UNVERIFIED** repairs: no binary carrying",
-    ),
-    (
         "docs/known-issues/jdk-only/H2-1-the-filetime-epoch-and-the-queue-lock-20260820.md",
         "status block says: **Status** `FIXED-UNVERIFIED` — **no binary carrying these changes has been",
     ),
