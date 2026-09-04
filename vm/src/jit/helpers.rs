@@ -1288,7 +1288,46 @@ pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
 /// address if a collection intervened, because the slot it comes out of is
 /// rooted and remapped (`memory/roots.rs` §10, `memory/gc.rs` §10).
 pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
-    thread.jit_pending_exception.take()
+    let exc = thread.jit_pending_exception.take();
+    if exc.is_some() {
+        drain_superseded_implicit_signals();
+    }
+    exc
+}
+
+/// Drop the implicit-trap flags when a real exception is being delivered.
+///
+/// An implicit signal (`npe`, `aioobe`, `arithmetic`) is a REQUEST for a
+/// throwable, not a throwable. Once another exception is in flight, that request
+/// can never be granted: the frame whose trap raised it is unwinding, and no
+/// door downstream owns the flag. Leaving it set is not inert -- the next
+/// unrelated JIT call drains it and builds a fresh exception at a site that
+/// never faulted.
+///
+/// The shape that found this (2026-09-03, see
+/// `known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`): the
+/// lambda direct arm finishes a deopted body in the interpreter and returns a
+/// zero with the real NPE parked in `jit_pending_exception`, exactly as its
+/// contract says. Compiled code then evaluates the second operand of the same
+/// expression before its post-invoke guard fires, dereferences the SAME null and
+/// raises a second trap. The first exception is delivered and caught; the second
+/// flag survives two iterations and surfaces as a `NullPointerException` for a
+/// receiver that was never null.
+///
+/// This is the same rule [`take_all_jit_signals`] already applies by taking
+/// everything at once -- stated for the other consumption point, so the two
+/// cannot disagree about whether a signal outlives the exception that overtook
+/// it. The deopt flag is deliberately NOT dropped: it describes the compiled
+/// frame's fate, which an exception does not settle.
+fn drain_superseded_implicit_signals() {
+    if take_jit_pending_npe() {
+        // The snapshot was taken for a raise that will never happen; a later
+        // drain would attach frames the raising code has long since left.
+        let _ = take_jit_pending_npe_action();
+        let _ = take_jit_pending_npe_compiled_frames();
+    }
+    let _ = take_jit_pending_aioobe();
+    let _ = take_jit_pending_arithmetic();
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
