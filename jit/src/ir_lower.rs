@@ -5660,12 +5660,22 @@ impl<'a> Lowerer<'a> {
                 // local_offset(i) = (i + 1) * 8
                 let param_offset = ((*idx as i32) + 1) * 8;
                 self.load_to_rax(param_offset);
-                self.store_rax(slot);
                 // An FP parameter is a loop invariant often enough to be worth
                 // a register; the copy comes from the home word this just
                 // wrote, because the prologue delivered it through a GPR.
-                if matches!(node.ty, IrType::Float | IrType::Double) {
-                    self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                //
+                // An INT or LONG parameter is exactly as much a loop invariant,
+                // and got nothing until 2026-09-03. `gp_store_value` writes the
+                // home word and then copies RAX into the register, so the
+                // publish here is register-to-register — no reload of a word
+                // this arm just wrote.
+                if matches!(node.ty, IrType::Int | IrType::Long) {
+                    self.gp_store_value(id, slot, RAX);
+                } else {
+                    self.store_rax(slot);
+                    if matches!(node.ty, IrType::Float | IrType::Double) {
+                        self.publish_fp_from_slot(id, slot, node.ty == IrType::Double);
+                    }
                 }
             }
             Op::Add => {
@@ -10889,6 +10899,25 @@ fn ir_residency_loop_weight_enabled() -> bool {
     })
 }
 
+/// Copy a loop-live int/long PARAMETER into a callee-saved register at entry —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_PARAM_COPY=1`.
+///
+/// The optimizing tier cannot promote an entry parameter at all: they are
+/// pinned to their incoming ABI registers, which are caller-saved and outside
+/// this file, and the allocator skips a pinned value. The baseline tier copies
+/// them into callee-saved registers in its prologue and reads them from there;
+/// this is that copy.
+///
+/// Off is exactly the previous emission: the parameter reaches every use
+/// through its frame slot.
+fn ir_param_prologue_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_PARAM_COPY").is_some()
+    })
+}
+
 fn ir_this_nonnull_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -11243,6 +11272,8 @@ fn plan_register_residency(
     let (mut skip_split, mut skip_bank, mut skip_home, mut skip_phi) = (0usize, 0, 0, 0);
     // Split apart from `skip_split` on 2026-09-03: see the refusal below.
     let (mut skip_no_alloc, mut skip_spilled) = (0usize, 0usize);
+    // Parameters copied into a callee-saved register by the prologue.
+    let mut param_copies = 0usize;
     // 2026-09-02, measured: promotion is not free, and two populations pay for
     // it without ever collecting.
     //
@@ -11494,6 +11525,70 @@ fn plan_register_residency(
         }
     }
 
+    // ── Entry parameters, which the allocator cannot reach ───────────
+    //
+    // `MachineModel::pin_entry_params` pins every `Param` to its INCOMING ABI
+    // register, and `allocate_linear_scan` skips a pinned value outright. Those
+    // ABI registers are caller-saved and are not in `IR_LOWER_LS_GPRS`, so a
+    // parameter can never be promoted into the callee-saved file however the
+    // heuristics are tuned — it reaches a loop through its frame slot, every
+    // iteration, by construction.
+    //
+    // That is what the 2026-09-03 disassembly of the inverted `fieldloop`
+    // showed: `mov rcx,[rbp-60h]` reloading the loop bound on every iteration,
+    // while the baseline tier had copied it into a callee-saved register in its
+    // prologue (`mov r14,rdx`) and read it from there.
+    //
+    // So the copy is made here instead, out of a register the ALLOCATOR DID NOT
+    // USE. That is the whole safety argument: an unassigned register in this
+    // file is written by nothing else — only the residency machinery publishes
+    // into it — and every register in the file is callee-saved, so a call
+    // cannot destroy it either. The parameter is SSA and never redefined, so
+    // one publish at entry is good for the whole method.
+    //
+    // `IrType::Ref` is excluded for the reason the bank match above gives, and
+    // it is not a tuning choice: `OopMapEntry` names frame slots only, so a
+    // reference in a register is invisible to a root walk and cannot be
+    // updated on evacuation. The receiver therefore stays in its frame slot,
+    // and closing that needs oop maps that can name a register.
+    if ir_param_prologue_copy_enabled() {
+        let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
+        taken.sort_unstable();
+        taken.dedup();
+        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+            .iter()
+            .copied()
+            .filter(|r| !taken.contains(r))
+            .collect();
+        for id in 0..n {
+            if free.is_empty() {
+                break;
+            }
+            if gp_reg_of.get(id).copied().flatten().is_some() {
+                continue;
+            }
+            let Some(node) = graph.nodes.get(id) else {
+                continue;
+            };
+            if !matches!(node.op, Op::Param(_)) {
+                continue;
+            }
+            if !matches!(node.ty, IrType::Int | IrType::Long) {
+                continue;
+            }
+            // Worth a register only if the reads outnumber the one publish.
+            // Loop-weighted, because a parameter's uses are typically inside a
+            // loop its definition is not.
+            if live.weight.get(id).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            if let Some(reg) = free.pop() {
+                gp_reg_of[id] = Some(reg);
+                param_copies += 1;
+            }
+        }
+    }
+
     let fp_promoted = reg_of.iter().filter(|r| r.is_some()).count();
     let gp_promoted = gp_reg_of.iter().filter(|r| r.is_some()).count();
     let promoted = fp_promoted + gp_promoted;
@@ -11514,7 +11609,7 @@ fn plan_register_residency(
         eprintln!(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
-             const={skip_const} single_use={skip_single_use} \
+             const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
              spilled={skip_spilled} no_alloc={skip_no_alloc}"
         );
     }
