@@ -139,6 +139,10 @@ const DEOPT_ARG1: u8 = 2; // RDX
 const DEOPT_ARG0: u8 = 7; // RDI
 #[cfg(not(target_os = "windows"))]
 const DEOPT_ARG1: u8 = 6; // RSI
+#[cfg(target_os = "windows")]
+const DEOPT_ARG2: u8 = 8; // R8
+#[cfg(not(target_os = "windows"))]
+const DEOPT_ARG2: u8 = 2; // RDX
 
 /// Bytes of caller shadow space reserved above `rsp` for the deopt stub's
 /// `call ir_deopt_entry` (Win64 requires 32; harmless on SysV). Kept clear of
@@ -751,6 +755,13 @@ struct Lowerer<'a> {
     /// shadow space, the arg-staging region AND the callee-saved XMM save area,
     /// so spills never overlap any of them.
     spill_cap_off: i32,
+    /// Offset of `gpr[0]` in the deopt register image: the stub spills the
+    /// whole file to `[rbp - deopt_regs_base .. +256)` and hands
+    /// `ir_deopt_entry` a `*const SavedRegisters` pointing at it.
+    ///
+    /// Zero when [`ir_deopt_regs_bytes`] reserved nothing, which is the signal
+    /// the stub reads to keep its historical two-argument shape.
+    deopt_regs_base: i32,
     /// Bytes reserved for the callee-saved XMM save area, `[spill_cap_off,
     /// spill_cap_off + this)`. See [`ir_saved_xmm_bytes`] and
     /// [`IR_LOWER_SAVED_XMMS`].
@@ -894,6 +905,26 @@ struct Lowerer<'a> {
     /// finding from "it fired and did not pay".
     phi_copy_reg_reads: usize,
     phi_copy_reg_publishes: usize,
+    /// `deopt_nameable[id]` — a deopt frame may describe `id` as living in its
+    /// register rather than in its home word.
+    ///
+    /// **The rule is exclusive ownership, and it is deliberately stronger than
+    /// "the value is resident".** A register-allocated value owns its register
+    /// only over its LIVE RANGE, and `plan_register_residency` releases the
+    /// deopt pins, so a bytecode local can still be named by a frame state long
+    /// after its last IR use — by which time the allocator may have given the
+    /// register to something else. Naming it then would reconstruct a
+    /// confidently wrong value, which is the failure mode this area produces.
+    ///
+    /// So a value is nameable only when **no other value anywhere in the method
+    /// is assigned the same register**. Then the register holds that value from
+    /// its definition to the end of the frame, no position mapping between
+    /// `graph.safepoints` and the allocator's positions is needed, and the
+    /// question "is the register still his at THIS bci" cannot be got wrong.
+    deopt_nameable: Vec<bool>,
+    /// How many frame-state slots were described by a register. Engagement, and
+    /// `Cell` because `frame_value_for` takes `&self`.
+    deopt_reg_named: std::cell::Cell<usize>,
     /// Number of input references to each node, over every input of every
     /// node. Filled by `prepare_fusion_tables` before the first block lowers.
     use_count: Vec<u32>,
@@ -1181,12 +1212,35 @@ impl<'a> Lowerer<'a> {
         // The GPR band sits below the XMM one and is excluded from the spill
         // range on exactly the same footing: a spill that overlapped it would
         // be silently destroyed by the prologue save.
+        // The deopt register image sits DEEPER than both prologue save bands
+        // and directly below the outgoing-argument staging, which is the one
+        // placement that leaves `callee_saved_lo == spill_cap_off` and the two
+        // bands' `spill_cap_off + ...` arithmetic untouched: the region simply
+        // extends the non-resumable band, and "storage this frame does not
+        // resume from" is exactly what a register image is.
+        //
+        // `gpr[0]` is its LOWEST address, at `[rbp - deopt_regs_base]`, and the
+        // struct ascends from there — `gpr[r]` at `[rbp - (base - 8r)]`,
+        // `xmm[n]` at `[rbp - (base - 128 - 8n)]`. Same convention as the
+        // single-pass backend's `deopt_regs_base`, deliberately, so the two
+        // stubs can be read against each other.
+        let deopt_regs_bytes = ir_deopt_regs_bytes();
         let spill_cap_off = frame_size
             - shadow
             - stack_arg_reserve
             - args_stage_size
             - saved_xmm_bytes
-            - saved_gpr_bytes;
+            - saved_gpr_bytes
+            - deopt_regs_bytes;
+        // Which lands the region's deep end exactly at the bottom of the
+        // staging region, leaving no gap and no overlap:
+        //   spill_cap_off + saved_xmm + saved_gpr + deopt_regs
+        //     == frame_size - shadow - stack_arg_reserve - args_stage_size
+        let deopt_regs_base = spill_cap_off + saved_xmm_bytes + saved_gpr_bytes + deopt_regs_bytes;
+        debug_assert!(
+            deopt_regs_bytes == 0 || deopt_regs_base == args_stage_top_off - args_stage_size,
+            "the deopt register image must abut the argument staging region"
+        );
 
         Lowerer {
             graph,
@@ -1282,6 +1336,7 @@ impl<'a> Lowerer<'a> {
             sp_id_bcis: Vec::new(),
             args_stage_top_off,
             spill_cap_off,
+            deopt_regs_base,
             saved_xmm_bytes,
             saved_gpr_bytes,
             call_exc_patches: Vec::new(),
@@ -1320,6 +1375,8 @@ impl<'a> Lowerer<'a> {
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
+            deopt_nameable: Vec::new(),
+            deopt_reg_named: std::cell::Cell::new(0),
             use_count: Vec::new(),
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
@@ -1344,6 +1401,53 @@ impl<'a> Lowerer<'a> {
         self.reg_of = residency.reg_of;
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
         self.gp_reg_of = residency.gp_reg_of;
+        // Exclusive ownership, computed once: how many values share each
+        // register, and a value is nameable only if the answer for its own is
+        // one. See the field comment for why "resident" is not enough.
+        self.deopt_nameable = vec![false; self.gp_reg_of.len()];
+        if ir_deopt_regs_enabled() {
+            let mut holders = [0usize; 16];
+            for reg in self.gp_reg_of.iter().flatten() {
+                if let Some(cell) = holders.get_mut(*reg as usize) {
+                    *cell += 1;
+                }
+            }
+            for id in 0..self.gp_reg_of.len() {
+                let Some(reg) = self.gp_reg_of[id] else { continue };
+                // `IR_LOWER_LS_GPRS` and nothing else: `DEOPT_ARG0` is spilled
+                // holding the point pointer rather than its trapping value
+                // (see `emit_deopt_stub`), and no register outside the file can
+                // be reasoned about here at all.
+                if !IR_LOWER_LS_GPRS.contains(&reg) {
+                    continue;
+                }
+                if holders.get(reg as usize).copied().unwrap_or(0) == 1 {
+                    self.deopt_nameable[id] = true;
+                }
+            }
+        }
+    }
+
+    /// Describe `id` as living in its register, if that is provably where it
+    /// is at every bci a frame state could name it.
+    ///
+    /// `None` for everything else, and the caller then falls through to the
+    /// home word exactly as before — this is additive, and with
+    /// `CRATONVM_JIT_IR_DEOPT_REGS` off it answers `None` for every value.
+    fn register_frame_value(&self, id: NodeId, ty: IrType) -> Option<FrameValue> {
+        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        let reg = self.gp_reg_of.get(id as usize).copied().flatten()?;
+        match ty {
+            // A cat-1 `int`: `Register` resolves it truncated to 32 bits.
+            IrType::Int => Some(FrameValue::Register(reg)),
+            // A cat-2 `long` keeps all 64.
+            IrType::Long => Some(FrameValue::RegisterLong(reg)),
+            // `Ref` is never in this file (the oop map names frame slots only),
+            // and FP lives in the other one. Both fall through to the home.
+            _ => None,
+        }
     }
 
     /// Install the level-2 machine list. Called once, after construction and
@@ -4036,6 +4140,24 @@ impl<'a> Lowerer<'a> {
     /// harmless because every float consumer reads it back with `MOVSS` (4 bytes).
     fn fp_store(&mut self, offset: i32, xmm: u8, is_double: bool) {
         self.buf.emit_byte(if is_double { 0xF2 } else { 0xF3 });
+        self.buf.emit(&[0x0F, 0x11]);
+        self.emit_rbp_modrm_disp(xmm, offset);
+    }
+
+    /// `MOVSD [rbp - offset], xmm` for **any** xmm, including `XMM8`-`XMM15`.
+    ///
+    /// [`Self::fp_store`] cannot reach those: it emits no REX byte, so its
+    /// ModRM `reg` field is three bits and `XMM8` encodes as `XMM0`. That is
+    /// harmless where it is used ([`IR_LOWER_LS_XMMS`] is low-numbered) and
+    /// fatal here, where the point is to capture the WHOLE file — a spill that
+    /// silently wrote `xmm[0]` eight times would leave the upper half of the
+    /// register image holding stale stack, and a `FrameValue::XmmDouble(9)`
+    /// resolving against it would reconstruct a plausible wrong number.
+    fn emit_movsd_frame_from_xmm(&mut self, offset: i32, xmm: u8) {
+        self.buf.emit_byte(0xF2);
+        if xmm >= 8 {
+            self.buf.emit_byte(0x44); // REX.R
+        }
         self.buf.emit(&[0x0F, 0x11]);
         self.emit_rbp_modrm_disp(xmm, offset);
     }
@@ -7884,6 +8006,16 @@ impl<'a> Lowerer<'a> {
                 EliminationCause::Unclassified,
             ));
         };
+        // A register beats a frame word, when the register is provably his.
+        // Placed after the `Op::Dead` / out-of-range handling above and before
+        // the constants below, because a CONSTANT needs no machine location at
+        // all and describing one by register would be a strict loss.
+        if !matches!(node.op, Op::Const(_) | Op::ConstF(_)) {
+            if let Some(v) = self.register_frame_value(node_id, node.ty) {
+                self.deopt_reg_named.set(self.deopt_reg_named.get() + 1);
+                return v;
+            }
+        }
         match node.op {
             // Integer / long constants need no machine location. A cat-1 `int`
             // constant resolves to `Int`; a cat-2 `long` constant resolves to
@@ -8410,8 +8542,43 @@ impl<'a> Lowerer<'a> {
             return;
         }
         let stub_off = self.buf.pos();
+        // ── Spill the register file, BEFORE anything here clobbers one ──
+        //
+        // Every guard reaches this stub by a `JMP`, so on entry the registers
+        // still hold their trapping-instant values — with ONE exception, which
+        // is why naming is restricted to `IR_LOWER_LS_GPRS`: the guard site
+        // already loaded the `DeoptimizationPoint` pointer into `DEOPT_ARG0`
+        // (RCX on Windows, RDI on System V) before jumping, so THAT register's
+        // spilled word is the pointer and not the trapping value. Neither
+        // register is in the residency file, and `deopt_nameable` is built from
+        // that file, so no frame value can name one.
+        //
+        // `gpr[r]` at `[rbp - (base - 8r)]` and `xmm[n]` at
+        // `[rbp - (base - 128 - 8n)]` — the `#[repr(C)]` field order of
+        // `SavedRegisters`, and the same arithmetic the single-pass backend's
+        // stub uses.
+        if self.deopt_regs_base > 0 {
+            for r in 0u8..16 {
+                // Cast: a 0..16 register index into the frame displacement.
+                self.store_abi_reg(r, self.deopt_regs_base - (r as i32) * 8);
+            }
+            for n in 0u8..16 {
+                // Cast: as above. MOVSD writes the low 8 bytes, which is
+                // exactly the `u64` the `xmm` half of the struct holds.
+                self.emit_movsd_frame_from_xmm(self.deopt_regs_base - 128 - (n as i32) * 8, n);
+            }
+        }
         // mov arg1, rbp
         self.emit_mov_reg_rbp(DEOPT_ARG1);
+        // arg2 = &SavedRegisters, or NULL when no region was reserved — which
+        // is what `ir_deopt_entry` reads as "this frame has no register image",
+        // giving it back the default-zeros behaviour it had before the region
+        // existed.
+        if self.deopt_regs_base > 0 {
+            self.lea_reg_from_frame(DEOPT_ARG2, self.deopt_regs_base);
+        } else {
+            self.emit_mov_reg_imm64(DEOPT_ARG2, 0);
+        }
         // mov rax, ir_deopt_entry ; call rax
         let fn_addr = ir_deopt_entry as *const () as u64;
         self.emit_mov_reg_imm64(RAX, fn_addr);
@@ -9080,12 +9247,15 @@ fn estimate_frame_bytes(num_locals: usize, spill_slots: usize, needs: &FrameNeed
     let saved_xmms = ir_saved_xmm_bytes() as usize;
     // Cast: `ir_saved_gpr_bytes` returns 0 or 40.
     let saved_gprs = ir_saved_gpr_bytes() as usize;
+    // Cast: `ir_deopt_regs_bytes` returns 0 or 256.
+    let deopt_regs = ir_deopt_regs_bytes() as usize;
     let total = locals
         .saturating_add(context)
         .saturating_add(bookkeeping)
         .saturating_add(spills)
         .saturating_add(saved_xmms)
         .saturating_add(saved_gprs)
+        .saturating_add(deopt_regs)
         .saturating_add(args_stage)
         .saturating_add(shadow)
         .saturating_add(stack_arg_reserve);
@@ -10384,6 +10554,40 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// wider value hiding in it. Zero unless the linear-scan path is on, for the
 /// same reason `ir_saved_xmm_bytes` returns zero then: a frame must not pay for
 /// a register nothing can hand out.
+/// Reserve the 256-byte [`crate::deopt::SavedRegisters`] region in this
+/// backend's frame, spill the register file into it at the deopt stub, and let
+/// a deopt frame NAME a register -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DEOPT_REGS=1`.
+///
+/// Off is the historical arrangement, whose contract `ir_deopt_entry` states:
+/// "the IR lowerer keeps every live value in a frame slot, so no register file
+/// is needed". That is what makes a deopt-named value's home word mandatory,
+/// and therefore what stops a register-resident value from ever losing it --
+/// see `plan_register_residency`'s `blocked_deopt` census.
+fn ir_deopt_regs_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_DEOPT_REGS").is_some()
+    })
+}
+
+/// Bytes the frame reserves for the deopt register image.
+///
+/// `size_of::<SavedRegisters>()` exactly: `{ gpr: [u64; 16], xmm: [u64; 16] }`,
+/// `#[repr(C)]`, and `saved_registers_layout_matches_the_stub_spill_region` in
+/// `deopt.rs` pins it.
+/// The whole struct is reserved rather than only the GPR half, because the
+/// pointer handed to `ir_deopt_entry` is a `*const SavedRegisters` and the
+/// resolver indexes both halves.
+fn ir_deopt_regs_bytes() -> i32 {
+    if ir_deopt_regs_enabled() {
+        256
+    } else {
+        0
+    }
+}
+
 fn ir_saved_gpr_bytes() -> i32 {
     if IR_LOWER_SAVED_GPRS.is_empty() || !linear_scan_enabled() {
         return 0;
@@ -12995,6 +13199,17 @@ pub(crate) fn lower_inner_with_scopes(
         eprintln!(
             "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
             lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+        );
+    }
+    if ls_active
+        && ir_deopt_regs_enabled()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+    {
+        eprintln!(
+            "[ir-ls] deopt regs: nameable={} frame_slots_named_by_register={} regs_base={}",
+            lowerer.deopt_nameable.iter().filter(|n| **n).count(),
+            lowerer.deopt_reg_named.get(),
+            lowerer.deopt_regs_base,
         );
     }
 
