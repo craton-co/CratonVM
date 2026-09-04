@@ -148,10 +148,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "status block says: **Status: FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`, `native-builtins/src/tls.rs` — this lane's files); NOMINATED (the rest).**",
     ),
     (
-        "docs/known-issues/jdk-only/G10-1-the-bignum-surface-measured-and-the-shipping-twin-20260816.md",
-        "status block says: **Status: CODE LANDED, BEHAVIOUR UNVERIFIED ON CRATONVM.** 2026-08-16, lane",
-    ),
-    (
         "docs/known-issues/jdk-only/G29-1-the-fabricated-http-request-and-its-missing-accessors-20260817.md",
         "status block says: oracle. The fix is written and formatted but **has not been built**, so its",
     ),
@@ -166,10 +162,6 @@ const ALLOWED: &[(&str, &str)] = &[
     (
         "docs/known-issues/jdk-only/G7-1-the-sslsession-surface-measured-and-the-merge-questions-settled-20260816.md",
         "status block says: **Status:** FIXED-UNVERIFIED (`native-builtins/src/t27_tls.rs`,",
-    ),
-    (
-        "docs/known-issues/jdk-only/G9-1-the-intrinsic-semantics-census-settled-20260816.md",
-        "status block says: **Status:** FIXED-UNVERIFIED-ON-CRATONVM. Four defects fixed, all four measured",
     ),
     (
         "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
