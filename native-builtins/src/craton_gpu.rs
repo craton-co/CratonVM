@@ -3263,6 +3263,9 @@ pub mod dispatch_timing {
         // Whether the submission registry drained. `live_at_exit` should
         // be 0 for a program that releases what it takes.
         cratonvm_types::gpu_submission_census::exit_summary();
+        // Whether the overlapped writeback path engaged. Silent unless
+        // something was chunkable at all.
+        cratonvm_types::gpu_chunk_census::exit_summary();
         // The transparent (`--gpu`) door's phase table, for the same
         // reason: it is self-gating and it counts the path `CALLS` cannot
         // see. See `gpu_offload_phase_census`.
