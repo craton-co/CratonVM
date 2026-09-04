@@ -633,10 +633,10 @@ work scale with the heap FLAG rather than with the garbage: at `-Xmx2g` with
 the span the bump cursor ran over — doubling `-Xmx` doubles every pause on a
 workload whose live set did not change.
 
-`CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` (**default 0, off**, added 2026-09-03)
-adds a second clause that collects once that percent of capacity has been
-allocated since the last cycle, capping the span a pause walks at
-`budget + live`. It is a pause-versus-throughput DIAL, measured on
+`CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` (added 2026-09-03; **0 without a pause
+target, 25 with one** — see the pairing below) adds a second clause that
+collects once that percent of capacity has been allocated since the last
+cycle, capping the span a pause walks at `budget + live`. It is a pause-versus-throughput DIAL, measured on
 `G1ChurnPauseProbe 50 600` at `-Xmx2048m` (release, three runs a row, one
 binary, only this switch moved):
 
@@ -773,11 +773,13 @@ steady state. Measured at `-Xmx4096m`:
 | target 200 ms alone | 14849 ms | 530 ms |
 | **target 200 ms + `ALLOC_TRIGGER=25`** | 13548 ms | **221 ms** |
 
-The pairing is better than the target alone on BOTH axes, which is why it is
-worth stating: the floor stops the one cycle the controller is blind to, and
-paying for that cycle up front costs less than the controller's recovery from
-it. It is not the default because the wall cost against no trigger at all is a
-policy call the corpora have not been run against.
+The pairing is better than the target alone on BOTH axes: the floor stops the
+one cycle the controller is blind to, and paying for that cycle up front costs
+less than the controller's recovery from it. **Since 2026-09-03 it is the
+default** — a pause target brings a 25 % floor with it unless the operator
+names a percentage. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
+rather than an absence, and is how the "target alone" arm above is measured;
+any other explicit value wins over the floor in both directions.
 
 
 **Mutators have TLABs on this backend, and since 2026-09-02 the JIT's inline
