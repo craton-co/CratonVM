@@ -3635,6 +3635,23 @@ fn band_word_is_an_object(w: usize) -> bool {
     unsafe { cratonvm_types::plausible_object_header_at(w as *const u8) }
 }
 
+/// `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN=1` — stop consulting the
+/// class file's type maps about a band word, so every word the object screen
+/// admits is reported.
+///
+/// The FAIL-OPEN direction, like the object screen's own switch: more words
+/// flagged means more cycles refusing to move, so this is the lever to reach
+/// for if a missed root is ever suspected here. It is also what makes the
+/// screen's worth measurable in ONE binary, which is the whole reason these
+/// switches exist in this file.
+fn band_liveness_screen_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN")
+            .is_some()
+    })
+}
+
 fn band_object_screen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
@@ -3705,9 +3722,10 @@ fn band_has_unpublished_word_with_map(
             // asymmetry §16 relies on, pointed the other way, because here the
             // consequence of being wrong is a missed root rather than a missed
             // refutation.
-            let dead_by_verifier = liveness
-                .map(|ask| ask(off) == VerifierSlotVerdict::NotOop)
-                .unwrap_or(false);
+            let dead_by_verifier = !band_liveness_screen_disabled()
+                && liveness
+                    .map(|ask| ask(off) == VerifierSlotVerdict::NotOop)
+                    .unwrap_or(false);
             if !dead_by_verifier {
                 return true;
             }

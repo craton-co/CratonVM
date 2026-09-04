@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-332 tokens.
+333 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -804,6 +804,7 @@ export inherited from a parent shell.
 | `ffm-intrinsic` | `CRATONVM_JIT_NO_FFM_INTRINSIC` |
 | `c2-alloc-upgrade` | `CRATONVM_JIT_C2_ALLOC_UPGRADE` |
 | `ir-inline` | `CRATONVM_JIT_IR_INLINE` |
+| `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `field-site-cache` | `CRATONVM_JIT_FIELD_SITE_CACHE` |
 | `cast-site-cache` | `CRATONVM_JIT_NO_CAST_SITE_CACHE` |
 | `code-ptr-memo` | `CRATONVM_JIT_NO_CODE_PTR_MEMO` |
@@ -920,7 +921,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-132 tokens.
+133 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -930,6 +931,7 @@ export inherited from a parent shell.
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
 | `moving-young-bounds-guard` | `CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD` |
 | `moving-young-band-object-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN` |
+| `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `full-rset-scan` | `CRATONVM_GC_FULL_RSET_SCAN` |

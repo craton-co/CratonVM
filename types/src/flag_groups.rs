@@ -1018,6 +1018,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "oopmap-coverage-presence-only", on_key: Some("CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "moving-young-bounds-guard", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BOUNDS_GUARD"), off_word: None, since: "2026-08-20" },
     E { group: Group::GC, token: "moving-young-band-object-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN"), off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "moving-young-band-liveness-screen", on_key: None, off_key: Some("CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN"), off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
@@ -1552,6 +1553,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ffm-intrinsic", on_key: None, off_key: Some("CRATONVM_JIT_NO_FFM_INTRINSIC"), off_word: None, since: "2026-08-26" },
     E { group: Group::JIT, token: "c2-alloc-upgrade", on_key: Some("CRATONVM_JIT_C2_ALLOC_UPGRADE"), off_key: None, off_word: None, since: "2026-08-27" },
     E { group: Group::JIT, token: "ir-inline", on_key: Some("CRATONVM_JIT_IR_INLINE"), off_key: None, off_word: None, since: "2026-08-27" },
+    E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "field-site-cache", on_key: Some("CRATONVM_JIT_FIELD_SITE_CACHE"), off_key: None, off_word: Some("0"), since: "2026-08-04" },
     E { group: Group::JIT, token: "cast-site-cache", on_key: None, off_key: Some("CRATONVM_JIT_NO_CAST_SITE_CACHE"), off_word: None, since: "2026-08-18" },
     // Default-ON kill switch, hence `off_key` only:
