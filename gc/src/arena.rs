@@ -1395,6 +1395,17 @@ impl Arena {
     #[must_use = "a refused commit must fail the allocation"]
     #[inline]
     fn hand_out(&mut self, offset: usize, size: usize) -> Option<*mut u8> {
+        {
+            // Clear the decommit witness for this range: it is mapped again, so
+            // a read of it no longer faults. Without this the bitmap would only
+            // ever accumulate and its answer would decay to "everything".
+            let base = self.data.as_ptr() as usize;
+            crate::reloc_witness::note_arena_base(base);
+            crate::reloc_witness::note_committed(
+                base.wrapping_add(offset),
+                base.wrapping_add(offset + size),
+            );
+        }
         if !self.data.commit_range(offset, size) {
             return None;
         }
@@ -1420,6 +1431,7 @@ impl Arena {
         // See `crate::reloc_witness`.
         {
             let base = self.data.as_ptr() as usize;
+            crate::reloc_witness::note_arena_base(base);
             crate::reloc_witness::note_decommitted(
                 base.wrapping_add(lo),
                 base.wrapping_add(hi),
@@ -2748,6 +2760,14 @@ impl Arena {
     #[must_use = "a refused commit must send the cycle down the serial path"]
     pub fn commit_parallel_evacuation_region(&mut self, bytes: usize) -> bool {
         debug_assert!(bytes <= self.low_bump_headroom());
+        {
+            let base = self.data.as_ptr() as usize;
+            crate::reloc_witness::note_arena_base(base);
+            crate::reloc_witness::note_committed(
+                base.wrapping_add(self.cursor),
+                base.wrapping_add(self.cursor + bytes),
+            );
+        }
         self.data.commit_range(self.cursor, bytes)
     }
 
