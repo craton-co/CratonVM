@@ -1424,11 +1424,59 @@ optimizing tier without touching anything else. Adding the unroll loss brings
 it to 1.75x of a 2.38x gap: about **two thirds of the inversion**, with
 register residency the dominant share and unrolling roughly 1.12x on top.
 
-A residual of ~1.36x is still unaccounted for. It is not any of the four
-candidates, not unrolling, and not the null check; it is whatever else the
-optimizing tier's 95-instruction body does that the baseline's does not, and
-naming it wants the same treatment — find a switch that removes it from the
-fast arm before building it into the slow one.
+#### The residual 1.36x: latency, not volume
+
+Chased, and it is not what the rest of this section assumed. Both tiers were
+disassembled at MATCHED settings — baseline with `CRATONVM_JIT_LOCAL_REGS=0`
+and `CRATONVM_DISABLE_UNROLL=1`, so both spill and neither unrolls — and
+counted:
+
+| | baseline (matched) | optimizing |
+|---|---|---|
+| loop-body instructions | 108 | **95** |
+| distinct frame slots touched | 24 | **15** |
+| memory `mov`s in the body | 41 | **32** |
+| time | 2.23 | **3.01** |
+
+**The optimizing tier does less of everything and takes 1.36x longer.** So the
+residual is not instruction count, not memory-operation count, and not slot
+count — every volume measure points the wrong way. The
+"instructions per iteration" framing earlier in this section explains the
+unrolling fifth and nothing beyond it.
+
+`CRATONVM_JIT_KERNEL_REG_LOCALS=0`, which makes the baseline's operand-stack
+scratch cache inert, moved the matched arm not at all (2.23 against 2.23), so
+that is not it either.
+
+**It is a dependency chain.** A probe with four INDEPENDENT accumulators
+(`a+=this.fx; b+=this.fx; c+=this.fx; d+=this.fx;`) instead of one shrinks the
+gap from **1.36x to 1.18x**, with the two control arms landing on 1.41 and
+1.41. Independent work overlaps a stall; it cannot overlap extra instructions.
+That is the signature of a latency bottleneck, and the disassembly shows the
+mechanism: the optimizing tier's body is a chain of store-then-load pairs on
+the same slot two instructions apart —
+
+```text
+1f5: mov [rbp-88h],rax      ; store the loaded field
+1fc: mov rax,[rbp-78h]
+200: mov rcx,[rbp-88h]      ; reload it, two instructions later
+207: add eax,ecx
+209: mov [rbp-90h],rax      ; and the accumulator goes back to memory
+```
+
+— with the accumulator itself crossing the back edge through the frame, so
+every iteration waits on the previous one's store.
+
+The exact stall could not be named: this host is a VM without PMU passthrough
+(`perf stat` reports `<not supported>` for cycles and instructions), so
+store-forwarding latency is the likely mechanism rather than the measured one.
+
+**What this changes.** It strengthens the register-residency conclusion rather
+than competing with it: keeping a loop's live set in registers removes the
+memory round trip *and* the chain that round trip creates. And it explains the
+four zeros a second way — shortening a serial chain by one link out of several
+does not speed it up. Both readings say the same thing: **the live set has to
+move as a group, or not at all.**
 
 **So the recommendation stands and now has a number behind it.** Getting a
 loop's live set into registers *as a group* is worth about 1.57x on this shape.
