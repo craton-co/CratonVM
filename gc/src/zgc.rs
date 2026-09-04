@@ -5489,16 +5489,37 @@ impl ZgcRealHeap {
             // every object start is `base + 8k`, so rounding the difference is
             // what keeps the destination on the same grid — and, because it
             // rounds the move DOWN, keeps `to >= from` without a second check.
-            let to = if immovable {
+            let mut to = if immovable {
                 pinned += 1;
                 from
             } else {
                 from + ((dest - size - from) & !7)
             };
+            // COMMIT THE DESTINATION FIRST. It is free space, and free space is
+            // exactly what `Arena::decommit_free_blocks` hands back to the OS —
+            // on the promise that everything which re-issues it goes through
+            // `hand_out`. A slide does not: it picks `to` arithmetically and
+            // memmoves. So the first slide after a give-back wrote into a
+            // `PROT_NONE` granule and died inside `memcpy`, which is what
+            // `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+            // recorded as "the fault address is always a page boundary, `rdi`
+            // equal to it, fault pc inside libc".
+            if to != from && !arena.commit_for_relocation(to - base, size) {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    addr = from,
+                    size,
+                    dest = to,
+                    "zgc relocate: the OS refused the HIGH slide's destination --                      leaving the survivor in place"
+                );
+                pinned += 1;
+                to = from;
+            }
             if to != from {
                 // SAFETY: `size` bytes are live at `from`; `to` is inside the
                 // high region, strictly above `from`, and `to + size <= dest <=
-                // high_hi`. The regions may overlap — `copy` is memmove, which
+                // high_hi`. The commit above proved `[to, to + size)` is mapped
+                // read-write. The regions may overlap — `copy` is memmove, which
                 // is correct in this direction.
                 unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                 pairs.push((from, to));
@@ -6206,16 +6227,32 @@ impl ZgcRealHeap {
                         }
                     }
                     match chosen {
-                        Some(to) => {
+                        Some(to) if arena.commit_for_relocation(to - base, size) => {
                             debug_assert!(to < from, "the slide must never move an object UP");
                             // SAFETY: `size` bytes are live at `from`, `to` is
-                            // inside the arena and strictly below `from`, and the
-                            // regions may overlap -- `copy` is memmove, correct in
-                            // that direction.
+                            // inside the arena and strictly below `from`, the
+                            // guard above proved `[to, to + size)` is mapped
+                            // read-write, and the regions may overlap -- `copy`
+                            // is memmove, correct in that direction.
                             unsafe { std::ptr::copy(from as *const u8, to as *mut u8, size) };
                             pairs.push((from, to));
                             moved += 1;
                             dest = to + size;
+                        }
+                        // The destination is free space the give-back returned
+                        // to the OS and the OS would not take back. Same answer
+                        // as "nowhere below it": the object stays put. See
+                        // `Arena::commit_for_relocation` for why a slide has to
+                        // ask at all.
+                        Some(from_stay) => {
+                            tracing::warn!(
+                                target: "cratonvm::gc::guard",
+                                addr = from,
+                                size,
+                                dest = from_stay,
+                                "zgc relocate: the OS refused the LOW slide's destination --                                  leaving the survivor in place"
+                            );
+                            dest = from + size;
                         }
                         // Nowhere below it inside a selected page: it stays put,
                         // and the cursor continues above it so a later survivor
@@ -10637,16 +10674,33 @@ fn zgc_alloc_trigger_percent() -> usize {
 /// Split out because both inputs are `OnceLock`-cached env reads, so a test
 /// cannot vary them in-process -- and the interesting cases here are the
 /// combinations, not the parsing.
-fn alloc_trigger_percent_for(explicit: Option<usize>, pause_target_ms: u64) -> usize {
-    match explicit {
-        // AN EXPLICIT ZERO IS A REFUSAL, not an absence. It is how an operator
-        // says "the target alone", and it is the arm every measurement of the
-        // target on its own was taken with; collapsing it into "unset" would
-        // make that arm unreachable and the comparison unrepeatable.
-        Some(p) => p,
-        None if pause_target_ms != 0 => ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET,
-        None => 0,
-    }
+fn alloc_trigger_percent_for(explicit: Option<usize>, _pause_target_ms: u64) -> usize {
+    // WITHDRAWN AS A DEFAULT ON 2026-09-04, the day it shipped. It stays
+    // available as `CRATONVM_ZGC_ALLOC_TRIGGER=<percent>`; only the implicit
+    // floor under a pause target is gone.
+    //
+    // The floor does what it was measured to do -- it caps the first cycle,
+    // which the controller is blind to -- but making it a DEFAULT changed how
+    // often the collector runs on every ZGC workload, and
+    // `org.h2.test.db.TestLargeBlob` does not survive that:
+    //
+    //   pause target on (floor active)   34 GC cycles   SIGSEGV in libc
+    //   pause target off (no floor)       0 GC cycles   PASS
+    //
+    // Same binary, same class, one switch, and reproduced 3 times out of 4 with
+    // the floor on against 0 of 3 with it off. The fault is inside a
+    // `FileChannelImpl.implWrite` -> `IOUtil.write` -> `DirectByteBuffer` path,
+    // which is the shape of a native operation whose backing store a collection
+    // reclaimed underneath it.
+    //
+    // THE CRASH IS ALMOST CERTAINLY OLDER THAN THIS FLAG. Without the floor
+    // that test never collects at all, so nothing was exercising the path; the
+    // floor is a reproducer, not the defect. But a default that turns a passing
+    // test into a native crash is not one to ship while the underlying bug is
+    // open, and "it only surfaces a pre-existing bug" is not a reason to leave
+    // it on -- it is a reason to go and fix that bug with the reproducer this
+    // gave us.
+    explicit.unwrap_or(0)
 }
 
 /// `CRATONVM_ZGC_BITMAP_BOUNDS` -- restrict the per-cycle object-start and
@@ -21041,35 +21095,33 @@ pub(crate) mod tests {
         assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Int(7)));
     }
 
-    /// A pause target brings a percentage floor with it; an explicit zero
-    /// refuses one.
+    /// A pause target does NOT bring a percentage floor with it -- the floor is
+    /// opt-in, and only an explicit percentage arms it.
     ///
-    /// The floor exists for the cycle the feedback loop is blind to -- the
-    /// first, which has no pause to measure yet and which the occupancy clause
-    /// otherwise lets run to 75% of `-Xmx`. See
-    /// `ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET` for the measurement.
+    /// It WAS a default for a few hours on 2026-09-04, and
+    /// `alloc_trigger_percent_for`'s own comment records why it is not any
+    /// more: it changed how often the collector runs on every ZGC workload, and
+    /// `org.h2.test.db.TestLargeBlob` went from 0 collections and a PASS to 34
+    /// collections and a SIGSEGV. The mechanism the floor implements is sound
+    /// and still reachable; the DEFAULT was not safe to ship.
     #[test]
-    fn a_pause_target_defaults_a_percentage_floor_under_itself() {
-        // No target, nothing named: the clause is off, exactly as before
-        // pause targets existed.
+    fn a_pause_target_does_not_imply_a_percentage_floor() {
+        // Nothing named, no target: off, as before pause targets existed.
         assert_eq!(alloc_trigger_percent_for(None, 0), 0);
-        // A target, nothing named: the floor.
+        // Nothing named, WITH a target: still off. This is the line that
+        // changed, and the one a future "surely the floor should be automatic"
+        // has to argue past.
         assert_eq!(
             alloc_trigger_percent_for(None, 200),
-            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
+            0,
+            "a pause target must not arm the allocation floor by itself: doing              so turned TestLargeBlob from 0 collections and a PASS into 34 and              a SIGSEGV"
         );
-        assert_eq!(
-            alloc_trigger_percent_for(None, 1),
-            ZGC_ALLOC_TRIGGER_PERCENT_UNDER_TARGET
-        );
-        // AN EXPLICIT ZERO IS A REFUSAL, not an absence: it is how an operator
-        // asks for the target alone, and it is the arm every measurement of
-        // the target on its own was taken with.
-        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
-        // And an explicit percentage wins over the floor in both directions.
-        assert_eq!(alloc_trigger_percent_for(Some(12), 200), 12);
-        assert_eq!(alloc_trigger_percent_for(Some(50), 200), 50);
+        assert_eq!(alloc_trigger_percent_for(None, 1), 0);
+        // An explicit percentage still wins, with or without a target -- the
+        // pairing is available, it is just not implicit.
+        assert_eq!(alloc_trigger_percent_for(Some(25), 200), 25);
         assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
+        assert_eq!(alloc_trigger_percent_for(Some(0), 200), 0);
     }
 
     /// COMPONENT MEASUREMENT for the young cycle's old-generation pre-mark

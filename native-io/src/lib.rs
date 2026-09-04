@@ -18471,7 +18471,7 @@ fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -18542,10 +18542,37 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             "([BII)V",
             &[Value::Object(Some(buf)), Value::Int(0), Value::Int(count)],
         );
-        let this = ctx.read_native_pin(this_pin, this);
+        this = ctx.read_native_pin(this_pin, this);
         ctx.unpin_native_roots(this_pin);
         write_result?;
         ctx.set_field(this, count_slot, Value::Int(0));
+    }
+    // `BufferedOutputStream.implFlush()` is `flushBuffer(); out.flush();` — the
+    // inner flush is UNCONDITIONAL, and it was missing here. Emptying our own
+    // buffer into `out` is not a flush of `out`: if the inner stream buffers
+    // too, its bytes stayed where they were, and any failure it would have
+    // raised was never raised at all.
+    //
+    // The tell was inside this same function: [`bos_side_flush`], the arm taken
+    // when the receiver has no real buffer slots, has always done
+    // `invoke_virtual(inner, "flush")` under its `flush_inner` flag. The two
+    // halves of one flush disagreed, and the half with the shorter path was
+    // the one that ran for a real `BufferedOutputStream`.
+    //
+    // MEASURED — `probes/CloseFlushSwallowProbe.java`'s
+    // `filterOutFlushFailureWins`: a sink whose `flush()` throws must let that
+    // failure out of `close()`. It answered `none`, because `flush()` was never
+    // called on it. `W7-57` swept 51 delegated-failure sites and this one
+    // survived the sweep, since the failure is not swallowed here — it is never
+    // produced. Same pin discipline as the write above: `flush()` is arbitrary
+    // overridable bytecode and can move `this`.
+    if let Some(inner) = bos_inner(ctx, this, out_slot) {
+        let this_pin = ctx.pin_native_root(this);
+        let flush_result = ctx.invoke_virtual(inner, "flush", "()V", &[]);
+        this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        let _ = this;
+        flush_result?;
     }
     Ok(None)
 }
@@ -18575,25 +18602,48 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this_pin = ctx.pin_native_root(this);
     let flush_result = native_bos_flush(ctx, args);
     let mut this = ctx.read_native_pin(this_pin, this);
-    if let Err(error) = flush_result {
-        ctx.unpin_native_roots(this_pin);
-        return Err(error);
-    }
-    // 2) Close the inner stream (matches the JDK
-    //    `try (out) {}` block in BufferedOutputStream.close).
+    // 2) Close the inner stream — from the equivalent of the JDK's `finally`,
+    //    so it happens EVEN WHEN THE FLUSH FAILED.
+    //
+    //    `FilterOutputStream.close()` is
+    //
+    //        try { flush(); } catch (Throwable e) { flushException = e; throw e; }
+    //        finally {
+    //            if (flushException == null) { out.close(); }
+    //            else { try { out.close(); } catch (Throwable ce) { … throw ce; } }
+    //        }
+    //
+    //    so a failing flush does not cost the caller its file descriptor. This
+    //    code used to `return Err(error)` on the flush failure and never reach
+    //    the close at all, which leaks the inner stream on exactly the path
+    //    where the caller most needs it released. It was invisible while
+    //    `native_bos_flush` could not produce a failure in the first place;
+    //    fixing that flush is what made this reachable.
+    //    MEASURED — `CloseFlushSwallowProbe`'s
+    //    `filterOutCloseAttemptedAfterFailedFlush`.
     let (out_slot, _, _) = bos_slots(ctx);
-    if let Some(inner) = bos_inner(ctx, this, out_slot) {
-        let close_result =
+    let close_result = if let Some(inner) = bos_inner(ctx, this, out_slot) {
+        let result =
             ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[]);
         this = ctx.read_native_pin(this_pin, this);
-        if let Err(error) = close_result {
-            ctx.unpin_native_roots(this_pin);
-            return Err(error);
-        }
-    }
+        result
+    } else {
+        Ok(None)
+    };
     bos_side_buffers().lock().remove(&bos_side_key(ctx, this));
     ctx.unpin_native_roots(this_pin);
-    Ok(None)
+    // Precedence is the JDK's: a close failure wins over a flush failure
+    // (the JDK suppresses the flush one INTO it), and a flush failure wins
+    // when the close succeeded.
+    //
+    // NOT REPRODUCED: `closeException.addSuppressed(flushException)` when both
+    // fail. The caller sees the close failure with the right identity and
+    // without the suppressed flush one attached.
+    match (flush_result, close_result) {
+        (_, Err(close_error)) => Err(close_error),
+        (Err(flush_error), Ok(_)) => Err(flush_error),
+        (Ok(_), Ok(_)) => Ok(None),
+    }
 }
 
 // PipedInputStream/OutputStream simplified as BAIS/BAOS
@@ -25220,6 +25270,30 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __rows_before = r.dump_registrations().len();
     let dc = "java/nio/channels/DatagramChannel";
 
+    // `provider()` — the platform `SelectorProvider`, not `null`.
+    //
+    // `AbstractSelectableChannel.provider()` reads a `private final
+    // SelectorProvider provider` field that this VM's synthetic channel never
+    // populates, so the accessor answered `null` and the documented route
+    // `dc.provider().openDatagramChannel()` was an NPE at a site that no longer
+    // names the cause. `Selector.provider()` was repaired the same way and the
+    // static `SelectorProvider.provider()` already resolves here — MEASURED,
+    // `sun.nio.ch.EPollSelectorProvider`, the same object HotSpot's instance
+    // accessor hands back (`probes/ResidualProbe.java`).
+    r.register(
+        dc,
+        "provider",
+        "()Ljava/nio/channels/spi/SelectorProvider;",
+        |ctx, _args| {
+            ctx.invoke(
+                "java/nio/channels/spi/SelectorProvider",
+                "provider",
+                "()Ljava/nio/channels/spi/SelectorProvider;",
+                &[],
+            )
+        },
+    );
+
     // open() → DatagramChannel
     r.register(
         dc,
@@ -25310,6 +25384,39 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     r.register(dc, "isConnected", "()Z", native_dc_is_connected);
     r.register(dc, "write", "(Ljava/nio/ByteBuffer;)I", native_dc_write);
     r.register(dc, "read", "(Ljava/nio/ByteBuffer;)I", native_dc_read);
+    // The Gathering/ScatteringByteChannel pair. Absent until now, so the JDK's
+    // own `DatagramChannelImpl` bytecode ran against a synthetic receiver and
+    // died on a null `writeLock`/`readLock`. W7-9 section 6.
+    r.register(
+        dc,
+        "write",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_dc_write_gathering,
+    );
+    r.register(
+        dc,
+        "read",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_dc_read_scattering,
+    );
+    // The one-argument forms the interfaces also declare, defined by the JDK as
+    // the three-argument ones over the whole array.
+    r.register(dc, "write", "([Ljava/nio/ByteBuffer;)J", |ctx, args| {
+        let srcs = obj_arg92(args, 1)?;
+        let n = ctx.array_length(srcs) as i32;
+        native_dc_write_gathering(
+            ctx,
+            &[args[0], args[1], Value::Int(0), Value::Int(n)],
+        )
+    });
+    r.register(dc, "read", "([Ljava/nio/ByteBuffer;)J", |ctx, args| {
+        let dsts = obj_arg92(args, 1)?;
+        let n = ctx.array_length(dsts) as i32;
+        native_dc_read_scattering(
+            ctx,
+            &[args[0], args[1], Value::Int(0), Value::Int(n)],
+        )
+    });
 
     // send(ByteBuffer, SocketAddress) → int
     // Was deferred to datagram.rs, which resolved the channel through its own
@@ -26462,6 +26569,172 @@ fn native_dc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     buf_set_position(ctx, buffer, view.pos + received as i32);
     Ok(Some(Value::Int(received as i32)))
+}
+
+/// `DatagramChannel.write(ByteBuffer[], int, int) -> long` — the gathering form.
+///
+/// NOT a loop over the single-buffer native, and that is the whole difficulty
+/// `W7-9` §6 named when it declined to implement this ("not composable from the
+/// single-buffer natives that do exist: for a datagram channel a scattering
+/// read consumes exactly one datagram"). A gathering write must produce ONE
+/// datagram from all the source buffers; writing each buffer in turn would put
+/// N datagrams on the wire and a receiver would see N messages.
+///
+/// So the buffers are concatenated VM-side into one payload — the same
+/// `bb_storage_view` / `bb_read_byte` machinery `native_dc_write` uses — and
+/// sent once. Positions are then advanced by exactly what the socket took, in
+/// buffer order, which is what `GatheringByteChannel` specifies.
+///
+/// Before this, the JDK's own `DatagramChannelImpl.write(ByteBuffer[],int,int)`
+/// bytecode ran against our synthetic channel and died on
+/// `NullPointerException: … because "this.writeLock" is null` — our own
+/// uninitialised state surfacing from inside library code, where the caller
+/// expected either bytes or a named refusal. Netty's datagram path uses this
+/// overload (`GatheringByteChannel`), which is why `W7-9` called it "genuinely
+/// absent, and genuinely reachable".
+fn native_dc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let srcs = obj_arg92(args, 1)?;
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = ctx.array_length(srcs) as i32;
+    // `Objects.checkFromIndexSize`, the JDK's own precondition.
+    if offset < 0 || length < 0 || offset > count - length {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!("offset {offset}, length {length}, array length {count}")),
+        }
+        .into());
+    }
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.write: channel has no UDP socket".into(),
+    })?;
+
+    let mut payload: Vec<u8> = Vec::new();
+    for index in offset..offset + length {
+        let Value::Object(Some(buffer)) = ctx.get_array_element(srcs, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        let remaining = (view.lim - view.pos).max(0) as usize;
+        for step in 0..remaining {
+            payload.push(bb_read_byte(ctx, view, view.pos as usize + step)?);
+        }
+    }
+    let sent = ctx
+        .fd_table()
+        .udp_send_connected(fd, &payload)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("DatagramChannel.write: {e}"),
+        })?;
+
+    // Advance each source by the part of it that actually went out. A short
+    // send leaves the tail buffers untouched rather than silently consumed.
+    let mut left = sent;
+    for index in offset..offset + length {
+        if left == 0 {
+            break;
+        }
+        let Value::Object(Some(buffer)) = ctx.get_array_element(srcs, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        let remaining = (view.lim - view.pos).max(0) as usize;
+        let taken = remaining.min(left);
+        buf_set_position(ctx, buffer, view.pos + taken as i32);
+        left -= taken;
+    }
+    Ok(Some(Value::Long(sent as i64)))
+}
+
+/// `DatagramChannel.read(ByteBuffer[], int, int) -> long` — the scattering form.
+///
+/// The mirror of [`native_dc_write_gathering`], and it has the same reason for
+/// not being a loop: a scattering read consumes exactly ONE datagram and
+/// spreads it across the buffers. Reading per-buffer would consume one datagram
+/// each and silently drop whatever did not fit the first.
+///
+/// Bytes beyond the buffers' total remaining are DISCARDED, which is the
+/// datagram contract — `ScatteringByteChannel` says the rest of the datagram is
+/// dropped, not held for the next read.
+fn native_dc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let dsts = obj_arg92(args, 1)?;
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = ctx.array_length(dsts) as i32;
+    if offset < 0 || length < 0 || offset > count - length {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!("offset {offset}, length {length}, array length {count}")),
+        }
+        .into());
+    }
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.read: channel has no UDP socket".into(),
+    })?;
+
+    let mut capacity = 0usize;
+    for index in offset..offset + length {
+        let Value::Object(Some(buffer)) = ctx.get_array_element(dsts, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        capacity += (view.lim - view.pos).max(0) as usize;
+    }
+    let mut bytes = vec![0u8; capacity];
+    // Same blocking-region bracket and re-sync as `native_dc_read`: the recv
+    // parks without touching the Java heap, and a stop-the-world pause during
+    // it may move the destination ARRAY.
+    let mut held = vec![Value::Object(Some(dsts))];
+    ctx.begin_blocking_region();
+    let recv = ctx.fd_table().udp_recv(fd, &mut bytes);
+    ctx.end_blocking_region_refs(&mut held);
+    let dsts = match held[0] {
+        Value::Object(Some(a)) => a,
+        _ => dsts,
+    };
+    let (received, _) = match recv {
+        Ok(received) => received,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(Some(Value::Long(0)));
+        }
+        Err(error) => {
+            return Err(RuntimeError::IOException {
+                message: format!("DatagramChannel.read: {error}"),
+            }
+            .into());
+        }
+    };
+
+    let mut placed = 0usize;
+    for index in offset..offset + length {
+        if placed >= received {
+            break;
+        }
+        let Value::Object(Some(buffer)) = ctx.get_array_element(dsts, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        let remaining = (view.lim - view.pos).max(0) as usize;
+        let take = remaining.min(received - placed);
+        for step in 0..take {
+            bb_write_byte(ctx, view, view.pos as usize + step, bytes[placed + step])?;
+        }
+        buf_set_position(ctx, buffer, view.pos + take as i32);
+        placed += take;
+    }
+    Ok(Some(Value::Long(placed as i64)))
 }
 
 /// `DatagramChannel.send(ByteBuffer, SocketAddress) -> int`.

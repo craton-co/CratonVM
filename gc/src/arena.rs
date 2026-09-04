@@ -2902,11 +2902,20 @@ impl Arena {
     /// the middle-only give-back returned **2 MiB of 64**.
     ///
     /// A free-list block is by definition not live, so its granules can go
-    /// back. The bytes come with no obligation either: every path that hands
-    /// one out again goes through [`Self::hand_out`], which commits before it
-    /// returns a pointer, and a re-committed granule reads as zero -- which is
-    /// what a caller of a reused block is entitled to and what `Arena::alloc`'s
-    /// consumers already zero for themselves.
+    /// back. The bytes come with an obligation, and it is worth stating
+    /// exactly: every path that ALLOCATES one out again goes through
+    /// [`Self::hand_out`], which commits before it returns a pointer, and a
+    /// re-committed granule reads as zero -- which is what a caller of a reused
+    /// block is entitled to and what `Arena::alloc`'s consumers already zero
+    /// for themselves.
+    ///
+    /// **Allocation is not the only path that writes here.** A relocating
+    /// collector's slide picks a destination inside free space arithmetically
+    /// and `memmove`s into it without asking the allocator for anything, so it
+    /// never reaches `hand_out`. That is what [`Self::commit_for_relocation`]
+    /// exists for, and both of `ZgcRealHeap`'s slides call it. This doc used to
+    /// claim `hand_out` was the only door, and the two slides were writing into
+    /// granules this method had already returned to the OS.
     ///
     /// WHOLE granules only, rounded INWARD: a block's ends usually share a
     /// granule with a live object, and rounding outward would take it too --
@@ -2935,6 +2944,35 @@ impl Arena {
         released
     }
 
+    /// Make `[offset, offset + len)` writable for a caller that is about to
+    /// write arena bytes WITHOUT going through [`Self::hand_out`].
+    ///
+    /// # The one such caller, and why it needs its own door
+    ///
+    /// [`Self::decommit_free_blocks`] gives free-list granules back to the OS
+    /// on a stated promise: "every path that hands one out again goes through
+    /// `hand_out`, which commits before it returns a pointer". A relocating
+    /// collector's SLIDE is a path that hands one out and does not — it picks
+    /// a destination inside free space arithmetically and `memmove`s into it,
+    /// because the whole point of a slide is that it never asks the allocator
+    /// for anything. `ZgcRealHeap`'s two slides (`compact_high_region` and the
+    /// low slide in `relocate_stw`) are exactly that shape.
+    ///
+    /// Measured 2026-09-04: with the give-back active, the first high slide
+    /// after one packs a survivor against `capacity` and faults inside
+    /// `__memcpy_avx512_unaligned_erms` on a `PROT_NONE` granule — reproduced
+    /// 3/3 in 7 s on `org.h2.test.store.TestRandomMapOps`, and 0/3 with
+    /// `CRATONVM_GC_RESERVE=0`, which is the whole of the reserve/commit
+    /// store's involvement.
+    ///
+    /// Returns `false` when the OS refuses, and the caller must then leave the
+    /// object where it is: a slide that cannot have its destination is a
+    /// missed compaction, never a reason to write anyway.
+    #[must_use = "a refused commit means the object must not be moved"]
+    pub(crate) fn commit_for_relocation(&mut self, offset: usize, len: usize) -> bool {
+        self.data.commit_range(offset, len)
+    }
+
     /// Is `offset` inside a granule that is currently committed, i.e. safe to
     /// read?
     ///
@@ -2943,6 +2981,16 @@ impl Arena {
     /// retracted past -- see `ZgcRealHeap::stamp_forwarding_words`.
     pub fn is_readable_at(&self, offset: usize) -> bool {
         self.data.is_committed_at(offset)
+    }
+
+    /// This arena's per-granule commit bitmap, readable without the arena
+    /// lock. `None` on the wholly-committed fallback store.
+    ///
+    /// See [`crate::reservation::HeapStore::commit_bits`] for what a reader is
+    /// buying: the right to ask "is this address backed?" before dereferencing
+    /// it, which `[base, base + capacity)` alone cannot answer.
+    pub fn commit_bits(&self) -> Option<std::sync::Arc<[std::sync::atomic::AtomicU64]>> {
+        self.data.commit_bits()
     }
 
     /// Bytes of this arena's capacity that are actually committed.

@@ -1921,7 +1921,7 @@ cached_is_set!(no_door_recv_memo, "CRATONVM_JIT_NO_DOOR_RECV_MEMO");
 ///
 /// The line-level defect is NOT yet identified, which is why this is a default
 /// flip and not a repair. See
-/// `known-issues/h2/bug-testrandommapops-deterministic-1810-null-20260903.md`.
+/// `fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`.
 cached_is_set!(invoke_fast_door_opt_in, "CRATONVM_JIT_INVOKE_FAST_DOOR");
 
 /// `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` -- disable the monomorphic
@@ -2372,7 +2372,7 @@ pub fn jit_ir_call_virtual() -> bool {
 /// is spliced against a receiver whose `root` mirror it then reads as null.
 /// That is `org.h2.test.store.TestRandomMapOps` op:1033, which has been failing
 /// H2 in 11-22 s and blocking
-/// `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902`,
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`,
 /// whose SIGSEGV needs 25-183 s to appear.
 ///
 /// Turning the default off restores exactly the state the surrounding code is

@@ -665,6 +665,33 @@ pub(super) fn compile_osr_artifact(
                 }
             };
             osr_stage("past-jit-scan");
+            // ── Would the optimizing tier have taken this method? ─────────
+            //
+            // INERT here, and deliberately so: this door reaches
+            // `x64::compile_with_param_slots` and has no promotion to refuse.
+            // It is a COUNTER, the same shape the String-intrinsic pin already
+            // takes at this door and for the same reason -- a zero from a
+            // one-door instrument is indistinguishable from "there was nothing
+            // to ask about", and that is what made the reach of the optimizing
+            // tier unfalsifiable.
+            //
+            // `ir_compatible_sized` is the FIRST of four gates, so this is an
+            // UPPER BOUND on what an OSR route could deliver, which is exactly
+            // what a go/no-go on building that route needs. The conjunct that
+            // refuses is named on stderr by `ir_reject` under
+            // `CRATONVM_DBG_IR_COMPILES`, so the reasons come free.
+            //
+            // Pure and lock-free: `scan` is already in hand and
+            // `ir_compatible_sized` reads nothing else.
+            let osr_ir_eligible = cratonvm_jit::ir::ir_compatible_sized(&scan, code_len);
+            cratonvm_types::osr_refusal_census::note_ir_eligibility(osr_ir_eligible);
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] osr ir-eligibility: {} for {}.{}{} -- INERT at this door,                      which is single-pass only",
+                    if osr_ir_eligible { "ACCEPTED" } else { "refused" },
+                    class_name, method_name, method_descriptor,
+                );
+            }
             // This method's own exception table. Read ONCE, here, because both
             // of the RBC gates below need it: RBC.6 (immediately below) admits
             // a bare `athrow` only when it is EMPTY, and RBC.6b (further down)
@@ -9324,6 +9351,57 @@ fn resolve_inline_site_from(
         .is_some()
     {
         no!("native-shadow-on-selected-method");
+    }
+    // ...and the same rule again, over the whole receiver-to-declaring chain.
+    //
+    // # Why the declaring class alone is not enough
+    //
+    // A native is registered on the class the RECEIVER actually has, and the
+    // method it shadows is very often DECLARED on a superclass. The two
+    // screens above ask about the constant-pool class and the declaring class,
+    // and a guarded virtual site has neither: it starts the selection walk at
+    // the runtime receiver, `find_method_recursive` returns the first concrete
+    // body it meets, and that body's declaring class is where the screen then
+    // looks — one or more classes ABOVE the one carrying the native.
+    //
+    // Measured 2026-09-04, `probes/TreeTailIterProbe.java` with
+    // `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1`: a compiled
+    // `for (e : treeMap.tailMap(k).entrySet())` iterates ZERO entries while
+    // `entrySet().size()` on the same object answers 6. The single spliced
+    // site is `java/util/Iterator.hasNext()Z`, guarded on
+    // `java/util/TreeMap$EntryIterator` -- which has
+    // `native_al_itr_has_next` registered on it by the `VALUES_ITR_CARRIERS`
+    // loop. But `hasNext` is DECLARED on `java/util/TreeMap$PrivateEntryIterator`,
+    // which carries no native, so `declaring_class_name` above cleared the
+    // screen and the splice ran the real JDK body -- `return next != null` over
+    // a `next` field a natively-managed iterator never populates. False, every
+    // time, from the first compiled call.
+    //
+    // Walking the chain is the precise form of the rule the two screens above
+    // state, because it asks the question DISPATCH asks: not "does the class
+    // that wrote this method have a native" but "does any class this receiver
+    // IS have one". Bounded by `declaring_id` -- past it the body is not the
+    // one being spliced -- and short in practice.
+    if let Some(receiver_id) = receiver_class_id {
+        let mut walk = Some(receiver_id);
+        while let Some(cid) = walk {
+            let Some(class) = store.get(cid) else { break };
+            if shared
+                .natives
+                .native_methods
+                .find(&*class.name, callee_method, callee_desc)
+                .is_some()
+            {
+                no!(format!(
+                    "native-shadow-on-receiver-chain (registered on {}, declared on {})",
+                    class.name, declaring_class_name
+                ));
+            }
+            if cid == declaring_id {
+                break;
+            }
+            walk = class.superclass;
+        }
     }
     // The class the SPLICED BODY belongs to, which is what an invalidation
     // dependency must name. For a constant-pool resolution this stays the

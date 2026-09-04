@@ -775,9 +775,7 @@ steady state. Measured at `-Xmx4096m`:
 
 The pairing is better than the target alone on BOTH axes: the floor stops the
 one cycle the controller is blind to, and paying for that cycle up front costs
-less than the controller's recovery from it. **Since 2026-09-03 it is the
-default** — a pause target brings a 25 % floor with it unless the operator
-names a percentage. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
+less than the controller's recovery from it. **It was made the default on 2026-09-03 and WITHDRAWN on 2026-09-04**, the day after: arming the floor implicitly changed how often the collector runs on every ZGC workload, and `org.h2.test.db.TestLargeBlob` went from 0 collections and a PASS to 34 collections and a SIGSEGV inside `FileChannelImpl.implWrite` -> `IOUtil.write` -> `DirectByteBuffer` (3 crashes in 4 runs with the floor on, 0 in 3 with it off, same binary). The crash is almost certainly older than the flag — without the floor that test never collects at all, so nothing exercised the path — but a default that turns a passing test into a native crash does not ship while that bug is open. Pair them explicitly with `CRATONVM_ZGC_ALLOC_TRIGGER=<percent>` if you want it. `CRATONVM_ZGC_ALLOC_TRIGGER=0` is an explicit refusal
 rather than an absence, and is how the "target alone" arm is measured; any
 other explicit value wins over the floor in both directions.
 

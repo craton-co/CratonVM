@@ -1503,7 +1503,35 @@ impl ClassStore {
     /// compact reference-field layout is enabled. Idempotent (overwrites on
     /// redefine / subclass-layout recompute). Safe no-op when the flag is off.
     pub fn register_compact_layout_if_enabled(&self, id: ClassId) {
-        if !cratonvm_types::compact_ref_fields_enabled() {
+        let compact = cratonvm_types::compact_ref_fields_enabled();
+        // `CRATONVM_DBG_LAYOUT=1`'s FIRST job is the class-id -> NAME mapping,
+        // and that mapping exists in every configuration. It used to sit past
+        // the `compact_ref_fields_enabled()` early return, so with compact
+        // layouts off — the default — the flag printed NOTHING, while three
+        // separate doc comments told readers to use it for exactly this:
+        //
+        //   gc/src/autobox.rs        "run with CRATONVM_DBG_LAYOUT=1, which
+        //                             prints `[layout] <name> cid=<N> ...`"
+        //   gc/src/heap.rs           "Run with CRATONVM_DBG_LAYOUT=1 to resolve
+        //                             a class_id to a name"
+        //   types/src/compact_value.rs  the same sentence again
+        //
+        // MEASURED (`G45-1`): `CRATONVM_DBG_COERCION=1 CRATONVM_DBG_LAYOUT=1`
+        // over `RJdkSecurity` produced 13,135 lines and not one `[layout]` row,
+        // so none of the six class ids in that transcript could be resolved.
+        // A cheap gate for a DIFFERENT feature was standing in front of an
+        // informative one and hiding its zero — and `autobox.rs`'s own comment
+        // says it best about the flag it replaced: "a diagnostic that names the
+        // wrong instrument costs more than no diagnostic, because it is
+        // trusted."
+        if !compact {
+            if loader_flags().dbg_layout {
+                let name = self.get(id).map(|c| c.name.to_string()).unwrap_or_default();
+                eprintln!(
+                    "[layout] {name} cid={} (no compact layout: compact reference                      fields are disabled in this build/configuration)",
+                    id.as_u32()
+                );
+            }
             return;
         }
         let built = self.build_compact_layout(id);

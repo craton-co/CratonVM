@@ -459,7 +459,8 @@ struct Lowerer<'a> {
     /// Number of parameter slots.
     num_params: usize,
     /// Number of local variable slots.
-    _num_locals: usize,
+    /// `max_locals`. Read by the prologue's unset-local zeroing.
+    num_locals: usize,
     /// Frame size (aligned).
     frame_size: i32,
     /// real-frame-deopt: bytecode pc → earliest native code offset emitted
@@ -1300,7 +1301,7 @@ impl<'a> Lowerer<'a> {
             block_offsets: vec![0; schedule.blocks.len()],
             branch_patches: Vec::new(),
             num_params,
-            _num_locals: num_locals,
+            num_locals,
             frame_size,
             bci_native: HashMap::new(),
             cur_bci: 0,
@@ -2617,6 +2618,35 @@ impl<'a> Lowerer<'a> {
             self.load_reg_from_frame(RAX, -disp);
             self.store_abi_reg(RAX, ((i as i32) + 1) * 8); // local_offset(i)
         }
+        // Zero every local slot this method did NOT receive as a parameter.
+        //
+        // The JVM's definite-assignment rule means such a slot is never read
+        // before it is written, so its entry value is unobservable to Java --
+        // but it is very observable to the GC. `alloc`'s `long[] a` is slot 1,
+        // and at the `new long[n]` safepoint one instruction later it still
+        // holds whatever the previous frame at this address left there. In an
+        // allocation-heavy workload that is a stale object pointer, so G1's
+        // band verifier finds a movable-resident word that no oop map names
+        // (correctly -- the dataflow knows the local is not live yet) and no
+        // shadow push published, and refuses to relocate.
+        //
+        // That was the ENTIRE residual after the reserved-tail zeroing below:
+        // 8.5-15.2% of pauses incomplete on `CoverageBench`, every report at
+        // this one offset in this one leaf.
+        //
+        // Safe only because this tier's prologue is the sole entry: `osr_enter`
+        // refuses here for want of an `osr_pc_to_native` table, which the
+        // assertion in `finish` pins. An OSR trampoline jumps PAST this
+        // prologue into a frame whose locals the interpreter already
+        // populated -- zeroing them there would destroy live state, so the edit
+        // that wires OSR into this tier must revisit this block, exactly as it
+        // must revisit the callee-saved save area.
+        if !prologue_zero_unset_locals_disabled() {
+            for i in self.num_params..self.num_locals {
+                // Cast: a JVM local index times 8 -- `max_locals` is u16.
+                self.emit_zero_frame_slot(((i as i32) + 1) * 8);
+            }
+        }
         // Zero the cached-thread and watermark slots BEFORE the fetch. The
         // fetch is erased (NOP'd) by `finish_lazy_thread_fetch` when the method
         // publishes nothing, and every consumer below is null-guarded on the
@@ -2626,6 +2656,38 @@ impl<'a> Lowerer<'a> {
         if self.get_current_thread != 0 && self.shadow_thread_slot_off > 0 {
             self.emit_zero_frame_slot(self.shadow_thread_slot_off);
             self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
+            // ... and the OTHER two reserved bookkeeping words, for the same
+            // reason and a second one.
+            //
+            // `shadow_savebase` is written only by a shadow PUSH and
+            // `phi_copy_scratch` only by a parallel copy that needs to break a
+            // cycle. A method that does neither -- every no-oop leaf, and
+            // `finish_lazy_thread_fetch` erases the fetch in exactly those --
+            // leaves both holding whatever the previous frame at this address
+            // left behind. In allocation-heavy code that is a stale object
+            // pointer, and G1's band verifier then finds a movable-resident
+            // word in the reserved-locals tail that no oop map names and no
+            // shadow push published, and correctly refuses to relocate the
+            // whole collection.
+            //
+            // Measured on `CoverageBench` after the §26 window repair: the
+            // ENTIRE residual incomplete rate (~19%, 386 reports over six runs)
+            // was `CoverageBench.alloc`, at three offsets -- and two of them are
+            // these. Neither word is ever read while it holds that garbage, so
+            // zeroing costs two prologue stores and removes the refusal.
+            //
+            // Kept inside this gate deliberately: it is the same "the reserved
+            // tail must read 0, not uninitialised stack" contract the two
+            // stores above already establish, and the same block the
+            // single-pass backend zero-initialises for.
+            if !prologue_zero_reserved_tail_disabled() {
+                if self.shadow_savebase_slot_off > 0 {
+                    self.emit_zero_frame_slot(self.shadow_savebase_slot_off);
+                }
+                if self.phi_copy_scratch_slot_off > 0 {
+                    self.emit_zero_frame_slot(self.phi_copy_scratch_slot_off);
+                }
+            }
         }
         // And the safepoint-id slot, for the SAME reason and on its own gate:
         // `active_safepoint_id` reads `[rbp - sp_id_slot_off]` on any live
@@ -7078,6 +7140,9 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
                     self.emit_gpr_array_elem_store(*kind);
+                    // RAX still holds the array pointer -- the store above
+                    // addresses through it. See `crate::gpu_barrier`.
+                    self.emit_gpu_input_cache_barrier();
                     return;
                 }
                 let is_d = matches!(kind, MemKind::Double);
@@ -7090,6 +7155,10 @@ impl<'a> Lowerer<'a> {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x11, 0x44, sib, HEADER_SIZE as u8]);
+                // Same contract as the integral arm above: RAX is the array.
+                // The barrier clobbers R10/R11 and the flags only, so an
+                // XMM-resident value elsewhere in the frame is untouched.
+                self.emit_gpu_input_cache_barrier();
             }
             // arraylength (COV-02). inputs = [ctrl, mem, array]. One 32-bit
             // load at a fixed header offset behind the JVMS null check. No
@@ -8672,6 +8741,24 @@ impl<'a> Lowerer<'a> {
     /// `MemKind::Ref` is refused by the caller (no store barrier in this tier)
     /// and the FP kinds take the XMM path. One shared header displacement, for
     /// the reason given on [`Self::emit_gpr_array_elem_load`].
+    /// Emit the GPU input-residency barrier after an inline primitive
+    /// array store, if a `--gpu` run armed it.
+    ///
+    /// Assumes RAX holds the array pointer, which both `ArrayStore` arms
+    /// guarantee. Clobbers R10, R11 and the flags: R10 is already this
+    /// backend's guard scratch, R11 is never register-resident, and this
+    /// backend's linear-scan residency uses only callee-saved GPRs
+    /// (`IR_LOWER_LS_GPRS`), so nothing live is at risk.
+    ///
+    /// Emits nothing at all unless armed -- see [`crate::gpu_barrier`],
+    /// which is also where the reason a compiled store marks a bucket
+    /// instead of calling `input_cache::invalidate` is written down.
+    fn emit_gpu_input_cache_barrier(&mut self) {
+        if let Some(bytes) = crate::gpu_barrier::barrier_bytes() {
+            self.buf.emit(&bytes);
+        }
+    }
+
     fn emit_gpr_array_elem_store(&mut self, kind: MemKind) {
         let d = crate::x64::disp::disp8_const(HEADER_SIZE as i64) as u8;
         match kind {
@@ -21121,6 +21208,30 @@ mod tests {
 /// which is default-ON. Latched: read once, because a codegen decision must not
 /// change under a running process. With it set, one binary reproduces the
 /// stale-mirror `ACTIVE_FRAME_MAP` refusals this fixed.
+/// Kill switch for zeroing the two reserved bookkeeping words the prologue used
+/// to leave holding the previous frame's stack (`shadow_savebase`,
+/// `phi_copy_scratch`).
+///
+/// Off restores the old behaviour, so the effect is one binary's A/B. This is a
+/// codegen change on every prologue, which is exactly the kind that has to ship
+/// with a switch.
+/// Kill switch for zeroing the local slots a method did not receive as
+/// parameters. Separate from [`prologue_zero_reserved_tail_disabled`] so the
+/// two prologue changes stay independently attributable.
+fn prologue_zero_unset_locals_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS").is_some()
+    })
+}
+
+fn prologue_zero_reserved_tail_disabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL").is_some()
+    })
+}
+
 fn ic_frame_republish_disabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
