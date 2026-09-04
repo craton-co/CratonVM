@@ -2175,3 +2175,104 @@ collected. That is an independent per-slot gap in `collect_live_oop_homes`,
 untouched by the window repair and now the only remaining lead from §25's
 question. It accounts for 6 to 24 reports per run against `alloc`'s 211, so it
 is worth pursuing only after the ~20 % residual incomplete rate is attributed.
+
+## 27. The residual, closed — and §26.5 was wrong about where it was (2026-09-04)
+
+### 27.1 There is no `m06` gap
+
+§26.5 named `m06`'s `shadow_pushed=2/3` as "an independent per-slot gap in
+`collect_live_oop_homes`". It is not a gap, on two counts.
+
+It is not measurable: with the §26 window repair in place, `m06` reports **zero**
+unpublished band words across six runs (386 reports, every one of them
+`CoverageBench.alloc`). The `2/3` was recorded while the window was still
+unresolved, when `published` was empty and therefore EVERY movable word in every
+frame reported. `m06` was one of the frames being billed for `alloc`'s lost
+window, not a second defect beside it.
+
+And it would not have been evidence even if it had persisted: `shadow_pushed`
+counts HOMES — `ShadowHome::Reg` and `ShadowHome::Frame` alike — while the
+denominator counts only the map's `frame_slot_offsets`. A register-resident
+local is one home and one mapped frame slot, and `collect_live_oop_homes`
+deduplicates besides, so the two numbers partition different sets and need not
+be equal. Reading `2/3` as "one slot was missed" was reading a ratio between
+incomparable counts.
+
+Both errors have the same root: a number recorded under one condition was
+carried into a paragraph written under another.
+
+### 27.2 What the residual actually was
+
+Every remaining report was `CoverageBench.alloc` at offsets 16, 48 and 64, all
+`in_map=false` — the active map does not name them, correctly, because the
+dataflow does not consider them live. Decoding the reserved tail from the
+`sp_id_off=32` the report already printed:
+
+| offset | slot |
+| --- | --- |
+| 16 | java local 1 — `long[] a`, before its first assignment |
+| 48 | `shadow_savebase_slot_off` |
+| 64 | `phi_copy_scratch_slot_off` |
+
+All three are **uninitialised frame words**. The prologue zeroes
+`shadow_thread` and `shadow_savetop` and stops there, so `shadow_savebase`
+(written only by a shadow push) and `phi_copy_scratch` (written only by a
+cycle-breaking parallel copy) hold whatever the previous frame at that address
+left — and in an allocation-heavy workload that is a stale object pointer. The
+Java local is the same story from the other direction: definite assignment means
+nothing reads it before it is written, so nothing writes it either.
+
+The band verifier is right about all three. A movable-resident word that no map
+names and no push published is exactly what it exists to refuse.
+
+### 27.3 The repair
+
+Two prologue changes, each behind its own switch so they stay attributable:
+
+* `CRATONVM_JIT_NO_ZERO_RESERVED_TAIL` — also zero `shadow_savebase` and
+  `phi_copy_scratch`, inside the block that already establishes "the reserved
+  tail must read 0, not uninitialised stack".
+* `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` — zero local slots `num_params
+  ..num_locals`. Safe only because this tier publishes no `osr_pc_to_native`,
+  so `osr_enter` refuses and this prologue is the sole entry; an OSR trampoline
+  would jump past it into a frame whose locals the interpreter had already
+  filled. The edit that wires OSR into this tier must revisit this block, for
+  the same reason it must revisit the callee-saved save area.
+
+`CoverageBench` at `-Xmx32m`, ABBA-interleaved, incomplete rate:
+
+| arm | rate | offsets still reporting |
+| --- | --- | --- |
+| both off | 17.7 – 20.1 % | 16, 32, 48, 64 |
+| reserved tail only | 7.6 – 9.6 % | 16, 32 |
+| both on | **0.00 %** | none |
+
+Zero at `-Xmx32m`, `64m` and `256m`, and zero under the precise-only-roots arm.
+Checksum identical in every arm of every run. Taken with §26, the rate on this
+workload went 99.6 % → ~20 % → 0 %.
+
+### 27.4 Cost
+
+Extra prologue stores, so it has to be priced. `CoverageBench 20000 400000 512`,
+ABBA-interleaved, 20 runs per heap:
+
+| heap | on | off |
+| --- | --- | --- |
+| 256 m | 9989 ms | 10794 ms |
+| 48 m | 11907 ms | 12622 ms |
+
+Both medians favour ON, but an earlier 6-run sample at 256 m put ON 3.7 %
+SLOWER, and the per-run spread is 8.8 – 16.7 s. Two samples that disagree in
+sign mean the effect is below this host's noise floor. The honest claim is "no
+measurable cost", not the 5.7 – 7.5 % the medians would otherwise support.
+
+The first attempt at this measurement was worse than useless: every arm exited
+`rc=1` and I read the wall-clock anyway. `CoverageBench`'s `r * 7919` overflows
+`int` past ~271k rounds, so 400k rounds threw
+`ArrayIndexOutOfBoundsException` — the probe's own arithmetic, reported as if it
+were the VM's. Fixed in the probe with a `long` widening; the published
+checksum at 150k rounds is unchanged, so every earlier number still holds.
+
+### 27.5 Gates
+
+`cratonvm-jit` 2230 passed, `cratonvm-vm` 201 passed, regression suite 90 of 90.
