@@ -124,6 +124,37 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// The pattern in both: **the fixes are usually right.** What is missing is the
 /// run, and a record nobody can act on is worth much less than the work in it.
 ///
+/// # The list reached zero on 2026-09-04, and what that cost
+///
+/// All 61 were paid. The pattern above held for most of them and broke for
+/// four, which is the part worth carrying forward:
+///
+/// * `H13-2` §2 — `ca8f03069` is an ancestor of `HEAD` and the defect
+///   reproduces. A provider written to the documented JCA contract is still
+///   unreachable; the probe the record named could not see it, because that
+///   probe registers no custom provider at all.
+/// * `G9-1` — the fixes landed; `"AΣ".toLowerCase(ROOT)` still gives medial
+///   sigma where the final form is required, 3 of 768 checks.
+/// * `W7-58` — `bb_state`'s missing direct-buffer arm is live, and it kills
+///   the probe partway, so the rows after it are UNTESTED rather than passing.
+/// * `G10-1` — one `doubleValue()` row returns a value no `double` can hold.
+///
+/// So "fixed in source" and "defect closed" are different claims, and this
+/// gate can only ever see the first. `W7-55` measured the same population by
+/// archaeology and concluded the campaign's records "under-retire, never
+/// overclaim" — true of whether a patch is in the tree, and not true of
+/// whether it works.
+///
+/// Two other things this campaign learned the hard way, both of which cost a
+/// wrong answer before they were caught:
+///
+/// * **A vector a record writes out in full is not a vector the suite runs.**
+///   `G10-1` and `G9-1` each embed their vector; neither was ever added, so
+///   the suite reported them ABSENT and a reader would call that passing.
+/// * **A full disk and a compile failure are indistinguishable in `cargo`'s
+///   output.** `cargo test --workspace` returned `cc` link errors across the
+///   tree; `/data` was at 100% and the linker had died with `Bus error`.
+///
 /// One thing the 2026-09-02 run established the hard way: some probes are
 /// arm-specific. `W7-57`/`W7-58`/`W7-70`/`W7-81` name sites registered only
 /// under `--synthetic-jdk`, and a default build produces numbers that measure
@@ -131,18 +162,6 @@ const DISCHARGE_MARKERS: &[&str] = &[
 /// reproduce line is `--jdk-only`. Read the record for its arm; do not assume
 /// the neighbour's.
 const ALLOWED: &[(&str, &str)] = &[
-    (
-        "docs/known-issues/jdk-only/H0-1-the-jmx-pin-and-a-jdk-that-was-not-there-20260820.md",
-        "status block says: **Status: FIXED-UNVERIFIED.** Three source/doc changes landed in the tree. **No",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-55-record-reconciliation.md",
-        "status block says: Nothing was built or run for this pass. Every verdict below is git and source",
-    ),
-    (
-        "docs/known-issues/jdk-only/W7-9-minted-interface-abstract-methods.md",
-        "status block says: **Nothing here has been built or run.** Every claim is either `javap` output from",
-    ),
 ];
 
 /// The walk must see at least this many pages, or it is broken rather than the
