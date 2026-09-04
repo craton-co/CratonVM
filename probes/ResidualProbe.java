@@ -15,11 +15,35 @@ public class ResidualProbe {
         String out;
         try {
             Object v = c.run();
-            out = v == null ? "null" : (v.getClass().getName() + " [" + v + "]");
+            out = v == null ? "null" : (v.getClass().getName() + " [" + norm(v) + "]");
         } catch (Throwable e) {
             out = e.getClass().getName() + ": " + e.getMessage();
         }
         System.out.println(label + " => " + out);
+    }
+
+    /**
+     * Erase an identity hash from a default toString.
+     *
+     * Object.toString() is `<class>@<Integer.toHexString(hashCode())>`, and that
+     * hash is not comparable across two VMs -- nor across two runs of one. This
+     * probe was diffed against HotSpot and reported six differing lines, four of
+     * which were only the hash; the class names on those rows were identical.
+     * A probe whose output is unstable cannot be scored, and the reader then has
+     * to be told which lines to ignore, which is how a real divergence gets
+     * ignored with them. Same repair as HttpServerWildcardAddressProbe's
+     * ephemeral ports and UnderAllocationProbe's temp filenames.
+     */
+    static String norm(Object v) {
+        String s = String.valueOf(v);
+        String prefix = v.getClass().getName() + "@";
+        if (s.startsWith(prefix) && s.length() > prefix.length()) {
+            String tail = s.substring(prefix.length());
+            if (tail.chars().allMatch(c -> Character.digit(c, 16) >= 0)) {
+                return prefix + "<identity>";
+            }
+        }
+        return s;
     }
     interface Call { Object run() throws Exception; }
 
