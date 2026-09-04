@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-336 tokens.
+338 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -770,6 +770,8 @@ export inherited from a parent shell.
 | `osr-exc-table` | `CRATONVM_JIT_OSR_EXC_TABLE` |
 | `staged-arg-shadow` | `CRATONVM_JIT_NO_STAGED_ARG_SHADOW` |
 | `ic-frame-republish` | `CRATONVM_JIT_NO_IC_FRAME_REPUBLISH` |
+| `zero-reserved-tail` | `CRATONVM_JIT_NO_ZERO_RESERVED_TAIL` |
+| `zero-unset-locals` | `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
 | `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
