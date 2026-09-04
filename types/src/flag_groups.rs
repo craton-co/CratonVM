@@ -1486,6 +1486,8 @@ pub const INVENTORY: &[E] = &[
     // `x64::safepoint::collect_live_oop_homes`.
     E { group: Group::JIT, token: "staged-arg-shadow", on_key: None, off_key: Some("CRATONVM_JIT_NO_STAGED_ARG_SHADOW"), off_word: None, since: "2026-08-26" },
     E { group: Group::JIT, token: "ic-frame-republish", on_key: None, off_key: Some("CRATONVM_JIT_NO_IC_FRAME_REPUBLISH"), off_word: None, since: "2026-08-24" },
+    E { group: Group::JIT, token: "zero-reserved-tail", on_key: None, off_key: Some("CRATONVM_JIT_NO_ZERO_RESERVED_TAIL"), off_word: None, since: "2026-09-04" },
+    E { group: Group::JIT, token: "zero-unset-locals", on_key: None, off_key: Some("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS"), off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "checkcast-inline", on_key: Some("CRATONVM_JIT_CHECKCAST_INLINE"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::JIT, token: "final-devirt", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT"), off_key: None, off_word: None, since: "2026-08-28" },
     // Declared 2026-09-02. `final-devirt` above is `java/lang/String`'s
