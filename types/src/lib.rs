@@ -68,7 +68,8 @@ pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
-    compact_tlab_body_size, single_layout_domain,
+    compact_tlab_body_size, layout_replace_epoch, layout_replace_epoch_guard,
+    single_layout_domain,
     foreign_layout_refusals, is_compact_object, layout_generation, layout_replace_guard,
     next_layout_domain, object_body_size, pack_fields_by_width_enabled, read_compact_field,
     register_class_layout, set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled,
@@ -734,6 +735,74 @@ pub mod scalar_deopt_census {
 /// Counting the door is what separates "the heap decided" from "someone
 /// asked", which is the question left after the trigger census came back
 /// empty.
+/// Why an OSR compile was refused, per gate.
+///
+/// AUDIT 2026-09-04. `compile_osr_artifact` sets `osr_stage("entry")` and
+/// then has FOUR early gates that `return None` without setting a stage of
+/// their own, so every early refusal reports `stage=entry` and the four are
+/// indistinguishable. That is how a refusal can be real and unattributed:
+/// `gpu_jit_gate_census` counts 7 methods blocked, all one-shot
+/// `<clinit>`s, while `Integration.integrate` gets ZERO OSR enters under
+/// `--gpu` and 14 other methods still enter -- so something refuses it that
+/// nothing counts.
+///
+/// This distinguishes the two possibilities the gate census cannot:
+/// OSR was ATTEMPTED and refused by a named gate, or OSR was never
+/// attempted at all, in which case no gate ran and the method appears
+/// nowhere.
+pub mod osr_refusal_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static REFUSALS: std::sync::Mutex<Vec<(&'static str, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+    static NAMED: std::sync::Mutex<Vec<(String, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_NAMED: usize = 48;
+
+    /// One entry into `compile_osr_artifact`.
+    #[inline]
+    pub fn note_attempt() {
+        ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One refusal, tagged with the gate that returned `None`.
+    pub fn note_refusal(gate: &'static str, method: &str) {
+        let mut v = REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
+        match v.iter_mut().find(|(g, _)| *g == gate) {
+            Some((_, n)) => *n += 1,
+            None => v.push((gate, 1)),
+        }
+        drop(v);
+        let mut n = NAMED.lock().unwrap_or_else(|p| p.into_inner());
+        if n.len() < MAX_NAMED && !n.iter().any(|(m, g)| m == method && *g == gate) {
+            n.push((method.to_string(), gate));
+        }
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let attempts = ATTEMPTS.load(Ordering::Relaxed);
+        if attempts == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            let mut v = REFUSALS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let refused: u64 = v.iter().map(|(_, n)| n).sum();
+            eprintln!(
+                "[cratonvm] osr refusals: attempts={attempts} refused_at_early_gate={refused}"
+            );
+            for (gate, n) in v {
+                eprintln!("[cratonvm] osr refusals:   {gate}: {n}");
+            }
+            for (m, g) in NAMED.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+                eprintln!("[cratonvm] osr refusals:   {g} <- {m}");
+            }
+        });
+    }
+}
+
 pub mod gc_entry_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

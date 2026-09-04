@@ -3,9 +3,10 @@
 ## Status
 
 **Root-caused and measured. Not fixed.** The chain below is established
-end to end by counters added on 2026-09-03/04, all of which are on `dev`.
-The last link — *why* the gate census does not count the refusal — is
-open, and is a defect in the instrument rather than in the VM.
+end to end by counters added on 2026-09-03/04, all of which are on `dev`,
+and is confirmed from both sides: the gate census names
+`Integration.integrate` as blocked, and the OSR refusal census names the
+gate that turned it away.
 
 ## The symptom
 
@@ -83,15 +84,53 @@ Each was measured and eliminated, in this order:
   an object) and was wrong: the baseline scalar-replaces nothing either,
   `scalar_new=[]` on all 21 traced kfusion compilations.
 
-## The open link
+## The gate census was NOT undercounting — that claim was wrong
 
-`gpu_jit_gate_census` reports 7 blocked methods and
-`Integration.integrate` is not among them, yet OSR is refused for it.
-Either the OSR site reaches a refusal that bypasses `caller_blocks_jit`,
-or the census under-counts because the verdict is cached per
-`(vm, class, method)` and only first computations are counted. Until
-that is resolved the "7 blocked" figure should not be trusted as a
-measure of the gate's reach.
+This page first recorded, as an open link, that `gpu_jit_gate_census`
+reported 7 blocked methods with `Integration.integrate` absent while OSR
+was refused for it. That was a reading error, not a defect: the 7 came
+from a run that judged only 301 methods. A run that reaches the whole
+pipeline reports
+
+    gpu jit gate: methods judged=623 blocked_from_jit=31 admitted=592
+
+and `Integration.integrate` IS in the blocked list. Both censuses agree.
+
+What DID need fixing is separate and real: `compile_osr_artifact` sets
+`osr_stage("entry")` and then four early gates `return None` without
+setting a stage of their own, so every early refusal reported
+`stage=entry` — sometimes a STALE `entry` left by a previous compile on
+the same thread. The four were indistinguishable, and a genuine refusal
+looked like a method that had never been considered. Each gate now names
+itself and `osr_refusal_census` counts refusals where they are taken:
+
+    osr refusals: attempts=28 refused_at_early_gate=4
+      gpu-offload: 4
+        sun/nio/cs/SingleByte.initC2B
+        kfusion/tornado/algorithms/ImagingOps.bilateralFilter
+        kfusion/tornado/algorithms/GraphicsMath.vertex2normal
+        kfusion/java/algorithms/Integration.integrate
+
+(no `--gpu`: 33 attempts, 0 refused.)
+
+## The scale of it, which is not a kfusion quirk
+
+The 31 blocked methods split 21 `writes-primitive-array` / 10
+`calls-eligible-kernel`, and the second group is the alarming one. The
+targets whose eligibility blocks their callers include:
+
+    java/lang/Math.max(II)I
+    java/lang/Math.min(II)I
+    uk/ac/manchester/tornado/api/types/utils/FloatOps.sq(F)F
+    uk/ac/manchester/tornado/api/types/utils/StorageFormats.toRowMajor...
+
+`Math.min(II)I` is judged an offload-eligible KERNEL, so
+`TornadoMath.clamp(III)I` is denied compilation, and so is anything
+calling it. The 21 array-writers are the whole TornadoVM vector and image
+accessor family — `Float3.set`, `Short2.set`, `Int3.set`,
+`ImageFloat.get`/`set` — which is precisely what kfusion's inner loops
+are built from. Under `--gpu` that entire data-structure layer is denied
+JIT, on any application using it, whether or not anything ever offloads.
 
 ## Repro
 

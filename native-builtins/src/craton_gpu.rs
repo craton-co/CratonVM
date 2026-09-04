@@ -3277,6 +3277,10 @@ pub mod dispatch_timing {
         // How much of the program `--gpu` moved off the JIT. See
         // `vm::runtime::offload_jit_gate`.
         cratonvm_types::gpu_jit_gate_census::exit_summary();
+        // The OSR side of the same question: the gate census counts
+        // `caller_blocks_jit` verdicts, this counts refusals actually taken
+        // at an OSR admission gate. They disagreed, which is the point.
+        cratonvm_types::osr_refusal_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
