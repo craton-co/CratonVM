@@ -1580,6 +1580,17 @@ split residency, the null-check port, the loop-weighted use count, the
 parameter prologue copy and the direct publish each addressed a symptom of the
 frame-slot-first model, and the model absorbed all five.
 
+That change is designed, sized and not built:
+[`feature-designs/ir-optional-home-slot.md`](feature-designs/ir-optional-home-slot.md).
+It records the three obligations already verified (deopt and safepoints are
+covered by `pinned`; references are excluded for oop-map reasons; the read side
+is 84 cached against 13 direct), the coupling that sets its shape (dropping the
+store needs a register-to-register publish, which needs the arms to say where
+their result is, and 50 of them say it only by writing memory), and a
+fail-closed route for the one hazard — `slot_of` on a homeless value fails the
+compile rather than reading a stale word, so the first run names the sites to
+convert instead of a whitelist being guessed.
+
 **So the recommendation stands and now has a number behind it.** Getting a
 loop's live set into registers *as a group* is worth about 1.57x on this shape.
 That is an order of magnitude above the measurement floor that swallowed all
