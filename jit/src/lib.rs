@@ -2566,6 +2566,21 @@ pub struct FrameLayout {
     /// Prologue save area for the caller's callee-saved GPRs.
     pub callee_saved_lo: i32,
     pub callee_saved_hi: i32,
+    /// Is that save area at the SHALLOW end of the frame (nearest the frame
+    /// pointer) rather than the deep end?
+    ///
+    /// x86-64 puts it deepest, which lets the band verifier treat
+    /// `callee_saved_lo` as a half-line -- everything at or beyond it is a
+    /// register image or past the frame. AArch64's prologue puts the saved
+    /// FP/LR pair and the callee-saved GPRs immediately below the frame
+    /// pointer and the spill area BELOW them, so that half-line would exclude
+    /// the entire spill area -- exactly where the oop maps point, leaving the
+    /// verifier unable to see the words it exists to check.
+    ///
+    /// `false` (the derived default) is the x86-64 geometry, so no existing
+    /// producer changes. A backend that sets it gets the RANGE exclusion
+    /// (`is_register_image`) and not the half-line.
+    pub callee_saved_shallow: bool,
     /// Prologue save area for the caller's callee-saved XMMs.
     pub xmm_saved_lo: i32,
     pub xmm_saved_hi: i32,
@@ -38693,7 +38708,7 @@ mod layout_constant_inventory {
 
     /// `(file, counts)` where `counts[i]` is the number of code uses of
     /// `LAYOUT_CONSTANTS[i]` in that file.
-    const INVENTORY: [(&str, [usize; 8]); 2] = [
+    const INVENTORY: [(&str, [usize; 8]); 3] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
         // two offset closures — `legacy()` (header-plus-cell, then the ref or
         // int-category payload offset inside that cell: one use of each) and
@@ -38839,12 +38854,22 @@ mod layout_constant_inventory {
         // cell it just proved is or is not written. No new EMISSION site: the
         // guard itself bakes an epoch address and a count, not a displacement.
         ("ir_lower.rs", [20, 4, 7, 0, 0, 0, 6, 6]),
+        // x64/objects.rs, added 2026-09-04. It bakes object-header
+        // displacements exactly as the two files above do -- the compact and
+        // legacy reference-store cell addresses, the array header, the inline
+        // TLAB `new` -- and was covered by NEITHER tripwire: the `x64.rs` scan
+        // matches only the `<CONST> as <ty>` cast form, and this inventory
+        // listed two files. The gap was found the honest way, by adding a
+        // legacy emission site there on 2026-09-02 and having to record it by
+        // hand in `header-shrink.md` because nothing counted it.
+        ("objects.rs", [8, 0, 3, 0, 2, 0, 2, 2]),
     ];
 
     fn source(file: &str) -> &'static str {
         match file {
             "lib.rs" => include_str!("lib.rs"),
             "ir_lower.rs" => include_str!("ir_lower.rs"),
+            "objects.rs" => include_str!("x64/objects.rs"),
             other => panic!("no source registered for {other}"),
         }
     }

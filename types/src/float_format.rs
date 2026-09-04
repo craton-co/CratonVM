@@ -1,10 +1,10 @@
 //! Java-compatible `Double.toString` / `Float.toString` formatting.
 //!
 //! Rust's `Display` for `f64`/`f32` produces the shortest round-tripping
-//! decimal *digits* — which agree with Java's — but it NEVER switches to
-//! scientific notation, so `format!("{}", 1e7)` is `"10000000"` where Java
-//! requires `"1.0E7"`. This module reuses Rust's shortest-digit generator (via
-//! the `{:e}` formatter, i.e. Ryū) but applies the JLS layout rule:
+//! decimal *digits*, and it NEVER switches to scientific notation, so
+//! `format!("{}", 1e7)` is `"10000000"` where Java requires `"1.0E7"`. This
+//! module reuses Rust's shortest-digit generator (via the `{:e}` formatter,
+//! i.e. Ryū) but applies the JLS layout rule:
 //!
 //! > If `10^-3 <= m < 10^7` the value is written in plain decimal form;
 //! > otherwise "computerized scientific notation" `d.dddEexp` is used.
@@ -18,6 +18,29 @@
 //! `"4.9E-324"`. For subnormals only, we generate fixed-scientific candidates
 //! with increasing precision and keep the first one that parses back to the
 //! original bits, matching the JDK output shape.
+//!
+//! # The digits do NOT always agree, and this module's own doc said they did
+//!
+//! This file used to claim Rust's shortest digits "agree with Java's". They
+//! agree on length, and whenever one candidate is strictly closer to the value
+//! than any other. They disagree on the TIE: when two shortest decimals are
+//! exactly equidistant from `v`, `Double.toString` is specified to pick "the
+//! one whose least significant digit is even", and Ryu does not.
+//!
+//! MEASURED - the double `0x4309_9999_9999_999a` is exactly
+//! `900719925474099.25`, and both `900719925474099.2` and `900719925474099.3`
+//! round-trip to it:
+//!
+//! ```text
+//!   HotSpot 25   9.007199254740992E14      (even last digit)
+//!   Ryu          9.007199254740993E14
+//! ```
+//!
+//! Found via `G10-1`, whose one divergent row was
+//! `new BigDecimal(BigInteger.valueOf(9007199254740993L), 1).doubleValue()`.
+//! That record attributes it to `doubleValue`; the raw bits are identical to
+//! HotSpot's on both VMs, so the conversion was never wrong - the RENDERING
+//! was, for every `double` that lands on a tie.
 
 /// Format an `f64` exactly as `java.lang.Double.toString(double)` does.
 pub fn java_double_to_string(v: f64) -> String {
@@ -42,7 +65,7 @@ pub fn java_double_to_string(v: f64) -> String {
     if abs < f64::MIN_POSITIVE {
         return layout_subnormal_f64(v.is_sign_negative(), abs);
     }
-    let sci = format!("{:e}", abs);
+    let sci = java_shortest_sci_f64(abs);
     layout_java(v.is_sign_negative(), &sci)
 }
 
@@ -70,8 +93,113 @@ pub fn java_float_to_string(v: f32) -> String {
     if abs < f32::MIN_POSITIVE {
         return layout_subnormal_f32(v.is_sign_negative(), abs);
     }
-    let sci = format!("{:e}", abs);
+    let sci = java_shortest_sci_f32(abs);
     layout_java(v.is_sign_negative(), &sci)
+}
+
+/// Rust's shortest scientific digits for `abs`, with Java's tie-break applied.
+///
+/// See the module header. The only disagreement with Ryu is the exact tie, and
+/// the check is two-stage so the hot path pays one extra `format!` at most:
+///
+/// 1. Render one digit MORE than the shortest form. An exact tie has the true
+///    expansion terminating at `...5`, so if that extra digit is not `'5'` no
+///    tie is possible and Ryu's answer stands. This rejects almost everything.
+/// 2. Only then render enough digits to see the whole exact expansion, and
+///    confirm the tail really is `5` followed by nothing.
+fn java_shortest_sci_f64(abs: f64) -> String {
+    let sci = format!("{:e}", abs);
+    let n = significant_digit_count(&sci);
+    if n == 0 {
+        return sci;
+    }
+    if !ends_in_five(&format!("{:.*e}", n, abs)) {
+        return sci;
+    }
+    let exact = format!("{:.*e}", n + 40, abs);
+    apply_java_tie_break(&sci, &exact, n).unwrap_or(sci)
+}
+
+/// The `f32` twin. Same rule, same two stages, `f32` precision throughout.
+fn java_shortest_sci_f32(abs: f32) -> String {
+    let sci = format!("{:e}", abs);
+    let n = significant_digit_count(&sci);
+    if n == 0 {
+        return sci;
+    }
+    if !ends_in_five(&format!("{:.*e}", n, abs)) {
+        return sci;
+    }
+    let exact = format!("{:.*e}", n + 20, abs);
+    apply_java_tie_break(&sci, &exact, n).unwrap_or(sci)
+}
+
+fn significant_digit_count(sci: &str) -> usize {
+    let mantissa = sci.split_once('e').map(|(m, _)| m).unwrap_or(sci);
+    mantissa.chars().filter(|c| c.is_ascii_digit()).count()
+}
+
+fn ends_in_five(sci: &str) -> bool {
+    let mantissa = sci.split_once('e').map(|(m, _)| m).unwrap_or(sci);
+    mantissa.chars().filter(|c| c.is_ascii_digit()).next_back() == Some('5')
+}
+
+/// Given Ryu's shortest form and an exact expansion of the same value, return
+/// the `n`-digit form Java would print, or `None` when there is no exact tie
+/// (in which case Ryu's answer is already right).
+fn apply_java_tie_break(sci: &str, exact: &str, n: usize) -> Option<String> {
+    let (em, ee) = exact.split_once('e')?;
+    let exp: i32 = ee.parse().ok()?;
+    let digits: String = em.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() <= n {
+        return None;
+    }
+    let (head, tail) = digits.split_at(n);
+    // A tie is "exactly one half in the last place": `5`, and then nothing.
+    if !tail.starts_with('5') || !tail[1..].bytes().all(|b| b == b'0') {
+        return None;
+    }
+    // The two candidates are `head` and `head + 1`; Java takes the even one.
+    let last = head.as_bytes()[n - 1];
+    let (chosen, exp) = if (last - b'0') % 2 == 0 {
+        (head.to_string(), exp)
+    } else {
+        let (bumped, carried) = increment_decimal(head);
+        (bumped, if carried { exp + 1 } else { exp })
+    };
+    let rebuilt = if chosen.len() > 1 {
+        format!("{}.{}e{}", &chosen[..1], &chosen[1..], exp)
+    } else {
+        format!("{chosen}e{exp}")
+    };
+    if rebuilt == sci {
+        None
+    } else {
+        Some(rebuilt)
+    }
+}
+
+/// Add one to a decimal digit string, keeping its LENGTH. Returns the new
+/// digits and whether it carried out of the top (`"999"` -> `("100", true)`);
+/// the caller absorbs that carry into the exponent.
+fn increment_decimal(digits: &str) -> (String, bool) {
+    let mut out: Vec<u8> = digits.as_bytes().to_vec();
+    for i in (0..out.len()).rev() {
+        if out[i] == b'9' {
+            out[i] = b'0';
+        } else {
+            out[i] += 1;
+            return (
+                String::from_utf8(out).unwrap_or_else(|_| digits.to_string()),
+                false,
+            );
+        }
+    }
+    out[0] = b'1';
+    (
+        String::from_utf8(out).unwrap_or_else(|_| digits.to_string()),
+        true,
+    )
 }
 
 fn layout_subnormal_f64(negative: bool, abs: f64) -> String {
@@ -306,5 +434,80 @@ mod tests {
                 "round-trip failed: {v} -> {s}"
             );
         }
+    }
+
+    /// The exact tie Ryu and Java break differently.
+    ///
+    /// `0x4309_9999_9999_999a` is exactly `900719925474099.25`. Both
+    /// `...099.2` and `...099.3` round-trip to it, so both are "shortest";
+    /// `Double.toString` is specified to take the one whose least significant
+    /// digit is EVEN. Ryu takes the other one.
+    ///
+    /// Every expected string here is the exact output of HotSpot JDK 25.
+    #[test]
+    fn double_exact_ties_round_half_to_even_like_java() {
+        let v = f64::from_bits(0x4309_9999_9999_999a);
+        // The premise: this really is a tie, and Ryu really does disagree.
+        assert_eq!(format!("{:e}", v), "9.007199254740993e14", "Ryu's answer");
+        assert_eq!(
+            "900719925474099.2".parse::<f64>().unwrap().to_bits(),
+            v.to_bits(),
+            "the even candidate must round-trip, or it is not a tie"
+        );
+        assert_eq!(
+            "900719925474099.3".parse::<f64>().unwrap().to_bits(),
+            v.to_bits(),
+            "the odd candidate must round-trip too, or it is not a tie"
+        );
+        assert_eq!(java_double_to_string(v), "9.007199254740992E14");
+        assert_eq!(java_double_to_string(-v), "-9.007199254740992E14");
+    }
+
+    /// The control the fix must not break: values that are NOT ties keep Ryu's
+    /// digits exactly. If the tie-break ever fires on these, it is guessing.
+    #[test]
+    fn non_ties_are_left_alone() {
+        for (bits, expected) in [
+            (0x4340_0000_0000_0000u64, "9.007199254740992E15"),
+            (0x3ff0_0000_0000_0001, "1.0000000000000002"),
+            (0x3ff0_0000_0000_0000, "1.0"),
+            (0x4059_0000_0000_0000, "100.0"),
+            (0x7fef_ffff_ffff_ffff, "1.7976931348623157E308"),
+            (0x0010_0000_0000_0000, "2.2250738585072014E-308"),
+        ] {
+            let v = f64::from_bits(bits);
+            assert_eq!(java_double_to_string(v), expected, "bits {bits:#018x}");
+        }
+    }
+
+    /// Whatever the tie-break picks must still parse back to the same double.
+    /// This is the property that makes the change unable to be *wrong*, only
+    /// differently-spelled, and it is checked over a wide sweep rather than
+    /// the handful of literals above.
+    #[test]
+    fn tie_break_never_breaks_the_round_trip() {
+        let mut bits: u64 = 0x4009_2179_2143_7f11;
+        for _ in 0..20_000 {
+            // A cheap deterministic walk over a wide range of exponents.
+            bits = bits.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let v = f64::from_bits(bits);
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            let s = java_double_to_string(v);
+            let back: f64 = s.parse().expect(&s);
+            assert_eq!(back.to_bits(), v.to_bits(), "{s} did not round-trip");
+        }
+    }
+
+    /// `increment_decimal` has to keep the digit COUNT and report the carry,
+    /// because the caller absorbs it into the exponent. The all-nines row is
+    /// the one that would silently lengthen the mantissa.
+    #[test]
+    fn increment_decimal_keeps_its_width() {
+        assert_eq!(increment_decimal("1234"), ("1235".to_string(), false));
+        assert_eq!(increment_decimal("1239"), ("1240".to_string(), false));
+        assert_eq!(increment_decimal("999"), ("100".to_string(), true));
+        assert_eq!(increment_decimal("9"), ("1".to_string(), true));
     }
 }

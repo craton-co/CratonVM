@@ -1638,18 +1638,48 @@ pub(crate) fn build_third_party_engine(
     algo: &str,
     required_super: &str,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    // Each of these four refusals used to be a bare `Ok(None)`, which the
+    // caller reports as "this provider does not offer that algorithm" — the
+    // `[_ => default]` shape this function's own doc names as the defect it
+    // exists to remove. They are still refusals; they are no longer silent.
     if third_party_service_class(Some(provider), type_str, algo).is_none() {
+        tracing::warn!(provider, type_str, algo, "jca chain: no third-party service class");
         return Ok(None);
     }
     let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
+        tracing::warn!(provider, type_str, algo, "jca chain: build_jca_impl declined");
         return Ok(None);
     };
     let engine = match impl_result? {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
+        other => {
+            tracing::warn!(provider, type_str, algo, ?other,
+                "jca chain: the impl class did not construct an object");
+            return Ok(None);
+        }
     };
-    let Some(super_id) = ctx.class_id_by_name(required_super) else {
-        return Ok(None);
+    // `class_id_by_name` only answers for a class the manager already HOLDS,
+    // and the engine's `getInstance` is a registered native — calling it never
+    // pulls `java.security.MessageDigest` (or `Signature`, or `KeyFactory`)
+    // into the class manager. So this lookup could miss purely on LOAD ORDER,
+    // and the refusal behind it reported the provider's algorithm as absent:
+    // a fact about what had been loaded, presented as a fact about the
+    // provider. MEASURED — `H13-2` §2's own falsifier fired here, three arms
+    // past the delegate arm everyone (this file's doc comment included) assumed
+    // was the culprit.
+    let super_id = match ctx.class_id_by_name(required_super) {
+        Some(id) => id,
+        None => {
+            let _ = ctx.load_class(required_super);
+            match ctx.class_id_by_name(required_super) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(provider, type_str, algo, required_super,
+                        "jca chain: the engine superclass is not loadable even after                          an explicit load");
+                    return Ok(None);
+                }
+            }
+        }
     };
     // Did the provider hand back the ENGINE class itself, or a bare SPI we had
     // to wrap? The JDK's answer to that question decides who owns the
@@ -1715,17 +1745,66 @@ pub(crate) fn build_third_party_engine(
             let prov_obj = ctx.read_native_pin(prov_pin, prov_obj);
             ctx.unpin_native_roots(spi_pin);
             ctx.unpin_native_roots(prov_pin);
-            match ctx.new_object_initialized(
-                delegate_class,
-                delegate_desc,
-                &[
-                    Value::Object(Some(spi)),
-                    Value::Object(Some(algo_str)),
-                    Value::Object(Some(prov_obj)),
-                ],
-            ) {
-                Ok(Some(Value::Object(Some(o)))) => o,
-                _ => return Ok(None),
+            // `Delegate`'s constructor is PRIVATE; `Delegate.of(spi, algo,
+            // provider)` is the JDK's own entry point and is what
+            // `MessageDigest.getInstance` itself calls. Going through it also
+            // picks `CloneableDelegate` when the SPI is `Cloneable`, which
+            // closes this fix's first recorded residual (constructing
+            // `Delegate` directly gave a digest whose `clone()` threw where
+            // HotSpot clones).
+            //
+            // The direct constructor is kept as a fallback for images whose
+            // `Delegate` has no `of` — it was the shape this code shipped with,
+            // and it is correct for any non-`Cloneable` SPI.
+            let via_factory = delegate_class
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| n.ends_with("Delegate"))
+                .then(|| {
+                    ctx.invoke(
+                        delegate_class,
+                        "of",
+                        &format!("{}L{delegate_class};", delegate_desc.trim_end_matches('V')),
+                        &[
+                            Value::Object(Some(spi)),
+                            Value::Object(Some(algo_str)),
+                            Value::Object(Some(prov_obj)),
+                        ],
+                    )
+                });
+            let built = match via_factory {
+                Some(Ok(Some(Value::Object(Some(o))))) => Some(o),
+                _ => match ctx.new_object_initialized(
+                    delegate_class,
+                    delegate_desc,
+                    &[
+                        Value::Object(Some(spi)),
+                        Value::Object(Some(algo_str)),
+                        Value::Object(Some(prov_obj)),
+                    ],
+                ) {
+                    Ok(Some(Value::Object(Some(o)))) => Some(o),
+                    _ => None,
+                },
+            };
+            match built {
+                Some(o) => o,
+                // A silent `Ok(None)` here is indistinguishable from "this
+                // provider registers nothing", which is the very shape this
+                // fix was written to remove — one level further down. Say so.
+                None => {
+                    tracing::warn!(
+                        delegate_class,
+                        delegate_desc,
+                        provider,
+                        type_str,
+                        algo,
+                        "could not wrap a bare SPI in its engine's Delegate; the caller \
+                         will report the algorithm as absent for this provider, which \
+                         is NOT the same thing. jca::provider_chain::build_third_party_engine"
+                    );
+                    return Ok(None);
+                }
             }
         }
     };

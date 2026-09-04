@@ -94,6 +94,64 @@ Probes (scratchpad, not committed): `charsweep.exe` / `CharSweep.java`,
 > three failures are identical in both modes, so nothing here is mode-specific,
 > and no claim is made about `--synthetic-jdk`, which was not run.
 
+> **FIXED 2026-09-04 — and the defect was not in case mapping.** This record's
+> three failing rows were all FINAL SIGMA, and every layer it implicates checked
+> out identical to HotSpot: `Character.getType` in BOTH overloads,
+> `Character.isUpperCase`/`isLowerCase`/`isLetter`/`isTitleCase`,
+> `java.text.StringCharacterIterator`, the `--nojit` arm, and the
+> `StringLatin1.toLowerCase` shadow dial. The in-tree Rust helper
+> `case_map::jdk_to_lowercase("A\u{03A3}")` already answered `"a\u{03C2}"`
+> correctly, and its unit test passed — but `String.toLowerCase(Locale)` is not
+> a registered native, so the JDK's own bytecode runs and never reaches it.
+>
+> **Reading the JDK source rather than assuming it** named the door.
+> `ConditionalSpecialCasing.isFinalCased` walks backwards from the sigma
+> **only while `!wordBoundary.isBoundary(i)`** — a word `BreakIterator`, not a
+> character iterator:
+>
+> ```java
+> BreakIterator wordBoundary = BreakIterator.getWordInstance(locale);
+> for (int i = index; (i >= 0) && !wordBoundary.isBoundary(i); i -= …) {
+>     ch = src.codePointBefore(i);
+>     if (isCased(ch)) { … return true; }
+> ```
+>
+> **Our word iterator classified word characters by testing
+> `is_ascii_alphanumeric()` on UTF-8 BYTES**, so every non-ASCII letter was a
+> non-word character and a boundary appeared at each ASCII/non-ASCII transition:
+>
+> ```text
+>          HotSpot                CratonVM (before)
+> "AΣ"     0=B 1=. 2=B            0=B 1=B 2=B      <- spurious boundary
+> "ABΣ"    0=B 1=. 2=. 3=B        0=B 1=. 2=B 3=B
+> "A'Σ"    0=B 1=. 2=. 3=B        0=B 1=B 2=. 3=B
+> "ΑΣ"     identical              identical        <- all-Greek was right by accident
+> ```
+>
+> `"ΑΣ"` and `"ΣΣ"` agreed only because BOTH characters were misclassified the
+> same way, so no transition occurred. The bug was visible exactly where the
+> classification changed — which is why it looked like a Greek-specific
+> case-mapping bug and was not one.
+>
+> **The fix** classifies per character (`bi_is_word_char`: alphanumeric in any
+> script, or `_`) and adds UAX #29's WB6/WB7 connector rule so `"can't"` and
+> `"A'Σ"` stay single words. Both the `next` and `previous` word arms are
+> rewritten; `isBoundary` is not registered and rides on `following`.
+>
+> ```text
+> RJdkG9Skew        768 checks, 0 fails   (was 3)   and byte-identical to HotSpot
+> BreakIterProbe    identical to HotSpot
+> SigmaSweepProbe   identical to HotSpot on all 13 contexts
+> ```
+>
+> **What is NOT claimed.** This is a documented SUBSET of UAX #29 — the
+> extend/format, regional-indicator, numeric and Katakana rules are still
+> unimplemented, as they were before. The claim is only that a letter is a
+> letter in every script, and that the listed connectors join. The blast radius
+> is wider than this record: `BreakIterator.getWordInstance` is used by any
+> text processing that segments words, and every such caller was seeing a break
+> at each ASCII/non-ASCII transition.
+
 ## 0. The headline
 
 | subject | before | after | how |

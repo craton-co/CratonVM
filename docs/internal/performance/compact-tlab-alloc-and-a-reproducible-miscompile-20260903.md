@@ -155,10 +155,36 @@ flagged cases were examined:
   `TestDataUtils` and `TestBitStream` all `rc=0`.
 - Throughput: a wash, eight alternated rounds, medians 16.6 s either way.
 
+### Extended 2026-09-04: real third-party libraries
+
+`probes/RealLibExercise.java` drives **Jackson databind** (serialize/deserialize
+round-trip, 20,000 objects with nested collections) and **commons-lang3**
+string helpers, and prints a checksum rather than a timing. Its answer on
+HotSpot is `rows=20000 sum=200438887 keys=97 cs=1880983495`, and CratonVM
+produces that byte for byte in all six configurations tested:
+
+| collector | default | `CRATONVM_COMPACT_TLAB_ALLOC=0` |
+|---|---|---|
+| Generational | 383,128 compact / 43,983 legacy, **28.6 MB saved** | 0 / 427,106 |
+| ZGC | 651,166 compact / 63,478 legacy, **50.5 MB saved** | 0 / 714,666 |
+| G1 | 383,190 compact / 43,989 legacy, **28.6 MB saved** | 0 / 427,205 |
+
+Identical checksum in every cell. This is the first evidence for the shape from
+code that is neither this repo's own probes nor H2: ~90% of a real library
+workload's objects take the compact shape, saving 28-50 MB per run, with the
+program unable to tell the difference.
+
+Fixtures cached under `C:/craton/smoke-cache`; the jars come from Maven Central
+at the coordinates in the probe's header.
+
 ### What is still not covered
 
-Spring, Tomcat, netty and Keycloak are not in this soak — their runners
-download fixtures this session could not fetch. The evidence above is 496
+Spring, Tomcat, netty and Keycloak SERVERS are still not in this soak. The
+network is reachable and `scripts/smoke/ri*.sh` know the right fixtures and
+invocations, so this is a matter of runtime, not of access: each is a
+long-running server workload rather than a batch program, and a differential
+soak over one needs a driver and a quiescence criterion this page does not
+have. The evidence above is 496
 program comparisons, a HotSpot-differential suite on three collectors, and
 four H2 applications. `CRATONVM_COMPACT_TLAB_ALLOC=0` restores the legacy
 shape exactly and is the first thing to set if an object is ever suspected of

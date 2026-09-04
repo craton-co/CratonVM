@@ -3432,6 +3432,23 @@ pub fn sp_ref_store_other_arm_counts() -> (u64, u64) {
     )
 }
 
+/// Executions of the full `jit_putfield_object` fallback that every inline
+/// reference-`putfield` arm shares — trace-only.
+///
+/// The compile-time census reports `gated=N declined=M`, and a DECLINED site
+/// had no run-time counter at all. Under G1, which publishes no barrier plan,
+/// that reads `gated=0 declined=6` followed by no execution line whatsoever —
+/// indistinguishable from a workload that never executed a reference store.
+/// The declined sites are precisely the ones paying the full helper, so this is
+/// the number that says what declining COSTS.
+pub static REF_STORE_FULL_HELPER_TAKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Executions of the shared full-barrier `jit_putfield_object` fallback.
+pub fn ref_store_full_helper_count() -> u64 {
+    REF_STORE_FULL_HELPER_TAKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `(inline, barrier, helper)` dynamic path counts for the single-pass arm.
 /// All zero means the trace was off.
 pub fn sp_ref_store_path_counts() -> (u64, u64, u64) {

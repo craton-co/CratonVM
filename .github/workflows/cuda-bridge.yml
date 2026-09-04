@@ -1,10 +1,35 @@
 # Build guard for the `cuda-bridge` crate.
 #
-# `cuda-bridge` ships two backends:
+# `cuda-bridge` ships three backends:
 #   * `backend_stub.rs`  — the default (`default = []`), compiled by every
 #                          normal build and the bulk of CI.
 #   * `backend_cuda.rs`  — the real cudarc-backed driver bridge, only
 #                          compiled behind the `cuda` Cargo feature.
+#   * `backend_oxide.rs` — NVlabs `cuda-core`, behind `cuda-oxide`.
+#
+# WHY `cuda-oxide` IS NOT CHECKED HERE (2026-09-04)
+#
+# It cannot be built on any runner this repo currently has, and adding a
+# job that fails is worse than saying so:
+#   * `ubuntu-latest` — `cuda-core` pulls `cuda-bindings`, whose build
+#     script runs `bindgen` over the vendor's `cuda.h`. That needs a CUDA
+#     **13+** toolkit (its floor is `MIN_CUDA_VERSION = 13000`, so
+#     `apt install nvidia-cuda-toolkit` is too old) plus `libclang`.
+#     Neither is on a public runner, and installing a CUDA toolkit per run
+#     is not proportionate for an opt-in backend.
+#   * `[self-hosted, gpu]` — Windows, and `cuda-core` 0.3.1 does not
+#     compile on MSVC. See
+#     docs/known-issues/gpu/cuda-core-msvc-enum-signedness-20260904.md.
+#
+# So it is guarded by review and by local runs, not by this workflow. On
+# a Linux box with a CUDA 13 toolkit and libclang the check is:
+#
+#     cargo check -p cratonvm-cuda-bridge --features cuda-oxide
+#     cargo test  -p cratonvm-cuda-bridge --features cuda-oxide -- --ignored
+#
+# Wire a job in here the moment a Linux GPU runner exists; the device
+# tests it would run are already backend-neutral (`cfg(feature =
+# "gpu-driver")`), so both backends execute the same suite.
 #
 # Because the real backend is not part of the default feature set, an
 # ordinary `cargo build` / `cargo check` never touches it — so it can

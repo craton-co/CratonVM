@@ -110,6 +110,10 @@ const ALLOWED: &[(&str, &str)] = &[
         "kind 4: a TEST-HARNESS regeneration switch, not a VM knob.          `types/tests/doc_citation_paths.rs` reads it with a raw          `std::env::var_os` to rewrite the dead-citation baseline and then          FAIL on purpose, because a regenerating run verifies nothing.          Nothing under any `src/` reads it, so declaring it would put one          test binary's maintenance switch on the runtime flag surface and          hand it a `CRATONVM_<GROUP>=` token the VM would never consult.",
     ),
     (
+        "CRATONVM_REGEN_DEAD_CITATION_BASELINE",
+        "kind 4: a TEST-HARNESS regeneration switch, not a VM knob.          `types/tests/doc_citation_paths.rs` reads it with a raw          `std::env::var_os` to rewrite `types/tests/dead-citation-baseline.txt`,          the ratchet of citations naming a page that exists nowhere. It is          deliberately outside the latched snapshot: the guard runs before any          VM exists, and a regenerating run FAILS on purpose, so routing it          through `VmFlags` would give a token to a switch the VM must never          honour. Nothing under any `src/` reads it.",
+    ),
+    (
         "CRATONVM_RATCHET_ROWS",
         "kind 4: a TEST-HARNESS dump switch, not a VM knob. \
          `native-builtins/tests/stub_ratchet.rs` reads it with a raw \
