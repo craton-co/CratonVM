@@ -21072,6 +21072,75 @@ pub(crate) mod tests {
         assert_eq!(alloc_trigger_percent_for(Some(12), 0), 12);
     }
 
+    /// COMPONENT MEASUREMENT for the young cycle's old-generation pre-mark
+    /// (review item E1), taken BEFORE deciding whether to build the bitmap
+    /// that would replace it.
+    ///
+    /// A young cycle pre-marks the old generation by walking EVERY registered
+    /// object and reading `gc_age()` out of its header -- `registered
+    /// .for_each_base(|base| header_mut(base).gc_age() >= promo_age)` in
+    /// `collect_garbage`. The age lives nowhere but the header, so the walk is
+    /// a scattered 64-byte line read per object; the whole-heap arm next to it
+    /// was already reduced to one linear store over `capacity / 512` bytes
+    /// (`mark_clear_all`).
+    ///
+    /// The candidate fix is a third bitmap over the same geometry, set on
+    /// promotion, so the pre-mark becomes `marks |= old` -- a word-wise OR
+    /// instead of a walk. That is real work with real risk (a bit that goes
+    /// stale against promotion or the sweep retains a dead object), so the
+    /// question this answers first is whether the walk is expensive enough to
+    /// be worth it. Both shapes are timed here over the same population:
+    /// the header walk, and `mark_clear_all` as the closest existing
+    /// bitmap-wide pass.
+    ///
+    ///   cargo test -p cratonvm-gc --features zgc --release --lib -- --ignored     ///     --nocapture measure_the_young_premark_walk
+    #[test]
+    #[ignore = "timing measurement; wants --release and a quiet box"]
+    fn measure_the_young_premark_walk() {
+        const CAPACITY: usize = 512 * 1024 * 1024;
+        let heap = ZgcRealHeap::with_capacity(CAPACITY);
+        heap.set_tlab_enabled(false);
+        let mut n = 0usize;
+        while heap.allocated_bytes() < CAPACITY * 6 / 10 {
+            heap.alloc_object(ClassId::new(11), 3);
+            n += 1;
+        }
+        let registered = heap.registry.snapshot();
+        let count = registered.base_count();
+        println!("[e1] capacity={CAPACITY} objects={n} registered={count}");
+        let promo = heap.promotion_age();
+
+        let mut walk = f64::MAX;
+        let mut clear = f64::MAX;
+        // Interleaved, three pairs, best of each -- see `measure_the_card_barrier`.
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let mut old = 0usize;
+            registered.for_each_base(|base| {
+                if heap.header_ref(base as *mut u8).gc_age() >= promo {
+                    old += 1;
+                }
+            });
+            let us = t.elapsed().as_micros() as f64;
+            std::hint::black_box(old);
+            walk = walk.min(us);
+
+            let t = std::time::Instant::now();
+            heap.mark_clear_all();
+            clear = clear.min(t.elapsed().as_micros() as f64);
+        }
+        println!(
+            "[e1] header walk {:.1} ms ({:.1} ns/object)   bitmap-wide pass {:.1} ms                ratio {:.1}x",
+            walk / 1000.0,
+            walk * 1000.0 / count.max(1) as f64,
+            clear / 1000.0,
+            walk / clear.max(1.0),
+        );
+        println!(
+            "[e1] read the RATIO: it is what an old-generation bitmap would buy,              and the walk only runs on a young cycle (CRATONVM_ZGC_GENERATIONAL)."
+        );
+    }
+
     /// COMPONENT MEASUREMENT for the card barrier's per-store cost.
     ///
     /// `card_object` runs on every reference store into an OLD object once
