@@ -530,6 +530,50 @@ here, both recorded so the next reader does not have to re-find them:
 > and NOT localised. The rows after line 492 are unmeasured in every CratonVM
 > mode and no claim is made about them in either direction.
 
+> **FIXED 2026-09-04.** The defect this record named — `bb_state`'s missing
+> direct-buffer arm, surviving as *"a real defect in shared code"* — is closed,
+> and `probes/DirectByteBufferStateProbe.java` now runs to the end:
+>
+> ```text
+>                        checks   BAD   reached the end?
+> HotSpot 25               282      0   yes
+> CratonVM compatible      282      0   yes -- PROBE PASS
+> CratonVM --jdk-only      282      0   yes -- PROBE PASS
+> ```
+>
+> Before: 262 checks, 2 BAD, and the run DIED at line 492, leaving ~20 rows
+> untested.
+>
+> **What it actually was.** `MemorySegment.asByteBuffer()` minted a
+> `DirectByteBuffer` unconditionally — the registration comment said so
+> outright, *"asByteBuffer() → a direct ByteBuffer over the segment's own
+> memory"*, stating the defect as if it were the design. A heap segment has no
+> native address, so `ofArray(byte[16]).asByteBuffer()` answered
+> `isDirect() == true` and `hasArray() == false`, and `hb.array()` on the next
+> probe line threw `UnsupportedOperationException` out of the run.
+>
+> **The fix** mirrors `HeapMemorySegmentImpl.makeByteBuffer()`: a heap-backed
+> segment becomes a HEAP buffer over its own backing array, built as
+> `ByteBuffer.wrap(base, start, size).slice()` — `wrap` sets position/limit and
+> `slice` turns the remaining window into capacity while folding the position
+> into `arrayOffset()`, which is byte-for-byte the shape
+> `newHeapByteBuffer(base, start, size, seg)` produces. Two natives that are
+> registered in every mode were chosen deliberately over `slice(II)`, which this
+> VM registers for `CharBuffer`/`IntBuffer`/`LongBuffer`/`FloatBuffer` and **not**
+> for `ByteBuffer` — a gap this note records and does not close.
+>
+> A non-`byte[]` base is refused by name, as the oracle does
+> (`ofArray(int[8]).asByteBuffer()` is `UnsupportedOperationException` on
+> HotSpot 25), including when the shape check declines to build a view at all —
+> without that second arm an `int[]` segment fell through to the direct path and
+> answered with a `DirectByteBuffer` over memory it does not own.
+>
+> **What is NOT claimed.** §1's census — 48 textual call sites, 78 after macro
+> expansion — was not re-counted, and this fix touches the `asByteBuffer`
+> producer rather than the `bb_state` consumer, so a site that mints a segment
+> buffer some other way is unaffected and untested. The `getIntLE`/`putIntLE`
+> residuals remain `--synthetic-jdk`-only and are not addressed here.
+
 ## 12. §6's probe, scheduled — the reachable half (2026-08-12)
 
 §7 is right that "the probe must be run `--features synthetic-jdk` +
