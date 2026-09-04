@@ -1895,6 +1895,11 @@ pub const INVENTORY: &[E] = &[
     // puts `offload_jit_gate` back to refusing JIT admission to every
     // method that writes a primitive array. See `jit::gpu_barrier`.
     E { group: Group::GC, token: "jit-gpu-array-barrier", on_key: Some("CRATONVM_JIT_GPU_ARRAY_BARRIER"), off_key: None, off_word: None, since: "2026-09-04" },
+    // `=0` puts `offload_jit_gate` back to blocking the caller of ANY
+    // analyzer-Eligible `invokestatic`, instead of only one the
+    // DISPATCHER could actually launch. The control arm for that
+    // narrowing; see `offload_jit_gate::target_can_ever_dispatch`.
+    E { group: Group::GC, token: "gpu-jit-gate-dispatchable", on_key: Some("CRATONVM_GPU_JIT_GATE_DISPATCHABLE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "gpu-critical-lease-ms", on_key: Some("CRATONVM_GPU_CRITICAL_LEASE_MS"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::GC, token: "gpu-critical-wait-ms", on_key: Some("CRATONVM_GPU_CRITICAL_WAIT_MS"), off_key: None, off_word: None, since: "2026-07-31" },
     // A/B levers declared 2026-09-02 with the four GPU-subsystem fixes.

@@ -434,6 +434,22 @@ fn target_can_ever_dispatch(
     descriptor: &str,
     gpu_min_work: u32,
 ) -> bool {
+    // `CRATONVM_GPU_JIT_GATE_DISPATCHABLE=0` says "any Eligible target
+    // blocks its callers", which is what this gate did until
+    // 2026-09-04. Kept as a switch and not just as history: it is the
+    // control arm for measuring what the narrowing is worth, and the two
+    // narrowings in this file have to be separable or a measurement
+    // cannot attribute a difference to either.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_JIT_GATE_DISPATCHABLE")
+            .ok()
+            .as_deref()
+            != Some("0")
+    });
+    if !on {
+        return true;
+    }
     // Gate 1 — `try_dispatch`'s `is_void || is_int_reduction ||
     // is_long_reduction`, verbatim.
     let is_void = descriptor.ends_with(")V");
