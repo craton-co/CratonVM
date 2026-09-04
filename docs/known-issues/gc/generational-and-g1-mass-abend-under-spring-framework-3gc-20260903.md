@@ -173,6 +173,35 @@ yet:
 
 Not investigated here — flagged for whoever picks this back up.
 
+### Update 2026-09-04 (later): fix verified against the residual Generational crashes — 94/94 eliminated
+
+Sequence, on the Azure host:
+
+1. `git pull origin dev` (fast-forward `1d36384b3..31c12dca8`) — `5dc49baf5`
+   was **not** yet on `dev`.
+2. `git cherry-pick -n 5dc49baf5` — applied clean (one auto-merge in
+   `gc/src/arena.rs`); touches `gc/src/arena.rs`, `gc/src/gen_heap.rs`,
+   `gc/src/reservation.rs`, `vm/src/threading/monitor.rs` (292 insertions,
+   24 deletions).
+3. `cargo build --release -p cratonvm-cli` (8m02s).
+4. Reran the 94 classes that still `CRASH`ed under Generational GC after the
+   *first* fix round (the G1-audit-only `dev` state) — i.e. the residual set
+   the audit's own fixes didn't touch:
+
+   ```
+   status: PASS=92 HANG=1 FAIL=1  sum_class_ms=1084954
+   === TOTAL wall: 23m39s ===
+   ```
+
+   **CRASH: 94 → 0.** The one HANG and one FAIL are unrelated pre-existing
+   class-specific issues, not SIGSEGVs — the `is_object_address` fix cleared
+   every remaining Generational-GC crash in this residual set.
+
+This closes the "practical implication" below for Generational specifically:
+`5dc49baf5` is confirmed to fix the defect it claims to, not just on H2/Spring
+Boot but on the exact class set that survived the first (G1-only) fix round.
+The G1-side discrepancy noted above is still open and unstarted.
+
 ### Practical implication
 
 The fix exists, is not yet on `dev`, and this doc's original 976/887 ABEND
