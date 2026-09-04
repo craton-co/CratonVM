@@ -9177,17 +9177,28 @@ fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()
     // scheduled order, then its terminator. This is exactly `lower_inner`'s
     // `for block_idx in 0..blocks.len() { lower_block(block_idx) }`.
     let mut emit_index: Vec<Option<usize>> = vec![None; graph.nodes.len()];
+    // Which laid-out block each node lands in. Used only to describe a failure:
+    // "def after use" means one thing when both sit in a single block (an
+    // intra-block scheduling order) and quite another when they do not (a block
+    // LAYOUT that put a definition's block after its user's).
+    let mut block_of: Vec<Option<usize>> = vec![None; graph.nodes.len()];
     let mut seq = 0usize;
-    for block in &schedule.blocks {
+    for (bpos, block) in schedule.blocks.iter().enumerate() {
         for &node_id in &block.nodes {
             if let Some(cell) = emit_index.get_mut(node_id as usize) {
                 *cell = Some(seq);
+            }
+            if let Some(cell) = block_of.get_mut(node_id as usize) {
+                *cell = Some(bpos);
             }
             seq += 1;
         }
         if let Some(term) = block.terminator {
             if let Some(cell) = emit_index.get_mut(term as usize) {
                 *cell = Some(seq);
+            }
+            if let Some(cell) = block_of.get_mut(term as usize) {
+                *cell = Some(bpos);
             }
             seq += 1;
         }
@@ -9263,8 +9274,12 @@ fn verify_data_locations(graph: &Graph, schedule: &Schedule) -> CompileResult<()
                     BailoutReason::UnallocatedValue { node: input },
                     format!(
                         "n{input} ({:?}) is emitted at position {def_seq}, after its \
-                         use by n{user} ({:?}) at position {use_seq}",
-                        def.op, node.op
+                         use by n{user} ({:?}) at position {use_seq} \
+                         [def in laid-out block {:?}, use in {:?}]",
+                        def.op,
+                        node.op,
+                        block_of.get(input as usize).copied().flatten(),
+                        block_of.get(user as usize).copied().flatten(),
                     ),
                 ));
             }
