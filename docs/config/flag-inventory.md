@@ -1270,7 +1270,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JFR_ENABLE_EVENTS` | — | `CRATONVM_JFR_ENABLE_EVENTS` | scalar | unset | behaviour | snapshot | vm |
 | `CRATONVM_JIT` | JIT | `CRATONVM_JIT=…` | group | unset | — | snapshot | types |
 | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` | JIT | `CRATONVM_JIT=activation-global-mutex` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_JIT_ARM64_SAFEPOINTS` | JIT | `CRATONVM_JIT=arm64-safepoints` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_ARM64_SAFEPOINTS` | JIT | `CRATONVM_JIT=arm64-safepoints` | default-on | on | behaviour | snapshot | jit, vm |
 | `CRATONVM_JIT_BISECT_ONLY` | DBG | `CRATONVM_DBG=jit-bisect-only` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_JIT_BOX_UNBOX_INTRINSIC` | JIT | `CRATONVM_JIT=box-unbox-intrinsic` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_BULK_BYTE_LOOPS` | JIT | `CRATONVM_JIT=bulk-byte-loops` | default-on | on | behaviour | snapshot | jit |
