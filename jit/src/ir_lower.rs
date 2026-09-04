@@ -10826,6 +10826,69 @@ fn verify_mir_allocation(
 ///
 /// Off restores the previous emission exactly: a `TEST`/`JZ` at every
 /// `getfield` whose receiver the per-block CSE has not already proven.
+/// Does a register for `id` pay for itself, counting loop frequency?
+///
+/// The publish is one memory→register load at the definition; each read it
+/// replaces is one memory→register load at its own site. So the trade is
+/// `uses_frequency >= 2 × definition_frequency`, and the static `use_count >= 2`
+/// is that same test with every frequency pinned to 1.
+///
+/// `live.weight[id]` is already the loop-frequency-weighted use count. The
+/// definition's frequency is derived from `live.loop_depth` and `live.span`,
+/// both public, using the same `LOOP_WEIGHT_PER_DEPTH` model — so the two sides
+/// of the comparison come from one model rather than two.
+///
+/// Falls back to the static rule whenever the loop model cannot place the
+/// definition, which keeps a graph the scheduler left unusual on the old
+/// behaviour rather than on a guess.
+fn ir_residency_pays_here(
+    live: &crate::regalloc::LiveModel,
+    schedule: &Schedule,
+    id: usize,
+    static_uses: u32,
+) -> bool {
+    if !ir_residency_loop_weight_enabled() {
+        return static_uses >= 2;
+    }
+    let Some(def_pos) = live.pos_of.get(id).copied().flatten() else {
+        return static_uses >= 2;
+    };
+    // Which block holds the definition? `span[b]` is that block's
+    // (first position, outgoing-edge position).
+    let mut def_depth: Option<u32> = None;
+    for b in 0..schedule.blocks.len() {
+        if let Some(&(lo, hi)) = live.span.get(b) {
+            if lo <= def_pos && def_pos <= hi {
+                def_depth = live.loop_depth.get(b).copied();
+                break;
+            }
+        }
+    }
+    let Some(depth) = def_depth else {
+        return static_uses >= 2;
+    };
+    let def_freq = u64::from(
+        crate::regalloc::LOOP_WEIGHT_PER_DEPTH
+            .checked_pow(depth)
+            .unwrap_or(crate::regalloc::MAX_LOOP_DEPTH_WEIGHT)
+            .min(crate::regalloc::MAX_LOOP_DEPTH_WEIGHT),
+    );
+    let uses_freq = live.weight.get(id).copied().unwrap_or(0);
+    uses_freq >= def_freq.saturating_mul(2)
+}
+
+/// Weigh the residency trade by loop frequency instead of a static use count —
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_LS_LOOP_WEIGHT=1`.
+///
+/// Off is the static `use_count >= 2` this file has always used.
+fn ir_residency_loop_weight_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_LS_LOOP_WEIGHT").is_some()
+    })
+}
+
 fn ir_this_nonnull_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -11221,7 +11284,32 @@ fn plan_register_residency(
                 // for, and its "definition" is an edge copy that is already
                 // paying the store.
                 Some(Op::Phi) => {}
-                _ if use_count.get(id).copied().unwrap_or(0) < 2 => {
+                // The `< 2` rule below counts STATIC graph edges. That is the
+                // right comparison only when the definition and the uses run
+                // equally often, and in a loop they do not: a value defined at
+                // method entry and read once per iteration is one publish
+                // against N reads, and the static count sees 1 and refuses.
+                //
+                // Measured on the loop the 2026-09-03 tier comparison found
+                // inverted: `Param(0)` (the receiver) and `Param(1)` (the loop
+                // bound) both read `static_uses=1 loop_weight=10` — refused by
+                // a rule that could not see the ten. The disassembly showed
+                // exactly that, `mov rax,[rbp-58h]` and `mov rcx,[rbp-60h]`
+                // reloaded every iteration, while the baseline tier held both
+                // in callee-saved registers.
+                //
+                // The loop-aware form compares the uses' frequency against the
+                // DEFINITION's: residency pays when the reads happen at least
+                // twice as often as the single publish. It reduces exactly to
+                // `use_count >= 2` when everything sits at depth 0, so a
+                // method with no loop is byte-identical.
+                _ if !ir_residency_pays_here(
+                    &live,
+                    schedule,
+                    id,
+                    use_count.get(id).copied().unwrap_or(0),
+                ) =>
+                {
                     skip_single_use += 1;
                     continue;
                 }
