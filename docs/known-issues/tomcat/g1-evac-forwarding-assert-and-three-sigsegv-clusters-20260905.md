@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN. The evac-worker panic cluster is confirmed **not** a straightforward regression of the exact line fixed in `docs/internal/fixed-bugs/g1-parallel-evacuation-cas-loser-tagged-mark-word-FIXED-20260807.md` (that fix is present and correct in the code that built this binary) — but it trips the same assert, in the same two-file panic-propagation shape, and the `make_forwarded` call-site census that doc closed is now stale. The three SIGSEGV clusters are a real, reproducible, class-list-stable phenomenon; whether they share a root cause with the evac panics is an open, honestly-unresolved question — evidence for and against is below. |
+| **Status** | OPEN. The evac-worker panic cluster is confirmed **not** a straightforward regression of the exact line fixed in `g1-parallel-evacuation-cas-loser-tagged-mark-word-FIXED-20260807` (that fix is present and correct in the code that built this binary) — but it trips the same assert, in the same two-file panic-propagation shape, and the `make_forwarded` call-site census that doc closed is now stale. The three SIGSEGV clusters are a real, reproducible, class-list-stable phenomenon; whether they share a root cause with the evac panics is an open, honestly-unresolved question — evidence for and against is below. |
 | **Scope** | 15 CRASH-classified classes, G1 arm only, 0 in the same run's Generational or ZGC arms. |
 | **Measured** | 3-GC-shard (640-class) Tomcat run on Azure, binary built from dev tip `7acc0b27c` (2026-09-05 ~12:07 UTC). G1 shard-0. |
 
@@ -52,7 +52,7 @@ present in all 5 when grepped directly.)
 `evac_pool.rs:218` is `panic!("g1 parallel-evac worker panicked")`, which fires
 when `RetireOnExit`'s guard observes `st.panicked` set — this is exactly the
 "second defect" (panic-safe worker retirement) that
-`docs/internal/fixed-bugs/g1-parallel-evacuation-cas-loser-tagged-mark-word-FIXED-20260807.md`
+`g1-parallel-evacuation-cas-loser-tagged-mark-word-FIXED-20260807`
 describes and fixed: a worker panic is converted into a loud, main-thread abort
 instead of a silent hang. **That half of the Aug-7 fix is doing exactly its
 documented job here** — it is not the bug, it is the mechanism correctly
