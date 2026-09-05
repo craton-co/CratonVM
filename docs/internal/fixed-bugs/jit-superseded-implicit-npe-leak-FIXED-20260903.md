@@ -92,14 +92,48 @@ been handed.
    it, because it costs the intrinsic every site inside a `try` and buys
    nothing once the caller returns the sentinel the check tests for.
 
-   Two things it left behind are worth keeping. Declining the intrinsic inside
-   `bytecode_walk`'s BOX_UNBOX region rather than at the resolution leaves
-   `callee_entry` holding the intrinsic sentinel and drops through to the plain
-   direct-call path, which emits a `CALL` to that value:
+   Two things it left behind. The first is a trap worth keeping: declining the
+   intrinsic inside `bytecode_walk`'s BOX_UNBOX region rather than at the
+   resolution leaves `callee_entry` holding the intrinsic sentinel and drops
+   through to the plain direct-call path, which emits a `CALL` to that value --
    `SIGSEGV at pc=0xffffffffffffffc7`, `fault pc is in NO live registered code
-   buffer`. And a gate that reads the bytecode is a claim about the bytecode,
-   not about what a later stage decides to emit for it -- which is a real gap
-   in that admission even though it is not this defect.
+   buffer`. A site the resolver has already claimed cannot be un-claimed
+   downstream.
+
+   The second was a claim, and it is **RETRACTED**. This page first said the
+   admission carried "a real gap ... even though it is not this defect":
+   `first_unsupported_precise_frame_site` clears opcode `0xb6` because
+   `precise_frame_publishing_opcode` says its lowering publishes a reason-9
+   frame, and the BOX_UNBOX region then substitutes a lowering whose edges are
+   reason-6. The source reading is correct; the conclusion drawn from it was
+   not. Worse, it was left as an OPEN gap inside a RETIRED page, which is the
+   one place nothing tracks it.
+
+   Measured 2026-09-05 on `dev@7acc0b27c`, with two probes built for exactly the
+   shape it predicts:
+
+   * `Integer.intValue()` / `Long.longValue()` as the ONLY throwing opcode in a
+     protected range, in a method invoked once so OSR is the only compile door,
+     with the handler reading locals set before the `try`;
+   * the same with the handler reading locals set before the LOOP -- the stale
+     pre-OSR locals `route_osr_exception_out_of_artifact` names as the hazard --
+     plus a witness the loop advances, so a stale read and a correct read differ.
+
+   Both engage, which is the half a passing probe has to prove first:
+   `OSR-compile ...arm()V entry_pc=24` on a method with a non-empty exception
+   table, and `[box-unbox-intrinsic] java/lang/Integer.intValue()I` for a site
+   that exists nowhere but inside that `try`. Both match HotSpot exactly, 3 runs
+   each, handler entered with correct locals: `caught=400 bad=0 drift=0
+   escaped=0`.
+
+   **A reason-6 deopt is not a weaker publication than a reason-9 frame; it is a
+   stronger action.** It abandons the compiled frame and hands a reconstructed
+   one back to the interpreter, which raises the NPE and searches the exception
+   table itself. The reason-9 frame exists for an exception that arrives INSIDE
+   the compiled body and has to be routed WITHOUT leaving it. A site that deopts
+   instead of publishing reaches the promise's purpose by another road, so the
+   admission's soundness does not depend on the substituted lowering publishing
+   anything.
 
 **Three arms each removed the symptom, and only one named the defect.**
 `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`, `CRATONVM_JIT_OSR_EXC_TABLE=0` and
