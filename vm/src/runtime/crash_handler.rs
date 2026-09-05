@@ -2750,7 +2750,7 @@ not an address\n",
         //
         // Built after a crash of this exact family was diagnosed through gdb
         // instead, because the report had nothing to say about it --
-        // `docs/internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+        // `internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
         if fault_addr_is_real {
             let mut rbuf = [0u8; 16];
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  gc_decommits_total=0x");
