@@ -7450,10 +7450,23 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             } else {
                 None
             };
-            // Closed-but-once-bound: the listener is gone, but the address it
-            // held is retained and is still what the real method reports.
-            let ip = ip
-                .or_else(|| (!side.host.is_empty()).then(|| side.host.clone()))
+            // THE RECORDED BIND ADDRESS OUTRANKS THE LISTENER'S.
+            //
+            // `side.host` is what the bind handler stored, and it already
+            // applies the rule this getter needs: a wildcard bind records the
+            // address the CALLER asked for, because the socket underneath is
+            // AF_INET6 with `IPV6_V6ONLY` cleared and its `local_addr()` says
+            // `::` whichever wildcard was requested. Reading the listener first
+            // threw that away and answered `::` for `new ServerSocket(0)`,
+            // where HotSpot -- on the same machine, equally dual-stack --
+            // answers `0.0.0.0`.
+            //
+            // The listener remains the fallback for a receiver this surface
+            // never bound (a phase-53-constructed ServerSocket, reached through
+            // the object-field listener id above), which has no recorded host.
+            let ip = (!side.host.is_empty())
+                .then(|| side.host.clone())
+                .or(ip)
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // `ServerSocket.getInetAddress()` hands back the very `InetAddress`
             // that was passed to `bind`, so whether it carries a name is
@@ -7528,14 +7541,20 @@ fn re2_server_socket_local_address(
                 .map(|a| (a.ip().to_string(), a.port() as i32))
         })
         .flatten();
-    let (ip, port) = live.unwrap_or_else(|| {
-        let host = if side.host.is_empty() {
-            "0.0.0.0".to_string()
-        } else {
-            side.host.clone()
-        };
-        (host, side.port)
-    });
+    // Same split as `getInetAddress`: the ADDRESS comes from what was bound,
+    // the PORT from the live listener. They have different authorities -- an
+    // ephemeral port is only knowable from the socket, while the wildcard
+    // family is only knowable from the request, since a dual-stack listener
+    // reports `::` for either one.
+    let (live_ip, live_port) = match live {
+        Some((ip, port)) => (Some(ip), Some(port)),
+        None => (None, None),
+    };
+    let ip = (!side.host.is_empty())
+        .then(|| side.host.clone())
+        .or(live_ip)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let port = live_port.unwrap_or(side.port);
     Ok(Some(Value::Object(Some(
         alloc_inet_socket_address_resolved(ctx, &ip, &ip, port)?,
     ))))
