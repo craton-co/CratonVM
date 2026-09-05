@@ -75,7 +75,7 @@ the copy was reading them.
 
 * **JNI array access.** `Get<Type>ArrayElements` hands native code a detached
   COPY and mints a global ref for the source as a keep-alive root
-  (`vm/src/native/jni.rs`, "GC-correctness (vm-jni-roots #2)"). That path is
+  (`../../../vm/src/native/jni.rs`, "GC-correctness (vm-jni-roots #2)"). That path is
   correct and is not this.
 * **The relocating slide.** Relocation is opt-in (`CRATONVM_ZGC_RELOCATE`) and
   off in these runs. The slide had its own instance of this fault shape, fixed

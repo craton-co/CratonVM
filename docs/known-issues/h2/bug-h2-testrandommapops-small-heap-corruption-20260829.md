@@ -26,7 +26,7 @@ Measured here, interleaved P/F, 10 reps per arm at `--Xmx 256m`:
 **SIGSEGV 5/10 pre-fix against 0/10 fixed** (Fisher's exact p = 0.016),
 while this page's `rc=1` faces were UNCHANGED at 1 against 2 -- which is the
 correct result, since nothing in that fix addresses them. See
-`bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md` for the root
+`../../internal/fixed-suite-bugs/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md` for the root
 cause and the guard-ON/OFF A/B that pins it. **Neither arm produced a passing
 run**, so this page's standing "no passing CratonVM run at any heap" still
 holds and the `NullPointerException` / `AssertionError` faces below remain
