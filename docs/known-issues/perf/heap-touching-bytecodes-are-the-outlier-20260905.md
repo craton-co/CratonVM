@@ -377,6 +377,89 @@ both arms. The quickened arm's worst pass (1944) beats the general path's best
 (2032). This page predicted "around one nanosecond, below what this host
 resolves"; that was wrong by a factor of five, in the conservative direction.
 
+## The 10x floor: both structural proposals refuted, by measurement
+
+The audit that opened this page named one structural change as "the only one on
+this page that attacks the 10x rather than the outliers": dispatch on the
+pre-decoded `QuickenedCode` stream instead of on raw bytes, making
+superinstruction fusion a build-time rewrite and branch targets resolved
+indices. It also named the eight opcodes with no fast arm as a consistency gap
+worth closing. **Both are wrong, and the numbers are cheap to reproduce.**
+
+### The pre-decoded stream is 2.2x SLOWER than the raw-byte match
+
+`--noverify` flips `use_fast_path`, which switches every arm at once from the
+155-arm raw-byte match to the decoded path — and the decoded path already runs
+on the `QuickenedCode` stream. So the two engines can be priced directly, on
+the same program, in one binary. `probes/FieldBurn.java`, N = 30 M, min-of-5,
+wall ms:
+
+| | fast path | decoded path (`--noverify`) |
+|---|---:|---:|
+| arithmetic loop | **2312** | **5078** |
+| instance-field loop | 2954 | 12963 |
+
+The stream is not the lever. Dispatching off `ops[]` as it stands would be a
+**regression**; the cost is `execute_instruction`'s out-of-line call, its
+~200-variant match on a 16-byte `Instruction`, the `thread.frames[frame_idx]`
+re-index per operand, and the `Result` round trip with its post-call error
+checks. An index-threaded loop that kept those handlers would inherit all of
+it. Rewriting them too is a different and far larger project than the audit
+described, and nothing here says it would pay.
+
+(The field row is 4.4x because `--noverify` also turns off the quickened field
+arms, so it measures `op_getfield`/`op_putfield` as well. Only the arithmetic
+row is a clean dispatch-engine comparison.)
+
+### Fast arms for `tableswitch` / `lookupswitch` are not a lever either
+
+The obvious inference from the row above — "decoded costs 2.2x, so the eight
+opcodes without a fast arm cost 2.2x" — **does not hold**, and it is worth
+writing down why, because it is an easy mistake to make twice. The ratio is per
+*bytecode*. A switch occurs once per iteration and does the work of a whole
+comparison chain, so its share of an iteration is small even at 2.2x.
+
+`probes/SwitchBurn.java`, N = 20 M, wall ms. `ifchain` performs the identical
+selection using only fast-path arms:
+
+| arm | CratonVM | HotSpot `-Xint` | ratio |
+|---|---:|---:|---:|
+| `ctl` (all fast arms) | 1801 | 229 | 7.9x |
+| `ifchain` (all fast arms) | 2989 | 505 | 5.9x |
+| **`table`** (decoded) | **1752** | 374 | **4.7x** |
+| **`lookup`** (decoded) | **1787** | 343 | **5.2x** |
+
+**A `tableswitch` is BETTER than the band** — 4.7x against straight-line
+arithmetic's 7.9x — while sitting on the path this section just measured at
+2.2x. It also beats its own `ifchain` equivalent outright (1752 against 2989),
+which is what an O(1) jump table should do and what the decoded handler
+delivers.
+
+This confirms the earlier note that said "fast-path arms for `tableswitch` /
+`lookupswitch` are not a lever ... they measure 11.0-11.5x, the same band as
+arithmetic that never leaves the fast path". That note was right. This page
+nearly re-derived the opposite from a correct number applied at the wrong
+granularity.
+
+### What is actually left
+
+Straight-line arithmetic on the fast path costs ~7.5 ns per bytecode against
+HotSpot's ~0.95 — about 26 cycles for work HotSpot does in three. That is the
+whole remaining floor, and it is **not** the dispatch mechanism and **not** the
+missing arms. It is the per-bytecode preamble plus the indirect branch, and
+`Three findings resolved without a change` below already establishes that most
+of the preamble cannot move: the site-cache epochs and the JVMTI watchpoint
+gate are correctness-bound, and the safepoint poll has no instruction to save
+on x86-64.
+
+The one item never tested is the indirect branch itself — a single dispatch
+site giving the predictor one history slot for every opcode transition in every
+program. Testing it needs a branch-misprediction counter, which is a hardware
+profiler question and not one this host answers cheaply. **Do not build
+replicated dispatch sites before that number exists**; this section is two
+refutations long precisely because structural proposals here have not survived
+contact with a probe.
+
 ## Three findings resolved without a change, and why
 
 These were on the original ranked list. Each was read to the point of a verdict
