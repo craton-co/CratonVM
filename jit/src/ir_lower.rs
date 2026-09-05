@@ -21044,6 +21044,98 @@ mod tests {
         }
     }
 
+    /// `op_reads_rax_then_rcx` is the consumer half of the carry contract, and
+    /// it is the half that cannot be proved by `buf.pos()`: an RCX carry has
+    /// the consumer's FIRST read emitted in between, and is safe only because
+    /// that read writes RAX and nothing else. So check the source says so.
+    ///
+    /// The required shape, in order, before anything else is emitted:
+    ///
+    /// ```text
+    /// let slot = self.alloc_slot(id);
+    /// self.gp_load_value(RAX, node.inputs[0]);
+    /// self.gp_load_value(RCX, node.inputs[1]);   // when it has a second
+    /// ```
+    ///
+    /// A single-input op (`Op::Neg`, `Op::I2L`, `Op::L2I`) has only the first.
+    /// `alloc_slot` emits nothing, which is what lets the RAX carry's position
+    /// check hold across the arm's opening line.
+    #[test]
+    fn every_carry_consumer_reads_rax_then_rcx() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let opens = line.starts_with("            Op::");
+            let continues = line.starts_with("            | Op::");
+            if continues {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if opens {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(!arms.is_empty(), "the arm scan found nothing");
+
+        let claimed_src = src
+            .split("fn op_reads_rax_then_rcx(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_reads_rax_then_rcx is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the consumer scan found nothing — `op_reads_rax_then_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| panic!("`op_reads_rax_then_rcx` claims Op::{name}, no arm"));
+            let reads: Vec<&str> = arm
+                .1
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("self.gp_load_value("))
+                .collect();
+            assert_eq!(
+                reads.first().copied(),
+                Some("self.gp_load_value(RAX, node.inputs[0]);"),
+                "Op::{name}'s arm does not open by reading its first input into \
+                 RAX — a carry planned onto it would read a stale register"
+            );
+            if reads.len() > 1 {
+                assert_eq!(
+                    reads.get(1).copied(),
+                    Some("self.gp_load_value(RCX, node.inputs[1]);"),
+                    "Op::{name}'s arm does not read its second input into RCX \
+                     next — an RCX carry planned onto it has no proof left"
+                );
+            }
+        }
+    }
+
     /// Every `Op::X` named in `op_defines_result_slot`'s body.
     fn ops_that_define_a_result_slot() -> std::collections::BTreeSet<String> {
         let src = include_str!("ir_lower.rs");
