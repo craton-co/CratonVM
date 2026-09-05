@@ -343,7 +343,8 @@ Notes:
   per-element array (`m = b[i]`, the same trick `GpuDivChain` already uses
   for its divisor) removes the closed form: HotSpot now does genuine work
   and the row flips from "GPU loses" (0.7x) to another 163x GPU win. The
-  dot-product row's swing (0.4x → 98x) is different in kind: `sum += p` was
+  dot-product row's swing (0.4x → 98x, and 586x since the warp-shuffle
+  reduction) is different in kind: `sum += p` was
   never foldable (both operands are runtime array reads), so scaling its
   per-element repeat count from 1x to 300x — needed to push HotSpot over 1
   second — genuinely shifts the kernel from launch/PCIe-overhead-bound (GPU

@@ -3442,6 +3442,77 @@ fn osr_optimizing_tier_enabled() -> bool {
     })
 }
 
+/// `(class, method+descriptor, entry pc)` triples whose optimizing OSR
+/// artifact this door has already built and REFUSED.
+///
+/// # Why a negative cache is the whole point
+///
+/// The door's admission is `ir_osr_entry_addr(entry_pc).is_some() &&
+/// ir_osr_sentinel_free`, and `ir_osr_sentinel_free` means the body emits no
+/// deopt stub AND no call-exception stub — so **any method containing a call
+/// fails it**. That is most methods. Without a memo the door pays a FULL
+/// optimizing compile on every OSR attempt for every one of them, throws the
+/// artifact away, and falls through to the single-pass path it was always
+/// going to take.
+///
+/// Measured on `LambdaJitTierUp.warmChecksum` (`entries=[] sentinel_free=false`,
+/// refused every time): the repeated compiles delay the single-pass OSR entry
+/// the frame actually gets, and while the loop is still interpreted its in-loop
+/// SAM call site has no compiled caller to hang an inline-cache thunk on — so
+/// every dispatch is answered by Rust. That is the intermittent
+/// `test_inline_cache_takes_over_the_sam_call_site` failure, at ~3% on a
+/// contended host and 0 in 60 runs with the door off.
+///
+/// Keyed by name rather than by `CachedBytecodeMethod` identity because the
+/// frame's handle is resolved afresh on some paths, and a memo that missed
+/// would be no memo at all.
+static OSR_OPTIMIZING_REFUSED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(u32, u64, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn osr_optimizing_refusal_key(
+    class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) -> (u32, u64, usize) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    method_name.hash(&mut h);
+    descriptor.hash(&mut h);
+    (class_id.as_u32(), h.finish(), entry_pc)
+}
+
+/// Has this door already built and refused an optimizing artifact here?
+fn osr_optimizing_already_refused(key: (u32, u64, usize)) -> bool {
+    // Kill switch, so the memo can be A/B'd inside ONE binary. Comparing an
+    // intermittent event across two builds is not a comparison.
+    if matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING_MEMO").as_deref(),
+        Ok("0") | Ok("false")
+    ) {
+        return false;
+    }
+    OSR_OPTIMIZING_REFUSED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|s| s.contains(&key))
+        .unwrap_or(false)
+}
+
+/// Record a refusal so the next attempt at this pc skips straight to
+/// single-pass.
+///
+/// Deliberately NOT cleared on class redefinition: `redefine_class` clears the
+/// JIT cache, so the worst a stale entry costs is that a method which would now
+/// be admitted keeps the single-pass OSR body it had before — a missed
+/// optimization on a path that is already the fallback, never a wrong answer.
+fn note_osr_optimizing_refusal(key: (u32, u64, usize)) {
+    if let Ok(mut s) = OSR_OPTIMIZING_REFUSED.get_or_init(Default::default).lock() {
+        s.insert(key);
+    }
+}
+
 pub(super) fn try_osr(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3517,7 +3588,11 @@ pub(super) fn try_osr(
     // unreachable.
     //
     // Anything else falls through to the single-pass path below, unchanged.
-    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled() {
+    let osr_opt_key =
+        osr_optimizing_refusal_key(class_id, &method_name, &method_descriptor, entry_pc);
+    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled()
+        && !osr_optimizing_already_refused(osr_opt_key)
+    {
         // The frame's own handle when it has one, and a resolution when it does
         // not. `main` is entered by the launcher rather than through the invoke
         // cache, so its frame carries no `CachedBytecodeMethod` — and a method
@@ -3555,11 +3630,18 @@ pub(super) fn try_osr(
                         ),
                     }
                 }
-                let cm = cm?;
+                let Some(cm) = cm else {
+                    // The compile itself declined. Same conclusion as a refused
+                    // artifact for this door's purposes, and the same waste if
+                    // it is repeated.
+                    note_osr_optimizing_refusal(osr_opt_key);
+                    return None;
+                };
                 // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
                 if cm.ir_osr_entry_addr(entry_pc as u32).is_some() && cm.ir_osr_sentinel_free {
                     Some(Arc::new(cm))
                 } else {
+                    note_osr_optimizing_refusal(osr_opt_key);
                     None
                 }
             })
