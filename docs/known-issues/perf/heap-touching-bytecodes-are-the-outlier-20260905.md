@@ -507,6 +507,44 @@ replicated dispatch sites before that number exists**; this section is two
 refutations long precisely because structural proposals here have not survived
 contact with a probe.
 
+## The one change that could not be A/B'd, and what bounds it instead
+
+`GcBarrier::stw_requested` is the hottest read in the VM — every interpreting
+thread reads it once per bytecode, and compiled code polls the same byte
+through `stw_requested_flag_addr`. Its three neighbours were all written by
+other threads (`gc_generation` per collection, `threads_blocked` on every
+blocking native op, and the barrier `Mutex` word on every lock and unlock), and
+all four sat inside the first 64 bytes. It now has its own line.
+
+**This one cannot be A/B'd, and that is inherent rather than an oversight**: a
+struct layout is not a runtime toggle, so there is no kill switch to write and
+no way to put both arms in one binary. Everything else on this branch was
+measured with a switch; this could not be, so it was **bounded** instead.
+
+`probes/SharedLine.java` puts compute threads in tight interpreted loops —
+reading the flag once per bytecode — alongside an **untimed** wait/notify
+ping-pong whose every hop crosses `enter_blocked`/`leave_blocked`. Untimed
+deliberately: a timed wait on Windows is tick-quantized to ~15 ms, which would
+cap churn at ~66/s per thread and make the probe vacuous (the first version of
+it used `wait(1)` and was exactly that).
+
+Measured: **116,025 handoffs in 4 s ≈ 29,000/s**, so ~58,000 writes/s to the
+line, from a ping-pong doing nothing else. At 8 interpreting threads and a
+~70 ns single-socket coherence miss:
+
+    58_000 writes/s  x  8 readers  x  70 ns  ~=  32 ms/s aggregate over 8 cores  ~=  0.4%
+
+Below what this harness resolves. The cost scales as
+`writers x readers x miss_latency`, so it grows with core count and across
+sockets — but not dramatically: 64 readers at ~200 ns cross-socket is still
+about 1%.
+
+**So the honest statement is a bound, not a win**, and the bound is small. It
+is kept because it costs 63 bytes once per process, cannot regress anything,
+and matches two existing in-tree precedents (`zgc/census.rs`,
+`collector.rs`). Anyone with a many-core box can turn the bound into a number
+with the probe. That is the only way this one gets measured.
+
 ## Three findings resolved without a change, and why
 
 These were on the original ranked list. Each was read to the point of a verdict

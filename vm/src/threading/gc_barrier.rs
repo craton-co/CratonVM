@@ -37,11 +37,38 @@ use crate::threading::thread_state::{self, ThreadExecState};
 /// `AtomicU64`s at 8 and 16 and the mutex at 24.
 ///
 /// So a write to any of them invalidated, on every interpreting core, the line
-/// carrying the flag those cores read every bytecode. The writes are not
-/// per-nanosecond, which is why this is insurance rather than a measured bug —
-/// but it is free insurance, and the tree already owns the idiom for exactly
-/// this reason (`gc/src/zgc/census.rs` and `gc/src/collector.rs` both carry
-/// `#[repr(align(64))]` so unrelated counters cannot share a line).
+/// carrying the flag those cores read every bytecode.
+///
+/// # What it is worth, bounded rather than guessed
+///
+/// This cannot be A/B'd the way everything else on its branch was: a struct
+/// layout is not a runtime toggle, so there is no kill switch to write. It was
+/// therefore bounded arithmetically, from a measured write rate.
+///
+/// `probes/SharedLine.java` runs compute threads in tight interpreted loops
+/// (reading this flag once per bytecode) alongside an **untimed** wait/notify
+/// ping-pong, whose every hop crosses `enter_blocked`/`leave_blocked`. Untimed
+/// deliberately — a timed wait on Windows is tick-quantized to ~15 ms, which
+/// would cap the churn at ~66/s and make the probe vacuous. Measured
+/// 2026-09-05: **116,025 handoffs in 4 s ≈ 29,000/s**, so ~58,000 writes/s to
+/// this line, from a synthetic ping-pong doing nothing else. Real code does
+/// not exceed that by orders of magnitude.
+///
+/// At 8 interpreting threads and a ~70 ns single-socket coherence miss, that
+/// is `58_000 * 8 * 70ns` ≈ **32 ms of aggregate CPU per second across 8
+/// cores — about 0.4%**, which is below what the harness resolves.
+///
+/// The cost scales as `writers x readers x miss_latency`, so it grows with
+/// core count and again across sockets — but not dramatically: 64 readers at a
+/// ~200 ns cross-socket miss is still only ~1%. **This is a small effect, and
+/// the honest claim is a bound, not a win.**
+///
+/// It is kept because it costs 63 bytes once per process and cannot regress
+/// anything, and because the tree already owns the idiom for exactly this
+/// reason (`gc/src/zgc/census.rs` and `gc/src/collector.rs` both carry
+/// `#[repr(align(64))]` so unrelated counters cannot share a line). Anyone
+/// with a many-core box can put a number on it with the probe; that is the
+/// only way this one gets measured rather than bounded.
 ///
 /// 64 rather than 128: the two in-tree precedents use 64 and 128 respectively,
 /// and the destructive-interference size on x86-64 is 64. A single `bool` in
