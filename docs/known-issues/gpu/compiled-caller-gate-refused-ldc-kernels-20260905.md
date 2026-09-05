@@ -69,9 +69,44 @@ was never the variable; the constant pool was.
 Pass the target class's constant pool:
 `analyze_with_pool(target_method, &target_class.constant_pool)`.
 
-Annotations are deliberately still not passed — hint-loosened kernels
-remain the documented "Known limitation" in the module docs. That one is
-a choice; the pool-free call was not.
+### The annotation half, closed the same day
+
+The first version of this fix passed the pool but **not** annotations,
+on the grounds that hint-loosened kernels were a documented, deliberate
+"Known limitation". Re-reading that limitation after measuring this one
+retired it. It said:
+
+> intentionally conservative in the direction that costs offload
+> throughput, not correctness — the worst case is a JIT-compiled caller
+> that stops offloading
+
+That worst case is the 10.8x above. The same sentence would have
+justified the constant-pool gap right until it was priced, so "costs
+throughput, not correctness" is not a reason to leave a gate asking a
+different question from the dispatcher it models.
+
+The gate now calls `analyze_with_annotations_and_pool` with the target's
+own annotations — the identical call `lookup_or_compile` makes, reusing
+its `decode_method_attrs`. It costs one attribute decode per scanned
+target, beside a full bytecode scan already being paid.
+
+The disagreement ran **both** ways, and only one of them was predictable
+from the docs. Measured on `test_classes/gpu/annotations/GateAnnotationParity.java`,
+two builds differing only by this change:
+
+| kernel | before | after |
+| --- | --- | --- |
+| `hinted` — eligible only via `ALLOW_INTRINSIC_CALLS` | no census at all: never registered, **site went dark** | `cuMemAlloc=3`, `considered=40 offloaded=40` |
+| `excluded` — `@GpuExclude` | `considered=40 offloaded=0`: hook **armed 40 times** for a method the dispatcher always refuses | no census: never registered |
+
+The second row is the one the docs did not predict. An annotation-free
+gate calls a `@GpuExclude` method `Eligible` and registers it, arming the
+offload hook for a target `lookup_or_compile` short-circuits and never
+launches — and under `CallerGateMode::Block` that would deny its caller
+compilation for an offload that cannot happen.
+
+What is still deliberately excluded: forward class references and
+`invokedynamic`-mediated calls, both still listed in the module docs.
 
 ### Found twice, independently, on the same day
 
