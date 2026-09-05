@@ -11697,13 +11697,45 @@ fn ir_drop_home_enabled() -> bool {
 /// `ir_osr_sentinel_free`, because such a method emits no deopt stub at all.
 /// Every one of those frame states is unreachable, and they still pin every
 /// intermediate to memory.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_carry_single_use_enabled`], the same shape as `LS_FORCE` and for the
+    /// same reason: a byte-comparison lane has to hold both of its arms equal.
+    static CARRY_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_carry_single_use_enabled`] on this thread.
+#[cfg(test)]
+struct CarryForce;
+
+#[cfg(test)]
+impl CarryForce {
+    fn off() -> CarryForce {
+        CARRY_FORCE.with(|c| c.set(Some(false)));
+        CarryForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for CarryForce {
+    fn drop(&mut self) {
+        CARRY_FORCE.with(|c| c.set(None));
+    }
+}
+
 fn ir_carry_single_use_enabled() -> bool {
-    // The level-2 machine list is compared byte-for-byte against these arms
-    // (`the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms`), and
-    // its tiler does not know this form. Residency is switched off under a MIR
-    // mode for exactly this reason -- see the comment at `ls_active` -- and so
-    // is this. A lane whose oracle is "the arms" cannot also be the reason the
-    // arms are not allowed to improve.
+    #[cfg(test)]
+    {
+        if let Some(forced) = CARRY_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    // OFF under a MIR mode, and not only so the byte-equality lane can compare.
+    // In `MirMode::Emit` a tiled node is emitted by the SELECTOR and its arm
+    // never runs, so a mix would be genuinely broken rather than merely
+    // different: an arm could start a carry that its tiled consumer never
+    // reads, or fold an immediate the tiler then re-materialises. Residency is
+    // switched off under a MIR mode for the same class of reason.
     if isel_emit_enabled() || isel_verify_enabled() {
         return false;
     }
@@ -11758,13 +11790,44 @@ fn ir_carry_single_use_enabled() -> bool {
 /// commutative ops. `gp_load_value(RAX, node.inputs[0])` being unconditional
 /// is what `op_reads_rax_then_rcx` and the carry's RAX contract rest on, and
 /// buying a few more folds is not worth making that conditional.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_alu_imm_enabled`], the same shape as `LS_FORCE` and for the
+    /// same reason: a byte-comparison lane has to hold both of its arms equal.
+    static ALU_IMM_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_alu_imm_enabled`] on this thread.
+#[cfg(test)]
+struct AluImmForce;
+
+#[cfg(test)]
+impl AluImmForce {
+    fn off() -> AluImmForce {
+        ALU_IMM_FORCE.with(|c| c.set(Some(false)));
+        AluImmForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for AluImmForce {
+    fn drop(&mut self) {
+        ALU_IMM_FORCE.with(|c| c.set(None));
+    }
+}
+
 fn ir_alu_imm_enabled() -> bool {
-    // The level-2 machine list is compared byte-for-byte against these arms
-    // (`the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms`), and
-    // its tiler does not know this form. Residency is switched off under a MIR
-    // mode for exactly this reason -- see the comment at `ls_active` -- and so
-    // is this. A lane whose oracle is "the arms" cannot also be the reason the
-    // arms are not allowed to improve.
+    #[cfg(test)]
+    {
+        if let Some(forced) = ALU_IMM_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    // OFF under a MIR mode, and not only so the byte-equality lane can compare.
+    // In `MirMode::Emit` a tiled node is emitted by the SELECTOR and its arm
+    // never runs, so a mix would be genuinely broken rather than merely
+    // different: the tiler would re-materialise an immediate this folded.
+    // Residency is switched off under a MIR mode for the same class of reason.
     if isel_emit_enabled() || isel_verify_enabled() {
         return false;
     }
@@ -20568,6 +20631,13 @@ mod tests {
         // selector -- and would report the selector as having changed bytes it
         // never touched.
         let _ls = LsForce::off();
+        // Same argument for the two emission changes that landed 2026-09-05.
+        // Both are ON by default now and neither is known to the tiler, so a
+        // comparison that left them on for the no-mode arm would measure THEM
+        // rather than the selector -- and would report the selector as having
+        // changed bytes it never touched.
+        let _carry = CarryForce::off();
+        let _imm = AluImmForce::off();
         let _force = mode.map(MirForce::set);
         let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
         // SAFETY: the artifact is alive for the duration of this borrow, and
