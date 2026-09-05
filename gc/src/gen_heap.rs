@@ -13606,17 +13606,25 @@ impl GenerationalHeap {
                     .class_id
                     .as_u32(),
             );
-            for overlay_ref in
-                crate::external_roots::external_roots_for_owner(obj_ptr as usize, owner_class)
-            {
-                mark_and_push_old_gen(
-                    overlay_ref.as_ptr(),
-                    old_gen,
-                    &walked_bases,
-                    &mut worklist,
-                    "external-overlay(BFS owner)",
-                );
-            }
+            // `with_...` rather than `external_roots_for_owner`: this runs once
+            // per marked object and the returning form allocates a `Vec` for
+            // every one that owns anything. The scratch buffer behind this is
+            // per-thread and lives for the whole cycle.
+            crate::external_roots::with_external_roots_for_owner(
+                obj_ptr as usize,
+                owner_class,
+                |overlay_refs| {
+                    for overlay_ref in overlay_refs {
+                        mark_and_push_old_gen(
+                            overlay_ref.as_ptr(),
+                            old_gen,
+                            &walked_bases,
+                            &mut worklist,
+                            "external-overlay(BFS owner)",
+                        );
+                    }
+                },
+            );
             if loader_pin_on {
                 // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };

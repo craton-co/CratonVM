@@ -11855,9 +11855,14 @@ impl ZgcRealHeap {
         if !self.counters.mark_root_filter.may_own_overlay(base) {
             return;
         }
-        for overlay_ref in crate::external_roots::external_roots_for_owner(base, Some(class_id)) {
-            f(overlay_ref.as_ptr() as usize);
-        }
+        // The scratch-buffer form: past the latch above this runs per marked
+        // object, and the returning form allocates for every owner that has
+        // anything.
+        crate::external_roots::with_external_roots_for_owner(base, Some(class_id), |refs| {
+            for overlay_ref in refs {
+                f(overlay_ref.as_ptr() as usize);
+            }
+        });
     }
 
 }
