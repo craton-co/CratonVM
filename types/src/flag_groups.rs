@@ -1587,6 +1587,10 @@ pub const INVENTORY: &[E] = &[
     // See `cratonvm_jit::code_ptr_memo_enabled`.
     E { group: Group::JIT, token: "code-ptr-memo", on_key: None, off_key: Some("CRATONVM_JIT_NO_CODE_PTR_MEMO"), off_word: None, since: "2026-08-21" },
     E { group: Group::DBG, token: "invoke-phases", on_key: Some("CRATONVM_DBG_INVOKE_PHASES"), off_key: None, off_word: None, since: "2026-08-19" },
+    // `field-phases` — the same cycle breakdown for a quickened `getfield`.
+    // Written after four structural explanations for the field ratio were
+    // proposed from reading the code and refuted by measurement.
+    E { group: Group::DBG, token: "field-phases", on_key: Some("CRATONVM_DBG_FIELD_PHASES"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::JIT, token: "param-tag-scan", on_key: None, off_key: Some("CRATONVM_JIT_NO_PARAM_TAG_SCAN"), off_word: None, since: "2026-08-18" },
     // ── Interpreter hot-path memoizations, 2026-09-02 ────────────────────
     // Each of the five below removes work that was being repeated per
