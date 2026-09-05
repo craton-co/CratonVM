@@ -1876,6 +1876,70 @@ cached_is_set!(no_backedge_poll_gate, "CRATONVM_JIT_NO_BACKEDGE_POLL_GATE");
 /// Token: `CRATONVM_JIT=-field-fast-path`.
 cached_is_set!(no_field_fast_path, "CRATONVM_JIT_NO_FIELD_FAST_PATH");
 
+/// `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE` -- restore the object-start registry
+/// probe the quickened field and array arms used to run on every receiver.
+///
+/// `field_ptr_for` and `prim_elem_ptr` opened with
+/// `ZgcRealHeap::is_object_address`, which on the bitmap arm is one `Acquire`
+/// load of a word of the object-start bitmap -- one bit per 8 arena bytes, so
+/// ~16 MB of bitmap for a 1 GiB heap, indexed by the receiver's own address.
+/// A probe with two live objects keeps that word in L1; a real working set
+/// makes it a random access into a structure sized by the heap.
+///
+/// It is not a check the arms are obliged to make. The handler they exist to
+/// replace -- `ZgcRealHeap::get_field` -- dereferences the receiver's header
+/// with no membership test at all (`self.header(obj)` is a bare pointer cast),
+/// and so does `set_field`. What actually establishes that this receiver
+/// matches this site is the header comparison immediately after the probe:
+/// `class_id`, `num_slots` and the compact flag, all three, on every access.
+///
+/// The one thing the probe did buy incidentally was a stale-receiver screen: a
+/// relocated address is pruned from the registry, so it missed and fell back to
+/// `op_getfield`, which heals the receiver with `load_and_forward`. That heal
+/// exists for a window the fast arms do not have -- `op_getfield` pops the
+/// receiver into a bare Rust local and then calls `resolve_field_ref`, which
+/// can load a class, allocate, and provoke a collection while the local is
+/// invisible to the root scan. Between `peek_compact` and the header read the
+/// quickened arm allocates nothing, takes no lock and calls nothing that can
+/// reach a safepoint, so its window is zero-length and the operand-stack slot
+/// it read is one the collector has already updated.
+///
+/// Token: `CRATONVM_JIT=-field-addr-elide`.
+cached_is_set!(no_field_addr_elide, "CRATONVM_JIT_NO_FIELD_ADDR_ELIDE");
+
+/// `CRATONVM_JIT_NO_ARRAYLENGTH_FAST` -- route `arraylength` back through the
+/// `Value` round trip and the `VmHeap` enum dispatch.
+///
+/// The quickened arm reads the length out of the header at the address already
+/// in the operand-stack slot. The path it replaces decoded that slot into the
+/// 16-byte `Value` enum (and pushed it back on the non-object path, keeping it
+/// live across the arm), then went through `dispatch!` to reach a collector
+/// method whose whole body is `self.header(obj).array_length()`. Measured
+/// 2026-09-05 the opcode cost 24.4 ns against HotSpot's 0.39 -- 62x, the worst
+/// ratio in the interpreter's operation table, for one header read.
+/// Token: `CRATONVM_JIT=-arraylength-fast`.
+cached_is_set!(no_arraylength_fast, "CRATONVM_JIT_NO_ARRAYLENGTH_FAST");
+
+/// `CRATONVM_JIT_NO_REF_ARRAY_FAST` -- route `aaload` back through
+/// `VmHeap::get_array_element`.
+///
+/// `aaload` sits in the same `0x2e..=0x35` dispatch arm as `iaload`, but that
+/// arm's quickened half declines it (`prim_elem_for_opcode` has no reference
+/// entry), so every reference element load took the full path. Measured
+/// 2026-09-05 at 99.9 ns per iteration against `iaload`'s 79.0 in the identical
+/// loop -- 21 ns, where HotSpot has the two identical to within noise.
+/// Token: `CRATONVM_JIT=-ref-array-fast`.
+cached_is_set!(no_ref_array_fast, "CRATONVM_JIT_NO_REF_ARRAY_FAST");
+
+/// `CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH` -- restore the class-manager read lock
+/// and name comparison `op_getstatic` used to perform on EVERY `getstatic` to
+/// decide whether the field was one of `System.out` / `err` / `in`.
+///
+/// Measured 2026-09-05, a `getstatic` + `putstatic` pair cost 86.4 ns against
+/// HotSpot's 3.45 (25x); `op_putstatic` never had the screen, so the pair's
+/// cost is the get half. Token: `CRATONVM_JIT=-system-class-latch`.
+cached_is_set!(no_system_class_latch, "CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH");
+
 /// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
 /// backward branch instead of only once `Frame::backward_count` has reached
 /// the smallest threshold the call could accept. Token:

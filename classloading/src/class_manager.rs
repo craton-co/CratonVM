@@ -1390,6 +1390,45 @@ pub fn class_is_java_util(id: ClassId) -> Option<bool> {
     }
 }
 
+/// The `ClassId` of `java/lang/System`, or `u32::MAX` before it is defined.
+///
+/// # Why a whole static for one class
+///
+/// `op_getstatic` has to know whether the field it resolved is one of
+/// `System.out` / `err` / `in`, because those three are intercepted during
+/// bootstrap. It asked by taking a `class_manager` **read lock**, calling
+/// `get_class`, and comparing the class's name against the literal
+/// `"java/lang/System"` — on **every `getstatic` in the program**. Measured
+/// 2026-09-05, a `getstatic` + `putstatic` pair cost 86.4 ns against HotSpot's
+/// 3.45 (25x), the second-worst ratio in the interpreter's operation table.
+///
+/// This is the same trade the two lines above it already make for
+/// `is_annotation_proxy_class` and `class_is_java_util`: one name comparison
+/// on the class-DEFINITION path, which runs a few thousand times per process,
+/// buys a one-integer-compare answer on a path that runs millions of times a
+/// second.
+///
+/// `u32::MAX` is the "not defined yet" sentinel rather than `0`, because `0`
+/// is a real `ClassId`. A getstatic executed before `java/lang/System` is
+/// defined therefore compares unequal and takes the ordinary path, which is
+/// correct: there are no `System.out` reads before the class exists.
+static SYSTEM_CLASS_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Record `java/lang/System`'s id. Called once, from the definition path.
+fn note_system_class(id: ClassId) {
+    SYSTEM_CLASS_ID.store(id.as_u32(), Ordering::Relaxed);
+}
+
+/// Is `id` `java/lang/System`? One relaxed load and one compare, no lock.
+///
+/// A `false` before the class is defined is correct (see [`SYSTEM_CLASS_ID`]),
+/// and the store happens on the defining thread before any code that could
+/// read the class's fields can run.
+#[inline]
+pub fn class_is_java_lang_system(id: ClassId) -> bool {
+    SYSTEM_CLASS_ID.load(Ordering::Relaxed) == id.as_u32()
+}
+
 static ANY_DUPLICATE_CLASS_NAME: AtomicBool = AtomicBool::new(false);
 
 /// True once two distinct `ClassId`s have shared a binary name. Single
@@ -9407,6 +9446,10 @@ impl ClassManager {
         }
         if name.starts_with("java/util/") {
             note_java_util_class(id);
+        }
+        // Same trade again, for `op_getstatic`'s System.out/err/in intercept.
+        if &*name == "java/lang/System" {
+            note_system_class(id);
         }
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();
