@@ -448,16 +448,32 @@ pub(super) fn getfield_fast_keyed(
                 CompactValue::null()
             } else {
                 // A wrapper may sit in a reference slot; `get_field` unboxes
-                // it and this arm does not.
-                if cratonvm_gc::autobox::wrapper_exists() {
-                    return false;
-                }
+                // it and this arm does not — so it must decline when the value
+                // it loaded IS one.
+                //
+                // This used to ask `autobox::wrapper_exists()`, the
+                // process-wide latch, which is armed at bootstrap by the
+                // class-mirror populator and is therefore true in every
+                // process. The screen was permanently closed and this arm never
+                // served a non-null reference field at all. Measured on the
+                // sibling `aaload` arm, which carried the identical screen:
+                // `hit=0 miss_barrier=0 miss_wrapper=2000146`.
+                //
+                // The precise question costs one header compare on the object
+                // just loaded. See `autobox::header_is_wrapper`.
+                //
                 // SAFETY: a non-zero reference slot of a live compact object
                 // holds an object address the collector maintains.
                 let obj = shared
                     .mem
                     .heap
                     .load_and_forward(unsafe { ObjectRef::from_raw(raw as *mut u8) });
+                // SAFETY: `load_and_forward` returned a live object address;
+                // its first `HEADER_SIZE` bytes are a header.
+                let obj_header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+                if cratonvm_gc::autobox::header_is_wrapper(obj_header) {
+                    return false;
+                }
                 match CompactValue::try_from_pointer(obj.as_ptr() as u64) {
                     Some(cv) => cv,
                     None => return false,
@@ -992,10 +1008,11 @@ pub(super) fn array_load_ref(
         site_stats::bump(site_stats::REFARR_MISS_BARRIER);
         return false;
     }
-    if cratonvm_gc::autobox::wrapper_exists() {
-        site_stats::bump(site_stats::REFARR_MISS_WRAPPER);
-        return false;
-    }
+    // NOT `autobox::wrapper_exists()`. That latch is armed at bootstrap by the
+    // class-mirror populator, so it is true in every process and a screen keyed
+    // on it is permanently closed — measured `aaload: hit=0 miss_barrier=0
+    // miss_wrapper=2000146` before this. The precise question is asked below,
+    // on the element this access actually loaded, for one header compare.
     let base = arr.as_ptr() as usize;
     // SAFETY: `arr` is the array reference of a verified `aaload`, popped from
     // the operand stack in this same safepoint-free window; its first
@@ -1024,6 +1041,15 @@ pub(super) fn array_load_ref(
     let cv = if raw == 0 {
         CompactValue::null()
     } else if cratonvm_types::plausible_heap_pointer(raw) {
+        // SAFETY: a plausible, non-zero element word of a live reference array
+        // addresses an object whose first `HEADER_SIZE` bytes are a header —
+        // the same premise `autobox_payload` reads on.
+        let elem_header = unsafe { &*(raw as usize as *const ObjectHeader) };
+        if cratonvm_gc::autobox::header_is_wrapper(elem_header) {
+            // A wrapper must be un-boxed, which is `get_array_element`'s job.
+            site_stats::bump(site_stats::REFARR_MISS_WRAPPER);
+            return false;
+        }
         match CompactValue::try_from_pointer(raw) {
             Some(cv) => cv,
             None => {

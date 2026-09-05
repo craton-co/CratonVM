@@ -139,6 +139,34 @@ pub fn array_unbox_latch_enabled() -> bool {
     })
 }
 
+/// Is this object an auto-box wrapper? The per-object test, for a reader that
+/// already holds a validated header.
+///
+/// # Why the process-wide latch is not enough
+///
+/// [`wrapper_exists`] was designed as a cheap screen on the premise, stated in
+/// the module note above, that "a process that never boxes — the overwhelming
+/// majority — pays one relaxed load ... and never touches the address
+/// validator". **In this VM there is no such process.** The class-mirror
+/// populator puns a `ClassId` (and `Int(-1)` for primitive mirrors) into slot 0
+/// of an object stamped `java/lang/Class`, that store goes through
+/// [`box_for_reference_slot`], and it arms the latch unconditionally at
+/// bootstrap. Measured 2026-09-05 with a per-cause census on
+/// `probes/ArrBurn.java`: `aaload: hit=0 miss_barrier=0 miss_wrapper=2000146`.
+/// Every screen keyed on the latch is therefore permanently open, and every
+/// fast path guarded by one is dead code.
+///
+/// A reader that has already loaded the reference can ask the precise question
+/// instead, for one header compare. That is the same discriminator
+/// [`super::GarbageCollector::autobox_payload`] applies — minus the
+/// `is_object_address` probe, which
+/// `interpreter::field_fast::registry_probe_restored` establishes is not
+/// needed for parity with the handlers these paths replace.
+#[inline(always)]
+pub fn header_is_wrapper(header: &cratonvm_types::ObjectHeader) -> bool {
+    header.class_id == AUTOBOX_CLASS_ID
+}
+
 /// The screen itself: `true` when a reference-array read must go on and probe
 /// for a wrapper. Reads as "the latch is off, or it says a wrapper exists".
 #[inline(always)]
