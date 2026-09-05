@@ -935,6 +935,8 @@ struct Lowerer<'a> {
     carries_read: usize,
     carries_refused: usize,
     carry_stores_dropped: usize,
+    /// ENGAGEMENT: constant operands folded into their ALU instruction.
+    alu_imms_folded: usize,
     /// Why an adjacent pair was not carried, per cause, and how many carried
     /// values still had to write their home because a frame state names them.
     carry_skips: [usize; 6],
@@ -1469,6 +1471,7 @@ impl<'a> Lowerer<'a> {
             carries_read: 0,
             carries_refused: 0,
             carry_stores_dropped: 0,
+            alu_imms_folded: 0,
             carry_skips: [0; 6],
             carry_named: 0,
             deopt_nameable: Vec::new(),
@@ -1784,6 +1787,77 @@ impl<'a> Lowerer<'a> {
         if let Some(cell) = self.gp_reg_live.get_mut(id as usize) {
             *cell = true;
         }
+    }
+
+    /// The `imm32` this operand denotes, if it is an integer constant that
+    /// fits one.
+    ///
+    /// A wider `long` constant falls back to the register form, which is
+    /// correct rather than merely conservative: every immediate form below
+    /// SIGN-EXTENDS its `imm32` to 64 bits, so a constant outside `i32` cannot
+    /// be expressed by one.
+    fn alu_imm32(&self, id: NodeId) -> Option<i32> {
+        if !ir_alu_imm_enabled() {
+            return None;
+        }
+        match self.graph.nodes.get(id as usize)?.op {
+            Op::Const(val) => i32::try_from(val).ok(),
+            _ => None,
+        }
+    }
+
+    /// `<op> EAX/RAX, imm32` in the one-byte accumulator form, if `id` is a
+    /// constant. Answers whether it emitted, so the caller skips its
+    /// register-to-register form.
+    ///
+    /// `acc` is the `AL/eAX, imm` opcode: ADD 0x05, OR 0x0D, AND 0x25,
+    /// SUB 0x2D, XOR 0x35 -- the same column of the opcode map, which is why
+    /// one helper covers five arms.
+    fn emit_alu_acc_imm(&mut self, id: NodeId, acc: u8, wide: bool) -> bool {
+        let Some(imm) = self.alu_imm32(id) else {
+            return false;
+        };
+        if wide {
+            self.buf.emit_byte(0x48); // REX.W
+        }
+        self.buf.emit_byte(acc);
+        self.buf.emit(&imm.to_le_bytes());
+        self.alu_imms_folded += 1;
+        true
+    }
+
+    /// `IMUL EAX/RAX, EAX/RAX, imm32` (0x69 /r id), if `id` is a constant.
+    fn emit_imul_imm(&mut self, id: NodeId, wide: bool) -> bool {
+        let Some(imm) = self.alu_imm32(id) else {
+            return false;
+        };
+        if wide {
+            self.buf.emit_byte(0x48);
+        }
+        self.buf.emit(&[0x69, 0xC0]); // dst=rax, src=rax
+        self.buf.emit(&imm.to_le_bytes());
+        self.alu_imms_folded += 1;
+        true
+    }
+
+    /// `<shift> EAX/RAX, imm8` (0xC1 /digit ib), if `id` is a constant.
+    ///
+    /// The count is masked here to the width the JVM specifies -- 5 bits for
+    /// `ishl`/`ishr`/`iushr`, 6 for the `l` forms. x86 masks a shift count the
+    /// same way, which is what makes the existing `CL` form correct without a
+    /// mask; doing it explicitly keeps the immediate form from depending on
+    /// that coincidence.
+    fn emit_shift_imm(&mut self, id: NodeId, digit: u8, wide: bool) -> bool {
+        let Some(imm) = self.alu_imm32(id) else {
+            return false;
+        };
+        let count = (imm as u32) & if wide { 63 } else { 31 };
+        if wide {
+            self.buf.emit_byte(0x48);
+        }
+        self.buf.emit(&[0xC1, digit, count as u8]);
+        self.alu_imms_folded += 1;
+        true
     }
 
     /// Load `id`'s value into `dst`, from its resident register when it has one
@@ -6561,13 +6635,15 @@ impl<'a> Lowerer<'a> {
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.gp_load_value(RAX, node.inputs[0]);
-                    self.gp_load_value(RCX, node.inputs[1]);
-                    if node.ty == IrType::Int {
-                        // ADD EAX, ECX
-                        self.buf.emit(&[0x01, 0xC8]);
-                    } else {
-                        // ADD RAX, RCX
-                        self.buf.emit(&[0x48, 0x01, 0xC8]);
+                    if !self.emit_alu_acc_imm(node.inputs[1], 0x05, node.ty != IrType::Int) {
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        if node.ty == IrType::Int {
+                            // ADD EAX, ECX
+                            self.buf.emit(&[0x01, 0xC8]);
+                        } else {
+                            // ADD RAX, RCX
+                            self.buf.emit(&[0x48, 0x01, 0xC8]);
+                        }
                     }
                     self.store_rax(slot);
                 }
@@ -6583,13 +6659,15 @@ impl<'a> Lowerer<'a> {
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.gp_load_value(RAX, node.inputs[0]);
-                    self.gp_load_value(RCX, node.inputs[1]);
-                    if node.ty == IrType::Int {
-                        // SUB EAX, ECX
-                        self.buf.emit(&[0x29, 0xC8]);
-                    } else {
-                        // SUB RAX, RCX
-                        self.buf.emit(&[0x48, 0x29, 0xC8]);
+                    if !self.emit_alu_acc_imm(node.inputs[1], 0x2D, node.ty != IrType::Int) {
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        if node.ty == IrType::Int {
+                            // SUB EAX, ECX
+                            self.buf.emit(&[0x29, 0xC8]);
+                        } else {
+                            // SUB RAX, RCX
+                            self.buf.emit(&[0x48, 0x29, 0xC8]);
+                        }
                     }
                     self.store_rax(slot);
                 }
@@ -6605,13 +6683,15 @@ impl<'a> Lowerer<'a> {
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.gp_load_value(RAX, node.inputs[0]);
-                    self.gp_load_value(RCX, node.inputs[1]);
-                    if node.ty == IrType::Int {
-                        // IMUL EAX, ECX
-                        self.buf.emit(&[0x0F, 0xAF, 0xC1]);
-                    } else {
-                        // IMUL RAX, RCX
-                        self.buf.emit(&[0x48, 0x0F, 0xAF, 0xC1]);
+                    if !self.emit_imul_imm(node.inputs[1], node.ty != IrType::Int) {
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        if node.ty == IrType::Int {
+                            // IMUL EAX, ECX
+                            self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                        } else {
+                            // IMUL RAX, RCX
+                            self.buf.emit(&[0x48, 0x0F, 0xAF, 0xC1]);
+                        }
                     }
                     self.store_rax(slot);
                 }
@@ -6973,63 +7053,75 @@ impl<'a> Lowerer<'a> {
             Op::And => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                // AND RAX, RCX
-                self.buf.emit(&[0x48, 0x21, 0xC8]);
+                if !self.emit_alu_acc_imm(node.inputs[1], 0x25, true) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    // AND RAX, RCX
+                    self.buf.emit(&[0x48, 0x21, 0xC8]);
+                }
                 self.store_rax(slot);
             }
             Op::Or => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                // OR RAX, RCX
-                self.buf.emit(&[0x48, 0x09, 0xC8]);
+                if !self.emit_alu_acc_imm(node.inputs[1], 0x0D, true) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    // OR RAX, RCX
+                    self.buf.emit(&[0x48, 0x09, 0xC8]);
+                }
                 self.store_rax(slot);
             }
             Op::Xor => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                // XOR RAX, RCX
-                self.buf.emit(&[0x48, 0x31, 0xC8]);
+                if !self.emit_alu_acc_imm(node.inputs[1], 0x35, true) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    // XOR RAX, RCX
+                    self.buf.emit(&[0x48, 0x31, 0xC8]);
+                }
                 self.store_rax(slot);
             }
             Op::Shl => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                if node.ty == IrType::Int {
-                    // SHL EAX, CL
-                    self.buf.emit(&[0xD3, 0xE0]);
-                } else {
-                    // SHL RAX, CL
-                    self.buf.emit(&[0x48, 0xD3, 0xE0]);
+                if !self.emit_shift_imm(node.inputs[1], 0xE0, node.ty != IrType::Int) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    if node.ty == IrType::Int {
+                        // SHL EAX, CL
+                        self.buf.emit(&[0xD3, 0xE0]);
+                    } else {
+                        // SHL RAX, CL
+                        self.buf.emit(&[0x48, 0xD3, 0xE0]);
+                    }
                 }
                 self.store_rax(slot);
             }
             Op::Shr => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                if node.ty == IrType::Int {
-                    // SAR EAX, CL
-                    self.buf.emit(&[0xD3, 0xF8]);
-                } else {
-                    // SAR RAX, CL
-                    self.buf.emit(&[0x48, 0xD3, 0xF8]);
+                if !self.emit_shift_imm(node.inputs[1], 0xF8, node.ty != IrType::Int) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    if node.ty == IrType::Int {
+                        // SAR EAX, CL
+                        self.buf.emit(&[0xD3, 0xF8]);
+                    } else {
+                        // SAR RAX, CL
+                        self.buf.emit(&[0x48, 0xD3, 0xF8]);
+                    }
                 }
                 self.store_rax(slot);
             }
             Op::UShr => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                if node.ty == IrType::Int {
-                    // SHR EAX, CL
-                    self.buf.emit(&[0xD3, 0xE8]);
-                } else {
-                    // SHR RAX, CL
-                    self.buf.emit(&[0x48, 0xD3, 0xE8]);
+                if !self.emit_shift_imm(node.inputs[1], 0xE8, node.ty != IrType::Int) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    if node.ty == IrType::Int {
+                        // SHR EAX, CL
+                        self.buf.emit(&[0xD3, 0xE8]);
+                    } else {
+                        // SHR RAX, CL
+                        self.buf.emit(&[0x48, 0xD3, 0xE8]);
+                    }
                 }
                 self.store_rax(slot);
             }
@@ -11616,6 +11708,38 @@ fn ir_carry_single_use_enabled() -> bool {
 /// into its branch and then emits nothing at all. `Op::Load`, `Op::ArrayLoad`
 /// and `Op::Call` are absent because they read their operands in another order
 /// or through another path.
+/// Fold a constant second operand into the ALU instruction instead of
+/// materialising it into RCX first -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_ALU_IMM=1`.
+///
+/// Every binary arithmetic arm in this file reads its second operand through
+/// `gp_load_value(RCX, ..)` and then works register-to-register. When that
+/// operand is a constant, `ir_const_imm` turns the read into `mov ecx, imm` --
+/// so the emitted loop carries a whole instruction per constant operand that
+/// x86 has an addressing form for:
+///
+/// ```text
+/// mov ecx,1Fh  /  imul eax,ecx        becomes   imul eax,eax,1Fh
+/// mov ecx,1    /  add eax,ecx         becomes   add eax,1
+/// mov ecx,0FFh /  and rax,rcx         becomes   and rax,0FFh
+/// ```
+///
+/// Unlike the rest of the work around it, this is not specific to a loop
+/// shape: it is every `x + 1`, `x & 0xFF` and `x * 31` in every compiled
+/// method. On `OsrTierBench.kernel` it is five of the loop's forty-four
+/// instructions.
+///
+/// Only the SECOND operand is folded, never the first, even for the
+/// commutative ops. `gp_load_value(RAX, node.inputs[0])` being unconditional
+/// is what `op_reads_rax_then_rcx` and the carry's RAX contract rest on, and
+/// buying a few more folds is not worth making that conditional.
+fn ir_alu_imm_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ALU_IMM") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 fn op_reads_rax_then_rcx(op: &Op) -> bool {
     matches!(
         op,
@@ -14548,6 +14672,7 @@ pub(crate) fn lower_inner_with_scopes(
              already_resident={} consumer_arm={} operand_position={}",
             s[0], s[1], s[2], s[3], s[4], s[5],
         );
+        eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to
