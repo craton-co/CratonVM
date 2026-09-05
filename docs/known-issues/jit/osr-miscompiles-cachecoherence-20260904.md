@@ -77,9 +77,19 @@ reachable from the entry pc the rule moved OSR to — so cause 1 rests on
 the argument, not on a demonstrated failure of its own. It is kept
 because the argument is sound and `osr.rs` states the same invariant
 from the other side (`osr_entry_native[header]` points *before* a
-hoisted preheader precisely so a cold OSR entry runs it). Whether it can
-be relaxed is a separate question, and a cheap one: revert it and see
-whether anything moves now that `wide iinc` is visible.
+hoisted preheader precisely so a cold OSR entry runs it).
+
+**Asked and answered.** With cause 2 fixed, every reproducer here is
+correct whether the rule is on or off. So it has no demonstrated failure
+of its own, and it did cost something: a versioning OSR test asserted
+the behaviour it removed (`c82154c4d`). It stays on — a soundness rule
+HotSpot also enforces, costing nothing measurable because a refused
+mid-expression pc is re-reached at the header a few bytecodes later —
+but it is a default-on codegen rule with **no kill switch**, which is a
+gap. One was written and validated (90/90) on 2026-09-05 and lost to a
+concurrent `git reset` in the shared checkout before it landed;
+re-applying it is a small mechanical change and the right next step for
+anyone who wants to re-open the question.
 
 ## What it was NOT — tested and refuted
 
@@ -119,3 +129,18 @@ A fourth **compiled CPU arm** was added 2026-09-04 and is what reported
 it. The lesson outlives the defect: a gate that keeps methods interpreted
 removes them from every differential suite that reaches the compiled tier
 only through that gate.
+
+## What this unblocks
+
+`CRATONVM_GPU_JIT_GATE_CALLERS=hook`
+(`../perf/gpu-compiled-caller-offload-hook-20260904.md`) was held opt-in
+for exactly one reason: it failed `cache_coherence`. That failure was
+THIS defect — the hook merely became the first thing that ever compiled
+the method. With `wide iinc` visible, `runtime-stress.sh` passes **all
+seven scenarios under `hook`**, as does `jit-writer-stale.sh`.
+
+So the 27-42x that mode is worth is unblocked. Flipping its default is a
+separate change and wants its own validation pass; note that
+`bench-gpu/gate-overbroad.sh`'s arm C is vacuous under `hook` (it toggles
+caller-blocking, which that mode disables outright) and needs rewriting
+first.
