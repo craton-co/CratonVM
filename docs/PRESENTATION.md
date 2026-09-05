@@ -37,13 +37,19 @@ still comes out ahead:
 | Integer division chain                     | 2,146 ms         | 26 ms         | **11 ms**         | **195x faster** | **2.4x faster** |
 | Double-precision division chain            | 1,780 ms         | 128 ms        | **95 ms**         | **18.7x faster**| **1.3x faster** |
 | 128 multiply-adds/element                  | 1,300 ms         | 27 ms         | **8 ms**          | **163x faster** | **3.4x faster** |
-| Dot-product reduction (int·int → long)     | 1,172 ms         | unimplemented | **12 ms**         | **98x faster**  | —               |
+| Dot-product reduction (int·int → long)     | 1,172 ms         | unimplemented | **2 ms**          | **586x faster** | —               |
 | Ray tracer kernel (33.2M pixels)           | 837 ms           | 24.3 ms       | **12.3 ms**       | **68x faster**  | **2.0x faster** |
 
 Every number above is checksum-verified bit-for-bit against HotSpot,
 including the GPU results — no rounding, no approximation, no "close enough."
 And that dot-product row isn't a gap in our table: TornadoVM's own engine
 throws `unimplemented` on that shape. CratonVM just runs it.
+
+RTX 2060, TornadoVM 4.0.1 (PTX backend), N = 2²⁴, warm, full
+host→device→host round-trip included. GPU rows re-verified 2026-09-05; the
+CPU baselines are the original idle-host measurements. The ray-tracer row is
+a reduced proxy kernel, not the full TornadoVM ray-tracer app — see
+BENCHMARK.md for what that means and for the per-row methodology.
 
 ---
 
