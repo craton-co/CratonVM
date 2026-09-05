@@ -170,6 +170,15 @@ errors and no harness-blindness flags. That suite is a HotSpot differential —
 a vector passes only when CratonVM's output matches the oracle's — so it is
 the right gate for a change that alters how a field is read.
 
+**Final gates, whole branch.** `regression-suite/run.sh` on the finished
+binary: **90/90 on the default collector and 90/90 under
+`--XX:UseGc G1`**. And `cratonvm-difftest gate --corpus difftest/seeds`:
+**clean, exit 0**, across `jit-on`, `nojit` and `interp-decoded`. That last
+axis is the one that matters most here: the interpreter has two
+implementations of every opcode, `--noverify` selects between them wholesale,
+and this branch added two new fast arms — `interp-decoded` is the axis built
+for exactly that failure, and it is the only mode that runs the decoded path.
+
 **Once per collector, because one of these changes is not in the interpreter
 at all.** The autobox latch below touches `G1Collector::get_array_element`,
 and every run above used the default collector, which would never have
