@@ -13660,6 +13660,10 @@ pub(crate) fn lower_inner_with_scopes(
 
     // real-frame-deopt (step 3): emit the shared deopt stub after the method
     // body so failed guards can jump to it, then patch in-method branches.
+    // Captured BEFORE the stubs are emitted: `emit_deopt_stub` takes its patch
+    // list, so afterwards the question cannot be asked.
+    let osr_sentinel_free =
+        lowerer.deopt_stub_patches.is_empty() && lowerer.call_exc_patches.is_empty();
     lowerer.emit_deopt_stub();
     // Gap B: emit the shared call-exception bail stub after the body so each
     // dispatch site's sentinel `JE` reaches it.
@@ -13887,6 +13891,7 @@ pub(crate) fn lower_inner_with_scopes(
     cm.compile_id = compile_id;
     cm.deopt_points = deopt_points;
     cm.ir_osr_entries = lowerer_osr_entries;
+    cm.ir_osr_sentinel_free = osr_sentinel_free;
     cm._deopt_point_boxes = deopt_boxes;
 
     // ── Moving-young relocation contract ────────────────────────────────

@@ -1380,7 +1380,13 @@ pub fn clear_reports() {
 ///
 /// Same shape as [`SCHEDULING_EVENTS`]: a closed set, a fixed array of relaxed
 /// counters, no allocation and no initialization order.
-pub const OSR_EVENTS: [&str; 13] = [
+pub const OSR_EVENTS: [&str; 14] = [
+    // The artifact this entry ran was the OPTIMIZING tier's, built through the
+    // shared assembly and entered through its own stub rather than through
+    // `osr_trampoline`. Zero on a default run: `CRATONVM_JIT_OSR_OPTIMIZING`
+    // gates it. Read beside `osr_entered` -- the difference is how many entries
+    // still went to the single-pass body.
+    "osr_entered_optimizing",
     // An OSR entry was actually taken: the trampoline ran and control reached
     // compiled code at a back edge. The denominator for everything below.
     "osr_entered",
@@ -1472,6 +1478,7 @@ pub const OSR_EVENTS: [&str; 13] = [
 
 /// One relaxed counter per [`OSR_EVENTS`] entry.
 static OSR_COUNTERS: [AtomicU64; OSR_EVENTS.len()] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
