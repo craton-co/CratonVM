@@ -142,6 +142,57 @@ field count is `javap -p` against the JDK 25.0.3.9 image on the Windows host
 > chains, not the source sites §6 enumerates, so no row above is matched to a
 > row in this record. What is settled is that the run is possible, was done on
 > an instrumented binary, and is not empty.
+
+> **TRIAGE 2026-09-04 of the census above — and a CORRECTION to what this note
+> claimed about it.**
+>
+> The discharge note reported *"13 species allocate against a class the VM
+> declares NO fields for (`real_fields=0`) … A `+9` against an undeclared layout
+> is a different species from a `+9` against a known one"*. That reads as one
+> finding. It is three, and `native-api/src/layout_alias.rs`'s own module header
+> says so before anyone runs it: `declared == 0` means **either** a genuinely
+> field-less class (an interface, `java/lang/Object` — benign), **or** a class
+> whose `ClassId` did not resolve, **or** a fabricated stub standing in for a
+> class with a wider real layout — *"the row says which allocation, not which of
+> the three — that is the reader's next step"*. Taking the bucket as a defect
+> population skipped that step.
+>
+> Taken now, on the same transcript:
+>
+> ```text
+> java/util/stream/Stream                 interface        java/nio/file/Path            interface
+> java/net/http/HttpClient                abstract         java/nio/file/FileSystem      abstract
+> java/net/http/HttpRequest               abstract         java/nio/file/spi/FileSystemProvider abstract
+> java/net/http/HttpRequest$Builder       interface        java/lang/reflect/ReflectAccess     class
+> java/net/http/HttpResponse              interface        java/io/FileDescriptor$1      anonymous
+> java/net/http/HttpResponse$BodyHandler  interface        java/nio/Buffer$2             anonymous
+> ```
+>
+> **All twelve are case 1.** An interface or abstract class declares no instance
+> fields, so `real_fields=0` is not a disagreement — it is the right answer, and
+> a carrier minted against that name is the known minted-receiver species
+> `W7-9`/`H5-1` already track. **Zero of the twelve is a confirmed defect.**
+>
+> **The 37 `<unresolved:ClassId(0)>` observations are case 3, and they are
+> already owned.** Every one requests **3** slots, and their `site=` chains are
+> all bootstrap class initialisation — `BuiltinClassLoader.<clinit>`,
+> `ServicesCatalog.<init>`, `ThreadContainers.<clinit>`,
+> `SecureClassLoader.<init>`, `ForkJoinPool.<clinit>`. That is not a bootstrap
+> artefact of the instrument: `layout_alias` observes the `ClassId::new(0)`
+> sentinel **deliberately**, before `alloc_object` substitutes
+> `cratonvm/synthetic/AnonymousObject$N`, precisely so this population stays
+> visible — *"the busiest blind-spot population in the workspace — 30 production
+> sites, 16 of them requesting fewer slots than the class they name really
+> declares"*. These rows belong to `W7-73-short-object-blind-spot.md`, which
+> holds the source-level site list this instrument cannot produce (it names the
+> JAVA frames, not the Rust allocator).
+>
+> **So the corrected reading of this census.** The `under`/`over` numbers stand
+> exactly as reported — 19 species and widest −16 on the under side, 19 and +5 on
+> the over side. The third bucket is **not** a third defect population: it is 12
+> benign field-less carriers plus one already-recorded short-object family. What
+> the census adds for `W7-73` is that its sentinel family is LIVE on an ordinary
+> boot, at one width, 37 times in two probes.
 ## 1. The repair is real — verified, not taken on trust
 
 `native-builtins/src/util_concurrent_ext.rs`, the condition at the funnel:
