@@ -212,6 +212,46 @@ number is physically sensible rather than an artifact.
 The residual ~25 ns is `Scratch::new`'s thread-local take/put and its length
 check. It does not scale, so it does not participate in the defect.
 
+### Engagement on a REAL netty workload, 2026-09-05
+
+`probes/NettySelectedKeysProbe.java` — netty 4.1.133.Final, NIO event loops,
+2 000 x 64 B echoed, `--add-opens java.base/sun.nio.ch=ALL-UNNAMED` so netty's
+key-set optimisation actually installs (the probe asserts that before sending
+traffic; without it the run is green and exercises nothing). Echo output is
+byte-identical to HotSpot on both arms (`echoed_bytes=128000`,
+`payload_sum=4032000`).
+
+```
+selected-keys fast=1095 generic=0        <- F4, with the fast path on
+selected-keys fast=0    generic=1151     <- CRATONVM_SEL_FAST_KEYS=0
+buffers heap=0 direct-raw=0 direct-arena=4296
+scratch hit=4291 grow=5 miss=0
+bb-slots hit=9744 fill=1 refused=0
+select ticks clean=1218 dirty=6  keys mirrored=6 walked=1098
+```
+
+Four things this settles that nothing before it could:
+
+1. **F4 executes.** 1 095 ready keys appended without entering the interpreter,
+   against 1 151 through `invoke_virtual` with the switch off. Before this probe
+   the path had never run outside its unit tests.
+2. **F2's premise is confirmed on a real workload, not inferred.** netty used
+   direct buffers for **every** transfer and **every one was an arena handle**:
+   `direct-raw=0` out of 4 296. The zero-copy direct path this work declined to
+   build is unreachable, exactly as predicted — and now on n=4 296 rather than
+   the n=1 the suite vector gave.
+3. **F1 and F6 engage on the real path** — no allocation after 5 growths,
+   9 744 slot-cache hits against one fill.
+4. **F3 works as designed**: 1 218 of 1 224 select ticks took the
+   process-global lock ZERO times, and 6 key rows were written where the old
+   code would have written 1 098.
+
+`SelectorScalingProbe` at 8 idle connections gives the mechanism even more
+sharply — `clean=620 dirty=2 mirrored=10 walked=5598` on, against
+`clean=0 dirty=622 mirrored=5598 walked=5598` off. **560x fewer rows written
+under the global lock.** These are counters, not timings, so they are immune to
+the host noise that defeated the wall-clock arms.
+
 ### What this does NOT establish
 
 This prices the work that was removed. It does NOT say what fraction of a real
@@ -242,9 +282,30 @@ is what makes that a finding rather than a disappointment: without it, this
 page would be quoting a CratonVM delta of the same magnitude and calling it a
 result.
 
-A quieter host, or a workload whose reads are served from an already-full
-receive buffer rather than a ping-pong round trip, would resolve it. The Azure
-hosts are the obvious candidates.
+**The Azure host was tried, 2026-09-05, and it does not resolve it either.**
+Linux loopback is much better — 17-20 us per pair against Windows' 65 — and at
+load ~10 the HotSpot control tightened to deltas straddling zero at +-1.5 us,
+which would just about resolve a 1.9 us effect. But the host is shared with
+~20 other lanes, its load rose from 10 to 29 across the session, and five
+ABBA passes then gave:
+
+```
+pass=1 ON=-2828.8  OFF=-412.9      pass=4 ON=-1105.9 OFF=+1263.1
+pass=2 ON=-1988.1  OFF=+1523.6     pass=5 ON=+341.4  OFF=-109.8
+pass=3 ON=+2524.8  OFF=+2484.5
+```
+
+ON ranges -2 829..+2 525 and OFF -6 437..+4 072; the ranges overlap completely
+and an earlier pass had ON's delta LARGER than OFF's, which is physically
+impossible if the fix works. That is noise, and the census (`scratch
+hit=731 998 grow=2 miss=0` against `hit=0 miss=732 000`) confirms both arms
+engaged exactly as intended over 732 000 transfers — so what failed is the
+instrument's resolution, not the change.
+
+**Both available hosts are therefore saturated, and the end-to-end number
+remains unmeasured.** What it needs is an unshared machine; nothing about the
+probe design is now in question, since the same design produced a usable
+control on Azure at load 10.
 
 ## The A/B recipe, for when a real workload is available
 
