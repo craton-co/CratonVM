@@ -22,7 +22,7 @@ cache had cached a permanent refusal for every one of them, and each call
 re-ran `invoke_or_native`'s whole cascade plus a compile probe that could never
 succeed. `VarHandle.get` on an `int` field cost **1 979 ns**; it now costs
 **155 ns**. Full record (internal):
-`fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
+`varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
 
 Re-measured on this page's own four classes, same host, same day, `-Xmx 1500m`,
 no per-method cap (so the class completes instead of being clipped). The host

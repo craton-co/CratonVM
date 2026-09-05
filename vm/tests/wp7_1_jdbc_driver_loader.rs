@@ -3,7 +3,7 @@
 
 //! WP7.1 — `DriverManager` + ServiceLoader-based JDBC driver discovery.
 //!
-//! Pins the WP7.1 acceptance criterion from `gaps/wildfly-ejbca-roadmap.md`
+//! Pins the WP7.1 acceptance criterion from `wildfly-ejbca-roadmap.md`
 //! §10: given a `META-INF/services/java.sql.Driver` on the classpath,
 //! the JVM surface must enumerate the listed driver class names.
 //!

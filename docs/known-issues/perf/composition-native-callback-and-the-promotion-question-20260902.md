@@ -2,7 +2,7 @@
 
 ## Status
 **OPEN, opened 2026-09-02.** The two things left by
-`performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+`completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
 (internal), which discharged all three of its own residuals and measured
 **1.20x** on composition. Neither item below is composition-specific, which is
 why they are a page rather than a section there.
@@ -73,7 +73,7 @@ graph and catches all of `java.util.concurrent` as collateral;
 `CRATONVM_DBG_TIERUP_DECLINE=1` reports 46 364 declines on the composition probe
 and every meaningful row is that reason.
 
-`retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
+`aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
 narrowing it and said **do not**: admitting a `ReentrantLock` loop cost ~30 %,
 reproducibly, on `probes/JavaUtilTierUpExclusionProbe.java`.
 
@@ -147,10 +147,10 @@ six reps minimum, and quote the ranges.
 
 ## Related
 
-- `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+- `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
   (internal) — the predecessor, and the source of every row above.
-- `performance/juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`
+- `juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`
   (internal).
-- `retired/aqs-thread-handoff-latency-RETIRED-20260805.md` (internal) — item 3,
+- `aqs-thread-handoff-latency-RETIRED-20260805.md` (internal) — item 3,
   the measurement item 2 re-opens.
 - [`interpreted-invoke-cost-350ns-20260825.md`](interpreted-invoke-cost-350ns-20260825.md)

@@ -680,7 +680,7 @@ struct Lowerer<'a> {
     /// The READ table, not `JIT_REGION_BOUNDS`: this tier emits no inline
     /// reference STORE, so it asks only "is this address mapped, so a raw load
     /// cannot fault". The store question -- which G1/ZGC answer by leaving
-    /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
+    /// `JIT_REGION_BOUNDS` empty (`g1-audit.md` 8.1) -- has no site
     /// here to ask it.
     ///
     /// **Since 2026-09-02 there is such a site** — `emit_gated_ir_ref_putfield`
@@ -3697,7 +3697,7 @@ impl<'a> Lowerer<'a> {
     /// `plan_object_alloc`, so a class with a perfectly good registered compact
     /// layout is still allocated legacy. An arm that inlines only compact
     /// receivers therefore inlines almost nothing. See
-    /// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+    /// every-jit-getfield-takes-the-helper-FIXED-20260820.md.
     ///
     /// The legacy read is the uniform 16-byte `Value` cell at
     /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
@@ -3769,7 +3769,7 @@ impl<'a> Lowerer<'a> {
         //
         // Note what this does NOT do: it does not publish `JIT_REGION_BOUNDS`
         // on a non-publishing collector. That table's emptiness is load-bearing
-        // — per `audits/g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
+        // — per `g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
         // every inline reference-STORE fast path unreachable under G1/ZGC, so a
         // JNI-pinned CSet-excluded region cannot lose its remembered-set edge.
         // Filling it to speed up loads would silently re-enable those stores.
@@ -7181,7 +7181,7 @@ impl<'a> Lowerer<'a> {
                 // no-op here — but this arm was the ONLY one resolving from a
                 // raw bci, and a raw bci inside a spliced body is the exact
                 // shape that produced
-                // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+                // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
                 // A fence and an asymmetry is one fence away from the bug;
                 // agreeing with the other emitters costs nothing.
                 let bci = self.resume_bci(bci);
@@ -9568,9 +9568,7 @@ impl<'a> Lowerer<'a> {
     /// # One stub per DISTINCT throw-site bci, not one shared stub
     ///
     /// This is the IR half of RBC.6, and it was the gap cov-07's closeout doc
-    /// flagged and did not own (`fixed-suite-bugs/hibernate/
-    /// offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-
-    /// 20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
+    /// flagged and did not own (`offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
     /// as *this* method's throw site and range-tested against `[start_pc,
     /// end_pc)` of every entry in this method's own exception table. Until this
     /// stub stamped it, that field still held whatever the CALLEE's compiled
@@ -13678,7 +13676,7 @@ pub fn last_lower_bail() -> Option<&'static str> {
 /// interpreted forever. A single Spring Boot suite class produced **8072** such
 /// warnings in one run, every one of them from this estimate (the report that
 /// first noticed the flood,
-/// `fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// `basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
 /// attributed them to the single-pass backend's estimate — that one accounted
 /// for 10).
 ///
@@ -13985,7 +13983,7 @@ pub(crate) fn lower_inner_with_scopes(
     // reference, the cell then holds a primitive under a reference's name, and
     // the fault appears much later in whatever dereferences it — a compiled
     // `arraylength` on `Int(1)`, faulting at `addr=0x5`
-    // (`fixed-suite-bugs/tomcat/punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
+    // (`punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
     // Nothing in the report points back here, because a wrong-slot write leaves
     // no trace of having chosen the wrong slot.
     //
@@ -14093,7 +14091,7 @@ pub(crate) fn lower_inner_with_scopes(
         // found no matching deopt point, defaulted the reason to
         // `UnreachedCode`, and refused the replay against a bci nothing
         // could resume at. See
-        // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+        // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
         spliced_ranges,
         sr_map,
         direct_calls,
@@ -14122,7 +14120,7 @@ pub(crate) fn lower_inner_with_scopes(
     // 300_000. Downstream it silently emptied Spring Boot's property binding,
     // because `BindHandler.onSuccess(name, target, context, result)` is
     // `aload 4; areturn` over five slots — see
-    // `fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // `webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
     // for the trail from there to `BindResult.isBound() == false` for every
     // property.
     //

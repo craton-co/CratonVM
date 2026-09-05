@@ -32,7 +32,7 @@ fn native_sl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // stale-ObjectRef pattern as `native_module_load_service`/
     // `native_module_load_service_from_caller_module_loader` in
     // jboss_module_loader.rs (see
-    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md) --
+    // wildfly-parallel-boot-stale-objectref-residual.md) --
     // this is the equally-hot `ServiceLoader.load(Class)` static-factory path.
     let service_pin = ctx.pin_native_root(service);
     // Fetch the thread context class loader via Thread.currentThread().getContextClassLoader().

@@ -2,7 +2,7 @@
 
 Two standalone Java programs used to develop and verify CratonVM's AF_UNIX
 channel support (see
-`fixed-suite-bugs/tomcat/27-xxxendpoint-unix-domain-socket-init-failure-FIXED.md`).
+`27-xxxendpoint-unix-domain-socket-init-failure-FIXED.md`).
 Both print `OK`/`FAIL` per step and are meant to be diffed against HotSpot.
 
 * **`UdsProbe.java`** — the prerequisites and the basic round trip:

@@ -5,7 +5,7 @@
 //!
 //! # The problem this solves
 //!
-//! `audits/flag-census.md` counted **692** distinct `CRATONVM_*`
+//! `flag-census.md` counted **692** distinct `CRATONVM_*`
 //! identifiers: 559 with a Rust read site, 133 referenced only by prose. They
 //! accumulated at roughly one per fixed bug with no retirement path, they
 //! duplicate each other (`CRATONVM_REAL_AQS` / `CRATONVM_SYNTHETIC_AQS` are one
@@ -1867,7 +1867,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "precise-only-roots", on_key: Some("CRATONVM_GC_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None, since: "2026-08-22" },
     // --- composition residuals, 2026-09-02 ----------------------------------
     // Three default-off diagnostics and four A/B switches from
-    // `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`.
+    // `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`.
     // Every one of them exists so a claim on that page can be re-priced in ONE
     // binary; two of them were built specifically to refute a hypothesis, and
     // one of those did.
@@ -3246,7 +3246,7 @@ mod tests {
     fn the_documented_no_ops_now_work() {
         // Each of these was documented for months and read by nothing: the
         // default was flipped and only the opt-out half was renamed.
-        // audits/flag-census.md section 3 has the full list.
+        // flag-census.md section 3 has the full list.
         let cases: &[(&str, &str, &str)] = &[
             (
                 "CRATONVM_JIT",

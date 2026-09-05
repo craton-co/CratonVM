@@ -50,7 +50,7 @@
 //! collection.
 //!
 //! Adding such a registration now fails CI. Removing one only requires deleting
-//! its allowlist row. See `feature-designs/native-builtins-shim-audit.md`
+//! its allowlist row. See `native-builtins-shim-audit.md`
 //! for the full risk-ordered census, including the base classes deliberately
 //! left out of the automated gate and why.
 //!
@@ -255,7 +255,7 @@ fn assert_no_unlisted_identity_shims(registry: &NativeMethodRegistry, which: &st
          real bytecode (or `java/lang/Object`'s stable identity natives) runs. Only add an \n\
          ALLOWLIST row in `native-builtins/tests/shim_inheritance_guard.rs` once you have \n\
          written down why the shim is right for every subclass. See \n\
-         feature-designs/native-builtins-shim-audit.md.",
+         native-builtins-shim-audit.md.",
         offenders.len(),
         offenders.join("\n"),
     );

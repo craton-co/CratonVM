@@ -20,7 +20,7 @@
 // suite diffs this output against HotSpot's in the same environment.
 //
 //   docs/known-issues/jdk-only/
-//     bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-server-20260822.md
+//     bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-server-20260822-FIXED-20260901.md
 import java.lang.management.BufferPoolMXBean;
 import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;

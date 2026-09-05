@@ -181,7 +181,7 @@ first-rep.
    escape-analysis fixed point (replacing the wrapper is what frees its storage
    array), and a deopt descriptor that can spell an array and a nested object.
    Requires `CRATONVM_SCALAR_DEOPT=1` alongside this flag; see
-   `fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`,
+   `per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`,
    which is also where the "why is it still opt-in" argument lives.
 
 2. **A call left inside a spliced body is re-executed on a deopt.** The store

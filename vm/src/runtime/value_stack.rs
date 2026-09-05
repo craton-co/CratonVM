@@ -167,7 +167,7 @@ fn log_tag_mismatch(_expected: &str, _cv: CompactValue, _stack_len: usize) {}
 // bit-identical to a tagged `Int`, and `pop_long`'s context-free decode would
 // sign-extend it, dropping the high bits and corrupting the value (the
 // `bc-ec-mod` / `Mod.modOddInverse` infinite-loop family; see
-// `gaps/bc-ec-mod-mododdinverse-investigation.md`).
+// `bc-ec-mod-mododdinverse-investigation.md`).
 //
 // `kinds[i]` records when slot `i` was pushed by a *genuine* long/double
 // producer, letting the typed pops read the bits verbatim. The design is
@@ -1312,7 +1312,7 @@ impl ValueStack {
         // ambiguity is unsalvageable from a single 8-byte slot (a real `Int(0)`
         // and the long `0xFFFC_0000_0000_0000` are bit-identical) and needs a
         // parallel stack type tag to close fully — see
-        // gaps/bc-ec-mod-mododdinverse-investigation.md.
+        // bc-ec-mod-mododdinverse-investigation.md.
         self.len -= 1;
         let cv = self.slots[self.len];
         // Fast, bit-exact path: the slot was pushed by a genuine long producer
@@ -2086,7 +2086,7 @@ mod tests {
     /// every such long — including the BC safegcd `Mod.updateDE30`/`updateFG30`
     /// accumulators (signed int*int products landing in the 0xFFFC_…/0xFFFE_…
     /// band with nonzero magnitude). See
-    /// gaps/bc-ec-mod-mododdinverse-investigation.md.
+    /// bc-ec-mod-mododdinverse-investigation.md.
     #[test]
     fn pop_long_preserves_resolvable_nan_tag_collisions() {
         // 0xFFFC_….: full NaN-box marker set; the 3-bit sub-tag (bits 49-47)
@@ -2121,7 +2121,7 @@ mod tests {
     /// bit-identical to a real `CompactValue::int`, so `pop_long` keeps the
     /// JVMS i2l-widen contract there (it cannot tell the two apart from a
     /// single 8-byte slot). Closing this fully needs a parallel stack type
-    /// tag — see gaps/bc-ec-mod-mododdinverse-investigation.md. Pin the
+    /// tag — see bc-ec-mod-mododdinverse-investigation.md. Pin the
     /// behaviour so a future encoding change is a conscious decision.
     #[test]
     fn pop_long_widens_unresolvable_int_collision() {

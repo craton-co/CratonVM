@@ -27,7 +27,7 @@
 //! two real fields: a reference written where the real class's reference map
 //! says a primitive lives is NOT relocated by a moving collector (the
 //! `BufferedReader.in` reads-null-right-after-construction symptom — see
-//! `fixed-suite-bugs/tomcat/form-authenticator-cookie-session-bare-assertion-FIXED.md`),
+//! `form-authenticator-cookie-session-bare-assertion-FIXED.md`),
 //! and conversely an `int` written where the map says a reference lives risks
 //! the collector treating that bit pattern as a pointer. Fixed the same way
 //! `stream_encoder.rs` fixed the analogous `StreamEncoder` corruption:
@@ -612,7 +612,7 @@ fn decode_into(
     // windows. Pin each and re-read the current address through the pin
     // before every post-window use (the WildFly domain-boot server-output
     // reader threads tripped the CRATONVM_DBG_STALE_OBJREF canary exactly
-    // here — see wildfly-domain-hc0053-server-inventory-timeout.md).
+    // here — see wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md).
     let this_pin = ctx.pin_native_root(this);
     let out_pin = ctx.pin_native_root(out);
 
@@ -676,7 +676,7 @@ fn decode_into(
             // `FileSystemResource.read()` (which wraps a `FileChannel` this
             // way) silently saw an empty migration script and reported
             // "successfully applied" a migration that created zero tables.
-            // See fixed-suite-bugs/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
+            // See quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
             let bb = crate::alloc_byte_buffer(ctx, want);
             let bb_pin = ctx.pin_native_root(bb);
             let cur_this = ctx.read_native_pin(this_pin, this);

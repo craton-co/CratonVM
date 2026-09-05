@@ -276,7 +276,7 @@ across the gauntlet; the **gpu-bench-cpu G1 SIGSEGV** (Step 8 finding, `task_b53
 here as the current blocker.
 
 **Status of that blocker, 2026-08-13 — NOT reproduced, and NOT confirmed fixed.** Two things are
-now true and neither is "it is gone". First, the internal record tree's `gaps/README.md` records `gpu-bench-cpu`
+now true and neither is "it is gone". First, the internal record tree's `README.md` records `gpu-bench-cpu`
 as PASS/PASS in three separate suite runs, which is inconsistent with the line above being current.
 Second, an attempt to reproduce it directly failed for a different reason: `GpuDotBench` under
 `-XX:+UseG1GC -Xmx512m` panics in `jit_thread_mut: aliasing &mut JvmThread borrow detected`

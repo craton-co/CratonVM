@@ -1275,7 +1275,7 @@ enum Job {
     // by nothing, and it was the only consumer of the equally unrooted
     // `PendingArrayWrite` side table (removed with it). Anyone restoring a
     // registry-backed read must root its references the way `Job::ReadFd`
-    // does; see `feature-designs/native-collections-root-audit.md`.
+    // does; see `native-collections-root-audit.md`.
     Write {
         id: i32,
         data: Vec<u8>,

@@ -99,7 +99,7 @@ fn test_vm() -> Vm {
 /// **This list is EMPTY, and that is its finished state, not an unset one.**
 /// All 924 fixtures produce the JDK-correct answer. The eleven entries it
 /// carried from 2026-08-02 were closed on 2026-08-11; see
-/// fixed-bugs/synthetic-jdk-class-library-gaps-FIXED-20260811.md for what each
+/// synthetic-jdk-class-library-gaps-FIXED-20260811.md for what each
 /// one turned out to be. Every one of the eleven was *reachable* code that had
 /// been switched off, mis-shaped or unlinked — a feature gate the synthetic
 /// library could not satisfy, a reified `Type` no `instanceof` could
@@ -1925,7 +1925,7 @@ fn test_method_handle_type() {
 
 // WP1.6 acceptance: MethodHandle.invokeExact strict-arity round-trip.
 // `findVirtual` + `bindTo` + `invokeExact` is the literal acceptance text
-// in `gaps/wildfly-ejbca-roadmap.md` Wave 1 §WP1.6. The pre-existing
+// in `wildfly-ejbca-roadmap.md` Wave 1 §WP1.6. The pre-existing
 // `test_method_handle_bind_to` exercises the loose `invoke` path; this
 // closes the gap by driving the signature-polymorphic strict-arity path.
 #[test]

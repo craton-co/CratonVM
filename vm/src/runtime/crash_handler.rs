@@ -107,7 +107,7 @@ pub fn savebase_watch_caught() -> bool {
 //   * **JDK mode.** CratonVM ships two complete, materially different Java
 //     class libraries (~5,200 Rust stubs vs ~300 natives over real JDK
 //     bytecode). They have different semantics and different bugs. Until
-//     `arch-2026-07-26/jdk-mode-determinism.md` the mode was
+//     `jdk-mode-determinism.md` the mode was
 //     host-detected and printed nowhere; the launcher now prints it, but the
 //     hardware-fault path below does NOT go through the launcher's panic hook,
 //     so without this snapshot a SIGSEGV/access-violation report still carries
@@ -117,7 +117,7 @@ pub fn savebase_watch_caught() -> bool {
 //     prove a complete rewritable root map. A heap-corruption report that does
 //     not say whether the last cycles compacted is nearly undiagnosable, and
 //     the degrade was invisible for a long time (see
-//     `arch-2026-07-26/moving-young-precise-roots.md`).
+//     `moving-young-precise-roots.md`).
 //   * **JIT state.** Whether the faulting thread was inside compiled code,
 //     and whether an unregistered JIT frame was on the stack, separates a
 //     codegen bug from an interpreter/GC bug on the first read.
@@ -258,7 +258,7 @@ pub fn gc_state_lines() -> Vec<String> {
 /// cannot make.
 ///
 /// That is not hypothetical: it is how
-/// fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md got
+/// g1-sigsegv-unguarded-callee-jit-frame-FIXED.md got
 /// its title. Four G1 crash dumps carried `young-gen policy: moving (Cheney
 /// young copy)` beside `last incomplete-coverage reason:
 /// innermost-rbp-belongs-to-unguarded-callee`, and the page concluded G1's
@@ -375,7 +375,7 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
 /// thread crashing in the middle of a hot bytecode loop it is the last known
 /// good position. The report says so rather than implying it is live.
 ///
-/// CR-VXC-1 (`arch-2026-07-26/vm-exec-closeout.md` §5.1): the
+/// CR-VXC-1 (`vm-exec-closeout.md` §5.1): the
 /// body below reads one process-wide `OnceLock` published from `Vm::new`, so a
 /// fault on a spawned worker or on a virtual-thread carrier used to render the
 /// *primordial* thread's frames — never the faulting thread's. The two crash
@@ -4220,7 +4220,7 @@ mod tests {
     /// incremented only by `gen_heap.rs`, so under any other collector they are
     /// zero by construction. Printing them there reads as a measurement of that
     /// collector and is how the Tomcat G1 SIGSEGV page
-    /// (fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md)
+    /// (g1-sigsegv-unguarded-callee-jit-frame-FIXED.md)
     /// came to blame a moving young collector that was never running.
     #[test]
     fn gc_state_lines_omit_generational_only_counters_under_another_collector() {

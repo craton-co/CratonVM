@@ -4,7 +4,7 @@
 //! GPU-offload JIT admission gate.
 //!
 //! Follow-up item 2 in
-//! `fixed-suite-bugs/gpu-offload-followups-20260711.md` ("JIT-compiled
+//! `gpu-offload-followups-20260711.md` ("JIT-compiled
 //! callers bypass the offload hook"): the transparent GPU-offload hook
 //! ([`crate::runtime::offload::try_dispatch`]) only fires from the
 //! *interpreter's* `execute_invokestatic` slow path. If the **caller**

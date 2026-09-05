@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! PGO-02 (docs/feature-designs/profile-guided-inlining.md, retired from
-//! feature-designs/c2/pgo-02-guarded-inlining.md): guarded monomorphic
+//! pgo-02-guarded-inlining.md): guarded monomorphic
 //! virtual/interface inlining, end to end through a real single-pass JIT
 //! compile with `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` on.
 //!

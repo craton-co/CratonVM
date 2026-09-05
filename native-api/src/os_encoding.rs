@@ -11,7 +11,7 @@
 //! pinned to UTF-8 for stdout/stderr/file/native"*. That is true of
 //! **`file.encoding` only** (JEP 400). The others still follow the platform,
 //! and the gap was the open residual of
-//! `bug-printstream-charset-answers-the-abstract-base-20260825.md` §5 —
+//! `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md` §5 —
 //! *"CratonVM answers UTF-8 where HotSpot answers the console encoding
 //! (`Cp1251` on this host, from `stdout.encoding`)"* — which
 //! `stdout-encoding-differs-from-hotspot-on-windows-20260901.md` then measured

@@ -135,7 +135,7 @@ fn init_classloader_common_fields(
     // below can trigger a moving GC; `this` (and, briefly, `cs`) are each
     // reused repeatedly across multiple such hazards, unpinned otherwise.
     // Same "Family 1" stale-ObjectRef pattern as the WildFly boot-crash
-    // fixes (see fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md)
+    // fixes (see wildfly-parallel-boot-stale-objectref-residual.md)
     // -- pin both now and re-read the forwarded reference right before use.
     let this_pin = ctx.pin_native_root(this);
     // defaultDomain → ProtectionDomain(CodeSource(null URL, null certs),
@@ -1245,7 +1245,7 @@ pub(crate) fn absorb_class_absent(
 /// here and its body allocates heavily —
 /// `CRATONVM_DBG_STALE_OBJREF` caught a stale deref in a native invoked from
 /// `ClassLoaderServiceImpl.classForName`. See
-/// fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md.
+/// map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md.
 fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1484,7 +1484,7 @@ fn cl_real_load_class_base_rooted(
     // it was silently swallowed and step 1 re-resolved the excluded class
     // globally anyway — `@ConditionalOnClass` checks made through such a
     // loader then saw a class the exclusion was written to hide. See
-    // fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md.
+    // data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md.
     let mut parent_user_defined_authoritative_miss = false;
     if let Some(parent) = parent {
         if crate::classloader::is_user_defined_loader(ctx, parent) {

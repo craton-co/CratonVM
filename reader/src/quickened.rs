@@ -54,7 +54,7 @@
 //! a **bitmap of instruction starts** plus a **per-block cumulative count**,
 //! so a lookup is two loads from one cache line and a `popcount`, with no
 //! search and no data-dependent branching. See [`PcBlock`] for the layout
-//! and `arch-2026-07-26/quickened-dispatch-o1.md` for the
+//! and `quickened-dispatch-o1.md` for the
 //! measurements behind the choice.
 //!
 //! The side index is a pure accelerator: it indexes exactly the same set of

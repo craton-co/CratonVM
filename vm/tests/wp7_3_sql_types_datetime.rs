@@ -3,7 +3,7 @@
 
 //! WP7.3 — `java.sql.Types` + `Date`/`Time`/`Timestamp` interop conformance.
 //!
-//! The roadmap (`gaps/wildfly-ejbca-roadmap.md` §10 WP7.3) demands legacy
+//! The roadmap (`wildfly-ejbca-roadmap.md` §10 WP7.3) demands legacy
 //! SQL date types and modern `java.time.*` driver paths interoperate
 //! correctly. The acceptance is "insert + select round-trips a
 //! `LocalDateTime` via H2 standard `TIMESTAMP` column" — H2 itself is a
@@ -29,7 +29,7 @@
 //! factory methods (`LocalDate.of`, `Instant.ofEpochMilli`, etc.) and in
 //! reflection (`Class.forName(String)`, `Class.getField`) — see the
 //! `Time` (0/16 floor → currently 0) and `Reflect` floors in
-//! `gaps/jdk-regression-baseline.md` plus the JCK harness output for
+//! `jdk-regression-baseline.md` plus the JCK harness output for
 //! `TckLocalDate` / `TckInstant`. To keep this file's signal honest:
 //!
 //!   * **Tier-1 tests run and must pass today.** They cover the

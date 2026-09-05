@@ -662,7 +662,7 @@ pub fn type_sig_to_java(
             // `Arrays.hashCode` get called 574,867+ times in 5 minutes with
             // no sign of terminating, hanging Spring Boot's Thymeleaf
             // `createLayoutFromConfigClass` test — see
-            // fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
+            // thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
             if let Value::Object(Some(decl)) = current_generic_decl() {
                 if let Some(cached) = cached_building_type_parameter(ctx, decl, name) {
                     return Ok(cached);
@@ -870,7 +870,7 @@ pub fn type_param_to_java(
     let _build_scope = TypeParamBuildScope::new(generic_decl);
     // GC-safety (2026-07-16): this is the "enum/type-var builder" residual
     // gap flagged (but never swept) in
-    // fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+    // jit-junit-discovery-reflection-corruption.md
     // — `tv` is freshly-allocated and not yet reachable from any Java-visible
     // root; `create_string` and the `bounds_arr` construction below (which
     // itself calls the allocating `typesig_to_real_type` per bound) can each

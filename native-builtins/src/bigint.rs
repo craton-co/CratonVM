@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! Step 1 of the limb-based `java.math.BigInteger` rewrite — see
-//! `gaps/biginteger-limb-rewrite-scope.md`.
+//! `biginteger-limb-rewrite-scope.md`.
 //!
 //! A self-contained signed arbitrary-precision integer over base-2^32
 //! little-endian magnitude words — the same words HotSpot/CratonVM already

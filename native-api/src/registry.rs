@@ -1144,7 +1144,7 @@ pub trait NativeClassAccess {
     /// very first time a class is needed under a given loader (the gap that
     /// made two prior lookup-based fix attempts for the H2 `Parser`
     /// loader-collapse bug regress on a fresh session -- see
-    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md's
+    /// bug-h2-suite-residual-fail-triage-FIXED.md's
     /// eighth-pass section).
     ///
     /// Native overrides that construct or invoke-special a DIFFERENT class
@@ -2458,8 +2458,7 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     /// class, but the name-based re-resolution picked the APPLICATION-loader
     /// copy whenever an isolating loader (Spring Boot's
     /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
-    /// own copy of that class. See fixed-suite-bugs/springboot/
-    /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+    /// own copy of that class. See servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
     ///
     /// Default implementation falls back to the name-based
     /// [`Self::invoke_special`] for contexts with no ClassId fast path.
@@ -2609,7 +2608,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// `Generational` GC backend only) to turn a stale read into an immediate,
     /// deterministic panic instead of silent corruption — see
     /// `gc/src/stale_objref_debug.rs` and
-    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+    /// wildfly-parallel-boot-stale-objectref-residual.md.
     ///
     /// # A funnel that allocates takes its receiver by `&mut ObjectRef`
     ///
@@ -3929,7 +3928,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// contended wait needs to be excused from an in-flight STW barrier
     /// pause instead of leaving the calling thread counted in its `expected`
     /// set for the whole wait (see
-    /// `fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`).
+    /// `wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`).
     ///
     /// Deliberately NARROW: `monitor_enter` itself stays on its original,
     /// non-GC-blocked path for the other ~80 native call sites that use
@@ -3941,7 +3940,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// path to span a completing (possibly moving) GC pause would expose
     /// all of them to the stale-`ObjectRef`-across-GC bug class this
     /// codebase has repeatedly hit (see
-    /// `fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// `wildfly-parallel-boot-stale-objectref-residual.md`)
     /// — an unaudited-at-scale regression risk far worse than the original
     /// hang. This method exists so the ONE call site with live-gdb-confirmed
     /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
@@ -4737,8 +4736,7 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
     /// java.lang.Object cannot be cast to
     /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
-    /// `obj_cid=0` — see `fixed-suite-bugs/wildfly/
-    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`,
+    /// `obj_cid=0` — see `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`,
     /// which documents the same family from WildFly's `parallel-extension-add`
     /// boot step) — one more independent occurrence of that already-tracked
     /// "register-invisible root" / cross-thread GC-root-visibility family,
@@ -5504,7 +5502,7 @@ pub struct StackTraceEntry {
     /// which takes no `ClassStore` by design).
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-1 of
-    /// `arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
+    /// `stackwalk-and-vtable.md`). This exists so
     /// that *deferred* line-number resolution can be **exact**. `class_name` +
     /// `method_name` + `byte_code_index` are not enough: a class may declare an
     /// overload set under one name, the members have different
@@ -5908,7 +5906,7 @@ pub struct NativeCensusEntry {
     ///
     /// This is the fourth distinct way this census has been misread; the other
     /// three are in
-    /// `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
+    /// `jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
     pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in
@@ -7543,7 +7541,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md
+        // bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is
@@ -8103,8 +8101,8 @@ impl NativeMethodRegistry {
         // `execute()`/`submit()`/`shutdown()` overrides too, sending them
         // straight to real JDK bytecode that dereferences an uninitialized
         // `ctl`/`mainLock` field and NPEs
-        // (`fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
-        // `fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
+        // (`threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
         // A prior narrower fix (merged separately, same day) exempted only
         // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
         // distinction into the interpreter's dispatch layer instead

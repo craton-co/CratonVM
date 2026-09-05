@@ -98,7 +98,7 @@
 //!
 //! **Then the blocker went away.** `ClassManager::ensure_synthetic_class` was
 //! deleted the same day
-//! (`fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`), and
+//! (`jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`), and
 //! with the infallible funnel gone strict mode creates none of the four: a
 //! `--jdk-only` run of `RChmKeySetView` dies on
 //! `NoClassDefFoundError: java/util/HashMap$KeyItr`, which is §5 enforcing
@@ -397,7 +397,7 @@ pub const VM_SERVICE_RECEIVERS: &[&str] = &[
 /// real JDK bytecode services the call, then delete the line and re-run both
 /// the strict corpus and the class-origin census.
 /// **Empty since 2026-08-10**, when `ClassManager::ensure_synthetic_class` was
-/// deleted (`fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`).
+/// deleted (`jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`).
 /// It had held `java/util/HashMap$KeyItr` and the three
 /// `Atomic*FieldUpdater$RustJvmImpl` classes. With the infallible funnel gone,
 /// strict mode creates none of them — a `--jdk-only` run of `RChmKeySetView`

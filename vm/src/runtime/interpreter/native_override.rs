@@ -148,8 +148,7 @@ pub(crate) fn is_class_mirror_native_override(
 /// bytecode invokes already prefer the registered native, but this call
 /// pattern (through the lambda-backed `ComputeValue` plumbing) can resolve
 /// through a dispatch path whose concrete-bytecode precedence needs this
-/// explicit shared gate — see fixed-suite-bugs/springboot/
-/// core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md Cluster C
+/// explicit shared gate — see core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md Cluster C
 /// "Residual 5" (fixed under `--nojit` without this gate; JIT mode still hit
 /// the original always-null-returning symptom until this was added).
 pub(crate) fn is_classvalue_native_override(
@@ -1966,7 +1965,7 @@ pub(crate) fn is_file_channel_impl_open_native_override(
 /// `native-builtins/src/phases_late/nio_file.rs` are unreachable and every
 /// `Files.createSymbolicLink` in the VM dies with a bare
 /// `UnsupportedOperationException` — see
-/// `fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`.
+/// `files-createsymboliclink-unsupported-FIXED.md`.
 ///
 /// The real `sun.nio.fs.*` provider names are listed alongside the base for the
 /// same reason `newFileChannel` lists them: a cached dispatch site can carry a
@@ -3582,7 +3581,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // `newCachedThreadPool()` allocated their return value under the REAL class
     // name and did not run it through the real `<init>` -- so real `execute()`
     // bytecode read a null `ctl` and NPE'd
-    // (fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md).
+    // (threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md).
     //
     // Why it is gone, in the order the removal required:
     //
@@ -3863,7 +3862,7 @@ pub(super) fn force_native_over_real_jdk_bytecode(
     // and even standard level names through `KnownLevel.findByName`, which
     // on JDK 25 throws internally (a `Module`-null NPE the method's own
     // catch-all reports as a generic `IllegalArgumentException: Bad level`)
-    // — see `gaps/kc16-blocker-map.md`'s KC16 investigation.
+    // — see `kc16-blocker-map.md`'s KC16 investigation.
     // This broke WildFly's own `host.xml`/`domain.xml` parsing of
     // `<level name="WARN"/>` (org.jboss.logmanager's extended levels) before
     // it ever reached a genuinely-unknown name. Force the registered native
@@ -5596,7 +5595,7 @@ pub(crate) fn redefine_immune_forced_native(
         // registered native. Keep in sync with vm_exec.rs's
         // invoke_on_class_shared_inner check_override entry for the same
         // triples; see
-        // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
+        // filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
         || (class_name == "java/util/logging/FileHandler"
             && matches!(
                 method_name,
@@ -6602,7 +6601,7 @@ pub(super) fn intercept_force_registered_native_cached(
     // (Receiver-shape probe deleted 2026-08-06 — see
     // `force_native_over_real_jdk_bytecode`. The ninth, receiver-blind arm this
     // one existed to undo went with it, so there is nothing left to undo.)
-    // Site A1 of `arch-2026-07-26/native-dispatch-memoization.md`
+    // Site A1 of `native-dispatch-memoization.md`
     // §3 Step 2. Perf (2026-07-19, TestResponsePerformance residual): memoize
     // the resolved callback per invoke-cache entry, same shape as
     // `force_native_cache` above -- `NativeMethodRegistry::find` was the #2
@@ -7504,7 +7503,7 @@ fn real_protected_stub_class_common(class_name: &str) -> bool {
             // slot 3 — real `elts`, null — and no-ops, so `size` never moves
             // and `toString()` renders just prefix+suffix. A silently empty
             // join, not a crash. See
-            // `fixed-suite-bugs/stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
+            // `stringjoiner-synthetic-native-real-jdk-field-mismatch-FIXED.md`.
             | "java/util/StringJoiner"
     )
 }

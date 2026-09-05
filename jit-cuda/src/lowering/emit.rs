@@ -246,7 +246,7 @@ const DEFAULT_IF_CONVERSION_BUDGET: u32 = 8;
 /// branch a warp does not diverge on is nearly free; `selp` makes every lane
 /// compute both arms. Sweeping the budget found no value that wins: 8 is a
 /// tie with off and every other setting is worse. See
-/// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass.
+/// `raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass.
 ///
 /// It is kept, and kept reachable, because that is one kernel. A shape with
 /// cheap arms and heavy divergence is exactly what it is for, and the flags

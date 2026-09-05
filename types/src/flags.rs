@@ -59,7 +59,7 @@
 //!
 //! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
 //! mean": the [`parse`] module carries five *different* boolean parsers because
-//! five different ones are in use today. `audits/flag-census.md` §10 has
+//! five different ones are in use today. `flag-census.md` §10 has
 //! the full matrix. Unifying them is a behaviour change and is deliberately not
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
@@ -406,7 +406,7 @@ pub mod parse {
     /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
     /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
     /// [`affirmative_word`]. Truth table 8 (see the module docs and
-    /// `audits/flag-census.md` §10). Lifted from
+    /// `flag-census.md` §10). Lifted from
     /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
     #[inline]
     pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {
@@ -600,7 +600,7 @@ pub enum BlockedAccessMode {
 /// correlated). Then run a class-unloading lane, not just the throughput and
 /// differential lanes.
 ///
-/// See `arch-2026-07-26/moving-young-precise-roots.md`.
+/// See `moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
 
 /// Whether the JIT publishes a complete, mechanically-enumerable **relocation
@@ -1157,7 +1157,7 @@ pub struct GcFlags {
     /// barrier inline instead of routing every compiled reference store to the
     /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
     ///
-    /// Closing defect G1-2 (`audits/g1-audit.md` §8.1, §10) made every
+    /// Closing defect G1-2 (`g1-audit.md` §8.1, §10) made every
     /// JIT-compiled reference store an out-of-line call, because the inline
     /// fast paths are gated on the `JIT_REGION_BOUNDS` table, which G1
     /// deliberately never publishes. §10 measured the cost as falling on the
@@ -1331,7 +1331,7 @@ pub struct GcFlags {
     /// actually means "the conservative scan found none", which is unknown, not
     /// none. Evacuating against it is what moved a live
     /// `StringLatin1.newString` reference out from under a compiled frame
-    /// (`bug-g1-evacuates-live-jit-reference-20260819.md`).
+    /// (`bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`).
     ///
     /// **It ships OFF because a refusal reclaims nothing**, so it can only buy
     /// time for a publication that later becomes non-empty. Measured before the
@@ -1504,8 +1504,7 @@ pub struct GcFlags {
     /// old/pinned) before and after every `collect_garbage()` call, and a
     /// fuller breakdown (incl. humongous) right before the "out of heap
     /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
-    /// see fixed-suite-bugs/
-    /// g1-native-alloc-no-safepoint-oom-FIXED.md.
+    /// see g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
     /// `CRATONVM_DBG_G1ACCESSOR` — at VM exit, print how many of this
     /// collector's field/array accessor calls had to take the global `regions`

@@ -51,7 +51,7 @@ fn osr_deny_list() -> &'static RwLock<HashSet<MethodKey>> {
 /// (constructed very early during VM init, well before any method can reach
 /// a compile threshold). Backs the `elapsed_ms` field of the
 /// `CRATONVM_DBG_TIER_ENQUEUE` diagnostic below -- see
-/// `fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md` for why
+/// `hib-misc-residuals-20260716-FIXED.md` for why
 /// "how far into the process's life did this compile trigger" was the key
 /// diagnostic needed to confirm the compile-time-tax mechanism.
 fn process_start() -> &'static std::time::Instant {
@@ -353,7 +353,7 @@ pub struct MethodState {
     /// codegen genuinely broke. That is what made "1531 of 1642 hot methods
     /// never compile" impossible to act on without re-deriving every entry by
     /// hand — see
-    /// `fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
+    /// `smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
     ///
     /// Those three bans have all since been deleted (2026-07-29 and
     /// 2026-07-31), so the same workload now reports `ineligible-by-policy=0`.
@@ -1218,7 +1218,7 @@ struct MethodPromotionSnapshot {
 /// characterize whether a slow run is dominated by code that genuinely never
 /// gets hot enough to promote past the interpreter (as opposed to a stuck
 /// lock, a cache-thrashing hot path, or some other fixable inefficiency) —
-/// see `fixed-suite-bugs/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput-FIXED.md`.
+/// see `ES-PERF-20260719-testSlicesDense-interpreter-throughput-FIXED.md`.
 /// No-op if no [`TieredCompilationManager`] was ever constructed this process
 /// (should not happen in the normal VM binary, but keeps this safe to call
 /// unconditionally from an exit hook).

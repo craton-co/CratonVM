@@ -34,7 +34,7 @@
 //! # Per-VM state audit: BENIGN — already correct, do not re-litigate
 //!
 //! The 2026-08-01 `vm/src/jit/` cache-keying sweep
-//! (`audits/vm-jit-cache-keying.md`) checked this module and found
+//! (`vm-jit-cache-keying.md`) checked this module and found
 //! nothing to fix. The table is `ClassId`-keyed, which is per-VM state, but it
 //! is NOT a process global: it is a by-value field of `JitRealm` inside
 //! `Arc<SharedVm>` (`vm/src/vm/realms/jit_realm.rs` `jit_alloc_class_cache`,
