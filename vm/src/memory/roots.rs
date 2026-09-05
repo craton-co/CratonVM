@@ -235,12 +235,43 @@ fn dbg_g1_precise_only_roots() -> bool {
     })
 }
 
+/// High-water mark of the last few root sets, in entries.
+///
+/// # Why `collect_roots` cannot just start at `Vec::new()`
+///
+/// It did, for a root set that on a real application runs to tens or hundreds
+/// of thousands of entries appended across ~41 sections. `Vec`'s growth is
+/// doubling, so that is a dozen-plus reallocations per collection — each one a
+/// fresh allocation plus a `memcpy` of everything gathered so far — and every
+/// one of them lands INSIDE the pause, on the initiating thread, before any
+/// marking has started.
+///
+/// A single relaxed load and one right-sized allocation replace all of them.
+/// The hint is monotone rather than an average on purpose: undershooting costs
+/// a reallocation, which is the thing being removed, while overshooting costs
+/// one `ObjectRef`-sized slot per unused entry of a vector that is dropped at
+/// the end of the collection. It is a hint and nothing reads it for
+/// correctness, so a torn or stale value cannot do worse than the `Vec::new()`
+/// this replaces.
+static ROOT_COUNT_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The capacity to start a root set at, and the ceiling that keeps a single
+/// pathological collection from pinning a large reservation for the life of the
+/// process.
+const ROOT_HINT_CEILING: usize = 1 << 20;
+
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if scan_marks_enabled() {
         SCAN_MARKS.lock().clear();
     }
     let __rp_t0 = crate::memory::native_roots::rootprof::on().then(std::time::Instant::now);
-    let mut roots = Vec::new();
+    // See `ROOT_COUNT_HINT`. The `+ 64` covers a set that grew by a handful of
+    // entries since the last collection without forcing a double.
+    let hint = ROOT_COUNT_HINT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(64)
+        .min(ROOT_HINT_CEILING);
+    let mut roots = Vec::with_capacity(hint);
 
     // Stage B (precise oop maps, B-K fix): reset the movable precise-JIT-root
     // set so it reflects only THIS collection's stack. `scan_active_jit_frames`
@@ -1612,6 +1643,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 );
             }
         }
+    }
+    // Feed the next collection's pre-size. Monotone: see `ROOT_COUNT_HINT`.
+    let seen = roots.len().min(ROOT_HINT_CEILING);
+    if seen > ROOT_COUNT_HINT.load(std::sync::atomic::Ordering::Relaxed) {
+        ROOT_COUNT_HINT.store(seen, std::sync::atomic::Ordering::Relaxed);
     }
     roots
 }

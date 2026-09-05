@@ -993,27 +993,37 @@ pub fn active() -> Option<&'static CompressedOops> {
 /// geometry is unusable — in which case narrow oops stay OFF and the VM runs
 /// with full 64-bit references exactly as before.
 pub fn enable_for_live_heap() -> Result<(u64, u8), String> {
+    // GEOMETRY, NOT PERMISSION -- and reading the wrong one of those is why this
+    // function used to refuse on two of the three collectors.
+    //
+    // It read `gen_heap::JIT_REGION_BOUNDS` directly. That table's load-bearing
+    // second job is "may an inline reference store skip the write barrier", and
+    // G1 and ZGC answer it by leaving the table EMPTY -- G1 must, or defect G1-2
+    // re-opens. So the loop found nothing under either of them and this returned
+    // "no live heap regions published (non-generational backend?)", which reads
+    // as a statement about compressed oops and is really a statement about a
+    // table that means something else entirely. `crate::heap_geometry` is the
+    // table that asks only where the heap is, and all three backends fill it.
+    //
+    // This does NOT by itself make compressed oops correct on G1 or ZGC -- their
+    // relocation and scan paths have not been audited for narrow slots, and that
+    // gate stays where the operator can see it, in `vm_init`. What changes is
+    // that the gate is now a statement about the audit rather than an accident
+    // of which table a helper happened to read.
     let mut lo = u64::MAX;
     let mut hi = 0u64;
-    for i in 0..3 {
-        let base =
-            crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2].load(AtomicOrdering::Acquire) as u64;
-        let end = crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2 + 1].load(AtomicOrdering::Acquire)
-            as u64;
-        if base == 0 || end <= base {
-            continue;
-        }
+    for (i, (base, end)) in crate::heap_geometry::heap_spans().enumerate() {
+        let (base, end) = (base as u64, end as u64);
         if base % 8 != 0 {
             return Err(format!(
-                "heap region {i} base {base:#x} is not 8-byte aligned; shift-3 \
-                 narrow oops would be misaligned"
+                "heap region {i} base {base:#x} is not 8-byte aligned; shift-3                  narrow oops would be misaligned"
             ));
         }
         lo = lo.min(base);
         hi = hi.max(end);
     }
     if lo == u64::MAX {
-        return Err("no live heap regions published (non-generational backend?)".to_string());
+        return Err("no live heap regions published by the selected GC backend".to_string());
     }
     if lo <= NARROW_OOP_HEADROOM {
         return Err(format!(

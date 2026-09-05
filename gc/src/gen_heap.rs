@@ -2918,6 +2918,13 @@ impl GenerationalHeap {
             // two tables only diverge on G1 (read-only publish) and ZGC
             // (neither). See `JIT_READ_BOUNDS`.
             publish_jit_read_bounds(i, base, base.wrapping_add(cap));
+            // ...and the capability-free "where is the heap" table. Same three
+            // spans, but a DIFFERENT question -- see `heap_geometry`. This one
+            // every backend fills, which is what lets a consumer such as
+            // `compressed_oops::enable_for_live_heap` ask it without having to
+            // read a table whose emptiness under another collector is
+            // load-bearing.
+            crate::heap_geometry::publish_heap_span(i, base, base.wrapping_add(cap));
         }
         // Republish the commit bitmaps beside the bounds. The old gen (slot 2)
         // is a wholly-committed `Vec<u8>`, so it never needs a screen; the two

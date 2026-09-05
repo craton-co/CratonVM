@@ -4199,6 +4199,24 @@ impl G1Collector {
             arena_base + arena.committed_len(),
         );
 
+        // The capability-free geometry table -- see `heap_geometry`. This is
+        // the one table in the family G1 fills WITHOUT a caveat, because it
+        // grants nothing: `JIT_REGION_BOUNDS` must stay empty here (defect G1-2,
+        // inline reference stores), `JIT_READ_BOUNDS` is bounded by the commit
+        // (a raw load must not reach an unmapped page) and `MOVABLE_BOUNDS`
+        // likewise. None of that constrains "where did this heap reserve its
+        // address space", which is the only thing this one says.
+        //
+        // The RESERVATION, not the committed prefix, and that is the difference
+        // from the two publishes above. A narrow-oop window has to cover every
+        // address the heap can ever produce; deriving it from a prefix that
+        // grows would invalidate every reference already encoded against it.
+        crate::heap_geometry::publish_heap_span(
+            0,
+            arena_base,
+            arena_base + arena.reserved_len(),
+        );
+
         // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
         //
         // A SEPARATE table from `JIT_REGION_BOUNDS`, whose emptiness under G1

@@ -1837,6 +1837,14 @@ impl ZgcRealHeap {
         // call in this file — so it cannot go stale between the root scan and
         // the pause, which a cursor-tight bound could.
         crate::gen_heap::publish_movable_bounds(0, arena_base, arena_end);
+        // And the capability-free geometry table. UNCONDITIONAL, unlike the two
+        // above: `heap_geometry` carries no permission of any kind, so there is
+        // nothing for this collector to withhold. It is what tells a consumer
+        // that wants a base and a limit -- `compressed_oops::
+        // enable_for_live_heap`, a conservative scanner's range prefilter --
+        // that this heap exists and where, without making it read a table whose
+        // emptiness under this collector means something else entirely.
+        crate::heap_geometry::publish_heap_span(0, arena_base, arena_end);
         // Publish the reference-store barrier plan. Three bytes that let
         // compiled code skip a barrier CALL exactly when this collector's own
         // helper would have returned on its first test:
