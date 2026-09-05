@@ -13314,26 +13314,32 @@ impl G1Collector {
             return 0;
         }
 
-        let declined = |why: &str| -> usize {
+        let declined = |code: usize, why: &str| -> usize {
             if gc_flags().g1_dbg_reach {
                 eprintln!("[g1][HUMONGOUS] eager reclaim declined: {why}");
             }
+            crate::gc_metrics::record_g1_eager_decline_reason(code);
             crate::gc_metrics::record_g1_eager_humongous(0, 0, true);
             0
         };
 
         if census.taken && !census.complete {
             return declined(
+                crate::gc_metrics::eager_decline::CENSUS_INCOMPLETE,
                 "a phase-4 region walk aborted, so the census under-counts live edges",
             );
         }
         if self.gc_state.phase() != ConcurrentGcPhase::Idle || self.satb_queue.is_active() {
             return declined(
+                crate::gc_metrics::eager_decline::MARKING_ACTIVE,
                 "a concurrent mark cycle is in flight (SATB snapshot liveness applies)",
             );
         }
         if !self.gray_set_is_empty() {
-            return declined("the gray set is non-empty");
+            return declined(
+                crate::gc_metrics::eager_decline::GRAY_SET_NON_EMPTY,
+                "the gray set is non-empty",
+            );
         }
         // NO FINALIZER GATE. It used to decline the ENTIRE reclaim whenever
         // `finalizer_pause` was set, and that flag is true for ANY registered
@@ -13347,7 +13353,10 @@ impl G1Collector {
         // named in the live set below instead. See `finalizer_addrs_this_pause`
         // and `a_humongous_span_awaiting_finalization_is_not_eagerly_reclaimed`.
         if pointer_map.iter().any(|(old, new)| old == new) {
-            return declined("evacuation failure kept cset regions phase 4 never walked");
+            return declined(
+                crate::gc_metrics::eager_decline::EVACUATION_FAILURE,
+                "evacuation failure kept cset regions phase 4 never walked",
+            );
         }
 
         // Everything the pause can see a reference from. A wide walk took a
@@ -13415,6 +13424,7 @@ impl G1Collector {
                 Some(set) => set,
                 None => {
                     return declined(
+                        crate::gc_metrics::eager_decline::SOURCE_WALK_ABORTED,
                         "a remembered-set source walk aborted, so rset-derived liveness                          under-counts",
                     )
                 }

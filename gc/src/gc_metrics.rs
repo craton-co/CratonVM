@@ -1113,13 +1113,25 @@ pub fn collector_decision_report() -> String {
     if verify.humongous_eager_spans > 0 || verify.humongous_eager_declined > 0 {
         s.push('\n');
         s.push_str(&format!(
-            "[GC] g1 humongous-eager: spans={} bytes={} declined_pauses={}              marked_live={} root_seeded={} walked_sources={}",
+            "[GC] g1 humongous-eager: spans={} bytes={} declined_pauses={}              marked_live={} root_seeded={} walked_sources={}{}",
             verify.humongous_eager_spans,
             verify.humongous_eager_bytes,
             verify.humongous_eager_declined,
             verify.humongous_eager_marked,
             verify.humongous_eager_root_seeded,
             verify.humongous_eager_walked_sources,
+            {
+                let reasons = g1_eager_decline_counts();
+                if reasons.is_empty() {
+                    String::new()
+                } else {
+                    let body: Vec<String> = reasons
+                        .iter()
+                        .map(|(label, n)| format!("{label}={n}"))
+                        .collect();
+                    format!(" declined_by: {}", body.join(" "))
+                }
+            },
         ));
     }
     s
@@ -1387,6 +1399,52 @@ static G1_PAUSES_COVERAGE_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
 /// Measured on H2 (`org.h2.test.store.TestMVStoreTool`, 612 compiled frames),
 /// G1 reports 100% incomplete where the probes report 0%, and the reason is
 /// exactly what that difference needed naming.
+/// Why a pause declined to reclaim humongous spans eagerly.
+///
+/// The `declined_pauses` total says the feature did not run; it never said
+/// WHICH gate stopped it, and on H2 the answer decides whether the remembered-
+/// set source walk beneath it is buying anything at all. Same shape as
+/// `G1_COVERAGE_REASONS`, and for the same reason: a count without a cause
+/// cannot direct work.
+pub mod eager_decline {
+    pub const CENSUS_INCOMPLETE: usize = 0;
+    pub const MARKING_ACTIVE: usize = 1;
+    pub const GRAY_SET_NON_EMPTY: usize = 2;
+    pub const EVACUATION_FAILURE: usize = 3;
+    pub const SOURCE_WALK_ABORTED: usize = 4;
+    pub const COUNT: usize = 5;
+
+    pub const LABELS: [&str; COUNT] = [
+        "census-incomplete",
+        "marking-active",
+        "gray-set-non-empty",
+        "evacuation-failure",
+        "source-walk-aborted",
+    ];
+}
+
+static G1_EAGER_DECLINE_REASONS: [AtomicU64; eager_decline::COUNT] =
+    [const { AtomicU64::new(0) }; eager_decline::COUNT];
+
+/// Record which gate stopped an eager humongous reclaim.
+pub fn record_g1_eager_decline_reason(code: usize) {
+    if let Some(slot) = G1_EAGER_DECLINE_REASONS.get(code) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(label, count)` for every decline reason seen at least once.
+pub fn g1_eager_decline_counts() -> Vec<(&'static str, u64)> {
+    eager_decline::LABELS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, label)| {
+            let n = G1_EAGER_DECLINE_REASONS[i].load(Ordering::Relaxed);
+            (n > 0).then_some((*label, n))
+        })
+        .collect()
+}
+
 static G1_COVERAGE_REASONS: [AtomicU64; crate::gc_quiescence::incomplete_reason::COUNT] =
     [const { AtomicU64::new(0) }; crate::gc_quiescence::incomplete_reason::COUNT];
 
