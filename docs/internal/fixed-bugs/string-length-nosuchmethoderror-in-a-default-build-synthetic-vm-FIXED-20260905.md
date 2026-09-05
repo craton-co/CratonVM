@@ -51,6 +51,28 @@ before and after this change, which is what identified the defect as
 configuration-specific rather than as a JDBC, jar, or class-loading defect.
 Neither test names `String` or the JDK mode, so neither read as one.
 
+**A second lane reached the same diagnosis from the other end, the same day**
+(`80700c259`, `6bcb9989f`). It added `config::SYNTHETIC_JDK_COMPILED_IN` and
+made both probes skip when the feature is absent, on the ground that what they
+measure past this point is a shim rather than the VM — including the sharp
+observation that the passing twin passed only because it never calls
+`String.length()`. That is right about those probes, and it is not this fix: no
+registration change makes the other ~5,200 compiled-out stubs appear. The two
+compose — one stops a shim measurement being read as a VM measurement, the
+other stops the shim from having lost `String` to a policy meant for real
+objects.
+
+Because those two now skip in a default build, this fix carries its own witness,
+which asks nothing about the completeness of the shim:
+`vm/tests/embedded_default_essential_surface.rs`. It runs `"abcdef".length()`,
+`isEmpty()`, `charAt(2)`, `substring(3).length()` and
+`ServiceLoader.load(Driver.class)` through the interpreter against a checked-in
+fixture. `charAt` and `substring` are in it because a fix that restored only
+`length()` would be the wrong fix passing the test; `equals` is deliberately
+NOT, because it resolves either way — to `Object.equals`, which interning then
+makes answer correctly for literals, and a method that cannot see the defect
+does not belong in the fixture that pins it.
+
 ## 3. The mechanism
 
 Three facts, each individually reasonable:
@@ -139,8 +161,9 @@ Directly relevant targets, all green after the change:
 
 | target | before | after |
 |---|---|---|
-| `wp7_2_jdbc_core_types_reachable` | 9 passed, 1 **failed** | 10 passed |
-| `wp1_8_real_jar_serviceloader` | 1 passed, 1 **failed** | 2 passed |
+| `embedded_default_essential_surface` (new; paired control) | 0 passed, 2 **failed** | 2 passed |
+| `wp7_2_jdbc_core_types_reachable` | 9 passed, 1 **failed** | 10 passed (skipped after `80700c259`) |
+| `wp1_8_real_jar_serviceloader` | 1 passed, 1 **failed** | 2 passed (skipped after `6bcb9989f`) |
 | `wp7_1_jdbc_driver_loader` | 4 passed | 4 passed |
 | `wp8_10_9_string_contains_native` | 6 passed | 6 passed (now in real-JDK mode) |
 | `cratonvm-vm --lib` `registrar_call_graph_witness` | 4 passed, 1 **failed** by design | 5 passed |

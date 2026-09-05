@@ -519,6 +519,27 @@ after; both are green under `--features synthetic-jdk` on either side of it,
 which is what identified the defect as configuration-4-only rather than as a
 JDBC or class-loading defect.
 
+**Two lanes reached this from opposite ends on the same day, and both fixes are
+wanted.** `80700c259` / `6bcb9989f` reached the same diagnosis — a default build
+boots a shim class library, `"abc".length()` fails in it, and
+`resultSet_next_is_boolean` "PASSED in that same build, for the sole reason that
+it never calls `String.length()`" — and answered it by *skipping* those probes
+when `config::SYNTHETIC_JDK_COMPILED_IN` is false, so a default build stops
+reporting a shim measurement as a VM measurement. That is right about those
+probes and does not overlap with this change: past `String.length()` what they
+exercise really is a shim, and no registration fix makes the other ~5,200 stubs
+appear in a binary that did not compile them.
+
+It does mean the two witnesses above now skip in a default build, so this fix
+keeps its own, which does not depend on the shim being complete:
+`vm/tests/embedded_default_essential_surface.rs` runs `"abcdef".length()`,
+`isEmpty()`, `charAt(2)`, `substring(3).length()` and
+`ServiceLoader.load(Driver.class)` through the interpreter on a checked-in
+fixture. Paired control, taken by reverting both hunks on the merged tree and
+rebuilding: 2/2 fail with `java/lang/NoSuchMethodError`, 2/2 pass with them
+restored. `charAt` and `substring` are in it because a fix that restored only
+`length()` would be the wrong fix passing the test.
+
 **Three places that were asking about a mode they were not in**, all now saying
 which mode they mean instead of inheriting it from the build:
 `wp8_10_9_string_contains_native.rs` booted `VmConfig::default()` and called the
