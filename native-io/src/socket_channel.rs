@@ -7013,10 +7013,20 @@ mod tests {
     #[test]
     fn nb_read_returns_eagain_zero() {
         // Spawn a real listener that just accepts and never sends anything.
+        //
+        // The accepted socket is bound to a NAMED local on purpose. `let _ =`
+        // drops its value immediately, so the server end was closed the instant
+        // it was accepted and the sleep below guarded nothing: the peer's FIN
+        // raced this thread's `try_read_nb`, and whichever won decided the
+        // result. FIN first means `Ok(0)` -> `Some(-1)`, and the assertion
+        // reads `None`, so the test failed ~1 run in 12 (MEASURED over 12 runs
+        // before this change: 11 pass, 1 fail). `let _named =` holds the socket
+        // open for the sleep, which is what makes "no data has been sent" true
+        // for the whole of the read below.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let _t = std::thread::spawn(move || {
-            let _ = listener.accept();
+            let _accepted = listener.accept();
             std::thread::sleep(Duration::from_secs(2));
         });
         // Connect and switch to non-blocking.
