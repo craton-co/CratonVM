@@ -32,7 +32,7 @@
 //! asserts all three because each failed independently:
 //!
 //!  1. the frames are **snapshotted** inside the helper, while they are still
-//!     on the stack (`jit::helpers::snapshot_npe_compiled_frames`);
+//!     on the stack (`jit::helpers::snapshot_trap_frames`);
 //!  2. the snapshot reaches **every** door that constructs the NPE. The first
 //!     cut reached one. `materialize_implicit_signal` — the constructor for an
 //!     implicit signal routed into a compiled callee's OWN handler, which is
