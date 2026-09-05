@@ -351,6 +351,57 @@ relaxed loads, so the target is known.
 
 ---
 
+## Verification, and one `rc=124` that was not a regression
+
+`bash regression-suite/run.sh` on the merged tree, debug binary, `TIMEOUT=600`:
+**90 passed, 0 failed.** A confirming run on the exact shipped binary (which
+added two relaxed counters and a flattened diagnostic string) came back **89
+passed, 1 failed — `RMapGcStress`, `rc=124`**, which is the harness's own
+timeout and which it labels `HARNESS FAULT — TIMED OUT; the harness killed the
+VM, it did not fail`.
+
+That label is a hint, not an attribution, and this vector had now timed out in
+two runs of three. So it was attributed rather than assumed, with the kill
+switch the change shipped with — one binary, both arms, interleaved so a fixed
+order could not manufacture a difference:
+
+| run | `CRATONVM_GC_STATIC_ROOT_SLOTS` | wall | result |
+|---|---|---|---|
+| 1 | default (on) | 718 s | PASS, 378053 checks |
+| 2 | `0` | 1121 s | PASS, 378053 checks |
+| 3 | default (on) | 1073 s | PASS, 378053 checks |
+| 4 | `0` | 1091 s | PASS, 378053 checks |
+| 5 | default (on) | 768 s | PASS, 378053 checks |
+| 6 | `0` | 677 s | PASS, 378053 checks |
+
+Two readings, and the second is the one that matters:
+
+* **Identical check counts in every run, both arms.** The slot-carrying root
+  path produces the same 378,053 assertions as the full walk on the tree's most
+  GC-hostile vector. That is the correctness statement.
+* **Both arms routinely exceed the 600 s budget.** The spread *within* the
+  control arm alone is 677–1121 s, a factor of 1.65, and the arm with the change
+  DISABLED produced the two slowest runs. A debug binary on this host simply
+  does not fit this vector inside `TIMEOUT=600` reliably; the run that passed
+  landed on a fast draw. There is no signal here to attribute to the change, and
+  the medians (768 s on, 1091 s off) point the other way from a regression.
+
+Isolated at `TIMEOUT=1800` on a quiet host, `RMapGcStress`, `RMapResizeGc` and
+`RSyncMethodJit` all pass.
+
+**Unrelated, and worth someone's attention:** the first timed-out run left a
+`cratonvm.exe` child alive at 1.2 GB that `Stop-Process -Force` and `taskkill /F`
+both refused to terminate, and that was still resident 80 minutes later. The
+harness's `timeout` kills the wrapper; this child outlived it in an
+uninterruptible state. It burns no CPU, so it only costs memory — but it costs
+it silently, on the same host as every subsequent run, which is exactly the kind
+of thing that makes a timing-sensitive vector look flaky.
+
+Other gates: 1866/1866 `cratonvm-gc` unit tests, `cargo check --workspace
+--all-targets` clean, `cargo clippy -p cratonvm-gc` clean, and the
+`--no-default-features` fallback build — which `gc/Cargo.toml` records as
+UNVERIFIED because no CI job compiles it — verified compiling.
+
 ## What a follow-up should measure first
 
 1. Re-run the **+153 % four-worker mark** number now that the provider lock is
