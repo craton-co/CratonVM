@@ -348,10 +348,35 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             continue;
         };
 
-        // Plain, annotation-free verdict — see "Known limitations" for
-        // why hint-loosened kernels are intentionally not covered.
-        let jit_cuda::OffloadVerdict::Eligible(sig) =
-            jit_cuda::analyzer::analyze(target_method)
+        // Annotation-free, but CONSTANT-POOL AWARE -- and the pool has to
+        // be the TARGET's, not this caller's.
+        //
+        // AUDIT 2026-09-05. This called the CP-free `analyze`, which
+        // rejects `ldc`/`ldc_w`/`ldc2_w` unconditionally because it has
+        // no pool to resolve them against. `lookup_or_compile` -- the
+        // dispatcher this gate exists to serve -- calls
+        // `analyze_with_pool`, which admits a numeric literal (AUDIT
+        // C31). So the two disagreed, silently, about any kernel
+        // containing a float or double constant.
+        //
+        // `bench-gpu/GpuFloatDivChain.divChain` is that kernel: its
+        // `x = x / d + 1.0000001` is an `ldc2_w`, so the gate saw
+        // INELIGIBLE while the interpreter saw `Eligible` and offloaded.
+        // Its int twin's `+ 12345` is a `sipush` with no pool entry, so
+        // that one agreed and worked. Measured at N=2^24: 9,276 ms
+        // against the int twin's 8 ms, and 28 ms with `CRATONVM_JIT_OSR=0`
+        // (which keeps the caller interpreted, where the CP-aware verdict
+        // is the one that runs).
+        //
+        // The disagreement was always wrong, and it became load-bearing
+        // when this scan started ARMING the compiled-tier hook rather
+        // than merely blocking: a target the gate cannot see is one the
+        // compiler binds directly, and the hook is then lost for the life
+        // of the process.
+        let jit_cuda::OffloadVerdict::Eligible(sig) = jit_cuda::analyzer::analyze_with_pool(
+            target_method,
+            &target_class.constant_pool,
+        )
         else {
             continue;
         };
