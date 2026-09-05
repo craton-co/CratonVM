@@ -25440,6 +25440,18 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
 
     // close() → void
     r.register(dc, "close", "()V", native_dc_close);
+    // The two protected halves of the same teardown. `close()` is `final` on
+    // `AbstractInterruptibleChannel` and drives `implCloseChannel()`, which
+    // `AbstractSelectableChannel` implements (also `final`) in terms of the
+    // abstract `implCloseSelectableChannel()`. `socket_channel.rs` registers
+    // both spellings for the stream channels and this family did not, so any
+    // caller that reached the JDK `close()` bytecode -- the reactor does, and
+    // so did the JIT's `final`-method devirtualiser until the native screen in
+    // `invoke::final_devirt_native_shadow` -- ran real `DatagramChannelImpl`
+    // teardown against JDK internals this VM never populated. Both point at
+    // the same body, which is what the JDK's own chain does.
+    r.register(dc, "implCloseChannel", "()V", native_dc_close);
+    r.register(dc, "implCloseSelectableChannel", "()V", native_dc_close);
 
     // isOpen() → boolean
     r.register(dc, "isOpen", "()Z", native_dc_is_open);
@@ -26245,6 +26257,25 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
         DC_NUM_FIELDS,
     )
     .obj;
+    // Seed the real `AbstractInterruptibleChannel` / `AbstractSelectableChannel`
+    // monitor and interruptor fields, exactly as `socket_channel.rs` does for
+    // the two stream channels. This factory does not run the JDK constructor
+    // that assigns them, so `closeLock` stayed null on every datagram channel
+    // this VM ever built -- and the real `close()` bytecode opens with
+    // `synchronized (closeLock)`.
+    //
+    // The reason this was invisible until 2026-09-05 is that nothing ran that
+    // bytecode: `close()` resolved to `native_dc_close`. Then the JIT's
+    // `final`-method devirtualiser bound the site straight to the JDK body,
+    // and netty's `NioDatagramChannel.doClose()` began throwing
+    // `NullPointerException` from the tier-up call on -- 3,487 of 4,000 closes
+    // in `probes/CloseDevirtProbe.java`, each leaking a UDP socket and leaving
+    // netty's `AbstractChannel.close()` to raise "close() must be invoked
+    // after the channel is closed." over a channel that never closed.
+    // `invoke::final_devirt_native_shadow` now refuses that bind; seeding the
+    // fields is the other half, so the JDK body is CORRECT rather than merely
+    // unreachable. Returns a possibly-relocated ref: seeding allocates.
+    let dc = crate::socket_channel::init_channel_locks(ctx, dc);
     // "A newly-created channel is always in blocking mode"
     // (`java.nio.channels.SelectableChannel`). Assert it rather than assume
     // it: the side tables are keyed by identity hash, and a fresh object may
@@ -26903,6 +26934,13 @@ fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
     }
+    // `native_dc_is_open` answers from `dc_fd` above, but the JDK's own
+    // `AbstractInterruptibleChannel.isOpen()` reads a `closed` field this
+    // family never wrote — and a JIT-compiled caller runs that body, because
+    // `isOpen()` is `final` and the devirtualiser takes it. See
+    // `socket_channel::mark_jdk_channel_closed` for the netty failure this
+    // divergence produced.
+    crate::socket_channel::mark_jdk_channel_closed(ctx, this);
     Ok(None)
 }
 

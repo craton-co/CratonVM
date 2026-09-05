@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-355 tokens.
+356 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -785,6 +785,7 @@ export inherited from a parent shell.
 | `zero-unset-locals` | `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
+| `final-devirt-native-screen` | `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN` |
 | `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |

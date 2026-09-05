@@ -6375,6 +6375,15 @@ pub struct NativeMethodRegistry {
     /// `find_by_method_descriptor` to avoid the O(N) linear scan over
     /// `registrations`. Built incrementally on every `register()`.
     by_method_desc: FxHashMap<(u64, u64), NativeCallback>,
+    /// Memo for [`owner_classes_for_method`](Self::owner_classes_for_method):
+    /// `(registrations.len() when built, (method, descriptor) -> owning classes)`.
+    /// Interior-mutable because every caller holds the registry by `&self`.
+    method_owner_index: std::sync::RwLock<
+        Option<(
+            usize,
+            std::collections::HashMap<(Box<str>, Box<str>), Vec<Box<str>>>,
+        )>,
+    >,
     /// Category aligned with `registrations` (index-parallel), for
     /// `dump_registrations` / census output.
     categories: Vec<NativeKind>,
@@ -6620,6 +6629,7 @@ impl NativeMethodRegistry {
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
+            method_owner_index: std::sync::RwLock::new(None),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             current_category: None,
             current_leaf: false,
@@ -7013,6 +7023,56 @@ impl NativeMethodRegistry {
     ) -> Option<NativeKind> {
         self.slot_for_exact(class_name, method_name, descriptor)
             .map(|slot| slot.kind)
+    }
+
+    /// Every class a native for `(method_name, descriptor)` is registered on.
+    ///
+    /// The registry is keyed on the EXACT class name, and every lookup path
+    /// asks it that way — `find`, `resolve_id`, the JIT site cache. This is the
+    /// one question they cannot answer: *given a method, which receivers would
+    /// take a native?* The JIT's `final`-method devirtualiser needs exactly
+    /// that, because it decides at COMPILE time, with no receiver in hand, to
+    /// bind a site straight to the classfile body — and a native registered on
+    /// a SUBCLASS of the declaring class shadows that body for every receiver
+    /// of the subclass. See `invoke::invokevirtual_site_final_owner`, whose
+    /// screen this serves, and the netty
+    /// `channeloutboundbuffer-close-ordering` page for the two defects that
+    /// escaped through the gap.
+    ///
+    /// Cold path: called once per candidate call site while compiling, never
+    /// per execution. The index behind it is built on first use and rebuilt if
+    /// `registrations` has grown since (registration is an init-time activity,
+    /// so in an ordinary run it is built exactly once, and the length check is
+    /// what keeps a late `register()` — the tests do this — from being invisible
+    /// to a cached answer).
+    #[must_use]
+    pub fn owner_classes_for_method(&self, method_name: &str, descriptor: &str) -> Vec<Box<str>> {
+        type Index = std::collections::HashMap<(Box<str>, Box<str>), Vec<Box<str>>>;
+        let mut guard = self
+            .method_owner_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale = match &*guard {
+            Some((built_len, _)) => *built_len != self.registrations.len(),
+            None => true,
+        };
+        if stale {
+            let mut index: Index = std::collections::HashMap::new();
+            for (class, method, desc) in &self.registrations {
+                index
+                    .entry((method.clone(), desc.clone()))
+                    .or_default()
+                    .push(class.clone());
+            }
+            *guard = Some((self.registrations.len(), index));
+        }
+        let Some((_, index)) = &*guard else {
+            return Vec::new();
+        };
+        index
+            .get(&(Box::from(method_name), Box::from(descriptor)))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Snapshot of every registration as `(class, method, descriptor, kind)`,

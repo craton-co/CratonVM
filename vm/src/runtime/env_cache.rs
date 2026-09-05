@@ -515,6 +515,33 @@ pub fn jit_final_devirt() -> bool {
     })
 }
 
+/// Screen the `final`-devirtualisation door against the native registry.
+/// Default ON; `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0` restores the
+/// pre-2026-09-05 behaviour, in which a `final` JDK method whose body a
+/// registered native shadows was bound straight to that body in compiled code
+/// while the interpreter kept running the native.
+///
+/// The B arm of an in-binary A/B, and the reason it is a SEPARATE switch from
+/// `CRATONVM_JIT_FINAL_DEVIRT`: turning the whole door off also removes every
+/// devirtualisation the screen would have admitted, so it cannot price the
+/// screen. With this at `0`, `probes/CloseDevirtProbe.java` returns to 3,487
+/// NullPointerExceptions in 4,000 datagram closes and
+/// `probes/ChanStateCensus3.java` to ~398k wrong `isOpen()` answers in 400k;
+/// with it at the default both read zero on the same binary. Counter:
+/// [`cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`].
+pub fn jit_final_devirt_native_screen() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub fn jit_inline_calls() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

@@ -18647,6 +18647,28 @@ pub static PRIVATE_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
 pub static FINAL_INVOKEVIRTUAL_PINNED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Call sites the `final`-devirtualisation door REFUSED because a registered
+/// native shadows the body it would have bound.
+///
+/// `final` promises no subclass declares another BODY; it promises nothing
+/// about CratonVM's native registry, which shadows a JDK method by registering
+/// on a class name that is usually a SUBCLASS of the one declaring the body.
+/// See `invoke::final_devirt_native_shadow` for the two channel defects that
+/// escaped through the gap and the measurements behind them.
+///
+/// Read it beside [`FINAL_INVOKEVIRTUAL_PINNED`]: together they say how much of
+/// the door's candidate set the screen takes. A zero here on a workload that
+/// moves the sibling counter means the screen is inert for that workload, not
+/// that it is unnecessary.
+pub static FINAL_DEVIRT_NATIVE_SHADOW_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`].
+#[must_use]
+pub fn final_devirt_native_shadow_refused_count() -> u64 {
+    FINAL_DEVIRT_NATIVE_SHADOW_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Call sites where the static-bind rewrite YIELDED to a call-site intrinsic.
 ///
 /// `java/lang/String` is `final`, so `invokevirtual_site_final_owner` answers

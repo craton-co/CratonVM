@@ -5502,6 +5502,7 @@ pub(super) fn compile_optimizing_artifact(
             // in `invoke::invokevirtual_site_final_owner` — so these three
             // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
+                shared,
                 &cm,
                 class_id,
                 target_class,
@@ -6049,6 +6050,7 @@ pub(super) fn compile_optimizing_artifact(
                 // in `invoke::invokevirtual_site_final_owner` — so these three
                 // per-door copies cannot drift apart on either.
                 return super::invoke::invokevirtual_site_final_owner(
+                    shared,
                     &cm,
                     callee_cid,
                     target_class,
@@ -7765,6 +7767,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // in `invoke::invokevirtual_site_final_owner` — so these three
             // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
+                shared,
                 &cm,
                 cid,
                 target_class,
