@@ -918,6 +918,22 @@ struct Lowerer<'a> {
     /// reloaded from the home word, and home stores skipped there.
     reg_publishes_at_def: usize,
     homes_dropped_at_def: usize,
+    /// `carry_of[id]` = `(register, consumer)`: this single-use value reaches
+    /// its one consumer in `register` and never touches its home word. Empty
+    /// unless [`ir_carry_single_use_enabled`]. See that function for why this
+    /// is not a residency decision.
+    carry_of: Vec<Option<(u8, NodeId)>>,
+    /// The carry in flight: `(producer, consumer, register, buffer position
+    /// when it started)`. At most one is ever live, because a carry is planned
+    /// only between ADJACENT nodes.
+    live_carry: Option<(NodeId, NodeId, u8, usize)>,
+    /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
+    /// miscompile — the value's home is `home_dropped`, so the fallback read
+    /// refuses the compile as well — but it means the contract this planned
+    /// under did not hold, which is a bug in the plan, not in the emission.
+    carries_taken: usize,
+    carries_read: usize,
+    carries_refused: usize,
     /// `deopt_nameable[id]` — a deopt frame may describe `id` as living in its
     /// register rather than in its home word.
     ///
@@ -1442,6 +1458,11 @@ impl<'a> Lowerer<'a> {
             cur_def_published: false,
             reg_publishes_at_def: 0,
             homes_dropped_at_def: 0,
+            carry_of: Vec::new(),
+            live_carry: None,
+            carries_taken: 0,
+            carries_read: 0,
+            carries_refused: 0,
             deopt_nameable: Vec::new(),
             deopt_reg_named: std::cell::Cell::new(0),
             home_dropped: Vec::new(),
@@ -1765,6 +1786,37 @@ impl<'a> Lowerer<'a> {
     /// which is a missed optimization and never wrong code: the home word is
     /// written unconditionally.
     fn gp_load_value(&mut self, dst: u8, id: NodeId) {
+        // ── A carried value is already in `dst`, and only in `dst` ────
+        //
+        // Every clause below is checked rather than argued, because a carried
+        // value exists in exactly one place and a wrong answer here would read
+        // a frame word nothing wrote:
+        //
+        // * this really is the consumer the carry was planned for;
+        // * it is asking for the register the plan chose;
+        // * and for an RAX carry, NOTHING has been emitted since the producer
+        //   left the value there — `buf.pos()` proves it, and no audit of what
+        //   the arms emit can be wrong about it. An RCX carry cannot use that
+        //   proof (the consumer's first read is emitted in between) and rests
+        //   on `op_reads_rax_then_rcx` instead: that read writes RAX only.
+        if let Some((prod, cons, reg, pos)) = self.live_carry {
+            if prod == id {
+                if self.cur_def != Some(cons) {
+                    self.refuse_carry("read outside its planned consumer");
+                } else if dst != reg {
+                    self.refuse_carry("read into a register the plan did not choose");
+                } else if reg == RAX && pos != self.buf.pos() {
+                    self.refuse_carry("something was emitted between the two");
+                } else {
+                    self.live_carry = None;
+                    self.carries_read += 1;
+                    // The value is in `dst`. That is the whole optimization:
+                    // no store, no load, and for an RAX carry no instruction
+                    // at all.
+                    return;
+                }
+            }
+        }
         // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
         // `Op::Const` arm still writes its home (a deopt frame may name it,
         // and some sites still read slots directly), but no reader of a
@@ -4347,12 +4399,62 @@ impl<'a> Lowerer<'a> {
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
+        if self.begin_carry_at_store(offset) {
+            return;
+        }
         if self.publish_def_at_store(offset) {
             return;
         }
         let mut bytes = FrameAccess::new();
         enc_frame_store(RAX, offset, &mut bytes);
         self.buf.emit(bytes.as_slice());
+    }
+
+    /// Start a carry at the store that would have written this definition's
+    /// home word, and answer whether that store may now be skipped.
+    ///
+    /// Nothing is emitted for an RAX carry — the value is already there, which
+    /// is what the store was about to write. An RCX carry costs one
+    /// register-to-register move and still removes two memory operations.
+    fn begin_carry_at_store(&mut self, offset: i32) -> bool {
+        let Some(id) = self.cur_def else {
+            return false;
+        };
+        let Some((reg, cons)) = self.carry_of.get(id as usize).copied().flatten() else {
+            return false;
+        };
+        let home = self
+            .node_slot
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .map(|off| off.get() as i32);
+        if home != Some(offset) {
+            return false;
+        }
+        if reg != RAX {
+            self.emit_mov_reg_reg64(reg, RAX);
+        }
+        self.live_carry = Some((id, cons, reg, self.buf.pos()));
+        self.carries_taken += 1;
+        true
+    }
+
+    /// Refuse the compile because a carry did not reach its consumer the way it
+    /// was planned to.
+    ///
+    /// Never a wrong answer, always a coverage loss, and `carries_refused`
+    /// names it. The fallback is safe on its own terms too: a carried value's
+    /// home is `home_dropped`, so any read that gets past here refuses in
+    /// `slot_of_checked`.
+    fn refuse_carry(&mut self, why: &'static str) {
+        if let Some((prod, cons, _, _)) = self.live_carry.take() {
+            self.carries_refused += 1;
+            self.latch_bailout(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: prod },
+                format!("n{prod}'s carry to n{cons} did not hold: {why}"),
+            ));
+        }
     }
 
     /// Recognise the store that writes the CURRENT definition's own home word,
@@ -4635,6 +4737,10 @@ impl<'a> Lowerer<'a> {
     // ── Node lowering ────────────────────────────────────────────────
 
     fn lower_block(&mut self, block_idx: usize) {
+        // A carry never spans a block — `carry_of` is planned between adjacent
+        // nodes of one block's list — so one left here is a planning bug, and
+        // the block boundary is a branch target besides.
+        self.refuse_carry("a block began while it was still in flight");
         self.block_offsets[block_idx] = self.buf.pos();
         // A receiver proof is block-local: control can enter this block from a
         // predecessor that never proved it.
@@ -6128,6 +6234,83 @@ impl<'a> Lowerer<'a> {
                 fused_cmp[cond as usize] = true;
             }
         }
+        // ── Single-use intermediates, carried to their consumer ──────
+        //
+        // Same three questions the fusion above asks, and the same answers
+        // make it safe: exactly one use, no frame state naming it, and nothing
+        // scheduled in between. The difference is only where the value ends up
+        // — a fused compare is recomputed at the branch, a carried value is
+        // simply left where the arm already put it.
+        let n_nodes = self.graph.nodes.len();
+        let mut carry_of: Vec<Option<(u8, NodeId)>> = vec![None; n_nodes];
+        if ir_carry_single_use_enabled() {
+            for block in &self.schedule.blocks {
+                for w in 1..block.nodes.len() {
+                    let prod = block.nodes[w - 1];
+                    let cons = block.nodes[w];
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    // A value a frame state can name has a second reader that
+                    // does not appear in `use_count` at all.
+                    if deopt_named.get(prod as usize).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let Some(pn) = self.graph.nodes.get(prod as usize) else {
+                        continue;
+                    };
+                    if !matches!(pn.ty, IrType::Int | IrType::Long) {
+                        continue;
+                    }
+                    // The producer's result must be in RAX at its home store,
+                    // which is exactly what this predicate certifies.
+                    if !op_home_is_one_store_rax(&pn.op) {
+                        continue;
+                    }
+                    // A value the residency file gave a register publishes
+                    // there instead; that path already removes the reload and
+                    // the two must not both claim the store.
+                    if self.assigned_gpr(prod).is_some() {
+                        continue;
+                    }
+                    let Some(cn) = self.graph.nodes.get(cons as usize) else {
+                        continue;
+                    };
+                    if !op_reads_rax_then_rcx(&cn.op) {
+                        continue;
+                    }
+                    // Those arms take an FP path for an FP result, and that
+                    // path reads through `fp_load_value`, which knows nothing
+                    // about a carry.
+                    if !matches!(cn.ty, IrType::Int | IrType::Long) {
+                        continue;
+                    }
+                    let reg = if cn.inputs.first() == Some(&prod) {
+                        RAX
+                    } else if cn.inputs.get(1) == Some(&prod) {
+                        RCX
+                    } else {
+                        continue;
+                    };
+                    carry_of[prod as usize] = Some((reg, cons));
+                }
+            }
+        }
+        // A carried value's home is never written, so every OTHER reader must
+        // refuse rather than take the word. `home_dropped` is that refusal and
+        // it already exists; sizing it here matters because residency may be
+        // off entirely, and this path does not depend on it.
+        if !carry_of.iter().all(Option::is_none) {
+            if self.home_dropped.len() < n_nodes {
+                self.home_dropped.resize(n_nodes, false);
+            }
+            for (id, c) in carry_of.iter().enumerate() {
+                if c.is_some() {
+                    self.home_dropped[id] = true;
+                }
+            }
+        }
+        self.carry_of = carry_of;
         self.use_count = use_count;
         self.deopt_named = deopt_named;
         self.fused_cmp = fused_cmp;
@@ -6252,6 +6435,14 @@ impl<'a> Lowerer<'a> {
                 BailoutReason::UnallocatedValue { node: id },
                 format!("n{id}'s home was dropped but its lowering published no register"),
             ));
+        }
+        // A carry that outlives the node that was supposed to read it is a
+        // value with nowhere to be. `prod == id` is the carry this node just
+        // STARTED, waiting for the next one.
+        if let Some((prod, _, _, _)) = self.live_carry {
+            if prod != id {
+                self.refuse_carry("its consumer finished without reading it");
+            }
         }
         self.cur_def = prev;
         self.cur_def_published = prev_published;
@@ -8101,6 +8292,9 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_terminator(&mut self, term: NodeId, block_idx: usize) {
+        // Same net at the other end of the block: a terminator is never a
+        // planned consumer.
+        self.refuse_carry("the block's terminator was reached first");
         if self.schedule.blocks[block_idx]
             .successors
             .iter()
@@ -11314,6 +11508,74 @@ fn ir_drop_home_enabled() -> bool {
 /// Getting this list wrong is not silent: `lower_data_node_tracked` refuses the
 /// compile when a value whose home was dropped reaches the end of its own
 /// lowering unpublished.
+/// Let a SINGLE-USE intermediate reach its one consumer in a register instead
+/// of through its home word -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_CARRY_SINGLE_USE=1`.
+///
+/// The residency work removed the frame traffic it could and then measured what
+/// was left: the loop's remaining `[rbp-...]` operations are pairs of the shape
+///
+/// ```text
+/// mov [rbp-0C0h],rax      ; store the result of an Add
+/// mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+/// ```
+///
+/// `plan_register_residency` skips every one of them (`single_use` in its
+/// census) and is right to: they do not want a register for their whole live
+/// range, they want not to be written to memory at all. Their range is one
+/// instruction long.
+///
+/// So this is not a promotion policy. It is the same move `fused_cmp` already
+/// makes for a comparison consumed by its branch, generalised: when a value has
+/// exactly one use, no frame state names it, and its consumer is the very next
+/// node in the same block, the value can stay in the register the arm computed
+/// it in and the consumer can read it there.
+fn ir_carry_single_use_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_SINGLE_USE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Does lowering `op` read its first input into RAX, and its second (if it has
+/// one) into RCX, before emitting anything else?
+///
+/// The consumer half of the carry contract, and — like
+/// [`op_home_is_one_store_rax`] — an audit of the arms rather than a guess.
+/// Every op here has the same shape: `alloc_slot`, `gp_load_value(RAX,
+/// inputs[0])`, `gp_load_value(RCX, inputs[1])`, the ALU, `store_rax`. That is
+/// what makes both carry registers safe:
+///
+/// * RAX, because NOTHING is emitted between the producer's last instruction
+///   and the consumer's first read — checked, not argued: the read refuses
+///   unless `buf.pos()` is still where the producer left it;
+/// * RCX, because the only thing emitted before the second read is the first
+///   read, and a `gp_load_value` into RAX writes RAX and nothing else.
+///
+/// `Op::Cmp`, `Op::LCmp` and `Op::FCmp` are absent: a comparison may be fused
+/// into its branch and then emits nothing at all. `Op::Load`, `Op::ArrayLoad`
+/// and `Op::Call` are absent because they read their operands in another order
+/// or through another path.
+fn op_reads_rax_then_rcx(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+    )
+}
+
 fn op_home_is_one_store_rax(op: &Op) -> bool {
     matches!(
         op,
@@ -14207,6 +14469,15 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.home_read_refusals.get(),
             lowerer.reg_publishes_at_def,
             lowerer.homes_dropped_at_def,
+        );
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+        eprintln!(
+            "[ir-ls] carries: planned={} taken={} read={} refused={}",
+            lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
+            lowerer.carries_taken,
+            lowerer.carries_read,
+            lowerer.carries_refused,
         );
     }
 
