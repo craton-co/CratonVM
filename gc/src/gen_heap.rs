@@ -2291,7 +2291,16 @@ pub struct GenerationalHeap {
     /// Next identity hash code.
     next_hash_code: AtomicI32,
     /// Young GC threshold in bytes.
-    young_gc_threshold: Mutex<usize>,
+    ///
+    /// An `AtomicUsize` rather than a `Mutex<usize>` because
+    /// [`Self::needs_gc_with_jit_allocation_frame`] reads it, and that runs on
+    /// the ALLOCATION path — a mutex there is a shared cache line taken
+    /// exclusive by every allocating thread to read one word that only ever
+    /// changes at a safepoint. Both writers (the post-collection pause-goal
+    /// feedback and the heap-expansion reset) run stop-the-world, so the
+    /// read-modify-writes they perform have no racing writer and a plain
+    /// load/store pair is exactly equivalent to what the lock provided.
+    young_gc_threshold: AtomicUsize,
     // Volatile field access uses `SeqCst` fences inside
     // `get_field_volatile`/`set_field_volatile`; no global lock is
     // needed (and the previous `Mutex<()>` here serialised every
@@ -2771,7 +2780,7 @@ impl GenerationalHeap {
             commit_bits_hold: Mutex::new([None, None, None]),
             card_table,
             next_hash_code: AtomicI32::new(1),
-            young_gc_threshold: Mutex::new(threshold),
+            young_gc_threshold: AtomicUsize::new(threshold),
             satb_queue: None,
             concurrent_gc_state: None,
             max_young_semi_size: max_young,
@@ -6181,7 +6190,7 @@ impl GenerationalHeap {
         );
         let threshold = young_gc_trigger_bytes(
             from.capacity(),
-            *self.young_gc_threshold.lock(),
+            self.young_gc_threshold.load(Ordering::Relaxed),
             non_moving_young,
             young_pause_goal_ms() > 0,
         );
@@ -6459,10 +6468,14 @@ impl GenerationalHeap {
         // worse than the pause it was trying to avoid.
         let floor = (capacity / 16).max(1);
         let ceiling = capacity * young_trigger_percent() / 100;
-        let mut threshold = self.young_gc_threshold.lock();
-        let current = (*threshold).clamp(floor, ceiling.max(floor));
+        // STW: this is the post-collection feedback step, so the read and the
+        // store below cannot race a second writer.
+        let current = self
+            .young_gc_threshold
+            .load(Ordering::Relaxed)
+            .clamp(floor, ceiling.max(floor));
         let mut feedback = self.young_trigger_feedback.lock();
-        *threshold = next_young_trigger(
+        let next = next_young_trigger(
             &mut feedback,
             current,
             floor,
@@ -6472,12 +6485,13 @@ impl GenerationalHeap {
             goal_ms,
             bytes_copied,
         );
+        self.young_gc_threshold.store(next, Ordering::Relaxed);
         drop(feedback);
-        if gc_flags().dbg_gcpause && *threshold != current {
+        if gc_flags().dbg_gcpause && next != current {
             eprintln!(
                 "[gcpause] young trigger {}KB -> {}KB (pause={pause_ms}ms goal={goal_ms}ms)",
                 current / 1024,
-                *threshold / 1024
+                next / 1024
             );
         }
     }
@@ -8855,12 +8869,14 @@ impl GenerationalHeap {
                 // the smaller of the two: the goal keeps its say, and the new
                 // capacity still supplies the ceiling.
                 let default_for_new_cap = new_cap * young_trigger_percent() / 100;
-                let mut threshold = self.young_gc_threshold.lock();
-                *threshold = if young_pause_goal_ms() > 0 {
-                    (*threshold).min(default_for_new_cap)
+                // STW: heap expansion runs inside the collection pause.
+                let current = self.young_gc_threshold.load(Ordering::Relaxed);
+                let next = if young_pause_goal_ms() > 0 {
+                    current.min(default_for_new_cap)
                 } else {
                     default_for_new_cap
                 };
+                self.young_gc_threshold.store(next, Ordering::Relaxed);
             }
         }
 

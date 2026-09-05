@@ -392,6 +392,10 @@ fn zgc_jit_read_bounds_enabled() -> bool {
 
 /// The cold half of [`ZgcRealHeap`] -- see [`ZgcRealHeap::counters`].
 struct ZgcCounters {
+    /// Has the JIT inline-load bound been withdrawn because the arena now has
+    /// decommitted holes in it? A one-way latch; see the site that sets it in
+    /// `collect_garbage`'s uncommit block.
+    jit_read_bounds_retracted: AtomicBool,
     /// Fragmentation ratchet — Phase 2.2. See [`ZFragGauge`].
     ///
     /// Held as three plain atomics rather than a `Mutex<ZFragGauge>` because
@@ -1953,6 +1957,7 @@ impl ZgcRealHeap {
                 }
             },
             counters: Box::new(ZgcCounters {
+                jit_read_bounds_retracted: AtomicBool::new(false),
                 frag_samples: AtomicUsize::new(0),
                 frag_worst_permille: AtomicUsize::new(usize::MAX),
                 frag_worst_free_permille: AtomicUsize::new(0),
@@ -13128,6 +13133,50 @@ impl GarbageCollector for ZgcRealHeap {
             };
             if released != 0 {
                 self.counters.bytes_uncommitted.fetch_add(released, Ordering::Relaxed);
+                // RETRACT THE INLINE-LOAD BOUND. This is the half that was
+                // missing, and it is a fault rather than a slowdown.
+                //
+                // `with_capacity` publishes `[arena_base, arena_end)` into
+                // `JIT_READ_BOUNDS` slot 0 once (see `zgc_jit_read_bounds_
+                // enabled`), and the JIT's guarded `getfield` emits a raw load
+                // of the receiver's class-id word for any address inside that
+                // range. The decommit above punches holes into the MIDDLE of
+                // that same range, and `reservation::platform_decommit` is
+                // `madvise(MADV_DONTNEED)` + `mprotect(PROT_NONE)` on Unix and
+                // `VirtualFree(MEM_DECOMMIT)` on Windows -- a released granule
+                // FAULTS on touch, it does not read back as zero (the paragraph
+                // on `Arena::decommit_free_blocks` says so, and records that
+                // believing otherwise is how two slides came to write into
+                // released granules). Nothing re-narrowed the bound, so a
+                // compiled load through a stale receiver that lands in a hole
+                // was a SIGSEGV in compiled code with no owner.
+                //
+                // G1 has the same pair and gets it right: `uncommit_trailing_
+                // free_regions_within` publishes the narrower bound BEFORE it
+                // unmaps, and says that the order is the whole safety argument.
+                // G1 can, because it only ever shrinks a PREFIX. These holes are
+                // interior, so there is no narrower `[base, end)` to publish --
+                // the only sound move is to withdraw the range entirely.
+                //
+                // A ONE-WAY LATCH, and cheap for exactly that reason: it costs
+                // one relaxed load per collection that released anything, it
+                // fires at most once per process, and after it every guarded
+                // site falls through to the checked helper -- which is what an
+                // unpublished collector already gets, and the fail-safe
+                // direction. Clearing the table is also the ONLY mechanism that
+                // can disarm an inline sequence in code that is already
+                // compiled; `set_barrier_color` documents the same manoeuvre for
+                // the same table.
+                if zgc_jit_read_bounds_enabled()
+                    && !self.counters.jit_read_bounds_retracted.swap(true, Ordering::Relaxed)
+                {
+                    crate::gen_heap::publish_jit_read_bounds(0, 0, 0);
+                    tracing::info!(
+                        target: "cratonvm::gc",
+                        bytes = released,
+                        "zgc: withdrew the JIT inline-load bound -- the arena now                          has decommitted holes inside it",
+                    );
+                }
                 tracing::debug!(
                     target: "cratonvm::gc",
                     bytes = released,
@@ -14514,6 +14563,63 @@ pub(crate) mod tests {
     /// unit test: nothing on the write path consulted commit state.
     /// `Arena::is_readable_at` is the read-side guard that already existed;
     /// `Arena::commit_for_relocation` is the write-side one this test pins.
+    /// The give-back must WITHDRAW the JIT inline-load bound.
+    ///
+    /// A source witness, and deliberately so: the defect is not a wrong value,
+    /// it is a call that does not happen. `with_capacity` publishes
+    /// `[arena_base, arena_end)` into `JIT_READ_BOUNDS` slot 0, the JIT emits a
+    /// raw load of any receiver inside that range, and the give-back then
+    /// decommits granules in the MIDDLE of it -- and a decommitted granule
+    /// faults on touch rather than reading back as zero (see
+    /// `Arena::decommit_free_blocks`). Nothing in this file re-narrowed the
+    /// bound, so a compiled load through a stale receiver landing in a hole was
+    /// a fault in compiled code with no owner.
+    ///
+    /// It cannot be pinned behaviourally here: `JIT_READ_BOUNDS` is
+    /// process-global and this crate's tests share one process, so a test that
+    /// actually retracted slot 0 would pull it out from under every other test
+    /// running beside it. What CAN be pinned is that the retraction sits inside
+    /// the block that releases the memory, and ahead of nothing that could
+    /// short-circuit it.
+    ///
+    /// G1 gets the same pair right by construction and says why on
+    /// `uncommit_trailing_free_regions_within`: publish the narrower bound
+    /// FIRST, then unmap. G1 only shrinks a prefix, so it HAS a narrower bound
+    /// to publish. These holes are interior, so withdrawal is the only sound
+    /// move.
+    #[test]
+    fn the_give_back_withdraws_the_jit_inline_load_bound() {
+        let src = include_str!("zgc.rs");
+
+        // Establish the corpus first: a file that stopped containing the
+        // give-back would make this pass for the wrong reason.
+        let uncommit = src
+            .find("arena.decommit_unbumped_middle() + arena.decommit_free_blocks()")
+            .expect("zgc.rs no longer performs the un-bumped-middle give-back");
+        // The retraction must be in the SAME block, i.e. after the release and
+        // before the block that follows it (the mark phase).
+        let mark_phase = src[uncommit..]
+            .find("---- Mark phase")
+            .map(|i| uncommit + i)
+            .expect("zgc.rs no longer has a mark phase after the give-back");
+        let block = &src[uncommit..mark_phase];
+        assert!(
+            block.contains("publish_jit_read_bounds(0, 0, 0)"),
+            "the give-back releases granules inside the arena whose range is              published to the JIT as safe to load from raw, and no longer              withdraws that range. A compiled load through an address in a              released granule faults."
+        );
+        assert!(
+            block.contains("jit_read_bounds_retracted"),
+            "the withdrawal is no longer latched, so it either re-publishes              every cycle or repeats work once per collection"
+        );
+        // The retraction must be gated on the bound having been published at
+        // all -- withdrawing a slot this collector never wrote would clear
+        // another backend's publication.
+        assert!(
+            block.contains("zgc_jit_read_bounds_enabled()"),
+            "the withdrawal is no longer gated on this collector having              published the bound in the first place"
+        );
+    }
+
     #[test]
     fn the_slide_commits_a_destination_the_give_back_had_decommitted() {
         use crate::reservation::GRANULE;
