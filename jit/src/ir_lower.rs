@@ -934,6 +934,11 @@ struct Lowerer<'a> {
     carries_taken: usize,
     carries_read: usize,
     carries_refused: usize,
+    carry_stores_dropped: usize,
+    /// Why an adjacent pair was not carried, per cause, and how many carried
+    /// values still had to write their home because a frame state names them.
+    carry_skips: [usize; 6],
+    carry_named: usize,
     /// `deopt_nameable[id]` — a deopt frame may describe `id` as living in its
     /// register rather than in its home word.
     ///
@@ -1463,6 +1468,9 @@ impl<'a> Lowerer<'a> {
             carries_taken: 0,
             carries_read: 0,
             carries_refused: 0,
+            carry_stores_dropped: 0,
+            carry_skips: [0; 6],
+            carry_named: 0,
             deopt_nameable: Vec::new(),
             deopt_reg_named: std::cell::Cell::new(0),
             home_dropped: Vec::new(),
@@ -4399,45 +4407,46 @@ impl<'a> Lowerer<'a> {
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
-        if self.begin_carry_at_store(offset) {
-            return;
+        // Two independent decisions, deliberately kept apart. Whether this
+        // definition is CARRIED to its consumer decides where the consumer
+        // reads it; whether its home was DROPPED decides if the word is
+        // written at all. A carried value normally still writes its home,
+        // because `graph.safepoints` names it.
+        let carry = self.carry_at_store(offset);
+        let drop_store = carry.is_some_and(|(id, _, _)| {
+            self.home_dropped.get(id as usize).copied().unwrap_or(false)
+        });
+        if !drop_store && !self.publish_def_at_store(offset) {
+            let mut bytes = FrameAccess::new();
+            enc_frame_store(RAX, offset, &mut bytes);
+            self.buf.emit(bytes.as_slice());
         }
-        if self.publish_def_at_store(offset) {
-            return;
+        if let Some((id, reg, cons)) = carry {
+            // RAX already holds it — that is what the store was about to
+            // write. RCX costs one register move and still removes a load.
+            if reg != RAX {
+                self.emit_mov_reg_reg64(reg, RAX);
+            }
+            self.live_carry = Some((id, cons, reg, self.buf.pos()));
+            self.carries_taken += 1;
+            if drop_store {
+                self.carry_stores_dropped += 1;
+            }
         }
-        let mut bytes = FrameAccess::new();
-        enc_frame_store(RAX, offset, &mut bytes);
-        self.buf.emit(bytes.as_slice());
     }
 
-    /// Start a carry at the store that would have written this definition's
-    /// home word, and answer whether that store may now be skipped.
-    ///
-    /// Nothing is emitted for an RAX carry — the value is already there, which
-    /// is what the store was about to write. An RCX carry costs one
-    /// register-to-register move and still removes two memory operations.
-    fn begin_carry_at_store(&mut self, offset: i32) -> bool {
-        let Some(id) = self.cur_def else {
-            return false;
-        };
-        let Some((reg, cons)) = self.carry_of.get(id as usize).copied().flatten() else {
-            return false;
-        };
+    /// Is this store the home write of a value planned to be carried, and if
+    /// so, `(the value, the register, its consumer)`?
+    fn carry_at_store(&self, offset: i32) -> Option<(NodeId, u8, NodeId)> {
+        let id = self.cur_def?;
+        let (reg, cons) = self.carry_of.get(id as usize).copied().flatten()?;
         let home = self
             .node_slot
             .get(id as usize)
             .copied()
             .flatten()
-            .map(|off| off.get() as i32);
-        if home != Some(offset) {
-            return false;
-        }
-        if reg != RAX {
-            self.emit_mov_reg_reg64(reg, RAX);
-        }
-        self.live_carry = Some((id, cons, reg, self.buf.pos()));
-        self.carries_taken += 1;
-        true
+            .map(|off| off.get() as i32)?;
+        (home == offset).then_some((id, reg, cons))
     }
 
     /// Refuse the compile because a carry did not reach its consumer the way it
@@ -6243,46 +6252,53 @@ impl<'a> Lowerer<'a> {
         // simply left where the arm already put it.
         let n_nodes = self.graph.nodes.len();
         let mut carry_of: Vec<Option<(u8, NodeId)>> = vec![None; n_nodes];
+        // Per-cause, because a bare zero from this planner cannot be acted on:
+        // [not-single-use, wrong-type, producer-arm, already-resident,
+        //  consumer-arm, wrong-operand-position].
+        let mut carry_skips = [0usize; 6];
+        let mut carry_named = 0usize;
+        let mut carry_droppable: Vec<NodeId> = Vec::new();
         if ir_carry_single_use_enabled() {
             for block in &self.schedule.blocks {
                 for w in 1..block.nodes.len() {
                     let prod = block.nodes[w - 1];
                     let cons = block.nodes[w];
                     if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
-                    // A value a frame state can name has a second reader that
-                    // does not appear in `use_count` at all.
-                    if deopt_named.get(prod as usize).copied().unwrap_or(true) {
+                        carry_skips[0] += 1;
                         continue;
                     }
                     let Some(pn) = self.graph.nodes.get(prod as usize) else {
                         continue;
                     };
                     if !matches!(pn.ty, IrType::Int | IrType::Long) {
+                        carry_skips[1] += 1;
                         continue;
                     }
                     // The producer's result must be in RAX at its home store,
                     // which is exactly what this predicate certifies.
                     if !op_home_is_one_store_rax(&pn.op) {
+                        carry_skips[2] += 1;
                         continue;
                     }
                     // A value the residency file gave a register publishes
                     // there instead; that path already removes the reload and
                     // the two must not both claim the store.
                     if self.assigned_gpr(prod).is_some() {
+                        carry_skips[3] += 1;
                         continue;
                     }
                     let Some(cn) = self.graph.nodes.get(cons as usize) else {
                         continue;
                     };
                     if !op_reads_rax_then_rcx(&cn.op) {
+                        carry_skips[4] += 1;
                         continue;
                     }
                     // Those arms take an FP path for an FP result, and that
                     // path reads through `fp_load_value`, which knows nothing
                     // about a carry.
                     if !matches!(cn.ty, IrType::Int | IrType::Long) {
+                        carry_skips[4] += 1;
                         continue;
                     }
                     let reg = if cn.inputs.first() == Some(&prod) {
@@ -6290,26 +6306,60 @@ impl<'a> Lowerer<'a> {
                     } else if cn.inputs.get(1) == Some(&prod) {
                         RCX
                     } else {
+                        carry_skips[5] += 1;
                         continue;
                     };
                     carry_of[prod as usize] = Some((reg, cons));
+                    // ── And, separately, may the home STORE go too? ──
+                    //
+                    // Eliding the LOAD needs nothing from the frame: the home
+                    // word is still written and every frame state still
+                    // resolves through it. Dropping the STORE needs the
+                    // stronger claim that nothing else can ever want the word
+                    // — and `graph.safepoints` records the FULL OPERAND STACK
+                    // at every bci, so an intermediate is named by a frame
+                    // state from its definition until its consumer pops it.
+                    //
+                    // That is why this is a separate question with its own
+                    // census line rather than a clause above. On a loop kernel
+                    // it answers no every time, and the reason is worth having
+                    // in front of you: the method emits no deopt stub at all
+                    // (`ir_osr_sentinel_free`), so all of those frame states
+                    // are unreachable — and they still pin every intermediate
+                    // to memory.
+                    //
+                    // The consumer must also be unable to TRAP. `Op::Div` and
+                    // `Op::Rem` emit their zero guard AFTER reading both
+                    // operands, and that guard is a deopt point whose frame
+                    // state names them — so a dropped home there would hand
+                    // the resume a word nothing wrote. Today `deopt_named`
+                    // already answers no for those operands (the bci's frame
+                    // state lists them), and this clause is what makes that
+                    // agreement a rule rather than a coincidence.
+                    let consumer_traps = matches!(cn.op, Op::Div | Op::Rem);
+                    if consumer_traps || deopt_named.get(prod as usize).copied().unwrap_or(true) {
+                        carry_named += 1;
+                    } else {
+                        carry_droppable.push(prod);
+                    }
                 }
             }
         }
-        // A carried value's home is never written, so every OTHER reader must
-        // refuse rather than take the word. `home_dropped` is that refusal and
-        // it already exists; sizing it here matters because residency may be
-        // off entirely, and this path does not depend on it.
-        if !carry_of.iter().all(Option::is_none) {
+        // A value whose home store is dropped has ONE readable location, so
+        // every other reader must refuse rather than take the word.
+        // `home_dropped` is that refusal and it already exists; sizing it here
+        // matters because residency may be off entirely, and this path does not
+        // depend on it.
+        if !carry_droppable.is_empty() {
             if self.home_dropped.len() < n_nodes {
                 self.home_dropped.resize(n_nodes, false);
             }
-            for (id, c) in carry_of.iter().enumerate() {
-                if c.is_some() {
-                    self.home_dropped[id] = true;
-                }
+            for id in &carry_droppable {
+                self.home_dropped[*id as usize] = true;
             }
         }
+        self.carry_skips = carry_skips;
+        self.carry_named = carry_named;
         self.carry_of = carry_of;
         self.use_count = use_count;
         self.deopt_named = deopt_named;
@@ -11527,9 +11577,21 @@ fn ir_drop_home_enabled() -> bool {
 ///
 /// So this is not a promotion policy. It is the same move `fused_cmp` already
 /// makes for a comparison consumed by its branch, generalised: when a value has
-/// exactly one use, no frame state names it, and its consumer is the very next
-/// node in the same block, the value can stay in the register the arm computed
-/// it in and the consumer can read it there.
+/// exactly one use and its consumer is the very next node in the same block,
+/// the value can stay in the register the arm computed it in and the consumer
+/// can read it there.
+///
+/// **Two decisions, deliberately separate.** Eliding the LOAD asks nothing of
+/// the frame — the home word is still written and every frame state still
+/// resolves through it — so it applies to every carried value. Dropping the
+/// STORE needs the stronger claim that nothing else can want the word, and
+/// `graph.safepoints` records the FULL OPERAND STACK at every bci, so an
+/// intermediate is named by a frame state from its definition until its
+/// consumer pops it. On a loop kernel that answers no every time, which the
+/// census reports as `still_deopt_named` — and it is worth reading beside
+/// `ir_osr_sentinel_free`, because such a method emits no deopt stub at all.
+/// Every one of those frame states is unreachable, and they still pin every
+/// intermediate to memory.
 fn ir_carry_single_use_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_SINGLE_USE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -14473,11 +14535,20 @@ pub(crate) fn lower_inner_with_scopes(
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
         eprintln!(
-            "[ir-ls] carries: planned={} taken={} read={} refused={}",
+            "[ir-ls] carries: planned={} taken={} read={} refused={} \
+             stores_dropped={} still_deopt_named={}",
             lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
             lowerer.carries_taken,
             lowerer.carries_read,
             lowerer.carries_refused,
+            lowerer.carry_stores_dropped,
+            lowerer.carry_named,
+        );
+        let s = lowerer.carry_skips;
+        eprintln!(
+            "[ir-ls] carry skips: multi_use={} wrong_type={} producer_arm={} \
+             already_resident={} consumer_arm={} operand_position={}",
+            s[0], s[1], s[2], s[3], s[4], s[5],
         );
     }
 
