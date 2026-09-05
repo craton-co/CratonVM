@@ -91,7 +91,7 @@ connection in flight. `TestFlowControl`, `TestHttp2Section_5_1` and
 `TestHttp2Section_6_1` are `OK` on the fix, at their exact failing counts; so is
 `catalina.core.TestAsyncContextImpl` from section 5, which carried the identical
 signature. Write-up:
-`fixed-suite-bugs/tomcat/socketchannelimpl-statelock-null-npe-kills-http-connections-FIXED-20260905.md`.
+`socketchannelimpl-statelock-null-npe-kills-http-connections-FIXED-20260905.md`.
 
 `TestHttp2Section_8_2` is NOT that bug — its log contains zero `stateLock`
 occurrences. Its row reads `124,300,HANG,21.27`: `rc=124` is this harness's

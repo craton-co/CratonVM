@@ -175,9 +175,26 @@ is one of ours. `SocketChannelImpl.implConfigureBlocking`'s body is
 `private final ReentrantLock` from the same never-run constructor, one field
 over from `stateLock`. Registering `implConfigureBlocking` natively means the
 real bytecode does not run whichever way the call arrives, so neither field is
-dereferenced. (This is the residual the original page left as "not confirmed to
-share this root cause"; it does share the family, and it is a different field
-from the one in the title.)
+dereferenced.
+
+MEASURED on the Azure host it was reported from (Linux, `-XX:+UseZGC`, one
+class, dev's binary against this branch's):
+
+| arm | result | NPE lines | `implConfigureBlocking` |
+|---|---|---:|---:|
+| `dev` (`aa41feb17`) | `Tests run: 5,  Failures: 3` | 20 | 1 |
+| this branch | `Tests run: 5,  Failures: 2` | **0** | **0** |
+
+Every NullPointerException in the class is gone and one of the three failures
+with them. The two that remain are the multicast environment gap
+`tribes-multicast-family-still-environmental.md` records, which this change does
+not touch and does not claim. The class does not reproduce this NPE on the
+Windows box at all (5/5 fail there for the multicast reason in both arms), which
+is why the A/B had to be run where the report came from.
+
+(This is the residual the original page left as "not confirmed to share this
+root cause"; it does share the family, and it is a different field from the one
+in the title.)
 
 **The construction path, pinned.** The original page could not name it. It is
 `alloc_channel_as_impl` (which mints `sun/nio/ch/SocketChannelImpl` at the real
