@@ -800,6 +800,11 @@ pub struct GcFlags {
     /// crossed to the parallel arm, which is the DEFAULT one, so a corrupt or
     /// interior candidate that the serial path refuses was followed, copied and
     /// written through. `=0` is the same-binary A/B for that claim.
+    ///
+    /// It also stands down `SharedEvac::evacuate`'s last-ditch alignment
+    /// refusal, deliberately: an off word that left one guard armed would be a
+    /// HALF A/B — the abort it exists to reproduce would not come back, and the
+    /// arm would read as evidence that the screens were not the fix.
     pub g1_parallel_evac_screen: bool,
     /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
     /// pauses taken while a thread is inside compiled code. Default **ON**

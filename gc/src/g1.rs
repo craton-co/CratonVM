@@ -1261,7 +1261,14 @@ impl<'a> SharedEvac<'a> {
         // unrecoverable abort into a counted refusal and a continued pause.
         // `None` is the caller-visible "evacuation failed", which every one of
         // the six call sites already handles by leaving the slot alone.
-        if old_ptr.is_null() || (old_ptr as usize) & 0x7 != 0 {
+        //
+        // Gated with the rest of the parity work on
+        // `CRATONVM_G1_PARALLEL_EVAC_SCREEN`, so `=0` really does restore the
+        // pre-2026-09-05 behaviour — abort included. A guard that stayed armed
+        // under the off word would make the switch a HALF A/B: the crash it is
+        // meant to reproduce would not come back, and the arm would look like
+        // evidence that the screens were not what fixed it.
+        if self.screens_armed() && (old_ptr.is_null() || (old_ptr as usize) & 0x7 != 0) {
             let n = PARALLEL_EVAC_UNALIGNED_CANDIDATE.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
                 tracing::warn!(
