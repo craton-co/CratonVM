@@ -54,6 +54,16 @@
 //! An unpublished slot is `(0, 0)`, and every reader treats the all-zero table
 //! as "this backend has not said", which is the same fail-safe every other table
 //! in this family uses.
+//!
+//! # One table per PROCESS, not per heap
+//!
+//! Like every other table in this family, and with the same consequence: two
+//! `VmHeap`s in one process (which happens in tests, not in a shipping VM)
+//! overwrite each other's spans. That is tolerable for the consumers this has
+//! -- `enable_for_live_heap` runs once at VM init, and an envelope is a filter
+//! whose worst error is admitting an address a later screen rejects -- and it is
+//! not tolerable for a consumer that would treat a span as proof of ownership.
+//! Do not add one without giving this table a heap identity first.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

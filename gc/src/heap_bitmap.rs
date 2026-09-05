@@ -38,7 +38,12 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 
 // ---------------------------------------------------------------------------
-// Object-start membership for `ZgcRealHeap` — the allocation-path bitmap
+// Object-start membership — the allocation-path bitmap
+//
+// Written for `ZgcRealHeap` and kept verbatim below, because the measurement
+// and the exactness argument are what justify the structure and they are
+// specific to where they were taken. The STRUCTURE is not specific to that
+// collector, which is the point of this module.
 // ---------------------------------------------------------------------------
 //
 // # Why (a measurement with an in-tree precedent, not a hypothesis)
@@ -61,7 +66,7 @@ use rustc_hash::FxHashSet;
 // `--verbose:gc` shows the depth-16 run performed exactly ONE collection
 // (1.1 ms, `bytes_freed=0`), finishing at 719 MB against a 4.2 GB heap. So the
 // cost is not the collector, and it is not allocation locking — TLABs
-// (`ZgcRealHeap::tlabs`]) landed first and did not move the number. It is
+// (`ZgcRealHeap::tlabs`) landed first and did not move the number. It is
 // per-allocation work on the mutator path that grows with the LIVE-OBJECT
 // COUNT. Tens of millions of entries in one global hash set, behind one global
 // mutex, probed with cache-missing scatter reads over a multi-gigabyte table,
@@ -101,13 +106,16 @@ use rustc_hash::FxHashSet;
 //   four bytes into an object, which is the `is_addr_live` unsoundness
 //   `ZgcRealHeap::conservative_addr_span` documents. It also has no `remove`.
 //
-// Neither file is edited. [`HeapBitmap`] below is the atomic twin:
+// Neither file was edited, and a fourth bitmap was written. That was the wrong
+// answer -- the two weaker ones are still in use by the other collectors, which
+// is exactly the cost this module now removes -- but the TYPE it produced is
+// the right one. [`HeapBitmap`] below is it:
 // `YoungMarkBits`'s storage and RMW discipline, `ObjectStartBits`'s exactness
 // rule, plus the `remove` the sweep needs.
 //
 // # Why the bitmap is EXACT here (three legs, each verified against the code)
 //
-// 1. **One contiguous region with a stable base.** `ZgcRealHeap::with_capacity`]
+// 1. **One contiguous region with a stable base.** `ZgcRealHeap::with_capacity`
 //    creates a single [`Arena`] and captures `arena_base`/`arena_end` from it;
 //    there is no `Arena::grow` call anywhere in this file and `alloc_raw` is the
 //    single arena chokepoint, so the envelope never moves. Those two fields
