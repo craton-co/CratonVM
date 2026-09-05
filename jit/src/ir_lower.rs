@@ -1129,6 +1129,9 @@ impl<'a> Lowerer<'a> {
         let frame_size = estimate_frame_bytes(num_locals, slot_plan.slots, &needs) as i32;
         let saved_xmm_bytes = ir_saved_xmm_bytes();
         let saved_gpr_bytes = ir_saved_gpr_bytes();
+        // Hoisted above the mirror check because the check has to COUNT it.
+        // The region itself is placed further down, off this same binding.
+        let deopt_regs_bytes = ir_deopt_regs_bytes();
         debug_assert_eq!(
             frame_size,
             ((locals_size
@@ -1137,6 +1140,21 @@ impl<'a> Lowerer<'a> {
                 + spill_size
                 + saved_xmm_bytes
                 + saved_gpr_bytes
+                // The deopt register image. `estimate_frame_bytes` has counted
+                // it since the region was introduced; this mirror never did, so
+                // the two disagreed by exactly its 256 bytes whenever
+                // `CRATONVM_JIT_IR_DEOPT_REGS` was on -- 464 against 208 in
+                // `a_deopt_frame_reads_a_register_the_stub_spilled` and its two
+                // siblings, the only tests that turn the flag on.
+                //
+                // The ESTIMATOR was right: it is what sizes the frame, and
+                // `deopt_regs_base` below is placed off the same reservation
+                // (`spill_cap_off` subtracts it, and the abutment assertion two
+                // screens down pins the result against the staging region). So
+                // the frame was always laid out correctly and only the
+                // statement of the invariant was wrong -- which is why this was
+                // a debug-only red and never a wrong-code bug.
+                + deopt_regs_bytes
                 + args_stage_size
                 + shadow
                 + stack_arg_reserve)
@@ -1245,7 +1263,6 @@ impl<'a> Lowerer<'a> {
         // `xmm[n]` at `[rbp - (base - 128 - 8n)]`. Same convention as the
         // single-pass backend's `deopt_regs_base`, deliberately, so the two
         // stubs can be read against each other.
-        let deopt_regs_bytes = ir_deopt_regs_bytes();
         let spill_cap_off = frame_size
             - shadow
             - stack_arg_reserve
