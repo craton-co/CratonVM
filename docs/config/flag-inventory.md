@@ -1232,6 +1232,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GPU_IF_CONVERT` | JIT | `CRATONVM_JIT=gpu-if-convert` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_IF_CONVERT_MAX_OPS` | JIT | `CRATONVM_JIT=gpu-if-convert-max-ops` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_JIT_ARRAY_WRITERS` | GC | `CRATONVM_GC=gpu-jit-array-writers` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_GPU_JIT_GATE_CALLERS` | GC | `CRATONVM_GC=gpu-jit-gate-callers` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_JIT_GATE_DISPATCHABLE` | GC | `CRATONVM_GC=gpu-jit-gate-dispatchable` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_MIN_WORK_GIVEUP` | GC | `CRATONVM_GC=gpu-min-work-giveup` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_NO_SUBMISSION_DRAIN` | GC | `CRATONVM_GC=gpu-submission-drain` | opt-out | on | behaviour | snapshot | vm |
