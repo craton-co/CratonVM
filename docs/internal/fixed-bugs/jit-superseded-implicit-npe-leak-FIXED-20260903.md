@@ -69,29 +69,63 @@ the site was.
 A kill switch that removes a symptom identifies an ingredient, not a mechanism.
 This one had three, and the one they share is the OSR admission.
 
-**REGRESSED 2026-09-04, and the cause is named.** `069e67b43` turned the
-box/unbox intrinsic default-ON, and this vector is a boxing lambda
-(`Function<String, Integer>`, so every `apply` is an `Integer.intValue()`).
-With the intrinsic on, the vector's NPE escapes to `main` uncaught — the exact
-symptom below. One run settles it, no build required:
+**REGRESSED 2026-09-04 by a DIFFERENT defect, and FIXED the same day.** The
+regression was real and this vector caught it, but the mechanism first written
+here was wrong and is corrected below — the intrinsic is not a second producer
+of implicit-trap signals, and its null path never fired at all.
+
+### What actually happened
+
+`try_lambda_site_direct_call`'s resumed-body arm parked a real exception in
+`jit_pending_exception` and returned **`0`**, calling it "the null/zero
+sentinel" and leaving it "for the compiled caller's own post-invoke check".
+
+**There is no such sentinel.** `emit_post_invoke_exception_check` compares `RAX`
+against `i64::MIN`, and consults `dispatch_threw` only on that comparison. `0`
+is an ordinary null reference return, so the check kept it and compiled code
+carried on with a null while the exception sat unclaimed.
+
+It looked correct because of what usually FOLLOWS a SAM call. Unboxing the
+result — `Integer.intValue()` — was a CALL, and that call crossed into Rust and
+delivered the pending exception a moment later at a site that could route it.
+`069e67b43` made the box/unbox intrinsic default-ON, the unbox became an inline
+load, the crossing disappeared, and the exception escaped its own `catch`.
+
+The fix is one line: park the exception and return `i64::MIN`, the sentinel the
+check actually tests for. It is right for every return type — for a reference
+`i64::MIN` cannot be a valid heap address, and for the `J`/`D`/`F` shapes where
+it is a representable value the check disambiguates through `dispatch_threw`,
+which finds exactly the signal parked on the line above.
+
+### How it was found, and the two wrong turns
+
+The arm table is the same as the original bug's — `CRATONVM_JIT_OSR=0`,
+`CRATONVM_JIT_LAMBDA_SITE=0`, `CRATONVM_JIT_LAMBDA_TIERUP=0` and a high
+threshold each make it disappear — which is why it looked like the same defect.
+Two hypotheses were built on that and both were wrong:
+
+1. **"The intrinsic is a second producer of implicit-trap signals."** It is not:
+   its null-receiver path is a DEOPT, not a `jit_npe_with_action`. Refuted by
+   reading the emitter.
+2. **"The inlined `intValue` sees the null and traps."** An instrument on
+   `jit_uncommon_trap` printed nothing — because with `deopt_real` on, reason 6
+   goes to `x64_deopt_entry` instead. `CRATONVM_DEOPT_REAL=0` made the failure
+   disappear, which named the frame-deopt path and led to the trace that
+   settled it:
 
 ```text
-$ cratonvm -cp build RJitLambdaNpeSupersede
-Exception in thread "main" java/lang/NullPointerException: ... "<local0>" is null
-
-$ CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1 cratonvm -cp build RJitLambdaNpeSupersede
-PASS RJitLambdaNpeSupersede (3 checks)
+[cratonvm-deopt] x64 frame-deopt entry reason=ReceiverTypeChanged at bci=118
+                 stack=[Int(0), Object(0)]
+[cratonvm-deopt] OSR exception with no precise frame in ...main — throw site is
+                 outside every protected range; propagating
 ```
 
-So the intrinsic's lowering does not honour the `take_jit_pending_exception`
-discipline the fix below established: it is a second producer of the implicit
-trap signals, and it was not taught to drop them.
+`Object(0)` on the stack at the unbox is the null the caller should never have
+been handed.
 
-Bisected by build, five arms: PASS at `ec96716a8` (the full suite was 90/90),
-FAIL at `ded395383`, `b111a3514`, `842e6d0f9` and `04a5d4d02`. `ded395383` is
-dev's own line with no feature branch merged into it, which is what rules out
-everything landed beside it. The window is the fourteen commits
-`ec96716a8..ded395383`, and `069e67b43` is the one the kill switch names.
+`probes/BoxUnboxNpeProbe.java` is the reduced repro: it needs only
+`lengthOf.apply(s)` (the vector's `stepFn` hop is not required), takes `-Dprobe.n`,
+and prints the iteration index.
 
 ## The symptom
 
