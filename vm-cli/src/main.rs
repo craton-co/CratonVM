@@ -276,6 +276,23 @@ fn maybe_dump_shutdown_reports() {
                     }
                 }
             }
+            // EXACT OBJECT-START answers (`CRATONVM_GC_OBJECT_STARTS`). The
+            // pair, because a hit count alone cannot say whether the bitmap is
+            // carrying the predicate or being consulted and ignored: a miss
+            // falls through to the header-shaped deduction that was there
+            // before, and on a conservative scan over zeroes, small integers
+            // and long bit patterns most candidates SHOULD miss. What the ratio
+            // cannot separate -- a genuine non-object from a real object the
+            // bitmap never saw because a TLAB bump-allocated it -- needs a
+            // workload, not another counter.
+            {
+                let (hits, misses) = cratonvm_vm::object_start_counts();
+                if hits != 0 || misses != 0 {
+                    eprintln!(
+                        "[cratonvm] exact object-start answers: hits={hits} misses={misses}"
+                    );
+                }
+            }
             // MEMORY RETURNED TO THE OS by the generational young collector
             // (`CRATONVM_GEN_UNCOMMIT`). Printed whenever a collection ran,
             // zero included: a zero with the switch ON means every collection

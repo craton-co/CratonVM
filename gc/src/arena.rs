@@ -134,7 +134,54 @@ impl DeferredWipe {
     }
 }
 
+/// `CRATONVM_GC_OBJECT_STARTS=1` -- maintain an exact object-start bitmap per
+/// arena and let `is_object_address` answer from it instead of deducing the
+/// answer from header bytes. Opt-in; see [`Arena::starts`].
+fn object_starts_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_OBJECT_STARTS").is_some()
+    })
+}
+
 pub struct Arena {
+    /// EXACT object-start membership for this arena, when
+    /// `CRATONVM_GC_OBJECT_STARTS` is on.
+    ///
+    /// # What it replaces, and why the replacement is only half-done on purpose
+    ///
+    /// `gen_heap::is_object_address` decides "is this address an allocation
+    /// base" by DEDUCING it from the bytes at that address: alignment, a bounds
+    /// scan, a commit probe, two enum-tag validations, header plausibility, a
+    /// slot-count cap, an extent computation and a second commit probe. It is a
+    /// guess, and its own comment names the false positive it cannot eliminate
+    /// -- an interior 16-byte `Value` cell of an `Object[]` decodes as a
+    /// self-consistent fake header (`class_id=4`, `num_slots=4`), caught only
+    /// afterwards by the extent check.
+    ///
+    /// A bit per 8 bytes, set where the allocation actually happens, answers the
+    /// question instead of deducing it: one shift and one bit test, exact.
+    ///
+    /// It is consulted in the ACCEPT direction only. A hit short-circuits the
+    /// deduction; a MISS falls through to it unchanged. That asymmetry is the
+    /// safety argument and it is deliberate: a bitmap that is not complete would,
+    /// used to REJECT, drop a live root and produce a use-after-free, and this
+    /// one is knowably incomplete -- a TLAB chunk is one `hand_out` and the
+    /// objects bump-allocated inside it never reach this code. Used to accept,
+    /// incompleteness costs only the old path.
+    ///
+    /// Exactness in the accept direction needs the removal half, and gets it:
+    /// `hand_out` is the single chokepoint every allocation funnels through and
+    /// `add_free_block` the single one every free does, so a base that is freed
+    /// stops being a base here at the same moment. Without that, a larger object
+    /// later allocated OVER a freed base would see the stale bit, be accepted at
+    /// an interior address, and take a mark-bit write into the middle of a live
+    /// object -- which is the corruption the extent check exists to stop.
+    ///
+    /// `None` when the switch is off, which is the default: a bit per 8 bytes is
+    /// capacity/64 bytes of side table (64 MB for a 4 GB heap), and whether that
+    /// is worth it is a measurement this ships the instrument for.
+    starts: Option<std::sync::Arc<crate::heap_bitmap::HeapBitmap>>,
     /// Backing storage for `capacity` bytes.
     ///
     /// Reserved address space committed in 2 MiB granules as the cursors reach
@@ -758,9 +805,65 @@ impl Arena {
             high_max: 0,
             high_pushed: 0,
             high_reserve: 0,
+            starts: None,
         };
         a.rearm_alloc_anchors();
+        a.arm_object_starts();
         a
+    }
+
+    /// Build the exact object-start bitmap, if `CRATONVM_GC_OBJECT_STARTS` is
+    /// on and this arena has any capacity to cover.
+    ///
+    /// Called from [`Arena::new`]. Deliberately NOT from `grow`: a grown arena
+    /// has a new base and a new span, so the old bitmap would answer for
+    /// addresses that no longer exist. `grow` drops it instead, which turns
+    /// every query into a miss and falls back to the deduction -- correct, and
+    /// visible in the hit census rather than silent.
+    fn arm_object_starts(&mut self) {
+        if !object_starts_enabled() || self.data.len() == 0 {
+            self.starts = None;
+            return;
+        }
+        self.starts = Some(std::sync::Arc::new(
+            crate::heap_bitmap::HeapBitmap::labelled(
+                self.data.as_ptr() as usize,
+                self.data.len(),
+                "arena-object-start",
+            ),
+        ));
+    }
+
+    /// Is `addr` an allocation base this arena handed out and has not freed?
+    ///
+    /// `None` means "not tracked" -- the switch is off, or this arena was grown
+    /// -- and is NOT the same answer as `Some(false)`. A caller must fall back
+    /// to the deduction on `None`, and may only ever use `Some(true)` to ACCEPT.
+    /// See the [`Arena::starts`] field for why the other direction is unsound.
+    #[inline]
+    pub fn is_object_start(&self, addr: usize) -> Option<bool> {
+        self.starts.as_ref().map(|b| b.contains(addr))
+    }
+
+    /// This arena's object-start bitmap, for a reader that wants to consult it
+    /// WITHOUT taking the arena lock.
+    ///
+    /// `is_object_address` is the VM's hottest validator and was made lock-free
+    /// on purpose -- its own comment records that the triple-mutex containment
+    /// check it replaced "contended catastrophically" with the allocator. Asking
+    /// this arena directly would put that back, `try_lock` included: a failed
+    /// try is still an atomic read-modify-write on a line every allocating
+    /// thread wants. So the heap publishes this `Arc` into a lock-free slot
+    /// beside `commit_bits` and reads through the raw pointer, exactly as it
+    /// already does for the commit screen.
+    pub fn object_starts(&self) -> Option<std::sync::Arc<crate::heap_bitmap::HeapBitmap>> {
+        self.starts.clone()
+    }
+
+    /// Whether this arena is tracking object starts at all.
+    #[inline]
+    pub fn tracks_object_starts(&self) -> bool {
+        self.starts.is_some()
     }
 
     /// (Re)size the allocator-anchor bucket table for the current capacity.
@@ -1411,6 +1514,15 @@ impl Arena {
         if !self.data.commit_range(offset, size) {
             return None;
         }
+        // The single door every allocation in this arena goes through, which is
+        // what makes the object-start bitmap complete for anything allocated
+        // directly (see the `starts` field). A TLAB chunk is ONE hand-out and
+        // the objects bump-allocated inside it never reach here -- knowably
+        // incomplete, which is precisely why the bitmap is only ever consulted
+        // to ACCEPT.
+        if let Some(bits) = self.starts.as_ref() {
+            bits.insert(self.data.as_ptr() as usize + offset);
+        }
         // SAFETY: `commit_range` returned `true`, which it only does for a
         // range wholly inside the reservation -- so `offset + size` is in
         // bounds and the bytes are mapped read-write.
@@ -1949,6 +2061,13 @@ impl Arena {
         }
         if (offset | size) & 7 != 0 {
             warn_unaligned_block("add_free_block", offset, size);
+        }
+        // A freed base stops being a base HERE, at the same moment the free
+        // list learns about it. Without this a larger object later allocated
+        // over the hole would see the stale bit, be accepted at an interior
+        // address, and take a mark-bit write into the middle of a live object.
+        if let Some(bits) = self.starts.as_ref() {
+            bits.remove(self.data.as_ptr() as usize + offset);
         }
         // Region routing. A reclaimed span goes back to the end it was carved
         // from, and `max_free_upper` deliberately does NOT see the high end:
@@ -2661,6 +2780,12 @@ impl Arena {
     }
 
     pub fn reset(&mut self) {
+        // Every base this arena handed out is now invalid: the cursors are back
+        // at the ends and the whole span is free. A stale bit here would be
+        // accepted at an address the next cycle allocates something else over.
+        if let Some(bits) = self.starts.as_ref() {
+            bits.clear_all();
+        }
         // stw-residual-close forensics: record the wipe range before zeroing
         // (site 2 = from-space reset). Gated; no-op unless the env is set.
         crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
@@ -2694,6 +2819,12 @@ impl Arena {
     /// semi-space is the next cycle's to-space, allocated into by no mutator)
     /// and joins the wipe before the next collection touches it.
     pub fn reset_deferring_zero(&mut self) -> DeferredWipe {
+        // Every base this arena handed out is now invalid: the cursors are back
+        // at the ends and the whole span is free. A stale bit here would be
+        // accepted at an address the next cycle allocates something else over.
+        if let Some(bits) = self.starts.as_ref() {
+            bits.clear_all();
+        }
         crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
         let wipe = DeferredWipe {
             low_end: self.cursor,
@@ -2733,6 +2864,12 @@ impl Arena {
     /// cursor bound.
     #[allow(dead_code)]
     pub unsafe fn reset_no_zero(&mut self) {
+        // Every base this arena handed out is now invalid: the cursors are back
+        // at the ends and the whole span is free. A stale bit here would be
+        // accepted at an address the next cycle allocates something else over.
+        if let Some(bits) = self.starts.as_ref() {
+            bits.clear_all();
+        }
         self.cursor = 0;
         self.high_cursor = self.data.len();
         self.clear_free_list();

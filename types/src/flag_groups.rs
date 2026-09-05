@@ -2020,6 +2020,13 @@ pub const INVENTORY: &[E] = &[
     // default for the same reason `g1-uncommit` is: it publishes the young
     // arenas' full reserved range to the JIT, and a decommitted granule faults
     // on touch rather than reading as zero.
+    // Opt-IN: maintain an EXACT object-start bitmap per arena (a bit per 8
+    // bytes, set in `hand_out`, cleared in `add_free_block` and on reset) and
+    // let `is_object_address` answer from it instead of deducing the answer
+    // from header bytes. Consulted in the ACCEPT direction only -- a miss falls
+    // through to the deduction, because the bitmap is knowably incomplete for
+    // TLAB-allocated objects and using it to REJECT would drop live roots.
+    E { group: Group::GC, token: "object-starts", on_key: Some("CRATONVM_GC_OBJECT_STARTS"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "static-root-slots", on_key: Some("CRATONVM_GC_STATIC_ROOT_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },

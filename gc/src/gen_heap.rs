@@ -1579,6 +1579,31 @@ pub fn young_bytes_uncommitted() -> u64 {
     YOUNG_BYTES_UNCOMMITTED.load(Ordering::Relaxed)
 }
 
+/// `is_object_address` answers the exact bitmap gave, and answers it declined.
+///
+/// The engagement pair for `CRATONVM_GC_OBJECT_STARTS`. `hits` counts the
+/// candidates the bitmap accepted without reading a header byte; `misses`
+/// counts the ones it had no bit for and which therefore paid the full
+/// deduction anyway. A high miss ratio is not a fault -- it is what a
+/// conservative scan over zeroes, small integers and long bit patterns looks
+/// like, and it is also what TLAB-allocated objects look like, since a TLAB
+/// chunk is one `hand_out` and its contents never reach the bitmap.
+///
+/// Separating those two populations is the next measurement, and it needs a
+/// workload rather than another counter.
+pub static OBJECT_START_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static OBJECT_START_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(hits, misses)` for the exact object-start fast path.
+pub fn object_start_counts() -> (u64, u64) {
+    (
+        OBJECT_START_HITS.load(Ordering::Relaxed),
+        OBJECT_START_MISSES.load(Ordering::Relaxed),
+    )
+}
+
 pub static JIT_REGION_BOUNDS: JitRegionBoundsTable = JitRegionBoundsTable {
     // Written out element-by-element (not `[const { ... }; 6]`) to stay under
     // the workspace MSRV — inline-const repeat expressions landed in 1.79.
@@ -2292,6 +2317,20 @@ pub struct GenerationalHeap {
     /// cannot leave a reader dereferencing freed memory. Only ever touched at
     /// publish time (STW), never on a read path.
     commit_bits_hold: Mutex<[Option<Arc<[AtomicU64]>>; 3]>,
+    /// Lock-free pointers to the two young arenas' exact object-start bitmaps,
+    /// and the `Arc`s that keep them alive.
+    ///
+    /// Same shape and the same reason as [`Self::commit_bits`]:
+    /// `is_object_address` is the VM's hottest validator and was deliberately
+    /// made lock-free, so it must reach the bitmap through a published pointer
+    /// rather than by locking the arena. `(0)` reads as "no bitmap", which is
+    /// the answer whenever `CRATONVM_GC_OBJECT_STARTS` is off and for the old
+    /// generation, which has no `Arena` at all.
+    ///
+    /// The pointer is retired BEFORE the `Arc` is dropped, so no reader can be
+    /// handed a pointer this heap is about to free.
+    object_starts: [AtomicUsize; 2],
+    object_starts_hold: Mutex<[Option<Arc<crate::heap_bitmap::HeapBitmap>>; 2]>,
     /// Card table covering the old generation's address space.
     ///
     /// T5.5.2 (HIGH-1 fix): the table now uses interior mutability for
@@ -2792,6 +2831,8 @@ impl GenerationalHeap {
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
             ],
             commit_bits_hold: Mutex::new([None, None, None]),
+            object_starts: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            object_starts_hold: Mutex::new([None, None]),
             card_table,
             next_hash_code: AtomicI32::new(1),
             young_gc_threshold: AtomicUsize::new(threshold),
@@ -3007,6 +3048,10 @@ impl GenerationalHeap {
         // is a wholly-committed `Vec<u8>`, so it never needs a screen; the two
         // young arenas do whenever the reserve/commit backing store is in use.
         self.store_commit_bits_locked(yf.commit_bits(), yt.commit_bits());
+        // ...and the exact object-start bitmaps, on the same schedule and for
+        // the same reason: the arenas may have been swapped or re-backed, so a
+        // pointer published before this call can describe the wrong arena.
+        self.store_object_starts_locked(yf.object_starts(), yt.object_starts());
     }
 
     /// Publish the young arenas' commit bitmaps into the lock-free
@@ -3015,6 +3060,32 @@ impl GenerationalHeap {
     ///
     /// Split out of [`Self::store_region_bounds_locked`] only so the borrow of
     /// the arena guards ends before the hold lock is taken.
+    /// Publish the two young arenas' object-start bitmaps into the lock-free
+    /// [`Self::object_starts`] mirror. Mirror of
+    /// [`Self::store_commit_bits_locked`], with the same retire-then-drop
+    /// ordering.
+    fn store_object_starts_locked(
+        &self,
+        yf: Option<Arc<crate::heap_bitmap::HeapBitmap>>,
+        yt: Option<Arc<crate::heap_bitmap::HeapBitmap>>,
+    ) {
+        let mut hold = self.object_starts_hold.lock();
+        for (i, bits) in [yf, yt].into_iter().enumerate() {
+            match &bits {
+                Some(b) => {
+                    self.object_starts[i]
+                        .store(Arc::as_ptr(b) as usize, Ordering::Release);
+                }
+                None => {
+                    // Retire before dropping the old `Arc`, so no reader can be
+                    // handed a pointer this call is about to free.
+                    self.object_starts[i].store(0, Ordering::Release);
+                }
+            }
+            hold[i] = bits;
+        }
+    }
+
     fn store_commit_bits_locked(
         &self,
         yf: Option<Arc<[AtomicU64]>>,
@@ -4376,6 +4447,29 @@ impl GenerationalHeap {
         }
     }
 
+    /// Ask arena `slot`'s exact object-start bitmap about `addr`.
+    ///
+    /// `None` means "not tracked" -- the switch is off, or the arena was grown
+    /// and dropped its bitmap -- and is a different answer from `Some(false)`.
+    /// Only slots 0 and 1 (the young semi-spaces) are `Arena`s; slot 2 is the
+    /// old generation, which is a `Vec<u8>` with no arena and therefore no
+    /// bitmap.
+    fn arena_object_start(&self, slot: usize, addr: usize) -> Option<bool> {
+        // Slot 2 is the old generation, which is a `Vec<u8>` with no `Arena`
+        // and therefore no bitmap.
+        let cell = self.object_starts.get(slot)?;
+        let ptr = cell.load(Ordering::Acquire) as *const crate::heap_bitmap::HeapBitmap;
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: the pointer was published by `store_object_starts_locked`
+        // from an `Arc` that `object_starts_hold` still owns, and that publisher
+        // retires the pointer (stores 0) BEFORE it drops the `Arc`, so a
+        // non-null read here cannot name freed memory. `HeapBitmap` is `Sync`
+        // and `contains` takes `&self`.
+        Some(unsafe { (*ptr).contains(addr) })
+    }
+
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         // Reject obvious garbage.
         if addr == 0 {
@@ -4440,6 +4534,7 @@ impl GenerationalHeap {
             return None;
         }
 
+
         // Validate raw enum tags before constructing an `ObjectHeader`
         // reference. Conservative root scans can land on arbitrary arena words;
         // invalid `#[repr(u8)]` discriminants must be rejected as bytes, not
@@ -4468,6 +4563,48 @@ impl GenerationalHeap {
         // the loose kind/slot checks below but fail one of these bytes.
         if !header_reserved_fields_plausible(header) {
             return None;
+        }
+
+        // EXACT ANSWER, once the bytes have been shown to be an object header.
+        //
+        // Everything BELOW this point exists to catch one thing: an address that
+        // is not an allocation base but whose bytes decode as a plausible one.
+        // The comment on the extent check names it -- an interior 16-byte
+        // `Value` cell of an `Object[]` gives `class_id=4` and `num_slots=4`,
+        // self-consistent and entirely coincidental -- and the way it is caught
+        // is by computing the claimed extent and proving it fits the arena and
+        // the commit map. That is the expensive half of this function.
+        //
+        // `Arena::is_object_start` settles the same question by construction: the
+        // bit was set in `hand_out` and cleared in `add_free_block`, so a hit
+        // means this arena really did hand `addr` out and has not taken it back.
+        // No interior address can hold that bit, so there is nothing left for
+        // the extent computation to catch.
+        //
+        // WHY IT IS HERE AND NOT BEFORE THE HEADER CHECKS, which is where it was
+        // first written. `hand_out` is the door for every allocation, not every
+        // OBJECT: a TLAB chunk is one hand-out, and its base carries the bit
+        // whether or not an object was ever bump-allocated at it. Accepting on
+        // the bit alone therefore hands a caller an `ObjectRef` to a chunk, whose
+        // first bytes are not an `ObjectHeader` -- the exact corruption this
+        // function exists to prevent, reintroduced by the thing meant to make it
+        // exact. The kind, element-type and reserved-field checks above are cheap
+        // byte tests and they are what rules that out; the extent arithmetic and
+        // the second commit probe are what the bitmap replaces.
+        //
+        // ACCEPT ONLY. `Some(false)` and `None` fall through unchanged, because
+        // the bitmap is knowably incomplete -- objects bump-allocated inside a
+        // TLAB chunk never reach `hand_out` -- and rejecting on it would drop
+        // live roots.
+        if let Some(hit) = self.arena_object_start(slot, addr) {
+            if hit {
+                OBJECT_START_HITS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: `raw` is inside a mapped arena region (checked above),
+                // its header decodes as a real object, and the bitmap confirms
+                // the arena handed this exact address out as an allocation base.
+                return Some(unsafe { ObjectRef::from_raw(raw as *mut u8) });
+            }
+            OBJECT_START_MISSES.fetch_add(1, Ordering::Relaxed);
         }
 
         // Cap num_slots at a sanity limit so a stale word can't fool us

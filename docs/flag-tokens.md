@@ -939,7 +939,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-143 tokens.
+144 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1043,6 +1043,7 @@ export inherited from a parent shell.
 | `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `compact-tlab-alloc` | `CRATONVM_COMPACT_TLAB_ALLOC` |
 | `compact-tlab-sites` | `CRATONVM_COMPACT_TLAB_SITES` |
+| `object-starts` | `CRATONVM_GC_OBJECT_STARTS` |
 | `gen-uncommit` | `CRATONVM_GEN_UNCOMMIT` |
 | `static-root-slots` | `CRATONVM_GC_STATIC_ROOT_SLOTS` |
 | `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
