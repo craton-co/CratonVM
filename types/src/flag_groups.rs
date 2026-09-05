@@ -3128,6 +3128,85 @@ mod tests {
         );
     }
 
+    /// **EVERY default-ON knob's off token must actually write the off word.**
+    ///
+    /// `default_on_knob_is_switched_off_by_value_not_by_unsetting` above pins
+    /// this for one row, which is one row's worth of protection: a NEW row
+    /// written in the wrong shape is not covered by it. Three were --
+    /// `xt-helper-window-discharge`, `xt-pinned-peer-depth` and
+    /// `xt-peer-shadow-scan` all named their own variable in `off_key` as well
+    /// as `on_key`, so `apply` took the "dedicated opt-out spelling" branch,
+    /// wrote `VAR=1`, then cleared `on_key` -- the same key -- and the knob came
+    /// out UNSET. Their parsers read unset as ON, so `CRATONVM_JIT=-<token>`
+    /// silently left three default-ON GC-root features running. Kill switches
+    /// that do not kill, which is worse than none: an arm that reads as
+    /// "the feature is not the cause" while the feature is still on.
+    ///
+    /// The structural gates caught the shape, and their message -- "off_word
+    /// only applies to a default-ON knob with no opt-out key" -- describes the
+    /// table, not the damage. This asserts the CONSEQUENCE, over every row that
+    /// has an `off_word` now or later, so the next one is reported as what it
+    /// costs rather than as a schema violation.
+    #[test]
+    fn every_default_on_knob_resolves_its_off_token_to_the_off_word() {
+        for e in INVENTORY {
+            let Some(word) = e.off_word else { continue };
+            let key = e
+                .on_key
+                .expect("checked by every_entry_can_be_switched_both_ways");
+            let c = case(&[(e.group.var(), &format!("-{}", e.token))]);
+            assert_eq!(
+                c.resolve().get(key),
+                Some(OsString::from(word)),
+                "{}=-{} must write {key}={word}. It resolved to {:?} instead, \
+                 which this knob's parser reads as ON -- the off token is inert.",
+                e.group.var(),
+                e.token,
+                c.resolve().get(key),
+            );
+        }
+    }
+
+    /// The three rows that were wrong, by name, because a table-driven test
+    /// keeps passing if a row is deleted. Each is a default-ON cross-thread
+    /// root-scan feature whose kill switch is the first thing an investigation
+    /// reaches for.
+    #[test]
+    fn the_xt_root_scan_kill_switches_actually_switch_off() {
+        for (group, token, key) in [
+            (
+                "CRATONVM_JIT",
+                "xt-helper-window-discharge",
+                "CRATONVM_XT_HELPER_WINDOW_DISCHARGE",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-pinned-peer-depth",
+                "CRATONVM_XT_PINNED_PEER_DEPTH",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-peer-shadow-scan",
+                "CRATONVM_XT_PEER_SHADOW_SCAN",
+            ),
+        ] {
+            let off = case(&[(group, &format!("-{token}"))]);
+            assert_eq!(
+                off.resolve().get(key),
+                Some(OsString::from("0")),
+                "{group}=-{token} must write {key}=0; the readers in \
+                 vm/src/jit/xt_root_scan.rs and conservative_roots.rs treat \
+                 anything else -- UNSET included -- as on"
+            );
+            let on = case(&[(group, token)]);
+            assert_eq!(
+                on.resolve().get(key),
+                Some(OsString::from("1")),
+                "{group}={token} must still write {key}=1"
+            );
+        }
+    }
+
     #[test]
     fn the_documented_no_ops_now_work() {
         // Each of these was documented for months and read by nothing: the
