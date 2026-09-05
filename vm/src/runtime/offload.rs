@@ -6863,8 +6863,43 @@ pub(crate) mod input_cache {
         if !is_enabled() {
             return;
         }
+        // BOTH steps under ONE hold of the cache mutex, in this order.
+        //
+        // The ORDER (bit, then map) is what makes the lock-free fast
+        // path in `invalidate` sound: a reader must never see the entry
+        // while its bit is still clear.
+        //
+        // Holding the LOCK across both is what makes it sound under
+        // concurrency, and until 2026-09-05 the `fetch_or` sat outside
+        // it. `rebuild_filter` STORES a mask recomputed from the table,
+        // so an inserting thread that had OR'd its bit but not yet
+        // reached the map could have that bit erased by any concurrent
+        // remover:
+        //
+        //   thread A: insert(X)        thread B: invalidate(Y)
+        //     ADDR_FILTER |= bit(X)
+        //                                lock
+        //                                table.remove(Y)
+        //                                rebuild_filter()  <- X is not
+        //                                  in the table yet, so this
+        //                                  STORES a mask with bit(X)
+        //                                  CLEARED
+        //                                unlock
+        //     lock
+        //     table.insert(X, entry)    <- X is now cached with its
+        //     unlock                       filter bit clear
+        //
+        // From then on every `invalidate(X)` takes the fast path and
+        // returns, so the host's writes to X never evict the device
+        // mirror and the next dispatch computes from a stale copy. A
+        // wrong answer, not a slow one — and it needs no GC: it was
+        // reproduced with zero collections in the run, which is why the
+        // remap/sweep path above is not the one at fault.
+        //
+        // See docs/known-issues/gpu/concurrent-dispatch-wrong-answer-20260905.md.
+        let mut tables = map().lock();
         ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
-        map().lock().entry(vm).or_default().insert(obj, entry);
+        tables.entry(vm).or_default().insert(obj, entry);
     }
 
     /// Drop the device-buffer cache entry for `obj` because the host
