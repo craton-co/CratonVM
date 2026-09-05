@@ -40,6 +40,15 @@ pub enum ParamKind {
     F64Array,
     I16Array,
     I8Array,
+    /// `boolean[]`.
+    ///
+    /// Unlike `char[]`, which reuses `I16Array` because `caload`/`saload`
+    /// carry the signedness in the OPCODE, `boolean[]` needs its own kind:
+    /// `bastore` serves BOTH `byte[]` and `boolean[]`, so the opcode
+    /// cannot say which narrowing applies. JVMS 6.5 requires the stored
+    /// int to be masked to bit 0 for a boolean array and left alone for a
+    /// byte array, and `array_store_byte` reads this kind to decide.
+    BoolArray,
 }
 
 impl ParamKind {
@@ -69,6 +78,7 @@ impl ParamKind {
                 FieldType::Double => ParamKind::F64Array,
                 FieldType::Short => ParamKind::I16Array,
                 FieldType::Byte => ParamKind::I8Array,
+                FieldType::Boolean => ParamKind::BoolArray,
                 // char[] reuses `I16Array` deliberately. Every
                 // `ParamKind::*Array` lowers to one `PtxParamKind::U64Ptr`
                 // (see `lowering.rs`), so the kind carries no element
@@ -96,6 +106,7 @@ impl ParamKind {
                 | ParamKind::F64Array
                 | ParamKind::I16Array
                 | ParamKind::I8Array
+                | ParamKind::BoolArray
         )
     }
 

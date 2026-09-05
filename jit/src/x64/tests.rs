@@ -7785,6 +7785,68 @@ fn test_arith_licm_no_hoist_when_operand_modified() {
 }
 
 #[test]
+fn test_arith_licm_no_hoist_when_operand_modified_by_wide_iinc() {
+    // The same refusal, through the `wide` prefix.
+    //
+    // AUDIT 2026-09-05. `find_modified_locals` had an arm for `iinc`
+    // (0x84) and none for `wide` (0xc4), so `wide iinc` fell to the
+    // length-only default: the walk stayed aligned and the local was
+    // never marked modified. javac emits `wide iinc` whenever the delta
+    // does not fit in a signed byte -- `i += 1024` -- so the induction
+    // variable of every such loop read as loop-INVARIANT and
+    // `i + <invariant>` got hoisted into the pre-header. Stride 1 was
+    // correct and stride 1024 was not.
+    //
+    //   PC 0: iload 4              — header
+    //   PC 2: iload_1
+    //   PC 3: if_icmpge +N
+    //   PC 6: iload 4  (the INDUCTION VARIABLE, not a constant)
+    //   PC 8: iload_0
+    //   PC 9: iadd                 ← i + base, must NOT hoist
+    //   PC 10: istore_2
+    //   PC 11: wide iinc 4, 1024   ← modifies local 4
+    //   PC 17: goto -17 → 0
+    let code: Vec<u8> = vec![
+        0x15, 0x04, // 0: iload 4
+        0x1b, // 2: iload_1
+        0xa2, 0x00, 0x11, // 3: if_icmpge +17 → 20
+        0x15, 0x04, // 6: iload 4   ← the induction variable
+        0x1a, // 8: iload_0
+        0x60, // 9: iadd
+        0x3d, // 10: istore_2
+        0xc4, 0x84, 0x00, 0x04, 0x04, 0x00, // 11: wide iinc 4, 1024
+        0xa7, 0xff, 0xef, // 17: goto -17 → 0
+        0, 0,
+    ];
+    let code_len = 20;
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_arith_loop_hoists(&code, code_len, &loops);
+    assert!(
+        hoists.is_empty(),
+        "an expression over a local incremented by WIDE iinc is not          loop-invariant and must not hoist; got {} hoist(s)",
+        hoists.len()
+    );
+}
+
+/// `wide` stores mark their local too, not just `wide iinc`.
+#[test]
+fn test_find_modified_locals_sees_every_wide_form() {
+    use crate::x64::escape_analysis::find_modified_locals;
+    // wide istore 4      c4 36 00 04
+    let m = find_modified_locals(&[0xc4, 0x36, 0x00, 0x04], 0, 4);
+    assert_eq!(m, 1 << 4, "wide istore must mark its local");
+    // wide astore 7      c4 3a 00 07
+    let m = find_modified_locals(&[0xc4, 0x3a, 0x00, 0x07], 0, 4);
+    assert_eq!(m, 1 << 7, "wide astore must mark its local");
+    // wide iinc 4, 1024  c4 84 00 04 04 00
+    let m = find_modified_locals(&[0xc4, 0x84, 0x00, 0x04, 0x04, 0x00], 0, 6);
+    assert_eq!(m, 1 << 4, "wide iinc must mark its local");
+    // wide iload 4 writes nothing.
+    let m = find_modified_locals(&[0xc4, 0x15, 0x00, 0x04], 0, 4);
+    assert_eq!(m, 0, "a wide LOAD must not mark anything");
+}
+
+#[test]
 fn test_arith_licm_excludes_idiv() {
     // idiv (0x6c) can throw ArithmeticException — it must never be part
     // of a hoisted run. `base / 3` here should yield no hoist.
