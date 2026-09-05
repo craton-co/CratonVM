@@ -14,7 +14,9 @@
 //! lane closed (the recorder existed with zero callers).
 
 use cratonvm_vm::config::VmConfig;
-use cratonvm_vm::jit::profile::{enable_profiling, MethodKey};
+use cratonvm_vm::jit::profile::{
+    enable_profiling, enable_receiver_profiling, is_receiver_profiling_enabled, MethodKey,
+};
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
 use std::sync::Arc;
@@ -177,8 +179,28 @@ fn test_pgo01_call_site_evidence() {
     // --- Negative control 2: same invokestatic shape, profiling disabled —
     // the gate itself must actually gate. A fresh Vm avoids any interference
     // from the profiling-enabled run above. ----------------------------------
+    //
+    // THERE ARE TWO GATES, AND CONSTRUCTING A VM RE-ARMS ONE OF THEM.
+    // `is_receiver_profiling_enabled()` is `PROFILING_ENABLED ||
+    // RECEIVER_PROFILING_ENABLED`; the second landed on 2026-09-02 so that
+    // receiver and call-site recording could be on by default while branch and
+    // back-edge recording stayed behind the master gate. `enable_profiling`
+    // clears only the master one, and `Vm::new` then calls
+    // `enable_receiver_profiling(tier_pgo_receivers())`, which DEFAULTS TRUE —
+    // so this control disabled nothing and the assertion below found
+    // `{11: 2}`. It read as "the gate leaks"; the gate was fine and the control
+    // was defeated by the VM it was about to measure.
+    //
+    // So: clear BOTH, and clear them AFTER construction. The assertion that the
+    // gate is really shut is the load-bearing part — without it a third gate
+    // would silently defeat this control the same way.
     enable_profiling(false);
     let mut vm2 = test_vm();
+    enable_receiver_profiling(false);
+    assert!(
+        !is_receiver_profiling_enabled(),
+        "the negative control must actually disable recording before it can claim \n         the gate works: `Vm::new` re-arms the receiver gate"
+    );
     let result = vm2.invoke(
         "cratonvm/PgoCallSiteEvidence",
         "callStaticLoop",

@@ -1387,6 +1387,8 @@ fn test_deopt_point(bci: u32) -> crate::deopt::DeoptimizationPoint {
 /// untransformed artifact can have: mapped back into interpreter-bci space,
 /// EVERY OSR entry in the region — the header's included — lands inside the
 /// FALLBACK copy, which sits after the guard and all four guarded bodies.
+/// "Every entry" is not "every pc": since `abcfaec38` only a pc whose abstract
+/// expression stack is EMPTY gets one, and this test pins both halves of that.
 /// `pc_to_native` is non-decreasing in pc, so comparing native offsets
 /// compares positions.
 ///
@@ -1420,19 +1422,73 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
         22,
         "one slot per interpreter bci, plus the end"
     );
+    // WHICH pcs may be entered at all, since `abcfaec38` (2026-09-04): an OSR
+    // entry pc must have an EMPTY abstract expression stack. Entering
+    // mid-expression lets the prologue materialise the pending operands once,
+    // correctly, for the entering iteration - and then every later iteration
+    // replays those frozen slots while the index advances, which is a
+    // wrong-VALUE bug no termination test can see. HotSpot has the same rule.
+    //
+    // Spelled out for this fixture rather than derived, because the depth at
+    // each pc IS the property:
+    //
+    //   4   iload_2    []        <- header, enterable
+    //   5   iload_0    [i]
+    //   6   if_icmpge  [i, n]
+    //   9   iload_1    []        <- enterable
+    //   10  iload_2    [s]
+    //   11  iadd       [s, i]
+    //   12  istore_1   [s+i]
+    //   13  iinc       []        <- enterable
+    //   16  goto       []        <- enterable, and the back edge
+    const ENTERABLE: [usize; 4] = [4, 9, 13, 16];
+    const MID_EXPRESSION: [usize; 5] = [5, 6, 10, 11, 12];
+
     // Versioning has no back-edge gap: the fallback is a full image of the
-    // region, so every INSTRUCTION in it keeps an entry — including the
-    // back edge itself, where a plain 4x unroll answers `-1` because its
-    // steady state is copy 0, which ends just before it.
-    let mut bci = 4usize;
-    while bci <= 16 {
+    // region, so every ENTERABLE pc in it keeps an entry - including the back
+    // edge itself, where a plain 4x unroll answers `-1` because its steady
+    // state is copy 0, which ends just before it.
+    for bci in ENTERABLE {
         assert!(
             rebuilt[bci] >= 0,
-            "bci {bci}: versioning must not refuse OSR inside the region"
+            "bci {bci}: versioning must not refuse OSR at an empty-stack pc \
+             inside the region"
         );
+    }
+    // BOTH DIRECTIONS, and this half is the one that earns its place. Asserting
+    // only the loop above passes just as well against a build that dropped the
+    // empty-stack rule and went back to publishing every pc - which is exactly
+    // the wrong-value bug that rule fixed. Until 2026-09-05 this test asserted
+    // the OPPOSITE of this loop, over every instruction in the region, and it
+    // was the only thing red on dev when the rule landed.
+    for bci in MID_EXPRESSION {
+        assert_eq!(
+            rebuilt[bci], -1,
+            "bci {bci}: an OSR entry pc must have an empty expression stack"
+        );
+    }
+    // The two lists have to PARTITION the region's real instruction
+    // boundaries, or either could quietly name a pc that is not one - a
+    // mid-instruction byte reads as `-1` and would satisfy the loop above for
+    // the wrong reason.
+    let mut bci = 4usize;
+    let mut walked: Vec<usize> = Vec::new();
+    while bci <= 16 {
+        walked.push(bci);
         bci += bytecode_len_at(&code, bci);
     }
     assert_eq!(bci, 19, "the walk must land past the back edge");
+    let mut listed: Vec<usize> = ENTERABLE
+        .iter()
+        .chain(MID_EXPRESSION.iter())
+        .copied()
+        .collect();
+    listed.sort_unstable();
+    assert_eq!(
+        walked, listed,
+        "the enterable and mid-expression lists must together be exactly the \
+         region's instruction boundaries"
+    );
     assert!(
         rebuilt[16] >= 0,
         "the back-edge bci stays enterable under versioning"
@@ -1446,7 +1502,7 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
          guard, which is not a loop header and so is not a pc the OSR \
          trampoline can reconstruct a compiled state for"
     );
-    for bci in [9usize, 10, 11, 12, 13, 16] {
+    for bci in ENTERABLE {
         assert!(
             rebuilt[bci] >= fallback_off,
             "bci {bci}: a mid-body OSR entry must land in the fallback copy, \
@@ -1456,6 +1512,71 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
     // …and the fast copies really are ahead of it, so the comparison above
     // is not trivially true of every artifact.
     assert!(out_osr[x.fast_base()] >= 0 && out_osr[x.fast_base()] < fallback_off);
+}
+
+/// `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` really does turn the rule off.
+///
+/// The switch was added 2026-09-05 to close the last open item on the
+/// retired `osr-miscompiles-cachecoherence-20260904` write-up: the rule is
+/// default-on CODEGEN that landed without a failure of its own, and re-opening
+/// the question should not need a rebuild. A declared flag that no test arms
+/// is a flag that might be inert, and every other test in this file would stay
+/// green if it were — so this asserts the difference the flag makes, on the
+/// same fixture and the same five pcs the test above pins as REFUSED.
+///
+/// `MID_EXPRESSION` is respelled rather than shared: the two tests must be
+/// able to disagree. If the list above is edited to match a regression, this
+/// one still names the pcs the rule was written for and fails.
+#[test]
+fn the_empty_stack_rule_has_an_off_switch_and_it_is_not_inert() {
+    // Depth at each pc, from the fixture's own table in the test above:
+    //   5 [i]  6 [i, n]  10 [s]  11 [s, i]  12 [s+i]
+    const MID_EXPRESSION: [usize; 5] = [5, 6, 10, 11, 12];
+
+    let rebuild = || {
+        let _armed = Armed::new();
+        let code = shape_int_accum_loop();
+        let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
+            .expect("versioned unroll");
+        let art = compile_bytes(&x.code, x.code_len).expect("compiles");
+        let out_osr = art
+            .osr_pc_to_native
+            .as_ref()
+            .expect("the artifact publishes OSR entries");
+        x.rebuild_pc_to_native(out_osr, 21)
+    };
+
+    // Default: refused, which is what `a_versioned_artifact_publishes_its_osr_
+    // entries_inside_the_fallback_copy` also asserts. Repeated here so a
+    // failure of this test says which half moved.
+    let on = rebuild();
+    for bci in MID_EXPRESSION {
+        assert_eq!(on[bci], -1, "bci {bci}: refused with the rule ON");
+    }
+
+    // Off: every one of them gets an entry again. Thread-scoped, so this does
+    // not disturb tests running in parallel in the same process — which is
+    // also why `osr_empty_stack_entry_enabled` must not latch in a `OnceLock`.
+    let off = cratonvm_types::flags::with_thread_overrides(
+        &[("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY", Some("1"))],
+        rebuild,
+    );
+    for bci in MID_EXPRESSION {
+        assert!(
+            off[bci] >= 0,
+            "bci {bci}: the rule is off, so this pc must be enterable again — \
+             the flag reached no read site"
+        );
+    }
+
+    // And nothing else moved: the enterable pcs are unaffected either way, so
+    // the difference above is the rule and not a wholesale change of artifact.
+    for bci in [4usize, 9, 13, 16] {
+        assert_eq!(
+            on[bci], off[bci],
+            "bci {bci}: an empty-stack pc is enterable under both settings"
+        );
+    }
 }
 
 /// End to end: with the rewriter armed the emitter really compiles the

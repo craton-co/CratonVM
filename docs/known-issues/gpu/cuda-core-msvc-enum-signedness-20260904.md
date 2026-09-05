@@ -80,6 +80,42 @@ would likely be closed as already-fixed. It also settles the convention
 -- `as _`, which keeps the source portable instead of hard-coding either
 platform's choice.
 
+### Verified on Linux 2026-09-05 -- WSL2, this same GPU
+
+The Windows census alone could only show one side of the ABI claim. WSL2
+(Ubuntu, kernel 6.18 microsoft-standard-WSL2) has `/dev/dxg` and
+`/usr/lib/wsl/lib/libcuda.so`, so `nvidia-smi` reports the same RTX 2060,
+and the CUDA 13.3 headers on the Windows side are readable at
+`/mnt/c/...` -- no toolkit install, and **no sudo**: rustup and the
+`libclang` wheel both live in `$HOME`.
+
+Same crate, same headers, same bindgen, same libclang 18.1.1; only the
+target differs:
+
+| | `c_uint` | `c_int` |
+| --- | ---: | ---: |
+| Linux (`x86_64-unknown-linux-gnu`, stable 1.98.1) | **111** | 2 |
+| Windows (`x86_64-pc-windows-msvc`) | 0 | **113** |
+
+The two that stay signed on Linux are exactly the two with a NEGATIVE
+enumerator (`CU_SHAREDMEM_CARVEOUT_DEFAULT = -1`,
+`CU_GRAPH_CHILD_GRAPH_OWNERSHIP_INVALID = -1`), so the rule is visible
+operating and predicting its own exceptions.
+
+Both README claims in the upstream report are now measured rather than
+argued:
+
+* unpatched `cuda-core` builds clean on Linux, on **stable**;
+* the runtime-PTX round trip ran on **sm_75** there, unpatched:
+  `mismatches = 0 of 1048576`.
+
+Two traps on the way, both mine. `types.rs` is pretty-printed on Windows
+and ONE 2 MB line on Linux, so a `^`-anchored census grep returned zero
+matches -- a formatting assumption reading as "no enums". And Git Bash
+rewrote `/mnt/c/...` into `C:/Program Files/Git/mnt/c/...` before
+`wsl.exe` saw it, which silently emptied several earlier probes;
+`MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1` is required on every call.
+
 ### `context.rs:293` is NOT affected
 
 Worth recording because it looks like it should be. `SyncPolicy::from_raw`

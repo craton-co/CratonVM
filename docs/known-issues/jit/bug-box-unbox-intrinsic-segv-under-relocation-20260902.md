@@ -77,12 +77,29 @@ CATEGORY is wrong, not that the next candidate inside it is closer.**
 
 ## Status
 
-**OPEN (root cause), MITIGATED (default flipped) 2026-09-02.** The stated
-hypothesis was refuted on 2026-09-02 -- see below -- and the search is narrowed
-rather than closed.
-`CRATONVM_JIT_BOX_UNBOX_INTRINSIC` is now opt-in. The crash it causes is gone
-from the shipped default; the reason the inline sequence is unsafe under a
-moving collector is NOT yet established, and that is what stays open.
+**RESOLVED 2026-09-04** — root cause found and fixed (the section above:
+`relocate_stw` slid a survivor into a granule the arena had decommitted;
+`Arena::ensure_committed_span` commits the destination first). The intrinsic is
+back at its shipped default of **ON** since `069e67b43`, and the crash does not
+reproduce.
+
+**Everything below this line is the investigation, not the answer.** It is kept
+because most of it is refuted hypotheses with the measurements that refuted
+them, and because two of those refutations cost days. Read it as history: the
+sections dated 2026-09-02 and 2026-09-03 reason from a stale-root framing that
+the root-cause section retires outright, and they say so in place.
+
+Three of the things this page left for a next reader are now closed:
+
+| item | state |
+|---|---|
+| the root cause | fixed 2026-09-04, `ensure_committed_span` |
+| the intrinsic's default | back ON, `069e67b43` |
+| the blocked-wake JIT remap | landed (`vm_exec::apply_pending_blocked_fixups` now remaps JIT frames and the register image) |
+| the `op:1033` blocker on the repro | fixed — it was the guarded-inline native screen asking the declaring class, `internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md` |
+
+The one item still open is `local_mask_unreached` — see **What is still open**
+at the end.
 
 ## What happens
 
@@ -466,19 +483,34 @@ Two ruled-out-by-checking notes for whoever takes it:
   which is what confirms whatever suppresses the crash in the guard arm is the
   PEER coverage and not per-safepoint map completeness.
 
-## The mitigation
+## The mitigation — SUPERSEDED, the default is back ON
 
-`box_unbox_intrinsic_disabled()` now defaults to disabled. Set
-`CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` to turn the family back on -- which is how
-the root-cause work should run it. The fix arm was verified at **3 of 3 runs
-clean to the 1200 s cap** on the workload that crashed 11 out of 11. `CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`
-still forces it off and still means the same thing, so any script that already
-sets it is unaffected.
+For two days `box_unbox_intrinsic_disabled()` defaulted to disabled and
+`CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` turned the family back on. **That is no
+longer the shipped state.** `069e67b43` restored the default to ON once the
+crash was root-caused to the collector rather than to this intrinsic: the
+intrinsic's only part was raising allocation pressure enough to make the slide
+run, which is why turning it off hid the crash and why turning it off was never
+a fix.
 
-Correctness first: the measured speedup is recoverable the moment the sequence
-is made relocation-safe.
+`CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still means the
+same thing, so any script that already sets it is unaffected.
 
-## The repro is currently BLOCKED by an earlier failure (2026-09-02)
+The speedup this section promised was "recoverable the moment the sequence is
+made relocation-safe". The sequence never was the problem; it was recovered by
+fixing the collector.
+
+## The repro was BLOCKED by an earlier failure (2026-09-02) — CLEARED
+
+**That blocker is fixed.** `seed:0 op:1033 AssertionError: (1810, null)` was the
+guarded-inline native screen asking the callee's DECLARING class when the native
+is registered on the concrete receiver class, so a compiled
+`for (e : treeMap.tailMap(k).entrySet())` iterated zero entries:
+`internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`.
+The section below is kept for its method note — which is still the right advice
+for scoring a bisect — and its "whoever takes this page next has to clear that
+first" instruction no longer applies.
+
 
 Run on `dev@08a1711e5`, `livedbg`, quiet host, against H2 built at
 `apps/h2database/h2`. **It cannot reach the window this page measures in.**
@@ -547,3 +579,55 @@ spelling is the token above.
 
 **As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
 currently BLOCKED by an earlier failure".
+
+## What is still open
+
+**One item: `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` should default ON,
+and the evidence for flipping it is stale.**
+
+This page found and priced a real correctness hole that is not this crash: a
+safepoint whose local-oop dataflow was never REACHED ships a map claiming
+complete frame-slot coverage while naming none of its live reference locals
+(`map_incomplete_cause::LOCAL_MASK_UNREACHED`, 125 on `TestCachedQueryResults`
+and dominant, while the SHADOW half counted the same population and refused).
+Its sibling — `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED`, the same hole for a method
+the dataflow never ran on at all — already **defaults ON** with a `=0` opt-out.
+This one is still opt-in, and `licm.rs` says why: *"this population is larger
+and its refusal cost is still being priced"*.
+
+The page's own pricing said ZERO OOM on 4 runs and 88/88, and recommended
+default-ON. **That pricing is no longer usable, and not because it was wrong.**
+It was taken on 2026-09-03, before the root-cause fix at the top of this page
+moved the OOM baseline on this very workload from 1497 to 0. A refusal's cost
+has to be measured against the collector that ships, and the collector changed
+underneath it. The whole reason to price this at all is that the blanket guard
+— the other refusal measured on this family — bought its safety at ~9700
+fragmentation OOMs and total loss of completion.
+
+**Attempted 2026-09-05 and not obtained.** An ABBA-interleaved re-pricing on
+`org.h2.test.jdbc.TestCachedQueryResults --Xmx 256m` was started on host `vm1`
+at load average 29-33. The first arm **timed out at the 1300 s cap** on a
+workload this page records completing in 462-728 s quiet, so every arm would
+have timed out and a timed-out arm yields no OOM or completion figure to
+compare. The run was stopped rather than reported. This page's own repro note
+already says it: *"A CONTENDED host hides it."*
+
+To finish it, on a quiet host (load < 5):
+
+```
+CVM=<release cratonvm> JDK=$JDK25
+H=apps/h2database/h2
+CP="$H/target/test-classes:$H/target/classes:$(cat $H/craton-testcp.txt)"
+# ABBA, 4 runs per arm, from a scratch cwd; count OutOfMemoryError and `actual`
+for arm in A B B A; do
+  case $arm in A) F= ;; B) F=CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1 ;; esac
+  env $F CRATONVM_GC_STATS=1 timeout 1300 "$CVM" --java-home "$JDK" --Xmx 256m \
+      -cp "$CP" org.h2.test.jdbc.TestCachedQueryResults
+done
+```
+
+Flip it when the fail-closed arm shows no OOM increase and still completes —
+inverting `local_mask_unreached_fail_closed_enabled` in `jit/src/x64/licm.rs`
+to the `=0`-opt-out shape its sibling already uses, and changing the
+`flag_groups.rs` row from `on_key` to `off_key`. **Do not flip it on the
+2026-09-03 numbers.**

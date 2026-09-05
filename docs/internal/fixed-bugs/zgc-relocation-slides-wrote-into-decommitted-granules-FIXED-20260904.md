@@ -179,3 +179,42 @@ address is inside one, tagged with the give-back's site. This page reached
 `compact_high_region` through gdb; the crash report said nothing. With the ring
 armed the same crash prints `site=free-list-high` and "NOT re-committed since",
 which is the diagnosis, in the report, from one run.
+
+### Confirmed on the full H2 suite, 2026-09-05
+
+Not just on the reproducer. All 218 classes, ZGC, `jit-real`, three shards on
+`vm1`, against the 2026-09-03 ZGC full run taken under comparable contention:
+
+| | baseline (09-03) | dev tip (09-05) |
+|---|---|---|
+| PASS | 176 | **182** |
+| FAIL | 16 | 15 |
+| HANG | 21 | 21 |
+| **CRASH** | **5** | **0** |
+
+**Zero regressions** — no class that passed on 09-03 stopped passing. And no
+`SIGSEGV` or fatal-error report anywhere in the run; the baseline had five, and
+all five are gone:
+
+| class | 09-03 | 09-05 |
+|---|---|---|
+| `db.TestLargeBlob` | CRASH | **PASS** |
+| `db.TestLIRSMemoryConsumption` | CRASH | **PASS** |
+| `unit.TestPerfectHash` | CRASH | **PASS** |
+| `synth.TestPowerOffFs2` | CRASH | FAIL |
+| `store.TestKillProcessWhileWriting` | CRASH | HANG |
+
+The last two still do not pass, but they no longer crash — a different failure,
+to be taken on its own terms rather than as this one.
+
+Worth recording about `TestLargeBlob` specifically: it crashed on 09-03 with NO
+`CRATONVM_ZGC_ALLOC_TRIGGER` set. The trigger was a way to make the defect
+reproduce on demand, not a precondition for it — the suite was meeting this by
+default, on three classes, and one of them (`TestLIRSMemoryConsumption`) had its
+own known-issue page pointed elsewhere.
+
+The remaining movement is HANG/FAIL churn among classes that were already
+failing (`TestCluster` and `TestDiskFull` to PASS, `TestStringCache` HANG to
+PASS, `TestKill` FAIL to HANG, `TestMVStoreCachePerformance` HANG to FAIL).
+HANG totals are identical at 21, and these are 300 s class timeouts on a shared
+box, so read them as contention rather than as signal.

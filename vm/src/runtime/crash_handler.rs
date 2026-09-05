@@ -2750,7 +2750,7 @@ not an address\n",
         //
         // Built after a crash of this exact family was diagnosed through gdb
         // instead, because the report had nothing to say about it --
-        // `docs/internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+        // `internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
         if fault_addr_is_real {
             let mut rbuf = [0u8; 16];
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  gc_decommits_total=0x");
@@ -2783,13 +2783,32 @@ not an address\n",
                 } else {
                     async_signal_safe::write_all(
                         async_signal_safe::STDERR_FD,
-                        b"#    *** and NOT re-committed since. This IS a use-after-free of heap memory: something held a pointer into a span the collector proved dead. ***\n",
+                        b"#    *** and NOT re-committed since. Something TOUCHED a span the collector proved dead: either a stale pointer read it, or a writer wrote into it. ***
+",
                     );
-                    // WHICH proof was wrong is the fork an investigation
-                    // otherwise cannot resolve from a register dump.
+                    // WHAT touched it is the fork an investigation otherwise cannot
+                    // resolve from a register dump. NOT "which liveness proof was
+                    // wrong": the span is usually dead and correctly free-listed,
+                    // and the defect is a WRITER. ZGC-RELOC-DECOMMIT.1 was a
+                    // compaction slide memmoving into a free-list-high span with no
+                    // missing root anywhere -- and this legend used to assert one,
+                    // which sent that investigation hunting an unrooted reference
+                    // that does not exist.
                     async_signal_safe::write_all(
                         async_signal_safe::STDERR_FD,
-                        b"#    site=free-list-* means the span was SWEPT and free-listed while still reachable -- a missing root.\n#    site=*-retract or unbumped-middle means a CURSOR passed over live bytes -- a sweep that mis-sized the live set.\n#    CRATONVM_GC_RESERVE=0 keeps the granules mapped, so the same defect reads stale bytes instead of faulting.\n",
+                        b"#    A dead span is a NORMAL state; REACHING it is the defect. Two shapes:
+#      (a) a WRITER put something there. The compaction slides pick a destination
+#          inside free space arithmetically, so they must go through
+#          Arena::commit_for_relocation first -- see ZGC-RELOC-DECOMMIT.1.
+#      (b) a READER held a stale pointer. Only THEN was the span reachable when it
+#          was freed, i.e. a missing root, or a sweep that mis-sized the live set
+#          (site=*-retract / unbumped-middle mean a cursor passed over live bytes).
+#    The faulting operand does NOT separate these: a memmove whose ranges overlap
+#    can fault at an address lying inside BOTH src and dst. Ask whether a slide was
+#    in progress before concluding a root is missing.
+#    CRATONVM_GC_RESERVE=0 keeps the granules mapped, so the same defect reads or
+#    writes stale bytes instead of faulting.
+",
                     );
                 }
             } else {

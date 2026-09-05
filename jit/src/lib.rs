@@ -2872,7 +2872,8 @@ pub struct CompiledMethod {
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
-    /// `(bci, offset of its OSR entry stub)` for every bci the OPTIMIZING
+    /// `(bci, offset of its OSR entry stub, locals the stub reads)` for every
+    /// bci the OPTIMIZING
     /// tier's body can be entered at part-way.
     ///
     /// Empty on every artifact today: the stubs are emitted only under
@@ -2888,7 +2889,21 @@ pub struct CompiledMethod {
     /// These are entry POINTS — each builds this tier's frame and seeds the
     /// locals itself, because an SSA body has no fixed local→home map to hand
     /// a trampoline.
-    pub ir_osr_entries: Vec<(u32, u32)>,
+    pub ir_osr_entries: Vec<(u32, u32, u32)>,
+    /// This body emits no site that can return the `i64::MIN` sentinel: no
+    /// deopt stub and no call-exception stub.
+    ///
+    /// Which is a different question from `deopt_points.is_empty()`, and the
+    /// difference matters. A deopt POINT is a resume description — the lowerer
+    /// records one per safepoint snapshot that has a native offset, so a loop
+    /// with no calls at all still has eleven of them. What decides whether a
+    /// body can leave abnormally is whether anything JUMPS to a stub, and that
+    /// is `deopt_stub_patches` / `call_exc_patches`.
+    ///
+    /// The OSR door reads it: an optimizing-tier entry has no
+    /// `OsrEntryPlan::resume_after_exit` to resume through, so it may only
+    /// enter a body that cannot take that exit.
+    pub ir_osr_sentinel_free: bool,
     /// real-frame-deopt: boxed deopt points whose addresses are baked as
     /// imm64 into the guard/deopt-trampoline machine code. JIT code holds raw
     /// pointers into these boxes, so — like `_jit_invoke_infos` — they must
@@ -3294,6 +3309,7 @@ impl CompiledMethod {
             safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             ir_osr_entries: Vec::new(),
+            ir_osr_sentinel_free: false,
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
@@ -3379,6 +3395,7 @@ impl CompiledMethod {
             safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             ir_osr_entries: Vec::new(),
+            ir_osr_sentinel_free: false,
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
@@ -3893,12 +3910,43 @@ impl CompiledMethod {
     /// from outside.
     ///
     /// `None` on every artifact today; see [`Self::ir_osr_entries`].
-    pub fn ir_osr_entry_addr(&self, bci: u32) -> Option<usize> {
+    pub fn ir_osr_entry_addr(&self, bci: u32) -> Option<(usize, u32)> {
         self.ir_osr_entries
             .iter()
-            .find(|(b, _)| *b == bci)
+            .find(|(b, _, _)| *b == bci)
             // Cast: an offset inside this artifact's own buffer.
-            .map(|(_, off)| self.entry as usize + *off as usize)
+            .map(|(_, off, needed)| (self.entry as usize + *off as usize, *needed))
+    }
+
+    /// Enter this artifact's optimizing-tier body at `bci`, seeding `locals`.
+    ///
+    /// The whole interface. Contrast [`Self::osr_enter`], which hands
+    /// `osr_trampoline` some twenty layout fields because that trampoline
+    /// builds the single-pass frame from OUTSIDE; this stub builds its own,
+    /// seeds the locals the snapshot at `bci` names, and jumps into the body.
+    ///
+    /// `None` when there is no entry for `bci`, or when the caller offered
+    /// FEWER locals than the stub reads. The second is the admission this call
+    /// owes: the stub indexes `locals[i]` by JVM local index with no bound of
+    /// its own, so a short slice would read past the end of the interpreter's
+    /// snapshot. Refusing is free — the interpreter simply keeps running the
+    /// frame it is already in.
+    ///
+    /// # Safety
+    /// `ctx` must be this VM's context pointer, and the calling thread must be
+    /// the one that installed the JIT thread pointer — the same contract every
+    /// other entry into compiled code carries.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn ir_osr_enter(&self, bci: u32, ctx: i64, locals: &[i64]) -> Option<i64> {
+        let (addr, needed) = self.ir_osr_entry_addr(bci)?;
+        if locals.len() < needed as usize {
+            return None;
+        }
+        // SAFETY: `addr` is inside this artifact's own executable buffer, at an
+        // offset `emit_osr_entry_stubs` recorded for a stub it emitted with
+        // exactly this signature.
+        let f: extern "C" fn(i64, *const i64) -> i64 = std::mem::transmute(addr);
+        Some(f(ctx, locals.as_ptr()))
     }
 
     pub fn can_osr_enter(&self, entry_pc: usize) -> bool {
@@ -6232,6 +6280,22 @@ fn c2_alloc_upgrade_enabled() -> bool {
         // old reason applies again unchanged. See `ir_inline_tlab_enabled`
         // for the repro and for what was ruled out.
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
+    })
+}
+
+/// May a method containing `anewarray` still plan its invokes?
+///
+/// Default yes. `=0` restores the historical coupling, where one reference-array
+/// allocation anywhere in a method discarded `invoke_info` for the whole method
+/// and the builder then refused it at its first invoke.
+fn ir_calls_with_anewarray_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_ANEWARRAY").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
@@ -23610,7 +23674,27 @@ fn try_compile_inner(
                 // arg-escaped by the escape analysis, so it is really allocated
                 // rather than scalar-replaced — see `build_connection_graph`'s
                 // `Op::Call` arm.
-                let call_eligible = scan.anewarray_ops.is_empty();
+                // `ir_compatible` admits up to `IR_MAX_ARRAY_ALLOCATIONS` (16)
+                // `anewarray` ops, "each one lowered through the shared
+                // `emit_new_array_stub`" — and then this line refused
+                // `invoke_info` for a method containing even ONE. Since a
+                // missing map bails the builder at whichever invoke comes
+                // first, the two gates disagreed and the admission gate lost:
+                // the method was admitted, walked, and then refused.
+                //
+                // The `new_ops` half of this same condition was already deleted
+                // as "a term that outlived its reason"; no rationale was ever
+                // recorded for the `anewarray` half, and the IR tier lowers
+                // `anewarray` through its own helper
+                // (`live_anewarray_calls_the_reference_array_helper`).
+                //
+                // Measured on `org.h2.test.db.TestAlter`: 13 of the 35 methods
+                // that lose `invoke_info` lose it here — 37% of the single
+                // largest refusal in the tier.
+                //
+                // `CRATONVM_JIT_IR_CALL_ANEWARRAY=0` restores the coupling.
+                let call_eligible =
+                    scan.anewarray_ops.is_empty() || ir_calls_with_anewarray_enabled();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     // See `builder.set_object_init_pcs` below.

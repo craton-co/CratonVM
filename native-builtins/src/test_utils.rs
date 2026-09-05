@@ -968,6 +968,14 @@ pub(crate) struct MockNativeContext {
     /// GpuStream affinity: every handle passed to `gpu_stream_release`,
     /// in call order. Read via `gpu_stream_release_calls()`.
     pub(crate) gpu_stream_release_calls: UnsafeCell<Vec<u64>>,
+    /// Every handle passed to `gpu_release_submission`, in call order.
+    /// Read via `gpu_release_submission_calls()`.
+    ///
+    /// The submission drain is a SECOND table keyed by the same handle as
+    /// this crate's own `state::futures`, and the shim is the only thing
+    /// that can bridge the two — see
+    /// `release_future_forwards_the_drain_to_the_registry`.
+    pub(crate) gpu_release_submission_calls: UnsafeCell<Vec<u64>>,
 }
 
 impl MockNativeContext {
@@ -1040,6 +1048,7 @@ impl MockNativeContext {
             gpu_stream_create_override: UnsafeCell::new(None),
             gpu_stream_create_calls: UnsafeCell::new(0),
             gpu_stream_release_calls: UnsafeCell::new(Vec::new()),
+            gpu_release_submission_calls: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -1213,6 +1222,13 @@ impl MockNativeContext {
     pub(crate) fn gpu_stream_release_calls(&self) -> Vec<u64> {
         // SAFETY: single-threaded test code.
         unsafe { (*self.gpu_stream_release_calls.get()).clone() }
+    }
+
+    /// Every handle the shim forwarded to `gpu_release_submission`, in
+    /// call order.
+    pub(crate) fn gpu_release_submission_calls(&self) -> Vec<u64> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.gpu_release_submission_calls.get()).clone() }
     }
 
     /// WP8.11.5: read the most recent `DefineClassFull` options passed
@@ -2610,6 +2626,13 @@ impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
         // SAFETY: single-threaded test code.
         unsafe {
             (*self.gpu_stream_release_calls.get()).push(handle);
+        }
+    }
+
+    fn gpu_release_submission(&mut self, handle: u64) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.gpu_release_submission_calls.get()).push(handle);
         }
     }
 }

@@ -1,6 +1,37 @@
-# A compiled caller can offload — but not while it also writes arrays
+# A compiled caller can offload
 
-**Status:** built, measured, and **opt-in**
+**Status:** DEFAULT since 2026-09-05.
+`CRATONVM_GPU_JIT_GATE_CALLERS=block` is the way back.
+
+Held opt-in for one day on one scenario — `runtime-stress.sh`'s
+`cache_coherence` — which turned out to be a JIT miscompilation this mode
+merely became the first thing to expose (`wide iinc` invisible to LICM;
+see `../jit/osr-miscompiles-cachecoherence-20260904.md`). With that fixed,
+every GPU suite passes with this as the default: `runtime-stress` (7/7),
+`jit-writer-stale`, `residency-gc` (3 collectors), `marshal-stress`,
+`submission-drain`, `gate-overbroad`, `ci-gate` (4 gates).
+
+`GpuHookOverheadBench`, one binary, this switch the only difference:
+
+| arm | `base` | `small` | `big` |
+|---|---:|---:|---:|
+| **default (hook)** | **17.8** | **457.9** | **66.0-72.8** |
+| `block` | 983.4 | 21952.3 | 77.5-114.6 |
+| no `--gpu` | 13.1 | 18.0 | 1030.4 |
+
+55x on `base`, 48x on `small`, and better on `big` too (3/3 repeats —
+a single earlier reading that said otherwise was noise, `block` being the
+noisier arm). `base` is a loop over an INELIGIBLE target, so the offload
+hook is not in it: that column is purely the cost of the enclosing method
+having been denied compilation. Engagement on the same run:
+`considered=9519 offloaded=9005 declined=514 bailed=0 sites_retired=2`.
+
+`bench-gpu/gate-overbroad.sh` measures the breadth of the CALLER gate, so
+both its control arms and its reference arm now pin
+`CRATONVM_GPU_JIT_GATE_CALLERS=block` — under the new default that gate is
+off outright and the comparison would be vacuous rather than failing.
+
+**Original status:** built, measured, and **opt-in**
 (`CRATONVM_GPU_JIT_GATE_CALLERS=hook`). The default is unchanged.
 **Blocker:** `bench-gpu/runtime-stress.sh`'s `cache_coherence` scenario
 fails under it. Not root-caused.
@@ -109,7 +140,9 @@ feature.
 `GpuRuntimeStress.cacheCoherence` is **miscompiled by OSR**.
 `CRATONVM_JIT_DENY` on that one method fixes it; denying `scale`, `sum`
 or `mix` does not. See
-`docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+the retired `osr-miscompiles-cachecoherence-20260904` write-up (fixed
+2026-09-05: the single-pass arith-LICM's invariance mask could not decode
+a `wide iinc`, so a strided loop's stored value was hoisted out of it).
 
 ### What this gate was doing
 

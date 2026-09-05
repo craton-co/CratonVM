@@ -1,6 +1,47 @@
 # `--gpu` refuses OSR for the hot loop, and kfusion runs 8x slower
 
-## Status
+## RESOLVED 2026-09-05 — the 8x does not reproduce
+
+Re-measured on the 2026-09-05 dev tip, and **neither half of the title
+still holds**:
+
+* **The OSR refusal is gone.** `Integration.integrate` gets **1** OSR
+  enter under `--gpu`, the same as without it. The page recorded 0.
+* **The 8x is gone.** Integration time, `--gpu` / no-`--gpu`, over three
+  alternating rounds: **0.98x, 0.99x, 1.56x** (totals 1.00x, 1.09x,
+  1.54x). The page's figures were 42.9 s → 327.6 s, a 7.6x regression.
+
+The breadth fix this page already documents
+(`fix/gpu-jit-gate-overbroad-20260904`) evidently closed the case it said
+it had left open. Its "What is LEFT" section below argues the residual is
+"still 8x for an offload that almost never happens"; on this workload
+that is now false.
+
+**What is NOT claimed.** The box was at 87% load and absolute times swung
+2.5x between rounds (integration 52 s to 128 s for the *same* arm), and
+there was no same-config control arm, so the ratio has wide error bars
+and the >1 lean in round 3 is not resolvable. The claim is only that the
+7.6x is absent — the worst round is 1.56x, five times smaller — not that
+`--gpu` is free here.
+
+**Reproduced how.** The blocker was recorded as "kfusion, whose dataset
+and build output are no longer on this box". The build output IS on the
+box, at `C:/craton/CratonVM1/apps/kfusion-tornadovm`; only the dataset
+and `bm-1f.settings` were missing. Both are now recoverable without the
+slambench build chain:
+
+* `bench-gpu/kfusion-1frame-dataset.py` writes the one-frame `.raw`
+  directly from the ICL-NUIM tarball (the layout is 16 + w*h*5 bytes,
+  read out of `RawDevice.java`);
+* `bench-gpu/kfusion-bm-1f.settings` is the settings file, reconstructed
+  from `bm-traj2.settings` since the original was never committed.
+
+That reconstruction is why the ABSOLUTE numbers here are not comparable
+with the ones above (integration 128 s vs the page's 42.9 s): the volume
+dimensions and integration rate come from `bm-traj2` and may differ from
+whatever the original `bm-1f` held. The ratio is what carries.
+
+## Status (as recorded 2026-09-04)
 
 **Root-caused and measured. Not fixed.** The chain below is established
 end to end by counters added on 2026-09-03/04, all of which are on `dev`,

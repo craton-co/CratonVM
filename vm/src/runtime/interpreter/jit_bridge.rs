@@ -3418,6 +3418,24 @@ pub(super) fn route_osr_exception_out_of_artifact(
     }
 }
 
+/// Let the OSR door reach the OPTIMIZING tier -- **default OFF**, opt in with
+/// `CRATONVM_JIT_OSR_OPTIMIZING=1`.
+///
+/// This door has always reached `x64::compile_with_param_slots` directly, so a
+/// method whose only route to compiled code is a back edge -- one big method
+/// that is one big loop -- has never had an optimizing body, whatever the tier
+/// settings said. `CRATONVM_DBG=ir-linear-scan` measured what that costs: on
+/// CratonBench, `arithmetic`, `hashmap`, `sieve` and `matrix` get no optimizing
+/// body at all, while six of seven methods compiled here would pass the tier's
+/// structural gate.
+fn osr_optimizing_tier_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_OPTIMIZING").is_some()
+    })
+}
+
 pub(super) fn try_osr(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3474,16 +3492,111 @@ pub(super) fn try_osr(
     // wire-tiered-manager Step 5: the OSR compile (or cache reuse) now lives in
     // `compile_osr_artifact`, which the background worker can also call off-thread.
     // The live-frame entry/transfer below stays on the mutator.
-    let compiled = compile_osr_artifact(
-        shared,
-        class_id,
-        class_name.to_string(),
-        method_name.to_string(),
-        method_descriptor.to_string(),
-        &code,
-        max_locals,
-        entry_pc,
-    )?;
+    // ── The optimizing tier, reached through the shared assembly ──────
+    //
+    // `compile_optimizing_artifact` is the input assembly WITHOUT the
+    // method-entry door's admission policy — the split exists because asking
+    // that door instead marks the method bail-listed on refusal, and
+    // `compile_gate::admit` honours the bail-list here too, so the question
+    // could switch off the single-pass OSR that works today.
+    //
+    // Used only when what comes back carries an entry stub for THIS bci. The
+    // lowerer refuses a bci whose live-in set the interpreter cannot supply
+    // (`emit_osr_entry_stubs`), so a stub's presence already means seeding here
+    // is sound. And only when the body CANNOT RETURN THE SENTINEL: an entered body
+    // that exits through one hands back a reconstructed frame, and resuming it
+    // in place is what `OsrEntryPlan::resume_after_exit` proves — a proof an
+    // optimizing entry does not have, leaving replay-or-lose at the exit. No
+    // deopt points means nothing returns the sentinel and that fork is
+    // unreachable.
+    //
+    // Anything else falls through to the single-pass path below, unchanged.
+    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled() {
+        // The frame's own handle when it has one, and a resolution when it does
+        // not. `main` is entered by the launcher rather than through the invoke
+        // cache, so its frame carries no `CachedBytecodeMethod` — and a method
+        // whose only route to compiled code is a back edge is very often
+        // exactly that shape, so taking the frame's handle alone made this
+        // inert on the population it was built for.
+        let cached_for_compile = thread.frames[frame_idx]
+            .cached_method()
+            .cloned()
+            .or_else(|| {
+                let key = format!("{class_name}.{method_name}:{method_descriptor}");
+                super::deopt_resume::resolve_inlined_callee(shared, class_id, &key).ok()
+            });
+        cached_for_compile
+            .or_else(|| {
+                if crate::runtime::env_cache::dbg_jitc() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr optimizing {class_name}.{method_name}: no cached method"
+                    );
+                }
+                None
+            })
+            .and_then(|c| {
+                let cm = compile_optimizing_artifact(shared, &c);
+                if crate::runtime::env_cache::dbg_jitc() {
+                    match &cm {
+                        None => eprintln!(
+                            "[cratonvm-jitc] osr optimizing {class_name}.{method_name} pc={entry_pc}: compile declined"
+                        ),
+                        Some(cm) => eprintln!(
+                            "[cratonvm-jitc] osr optimizing {class_name}.{method_name} pc={entry_pc}: stub={} entries={:?} sentinel_free={}",
+                            cm.ir_osr_entry_addr(entry_pc as u32).is_some(),
+                            cm.ir_osr_entries.iter().map(|(b, _, _)| *b).collect::<Vec<_>>(),
+                            cm.ir_osr_sentinel_free,
+                        ),
+                    }
+                }
+                let cm = cm?;
+                // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
+                if cm.ir_osr_entry_addr(entry_pc as u32).is_some() && cm.ir_osr_sentinel_free {
+                    Some(Arc::new(cm))
+                } else {
+                    None
+                }
+            })
+    } else {
+        None
+    };
+    let compiled = match ir_osr {
+        Some(c) => {
+            cratonvm_jit::metrics::record_osr_event("osr_entered_optimizing");
+            // Dump the body this door is about to ENTER, under a label that
+            // distinguishes it from the single-pass one.
+            //
+            // Without this the optimizing artifact is invisible to
+            // `CRATONVM_DBG_JIT_DISASM`: the only `osr` dump comes from inside
+            // `compile_osr_artifact`, which this arm SKIPS — and the background
+            // tier worker calls that function anyway, so a dump appears, is
+            // labelled `osr`, and is the single-pass body. Reading it while the
+            // door was on showed code that did not change when the residency
+            // flags changed, which is exactly the wrong conclusion and cost
+            // several rounds to catch. The counter said the door had engaged
+            // and the disassembly said it had not; the disassembly was of
+            // another artifact.
+            crate::jit::disasm::maybe_dump(
+                "osr-optimizing",
+                &class_name_arc,
+                &method_name_arc,
+                &descriptor_arc,
+                c.entry_ptr(),
+                c.code_bytes(),
+            );
+            c
+        }
+        None => compile_osr_artifact(
+            shared,
+            class_id,
+            class_name.to_string(),
+            method_name.to_string(),
+            method_descriptor.to_string(),
+            &code,
+            max_locals,
+            entry_pc,
+        )?,
+    };
 
     // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret),
     // reading each slot's VTAG byte from the SAME snapshot as its word.
@@ -3561,7 +3674,22 @@ pub(super) fn try_osr(
     // A refusal is free of side effects — the check reads metadata and these two
     // slices, allocates one `Vec`, and never enters compiled code — so falling
     // back to `entry_pc`, where the interpreter already is, replays nothing.
-    let plan = match compiled.validate_osr_entry(&osr_state) {
+    // An optimizing-tier stub is admitted by its OWN construction, not by
+    // `validate_osr_entry`: that check proves the offered slots against the
+    // single-pass entry contract — `osr_num_locals`, the per-method local
+    // assignments, the deopt points `osr_trampoline` would seed through — and
+    // an SSA body has none of those. What stands in its place is the refusal
+    // the lowerer already made: a bci gets a stub only when every value live on
+    // entry is one the snapshot names, and `ir_osr_enter` refuses a locals
+    // slice shorter than the stub reads.
+    // Cast: a bci fits u32.
+    let ir_entry = compiled.ir_osr_entry_addr(entry_pc as u32);
+    let plan = match if ir_entry.is_some() {
+        // Nothing to validate, and nothing validated: skip straight past.
+        Ok(None)
+    } else {
+        compiled.validate_osr_entry(&osr_state).map(Some)
+    } {
         Ok(plan) => plan,
         Err(b) => {
             // Only an ARTIFACT-level verdict may be memoed: it is a pure function
@@ -3660,7 +3788,29 @@ pub(super) fn try_osr(
             // `should_try_osr` refuses long before here.
             #[cfg(target_arch = "x86_64")]
             {
-                unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
+                match &plan {
+                    // The single-pass trampoline, with its proof.
+                    // SAFETY: `plan` is `validate_osr_entry`'s result for THIS
+                    // artifact at THIS bci, so every seeded slot's JVM type has
+                    // been checked against the compiled entry's contract — the
+                    // argument spelled out above this `cfg` block.
+                    Some(plan) => unsafe {
+                        compiled.osr_enter_planned(vm_ptr, &osr_state, plan, thread_ptr)
+                    },
+                    // The optimizing tier's own stub. It builds this tier's
+                    // frame, seeds the locals the snapshot at this bci names,
+                    // and jumps into the body — two arguments where the
+                    // trampoline takes twenty layout fields, because the
+                    // lowerer knows the layout and the trampoline never could.
+                    // SAFETY: a DIFFERENT contract from the arm above, and the
+                    // reason each arm states its own: this entry takes no plan,
+                    // so what must hold is that `entry_pc` is an OSR entry the
+                    // artifact published and `jit_locals` matches the snapshot
+                    // that bci names.
+                    None => unsafe {
+                        compiled.ir_osr_enter(entry_pc as u32, vm_ptr, &jit_locals)
+                    },
+                }
             }
             // `None`, NOT `unreachable!()`. The reasoning above is sound and
             // the panic was still the wrong answer twice over. `None` is this
@@ -3674,7 +3824,7 @@ pub(super) fn try_osr(
             // against a budget of zero and turned the gate red for everyone.
             #[cfg(not(target_arch = "x86_64"))]
             {
-                let _ = (&osr_state, &plan, thread_ptr, vm_ptr);
+                let _ = (&osr_state, &plan, thread_ptr, vm_ptr, &jit_locals);
                 None
             }
         }));
@@ -4059,11 +4209,18 @@ pub(super) fn try_osr(
             // this artifact whose `ResumeSemantics` is `REEXECUTE` — instead of
             // trusting `rframe.bci` verbatim. It is the only sanctioned resume
             // point once compiled code has run.
+            // `plan` is `None` for an optimizing-tier entry, which is admitted
+            // only for an artifact with no deopt points — so this arm is
+            // unreachable for one, and guarding rather than unwrapping is what
+            // makes that a refusal instead of a panic if the admission above
+            // ever widens.
             if compiled.can_osr_exit
-                && transfer_osr_exit_into_live_frame(
-                    shared, thread, frame_idx, &rframe, &compiled, &plan,
-                )
-                .is_some()
+                && plan.as_ref().is_some_and(|plan| {
+                    transfer_osr_exit_into_live_frame(
+                        shared, thread, frame_idx, &rframe, &compiled, plan,
+                    )
+                    .is_some()
+                })
             {
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                     eprintln!(
@@ -5158,227 +5315,34 @@ fn jit_ldc_constant_for(
     }
 }
 
-/// WP2.4-F1: variant of [`try_jit_upgrade`] that takes an explicit
-/// [`RedefineGate`] so the JIT entry inherits the same staleness binding
-/// as the bytecode entry it's replacing.  Saves one
-/// `class_manager.read()` round-trip on the hot promotion path.
-pub(super) fn try_jit_upgrade_with_gate(
+
+/// Build an OPTIMIZING-TIER artifact for `cached`, and nothing else.
+///
+/// The input assembly — every constant-pool resolver, the invoke plans, the
+/// `new`-site resolutions, the inline sites, the PGO profile, the helper table
+/// — with **no admission policy and no side effects on the method's tiering
+/// state**. That separation is the whole point of this function existing.
+///
+/// It was extracted from [`try_jit_upgrade_with_gate`], which is the
+/// METHOD-ENTRY door: it asks a policy question first, and on a refusal it
+/// calls `mark_jit_bail_listed`. That combination makes it unusable as a
+/// question. Another door that called it to ask "could the optimizing tier
+/// take this?" got two wrong answers at once — a refusal for a reason that
+/// belongs to the method-entry door (any native-shadowed callee, i.e. nearly
+/// every method containing a `println`), and a bail-list entry that
+/// `compile_gate::admit` then honours at EVERY door, switching off compiles
+/// that were working. The OSR door tried exactly that on 2026-09-04.
+///
+/// So: policy stays with the door that owns it, assembly lives here, and a
+/// caller takes the second without triggering the first. `try_jit_upgrade_with_gate`
+/// keeps its gates and calls this; the OSR door calls this and applies its own.
+///
+/// `None` when the backend declines the method — a compile refusal, which is
+/// never a statement about whether the method may be compiled again.
+pub(super) fn compile_optimizing_artifact(
     shared: &SharedVm,
     cached: &Arc<CachedBytecodeMethod>,
-    gate: RedefineGate,
-) -> Option<CachedInvokeTarget> {
-    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
-    // Mirrors the gate in `try_jit_compile_callee` so the user-facing
-    // CRATONVM_DISABLE_JIT flag actually disables BOTH JIT entry points
-    // (the caller-method counter path here, and the dispatcher path there).
-    // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
-    if crate::runtime::env_cache::disable_jit() {
-        return None;
-    }
-    // The gate is bound to this exact declaring class. Keep the conservative
-    // no-JIT policy for a retransformed body, but do not punish every other
-    // class in the VM after an agent touches one class.
-    if gate.generation > 0 {
-        return None;
-    }
-    // The compiled body carries no ACC_SYNCHRONIZED monitor prologue/epilogue —
-    // the *caller* supplies it. Both interpreter entry points into compiled code
-    // (`execute_jit_call` and `execute_jit_call_decoded`) already wrap the call
-    // in a `JitSynchronizedMonitorGuard`, which acquires the receiver's (or the
-    // class mirror's) monitor for the whole native activation and releases it on
-    // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
-    // through those two, so admitting a synchronized method here is contained.
-    //
-    // Every OTHER entry runs the body with no monitor at all, and each must
-    // refuse a synchronized callee independently:
-    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`, both
-    //     on its compile path (`..._slow`'s `is_synchronized` gate) AND on its
-    //     `jit_cache` fast path, which serves an already-published body and so
-    //     never reaches that gate;
-    //   * `jit_invoke_dispatch`'s own `jit_cache` arm (`vm/src/jit/helpers.rs`),
-    //     which fills `DISPATCH_CACHE` and does not go through
-    //     `try_jit_compile_callee` at all;
-    //   * the specialized `get(I)D` scalar routes in the same file — `Vector.get`
-    //     is `synchronized` in the JDK, so this one is not hypothetical;
-    //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
-    //   * OSR — the `is_synchronized` gate near the top of this file.
-    //
-    // The first three ask `CompiledMethod::requires_wrapped_entry`, stamped at
-    // publication, because they hold a raw entry pointer and no method handle.
-    // Listing only the compile-time gates here is what let the fast paths drift:
-    // the enumeration said "three" while `jit_cache` answered for two more.
-    //
-    // Why this matters: every layer Tomcat's BCEL annotation scan drives per
-    // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
-    // is an ACC_SYNCHRONIZED one-liner, so this gate kept the whole webapp
-    // deploy interpreted — the method was rejected here *before* it was ever
-    // counted, which is why `jit-method-stats` reported it neither compiled nor
-    // `hot_but_stuck_in_interpreter`. See
-    // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
-    //
-    // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
-    if cached.is_synchronized && !jit_sync_methods_enabled() {
-        return None;
-    }
-    // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
-    // expensive gates below (two superclass-chain walks under the
-    // class_manager read lock). The retry stride re-enters this function
-    // every 64 calls for a hot method; with a scan-rejected (e.g. athrow)
-    // method that meant tens of thousands of full gate evaluations per
-    // suite run while `try_compile` would bail instantly anyway.
-    if crate::jit::is_jit_bail_listed(
-        &cached.class_name,
-        &cached.method_name,
-        &cached.method_descriptor,
-    ) {
-        return None;
-    }
-    // S111r15 — refuse to JIT a method that has a Rust native shadow.
-    // Mirrors the equivalent gate in `try_jit_compile_callee` so the
-    // caller-method-counter path doesn't bypass natives that the
-    // dispatcher path correctly defers to. Concretely: without this
-    // check, `Character.toLowerCase(C)C` got JIT-compiled (its JDK
-    // bytecode delegates to `(I)I` → `CharacterData.of/toLowerCase`
-    // virtual chain), and the resulting machine code returned 0 for
-    // most inputs after warm-up, corrupting Spring's
-    // `BeanPropertyName.toDashedForm` (`bannerMode` →
-    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
-    // `InvalidConfigurationPropertyNameException` during SportMe boot.
-    //
-    // bytebuddy_probe / ANTLR cold-path follow-up: reject an override on this
-    // upgrade path only when its body invokes a native-shadowed target such as
-    // `Object.equals`. A bytecode override that merely has an identity native
-    // somewhere up its ancestor chain is allowed to compile.
-    {
-        if registered_native_will_run(
-            shared,
-            &cached.class_name,
-            &cached.method_name,
-            &cached.method_descriptor,
-        ) {
-            if crate::runtime::env_cache::dbg_bblp()
-                && cached.class_name.contains("LazyProjection")
-                && &*cached.method_name == "equals"
-            {
-                eprintln!(
-                    "[BBLP-upgrade] direct-native skip {}.{}{}",
-                    cached.class_name, cached.method_name, cached.method_descriptor
-                );
-            }
-            return None;
-        }
-        let tdigest_numeric_kernel = &*cached.class_name == "org/elasticsearch/tdigest/Dist"
-            && matches!(
-                (&*cached.method_name, &*cached.method_descriptor),
-                ("quantile", "(DILjava/util/function/Function;)D")
-                    | ("cdf", "(DILjava/util/function/Function;)D")
-            );
-        if !tdigest_numeric_kernel
-            && jit_method_calls_native_shadowed(
-                shared,
-                cached.declaring_class_id,
-                &cached.code,
-                cached.code.len().saturating_sub(2),
-            )
-        {
-            if crate::runtime::env_cache::dbg_bblp()
-                && cached.class_name.contains("LazyProjection")
-                && &*cached.method_name == "equals"
-            {
-                eprintln!(
-                    "[BBLP-upgrade] inner-native skip {}.{}{}",
-                    cached.class_name, cached.method_name, cached.method_descriptor
-                );
-            }
-            // PERF FIX (2026-07-15, companion to the invoke-cache fix above):
-            // this verdict is a pure function of the method's bytecode (which
-            // native-shadowed targets it calls never changes for a given
-            // class+method+descriptor, mirroring the `any_class_redefined()`
-            // coarse-invalidation already relied on by the `mark_jit_bail_listed`
-            // call in `jit::try_compile` — see the "RBC.4" comment at the top
-            // of this function). Without memoizing it here, a hot method that
-            // calls ANY native-shadowed target (extremely common — e.g. one
-            // that calls `Object.equals`/`String` methods internally) re-runs
-            // this full O(method-bytecode-size) decode-and-scan
-            // (`jit_method_calls_native_shadowed`) from scratch every
-            // `JIT_RETRY_STRIDE` (64) invocations, forever, for the lifetime
-            // of the process — the exact "tens of thousands of full gate
-            // evaluations per suite run" cost pattern RBC.4 fixed for
-            // scan-rejected methods, just via a different gate that wasn't
-            // wired into the same short-circuit. Mark it bail-listed so the
-            // early `is_jit_bail_listed` check at the top of this function
-            // short-circuits every future retry.
-            crate::jit::mark_jit_bail_listed(
-                &cached.class_name,
-                &cached.method_name,
-                &cached.method_descriptor,
-            );
-            return None;
-        }
-        if crate::runtime::env_cache::dbg_bblp()
-            && cached.class_name.contains("LazyProjection")
-            && &*cached.method_name == "equals"
-        {
-            eprintln!(
-                "[BBLP-upgrade] no native shadow, COMPILING {}.{}{}",
-                cached.class_name, cached.method_name, cached.method_descriptor
-            );
-        }
-    }
-    // W2-CHM: honor the JIT skip list on this caller-method-counter
-    // promotion path too. Previously only the first-call compile path
-    // (interpreter.rs::~1112) and the callee-dispatcher path
-    // (try_jit_compile_callee) consulted `should_skip_jit`; promotions
-    // triggered by the caller's invocation count silently bypassed the
-    // list and JIT'd skip-listed methods (notably `Integer.valueOf` /
-    // `Integer.<init>`) anyway, defeating the W2-CHM box-method ban.
-    // Reproducer: `apps/chm_basic/ChmScale` lost entries `k992..k999`
-    // even after `is_known_miscompile` listed `Integer.valueOf` because
-    // ChmScale's `main` outer-frame loops crossed the per-callee
-    // invocation threshold (2000) and re-promoted `Integer.valueOf`
-    // here.
-    {
-        // The static JIT ban list was deleted 2026-07-31 (see
-        // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
-        // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
-        // remaining force-interpret lever, applied in `jit::try_compile`.
-        // GPU-offload JIT admission gate — see offload_jit_gate: a
-        // promoted caller containing an offload-eligible invokestatic
-        // would bypass the interpreter offload hook.
-        #[cfg(feature = "gpu-offload")]
-        if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
-            shared,
-            cached.declaring_class_id,
-            &cached.method_name,
-            &cached.method_descriptor,
-        ) {
-            return None;
-        }
-    }
-    // Check shared JIT cache first
-    {
-        let jit_cache = shared.jit.jit_cache.read();
-        if let Some(compiled) = jit_cache.get(
-            &cached.class_name,
-            &cached.method_name,
-            &cached.method_descriptor,
-            cached.declaring_class_id,
-        ) {
-            let ret = cached.return_tag();
-            let heap = compiled.needs_heap();
-            return Some(CachedInvokeTarget::Jit {
-                compiled: compiled.into(),
-                num_params: cached.num_params,
-                return_type: ret,
-                needs_heap: heap,
-                cached: cached.clone(),
-                gate,
-                supersede_epoch: crate::classloading::jit_supersede_epoch(),
-            });
-        }
-    }
-
-    // Try to compile — build CP resolvers for multianewarray and field access
+) -> Option<cratonvm_jit::CompiledMethod> {
     let class_id = cached.declaring_class_id;
     let resolver = |cp_idx: u16| -> Option<String> {
         let cm = shared.classes.class_manager.read();
@@ -6458,7 +6422,7 @@ pub(super) fn try_jit_upgrade_with_gate(
             .is_some_and(|kind| kind == cratonvm_native_api::NativeKind::Intrinsic)
     };
 
-    let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
+    let compiled = crate::jit::try_compile_with_invokespecial_resolver(
         cached,
         Some(&resolver),
         Some(&field_resolver),
@@ -6534,6 +6498,235 @@ pub(super) fn try_jit_upgrade_with_gate(
         // whether a thin direct-call helper may shadow real bytecode.
         Some(&intrinsic_resolver),
     )?;
+    Some(compiled)
+}
+
+/// WP2.4-F1: variant of [`try_jit_upgrade`] that takes an explicit
+/// [`RedefineGate`] so the JIT entry inherits the same staleness binding
+/// as the bytecode entry it's replacing.  Saves one
+/// `class_manager.read()` round-trip on the hot promotion path.
+pub(super) fn try_jit_upgrade_with_gate(
+    shared: &SharedVm,
+    cached: &Arc<CachedBytecodeMethod>,
+    gate: RedefineGate,
+) -> Option<CachedInvokeTarget> {
+    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
+    // Mirrors the gate in `try_jit_compile_callee` so the user-facing
+    // CRATONVM_DISABLE_JIT flag actually disables BOTH JIT entry points
+    // (the caller-method counter path here, and the dispatcher path there).
+    // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
+    if crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    // The gate is bound to this exact declaring class. Keep the conservative
+    // no-JIT policy for a retransformed body, but do not punish every other
+    // class in the VM after an agent touches one class.
+    if gate.generation > 0 {
+        return None;
+    }
+    // The compiled body carries no ACC_SYNCHRONIZED monitor prologue/epilogue —
+    // the *caller* supplies it. Both interpreter entry points into compiled code
+    // (`execute_jit_call` and `execute_jit_call_decoded`) already wrap the call
+    // in a `JitSynchronizedMonitorGuard`, which acquires the receiver's (or the
+    // class mirror's) monitor for the whole native activation and releases it on
+    // every Rust return path. A `CachedInvokeTarget::Jit` is only ever consumed
+    // through those two, so admitting a synchronized method here is contained.
+    //
+    // Every OTHER entry runs the body with no monitor at all, and each must
+    // refuse a synchronized callee independently:
+    //   * compiled→compiled direct dispatch — `try_jit_compile_callee`, both
+    //     on its compile path (`..._slow`'s `is_synchronized` gate) AND on its
+    //     `jit_cache` fast path, which serves an already-published body and so
+    //     never reaches that gate;
+    //   * `jit_invoke_dispatch`'s own `jit_cache` arm (`vm/src/jit/helpers.rs`),
+    //     which fills `DISPATCH_CACHE` and does not go through
+    //     `try_jit_compile_callee` at all;
+    //   * the specialized `get(I)D` scalar routes in the same file — `Vector.get`
+    //     is `synchronized` in the JDK, so this one is not hypothetical;
+    //   * inlining — `resolve_inline_site`'s `method.is_synchronized()` gate;
+    //   * OSR — the `is_synchronized` gate near the top of this file.
+    //
+    // The first three ask `CompiledMethod::requires_wrapped_entry`, stamped at
+    // publication, because they hold a raw entry pointer and no method handle.
+    // Listing only the compile-time gates here is what let the fast paths drift:
+    // the enumeration said "three" while `jit_cache` answered for two more.
+    //
+    // Why this matters: every layer Tomcat's BCEL annotation scan drives per
+    // byte (`ByteArrayInputStream.read()`, `DataInputStream.readUnsignedByte`)
+    // is an ACC_SYNCHRONIZED one-liner, so this gate kept the whole webapp
+    // deploy interpreted — the method was rejected here *before* it was ever
+    // counted, which is why `jit-method-stats` reported it neither compiled nor
+    // `hot_but_stuck_in_interpreter`. See
+    // docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md.
+    //
+    // Default-OFF pending the A/B and the concurrency soak: `CRATONVM_JIT=sync-methods`.
+    if cached.is_synchronized && !jit_sync_methods_enabled() {
+        return None;
+    }
+    // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
+    // expensive gates below (two superclass-chain walks under the
+    // class_manager read lock). The retry stride re-enters this function
+    // every 64 calls for a hot method; with a scan-rejected (e.g. athrow)
+    // method that meant tens of thousands of full gate evaluations per
+    // suite run while `try_compile` would bail instantly anyway.
+    if crate::jit::is_jit_bail_listed(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
+        return None;
+    }
+    // S111r15 — refuse to JIT a method that has a Rust native shadow.
+    // Mirrors the equivalent gate in `try_jit_compile_callee` so the
+    // caller-method-counter path doesn't bypass natives that the
+    // dispatcher path correctly defers to. Concretely: without this
+    // check, `Character.toLowerCase(C)C` got JIT-compiled (its JDK
+    // bytecode delegates to `(I)I` → `CharacterData.of/toLowerCase`
+    // virtual chain), and the resulting machine code returned 0 for
+    // most inputs after warm-up, corrupting Spring's
+    // `BeanPropertyName.toDashedForm` (`bannerMode` →
+    // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
+    // `InvalidConfigurationPropertyNameException` during SportMe boot.
+    //
+    // bytebuddy_probe / ANTLR cold-path follow-up: reject an override on this
+    // upgrade path only when its body invokes a native-shadowed target such as
+    // `Object.equals`. A bytecode override that merely has an identity native
+    // somewhere up its ancestor chain is allowed to compile.
+    {
+        if registered_native_will_run(
+            shared,
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        ) {
+            if crate::runtime::env_cache::dbg_bblp()
+                && cached.class_name.contains("LazyProjection")
+                && &*cached.method_name == "equals"
+            {
+                eprintln!(
+                    "[BBLP-upgrade] direct-native skip {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                );
+            }
+            return None;
+        }
+        let tdigest_numeric_kernel = &*cached.class_name == "org/elasticsearch/tdigest/Dist"
+            && matches!(
+                (&*cached.method_name, &*cached.method_descriptor),
+                ("quantile", "(DILjava/util/function/Function;)D")
+                    | ("cdf", "(DILjava/util/function/Function;)D")
+            );
+        if !tdigest_numeric_kernel
+            && jit_method_calls_native_shadowed(
+                shared,
+                cached.declaring_class_id,
+                &cached.code,
+                cached.code.len().saturating_sub(2),
+            )
+        {
+            if crate::runtime::env_cache::dbg_bblp()
+                && cached.class_name.contains("LazyProjection")
+                && &*cached.method_name == "equals"
+            {
+                eprintln!(
+                    "[BBLP-upgrade] inner-native skip {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                );
+            }
+            // PERF FIX (2026-07-15, companion to the invoke-cache fix above):
+            // this verdict is a pure function of the method's bytecode (which
+            // native-shadowed targets it calls never changes for a given
+            // class+method+descriptor, mirroring the `any_class_redefined()`
+            // coarse-invalidation already relied on by the `mark_jit_bail_listed`
+            // call in `jit::try_compile` — see the "RBC.4" comment at the top
+            // of this function). Without memoizing it here, a hot method that
+            // calls ANY native-shadowed target (extremely common — e.g. one
+            // that calls `Object.equals`/`String` methods internally) re-runs
+            // this full O(method-bytecode-size) decode-and-scan
+            // (`jit_method_calls_native_shadowed`) from scratch every
+            // `JIT_RETRY_STRIDE` (64) invocations, forever, for the lifetime
+            // of the process — the exact "tens of thousands of full gate
+            // evaluations per suite run" cost pattern RBC.4 fixed for
+            // scan-rejected methods, just via a different gate that wasn't
+            // wired into the same short-circuit. Mark it bail-listed so the
+            // early `is_jit_bail_listed` check at the top of this function
+            // short-circuits every future retry.
+            crate::jit::mark_jit_bail_listed(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+            return None;
+        }
+        if crate::runtime::env_cache::dbg_bblp()
+            && cached.class_name.contains("LazyProjection")
+            && &*cached.method_name == "equals"
+        {
+            eprintln!(
+                "[BBLP-upgrade] no native shadow, COMPILING {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor
+            );
+        }
+    }
+    // W2-CHM: honor the JIT skip list on this caller-method-counter
+    // promotion path too. Previously only the first-call compile path
+    // (interpreter.rs::~1112) and the callee-dispatcher path
+    // (try_jit_compile_callee) consulted `should_skip_jit`; promotions
+    // triggered by the caller's invocation count silently bypassed the
+    // list and JIT'd skip-listed methods (notably `Integer.valueOf` /
+    // `Integer.<init>`) anyway, defeating the W2-CHM box-method ban.
+    // Reproducer: `apps/chm_basic/ChmScale` lost entries `k992..k999`
+    // even after `is_known_miscompile` listed `Integer.valueOf` because
+    // ChmScale's `main` outer-frame loops crossed the per-callee
+    // invocation threshold (2000) and re-promoted `Integer.valueOf`
+    // here.
+    {
+        // The static JIT ban list was deleted 2026-07-31 (see
+        // docs/known-issues/jit-bans/jit-bans-all-disabled-20260731.md).
+        // Nothing is statically skipped now; `CRATONVM_JIT_DENY` is the single
+        // remaining force-interpret lever, applied in `jit::try_compile`.
+        // GPU-offload JIT admission gate — see offload_jit_gate: a
+        // promoted caller containing an offload-eligible invokestatic
+        // would bypass the interpreter offload hook.
+        #[cfg(feature = "gpu-offload")]
+        if crate::runtime::offload_jit_gate::caller_blocks_jit_by_name(
+            shared,
+            cached.declaring_class_id,
+            &cached.method_name,
+            &cached.method_descriptor,
+        ) {
+            return None;
+        }
+    }
+    // Check shared JIT cache first
+    {
+        let jit_cache = shared.jit.jit_cache.read();
+        if let Some(compiled) = jit_cache.get(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            cached.declaring_class_id,
+        ) {
+            let ret = cached.return_tag();
+            let heap = compiled.needs_heap();
+            return Some(CachedInvokeTarget::Jit {
+                compiled: compiled.into(),
+                num_params: cached.num_params,
+                return_type: ret,
+                needs_heap: heap,
+                cached: cached.clone(),
+                gate,
+                supersede_epoch: crate::classloading::jit_supersede_epoch(),
+            });
+        }
+    }
+
+    // Try to compile — build CP resolvers for multianewarray and field access
+    // The assembly, which this door no longer owns. Its gates above are the
+    // policy half; `compile_optimizing_artifact` is the half another door can
+    // reuse without inheriting them. See that function for why the split is
+    // not cosmetic.
+    let mut compiled = compile_optimizing_artifact(shared, cached)?;
     let ret = cached.return_tag();
     let heap = compiled.needs_heap();
 

@@ -37,7 +37,10 @@
 
 #![allow(dead_code)]
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Child, Output};
+use std::time::{Duration, Instant};
 
 /// Environment variable that promotes a skipped prerequisite to a failure.
 pub const REQUIRE_VAR: &str = "CRATONVM_REQUIRE_E2E";
@@ -56,6 +59,9 @@ pub fn require_e2e() -> bool {
 /// it is `None` and [`REQUIRE_VAR`] is set — then fail loudly instead of
 /// letting the caller skip to a green.
 pub fn require_binary(found: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = found.as_deref() {
+        warn_if_stale(path);
+    }
     if found.is_none() && require_e2e() {
         panic!(
             "{REQUIRE_VAR} is set, but no `cratonvm` binary was found, so this test would have \
@@ -65,6 +71,112 @@ pub fn require_binary(found: Option<PathBuf>) -> Option<PathBuf> {
         );
     }
     found
+}
+
+/// The newest modification time across the workspace's Rust sources and
+/// manifests, computed once per test process.
+///
+/// Deliberately a SOURCE timestamp and not the test binary's own: a contributor
+/// who runs `cargo build --release -p cratonvm-cli` and only later `cargo test`
+/// has a launcher that is older than the test binary and perfectly current.
+/// Comparing against the sources answers the question actually being asked —
+/// "was this launcher built from at least this source state?" — and gives no
+/// false alarm for that ordering.
+///
+/// `target/`, `.git/` and `.claude/` are skipped: the first is where the
+/// artefacts being judged live, and including it would make every binary newer
+/// than its own yardstick.
+fn newest_source_mtime() -> Option<std::time::SystemTime> {
+    use std::sync::OnceLock;
+    static NEWEST: OnceLock<Option<std::time::SystemTime>> = OnceLock::new();
+    *NEWEST.get_or_init(|| {
+        fn walk(dir: &std::path::Path, newest: &mut Option<std::time::SystemTime>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "target" || name == ".git" || name == ".claude" {
+                        continue;
+                    }
+                    walk(&path, newest);
+                } else {
+                    let interesting = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e == "rs")
+                        || path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml");
+                    if !interesting {
+                        continue;
+                    }
+                    if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
+                        if newest.is_none_or(|n| m > n) {
+                            *newest = Some(m);
+                        }
+                    }
+                }
+            }
+        }
+        // `vm/tests/common` -> workspace root.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+        let mut newest = None;
+        walk(root, &mut newest);
+        newest
+    })
+}
+
+/// **IS THIS LAUNCHER OLDER THAN THE SOURCE THE TEST WAS BUILT FROM?**
+///
+/// The lookups in this suite prefer `target/release/cratonvm` over `debug` and
+/// take whichever exists, with no freshness check at all — so a test can
+/// silently measure a binary from an arbitrary earlier commit. That is the same
+/// vacuous-result family this module's header is about, with both polarities
+/// live: a fixed defect reported as OPEN, or, worse, an open defect reported as
+/// FIXED because the binary predates the regression.
+///
+/// It is not hypothetical either. On 2026-09-05
+/// `inet_address_hostname_contract` reported the ServerSocket wildcard defect
+/// as still open six minutes after its fix merged, because
+/// `target/release/cratonvm.exe` was built at 09:48 and the fix landed at
+/// 09:54. Rebuilding the launcher turned the same test green with no source
+/// change. Two other investigations the same day were sent down blind alleys by
+/// stale binaries on a shared host.
+///
+/// `CRATONVM_BIN` is EXEMPT: naming a binary explicitly is a deliberate act,
+/// and the H2 and Netty runners do it precisely to test an older build.
+///
+/// Warns always so the note is in front of anyone reading a failure, and fails
+/// hard under `CRATONVM_REQUIRE_E2E` — the same escalation `require_binary`
+/// applies to a missing binary, and the one CI sets.
+fn warn_if_stale(binary: &std::path::Path) {
+    if std::env::var_os("CRATONVM_BIN").is_some() {
+        return;
+    }
+    let (Some(newest_src), Ok(built)) = (
+        newest_source_mtime(),
+        std::fs::metadata(binary).and_then(|m| m.modified()),
+    ) else {
+        return;
+    };
+    if built >= newest_src {
+        return;
+    }
+    let msg = format!(
+        "the `cratonvm` binary at {} is OLDER than the newest workspace source. \
+         This test drives that binary, so it is reporting on a build that does \
+         not contain the code under test — a fixed defect can read as open, and \
+         an open one as fixed. Rebuild with `cargo build --release -p \
+         cratonvm-cli`, or point `CRATONVM_BIN` at the binary you meant.",
+        binary.display()
+    );
+    if require_e2e() {
+        panic!("{msg}");
+    }
+    eprintln!("[common] WARNING: {msg}");
 }
 
 /// The [`require_binary`] contract for a **checked-in Java fixture**.
@@ -152,4 +264,98 @@ pub fn require_jdk(found: Option<PathBuf>) -> Option<PathBuf> {
         );
     }
     found
+}
+
+/// Wait for `child` up to `cap`, **draining its pipes the whole time**, and
+/// report what it produced either way.
+///
+/// # Why a test cannot just poll `try_wait`
+///
+/// The shape this replaces is everywhere in `vm/tests`:
+///
+/// ```ignore
+/// let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+/// loop {
+///     match child.try_wait()? {
+///         Some(_) => break,
+///         None if start.elapsed() < CAP => sleep(50ms),
+///         None => { child.kill(); panic!("timed out") }
+///     }
+/// }
+/// let output = child.wait_with_output()?;   // <- the first read of the pipes
+/// ```
+///
+/// Nothing reads either pipe until after the child has exited. A Linux pipe
+/// holds 64 KiB; once the child has written that much it blocks in `write` and
+/// can never exit, so the parent polls out its whole timeout and reports a
+/// hang. The child is not hung — it is waiting for the parent, which is
+/// waiting for it.
+///
+/// Measured 2026-09-04 on `class_loader_unload_regression`: the probe's stdout
+/// was 124 bytes and its **stderr was 101,808** (`[GC]` lines, one pair per
+/// `System.gc()`, and that probe calls it ~180 times). Run with its output to a
+/// file it finishes in under 20 s and prints `ok=true`; run under that poll
+/// loop it "times out" at 180 s, in both jit and nojit modes, deterministically,
+/// on a quiet host. It had nothing to do with class unloading.
+///
+/// The GC noise itself is now gated (`zgc.rs`'s logging block), which removes
+/// this instance. **That is not the fix, and this is** — a test must not depend
+/// on the process it drives staying under 64 KiB, and the next diagnostic
+/// anyone adds should not be able to hang the suite.
+///
+/// # What it returns
+///
+/// Always the output that was captured, plus whether the cap was hit. A timeout
+/// that can show what the child managed to say is a diagnosis; the poll loop's
+/// bare `panic!("timed out")` is what made this cost a session.
+pub struct TimedOutput {
+    pub output: Output,
+    pub timed_out: bool,
+}
+
+pub fn wait_draining(mut child: Child, cap: Duration) -> TimedOutput {
+    // Take the pipes BEFORE the wait and read them on their own threads, so
+    // neither can fill while this function is sleeping.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait().expect("poll child") {
+            Some(s) => break s,
+            None if start.elapsed() < cap => std::thread::sleep(Duration::from_millis(50)),
+            None => {
+                // Killing closes the pipes, which is what lets both readers
+                // reach EOF and join below.
+                let _ = child.kill();
+                timed_out = true;
+                break child.wait().expect("reap killed child");
+            }
+        }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    TimedOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+    }
 }

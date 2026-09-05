@@ -7273,6 +7273,54 @@ impl IrBuilder {
                     pc += 1;
                 }
 
+                // dup2 — JVMS has two forms, and this builder's abstract stack
+                // makes the second one trivial.
+                //
+                // Form 2 is a single CATEGORY-2 value duplicated. The stack here
+                // holds one entry per VALUE rather than per slot, so a `long` or
+                // `double` is one entry and duplicating it is exactly `dup`.
+                //
+                // Form 1 is the top TWO category-1 values duplicated as a pair:
+                // `.., v2, v1` becomes `.., v2, v1, v2, v1`.
+                //
+                // A category-1 top over a category-2 second is not a legal
+                // `dup2` shape in either form — the verifier does not produce
+                // it — so it is refused rather than shuffled, the same call
+                // `dup_x1` above makes for the same reason: guessing which
+                // entry "the value below" names is how the builder's stack and
+                // the verifier's stack quietly disagree.
+                //
+                // Measured on `org.h2.test.db.TestAlter`: one of the six
+                // `unsupported_opcode` build refusals.
+                0x5c => {
+                    let Some(v1) = self.pop_opt() else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    let v1_cat2 = matches!(
+                        self.graph.nodes[v1 as usize].ty,
+                        IrType::Long | IrType::Double
+                    );
+                    if v1_cat2 {
+                        self.push(v1);
+                        self.push(v1);
+                    } else {
+                        let Some(v2) = self.pop_opt() else {
+                            return ir_build_bail(line!(), pc);
+                        };
+                        if matches!(
+                            self.graph.nodes[v2 as usize].ty,
+                            IrType::Long | IrType::Double
+                        ) {
+                            return ir_build_bail(line!(), pc);
+                        }
+                        self.push(v2);
+                        self.push(v1);
+                        self.push(v2);
+                        self.push(v1);
+                    }
+                    pc += 1;
+                }
+
                 // ifeq..ifle (0x99..0x9e) — compare int against zero
                 0x99..=0x9e => {
                     let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;

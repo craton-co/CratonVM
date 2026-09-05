@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const CLASS_NAME: &str = "DisReadFullyPinProbe";
 
@@ -209,24 +209,50 @@ fn data_input_stream_read_fully_reloads_pinned_byte_array() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().expect("spawn cratonvm");
-    let start = Instant::now();
-    let timeout = Duration::from_secs(90);
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("DisReadFullyPinProbe timed out after {timeout:?}");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-
-    let out = child.wait_with_output().expect("wait_with_output");
+    let child = cmd.spawn().expect("spawn cratonvm");
+    // DRAIN THE PIPES WHILE WAITING. A `try_wait` poll loop over piped stdio
+    // deadlocks the moment the child outruns the pipe: it blocks in `write`,
+    // never exits, and the loop reports a TIMEOUT for a process that finished
+    // its work in seconds.
+    //
+    // Which is what happened here, deterministically, on LINUX only:
+    // 10 runs, 10 timeouts at 90 s, while the identical command run from a
+    // shell passes in seconds. The child under test wrote 92 210 bytes of
+    // stderr against a 65 536-byte pipe — one `[GC] zgc-real` and one
+    // `[GC] zgc-pause` line per cycle, and this probe drives 256 cycles.
+    //
+    // CORRECTION, and it does not weaken the case. That GC chatter was fixed
+    // by `8137c0441` (2026-09-04), which put the per-collection log behind
+    // `gc_log_enabled` — the same commit that wrote `wait_draining`. The
+    // binary this deadlock was measured against was built BEFORE it, so a
+    // current build writes 150 bytes here and cannot fill the pipe with these
+    // particular lines. Verified on a clean environment at dev tip: 0 `[GC]`
+    // lines, 150 bytes, exit 0.
+    //
+    // The harness still has to drain, for the reason `wait_draining`'s own doc
+    // gives: a test must not depend on the process it drives staying under
+    // 64 KiB, and the next diagnostic anyone adds must not be able to hang the
+    // suite. The 10/10 Linux verification of this change ran against that
+    // ungated binary ON PURPOSE — it is the 92 KB worst case, and it is the
+    // only arm that can prove the drain works rather than that the child
+    // happened to be quiet.
+    //
+    // `common::wait_draining` exists for exactly this and carries its own
+    // regression test (`wait_draining_survives_a_child_that_outruns_the_pipe`).
+    // Its doc states the rule this harness broke: a test must not depend on the
+    // process it drives staying under 64 KiB.
+    let timed = common::wait_draining(child, Duration::from_secs(90));
+    let out = timed.output;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !timed.timed_out,
+        "DisReadFullyPinProbe timed out after 90s
+stdout:
+{stdout}
+stderr:
+{stderr}"
+    );
     assert_eq!(
         out.status.code(),
         Some(0),

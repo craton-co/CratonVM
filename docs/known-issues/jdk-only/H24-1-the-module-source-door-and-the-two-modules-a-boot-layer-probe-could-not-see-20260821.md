@@ -53,6 +53,63 @@ Every claim is **MEASURED** (this lane ran it today) or **ARGUED** (read it).
 > could not see are the record's subject and no probe here looks for them; a
 > green vector is not a census. Nothing here is `--synthetic-jdk`.
 
+> **Falsifier 1 RESOLVED 2026-09-04 — it cannot be evaluated in either shipping
+> arm, and the reason is structural rather than a missing command line.**
+>
+> The discharge note above left this open, saying only that no `[SL-DBG]` line
+> could be captured and that the silence was evidence about my invocation. Both
+> halves of that have now been chased down.
+>
+> **The invocation was indeed wrong the first time, and is now right.** The
+> harness gives this vector `-D` properties and the module on the CLASS path,
+> and deliberately NO `--module-path` — `class_args()` says so explicitly,
+> because the vector asserts `System.getProperty("jdk.module.path") == null` as
+> a PRECONDITION. My earlier attempt passed `--module-path`, i.e. it violated
+> the thing the vector exists to test. Run the harness's way:
+>
+> ```text
+> HotSpot 25            PASS RServiceLoaderDoubleSource (1265 checks)
+> CratonVM compatible   PASS RServiceLoaderDoubleSource (1265 checks)
+> CratonVM --jdk-only   PASS RServiceLoaderDoubleSource (1265 checks)
+> ```
+>
+> **And the diagnostic still emits nothing — because it cannot.**
+> `CRATONVM_DIAG_SERVICELOADER=1` gates `eprintln!("[SL-DBG] …")` inside
+> `native-builtins/src/service_loader.rs`, and every `java/util/ServiceLoader`
+> registration in that file sits behind
+>
+> ```rust
+> #[cfg(feature = "synthetic-jdk")]
+> ```
+>
+> added 2026-08-30 with the note *"SYNTHETIC-JDK ONLY. `java.util.ServiceLoader`
+> is pure Java … In a real-JDK build these nine were a shadow over a class the
+> VM already executes correctly."* So in a default build the JDK's own bytecode
+> serves `ServiceLoader`, that file's functions are never entered, and the flag
+> is mute by construction.
+>
+> Confirmed from the registry rather than from the `#[cfg]` alone: a
+> `--dump-native-registry` run shows **no `java/util/ServiceLoader` rows at
+> all**, only two `ServiceLoader$Itr` rows from `streams.rs`, both with **zero**
+> invocations — which is the same observation that registrar's own comment
+> records. Two different ServiceLoader-using vectors (`RJdkServices` and this
+> one) produce zero `[SL-DBG]` lines on both arms.
+>
+> **So falsifier 1 is not "not fired" — it is unfalsifiable here.** This
+> record's before-state (`descriptors=0 providers=2`) was MEASURED on
+> `cratonvm-r8.exe` in Compatible mode, when that registrar was not yet
+> cfg-gated. It has been since 2026-08-30, so the instrument this falsifier
+> names no longer exists on the path it names, and its silence carries no
+> information about the module filter in either direction.
+>
+> A falsifier that can no longer be evaluated is worth more said than left
+> looking unfired. **What still stands is falsifier 2**, the load-bearing
+> negative control: `RJdkModule` does not go red, and
+> `RServiceLoaderDoubleSource` — measured in this record as dying at line 490 —
+> passes at 1265 checks, byte-identical to the oracle. To evaluate falsifier 1
+> as written, someone needs a `--features synthetic-jdk` binary, where the
+> registrar and its diagnostic are both live.
+
 ## 1. The diagnosis is live, not stale — re-measured before acting
 
 `D1-R11`'s fix landed and its diagnosis expired; `H15-3` said so, and a triage

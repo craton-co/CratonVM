@@ -14108,7 +14108,30 @@ impl GarbageCollector for ZgcRealHeap {
                 );
             }
         }
-        if let Some(started) = gc_started {
+        // THE LOGGING BLOCK, and it needs its OWN gate rather than `gc_started`.
+        //
+        // `gc_started` is `Some` when logging is on **or a pause target is
+        // set**, and that disjunction is deliberate: the budget loop above has
+        // to run on a quiet run, or `--verbose:gc` would change the collector's
+        // behaviour and not just its output. But the pause target defaults to
+        // 200 ms (`zgc_pause_target_ms`), so `gc_started` is `Some` on EVERY
+        // run, and these two `eprintln!`s were firing on every cycle of every
+        // release run that never asked for them.
+        //
+        // Measured 2026-09-04: `vm/tests/class_loader_unload_regression.rs`
+        // drives a probe that calls `System.gc()` ~180 times. Its stdout is
+        // 124 bytes; its stderr was **101,808 bytes**, essentially all of it
+        // these two lines. A Linux pipe holds 64 KiB, so a parent that captures
+        // stderr and does not drain it until the child exits deadlocks — which
+        // is exactly what that test did, and it read as "class-loader unloading
+        // probe timed out". The probe itself answers `ok=true` in under 20 s
+        // when its output goes anywhere with room for it.
+        //
+        // The test is fixed independently (it now drains while it waits — a
+        // test must not depend on the child staying quiet). This is the other
+        // half: a quiet run is quiet again, which is what the comment on the
+        // budget loop above already assumed.
+        if let Some(started) = gc_started.filter(|_| self.gc_log_enabled.load(Ordering::Relaxed)) {
             let pause_us = started.elapsed().as_micros();
             // `mark=` is the ONE field that says whether this collection's
             // mark phase was paid for inside the pause. Without it a

@@ -1334,8 +1334,8 @@ pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
 /// never faulted.
 ///
 /// The shape that found this (2026-09-03, see
-/// `known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`): the
-/// lambda direct arm finishes a deopted body in the interpreter and returns a
+/// `internal/fixed-bugs/jit-superseded-implicit-npe-leak-FIXED-20260903.md`):
+/// the lambda direct arm finishes a deopted body in the interpreter and returns
 /// zero with the real NPE parked in `jit_pending_exception`, exactly as its
 /// contract says. Compiled code then evaluates the second operand of the same
 /// expression before its post-invoke guard fires, dereferences the SAME null and
@@ -20496,7 +20496,7 @@ unsafe fn try_lambda_site_direct_call(
                     // intrinsic default-ON removed the call — the unbox became
                     // an inline load with a null-receiver guard — and the
                     // exception escaped its own `catch`. See
-                    // `docs/known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`.
+                    // `internal/fixed-bugs/jit-superseded-implicit-npe-leak-FIXED-20260903.md`.
                     //
                     // `i64::MIN` is right for every return type: for a
                     // reference it cannot be a valid heap address, and for the

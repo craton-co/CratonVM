@@ -2,9 +2,24 @@
 
 ## Status
 
-**FIXED 2026-09-03.** `take_jit_pending_exception` now drops the implicit-trap
-signals when it hands out an exception. Regression vector:
-`regression-suite/src/RJitLambdaNpeSupersede.java`.
+**FIXED 2026-09-03. Regressed and re-fixed 2026-09-04. Retired 2026-09-04.**
+`take_jit_pending_exception` drops the implicit-trap signals when it hands out
+an exception. Regression vector:
+`regression-suite/src/RJitLambdaNpeSupersede.java`, in `run.sh`'s
+`CORE_CLASSES`.
+
+Retired on `dev@9c66b0b7d`, against the check this page itself says is the only
+one that counts -- `test_npe_from_body` run **ALONE**, because with its eleven
+siblings the arm never engages and a green file proves nothing:
+
+```
+cargo test --release -p cratonvm-vm --test lambda_jit_tierup_tests \
+    test_npe_from_body -- --exact
+```
+
+`ok. 1 passed; 11 filtered out`, 3 of 3, plus `regression-suite/run.sh` at
+90/90 including `RJitLambdaNpeSupersede`, and the reduced probe at checksum
+`1210000` against HotSpot's `1210000`.
 
 **REGRESSED 2026-09-04 by a DIFFERENT defect, and FIXED the same day.** The
 regression was real and this vector caught it, but the mechanism first written
@@ -59,6 +74,71 @@ Two hypotheses were built on that and both were wrong:
 
 `Object(0)` on the stack at the unbox is the null the caller should never have
 been handed.
+
+3. **"The BOX_UNBOX intrinsic claimed a site the OSR admission had already
+   promised."** Reached independently, from `test_npe_from_body` rather than
+   from the suite vector, and it is a true statement that is not the cause.
+   `compile_osr_artifact` admits a method with an exception table on the
+   promise that every throwing site inside a protected range publishes a
+   reason-9 precise frame, `first_unsupported_precise_frame_site` checks that
+   over the BYTECODE where the site is an ordinary `invokevirtual`, and the
+   intrinsic then substitutes a lowering whose edges are reason-6. Refusing the
+   intrinsic for a `pc` inside the exception table DOES make the vector pass --
+   and so does the one-line sentinel fix above, with the intrinsic left fully
+   on. Measured both ways: with `2422b006d` in and that refusal reverted,
+   `test_npe_from_body` alone is `ok` 3 of 3 and the suite is 90/90. So the
+   refusal removes an INGREDIENT (the Rust crossing at the unbox) and the
+   sentinel fix removes the DEFECT. It was dropped rather than landed beside
+   it, because it costs the intrinsic every site inside a `try` and buys
+   nothing once the caller returns the sentinel the check tests for.
+
+   Two things it left behind. The first is a trap worth keeping: declining the
+   intrinsic inside `bytecode_walk`'s BOX_UNBOX region rather than at the
+   resolution leaves `callee_entry` holding the intrinsic sentinel and drops
+   through to the plain direct-call path, which emits a `CALL` to that value --
+   `SIGSEGV at pc=0xffffffffffffffc7`, `fault pc is in NO live registered code
+   buffer`. A site the resolver has already claimed cannot be un-claimed
+   downstream.
+
+   The second was a claim, and it is **RETRACTED**. This page first said the
+   admission carried "a real gap ... even though it is not this defect":
+   `first_unsupported_precise_frame_site` clears opcode `0xb6` because
+   `precise_frame_publishing_opcode` says its lowering publishes a reason-9
+   frame, and the BOX_UNBOX region then substitutes a lowering whose edges are
+   reason-6. The source reading is correct; the conclusion drawn from it was
+   not. Worse, it was left as an OPEN gap inside a RETIRED page, which is the
+   one place nothing tracks it.
+
+   Measured 2026-09-05 on `dev@7acc0b27c`, with two probes built for exactly the
+   shape it predicts:
+
+   * `Integer.intValue()` / `Long.longValue()` as the ONLY throwing opcode in a
+     protected range, in a method invoked once so OSR is the only compile door,
+     with the handler reading locals set before the `try`;
+   * the same with the handler reading locals set before the LOOP -- the stale
+     pre-OSR locals `route_osr_exception_out_of_artifact` names as the hazard --
+     plus a witness the loop advances, so a stale read and a correct read differ.
+
+   Both engage, which is the half a passing probe has to prove first:
+   `OSR-compile ...arm()V entry_pc=24` on a method with a non-empty exception
+   table, and `[box-unbox-intrinsic] java/lang/Integer.intValue()I` for a site
+   that exists nowhere but inside that `try`. Both match HotSpot exactly, 3 runs
+   each, handler entered with correct locals: `caught=400 bad=0 drift=0
+   escaped=0`.
+
+   **A reason-6 deopt is not a weaker publication than a reason-9 frame; it is a
+   stronger action.** It abandons the compiled frame and hands a reconstructed
+   one back to the interpreter, which raises the NPE and searches the exception
+   table itself. The reason-9 frame exists for an exception that arrives INSIDE
+   the compiled body and has to be routed WITHOUT leaving it. A site that deopts
+   instead of publishing reaches the promise's purpose by another road, so the
+   admission's soundness does not depend on the substituted lowering publishing
+   anything.
+
+**Three arms each removed the symptom, and only one named the defect.**
+`CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`, `CRATONVM_JIT_OSR_EXC_TABLE=0` and
+`CRATONVM_DEOPT_REAL=0` are all clean, and each supported a different story. A
+kill switch identifies an ingredient; only the trace above identified the cause.
 
 `probes/BoxUnboxNpeProbe.java` is the reduced repro: it needs only
 `lengthOf.apply(s)` (the vector's `stepFn` hop is not required), takes `-Dprobe.n`,

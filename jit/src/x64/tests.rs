@@ -7097,6 +7097,54 @@ fn test_find_modified_locals() {
     assert!(modified & (1 << 3) == 0); // local 3 NOT modified
 }
 
+/// A `long`/`double` store writes TWO local slots, and the mask has to say so.
+///
+/// `test_find_modified_locals_sees_every_wide_form` covers the `wide` prefix
+/// (`7af844829`). This is the adjacent hole that audit turned up: every arm of
+/// this scan recorded only the LOWER slot of a category-2 store, so a consumer
+/// asking about the upper one was told the loop does not write it.
+///
+/// It was pinned the wrong way round in this very file until 2026-09-05 —
+/// `p87_fp_loop_hoist_detection` and `p87_fp_hoist_double_and_float` both
+/// asserted that a `dload_1` is hoistable out of a loop whose body contains
+/// `dstore_0`, one of them with the comment "this modifies 0, but doesn't
+/// affect 1". It affects 1.
+#[test]
+fn find_modified_locals_marks_the_high_half_of_a_category_2_store() {
+    // dstore_1 (narrow, implicit index) covers locals 1 and 2.
+    let dstore_1: Vec<u8> = vec![0x48, 0xb1];
+    assert_eq!(
+        find_modified_locals(&dstore_1, 0, dstore_1.len()),
+        (1u64 << 1) | (1u64 << 2),
+        "`dstore_1` writes locals 1 and 2"
+    );
+
+    // lstore 5 (1-byte index operand) covers 5 and 6.
+    let lstore_5: Vec<u8> = vec![0x37, 0x05, 0xb1];
+    assert_eq!(
+        find_modified_locals(&lstore_5, 0, lstore_5.len()),
+        (1u64 << 5) | (1u64 << 6),
+        "`lstore 5` writes locals 5 and 6"
+    );
+
+    // wide lstore 5 (2-byte index operand) covers the same pair.
+    let wide_lstore: Vec<u8> = vec![0xc4, 0x37, 0x00, 0x05, 0xb1];
+    assert_eq!(
+        find_modified_locals(&wide_lstore, 0, wide_lstore.len()),
+        (1u64 << 5) | (1u64 << 6),
+        "`wide lstore 5` writes locals 5 and 6"
+    );
+
+    // A category-1 store keeps its single slot: over-marking is safe here, but
+    // marking MORE than the store writes is still a lost hoist, so pin it.
+    let istore_5: Vec<u8> = vec![0x36, 0x05, 0xb1];
+    assert_eq!(
+        find_modified_locals(&istore_5, 0, istore_5.len()),
+        1u64 << 5,
+        "`istore 5` writes local 5 only"
+    );
+}
+
 /// `for (i = 0; i < a.length; i++) if (a[i] == 'a') c++;` — the exact inner
 /// loop of `probes/CharAtCostCurve.java::scanArr`, taken from `javap -c -p -l`.
 ///
@@ -7203,10 +7251,17 @@ fn find_array_len_hoists_refuses_a_reassigned_array_local() {
     );
 }
 
-/// `find_modified_locals` cannot decode a `wide`-prefixed store: it falls into
-/// the catch-all arm and records nothing, so a `wide astore 0` would leave
-/// local 0 looking invariant. The body scan refuses any body containing the
-/// prefix at all rather than trusting a mask that cannot see it.
+/// The body scan refuses any body containing a `wide` prefix outright.
+///
+/// It was written when `find_modified_locals` genuinely could not decode one:
+/// a `wide astore 0` fell into that function's catch-all arm and left local 0
+/// looking invariant. The mask decodes `wide` now -- it had to, because the
+/// arith, `aaload` and FP hoists share it and had no guard of their own, and
+/// the arith one miscompiled a strided loop as a result. So this refusal is
+/// belt-and-braces today. Kept anyway: the same scan also refuses `jsr`/`ret`,
+/// which `detect_loops` still does not model, and refusing costs only a hoist.
+///
+/// The second assertion is the one that notices the mask regressing.
 #[test]
 fn find_array_len_hoists_refuses_a_wide_prefixed_body() {
     // Same as the refusal above, but the store is `wide astore 0`
@@ -7228,6 +7283,11 @@ fn find_array_len_hoists_refuses_a_wide_prefixed_body() {
     assert!(
         hoists.is_empty(),
         "a wide prefix in the body is not modelled, got {hoists:?}"
+    );
+    assert_eq!(
+        find_modified_locals(&code, 0, code_len) & 1,
+        1,
+        "and the mask itself must see the `wide astore 0`"
     );
 }
 
@@ -7782,6 +7842,68 @@ fn test_arith_licm_no_hoist_when_operand_modified() {
         hoists.is_empty(),
         "expr on a loop-modified local must not hoist"
     );
+}
+
+#[test]
+fn test_arith_licm_no_hoist_when_operand_modified_by_wide_iinc() {
+    // The same refusal, through the `wide` prefix.
+    //
+    // AUDIT 2026-09-05. `find_modified_locals` had an arm for `iinc`
+    // (0x84) and none for `wide` (0xc4), so `wide iinc` fell to the
+    // length-only default: the walk stayed aligned and the local was
+    // never marked modified. javac emits `wide iinc` whenever the delta
+    // does not fit in a signed byte -- `i += 1024` -- so the induction
+    // variable of every such loop read as loop-INVARIANT and
+    // `i + <invariant>` got hoisted into the pre-header. Stride 1 was
+    // correct and stride 1024 was not.
+    //
+    //   PC 0: iload 4              — header
+    //   PC 2: iload_1
+    //   PC 3: if_icmpge +N
+    //   PC 6: iload 4  (the INDUCTION VARIABLE, not a constant)
+    //   PC 8: iload_0
+    //   PC 9: iadd                 ← i + base, must NOT hoist
+    //   PC 10: istore_2
+    //   PC 11: wide iinc 4, 1024   ← modifies local 4
+    //   PC 17: goto -17 → 0
+    let code: Vec<u8> = vec![
+        0x15, 0x04, // 0: iload 4
+        0x1b, // 2: iload_1
+        0xa2, 0x00, 0x11, // 3: if_icmpge +17 → 20
+        0x15, 0x04, // 6: iload 4   ← the induction variable
+        0x1a, // 8: iload_0
+        0x60, // 9: iadd
+        0x3d, // 10: istore_2
+        0xc4, 0x84, 0x00, 0x04, 0x04, 0x00, // 11: wide iinc 4, 1024
+        0xa7, 0xff, 0xef, // 17: goto -17 → 0
+        0, 0,
+    ];
+    let code_len = 20;
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_arith_loop_hoists(&code, code_len, &loops);
+    assert!(
+        hoists.is_empty(),
+        "an expression over a local incremented by WIDE iinc is not          loop-invariant and must not hoist; got {} hoist(s)",
+        hoists.len()
+    );
+}
+
+/// `wide` stores mark their local too, not just `wide iinc`.
+#[test]
+fn test_find_modified_locals_sees_every_wide_form() {
+    use crate::x64::escape_analysis::find_modified_locals;
+    // wide istore 4      c4 36 00 04
+    let m = find_modified_locals(&[0xc4, 0x36, 0x00, 0x04], 0, 4);
+    assert_eq!(m, 1 << 4, "wide istore must mark its local");
+    // wide astore 7      c4 3a 00 07
+    let m = find_modified_locals(&[0xc4, 0x3a, 0x00, 0x07], 0, 4);
+    assert_eq!(m, 1 << 7, "wide astore must mark its local");
+    // wide iinc 4, 1024  c4 84 00 04 04 00
+    let m = find_modified_locals(&[0xc4, 0x84, 0x00, 0x04, 0x04, 0x00], 0, 6);
+    assert_eq!(m, 1 << 4, "wide iinc must mark its local");
+    // wide iload 4 writes nothing.
+    let m = find_modified_locals(&[0xc4, 0x15, 0x00, 0x04], 0, 4);
+    assert_eq!(m, 0, "a wide LOAD must not mark anything");
 }
 
 #[test]
@@ -11501,34 +11623,69 @@ fn p87_xmm_local_allocation_verified() {
 
 #[test]
 fn p87_fp_loop_hoist_detection() {
-    // Loop: dload_0; dload_1; dadd; dstore_0; iinc 2 1; iload_2; iconst_5; if_icmplt -10; dload_0; dreturn
-    // dload_1 is invariant (local 1 not modified), dload_0 is NOT (dstore_0 modifies it)
+    // Loop: dload_0; dload 4; dadd; dstore_0; iinc 2 1; iload 2; iconst_5;
+    //       if_icmplt -11; dload_0; dreturn
+    //
+    // The invariant operand is `dload 4`, NOT the `dload_1` this test used to
+    // carry. `dstore_0` stores a `double`, which occupies slots 0 AND 1, so
+    // `dload_1` reads a slot the loop body writes and hoisting it out is
+    // unsound. The old fixture asserted that hoist was legal — it was written
+    // from what `find_modified_locals` did, which recorded only the lower slot
+    // of a category-2 store until 2026-09-05. `dload 4` (slots 4, 5) is
+    // disjoint from the accumulator (0, 1) and from the counter (2), so the
+    // property the test was written for is preserved and now stated on a
+    // fixture where it holds.
     let code: Vec<u8> = vec![
-        0x26, // 0: dload_0  (modified — acc)
-        0x27, // 1: dload_1  (invariant — constant)
-        0x63, // 2: dadd
-        0x47, // 3: dstore_0
-        0x84, 0x02, 0x01, // 4: iinc 2, 1
-        0x15, 0x02, // 7: iload 2
-        0x08, // 9: iconst_5
+        0x26, // 0:  dload_0  (modified — acc, slots 0+1)
+        0x18, 0x04, // 1:  dload 4 (invariant — slots 4+5)
+        0x63, // 3:  dadd
+        0x47, // 4:  dstore_0
+        0x84, 0x02, 0x01, // 5: iinc 2, 1
+        0x15, 0x02, // 8:  iload 2
+        0x08, // 10: iconst_5
+        0xa1, 0xFF, 0xF5, // 11: if_icmplt -11 → target=0
+        0x26, // 14: dload_0
+        0xaf, // 15: dreturn
+        0, 0,
+    ];
+    let code_len = 16;
+    let loops = detect_loops(&code, code_len);
+    assert!(!loops.is_empty(), "Should detect a loop");
+
+    let hoists = find_fp_loop_hoists(&code, code_len, &loops);
+    // dload 4 at PC=1 should be hoistable (locals 4 and 5 are invariant)
+    let hoisted_pcs: Vec<usize> = hoists.iter().map(|h| h.load_pc).collect();
+    assert!(
+        hoisted_pcs.contains(&1),
+        "dload 4 at PC=1 should be hoistable"
+    );
+    // dload_0 at PC=0 should NOT be hoistable (local 0 is modified by dstore_0)
+    assert!(!hoisted_pcs.contains(&0), "dload_0 should not be hoistable");
+
+    // And the shape the old fixture asserted was legal must be refused: swap
+    // the invariant operand back to `dload_1`, whose slot 1 is the dead high
+    // half of the `dstore_0` in the body. Two bytes shorter, so the branch
+    // offset moves with it.
+    let overlapping: Vec<u8> = vec![
+        0x26, // 0:  dload_0
+        0x27, // 1:  dload_1  <- reads slots 1+2, and the body writes both
+        0x63, // 2:  dadd
+        0x47, // 3:  dstore_0 (writes slots 0+1)
+        0x84, 0x02, 0x01, // 4: iinc 2, 1  (writes slot 2)
+        0x15, 0x02, // 7:  iload 2
+        0x08, // 9:  iconst_5
         0xa1, 0xFF, 0xF6, // 10: if_icmplt -10 → target=0
         0x26, // 13: dload_0
         0xaf, // 14: dreturn
         0, 0,
     ];
-    let code_len = 15;
-    let loops = detect_loops(&code, code_len);
-    assert!(!loops.is_empty(), "Should detect a loop");
-
-    let hoists = find_fp_loop_hoists(&code, code_len, &loops);
-    // dload_1 at PC=1 should be hoistable (local 1 is invariant)
-    let hoisted_pcs: Vec<usize> = hoists.iter().map(|h| h.load_pc).collect();
+    let overlapping_loops = detect_loops(&overlapping, 15);
     assert!(
-        hoisted_pcs.contains(&1),
-        "dload_1 at PC=1 should be hoistable"
+        find_fp_loop_hoists(&overlapping, 15, &overlapping_loops)
+            .iter()
+            .all(|h| h.load_pc != 1),
+        "`dload_1` overlaps the `dstore_0` in the body and must not hoist"
     );
-    // dload_0 at PC=0 should NOT be hoistable (local 0 is modified by dstore_0)
-    assert!(!hoisted_pcs.contains(&0), "dload_0 should not be hoistable");
 }
 
 #[test]
@@ -11976,30 +12133,35 @@ fn p87_mixed_fp_and_int_computation() {
 
 #[test]
 fn p87_fp_hoist_double_and_float() {
-    // Verify hoist detection for both float and double types
-    // Loop with fload_0 (invariant) and dload_1 (invariant), fstore_2 modified
+    // Verify hoist detection for both float and double types.
+    //
+    // The invariant `double` is `dload 4`, not the `dload_1` this test used to
+    // carry: `dstore_0` at PC=4 writes slots 0 AND 1, so `dload_1` reads a
+    // slot the body writes. The old comment said `dstore_0` "modifies 0, but
+    // doesn't affect 1", which is not true of a category-2 store — see
+    // `p87_fp_loop_hoist_detection`, which carried the same mistake.
     let code: Vec<u8> = vec![
-        0x22, // 0: fload_0 (float, invariant)
-        0x27, // 1: dload_1 (double, invariant — this is wrong mix, but tests detection)
-        0x63, // 2: dadd (type mismatch at runtime, but tests analysis)
-        0x47, // 3: dstore_0 (this modifies 0, but doesn't affect 1)
-        0x84, 0x03, 0x01, // 4: iinc 3, 1
-        0x15, 0x03, // 7: iload 3
-        0x08, // 9: iconst_5
-        0xa1, 0xFF, 0xF6, // 10: if_icmplt -10 → target=0
+        0x22, // 0: fload_0 (float — local 0, which the dstore_0 below writes)
+        0x18, 0x04, // 1: dload 4 (double, invariant — slots 4+5)
+        0x63, // 3: dadd (type mismatch at runtime, but tests analysis)
+        0x47, // 4: dstore_0 (writes slots 0 AND 1)
+        0x84, 0x03, 0x01, // 5: iinc 3, 1
+        0x15, 0x03, // 8: iload 3
+        0x08, // 10: iconst_5
+        0xa1, 0xFF, 0xF5, // 11: if_icmplt -11 → target=0
         0x26, 0xaf, 0, 0,
     ];
-    let code_len = 15;
+    let code_len = 16;
     let loops = detect_loops(&code, code_len);
     let hoists = find_fp_loop_hoists(&code, code_len, &loops);
 
-    // fload_0 at PC=0: local 0 IS modified (dstore_0 at PC=3) → NOT hoistable
-    // dload_1 at PC=1: local 1 is NOT modified → hoistable
+    // fload_0 at PC=0: local 0 IS modified (dstore_0 at PC=4) → NOT hoistable
+    // dload 4 at PC=1: locals 4 and 5 are NOT modified → hoistable
     let hoisted_locals: Vec<(usize, bool)> =
         hoists.iter().map(|h| (h.local_idx, h.is_double)).collect();
     assert!(
-        hoisted_locals.contains(&(1, true)),
-        "dload_1 should be hoistable"
+        hoisted_locals.contains(&(4, true)),
+        "dload 4 should be hoistable"
     );
     assert!(
         !hoisted_locals.iter().any(|(l, _)| *l == 0),

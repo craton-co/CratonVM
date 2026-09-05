@@ -556,6 +556,10 @@ impl Compiler {
 
         let mut dead = false; // true after unconditional control transfer
 
+        // Read once for the whole method: see `osr_empty_stack_entry_enabled`
+        // for why this is not a `OnceLock` and not read per pc.
+        let osr_empty_stack_rule = super::osr::osr_empty_stack_entry_enabled();
+
         let mut pc = 0;
         while pc < code_len {
             // Stage 2 (precise oop maps) — track the bytecode PC being emitted
@@ -821,11 +825,64 @@ impl Compiler {
                 // `catch` block is now emitted keeps the OSR-entry answer it
                 // had when that block was dead code.
                 let handler_only = handler_only_pcs.get(pc).copied().unwrap_or(false);
+                // The abstract operand stack must be EMPTY here.
+                //
+                // AUDIT 2026-09-04, and this one was wrong code, not a
+                // missed optimisation. Entering part-way through an
+                // expression means the entry prologue has to materialise
+                // the pending operands -- and it does, correctly, for the
+                // entering iteration. What it cannot do is make the LOOP
+                // recompute them: the back edge targets the header, the
+                // operand pushes live ABOVE the entry point, and every
+                // later iteration replays the slots the prologue filled
+                // once.
+                //
+                // `test_classes/jit/OsrStridedValue.java`, entering at the
+                // `iastore` of `a[i] = i + r` with `[a, i, i+r]` pending:
+                //
+                //     --nojit   11 1035 2059 3083 4107 5131
+                //     jit       11   11   11   11   11   11
+                //
+                // The addresses advance because the index is a local in a
+                // register; the VALUE is frozen at the entering
+                // iteration's `i` because it lives in an operand slot
+                // written before the loop. Same shape, same reason, as the
+                // synthetic-guard case just above -- "part-way through,
+                // the abstract operand stack is not the header's" -- which
+                // is why that one already refuses.
+                //
+                // Costs nothing in practice: javac gives every loop header
+                // an empty expression stack, so the pcs this newly refuses
+                // are mid-expression ones the interpreter reaches again a
+                // few bytecodes later at the header.
+                // `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` gives this rule
+                // an off switch; see `osr::osr_empty_stack_entry_enabled` for
+                // why a soundness rule gets one.
+                let operand_stack_live = !self.stack.is_empty() && osr_empty_stack_rule;
+                if operand_stack_live {
+                    // The switch above changes no ANSWER — that is the page's
+                    // own finding — so its engagement is invisible in output.
+                    // Count it, and name it in the `[cratonvm-jitc]` stream the
+                    // other OSR refusals already use, so "the rule fired" /
+                    // "the switch turned it off" is one grep instead of an
+                    // inference from a diff that is empty either way. See
+                    // `super::osr::OSR_EMPTY_STACK_REFUSALS`.
+                    let n = super::osr::OSR_EMPTY_STACK_REFUSALS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] osr-refuse (operand-stack-live) pc={pc} depth={} #{n}",
+                            self.stack.len()
+                        );
+                    }
+                }
                 if inside_aaload_hoisted
                     || inside_arith_hoisted
                     || inside_len_hoisted
                     || inside_synthetic_guard
                     || handler_only
+                    || operand_stack_live
                 {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {

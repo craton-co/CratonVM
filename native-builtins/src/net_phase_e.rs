@@ -7450,10 +7450,23 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             } else {
                 None
             };
-            // Closed-but-once-bound: the listener is gone, but the address it
-            // held is retained and is still what the real method reports.
-            let ip = ip
-                .or_else(|| (!side.host.is_empty()).then(|| side.host.clone()))
+            // THE RECORDED BIND ADDRESS OUTRANKS THE LISTENER'S.
+            //
+            // `side.host` is what the bind handler stored, and it already
+            // applies the rule this getter needs: a wildcard bind records the
+            // address the CALLER asked for, because the socket underneath is
+            // AF_INET6 with `IPV6_V6ONLY` cleared and its `local_addr()` says
+            // `::` whichever wildcard was requested. Reading the listener first
+            // threw that away and answered `::` for `new ServerSocket(0)`,
+            // where HotSpot -- on the same machine, equally dual-stack --
+            // answers `0.0.0.0`.
+            //
+            // The listener remains the fallback for a receiver this surface
+            // never bound (a phase-53-constructed ServerSocket, reached through
+            // the object-field listener id above), which has no recorded host.
+            let ip = (!side.host.is_empty())
+                .then(|| side.host.clone())
+                .or(ip)
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // `ServerSocket.getInetAddress()` hands back the very `InetAddress`
             // that was passed to `bind`, so whether it carries a name is
@@ -7528,14 +7541,20 @@ fn re2_server_socket_local_address(
                 .map(|a| (a.ip().to_string(), a.port() as i32))
         })
         .flatten();
-    let (ip, port) = live.unwrap_or_else(|| {
-        let host = if side.host.is_empty() {
-            "0.0.0.0".to_string()
-        } else {
-            side.host.clone()
-        };
-        (host, side.port)
-    });
+    // Same split as `getInetAddress`: the ADDRESS comes from what was bound,
+    // the PORT from the live listener. They have different authorities -- an
+    // ephemeral port is only knowable from the socket, while the wildcard
+    // family is only knowable from the request, since a dual-stack listener
+    // reports `::` for either one.
+    let (live_ip, live_port) = match live {
+        Some((ip, port)) => (Some(ip), Some(port)),
+        None => (None, None),
+    };
+    let ip = (!side.host.is_empty())
+        .then(|| side.host.clone())
+        .or(live_ip)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let port = live_port.unwrap_or(side.port);
     Ok(Some(Value::Object(Some(
         alloc_inet_socket_address_resolved(ctx, &ip, &ip, port)?,
     ))))
@@ -13636,6 +13655,158 @@ fn re5_ssl_parameter_ciphers(
 
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
+/// Start `sendAsync`'s request on its own thread, returning the INCOMPLETE
+/// future the caller gets back — or `None` when that could not be arranged, in
+/// which case the caller falls back to performing the request inline.
+///
+/// Every step can fail on a VM that has not loaded these classes, and each
+/// failure answers `None` rather than half-starting: a future handed out with
+/// no thread to complete it would hang the first `get()`.
+fn re5_start_async_send(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<cratonvm_types::ObjectRef> {
+    let future = match ctx.new_object_initialized(
+        "java/util/concurrent/CompletableFuture",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(f)))) => f,
+        _ => return None,
+    };
+    let future_root = ctx.add_global_root(future);
+    let task = match try_alloc_concurrent_synthetic(ctx, RE5_SEND_TASK, RE5_TASK_FIELDS) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+    ctx.set_field(task, RE5_TASK_FUTURE, Value::Object(Some(future)));
+    ctx.set_field(task, RE5_TASK_CLIENT, args.first().copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(task, RE5_TASK_REQUEST, args.get(1).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(task, RE5_TASK_HANDLER, args.get(2).copied().unwrap_or(Value::Object(None)));
+
+    let task_root = ctx.add_global_root(task);
+    let thread = match ctx.new_object_initialized(
+        "java/lang/Thread",
+        "(Ljava/lang/Runnable;)V",
+        &[Value::Object(Some(task))],
+    ) {
+        Ok(Some(Value::Object(Some(t)))) => t,
+        _ => return None,
+    };
+    // Daemon, so an in-flight request cannot hold the VM open at exit — the
+    // JDK's own HttpClient threads are daemons for the same reason.
+    let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    if ctx.thread_start(thread).is_err() {
+        return None;
+    }
+    let _ = ctx.resolve_global_root(task_root);
+    ctx.resolve_global_root(future_root)
+}
+
+/// The class of the task object `sendAsync` hands to a `Thread`.
+const RE5_SEND_TASK: &str = "cratonvm/internal/HttpSendTask";
+const RE5_TASK_FUTURE: usize = 0;
+const RE5_TASK_CLIENT: usize = 1;
+const RE5_TASK_REQUEST: usize = 2;
+const RE5_TASK_HANDLER: usize = 3;
+const RE5_TASK_FIELDS: usize = 4;
+
+/// `Runnable.run()` for the task above: perform the request that `sendAsync`
+/// used to perform inline, then complete the future it already handed back.
+///
+/// Completion mirrors `native-io`'s async-channel path exactly, including the
+/// `postComplete` call: `completeThrowable` and `complete` are the real JDK
+/// primitives, and `postComplete` is bytecode, so it needs the bytecode-only
+/// resolver or the by-name native lookup misses it and waiters never wake.
+fn re5_send_task_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let future = match ctx.get_field(this, RE5_TASK_FUTURE) {
+        Value::Object(Some(f)) => f,
+        _ => return Ok(None),
+    };
+    let client = ctx.get_field(this, RE5_TASK_CLIENT);
+    let request = ctx.get_field(this, RE5_TASK_REQUEST);
+    let handler = ctx.get_field(this, RE5_TASK_HANDLER);
+
+    let future_root = ctx.add_global_root(future);
+    let outcome = re5_do_request(ctx, &[client, request, handler]);
+    let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+
+    match outcome {
+        Ok(resp) => {
+            let _ = ctx.invoke_virtual(
+                future,
+                "complete",
+                "(Ljava/lang/Object;)Z",
+                &[resp.unwrap_or(Value::Object(None))],
+            );
+        }
+        Err(failure) => {
+            let thrown = re5_throwable_for(ctx, failure);
+            let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+            if let Some(t) = thrown {
+                let _ = ctx.invoke_virtual(
+                    future,
+                    "completeThrowable",
+                    "(Ljava/lang/Throwable;)Z",
+                    &[Value::Object(Some(t))],
+                );
+            } else {
+                // Nothing to complete it WITH is still better than a future no
+                // one ever completes: a caller blocked in `get()` would hang.
+                let _ = ctx.invoke_virtual(
+                    future,
+                    "complete",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(None)],
+                );
+            }
+        }
+    }
+    let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+    let _ = ctx.invoke_virtual_bytecode_only(future, "postComplete", "()V", &[]);
+    Ok(None)
+}
+
+/// Turn a native failure into a Java `Throwable`, or `None` when it is a VM
+/// fault rather than something a `catch` could name.
+///
+/// The common shape is `InternalError(VmError::Runtime(..))`, NOT an
+/// already-materialised `ExceptionThrown` — reading that wrong is why the first
+/// version of the `sendAsync` repair changed nothing observable.
+fn re5_throwable_for(
+    ctx: &mut dyn NativeContext,
+    failure: cratonvm_types::error::MethodCallFailed,
+) -> Option<cratonvm_types::ObjectRef> {
+    use cratonvm_types::error::{MethodCallFailed, VmError};
+    match failure {
+        MethodCallFailed::ExceptionThrown(t) => Some(t),
+        MethodCallFailed::InternalError(VmError::Runtime(re)) => {
+            let (class_name, message) = re.as_java_throwable()?;
+            let message = message.map(|m| m.into_owned());
+            let built = match &message {
+                Some(m) => {
+                    let msg_obj = ctx.create_string(m);
+                    ctx.new_object_initialized(
+                        class_name,
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(msg_obj))],
+                    )
+                }
+                None => ctx.new_object_initialized(class_name, "()V", &[]),
+            };
+            match built {
+                Ok(Some(Value::Object(Some(t)))) => Some(t),
+                _ => None,
+            }
+        }
+        MethodCallFailed::InternalError(_) => None,
+    }
+}
+
 /// `CompletableFuture.failedFuture(t)` — the future `sendAsync` hands back when
 /// the request failed.
 ///
@@ -14099,6 +14270,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         // class is `CompletableFuture` where HotSpot's is `MinimalFuture`. A
         // caller that chains on it sees the continuation run on the calling
         // thread. Making the send genuinely asynchronous is a different change.
+        // ASYNCHRONOUS when a thread can be started for it, synchronous when
+        // one cannot. The request runs on its own thread and completes the
+        // future the caller already holds, so N calls overlap instead of
+        // serialising and a continuation runs off the caller's thread — which
+        // is what `sendAsync` means. If the thread cannot be created the old
+        // synchronous path below runs unchanged, so the failure mode is the
+        // previous behaviour rather than a future nobody completes.
+        if let Some(future) = re5_start_async_send(ctx, args) {
+            return Ok(Some(Value::Object(Some(future))));
+        }
         match re5_do_request(ctx, args) {
             Ok(resp) => ctx.invoke(
                 "java/util/concurrent/CompletableFuture",
@@ -14157,6 +14338,10 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Err(internal) => Err(internal),
         }
     };
+    // The task carrier's `run()`. Registered on its own class so dispatch —
+    // which keys on the receiver's runtime class — finds it when `Thread.run()`
+    // calls `target.run()`.
+    r.register(RE5_SEND_TASK, "run", "()V", re5_send_task_run);
     r.register(
         hc,
         "sendAsync",
