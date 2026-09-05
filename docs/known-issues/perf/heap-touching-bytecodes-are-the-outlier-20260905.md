@@ -64,6 +64,51 @@ and decoded only on the decline. It was one arm out of step with its
 neighbour, not an opcode family. Fixed by giving the load arm the store arm's
 shape.
 
+## RETRACTION: the field half of the registry elide was wrong, and is reverted
+
+Written at the top of the section it retracts, because a page that buries its
+own correction is worse than one that never made the claim.
+
+The argument below — that eliding `is_object_address` restores parity because
+"the handler those arms replace, `ZgcRealHeap::get_field`, does no membership
+check" — is **wrong, and it is wrong by looking one level too low.**
+
+The handler a quickened `getfield` stands in for is **`op_getfield`**, not
+`get_field`. Its second act, immediately after popping the receiver, is
+`shared.mem.heap.load_and_forward(obj_ref)`, and `load_and_forward_inner` opens
+with:
+
+```rust
+if !pre_validated && self.is_object_address(obj.as_ptr() as usize).is_none() {
+```
+
+`op_putfield` does the same. **The slow path does probe the receiver.** Eliding
+it on the field arms was a robustness regression, not a parity restoration, and
+it bought a weak 1-4 ns at 8/10 pairwise — the least valuable result on this
+page. Reverted; `field_ptr_for` probes unconditionally again.
+
+**Two comments in the file said so and were overruled by the bad argument.**
+`field_ptr_for`'s own doc — "it keeps a stale operand-stack reference to an
+uncommitted page from faulting where the slow handler would have answered
+`class 0`" — and the `# Safety` contract on the raw accessors, which names the
+probe as its first discharging leg. Both were right.
+
+**How it surfaced, which is the transferable part.** Not from a test — the
+suite was green on the elide, twice, on two collectors, and difftest was clean.
+It surfaced from a *merge*. `dev` had added that `# Safety` contract the same
+morning; the merge was textually clean, so it kept my code and their comment,
+and the file was left documenting a discharge that no longer happened. Reading
+the merge for semantic conflicts rather than trusting a clean auto-merge is
+what found it. A green suite does not exercise a robustness net; that is what a
+robustness net is for.
+
+**The array half stands, and the asymmetry is the real finding.** The array
+slow paths genuinely do not validate: the `0x2e..=0x35` arm reaches
+`VmHeap::get_array_element` and the `0xbe` arm reaches `VmHeap::array_length`
+with **zero** `load_and_forward` calls between the pop and the header read. So
+"does the slow path check this?" has a different answer for fields than for
+arrays — and one gate was covering both.
+
 ## The item that was taken: the registry probe
 
 `field_ptr_for` and `prim_elem_ptr` both opened with
