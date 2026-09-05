@@ -3955,8 +3955,8 @@ pub(super) fn try_osr(
     }
     if crate::jit::helpers::take_jit_pending_npe() {
         // Taken BEFORE the construction below re-captures a stack the compiled
-        // frames have already left — see `attach_snapshotted_npe_frames`.
-        let npe_snapshot = crate::jit::helpers::take_jit_pending_npe_compiled_frames();
+        // frames have already left — see `attach_snapshotted_trap_frames`.
+        let npe_snapshot = crate::jit::helpers::take_jit_pending_trap_frames();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
         // whose code raised the NPE, so this frame's table is the one to
@@ -3978,7 +3978,7 @@ pub(super) fn try_osr(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -11223,14 +11223,14 @@ pub(super) fn execute_jit_call(
         // i64::MIN deopt sentinel and ran the epilogue, so construction here
         // sees only what the interpreter still holds. `sig` carries the
         // snapshot the helper took while they were live.
-        let npe_snapshot = sig.npe_compiled_frames.take();
+        let npe_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -11317,6 +11317,15 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
+        // The compiled frames this div-by-zero was raised in have already
+        // left the stack, exactly as in the `sig.npe` arm above: the
+        // zero-divisor stub called `jit_throw_arithmetic`, loaded the i64::MIN
+        // deopt sentinel and ran the epilogue. `sig` carries the snapshot that
+        // helper took while they were live; without draining it here the
+        // throwable keeps the frameless trace `fillInStackTrace` just built,
+        // AND the snapshot is left in the cell for the next take — which
+        // belongs to a different throwable.
+        let trap_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -11325,6 +11334,12 @@ pub(super) fn execute_jit_call(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 let exc_locals = synchronized_args.as_deref().map_or_else(
                     || jit_saved_args_to_values(cached, &saved_args, np),
                     |args| args.to_vec(),
@@ -11712,14 +11727,14 @@ pub(super) fn execute_jit_call_decoded(
         // i64::MIN deopt sentinel and ran the epilogue, so construction here
         // sees only what the interpreter still holds. `sig` carries the
         // snapshot the helper took while they were live.
-        let npe_snapshot = sig.npe_compiled_frames.take();
+        let npe_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -11766,6 +11781,7 @@ pub(super) fn execute_jit_call_decoded(
     // the matching block in `execute_jit_call`). Throw `ArithmeticException`
     // through the method's exception table instead of re-running from entry.
     if sig.arithmetic {
+        let trap_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -11774,6 +11790,12 @@ pub(super) fn execute_jit_call_decoded(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12106,14 +12128,14 @@ pub(super) fn execute_jit_call_oneshot(
         // i64::MIN deopt sentinel and ran the epilogue, so construction here
         // sees only what the interpreter still holds. `sig` carries the
         // snapshot the helper took while they were live.
-        let npe_snapshot = sig.npe_compiled_frames.take();
+        let npe_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -12155,6 +12177,7 @@ pub(super) fn execute_jit_call_oneshot(
         }
     }
     if sig.arithmetic {
+        let trap_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -12163,6 +12186,12 @@ pub(super) fn execute_jit_call_oneshot(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 return oneshot_route_exception(
                     shared,
                     thread,
