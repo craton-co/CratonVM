@@ -1,87 +1,115 @@
-# Blocking connect/accept stalls between 96 and 128 connections
+# Client-side blocking `connect` stalls after a few dozen connections — Windows only
 
-**Status: OPEN, 2026-09-05.** Found while building F3's acceptance curve for
-`performance/socket-transfer-per-call-costs-20260904.md`. **Not caused by that
-work** — see the exoneration below, which is the first thing to re-run if you
-doubt it.
+**Status: OPEN, characterised 2026-09-05.** Found while building F3's
+acceptance curve for `performance/socket-transfer-per-call-costs-20260904.md`.
+**Not caused by that work** — the exoneration arm is below and is one command.
 
-## The symptom
+The page's first revision said "connect/accept stalls near 128 connections".
+Both halves of that title were wrong: it is **not** accept, and there is **no
+fixed threshold**. Corrected below, with the arm that refuted each.
 
-`probes/SelectorScalingProbe.java` opens `N + 1` loopback connections in a
-plain sequential loop — `SocketChannel.open(addr)` then `server.accept()`, one
-pair at a time, each accepted socket registered `OP_READ` on a `Selector` — and
-then runs a one-byte echo round trip against the first connection.
+## What it is
 
-| N idle connections | CratonVM | HotSpot 25.0.3+9 |
+`probes/WinConnectStallProbe.java` opens N loopback connections in a plain
+sequential loop and prints, flushed, before every call. On Windows, CratonVM's
+**client** side stops returning from `SocketChannel.open(addr)`. No exception,
+no error, no progress.
+
+## What has been established, and by which arm
+
+| claim | arm | result |
 |---|---|---|
-| 8 | passes | passes |
-| 64 | passes | passes |
-| 256 | **STALLS in setup** | passes |
-| 2048 | not reached | passes |
+| It is the CLIENT, not the server | HotSpot server + CratonVM client | **stalls at connect #43** |
+| The server/accept side is fine | CratonVM server + HotSpot client | **200 connections OK** |
+| Not the machine's socket state | HotSpot client, same moment, same probe | **200 OK** |
+| Windows only | Azure Linux, same commit, idle=256 | **passes, checksum matches** |
+| Not the selector | `noreg` mode, no `register()` at all | stalls identically |
+| Not TIME_WAIT / ports | `Get-NetTCPConnection` | TIME_WAIT 8 vs 204 → **same index**; 16 384 ports free |
+| Not leaked processes | `Get-Process cratonvm` between runs | none |
+| Not GC / heap pressure | `-Xmx2g` vs default | **36 vs 36** — identical |
+| Blocked, not slow | `Get-Process` CPU across 8 s | flat at 13.3 s |
+| Blocked in a NATIVE call | `--stack-dump-on-timeout 45` | watchdog: `deposit=STALE … RUNNING right now … JIT-compiled code or a long native call`; `[WAIT-CENSUS] none`, so not `Object.wait()`, not a monitor |
 
-The stall is in **connection setup, between 96 and 128**, not in the traffic
-that follows: the probe prints a progress line every 32 connections and the last
-one printed is `connecting 96/256`. It never reaches `setup complete`.
+At the stall the two processes are waiting on each other: the client printed
+`[22] connect` and the HotSpot server printed `[22] accept`. **The connection
+never reaches the listener.**
 
-**It is a stall, not slowness.** `Get-Process cratonvm` shows CPU flat at 13.3 s
-across an 8-second window — the process is blocked, not spinning. That check
-matters here because this tree has a recorded case of exactly the opposite
-diagnosis ([[hashmap-hang-is-debug-slowness-not-deadlock]]): confirm which one
-you have before reasoning about causes.
+## There is no fixed threshold, and that is a finding
 
-## Why this is not the socket fast-I/O work
+Observed stall indices across one session, same binary, same probe:
 
-The decisive run, and it is cheap:
-
-```bash
-CRATONVM_SC_SCRATCH=0 CRATONVM_SC_BB_SLOTS=0 \
-  CRATONVM_SEL_READY_CACHE=0 CRATONVM_SEL_FAST_KEYS=0 \
-  ./target/release/cratonvm.exe -cp <probe> SelectorScalingProbe
+```
+73, 73, 48, 48, 48, 44, 44, 43, 43, 36, 36, 22, 58
 ```
 
-**It stalls identically.** Those four switches revert F1, F3, F4, F5 and F6 to
-their pre-change behaviour at runtime, so with every behaviour change disabled
-the stall persists. What is left of that commit is a census counter and one
-added `NativeContext` accessor, neither of which can block a connect.
+Deterministic within a batch, drifting between batches, and NOT explained by
+TIME_WAIT (8 vs 204 gave the same index), heap, or leaked processes. **So this
+is timing- or state-dependent, not a resource ceiling** — which means the
+original "≈128 connections" framing was an artefact of the first probe printing
+only every 32 connections. Do not go looking for a constant to raise.
 
-The same probe at N=8 and N=64 passes on BOTH arms with the checksum HotSpot
-produces (4594), so the path works and simply does not scale.
+## The strongest lead, stated as a contradiction
 
-## Why it matters more than a probe failure
+`sc_connect_inner`'s blocking path routes through
+`outbound_policy::policy_connect`, which dials with
+`TcpStream::connect_timeout(&addr, connect_timeout())`. That timeout is
+`DEFAULT_CONNECT_TIMEOUT_MS = 30_000` and the accessor is written to be
+**always finite** — its own doc says *"even if an embedder calls
+`set_connect_timeout(Duration::ZERO)` we fall back to the 30 s default so the
+blocking thread can't hang indefinitely."*
 
-This is the shape an HTTP keep-alive server has. A server that cannot get past
-~128 concurrent connections does not report an error — **it hangs**, which is
-indistinguishable at the harness level from the throughput walls this tree has
-already had to reclassify (`compression-cluster-testhugedecompress-180s-...`,
-`quarkustestprofileawareclassorderer-not-a-hang-throughput-gap-...`). Any HTTP
-cluster whose fixture opens more than ~128 connections would present as a
-timeout with no exception and no diagnostic.
+**A run stalled for 240 s with no exception.** Both facts cannot describe the
+same code, so one of them is false about the live path:
 
-## What is NOT yet established
+* the block is **not inside** `connect_timeout` — it is somewhere else in the
+  same native call. `tcp_register`/`tcp_blocking_state` take
+  `tcp_registry().write()` right after the dial, and a writer starved by a
+  reader would present exactly like this: a long native call, no exception, no
+  CPU. **This is the first thing to test.**
+* or this path is not `policy_connect` at all. `sc_open_connected` /
+  `sc_blocking_connect` / `sc_connect` are the three entry points; confirm
+  which one `SocketChannel.open(SocketAddress)` reaches before assuming.
 
-The cause. Candidates worth testing in this order, none of them confirmed:
+Instrumenting either is cheap: a print on both sides of the dial separates
+"never dialled" from "dialled and never returned", and that single bit chooses
+between the two bullets.
 
-* the listen backlog — the probe passes `bind(addr, 4096)` explicitly, and the
-  loop accepts each connection before opening the next, so at most one should
-  ever be pending. If the backlog argument is dropped somewhere this would still
-  not obviously explain it, which is why it is first: it is the cheapest to
-  refute;
-* a fixed-size table or handle exhaustion in `tcp_registry` /
-  `selector_register`, which `try_clone()`s a duplicate handle per registration
-  — so N registrations hold ~3N sockets;
-* a Windows-specific limit in the poll path. **Untested on Linux**: the Azure
-  host has the same binary built and the probe is committed, so the one-line
-  next step is running it there. If it passes on Linux the search narrows to the
-  WSAPoll path immediately.
+## What was NOT established
 
-Do not file a cause on this page without running the arm that supports it — the
-above are candidates, not a diagnosis.
+The cause. `CRATONVM_DBG_NET=1` produced no output on this path, so the
+existing net tracing does not cover it — worth fixing on the way past, since
+its absence is what made this expensive to localise.
+
+Also untested: whether the stall needs a *fresh* connect per iteration, or
+whether holding the earlier connections open is what matters. Closing each
+connection before opening the next would answer it in one run.
+
+## Why it matters
+
+This is the shape an HTTP keep-alive client has, and a client that stops
+connecting does not raise — **it hangs**. At the harness level that is
+indistinguishable from the throughput walls this tree has already had to
+reclassify twice (`compression-cluster-testhugedecompress-180s-…`,
+`quarkustestprofileawareclassorderer-not-a-hang-throughput-gap-…`). Any
+Windows HTTP cluster whose fixture opens a few dozen client connections can
+present as a timeout with no diagnostic.
 
 ## Repro
 
 ```bash
-javac -d /tmp/p probes/SelectorScalingProbe.java
-# IDLE_COUNTS in the probe selects the sweep; {8} and {64} pass, {256} stalls
-timeout 240 ./target/release/cratonvm.exe -cp /tmp/p SelectorScalingProbe
-# RC=124 with the last stderr line `[probe] connecting 96/256`
+javac -d /tmp/p probes/WinConnectStallProbe.java
+# server in one process, client in the other — the split is what names the half
+java -cp /tmp/p WinConnectStallProbe server 200      # prints PORT=<p>
+./target/release/cratonvm.exe -cp /tmp/p WinConnectStallProbe client <p> 200
+# last stderr line is `[N] connect`; N drifts run to run
 ```
+
+The exoneration arm, if you suspect the socket fast-I/O work:
+
+```bash
+CRATONVM_SC_SCRATCH=0 CRATONVM_SC_BB_SLOTS=0 \
+  CRATONVM_SEL_READY_CACHE=0 CRATONVM_SEL_FAST_KEYS=0 \
+  ./target/release/cratonvm.exe -cp /tmp/p WinConnectStallProbe client <p> 200
+```
+
+Those four revert F1/F3/F4/F5/F6 at runtime. It stalls identically.
