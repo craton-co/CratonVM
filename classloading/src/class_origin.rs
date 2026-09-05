@@ -195,7 +195,7 @@ pub struct ClassOriginEntry {
     /// implementor, including user-defined ones, and that blast radius is the
     /// open question on `register_interface_natives` and on the 308
     /// inherited-abstract rows in
-    /// `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
+    /// `jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
     /// Answering it needs the loaded class graph: the native census names the
     /// declaring class, and only this column says which loaded classes sit
     /// under it. `scripts/jdk-only-interception.py` does that join.

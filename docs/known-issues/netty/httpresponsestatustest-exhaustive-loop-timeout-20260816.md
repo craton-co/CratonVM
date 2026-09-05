@@ -50,7 +50,7 @@ wall. Raising the harness cap in `class-overrides.tsv` would change `HANG` to
 | the harness wall | | | | | 180 s |
 
 The 2026-08-25 receiver-guard fix
-(`fixed-suite-bugs/jit/string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`),
+(`string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`),
 which is worth 6.6x on the sibling class, is **worth nothing here**: medians
 324 s → 311 s, with the two arms' ranges overlapping. That is the expected
 answer — this loop contains no `CharSequence`-declared String accessor — and it
@@ -255,10 +255,10 @@ Any arm added here must still be checked against `CRATONVM_DBG_JITC=1` for
 * [`httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md`](httpheadervalidationutiltest-exhaustive-loop-timeout-20260816.md)
   — the sibling. Its own deopt defect closed 2026-08-25; its remainder is the
   same per-iteration wall as this page's.
-* `fixed-suite-bugs/jit/string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`
+* `string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`
   — the 2026-08-25 fix, and the measurement that it is worth nothing on THIS
   class.
 * [`fastthreadlocal-2e9-iteration-throughput-wall-20260812.md`](fastthreadlocal-2e9-iteration-throughput-wall-20260812.md)
   — same family of finding, with per-component throughput measurements.
-* `fixed-bugs/osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md`
+* `osr-refused-for-a-loop-inline-in-main-FIXED-20260818.md`
   — the shape this looks like and is not; OSR is entered here.

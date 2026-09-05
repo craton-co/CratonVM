@@ -465,7 +465,7 @@ the whole job:
 2. **`PrintStream.charset` must be a concrete `Charset`.** It is currently an
    instance of the abstract `java.nio.charset.Charset`, which is one of the
    five blocker families the retired
-   `retired/jdk-only-step1-bytecode-available-RESOLVED-20260806.md` names; real
+   `jdk-only-step1-bytecode-available-RESOLVED-20260806.md` names; real
    `writeln` reaches it through `charOut`.
 3. **`native_printstream_init_outputstream` must chain to a real constructor**
    the way `native_printwriter_init_outputstream` already does, or be retired

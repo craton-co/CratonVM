@@ -4,7 +4,7 @@
 //! Software watchpoint for the bc-math-ec `0x4` corruption (session
 //! "continue investigating", 2026-06-05).
 //!
-//! Established facts (see `gaps/bc-math-ec-jit-miscompile-investigation.md`):
+//! Established facts (see `bc-math-ec-jit-miscompile-investigation.md`):
 //! a mutator path raw-writes the small value `4` into a heap **reference
 //! field's payload-low** half, bypassing `set_field`/`set_array_element` and
 //! the GC. The victim object is essentially random (X9*/ECCurve, but also JDK
@@ -129,7 +129,7 @@ fn header_base(holder: ObjectRef) -> usize {
 }
 
 /// `Value` discriminant value for the `Object` variant (Int=0, Long=1, Float=2,
-/// Double=3, Object=4) — see gaps/bc-math-ec-jit-miscompile-investigation.md.
+/// Double=3, Object=4) — see bc-math-ec-jit-miscompile-investigation.md.
 const VALUE_DISC_OBJECT: u32 = 4;
 
 /// Re-read every watched field; return `(holder_addr, field_idx, expected, now)`

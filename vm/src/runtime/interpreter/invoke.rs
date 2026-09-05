@@ -512,7 +512,7 @@ pub(super) fn resolved_private_invokevirtual_target(
     // loader's copy — pinning a private call's dispatch to the wrong
     // class's bytecode/constant pool while the receiver stays the caller's
     // own (correct-loader) object. See
-    // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md
+    // bug-h2-suite-residual-fail-triage-FIXED.md
     // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
     let self_match = {
         let cm = shared.classes.class_manager.read();
@@ -609,7 +609,7 @@ pub(super) fn stale_mirror_recovery_applies(
 /// This narrows the recovery. The case it exists for —
 /// `Thread.currentThread().getThreadGroup()` in Tomcat's
 /// `TaskThreadFactory.<init>`, see
-/// `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`
+/// `gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`
 /// — names `java/lang/Thread` and is unaffected. An `Object`-typed use of a
 /// stale mirror now reads the zeroed object instead of being repaired; that
 /// degrades a `toString`, where admitting it risks corrupting a live object's
@@ -671,7 +671,7 @@ pub(super) fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    // PGO-01 (feature-designs/c2/pgo-01-call-site-evidence-gap.md):
+    // PGO-01 (pgo-01-call-site-evidence-gap.md):
     // call-site evidence for invokespecial. invokevirtual/invokeinterface are
     // NOT recorded here — they are covered by the receiver-type profile
     // instead (see MethodProfile's doc comment on `receivers` vs
@@ -756,7 +756,7 @@ pub(super) fn execute_invoke_kind(
     // such a long as `Value::Int`, which `coerce_invoke_arg_for_descriptor`
     // then widened — corrupting `J` args to invokevirtual/special callees.
     // Mirrors `pop_coerced_invoke_args_virtual`. See
-    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+    // bc-ec-mod-mododdinverse-investigation.md.
     let mut tmp_cv: Vec<(CompactValue, u8)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
         tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
@@ -1048,7 +1048,7 @@ pub(super) fn execute_invoke_kind(
     // `java.lang.Thread` mirror while a *stale copy* of its old address still
     // sits in a running or blocked frame's operand stack / local — the
     // frame/operand remap-coverage gap documented in
-    // `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`. The
+    // `gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`. The
     // registry and the per-thread `java_thread_obj` field are remapped, but
     // the frame copy is not, so an invoke whose receiver is that copy (the
     // classic `Thread.currentThread().getThreadGroup()` in
@@ -1086,8 +1086,7 @@ pub(super) fn execute_invoke_kind(
     // `java/lang/Thread`, `jdk/internal/misc/InnocuousThread` and
     // `org/h2/mvstore/FileStore$BackgroundWriterThread` on different runs —
     // whichever mirror had previously occupied the address.
-    // See `fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+    // See `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
     //
     // The all-zero test is exactly what the recovery was written for — the
     // Tomcat `TestDigestAuthenticator` case dispatches on a *zeroed* object —
@@ -2227,7 +2226,7 @@ pub(super) fn execute_invoke_kind(
     //
     // Costs nothing on a healthy run: the whole check is two string compares
     // that fail, and it is only reached at a dispatch terminal. See
-    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`,
+    // `bug-h2-classid0-stale-address-family-FIXED.md`,
     // whose "what to try next" asked for exactly this — the two
     // `CloneNotSupportedException` occurrences it recorded produced no verdict
     // because nothing on the clone path consulted the heap.
@@ -3965,7 +3964,7 @@ pub(super) fn try_stackless_invoke(
         // (e.g. `org/h2/command/ParserBase.read()V`) onto a receiver whose
         // own, unrelated class of the same name declares that method
         // itself and doesn't extend that ancestor at all. See
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md
+        // bug-h2-suite-residual-fail-triage-FIXED.md
         // (TestUpgrade's `ParserBase.getSyntaxError`/`Token.start()` NPE).
         let start_cid = |cm: &crate::classloading::ClassManager| {
             dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name))

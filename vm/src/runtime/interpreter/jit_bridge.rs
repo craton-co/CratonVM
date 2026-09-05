@@ -820,7 +820,7 @@ pub(super) fn compile_osr_artifact(
             // the OSR'd code) get silently RE-EXECUTED by the interpreter from
             // the stale resume state — e.g. an `ArrayList` ending up with extra
             // duplicate elements with no exception anywhere. See
-            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
@@ -2360,7 +2360,7 @@ pub(super) fn compile_osr_artifact(
             // indy uncommon trap: the bail resumes the pre-OSR interpreter
             // frame at the stale back-edge, silently re-running a loop whose
             // side effects already committed (see
-            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+            // jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
             // Admit only BRIDGED sites, which emit a direct call and never
             // deopt at the indy bci. `indy_info` drops sites it cannot resolve,
             // so a length mismatch also means "not fully bridged" and is
@@ -2400,7 +2400,7 @@ pub(super) fn compile_osr_artifact(
             // backend may elide only these; a no-arg constructor that is NOT proven empty
             // keeps both its allocation and its call, because eliding it would drop
             // whatever the body writes to global state (see
-            // fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
+            // jit-elided-constructor-side-effects-FIXED-20260812.md).
             let mut elidable_init_pcs: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
@@ -3161,7 +3161,7 @@ pub(super) fn compile_osr_artifact(
                 // bail that matters most — this door compiles a `@Test` method's
                 // hot loop, and a method denied here runs its whole life in the
                 // interpreter with no other diagnostic. See
-                // fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
+                // osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
                 // which took a six-arm shape bisect to find for exactly this reason.
                 crate::jit::mark_jit_bail_listed_with_site(
                     &class_name,
@@ -6824,7 +6824,7 @@ pub(super) fn try_jit_upgrade_with_gate(
 /// `FjpDeepSum$SumTask.compute` from `3 145 652 invocations compile-failed` to
 /// compiled with `hot_but_stuck_in_interpreter=0`). Plus `FjpProbe` at depth 10
 /// and `FjpDeepSum` at depth 17. See
-/// `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
+/// `completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
 ///
 /// Returns `true` only when `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1` puts the
 /// workaround back AND the named class transitively extends
@@ -10976,7 +10976,7 @@ pub(super) fn execute_jit_call(
     //     NaN-tag int space (BC safegcd 0xFFFC_… accumulator) was decoded by
     //     the prior unconditional `to_value()` as `Value::Int`, truncating to
     //     the low 32 bits. `decode_by_descriptor(b'J')` reinterprets the raw
-    //     i64 bit-exact. See gaps/bc-ec-mod-mododdinverse-investigation.md.
+    //     i64 bit-exact. See bc-ec-mod-mododdinverse-investigation.md.
     let is_static = cached.is_static;
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See

@@ -5,7 +5,7 @@
 //!
 //! # The problem this solves
 //!
-//! `audits/flag-census.md` counted **692** distinct `CRATONVM_*`
+//! `flag-census.md` counted **692** distinct `CRATONVM_*`
 //! identifiers: 559 with a Rust read site, 133 referenced only by prose. They
 //! accumulated at roughly one per fixed bug with no retirement path, they
 //! duplicate each other (`CRATONVM_REAL_AQS` / `CRATONVM_SYNTHETIC_AQS` are one
@@ -462,6 +462,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "fc-fast-io-stats", on_key: Some("CRATONVM_FC_FAST_IO_STATS"), off_key: None, off_word: None, since: "2026-08-23" },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None, since: "2026-07-10" },
+    // The socket transfer / selector engagement census
+    // (`native-io::socket_fast_io::stats`). Diagnostic only: it prints counters
+    // at exit and changes nothing a program can observe.
+    E { group: Group::DBG, token: "sc-io-stats", on_key: Some("CRATONVM_SC_IO_STATS"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None, since: "2026-07-23" },
     E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "force-moving", on_key: Some("CRATONVM_DBG_FORCE_MOVING"), off_key: None, off_word: None, since: "2026-06-03" },
@@ -598,6 +602,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-direct-binds", on_key: Some("CRATONVM_DBG_JIT_DIRECT_BINDS"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::DBG, token: "ir-graph", on_key: Some("CRATONVM_DBG_IR_GRAPH"), off_key: None, off_word: None, since: "2026-08-28" },
+    E { group: Group::DBG, token: "ir-sink", on_key: Some("CRATONVM_DBG_IR_SINK"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::DBG, token: "zgc-target", on_key: Some("CRATONVM_DBG_ZGC_TARGET"), off_key: None, off_word: None, since: "2026-08-28" },
     // The LARGE-OBJECT end's compactor, one line per engaged cycle: what it
     // moved and what the high free list looked like on either side of it.
@@ -1238,6 +1243,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-publish-at-def", on_key: Some("CRATONVM_JIT_IR_PUBLISH_AT_DEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-carry-single-use", on_key: Some("CRATONVM_JIT_IR_CARRY_SINGLE_USE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-sink-late", on_key: Some("CRATONVM_JIT_IR_SINK_LATE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-alu-imm", on_key: Some("CRATONVM_JIT_IR_ALU_IMM"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "merged-call-sentinel", on_key: Some("CRATONVM_JIT_MERGED_CALL_SENTINEL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
@@ -1609,6 +1616,21 @@ pub const INVENTORY: &[E] = &[
     // `field-fast-path` — off restores the full `op_getfield` / `op_putfield`
     // handler on every instance field access.
     E { group: Group::JIT, token: "field-fast-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_FAST_PATH"), off_word: None, since: "2026-09-02" },
+    // `field-addr-elide` — off restores the object-start registry probe the
+    // quickened field and array arms ran on every receiver. The handler those
+    // arms replace (`ZgcRealHeap::get_field`) never made that test, and the
+    // header comparison beside it is what actually validates the site.
+    E { group: Group::JIT, token: "field-addr-elide", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_ADDR_ELIDE"), off_word: None, since: "2026-09-05" },
+    // `arraylength-fast` — off routes `arraylength` back through the `Value`
+    // round trip and the `VmHeap` enum dispatch, for one header read.
+    E { group: Group::JIT, token: "arraylength-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_ARRAYLENGTH_FAST"), off_word: None, since: "2026-09-05" },
+    // `ref-array-fast` — off routes `aaload` back through
+    // `VmHeap::get_array_element`; the `0x2e..=0x35` arm's primitive half
+    // declines reference elements by construction.
+    E { group: Group::JIT, token: "ref-array-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_REF_ARRAY_FAST"), off_word: None, since: "2026-09-05" },
+    // `system-class-latch` — off restores the class-manager read lock and name
+    // comparison `op_getstatic` performed on every getstatic.
+    E { group: Group::JIT, token: "system-class-latch", on_key: None, off_key: Some("CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH"), off_word: None, since: "2026-09-05" },
     // `osr-inline-gate` — off calls `try_osr_with_backoff` on every backward
     // branch instead of only past the smallest OSR threshold.
     E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },
@@ -1694,6 +1716,35 @@ pub const INVENTORY: &[E] = &[
     // opt-out-only, same shape as `vector-intrinsics` above: the switch gates
     // REGISTRATION so the off arm is the un-intercepted VM.
     E { group: Group::JIT, token: "fc-fast-io", on_key: Some("CRATONVM_FC_FAST_IO"), off_key: None, off_word: Some("0"), since: "2026-08-23" },
+    // The socket path's per-call cost removals, each separately switchable so
+    // its A/B is one binary and one variable. All default-ON and opt-out-only,
+    // the same shape as `fc-fast-io` above.
+    //
+    // `sc-scratch`      — reuse the thread's transfer buffer instead of
+    //                     allocating and zeroing one sized to the destination's
+    //                     remaining capacity on every call.
+    // `sc-bb-slots`     — memoize `ByteBuffer` field slots per (VM, class)
+    //                     instead of resolving them by name on every transfer.
+    // `sel-ready-cache` — mirror a selector's readiness into the process-global
+    //                     side table only when it CHANGED, not every key every
+    //                     tick.
+    // `sel-fast-keys`   — append ready keys straight into netty's own key set
+    //                     instead of re-entering the interpreter once per key.
+    //
+    // The last two are separate tokens rather than one: they are independent
+    // cuts to the same function, and `sel-ready-cache`'s failure mode (a latched
+    // cache suppressing a real readiness change) is silent, so an A/B that could
+    // only turn both off together could not attribute it.
+    E { group: Group::JIT, token: "sc-scratch", on_key: Some("CRATONVM_SC_SCRATCH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sc-bb-slots", on_key: Some("CRATONVM_SC_BB_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sel-ready-cache", on_key: Some("CRATONVM_SEL_READY_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sel-fast-keys", on_key: Some("CRATONVM_SEL_FAST_KEYS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    // `sc-preresolved` — dial the address an `InetSocketAddress` ALREADY holds
+    // instead of re-resolving its hostname on every connect. Default-ON and
+    // opt-out-only; `=0` restores the per-dial `getaddrinfo`, which is the
+    // "off" arm for
+    // `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+    E { group: Group::JIT, token: "sc-preresolved", on_key: Some("CRATONVM_SC_PRERESOLVED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-07-27" },
@@ -1853,7 +1904,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "precise-only-roots", on_key: Some("CRATONVM_GC_PRECISE_ONLY_ROOTS"), off_key: None, off_word: None, since: "2026-08-22" },
     // --- composition residuals, 2026-09-02 ----------------------------------
     // Three default-off diagnostics and four A/B switches from
-    // `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`.
+    // `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`.
     // Every one of them exists so a claim on that page can be re-priced in ONE
     // binary; two of them were built specifically to refute a hypothesis, and
     // one of those did.
@@ -2386,6 +2437,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None, since: "2026-08-24" },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
+    // `array-autobox-latch` — off restores the unconditional `autobox_payload`
+    // probe on every non-null reference-ARRAY element read. That probe opens
+    // with `is_object_address` and can only answer `Some` when a wrapper
+    // exists, which is what the latch records; the FIELD read paths have been
+    // latched since the latch was introduced and the array ones were not.
+    E { group: Group::GC, token: "array-autobox-latch", on_key: None, off_key: Some("CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH"), off_word: None, since: "2026-09-05" },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0"), since: "2026-07-27" },
     // Default-ON, off for the exact untrimmed string `0` only — the
@@ -3226,7 +3283,7 @@ mod tests {
     fn the_documented_no_ops_now_work() {
         // Each of these was documented for months and read by nothing: the
         // default was flipped and only the opt-out half was renamed.
-        // audits/flag-census.md section 3 has the full list.
+        // flag-census.md section 3 has the full list.
         let cases: &[(&str, &str, &str)] = &[
             (
                 "CRATONVM_JIT",

@@ -3,7 +3,7 @@
 
 //! WP7.3 — `java.sql.Types` + `Date`/`Time`/`Timestamp` interop conformance.
 //!
-//! The roadmap (`gaps/wildfly-ejbca-roadmap.md` §10 WP7.3) demands legacy
+//! The roadmap (`wildfly-ejbca-roadmap.md` §10 WP7.3) demands legacy
 //! SQL date types and modern `java.time.*` driver paths interoperate
 //! correctly. The acceptance is "insert + select round-trips a
 //! `LocalDateTime` via H2 standard `TIMESTAMP` column" — H2 itself is a
@@ -29,7 +29,7 @@
 //! factory methods (`LocalDate.of`, `Instant.ofEpochMilli`, etc.) and in
 //! reflection (`Class.forName(String)`, `Class.getField`) — see the
 //! `Time` (0/16 floor → currently 0) and `Reflect` floors in
-//! `gaps/jdk-regression-baseline.md` plus the JCK harness output for
+//! `jdk-regression-baseline.md` plus the JCK harness output for
 //! `TckLocalDate` / `TckInstant`. To keep this file's signal honest:
 //!
 //!   * **Tier-1 tests run and must pass today.** They cover the
@@ -203,6 +203,14 @@ fn wp7_3_sqlTime_millis_roundtrip() {
 #[test]
 fn wp7_3_jdbc_essential_natives_registered() {
     let mut r = NativeMethodRegistry::new();
+    // 2026-09-05: that gate is no longer `#[cfg(feature = "synthetic-jdk")]` --
+    // it reads `NativeMethodRegistry::drops_real_layout_synthetic()`, because a
+    // DEFAULT build running synthetic mode (`VmConfig::default()`, i.e. every
+    // in-tree test and every plain `Vm::new`) has no `ServiceLoader` bytecode
+    // for the retirement to defer to and raised `NoSuchMethodError` instead.
+    // A bare registry answers "synthetic", so a test asking the real-JDK
+    // question has to say so.
+    r.set_drop_real_layout_synthetic(true);
     cratonvm_native_builtins::register_essential_natives(&mut r);
     // INVERTED 2026-08-30. `register_service_loader_natives`' body is
     // `#[cfg(feature = "synthetic-jdk")]`, and its header explains why: in a

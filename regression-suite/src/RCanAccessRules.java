@@ -17,7 +17,7 @@ import java.lang.reflect.Method;
  * `... && Util.canAccess(null, field)` and, on `false`, builds its own
  * "No public static field named [X] was found" message with a NULL cause —
  * while `getField`, `getModifiers` and `Field.get` had all answered correctly.
- * See tomcat/teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
+ * See teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
  *
  * The arm that was wrong: a PUBLIC member of a declaring class that is NOT
  * public, read from a caller in that class's own package. The VM asked "is the

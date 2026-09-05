@@ -693,7 +693,7 @@ residual is not interpretable.
 * `jfr/src/phase.rs` — the implementation and its tests
 * `docs/jit/compiler-metrics.md` — the per-compilation breakdown this report
   delegates to
-* `audits/tlab-and-card-audit.md` — `gc_metrics_report()` and
+* `tlab-and-card-audit.md` — `gc_metrics_report()` and
   `collector_decision_report()`, which explain *why* the `gc_pause` bucket is
   the size it is
 * `docs/benchmarking/methodology.md` — how to measure the wall clock this

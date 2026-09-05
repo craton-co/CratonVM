@@ -561,7 +561,6 @@ fn watch_service_surface_has_a_single_owner_in_native_io() {
 ///   the pre-fix `field 0 = None` shape. Every Spring Boot test going
 ///   through `ModifiedClassPathClassLoader` (Aether resolving
 ///   `@ClassPathOverrides` coordinates over HTTPS) failed on it. See
-///   `fixed-suite-bugs/springboot/`
 ///   `sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 ///
 /// So this pins the *surviving owner site*, not merely the count: a duplicate
@@ -720,7 +719,7 @@ fn no_native_mints_a_field_less_ssl_socket_factory_carrier() {
 /// `std::path::Path::join` and stored the result without going through
 /// `p57_alloc_path`, so they skipped the normalize-at-construction step and
 /// silently re-introduced the trailing-separator defect from
-/// `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
+/// `resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
 ///
 /// The assertion compares the WINNING registration site against the site that
 /// wins when phase 57 registers alone, rather than asserting a registration

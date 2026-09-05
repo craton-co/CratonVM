@@ -27,7 +27,6 @@
 //! cov-07's closeout doc flagged this as a known, pre-existing gap that lane
 //! did not own; it became reachable in practice once the exception-table
 //! admission relaxation let `try`/`finally` methods onto this tier. See
-//! `fixed-suite-bugs/hibernate/`
 //! `offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md`.
 //!
 //! Measured on the fix commit, `n = 200 000`: **198 927** skipped `finally`

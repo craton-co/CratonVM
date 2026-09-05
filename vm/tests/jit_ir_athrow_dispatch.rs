@@ -36,7 +36,6 @@
 //! nothing else, so when the throw is swallowed `throwAsUnchecked` falls
 //! through to its `return null`, the caller throws that null, and the ORIGINAL
 //! exception is replaced by a helpful-NPE. See
-//! `fixed-suite-bugs/hibernate/`
 //! `offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md`.
 
 use std::path::{Path, PathBuf};

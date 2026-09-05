@@ -40,7 +40,7 @@
 //!   container; worker threads release the lock while invoking Java
 //!   callbacks to prevent reentrancy deadlocks.
 //!
-//! See `history/roadmap-100.md` T19.1 for the feature scope.
+//! See `roadmap-100.md` T19.1 for the feature scope.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -3693,8 +3693,7 @@ fn native_start_context_failed(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// always reads that untouched, empty real map — even for a service `install()`
 /// just registered a moment earlier. `getRequiredService` (below) built on top
 /// of this always sees `null` and throws `ServiceNotFoundException`, aborting
-/// boot ~3s in under `CRATONVM_MSC_REAL_START=1` (`fixed-suite-bugs/wildfly/
-/// bug-15-msc-real-start-servicenotfound-and-domain-hang.md`, Symptom 2). Fix:
+/// boot ~3s in under `CRATONVM_MSC_REAL_START=1` (`bug-15-msc-real-start-servicenotfound-and-domain-hang.md`, Symptom 2). Fix:
 /// answer from the SAME shadow container `install()` populates instead of the
 /// always-empty real registry. `LeakDetectorServiceContainer.getService` (the
 /// caller WildFly's `BootstrapImpl` actually sees) just forwards to this method

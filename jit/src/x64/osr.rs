@@ -461,7 +461,7 @@ pub(super) fn publish_entry_metadata(
     // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
     // avoided clobbering the live owner, but the resulting coalesced state
     // transition was not proven safe -- see
-    // fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // jit-osr-linux-regression-triad.md). The
     // hazard that argument rests on is *sharing*: a dead local whose register
     // is also some live local's home. A dead local that owns its register
     // outright has no coalesced state to reconstruct -- nothing reads it before

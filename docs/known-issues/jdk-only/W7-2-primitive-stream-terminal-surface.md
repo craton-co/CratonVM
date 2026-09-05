@@ -289,7 +289,7 @@ Same shape one level down. `javap -p` (JDK 25) against what
 IntSummaryStatistics::combine)`, and every `Collectors.summarizingInt` merge
 goes through it. Five of the eight declared members were covered; the three that
 were not are the ones no probe had reached — the FFM carrier finding
-(fixed-bugs/ffm-memorysegment-set-carriers-FIXED-20260810.md, four of nine
+(ffm-memorysegment-set-carriers-FIXED-20260810.md, four of nine
 carriers) and W6-7 (`ForkJoinTask.quietly*`, zero of six) are the same finding.
 
 ### 4.1 A layout hazard the moment `summaryStatistics` becomes live

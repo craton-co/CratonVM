@@ -10,7 +10,7 @@ import java.util.TreeMap;
  * Size the JCA provider gap PER SERVICE, by the only test that decided the
  * JCEKS case: does the JDK's own SPI class load here?
  *
- * `jca-provider-population-gap-20260830.md` measured that SunJCE carries 103 of
+ * `jca-provider-population-gap-20260830-FIXED.md` measured that SunJCE carries 103 of
  * HotSpot's 194 services and SUN 44 of 68, and named the six/two missing TYPES.
  * A type is not a unit of work, though. The unit is a (type, algorithm) pair
  * with an implementation class behind it, and each pair is tractable exactly

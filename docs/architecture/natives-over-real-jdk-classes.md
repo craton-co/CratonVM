@@ -304,7 +304,7 @@ Existing records, cross-referenced rather than restated:
 the standing "resolve by name first, index as synthetic fallback" remedy),
 `W6-3-slot-index-species-residuals.md` (the `javap` oracle, `java.nio.ByteOrder`
 as a second instance), `W4-1-publiclookup-allowedmodes-never-checked.md` (the
-Lookup case end to end), `audits/jdk-only-object-layout-audit.md` (the site census).
+Lookup case end to end), `jdk-only-object-layout-audit.md` (the site census).
 
 ## 6. Declaring a `CRATONVM_*` flag — four files, and it is bidirectional
 
@@ -406,9 +406,9 @@ tree; this section exists so they can be found from one place.
   *"Do not add fixed wall-clock bounds to any check. Both directions flake: an
   upper bound fails under contention, and a lower bound can pass while measuring
   nothing."* Line-bands rot the same way and have already done so in this
-  campaign — `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`
+  campaign — `jdk-only-census-one-class-one-platform-FIXED-20260810.md`
   records its own line numbers as stale against `dev`, and
-  `feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md`'s
+  `STRICT-CORPUS-CAMPAIGN-20260807.md`'s
   `run.sh` citations are stale as written (§9). Source-witness tests that scan a
   fixed window (`vm/tests/t11_safety_conformance.rs`'s five-line `// SAFETY:`
   window, `vm-cli/tests/no_diag_eprintln.rs`'s four-line window) are the same
@@ -444,8 +444,8 @@ before editing:
 | `known-issues/jdk-only/W6-4-duplicate-registration-gate.md` | gate "ships"; StampedLock served by two implementations | not in CI, baselines unseeded; the losing StampedLock registrar is disabled at its call site (see `W6-12`) |
 | `known-issues/jdk-only/W6-5-vacuous-tests.md` | `require_fixture` "not done here"; `probes/FjpProbe.java` as the durable home | it exists; that path does not |
 | `known-issues/jdk-only/W6-12-stampedlock-split-brain.md` | "no regression-suite vector covers `Phaser`" | `RJdkPhaser` exists and is scheduled — but is untracked |
-| `feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md` | "+2" propagated; `run.sh` line citations; "21 vectors" | corrected in place |
-| `feature-designs/jdk-only-wave2/README.md` | cites `probes/ExecProbe.java` | `apps/executor_probe/ExecProbe.java` (tracked) |
+| `STRICT-CORPUS-CAMPAIGN-20260807.md` | "+2" propagated; `run.sh` line citations; "21 vectors" | corrected in place |
+| `README.md` | cites `probes/ExecProbe.java` | `apps/executor_probe/ExecProbe.java` (tracked) |
 
 Separately, seven records in `known-issues/jdk-only/` (`L5`, `L8` ×2, `W4-2`,
 `W5-4`, `W6-5` ×4, `W6-8`) cited internal records by their path inside the

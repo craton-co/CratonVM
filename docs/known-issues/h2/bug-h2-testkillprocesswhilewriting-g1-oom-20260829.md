@@ -720,7 +720,7 @@ header-vs-region disagreement it contains is still happening.
 **FIXED 2026-09-02 — the class PASSES under `-XX:+UseG1GC`, 3/3 (605-716 s, against 392 s for the default collector on the same host and binary), with zero dangling references and zero implausible headers.** Two independent defects had to close: the CORRUPTION face (section 4d — G1 evacuated a conservative root pointing INSIDE a reference array and fabricated an object from the element) and the CAP face (section 4f — one live finalizable object disabled eager humongous reclaim for the whole process, leaving the heap 81% humongous and Eden at one region). Historical status below.
 
 **The OOM face is FIXED (2026-08-30) and held on 2026-09-02 (section 4c: 0 real `OutOfMemoryError` on both G1 arms, and the default-collector control PASSES in 811 s the same day, so the cap is a failure and not a slow host). The ROOT CAUSE of the corruption family is found and fixed (section 4d): G1 evacuated a CSet root pointing INSIDE a reference array and manufactured an object out of the element -- `num_slots=512` was the top half of a heap address, not a shape. Every downstream implausible-header site went to ZERO and V7b dangling references to 0, but the class STILL CAPS at 900 s, so the cap face is untouched. A separate allocation-publication defect was also fixed (section 4b) and did not close anything on its own. The FAILURE MODE MOVED to SIGSEGV in 2026-08-30's arm -- read section 3 before treating that as an improvement. The 48 617 dangling references are 6 holders, not a rate. Split out 2026-08-29** from
-`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, whose ZGC
+`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`, whose ZGC
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
 
@@ -882,5 +882,5 @@ CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
 
 ## Related
 
-- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of, and the A/B that separated the two.

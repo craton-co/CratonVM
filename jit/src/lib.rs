@@ -358,7 +358,7 @@ fn publish_region_snapshot(regions: &JitCodeRegion) {
 /// UPDATE path that is 1.54% of CPU (`perf`, flat self-attribution,
 /// 2026-08-21); at 25 threads it is a serialisation point on a path with
 /// nothing else to serialise on, which is the shape
-/// `performance/h2-update-path-throughput-RETIRED-20260821.md` calls
+/// `h2-update-path-throughput-RETIRED-20260821.md` calls
 /// "genuinely scaling rather than constant-factor work".
 ///
 /// The memo takes the lock out of the steady state without weakening the check:
@@ -584,7 +584,7 @@ pub struct ExecutableBuffer {
     /// Four independent estimates allocate executable buffers, and the warning
     /// named none of them — so an overflow flood was attributed by arithmetic
     /// on the printed `len`, and got attributed to the WRONG one
-    /// (`fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`
+    /// (`basicerrorcontroller-jit-only-failure-20260731-FIXED.md`
     /// blamed the single-pass backend's estimate for a flood that was entirely
     /// the optimizing tier's).
     tag: &'static str,
@@ -2542,7 +2542,7 @@ pub fn jit_code_region_covering(addr: usize) -> JitRegionLookup {
 ///     Nothing resumes from any of them in a way the owning frame's own
 ///     published roots do not already cover.
 ///
-/// See `fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
+/// See `moving-young-gen-drops-jit-held-oops-FIXED.md`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
     /// Java locals: slot `i` at `[rbp - (i + 1) * 8]`.
@@ -2998,7 +2998,7 @@ pub struct CompiledMethod {
     ///
     /// A DIFFERENT question from [`Self::fully_oop_covered`], and the
     /// difference is what
-    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` ran
     /// aground on. `fully_oop_covered` asks whether every live oop is named by
     /// a FRAME SLOT in the map (`safepoint_pcs ⊆ mapped_safepoint_pcs`), which
     /// a direct JIT→JIT call with a reference argument can never satisfy: the
@@ -6018,7 +6018,7 @@ unsafe fn osr_trampoline(
 /// applies the per-site tier via [`inline_site_expansion_cost_tiered`].
 /// Lowering this constant back to 35 would make the hot tier unreachable.
 ///
-/// See `arch-2026-07-26/jit-inlining-and-ir-calls.md`.
+/// See `jit-inlining-and-ir-calls.md`.
 pub const MAX_INLINE_BYTECODE_SIZE: usize = 325;
 
 /// Callee-size cap for a call site with **no evidence of hotness** —
@@ -6656,10 +6656,10 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// scalar replacement lands beside it"; array scalar replacement landed on
 /// 2026-08-27 and the allocation is fully deleted now (`volume` 478 ->
 /// 43.9 ns/voxel, converging on its own no-wrapper control at 39.2; see
-/// `fixed-bugs/per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
+/// `per-voxel-allocation-escapes-its-method-so-ea-cannot-help-FIXED-20260827.md`).
 ///
 /// What keeps it off is no longer the pricing — the 2026-08-28 gauntlet soak
-/// (`performance/ir-inline-gauntlet-soak-20260828.md`) did that,
+/// (`ir-inline-gauntlet-soak-20260828.md`) did that,
 /// and the trades came out in the flag's favour: 11 030 methods spliced across
 /// 200 netty classes, 8% faster on a serial netty slice and 15-26% on
 /// hibernate, with the sharded run's apparent +18% traced to contention rather
@@ -6668,7 +6668,7 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// What kept it off was a CORRECTNESS regression the soak found — a 3-byte
 /// out-of-bounds read through a spliced accessor raising `InternalError`
 /// instead of `IndexOutOfBoundsException`. **That is FIXED** (2026-08-28,
-/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`):
+/// `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`):
 /// `lower_inner_with_scopes` was passing `Lowerer::new` an empty
 /// `spliced_ranges`, so every deopt inside a relocated body recorded a bci
 /// the method does not have. `DuplicatedByteBufTest` is `ok=416 failed=0`
@@ -6676,7 +6676,7 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 ///
 /// It is still OFF, and flipping it is a separate decision this comment must
 /// not pre-empt: the soak's own record stages the flip
-/// (`performance/ir-inline-gauntlet-soak-20260828.md`, landed as "do not flip
+/// (`ir-inline-gauntlet-soak-20260828.md`, landed as "do not flip
 /// it yet"), and the blocker being gone is a precondition, not the decision.
 /// Whoever takes it should re-run the 200-class serial netty pass and the
 /// hibernate slice on the fixed binary rather than inheriting the soak's
@@ -7252,7 +7252,7 @@ pub enum ReceiverShape {
 /// Why a candidate was not inlined. Every refusal is reported rather than
 /// silently dropped, because "the inliner did nothing" and "the inliner
 /// declined for a stated reason" are indistinguishable from the outside, and
-/// that is precisely the failure mode `audits/flag-census.md` tracks.
+/// that is precisely the failure mode `flag-census.md` tracks.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InlineRefusal {
     /// The compilation requested precise exception frames. Mirrors the
@@ -9337,7 +9337,7 @@ impl StringFieldLayout {
     ///   schema name (used as a `HashMap` key, so its hash was cached), and
     ///   wrote `CREATE SEQUENCE ""."SEQ1"` into its persisted metadata —
     ///   after which reopening the database failed with `Schema  not found`
-    ///   (`fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`).
+    ///   (`h2-jitban-schema-not-found-on-reconnect-FIXED.md`).
     ///   `hashCode()` had the mirror defect: it read `hashIsZero` as the
     ///   cached hash, so `"".hashCode()` returned 1.
     /// * for the LEGACY arm the fixed `+8` happens to be right for field
@@ -9900,7 +9900,7 @@ pub enum JitIntrinsic {
     //
     // Both classes hold a single `private int crc` at instance field slot 0
     // (`CRC_FIELD_SLOT`), the running (uncomplemented) CRC state — see
-    // gaps/crc_layout_contract.md and native-builtins/src/
+    // crc_layout_contract.md and native-builtins/src/
     // zip_crc32c.rs. Each intrinsic threads that slot: load slot 0, fold the
     // input byte(s), store back. `update(I)V` folds one byte; `update([BII)V`
     // folds a `byte[]` range (with inline null + bounds guards). A receiver
@@ -11313,7 +11313,7 @@ pub fn varhandle_read_direct_helpers_enabled() -> bool {
 // of `HibfixVarHandleProbe` counts 698 000 `VarHandle.set` invocations for
 // 500 000 probe writes: every one is a full dispatch.
 //
-// See `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
+// See `varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
 // (retired to the internal tree 2026-08-27, FIXED).
 //
 // A write is the EASIER half of what the read bind refused, not the harder one.
@@ -12352,7 +12352,7 @@ pub fn try_resolve_intrinsic(
     // java.util.zip.CRC32 / CRC32C `update` call-site intrinsics (Phase 4c).
     //
     // The foundation wave (commit 2fb0df0) pinned the receiver layout
-    // (gaps/crc_layout_contract.md): both classes carry exactly one
+    // (crc_layout_contract.md): both classes carry exactly one
     // instance field — `private int crc` at slot 0 — holding the running,
     // uncomplemented CRC state. It also added a bit-exact native CRC32C
     // (native-builtins/src/zip_crc32c.rs) that serves as the differential
@@ -12753,8 +12753,7 @@ fn box_unbox_intrinsic_disabled() -> bool {
             return true;
         }
         // DEFAULT ON AGAIN (2026-09-04). The mitigation this replaced existed
-        // for exactly one reason -- the SIGSEGV recorded in `fixed-bugs/
-        // zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+        // for exactly one reason -- the SIGSEGV recorded in `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
         // -- and that crash was not this intrinsic's. It was
         // `ZgcRealHeap`'s relocation slides writing into arena granules
         // `Arena::decommit_free_blocks` had already returned to the OS; the
@@ -12855,7 +12854,7 @@ pub fn try_resolve_box_unbox_intrinsic(
 /// about. Keeping them separate meant the tests went on guarding the match
 /// across the default's two flips — off on 2026-09-02 for a crash that was the
 /// collector's, and on again on 2026-09-04 once
-/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+/// `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
 /// closed it.
 pub(crate) fn box_unbox_intrinsic_shape(
     class: &str,
@@ -13116,7 +13115,7 @@ mod atomic_accessor_intrinsic_tests {
     /// family's: `ZgcRealHeap`'s relocation slides were writing into arena
     /// granules `Arena::decommit_free_blocks` had returned to the OS. See
     /// `box_unbox_intrinsic_disabled`, and
-    /// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+    /// `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
     #[test]
     fn box_unbox_is_default_on_and_the_off_switch_still_works() {
         const CID: u32 = 12345;
@@ -14487,7 +14486,7 @@ struct JitKey {
     // `ClassLoader(null)` re-loading an old H2 jar's own
     // `org.h2.mvstore.RootReference` alongside the identically-named class
     // already on the application classpath — see
-    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`'s
+    // `bug-h2-suite-residual-fail-triage-FIXED.md`'s
     // `TestUpgrade` residual) are DISTINCT classes with unrelated bytecode,
     // but the interpreter's own dispatch (`resolve_method_ref` /
     // `execute_invoke_kind` / `try_stackless_invoke`) already correctly
@@ -17586,7 +17585,7 @@ fn virtual_object_info_for(
 /// optimizing tier is an optimization, never a requirement.
 ///
 /// This is the adapter the P0 "JIT correctness" lane of
-/// `feature-designs/c2/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `deep-research-vm-c2.md` asks for: `verify_graph` returns
 /// `Result`, the compile path returns `Option`, and rather than change the
 /// signature of anything already in the pipeline the conversion happens here,
 /// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
@@ -17722,7 +17721,7 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
 /// is also the one that matters most — that door compiles a `@Test` method's hot
 /// loop, and a method denied there runs its whole life interpreted with no other
 /// diagnostic. Found the hard way on `HttpHeaderValidationUtilTest`'s two
-/// exhaustive loops (fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
+/// exhaustive loops (osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md).
 ///
 /// Consumes the thread-local site, like `try_compile`'s own recorder.
 pub fn mark_jit_bail_listed_with_site(class_name: &str, method_name: &str, descriptor: &str) {
@@ -18180,7 +18179,7 @@ pub const CODE_BUFFER_TOO_SMALL_SITE: &str = "code-buffer-estimate-too-small";
 ///
 /// The retry is deferred to the NEXT compile request, so every shortfall is a
 /// full lowering done twice. Whether that matters is an arithmetic question and
-/// it had never been answered: `bug-two-pqc-classes-exceed-900s-20260821.md`
+/// it had never been answered: `bug-two-pqc-classes-exceed-900s-20260821-RESOLVED.md`
 /// listed "14 wasted compiles of ~120 KB methods" as a lead and said, correctly,
 /// "worth sizing before assuming it matters". These two counters size it. They
 /// are printed beside `total_compile_time_ms`, which is the denominator that
@@ -19563,7 +19562,6 @@ pub fn jit_direct_call_requires_dispatch(
 /// can select the caller's oop map for the callee's frame and lose live
 /// roots. This exact mechanism produced the IVFKnn stress-test
 /// stale-precise-root-mirror corruption (see
-/// fixed-suite-bugs/elasticsearch-suite/
 /// ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b-FIXED.md).
 /// Closed by two companion fixes that ship alongside this flag:
 /// [`Compiler::emit_post_call_rbp_republish`] (re-publishes the caller's RBP
@@ -20629,7 +20627,7 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // callee's handler frame from its incoming arguments and lost every other
     // local). Anyone reading a failure of this class as evidence against this
     // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
-    // fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
+    // basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
     //
     // The class is not immune to two intermittent failures unrelated to this
     // gate — a stall in Spring Boot's two-thread `OnClassCondition` filtering
@@ -20644,7 +20642,7 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
     // callee's handler frame from its incoming arguments and lost every other
     // local). Anyone reading a failure of this class as evidence against this
     // gate between 2026-07-31 and 2026-08-01 was reading the wrong defect; see
-    // fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
+    // basicerrorcontroller-jit-only-failure-20260731-FIXED.md.
     //
     // The OPTIMIZING-TIER gate stays scoped as
     // `moving_young_relocates_compiled_frames()` — that one protects frames
@@ -21092,7 +21090,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // Flyway HSQLDB path "is running interpreted" in a run where it had been
     // JIT-eligible for four days, and looked for the stall in the wrong place.
     // The real defect was `383e7f5cf`. See
-    // `fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
+    // `flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`.
     //
     // If a package ever needs to be force-interpreted again, do it through the
     // bisect levers below (which `compile_gate::admit` applies at all three
@@ -21761,7 +21759,7 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
 /// **Unlike `getfield`/`getstatic`, this admission is NOT bookkeeping.** Both
 /// lowerings grew a publishing exit in the same change that added them here,
 /// which is the condition
-/// `fixed-bugs/rbc6-protected-field-ops-FIXED-20260802.md` states and the
+/// `rbc6-protected-field-ops-FIXED-20260802.md` states and the
 /// netty adaptive-allocator page insisted on: admitting `new` without giving
 /// its lowering a precise frame is a miscompile, not a speedup.
 ///
@@ -22186,7 +22184,7 @@ fn precise_exception_frame_sites_supported(
 /// where every throwing site in those ranges publishes one. That is exactly
 /// this predicate, so `compile_osr_artifact` calls it rather than growing a
 /// second, drifting copy of the opcode table. See
-/// `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
+/// `osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`.
 #[cfg(target_arch = "x86_64")]
 pub fn first_unsupported_precise_frame_site(
     code: &[u8],
@@ -22781,8 +22779,7 @@ fn try_compile_inner(
                     // `StringCache.toString`, refused for its `synchronized`
                     // block's javac-generated monitor handler; it sits in the
                     // middle of a 600M-call hot chain whose neighbours both
-                    // compile. See tomcat/
-                    // 30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md.)
+                    // compile. See 30-hot-loop-jit-admission-bans-testmethodperformance-CLOSED.md.)
                     //
                     // The pc/opcode is the actionable half: it names the ONE
                     // lowering that would have to publish a precise frame for
@@ -23254,7 +23251,7 @@ fn try_compile_inner(
         // the IR builder. `getstatic` + `ldc`/`ldc_w` was 189 of the 273
         // opcode-gap events measured on 2026-08-03 — 69% of every opcode the
         // optimizing builder had no arm for
-        // (`feature-designs/c2/ir-coverage-survey-20260803.md`).
+        // (`ir-coverage-survey-20260803.md`).
         //
         // Three site kinds, three tables, all fed from the SAME resolver the
         // single-pass backend uses — this lane consumes a table the caller
@@ -24986,7 +24983,7 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
-                // P0 "JIT correctness" (feature-designs/c2/deep-research-vm-c2.md):
+                // P0 "JIT correctness" (deep-research-vm-c2.md):
                 // the IR verifier runs after every mutating pass when
                 // `ir_verify::verify_enabled()` (debug builds, or
                 // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately
@@ -26981,8 +26978,7 @@ fn try_compile_inner(
                         // re-run — safe only when nothing observable
                         // happened before this call, an invariant this scan
                         // cannot verify and the JDT `Parser` stack-corruption
-                        // bug violates (fixed-suite-bugs/
-                        // jasper-jdt-parser-arrayindexoutofbounds.md: a
+                        // bug violates (jasper-jdt-parser-arrayindexoutofbounds.md: a
                         // `stack[ptr--]` decrement already committed earlier
                         // in the same method gets re-executed on re-run).
                         // Register an ordinary `JitInvokeInfo` dispatch
@@ -28219,7 +28215,7 @@ fn try_compile_inner(
     // DOUBLE-EXECUTES every side effect already committed before the trap —
     // e.g. a `stack[ptr--]` decrement already written to the heap. This was
     // the root cause of the JDT `Parser` stack-corruption bug
-    // (fixed-suite-bugs/jasper-jdt-parser-arrayindexoutofbounds.md): an
+    // (jasper-jdt-parser-arrayindexoutofbounds.md): an
     // always-deopting reference-array `System.arraycopy` call inside a method
     // with a live `this` made every single invocation re-run from entry.
     let param_oop_mask =
@@ -28739,7 +28735,7 @@ fn is_category2_opcode(op: u8) -> bool {
 /// the coarse method-level gate — is what let the OSR-exit snapshot at
 /// `getstatic System.out` + an `if`/`else`-computed `makeConcatWithConstants`
 /// argument decode its operand stack precisely; see
-/// `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`.
+/// `testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`.
 pub fn indy_arg_type_tags(descriptor: &str) -> Vec<u8> {
     let bytes = descriptor.as_bytes();
     let mut tags = Vec::new();
@@ -39086,7 +39082,7 @@ mod layout_constant_inventory {
         // branch, `HEADER_SIZE + field_index * SLOT_SIZE` plus the payload bias
         // inside the 16-byte `Value` cell. It is the arm that stopped every
         // legacy-layout receiver from taking `jit_getfield` — see
-        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
+        // every-jit-getfield-takes-the-helper-FIXED-20260820.md
         // — and it is a disp32 site in all three forms it emits
         // (`48 8B 80 disp32`, `8B 80 disp32`, `48 63 80 disp32`), so it does
         // not share the disp8 hazard either. `SLOT_SIZE` goes 5 -> 6 with it:
@@ -39267,7 +39263,7 @@ mod layout_constant_inventory {
                      inventory records {want}x. Both files emit object-header \
                      displacements into machine code, and neither is covered by \
                      the substring tripwire in x64.rs. Update \
-                     arch-2026-07-26/layout-constant-hazards.md and \
+                     layout-constant-hazards.md and \
                      header-shrink.md §6.6 in the same change, and confirm the new \
                      or moved site is value-safe at the new layout — the disp8 \
                      sites in ir_lower.rs silently address backwards past 127."

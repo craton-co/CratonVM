@@ -1144,7 +1144,7 @@ pub trait NativeClassAccess {
     /// very first time a class is needed under a given loader (the gap that
     /// made two prior lookup-based fix attempts for the H2 `Parser`
     /// loader-collapse bug regress on a fresh session -- see
-    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md's
+    /// bug-h2-suite-residual-fail-triage-FIXED.md's
     /// eighth-pass section).
     ///
     /// Native overrides that construct or invoke-special a DIFFERENT class
@@ -2458,8 +2458,7 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     /// class, but the name-based re-resolution picked the APPLICATION-loader
     /// copy whenever an isolating loader (Spring Boot's
     /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
-    /// own copy of that class. See fixed-suite-bugs/springboot/
-    /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+    /// own copy of that class. See servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
     ///
     /// Default implementation falls back to the name-based
     /// [`Self::invoke_special`] for contexts with no ClassId fast path.
@@ -2609,7 +2608,7 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// `Generational` GC backend only) to turn a stale read into an immediate,
     /// deterministic panic instead of silent corruption — see
     /// `gc/src/stale_objref_debug.rs` and
-    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+    /// wildfly-parallel-boot-stale-objectref-residual.md.
     ///
     /// # A funnel that allocates takes its receiver by `&mut ObjectRef`
     ///
@@ -3929,7 +3928,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// contended wait needs to be excused from an in-flight STW barrier
     /// pause instead of leaving the calling thread counted in its `expected`
     /// set for the whole wait (see
-    /// `fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`).
+    /// `wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md`).
     ///
     /// Deliberately NARROW: `monitor_enter` itself stays on its original,
     /// non-GC-blocked path for the other ~80 native call sites that use
@@ -3941,7 +3940,7 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// path to span a completing (possibly moving) GC pause would expose
     /// all of them to the stale-`ObjectRef`-across-GC bug class this
     /// codebase has repeatedly hit (see
-    /// `fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// `wildfly-parallel-boot-stale-objectref-residual.md`)
     /// — an unaudited-at-scale regression risk far worse than the original
     /// hang. This method exists so the ONE call site with live-gdb-confirmed
     /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
@@ -4737,8 +4736,7 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
     /// java.lang.Object cannot be cast to
     /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
-    /// `obj_cid=0` — see `fixed-suite-bugs/wildfly/
-    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`,
+    /// `obj_cid=0` — see `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`,
     /// which documents the same family from WildFly's `parallel-extension-add`
     /// boot step) — one more independent occurrence of that already-tracked
     /// "register-invisible root" / cross-thread GC-root-visibility family,
@@ -4818,6 +4816,56 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// for the arena-handle vs raw-pointer distinction.
     fn copy_to_native_memory(&mut self, _addr: i64, _data: &[u8]) -> bool {
         false
+    }
+
+    /// Is `addr` one of the VM's `Unsafe`-arena handles rather than a real,
+    /// dereferenceable OS pointer?
+    ///
+    /// This is the distinction [`Self::copy_from_native_memory`] already makes
+    /// internally, surfaced so a caller can *report* which population it is
+    /// serving without attempting a transfer. `cratonvm-native-io`'s socket
+    /// census uses it to answer a question that decides whether a whole class
+    /// of optimisation is reachable at all: the bounce buffer in the direct
+    /// `ByteBuffer` transfer path is removable only for a REAL pointer, since
+    /// an arena handle cannot be handed to the kernel. Measuring the split on a
+    /// live HTTP workload is what tells you whether that work is worth doing —
+    /// and the answer must come from a counter, not from an assumption about
+    /// which allocator the application used.
+    ///
+    /// It exists on this trait rather than as a direct call into
+    /// `cratonvm-native-builtins` (which owns the tag bit) because
+    /// `native-builtins` DEPENDS on `native-io`; the reverse edge would be a
+    /// dependency cycle. Duplicating the tag constant into `native-io` was the
+    /// other option and is worse — a second copy of a magic number that must
+    /// track the arena allocator's, with nothing to notice when it stops.
+    ///
+    /// The default answers `false` — "assume a real pointer". A context that
+    /// does not model the arena has no handles to misreport, and the only
+    /// consumer is diagnostic.
+    fn native_addr_is_arena_handle(&self, _addr: i64) -> bool {
+        false
+    }
+
+    /// [`Self::class_id_of_object`], but resolved through the read barrier the
+    /// way [`Self::get_field_by_name`] resolves it.
+    ///
+    /// The two are NOT interchangeable for a caller that memoizes field slots.
+    /// `class_id_of_object` validates the address and answers `ClassId(0)` when
+    /// it is not a live object base — but if a moving collection relocated the
+    /// object and something else has since been allocated at the old address,
+    /// it answers the class of THAT object instead. Pairing such an id with
+    /// [`Self::get_field`], which forwards internally, would read the new
+    /// object's slot layout out of the forwarded original: a wrong field, in
+    /// bounds, with nothing raised.
+    ///
+    /// `get_field_by_name` never has that problem because it forwards first and
+    /// derives the id from the forwarded object. Any caller resolving an index
+    /// once and reusing it must do the same, which is what this exists for.
+    ///
+    /// The default delegates, because a context with no moving collector has
+    /// nothing to forward.
+    fn class_id_of_object_forwarded(&self, obj: ObjectRef) -> ClassId {
+        self.class_id_of_object(obj)
     }
 
     /// Record a printed line (for System.out.println capture in tests).
@@ -5504,7 +5552,7 @@ pub struct StackTraceEntry {
     /// which takes no `ClassStore` by design).
     ///
     /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-1 of
-    /// `arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
+    /// `stackwalk-and-vtable.md`). This exists so
     /// that *deferred* line-number resolution can be **exact**. `class_name` +
     /// `method_name` + `byte_code_index` are not enough: a class may declare an
     /// overload set under one name, the members have different
@@ -5908,7 +5956,7 @@ pub struct NativeCensusEntry {
     ///
     /// This is the fourth distinct way this census has been misread; the other
     /// three are in
-    /// `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
+    /// `jdk-only-census-one-class-one-platform-FIXED-20260810.md`.
     pub owns_slot: bool,
     /// Whether [`Self::kind`] was **stated at this registration site**
     /// (`register_with_kind`) or inherited from an ambient `set_category` in
@@ -7603,7 +7651,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md
+        // bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is
@@ -8163,8 +8211,8 @@ impl NativeMethodRegistry {
         // `execute()`/`submit()`/`shutdown()` overrides too, sending them
         // straight to real JDK bytecode that dereferences an uninitialized
         // `ctl`/`mainLock` field and NPEs
-        // (`fixed-suite-bugs/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
-        // `fixed-suite-bugs/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
+        // (`threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md`).
         // A prior narrower fix (merged separately, same day) exempted only
         // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
         // distinction into the interpreter's dispatch layer instead

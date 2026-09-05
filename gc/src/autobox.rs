@@ -101,6 +101,79 @@ pub fn wrapper_exists() -> bool {
     WRAPPER_CREATED.load(Ordering::Relaxed)
 }
 
+/// Should a reference-ARRAY read consult [`wrapper_exists`] before probing for
+/// a wrapper? Default yes; `CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH=1`
+/// (`CRATONVM_GC=-array-autobox-latch`) restores the unconditional probe.
+///
+/// # Why this existed to be fixed
+///
+/// The module note above explains the latch by saying `gen_heap::get_field`
+/// "used to pay an unconditional `is_object_address` probe plus a header read
+/// on EVERY compact reference-field read, just in case the slot held a
+/// wrapper", and that giving the other heaps that unconditionally "would be a
+/// real regression".
+///
+/// The FIELD read paths took that advice — `get_field` goes through
+/// [`unbox_reference_slot`], which is latched. The reference-**array** read
+/// paths did not: `ZgcRealHeap::get_array_element` (both its barrier arm and
+/// its plain arm) and `G1Collector::get_array_element` called
+/// [`super::GarbageCollector::autobox_payload`] directly, whose first act is
+/// `is_object_address` — the exact probe this latch exists to avoid — on every
+/// non-null `aaload`. Measured 2026-09-05 at +47 ns for an `aaload` over an
+/// `iaload` + `ifne` doing the same work, against HotSpot's −0.8 ns.
+///
+/// # Why the screen cannot change an answer
+///
+/// `autobox_payload` returns `Some` only when the loaded object's header says
+/// `class_id == AUTOBOX_CLASS_ID`, and such an object can only exist if some
+/// site created one — which is exactly what sets the latch, array sites
+/// included (see the module note on why it is deliberately set by those too).
+/// So `wrapper_exists() == false` implies `autobox_payload` would have
+/// returned `None`. The ordering argument for a cross-thread reader is the one
+/// [`wrapper_exists`] already makes.
+#[inline(always)]
+pub fn array_unbox_latch_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH").is_none()
+    })
+}
+
+/// Is this object an auto-box wrapper? The per-object test, for a reader that
+/// already holds a validated header.
+///
+/// # Why the process-wide latch is not enough
+///
+/// [`wrapper_exists`] was designed as a cheap screen on the premise, stated in
+/// the module note above, that "a process that never boxes — the overwhelming
+/// majority — pays one relaxed load ... and never touches the address
+/// validator". **In this VM there is no such process.** The class-mirror
+/// populator puns a `ClassId` (and `Int(-1)` for primitive mirrors) into slot 0
+/// of an object stamped `java/lang/Class`, that store goes through
+/// [`box_for_reference_slot`], and it arms the latch unconditionally at
+/// bootstrap. Measured 2026-09-05 with a per-cause census on
+/// `probes/ArrBurn.java`: `aaload: hit=0 miss_barrier=0 miss_wrapper=2000146`.
+/// Every screen keyed on the latch is therefore permanently open, and every
+/// fast path guarded by one is dead code.
+///
+/// A reader that has already loaded the reference can ask the precise question
+/// instead, for one header compare. That is the same discriminator
+/// [`super::GarbageCollector::autobox_payload`] applies — minus the
+/// `is_object_address` probe, which
+/// `interpreter::field_fast::registry_probe_restored` establishes is not
+/// needed for parity with the handlers these paths replace.
+#[inline(always)]
+pub fn header_is_wrapper(header: &cratonvm_types::ObjectHeader) -> bool {
+    header.class_id == AUTOBOX_CLASS_ID
+}
+
+/// The screen itself: `true` when a reference-array read must go on and probe
+/// for a wrapper. Reads as "the latch is off, or it says a wrapper exists".
+#[inline(always)]
+pub fn array_read_may_hold_wrapper() -> bool {
+    !array_unbox_latch_enabled() || wrapper_exists()
+}
+
 /// Arm [`wrapper_exists`]. Called from every site that allocates a wrapper —
 /// the four `set_array_element`s and [`box_for_reference_slot`].
 #[inline]

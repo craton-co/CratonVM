@@ -3411,7 +3411,6 @@ pub(crate) fn native_class_for_name(
                     }
                 }
                 // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
-                // fixed-suite-bugs/wildfly/
                 // wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md): `mirror` -- the `Class` object
                 // `invoke_virtual` just handed back from recursively
                 // interpreting `loadClass`'s real bytecode -- is a bare Rust
@@ -4485,7 +4484,7 @@ pub(crate) fn native_class_is_primitive(
     // that that's where THIS JDK build's compiled `java/lang/Class` happens
     // to place the `primitive` field — the exact "answering true for a
     // class that is not primitive" hazard flagged in
-    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md.
+    // spring-bean-attribute-type-null-flake-RESOLVED-20260806.md.
     // Resolve it the same way the writer does (`resolve_class_mirror_slots`
     // in `vm/src/vm/vm_object.rs`, i.e. by field name against the loaded
     // `java/lang/Class`), so reader and writer agree by construction instead
@@ -6670,7 +6669,7 @@ pub(crate) fn verify_member_access(
     // `public_member_class_is_reachable`, and asks it correctly — answered with
     // the value. `StaticFieldELResolver.getValue` consults `canAccess`, so the
     // disagreement surfaced as `PropertyNotFoundException` with a null cause.
-    // See tomcat/teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
+    // See teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
     let declaring_is_public =
         (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) != 0;
 
@@ -8312,7 +8311,7 @@ fn capture_field_descriptor(type_char: char) -> String {
 /// real HotSpot's `LambdaMetafactory`-spun proxy classes carry, for a
 /// CratonVM lambda-proxy `class_id`. Lambda proxies are never registered in
 /// `class_manager` (they live in `shared.classes.lambda_proxies` instead — see
-/// `fixed-suite-bugs/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
+/// `comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
 /// for the same root cause in a sibling `Comparable` check), so
 /// `NativeContext::declared_fields` can't see them and reflective access to
 /// a lambda's captured field (e.g. AssertJ's `extracting("arg$1")` fallback,
@@ -8805,7 +8804,7 @@ pub(crate) fn create_method_object(
     // (500+ module jars) it reproduces deterministically as
     // "Constructor.newInstance: no declaring class" (the analogous
     // `create_constructor_object` bug it shares this pattern with — see
-    // fixed-suite-bugs/wildfly/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md).
+    // wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md).
     // Pin everything now and re-read the forwarded reference right before use.
     let obj_pin = ctx.pin_native_root(obj);
 
@@ -9628,7 +9627,7 @@ fn build_serialized_lambda(
     // are all reused repeatedly across these hazards, unpinned otherwise.
     // Same "Family 1" stale-ObjectRef pattern as `create_method_object`/
     // `create_constructor_object`/`create_field_object` (see
-    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
+    // wildfly-parallel-boot-stale-objectref-residual.md).
     let proxy_pin = ctx.pin_native_root(proxy);
     let capturing_mirror_pin = match capturing_mirror {
         Value::Object(Some(m)) => Some(ctx.pin_native_root(m)),
@@ -10260,8 +10259,7 @@ pub(crate) fn native_method_invoke(
         // own nested `@Configuration` class) while the test body's
         // `Mockito.verify()` ran application-loader bytecode against the
         // application copy of `MockUtil`, whose `mockMakers` map never saw the
-        // mock → `NotAMockException`. See fixed-suite-bugs/
-        // springboot/servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+        // mock → `NotAMockException`. See servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
         let special_result = match mirror_class_id(ctx, declaring_mirror) {
             Some(cid) => ctx.invoke_special_by_class_id(
                 cid,
@@ -11827,7 +11825,7 @@ pub(crate) fn create_constructor_object(
     let num_fields = base + CONSTRUCTOR_EXTRA_SLOTS;
     let obj = ctx.alloc_object(class_id, num_fields);
     // GC-safety (root cause of
-    // fixed-suite-bugs/wildfly/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md):
+    // wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md):
     // every reflective mirror/array/string built below can trigger classloading
     // (and therefore GC) via `get_class_mirror` / `descriptor_to_class_mirror[_via_loader]`
     // / `build_mirror_array_comp` / `create_string`. A moving collection between
@@ -12273,7 +12271,7 @@ pub(crate) fn native_constructor_new_instance(
                         // `obj` is returned afterward, unpinned otherwise --
                         // exactly the "Constructor.newInstance"-family
                         // stale-ObjectRef pattern documented in
-                        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+                        // wildfly-parallel-boot-stale-objectref-residual.md.
                         let obj_pin = ctx.pin_native_root(obj);
                         {
                             // Run the ancestor's no-arg `<init>` (`clazz`);
@@ -12746,7 +12744,7 @@ pub(crate) fn native_class_get_declared_constructor(
 /// triggered by the Nth `create_field_object` call could relocate/reclaim
 /// the first N-1 already-created Field mirrors, since that Vec was not a
 /// GC root. This is the exact residual gap flagged (but never swept) in
-/// `fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`
+/// `jit-junit-discovery-reflection-corruption.md`
 /// ("collect_public_fields/methods (getFields/getMethods Vec-build)").
 fn collect_public_fields(
     ctx: &mut dyn NativeContext,
@@ -13441,8 +13439,7 @@ pub(crate) fn native_class_get_constructor(
 /// Resolve a lambda proxy's functional interface to a `ClassId`, preserving
 /// the bootstrap's exact resolved identity before any host-scoped fallback.
 ///
-/// Residual 4 follow-up (2026-07-20, fixed-suite-bugs/springboot/
-/// core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md): both
+/// Residual 4 follow-up (2026-07-20, core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md): both
 /// `native_class_get_interfaces` and `native_class_get_generic_interfaces`
 /// used a bare `ctx.class_id_by_name(&iface_name)` here — loader-blind.
 /// Scoping `typesig_to_real_type`'s LATER resolution (inside the generic
@@ -15880,7 +15877,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 if let Some(enum_cid) = enum_cid_opt {
                     // GC-safety (2026-07-16): this is the "enum builder" residual
                     // gap flagged (but never swept) in
-                    // fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+                    // jit-junit-discovery-reflection-corruption.md
                     // — `class_mirror` is held in a Rust local across the
                     // allocating `create_string` call (and the `Enum.valueOf`
                     // invocation itself, which can allocate/classload) before
@@ -17644,7 +17641,7 @@ pub(crate) fn native_method_get_parameter_annotations(
     // the forwarded reference each iteration, matching `build_mirror_array`'s
     // established pattern. This is the "getParameterAnnotations" residual gap
     // flagged in
-    // `fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`.
+    // `jit-junit-discovery-reflection-corruption.md`.
     let mut outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
     let outer_pin = ctx.pin_native_root(outer);
     for i in 0..aligned_annotations.len() {
@@ -18129,8 +18126,7 @@ pub(crate) fn native_class_get_generic_interfaces(
             // `Class` for every lambda -- never a `ParameterizedType`, and
             // regardless of how concretely the call site's target type was
             // parameterized (verified against `jdk-25.0.3.9-hotspot`; see
-            // `fixed-suite-bugs/springboot/
-            // lambda-getgenericinterfaces-fabricates-parameterizedtype-FIXED.md`).
+            // `lambda-getgenericinterfaces-fabricates-parameterizedtype-FIXED.md`).
             //
             // A previous session reconstructed a concrete `ParameterizedType`
             // here out of the lambda's call-site instantiated descriptor, so
@@ -18948,7 +18944,7 @@ pub(crate) fn native_class_get_package_name(
 // Arquillian's `EventTestRunnerAdaptor` bootstrap (MOXy JAXB asks
 // `Package.isAnnotationPresent(XmlSchema.class)` on classes from
 // JBoss-vendored jars whose manifests set `Specification-Vendor`). See
-// `fixed-suite-bugs/keycloak/keycloak-arquillian-package-getannotation-string-linkage.md`.
+// `keycloak-arquillian-package-getannotation-string-linkage.md`.
 //
 // Consequence of writing by name only: since `Package` has no flat
 // `specTitle`/etc. fields to target by name, `getSpecificationTitle()` and
@@ -22515,7 +22511,7 @@ pub(crate) fn native_class_get_annotated_superclass(
 /// of `AnnotatedParameterizedTypeImpl` вЂ” the same ByteBuddy `AnnotatedType`
 /// dispatch mismatch the ES bytebuddy-annotatedtype fix addressed for
 /// methods/fields/parameters (see
-/// `fixed-suite-bugs/elasticsearch-suite/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`),
+/// `elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`),
 /// just not yet applied here. Mockito's `mock(Path.class)` walks exactly
 /// this path via ByteBuddy's owner-type reader when generating the mock.
 pub(crate) fn native_class_get_annotated_interfaces(
@@ -22649,7 +22645,7 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
 /// `getAnnotatedActualTypeArguments()`, which only that subclass declares)
 /// and fail with a receiver-type mismatch a few frames up the call chain
 /// when handed a plain `AnnotatedTypeBaseImpl` instead вЂ” see
-/// `fixed-suite-bugs/elasticsearch-suite/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`.
+/// `elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`.
 fn annotated_type_impl_class_name(
     ctx: &mut dyn NativeContext,
     backing_type: cratonvm_types::ObjectRef,
@@ -26972,7 +26968,7 @@ Implementation-Title: opensaml-core-api\r\n\
     fn t19_h10_get_package_manifest_writes_do_not_corrupt_module_or_package_info() {
         // Regression test for the `Package.getAnnotation()` ->
         // `NoSuchMethodError: java/lang/String.getAnnotation` crash (see
-        // fixed-suite-bugs/keycloak/keycloak-arquillian-package-getannotation-string-linkage.md):
+        // keycloak-arquillian-package-getannotation-string-linkage.md):
         // manifest-attribute writes must land ONLY on their named fields,
         // never on raw slots 1-6. Real JDK 9+ `java.lang.Package` has no
         // flat `specTitle`/`specVersion`/`specVendor`/`implTitle`/

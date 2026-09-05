@@ -33,8 +33,7 @@ use super::*;
 /// ~10 BigInteger allocations + 10 limb-division calls per
 /// candidate, over hundreds of candidates per RSA prime, which dominates
 /// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
-/// the documented RSA non-finish — `comparison-handoff/
-/// bug-bc-crypto-regression-timeout.md`). This intrinsic reads the candidate's magnitude
+/// the documented RSA non-finish — `bug-bc-crypto-regression-timeout.md`). This intrinsic reads the candidate's magnitude
 /// once and computes each `x mod m` with a single Horner pass over the limbs
 /// (zero allocation), returning the method's exact boolean result.
 ///

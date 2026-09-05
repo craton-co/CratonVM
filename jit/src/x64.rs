@@ -930,7 +930,7 @@ struct Compiler {
     /// finds the value), but it silently defeated the OSR-exit/invokedynamic
     /// uncommon-trap deopt snapshot's operand-stack decoding at any later
     /// safepoint that read the slot — see
-    /// `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`.
+    /// `testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`.
     /// Recording the real marks here lets the reconstruction restore them
     /// instead of guessing `false`.
     branch_target_stack_oop_marks: FxHashMap<usize, Vec<bool>>,
@@ -1119,7 +1119,7 @@ struct Compiler {
     /// for PCs the forward dataflow never reached (e.g. exception-handler-only
     /// entries), where no precise local marking is emitted and the GC falls
     /// back to the conservative frame sweep. See
-    /// `fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md` (Stage 2).
+    /// `precise-jit-stack-maps-design.md` (Stage 2).
     local_oop_masks: Vec<u64>,
     /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
     /// dataflow reached each PC. Only `reached` PCs get precise local entries.
@@ -1160,7 +1160,7 @@ struct Compiler {
     /// wholesale, and the safe-reject fallback re-runs the interpreter from
     /// the pre-OSR-entry frame, silently re-executing every loop iteration
     /// the OSR-compiled code already committed
-    /// (`fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
+    /// (`testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
     /// (`regalloc::live_locals_per_pc_all`) — `local_liveness[pc *
     /// local_liveness_words + w]` covers slots `[w*64, w*64+64)`. Read through
     /// [`Compiler::local_live_at`], never directly: a method with more than 64
@@ -2501,7 +2501,7 @@ impl Compiler {
                                                                                               // themselves: `pop_stack` reclaims them but the popped `StackSlot::Frame`s
                                                                                               // stay live until `emit_stack_arg_setup` marshals them, so an aliased
                                                                                               // reservation reverses the arguments into themselves and the callee gets
-                                                                                              // arg0 in every slot (fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md).
+                                                                                              // arg0 in every slot (jit-direct-call-arg1-clobbered-by-arg0-FIXED.md).
                                                                                               //
                                                                                               // The copy needs one slot per argument, and a call site's arguments are
                                                                                               // themselves on the operand stack, so `max_stack` slots of headroom is
@@ -3372,7 +3372,7 @@ mod tests;
 // Flag-skew and header-offset contracts
 // ---------------------------------------------------------------------------
 //
-// Companion doc: `arch-2026-07-26/x64-flag-skew-and-contracts.md`.
+// Companion doc: `x64-flag-skew-and-contracts.md`.
 //
 // These tests defend two properties that no build error would catch:
 //

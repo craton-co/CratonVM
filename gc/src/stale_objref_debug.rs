@@ -17,8 +17,8 @@
 //! the first instrument anyone reaches for on a "native held a stale reference"
 //! crash, and a default-build run of it looks exactly like an exoneration.
 //!
-//! See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
-//! and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md for
+//! See wildfly-parallel-boot-stale-objectref-residual.md
+//! and wildfly-stale-objectref-debug-assertion-scoping.md for
 //! the full writeup of the bug class this catches and the design rationale.
 //!
 //! In one sentence: a native Rust function that captures a raw `ObjectRef`

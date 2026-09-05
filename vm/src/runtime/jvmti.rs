@@ -57,7 +57,7 @@
 //!  * **`UNATTRIBUTED_VM` (`0`) is a migration seam, not a scope.** Call sites
 //!    that cannot supply a `vm_identity` land there, and per-VM lookups fall
 //!    back to it. Prefer the `*_for_vm` entry points; see
-//!    `audits/jvmti-vm-scoping.md` for what is still unattributed
+//!    `jvmti-vm-scoping.md` for what is still unattributed
 //!    and why.
 //!
 //! What IS live in this file on a default build:
@@ -923,7 +923,7 @@ pub struct JvmtiEventManager {
     /// owned by VM B can never deliver into VM A's `shared.debug.jvmti_env`.
     /// An unattributed manager falls back to [`sole_live_bridge`], which
     /// answers `None` unless exactly one VM is live — fail-closed, never a
-    /// guess. See `audits/jvmti-vm-scoping.md`.
+    /// guess. See `jvmti-vm-scoping.md`.
     vm: usize,
     /// Global event enable/disable state.
     global_events: RwLock<HashSet<JvmtiEventKind>>,
@@ -2816,7 +2816,7 @@ impl fmt::Debug for JvmtiEnv {
 //     `any_*_listener` fast-path flag. Event *delivery* was process-global,
 //     so re-keying any one downstream table (the field-watchpoint map, say)
 //     produced a subsystem that looked isolated in review and was not. See
-//     `feature-designs/vm-process-global-state-round-2.md` § "Still open".
+//     `vm-process-global-state-round-2.md` § "Still open".
 //   * `REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<SharedVm>>` — a single `Weak`,
 //     first-writer-wins. Exactly the shape that made `RedefineClasses`
 //     silently do nothing in a second VM. Verified failure modes:
@@ -3206,7 +3206,7 @@ fn bridge_for_vm(vm: usize) -> Option<Arc<crate::vm::SharedVm>> {
 /// an interface a debugger treats as authoritative.
 ///
 /// The fix that removes the ambiguity is at the call site, not here — see
-/// `audits/jvmti-vm-scoping.md`.
+/// `jvmti-vm-scoping.md`.
 fn sole_live_bridge() -> Option<Arc<crate::vm::SharedVm>> {
     let guard = environments_read();
     let map = guard.as_ref()?;
@@ -3358,7 +3358,7 @@ pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
 // ---------------------------------------------------------------------------
 //
 // The interpreter dispatch loop and opcode handlers call these at the sites
-// listed in history/roadmap-100.md §T17.Δ. The hot-path contract for each of
+// listed in roadmap-100.md §T17.Δ. The hot-path contract for each of
 // these is:
 //
 //   1. A single `AtomicBool::Acquire` load on the per-event **union** mirror

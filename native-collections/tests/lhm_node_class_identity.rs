@@ -18,7 +18,7 @@
 //! hand `removeEldestEntry` a copied `AbstractMap$SimpleImmutableEntry` — the
 //! invented class declares no methods at all, so `eldest.getKey()` was a
 //! `NoSuchMethodError`. See
-//! `fixed-suite-bugs/springboot/kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`.
+//! `kafka-embedded-kraft-boundport-listeners-distinct-classcastexception-20260804-FIXED.md`.
 //!
 //! These are name-and-shape guards, not end-to-end ones: `MockCtx` invents a
 //! `ClassId` for any name asked of it, so what they actually pin down is which

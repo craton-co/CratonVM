@@ -1,5 +1,5 @@
 //! Manual interop validation for T-CBC.1 (see
-//! fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md).
+//! rustls-cbc-cipher-suites-not-supported.md).
 //!
 //! Not a `#[test]` on purpose: it needs an external, independent TLS peer
 //! (the system `openssl` CLI) to prove the key-schedule/record-layer

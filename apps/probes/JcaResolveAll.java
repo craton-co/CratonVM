@@ -6,7 +6,7 @@ import java.io.FileReader;
  *
  * The enumeration gap and the functional gap are different sizes, and reasoning
  * from the first to the second is exactly the error
- * `jca-provider-population-gap-20260830.md` made: 186 services are absent from
+ * `jca-provider-population-gap-20260830-FIXED.md` made: 186 services are absent from
  * `provider.getServices()` here, but a 17-row functional sample found only 3
  * that actually refuse -- Diffie-Hellman runs a complete 2048-bit agreement
  * 0-diff against HotSpot despite its whole `KeyAgreement` type being unlisted.

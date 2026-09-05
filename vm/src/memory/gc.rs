@@ -141,7 +141,7 @@ pub fn unload_dead_class_metadata(
     // target not represented in its key.
     //
     // ARCH-2026-07-26 (request CR-LR-1 of
-    // `arch-2026-07-26/stackwalk-and-vtable.md`): this used to
+    // `stackwalk-and-vtable.md`): this used to
     // call `invalidate_all()`, which takes THREE write locks — but two of them
     // guard `SharedResolutionState::global_methods` / `global_fields`, whose
     // only writers (`cache_method` / `cache_field`) have no production callers,
@@ -156,7 +156,7 @@ pub fn unload_dead_class_metadata(
     let mut jit_entries_retired = 0;
     {
         // PERF (ARCH-2026-07-26, request CR-VT-1 of
-        // `arch-2026-07-26/stackwalk-and-vtable.md`).
+        // `stackwalk-and-vtable.md`).
         // `unload_class` calls `invalidate_class`, which sweeps EVERY slot of
         // EVERY vtable in the VM — so a per-class loop here costs
         // O(unloaded x all_classes x slots_per_class) under the manager write
@@ -649,7 +649,7 @@ pub(crate) fn remap_handle_slots(
 /// spent its life as a `Cell<Option<ObjectRef>>` inside the `JIT_SIGNALS`
 /// `thread_local!` in `jit/helpers.rs`, where neither half could reach it — TLS
 /// belongs to the mutator, and every `VM_ROOT_SOURCES` callback runs on the
-/// collector. See `fixed-bugs/jit-signals-root-gap.md`.
+/// collector. See `jit-signals-root-gap.md`.
 pub(crate) fn remap_thread_object_slots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
@@ -979,7 +979,7 @@ pub fn update_all_roots(
     // this thread, the JIT analogue of the interpreter-frame remap above. Inert
     // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
     // it is the piece that lets a moving collector run while JIT frames are live
-    // (see fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md, Stage 3).
+    // (see precise-jit-stack-maps-design.md, Stage 3).
     crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
     crate::jit::conservative_roots::remap_register_image_words(pointer_map, Some(shared));
     crate::jit::conservative_roots::report_stale_after_remap(pointer_map, Some(shared));
@@ -2104,7 +2104,7 @@ mod tests {
     /// collection inside a hook reclaimed it — the render then read a zeroed
     /// header as `ClassId(0)` and printed `Exception in thread "main"
     /// java/lang/Object`. See
-    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md`.
+    /// `bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md`.
     ///
     /// The count below is the point of the test: a new slot added to
     /// `remap_thread_object_slots` without being added here leaves the guard

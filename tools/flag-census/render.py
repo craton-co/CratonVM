@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024-2026 Craton Software Company
-"""Render `audits/flag-census.md` from the scan in `census.py`.
+"""Render `flag-census.md` from the scan in `census.py`.
 
 Usage:  python3 tools/flag-census/render.py [REPO_ROOT]
 

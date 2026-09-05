@@ -5,7 +5,7 @@
 //!
 //! ## Why this exists
 //!
-//! The C2 review (`feature-designs/c2/deep-research-vm-c2.md`) has a P0 lane
+//! The C2 review (`deep-research-vm-c2.md`) has a P0 lane
 //! "Separate startup, compilation, execution, and GC time", whose acceptance
 //! criterion is: *"Every benchmark's wall time reconciles to named categories
 //! within 2%."* Nothing in the tree could answer that. `jit::metrics` measures

@@ -157,39 +157,65 @@ fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
             return None;
         }
     };
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "[vthread_probe_regression] {class_name} timed out after {:?}",
-                        timeout
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                eprintln!("[vthread_probe_regression] try_wait failed: {e}");
-                return None;
-            }
-        }
+    // DRAIN WHILE WAITING. The loop this replaces polled `try_wait` over piped
+    // stdio without reading it, which deadlocks the moment a child outruns the
+    // 64 KiB pipe — the child blocks in `write`, never exits, and the guard
+    // reports a "timeout" for a process that finished its work. That is not
+    // what is failing here today (this probe writes 175 bytes), but it is the
+    // same latent defect that cost `native_io_dis_read_fully_pin` 10 timeouts
+    // in 10 on Linux, and the next diagnostic anyone adds to the VM re-creates
+    // it. `common::wait_draining` reads both pipes on their own threads and
+    // returns what it captured even when the cap is hit.
+    let timed = common::wait_draining(child, timeout);
+    let stdout = String::from_utf8_lossy(&timed.output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&timed.output.stderr).into_owned();
+    if timed.timed_out {
+        panic!(
+            "[vthread_probe_regression] {class_name} timed out after {timeout:?}
+             stdout:
+{stdout}
+stderr:
+{stderr}"
+        );
     }
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("[vthread_probe_regression] wait_with_output failed: {e}");
-            return None;
-        }
-    };
-    Some((
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    Some((stdout, stderr))
 }
+
+/// The hang cap for `VthreadProbe`. It is a LIVELOCK GUARD, not a performance
+/// assertion: the test asserts `counted=10000 ok=true`, and this only exists so
+/// a scheduler that stops making progress fails fast instead of hanging the
+/// suite.
+///
+/// # It was briefly 300 s, and that was wrong
+///
+/// `vthread_probe_10000_all_increment` flaked in the 2026-09-05 Linux sweep
+/// (2 failures in 8). Twenty runs of the probe under added load looked like a
+/// heavy tail — 20/20 correct, 3.36 s to 26.39 s — so the cap was raised to
+/// 300 s on the theory that 60 s sat inside that tail.
+///
+/// THE TAIL WAS NOT THE STORY. Running the VM DIRECTLY, no test harness
+/// involved, ten times on Windows:
+///
+/// ```text
+/// 8 runs   2-4 s   counted=10000 ok=true
+/// 2 runs   killed at 120 s, no output at all
+/// ```
+///
+/// Bimodal, with nothing in between, and independent of machine load — one
+/// failure came with three background compilers running and three of the
+/// passes came with the same three. That is a HANG, and the loop's original
+/// comment named the suspect: a v-thread scheduler that regresses to a
+/// 1-carrier livelock.
+///
+/// A hang is not something a cap can fix. Raising it to 300 s bought nothing
+/// except making CI wait five times longer to report a real defect, so it is
+/// back to 60 s — twenty times the healthy runtime and twice the worst
+/// completed run ever measured, which is ample for a guard whose job is to
+/// notice that progress stopped.
+///
+/// The hang itself is recorded in
+/// `docs/known-issues/jit/vthread-probe-intermittent-hang-20260905.md`.
+const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(60);
 
 /// Memoize each probe run so all subtests targeting the same class share one
 /// VM spawn. Keyed by class name.
@@ -265,7 +291,7 @@ fn vthread_tiny_builder_start_join() {
 /// "Thread.sleep on a v-thread never resumes".
 #[test]
 fn vthread_probe_10000_all_increment() {
-    let (stdout, stderr) = match cached_run("VthreadProbe", Duration::from_secs(60)) {
+    let (stdout, stderr) = match cached_run("VthreadProbe", VTHREAD_PROBE_CAP) {
         Some(o) => o,
         None => return,
     };

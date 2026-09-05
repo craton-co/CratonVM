@@ -215,7 +215,7 @@ winning `arrive()` had been keeping there. One `getUnarrivedParties()` call
 corrupts the phaser for every subsequent `arrive()`.
 
 **Layer 2 — the `cfg` gate answered the wrong question.** The gate added by
-`gaps/gap-phaser-real-bytecode-state.md` was `#[cfg(feature = "synthetic-jdk")]`
+`gap-phaser-real-bytecode-state.md` was `#[cfg(feature = "synthetic-jdk")]`
 — a *build*-time predicate standing in for `config.use_synthetic_jdk`, a
 *runtime* one. In a `synthetic-jdk` **feature** build running real-JDK **mode**,
 `vm_init` takes the arm that skips `register_builtins` but still calls

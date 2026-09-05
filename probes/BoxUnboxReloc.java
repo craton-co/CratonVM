@@ -1,5 +1,5 @@
 // Targeted repro for the BOX_UNBOX intrinsic's SIGSEGV under a relocating
-// collector (fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md).
+// collector (zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md).
 //
 // The first version of this probe ran clean 3/3 and meant nothing:
 // `objects_relocated=0`, `compaction_cycles=0`. It allocated the boxed

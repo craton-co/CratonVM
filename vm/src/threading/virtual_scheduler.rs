@@ -3,7 +3,7 @@
 
 //! VESTIGIAL — this module has **no live callers** and bounds nothing.
 //! Do not wire it up. Scheduled for deletion; see
-//! `arch-2026-07-26/vt-resume-gc-fixup.md` §3.
+//! `vt-resume-gc-fixup.md` §3.
 //!
 //! It was an early sketch of JEP 444: a counting semaphore meant to bound how
 //! many virtual threads run at once. The bound was never real. The permits

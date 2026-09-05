@@ -129,7 +129,7 @@ three times over:
 
 | date | workload | shape |
 |---|---|---|
-| 2026-08-10 | `ZipContentTests` (Spring Boot) | OOM at `-Xmx 2g`, passes at 3g; Generational passes at 2g. Two defects under it, both fixed — see `fixed-suite-bugs/vm/zgc-oom-with-84-percent-of-the-heap-free-FIXED-20260810.md`. |
+| 2026-08-10 | `ZipContentTests` (Spring Boot) | OOM at `-Xmx 2g`, passes at 3g; Generational passes at 2g. Two defects under it, both fixed — see `zgc-oom-with-84-percent-of-the-heap-free-FIXED-20260810.md`. |
 | 2026-08-11 | Hibernate `sql.exec.SmokeTests` | OOM on a 65,552-byte `DFAState[8192]` with `free_list_bytes=1211993376 largest_free_block=65528` — short by 24 bytes. Fixed by raising the TLAB chunk 64 KiB -> 512 KiB. |
 | 2026-08-13 | Tomcat `TestNonBlockingAPI` | OOM on a 2,101,264-byte `char[]` with 1.99 GB free and `largest_free_block=524192`. **Same mechanism, one chunk size later.** |
 
@@ -180,7 +180,7 @@ what makes the maturity question hard to answer at all. As of this commit:
 |---|---|---|
 | "Why it is **default-off**" | `zgc-production-implementation-plan.md` | **Stale.** ZGC has been the default `GcAlgorithm` since 2026-08-10 (`vm/src/config.rs:769`). |
 | ZGC "has **no TLABs** (every allocation takes the arena lock)" | `gc-tuning.md` | **Stale.** The ZGC TLAB is default-ON (`CRATONVM_ZGC_TLAB`, `zgc_tlab_enabled_by_default`) and `alloc_raw_tlab` is the funnel for every object and array. |
-| "ZGC is **opt-in and experimental**" | `audits/gc-crate-audit.md` (internal) | **Stale** in the same way. |
+| "ZGC is **opt-in and experimental**" | `gc-crate-audit.md` (internal) | **Stale** in the same way. |
 | Spring Boot "1860 PASS vs Generational's 1902, 49 HANG vs 18" | `gc-tuning.md` | **Stale in ZGC's disfavour**, and the page says so: the numbers predate two ZGC-only fixes from 2026-08-10 and the suite has not been re-run under ZGC since. |
 
 A default collector documented as an opt-in experiment is a governance

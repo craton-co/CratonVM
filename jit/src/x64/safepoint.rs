@@ -71,7 +71,7 @@ pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
 /// `mapped_safepoint_pcs`, which turns `CompiledMethod::fully_oop_covered`
 /// false for the whole method, which the runtime reports as one
 /// `map_coverage=N` counter on the `[jitroots]` line. That aggregate is where
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran out of
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` ran out of
 /// road: it names the field, never the reason, and the six ways to get there
 /// want six different repairs.
 ///
@@ -709,7 +709,7 @@ impl Compiler {
     /// it false for **every method the fast tier ever compiled**, which through
     /// the OSR fallback refused relocation on 725 of 759 collections of
     /// `TestKillProcessWhileWriting` — the
-    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
     /// residual. Measured with `CRATONVM_DBG_OOPCOV=1`: every uncovered method
     /// reported exactly `shadow_missing_pcs=[4294967295]`.
     ///
@@ -1638,7 +1638,7 @@ impl Compiler {
         // the never-mapped operand-spill slots those runs report. Those are
         // staged invoke-arguments, which were never in this vocabulary to be
         // dropped from. See
-        // `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`. Every `continue`/failed-`if let` below is
+        // `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`. Every `continue`/failed-`if let` below is
         // a silent omission, and until this existed none of them reached
         // `fully_oop_covered`, which tests only that each safepoint produced AN
         // entry (`safepoint_pcs ⊆ mapped_safepoint_pcs`). A safepoint whose map

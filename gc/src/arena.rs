@@ -2432,7 +2432,7 @@ impl Arena {
 
     /// `vacated` is the third argument and the reason it exists is the whole
     /// of `Follow-up 2026-08-29` on
-    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`:
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`:
     /// **the space a slide empties is only reclaimed when the CURSOR can drop
     /// to it, and otherwise it was lost forever.**
     ///

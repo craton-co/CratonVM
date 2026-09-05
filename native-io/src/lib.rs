@@ -45,7 +45,7 @@
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::IoFlags`], parsed once at first use. This crate used to
 /// carry its own `env_flag_enabled` boolean parser, one of the five
-/// inconsistent truth tables catalogued in `audits/flag-census.md`; the
+/// inconsistent truth tables catalogued in `flag-census.md`; the
 /// parser now lives in `cratonvm_types::flags::parse::truthy_word` with its
 /// semantics unchanged.
 #[inline]
@@ -93,10 +93,15 @@ pub mod zip_real_jar;
 // WP3.3 + WP3.6 — real FileChannel.map (memmap2) + transferTo (sendfile/TransmitFile).
 pub mod file_channel;
 // `FileChannelImpl.read/write(ByteBuffer)` collapsed into one native call —
-// see `performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`.
+// see `filechannel-heap-read-glue-depth-FIXED-20260823.md`.
 pub mod file_channel_fast_read;
 // WP3.4 — non-blocking SocketChannel / ServerSocketChannel with EAGAIN semantics.
 pub mod socket_channel;
+// Per-call cost removal shared by the socket transfer and selector paths: the
+// reusable transfer buffer that replaces `vec![0u8; remaining]`, the
+// per-`ClassId` `ByteBuffer` layout cache that replaces `get_field_by_name`,
+// and the engagement census that says whether either engaged.
+pub mod socket_fast_io;
 // Real non-blocking TCP connect with a pollable OS fd (ES-HANG-02 residual 1).
 pub mod nb_connect;
 // AF_UNIX stream sockets backing `*.open(StandardProtocolFamily.UNIX)` — the
@@ -2382,8 +2387,7 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // bytecode call has cached this method's real-bytecode resolution) left
     // `this.fd == null`, and any subsequent `close()` NPE'd in
     // `FileDescriptor.closeAll` reading it (surfaced as Jasper's JDT
-    // compiler's `FileInputStream.close()` NPE — see fixed-suite-bugs/tomcat/
-    // jspdocumentparser-saxparse-malformed-markup-FIXED.md). Only
+    // compiler's `FileInputStream.close()` NPE — see jspdocumentparser-saxparse-malformed-markup-FIXED.md). Only
     // mirror into slot 0 when there is no real `FileDescriptor` object,
     // exactly mirroring `fis_set_fd`'s guard.
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
@@ -4027,7 +4031,7 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // runs real bytecode and can trigger a moving GC on every iteration
         // -- an unpinned `ObjectRef` goes stale and the eventual
         // `set_array_element` then writes through a dangling pointer (see
-        // fixed-suite-bugs/hibernate/hib-jpalargeblobtest-object-read-nosuchmethod.md).
+        // hib-jpalargeblobtest-object-read-nosuchmethod.md).
         let this_pin = ctx.pin_native_root(this);
         let buf_pin = ctx.pin_native_root(buf);
         let mut this = this;
@@ -14105,7 +14109,7 @@ fn dis_read_exact(
     // TestJspConfig/TestELInterpreterTagSetters/TestEnvEntry/
     // TestWsWebSocketContainerTimeoutClient hang residual left after the
     // native_dis_read_bytes/dis_read_fully_impl/native_dis_skip_bytes fixes
-    // (see fixed-suite-bugs/elinjsp-socket-read-timeout.md).
+    // (see elinjsp-socket-read-timeout.md).
     // Bulk-read instead, preserving the same zero-progress-guard fallback
     // `dis_read_one` had (a stream returning 0 for a non-empty request is a
     // contract violation but tolerated here via a scalar `read()` retry).
@@ -14235,8 +14239,7 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // overhead where real Java does one native syscall, which manifested
     // as an apparent permanent hang (confirmed NOT infinite — it just never
     // finished within a 300s budget) in the STW-takeover-cluster residual
-    // investigation (see fixed-suite-bugs/
-    // stw-crossthread-jit-takeover-hang-cluster.md and
+    // investigation (see stw-crossthread-jit-takeover-hang-cluster.md and
     // elinjsp-socket-read-timeout.md). `DataInputStream.read(byte[],int,int)`
     // in real JDK is a single delegating call to `in.read(b, off, len)` —
     // it does not prefetch or over-read, so making exactly one call here
@@ -14661,11 +14664,9 @@ fn eof_exception() -> MethodCallFailed {
 /// O(len) interpreter-dispatch round trips for what real Java does as a
 /// handful of native `read()` calls. Independently root-caused twice the
 /// same day from two different angles: the STW-takeover-cluster residual
-/// investigation (fixed-suite-bugs/
-/// stw-crossthread-jit-takeover-hang-cluster.md — compiled JSP class
+/// investigation (stw-crossthread-jit-takeover-hang-cluster.md — compiled JSP class
 /// files/JAR entries via Jasper's classloading path) and the jar-signature
-/// investigation (fixed-suite-bugs/
-/// inputstream-readallbytes-readnbytes-readfully-byte-at-a-time-FIXED.md —
+/// investigation (inputstream-readallbytes-readnbytes-readfully-byte-at-a-time-FIXED.md —
 /// Spring Boot loader's `JarEntriesStream.assertSameContent()`, once per
 /// up-to-4KB chunk per jar entry). Both turned a sub-millisecond real-JDK
 /// operation into minutes of VM overhead, confirmed NOT infinite — it just
@@ -14905,7 +14906,7 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // that seeding this field fixes the symptom). Seed it
     // here exactly like the real constructor does, so any current or
     // future not-natively-overridden method that depends on it works.
-    // See fixed-suite-bugs/h2-suite-bugs/bug-h2-dataoutputstream-writechars-data-loss-FIXED.md.
+    // See bug-h2-dataoutputstream-writechars-data-loss-FIXED.md.
     let write_buffer = ctx.new_array(ArrayElementType::Byte, 8);
     ctx.set_field_by_name(this, "writeBuffer", Value::Object(Some(write_buffer)));
     Ok(None)
@@ -18511,7 +18512,7 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // against for `buf`/`inner`. This is a real, independently-justified
         // fix (verified via 2 full WildFly domain-boot runs: no regression,
         // same subsequent behavior otherwise) — NOTE it was found while
-        // investigating `fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md`'s
+        // investigating `wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md`'s
         // WFLYHC0053 blocker, but is NOT that bug's root cause: the observed
         // byte value (152) that looked like corruption on first read is
         // actually the real WildFly wire protocol's own `CHUNK_START` marker
@@ -18996,7 +18997,7 @@ fn tb_static_object(
 /// Code-less abstract declaration and throws AbstractMethodError unless
 /// registered directly here — same shape as the `get`/`put`/`compact`
 /// registrations already in each loop below. See
-/// fixed-suite-bugs/elasticsearch-suite/ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode-FIXED.md.
+/// ES-FAIL-FAMILY-20260710-floatbuffer-abstract-receiver-nocode-FIXED.md.
 macro_rules! tb_abstract_view_fns {
     ($slice_fn:ident, $slice2_fn:ident, $dup_fn:ident, $ro_fn:ident, $order_fn:ident, $cls:literal, $elem:expr, $suffix:literal) => {
         /// `slice()` — F37-1 §2, landing F26-1 §9.1 for the typed families.

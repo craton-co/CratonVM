@@ -72,7 +72,7 @@
 >   `native-builtins/src/phases_early.rs:20556-20720`. Missing inferred source
 >   class/method — **closed in Compatible only**, commit `b7a8c37bf`,
 >   `stamp_inferred_caller` at `logmanager.rs:4168`; the strict half is its own
->   record, retired/jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md,
+>   record, jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md,
 >   and the strict half is FIXED by W7-56-infercaller-strict.md — NOT by the
 >   accessor retirement alone, but by a shadow CONSTRUCTOR that dropped
 >   `needToInferCaller`, so the real lazy getter never called `inferCaller()`.

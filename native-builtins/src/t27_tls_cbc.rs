@@ -2,7 +2,7 @@
 //! engine (`TLS_ECDHE_{RSA,ECDSA}_WITH_AES_{128,256}_CBC_SHA{256,384}`).
 //!
 //! rustls's `ring`/`aws-lc-rs` crypto providers never implement CBC-mode
-//! suites -- see `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`
+//! suites -- see `rustls-cbc-cipher-suites-not-supported.md`
 //! for why (rustls's maintainers consider hand-written CBC-then-MAC record
 //! processing too easy to get subtly wrong in a way that reintroduces a
 //! Lucky13-style timing side channel, so they simply don't ship it at all).
@@ -484,7 +484,7 @@ static TLS12_RSA_SCHEMES: &[SignatureScheme] = &[
 ];
 
 /// `TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256` -- the suite
-/// `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`
+/// `rustls-cbc-cipher-suites-not-supported.md`
 /// was filed against (`SslConnectorCustomizerTests`).
 pub static TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256: Tls12CipherSuite = Tls12CipherSuite {
     common: CipherSuiteCommon {

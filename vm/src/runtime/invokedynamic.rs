@@ -2737,7 +2737,7 @@ fn value_to_string(
                 // own `invokevirtual` handling does, so it silently resolves to
                 // `Object.toString()` here too (`java.nio.file.Path@<hash>`) for
                 // `"literal" + aPath` string concatenation. Same family as
-                // `fixed-suite-bugs/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+                // `path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
                 // a third, distinct call site. Route through the same
                 // display-string helper the registered `Path.toString()` native
                 // itself uses, bypassing `invoke_virtual` entirely for this type.

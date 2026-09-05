@@ -5,7 +5,7 @@
 //! must enumerate matches that live inside JAR classpath entries when
 //! the VM runs in real-JDK mode.
 //!
-//! Roadmap reference: `history/roadmap-any-java-app.md` §RSLF4J.1.
+//! Roadmap reference: `roadmap-any-java-app.md` §RSLF4J.1.
 //!
 //! Why this is a real-JDK-mode pin (not a `vm.invoke` Rust unit test):
 //!   * The bug is "the cl_get_resources native override is never
