@@ -431,6 +431,12 @@ pub(super) fn getfield_fast_keyed(
     cp_index: u16,
     ret_opcode: u8,
 ) -> bool {
+    // Phase boundaries for `CRATONVM_DBG_FIELD_PHASES=1`. `now()` returns 0 and
+    // `charge` is a no-op when the instrument is off, so an unarmed run pays one
+    // predicted branch per boundary. See `field_phases` for what it can and
+    // cannot claim, and for the four refuted hypotheses that made it necessary.
+    use crate::runtime::interpreter::field_phases as ph;
+    let t_entry = ph::now();
     if crate::runtime::jvmti::any_field_watchpoint_active() {
         return false;
     }
@@ -440,6 +446,8 @@ pub(super) fn getfield_fast_keyed(
     let Some(ptr) = stack.peek_compact().as_object_ptr() else {
         return false;
     };
+    let t_gates = ph::now();
+    ph::charge(ph::P_GATES, t_entry, t_gates);
     let site = match sites.get(class_id, cp_index) {
         Some(s) => *s,
         None => {
@@ -447,12 +455,16 @@ pub(super) fn getfield_fast_keyed(
             return false;
         }
     };
+    let t_site = ph::now();
+    ph::charge(ph::P_SITE, t_gates, t_site);
     if ret_opcode != 0 && !return_opcode_agrees(&site, ret_opcode) {
         return false;
     }
     let Some(fp) = field_ptr_for(zgc, ptr, &site) else {
         return false;
     };
+    let t_ptr = ph::now();
+    ph::charge(ph::P_PTR, t_site, t_ptr);
     let Some(storage) = site.storage else {
         return getfield_legacy(shared, stack, fp, &site);
     };
@@ -524,6 +536,12 @@ pub(super) fn getfield_fast_keyed(
     };
     stack.pop_compact();
     stack.push_compact(pushed);
+    ph::charge(ph::P_READ, t_ptr, ph::now());
+    // CALIB last, so it measures two reads under the conditions the phases
+    // above actually ran in rather than at a cold cache.
+    let c0 = ph::now();
+    ph::charge(ph::P_CALIB, c0, ph::now());
+    ph::count_access();
     site_stats::bump(site_stats::FAST_GET_HIT);
     true
 }
