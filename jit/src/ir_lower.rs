@@ -11563,8 +11563,8 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// a register nothing can hand out.
 /// Reserve the 256-byte [`crate::deopt::SavedRegisters`] region in this
 /// backend's frame, spill the register file into it at the deopt stub, and let
-/// a deopt frame NAME a register -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_DEOPT_REGS=1`.
+/// a deopt frame NAME a register -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_DEOPT_REGS=0` is the kill switch.
 ///
 /// Off is the historical arrangement, whose contract `ir_deopt_entry` states:
 /// "the IR lowerer keeps every live value in a frame slot, so no register file
@@ -11572,22 +11572,23 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// and therefore what stops a register-resident value from ever losing it --
 /// see `plan_register_residency`'s `blocked_deopt` census.
 /// Drop the home-word store for a loop-carried value that a deopt frame can
-/// name in its register -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_DROP_PHI_HOME=1`.
+/// name in its register -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_DROP_PHI_HOME=0` is the kill switch.
 ///
 /// This is the payoff the register image exists for, and it is a CONJUNCTION:
 /// see [`Lowerer::phi_home_droppable`], which will not drop a home unless every
 /// reader of that home has somewhere else to read from.
 fn ir_drop_phi_home_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_PHI_HOME") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 /// Publish a resident value into its register AT ITS DEFINITION, out of RAX,
 /// instead of reloading the home word this backend just wrote -- **default
-/// OFF**, opt in with `CRATONVM_JIT_IR_PUBLISH_AT_DEF=1`.
+/// ON** since 2026-09-05; `CRATONVM_JIT_IR_PUBLISH_AT_DEF=0` is the kill switch.
 ///
 /// The generic publish at the end of `lower_data_node` is a LOAD of the word
 /// the arm above it stored, and its own comment has said since it landed that
@@ -11601,14 +11602,15 @@ fn ir_drop_phi_home_enabled() -> bool {
 /// It is also the precondition for dropping the store: with the publish reading
 /// the home, a home that is never written cannot be published from.
 fn ir_publish_at_def_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PUBLISH_AT_DEF") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
-/// Extend the dropped home from phis to ORDINARY VALUES -- **default OFF**, opt
-/// in with `CRATONVM_JIT_IR_DROP_HOME=1`.
+/// Extend the dropped home from phis to ORDINARY VALUES -- **default ON** since
+/// 2026-09-05; `CRATONVM_JIT_IR_DROP_HOME=0` is the kill switch.
 ///
 /// `CRATONVM_JIT_IR_DROP_PHI_HOME` removes one frame store, at the one site
 /// (`emit_copy_op`) where this backend knew both that RAX held the value and
@@ -11619,9 +11621,10 @@ fn ir_publish_at_def_enabled() -> bool {
 /// `Lowerer::cur_def` the second, the same conjunction can be asked of any
 /// value: see [`Lowerer::value_home_droppable`].
 fn ir_drop_home_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_HOME") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11649,8 +11652,8 @@ fn ir_drop_home_enabled() -> bool {
 /// compile when a value whose home was dropped reaches the end of its own
 /// lowering unpublished.
 /// Let a SINGLE-USE intermediate reach its one consumer in a register instead
-/// of through its home word -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_CARRY_SINGLE_USE=1`.
+/// of through its home word -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_CARRY_SINGLE_USE=0` is the kill switch.
 ///
 /// The residency work removed the frame traffic it could and then measured what
 /// was left: the loop's remaining `[rbp-...]` operations are pairs of the shape
@@ -11683,9 +11686,10 @@ fn ir_drop_home_enabled() -> bool {
 /// Every one of those frame states is unreachable, and they still pin every
 /// intermediate to memory.
 fn ir_carry_single_use_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_SINGLE_USE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11709,8 +11713,8 @@ fn ir_carry_single_use_enabled() -> bool {
 /// and `Op::Call` are absent because they read their operands in another order
 /// or through another path.
 /// Fold a constant second operand into the ALU instruction instead of
-/// materialising it into RCX first -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_ALU_IMM=1`.
+/// materialising it into RCX first -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_ALU_IMM=0` is the kill switch.
 ///
 /// Every binary arithmetic arm in this file reads its second operand through
 /// `gp_load_value(RCX, ..)` and then works register-to-register. When that
@@ -11734,9 +11738,10 @@ fn ir_carry_single_use_enabled() -> bool {
 /// is what `op_reads_rax_then_rcx` and the carry's RAX contract rest on, and
 /// buying a few more folds is not worth making that conditional.
 fn ir_alu_imm_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ALU_IMM") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11786,7 +11791,8 @@ fn op_home_is_one_store_rax(op: &Op) -> bool {
 }
 
 /// Emit an OSR entry stub for every bci this body can safely be entered at --
-/// **default OFF**, opt in with `CRATONVM_JIT_IR_OSR_ENTRY=1`.
+/// **default ON** since 2026-09-05; `CRATONVM_JIT_IR_OSR_ENTRY=0` is the kill
+/// switch.
 ///
 /// Nothing in the VM calls these yet: `compile_osr_artifact` reaches
 /// `x64::compile_with_param_slots` directly and knows nothing about this tier.
@@ -11801,9 +11807,10 @@ fn ir_osr_entry_enabled() -> bool {
             return forced;
         }
     }
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_OSR_ENTRY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11843,7 +11850,13 @@ fn ir_deopt_regs_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_DEOPT_REGS").is_some()
+        // 2026-09-05: DEFAULT ON. `=0` is the kill switch — which is why
+        // this reads the VALUE now rather than only asking whether the
+        // variable is present.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DEOPT_REGS").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -12598,8 +12611,8 @@ fn ir_residency_loop_weight_enabled() -> bool {
 /// Off is exactly the previous emission: the parameter reaches every use
 /// through its frame slot.
 /// Give every LOOP-CARRIED value a register of its own before the transients
-/// compete for one -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_RESERVE_CARRIED=1`.
+/// compete for one -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_RESERVE_CARRIED=0` is the kill switch.
 ///
 /// The census said the residency file accepts ONE of the nineteen values the
 /// scan promotes on a loop kernel, and that two of the four loop-carried values
@@ -12613,7 +12626,13 @@ fn ir_reserve_carried_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_RESERVE_CARRIED").is_some()
+        // 2026-09-05: DEFAULT ON. `=0` is the kill switch — which is why
+        // this reads the VALUE now rather than only asking whether the
+        // variable is present.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESERVE_CARRIED").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -14916,26 +14935,30 @@ pub(crate) fn lower_inner_with_scopes(
 /// as they were before 2026-09-02 and the residency census reports them
 /// under `phi=`.
 /// A definition whose value is already live in its register is not published
-/// again -- **default OFF**, opt in with `CRATONVM_JIT_IR_SKIP_REPUBLISH=1`.
+/// again -- **default ON** since 2026-09-05; `CRATONVM_JIT_IR_SKIP_REPUBLISH=0`
+/// is the kill switch.
 ///
 /// Off is the historical unconditional reload of the home word at every
 /// definition site, phis included.
 fn ir_skip_live_republish_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SKIP_REPUBLISH") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 /// An edge's phi copies move register to register where both ends are
-/// resident -- **default OFF**, opt in with `CRATONVM_JIT_IR_PHI_COPY_REGS=1`.
+/// resident -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_PHI_COPY_REGS=0` is the kill switch.
 ///
 /// Off is the historical memory-to-memory copy through RAX followed by a
 /// reload of the word just written.
 fn ir_phi_copy_regs_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_REGS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
