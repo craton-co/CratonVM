@@ -348,12 +348,69 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             continue;
         };
 
-        // Plain, annotation-free verdict — see "Known limitations" for
-        // why hint-loosened kernels are intentionally not covered.
-        let jit_cuda::OffloadVerdict::Eligible(sig) =
-            jit_cuda::analyzer::analyze(target_method)
-        else {
-            continue;
+        // Annotation-free, but CONSTANT-POOL-AWARE — see "Known
+        // limitations" for why hint-loosened kernels are still not
+        // covered.
+        //
+        // The pool is not optional here. `analyze` has no constant pool,
+        // so it rejects EVERY `ldc`/`ldc_w`/`ldc2_w` with
+        // `Reason::LoadConstant` whatever it targets, while the
+        // dispatcher this gate exists to PREDICT calls
+        // `analyze_with_annotations_and_pool` and admits a numeric
+        // literal. Until 2026-09-05 the gate used the pool-free entry
+        // point, so any kernel whose body needed a constant-pool
+        // constant was judged ineligible, never registered with
+        // `offload_hook`, and its compiled call sites bound directly and
+        // went dark.
+        //
+        // That read as "the compiled caller drops long[] and double[]",
+        // because a `long`/`double` literal has no small-immediate form
+        // — `3L` and `3.0` are `ldc2_w` while `3` is `bipush` — so the
+        // 64-bit kernels were simply the ones that always tripped it.
+        // The element width was never the variable: an `int[]` kernel
+        // using a constant above `sipush` range goes dark too, and a
+        // `long[]` kernel using only `lconst_1` offloads normally. Both
+        // measured — see
+        // docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md.
+        let sig = match jit_cuda::analyzer::analyze_with_pool(
+            target_method,
+            &target_class.constant_pool,
+        ) {
+            jit_cuda::OffloadVerdict::Eligible(sig) => sig,
+            // Counted, and named. This refusal used to be a bare
+            // `continue`: the two counters below it exist because a
+            // narrowing that shows up only as an ABSENCE cannot be told
+            // from one that never fired, and this one had no counter at
+            // all. That is how the pool-free `analyze` above went
+            // unnoticed — a run whose kernels had all silently stopped
+            // registering printed a census identical to a healthy one.
+            jit_cuda::OffloadVerdict::Rejected(reason) => {
+                // Split, because a census that folds "never a candidate"
+                // into "refused" is one nobody reads: one run of
+                // `GpuIntensitySweep` walks past ~170 signature-refused
+                // JDK targets, and naming those would bury the handful
+                // that matter.
+                use jit_cuda::analyzer::Reason;
+                let never_a_candidate = matches!(
+                    reason,
+                    Reason::NonStatic
+                        | Reason::Synchronized
+                        | Reason::NativeOrAbstract
+                        | Reason::NoCode
+                        | Reason::BadDescriptor
+                        | Reason::UnsupportedParamType
+                        | Reason::UnsupportedReturnType
+                        | Reason::GpuExcluded
+                );
+                if never_a_candidate {
+                    cratonvm_types::gpu_jit_gate_census::note_target_never_candidate();
+                } else {
+                    cratonvm_types::gpu_jit_gate_census::note_target_body_refused(format!(
+                        "{target_class_name}.{target_method_name}{target_descriptor} — {reason:?}"
+                    ));
+                }
+                continue;
+            }
         };
 
         // ...and then the DISPATCHER's own gates. `Eligible` answers
