@@ -74,7 +74,7 @@ before. All three bench scenarios beat the default:
 | `hook` | 13.2 | 358.5 | 79983.0 |
 | no `--gpu` | 15.4 | 28.5 | 2030.7 |
 
-## Why it is not the default
+## Why it is not the default — and it is not this feature's fault
 
 `bench-gpu/runtime-stress.sh`:
 
@@ -82,43 +82,44 @@ before. All three bench scenarios beat the default:
 FAIL cache_coherence: control=-6705490297358015087 gpu=-8633255346386885231
 ```
 
-Every other scenario passes, and the same suite passes on every other
-arm. What `cacheCoherence` does that the others do not is host-write its
-input array **inline, in the same method** as the `scale(in, out)` call
-— so under `hook` that one method both writes a primitive array from
-compiled code and offloads from compiled code.
+**The first reading of this was wrong and is worth keeping visible.** It
+was recorded as "the compiled-tier array barrier's deferred dirty mark
+does not compose with a compiled-tier offload", on two arms:
+`CRATONVM_GPU_JIT_ARRAY_WRITERS=refuse` passed, and
+`CRATONVM_GPU_MIN_WORK_GIVEUP=0` still failed. Both of those are true
+and both are consistent with a completely different cause, because both
+of them also stop the method being COMPILED.
 
-Two switches localise it, and neither is the retirement policy:
+Three more arms settled it:
 
 | arm | `cache_coherence` |
 |---|---|
-| `hook` | **FAIL** |
-| `hook` + `CRATONVM_GPU_JIT_ARRAY_WRITERS=refuse` | PASS |
-| `hook` + `CRATONVM_GPU_MIN_WORK_GIVEUP=0` | FAIL |
-| `block` (default) | PASS |
+| `hook` | WRONG |
+| `hook` + `ARRAY_WRITERS=allow` (residency cache **off**) | WRONG |
+| `hook` + `--gpu-min-work 999999` (**nothing offloads**) | WRONG |
+| **`cratonvm`, no `--gpu` at all, JIT on** | **WRONG** |
+| `cratonvm --nojit` | right |
+| `cratonvm CRATONVM_JIT_OSR=0` | right |
 
-`ARRAY_WRITERS=refuse` keeps array writers interpreted, so their stores
-call `input_cache::invalidate` directly instead of going through the
-compiled-tier barrier's deferred dirty mark. That it passes says the
-fault is in how the barrier's deferral composes with an offload issued
-from the same compiled method — not in the argument decode, not in the
-door closing, and not in the give-up policy.
+With the cache disabled the answer is still wrong, so nothing is going
+stale. With offload disabled entirely it is still wrong, so no kernel is
+involved. With no `--gpu` at all it is still wrong, so neither is this
+feature.
 
-That is a hypothesis with two supporting arms, not a diagnosis. The
-barrier itself is sound in isolation: `jit-writer-stale.sh` fires it
-5,497 times against a live cache with checksums bit-identical to
-HotSpot.
+`GpuRuntimeStress.cacheCoherence` is **miscompiled by OSR**.
+`CRATONVM_JIT_DENY` on that one method fixes it; denying `scale`, `sum`
+or `mix` does not. See
+`docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
 
-## Where to start
+### What this gate was doing
 
-The drain runs at the top of every `input_cache` getter and at the top
-of `remap_and_sweep`. The compiled offload path reaches the getters
-through `dispatch_method_sync`, the same as the interpreted one, so the
-ordering *looks* right — which is exactly why this needs a trace of
-mark-vs-drain-vs-marshal on one `cacheCoherence` round rather than more
-reading.
+Hiding that defect. All three of `runtime-stress.sh`'s arms avoid
+compiling the method — HotSpot, `--nojit`, and `--gpu`, where
+`offload_jit_gate` refuses it for both of its reasons at once. This mode
+is the first thing that ever compiled it.
 
-`n=65536`, 12 rounds, and the divergence is stable run to run, so a
-per-round dump of `(dirty buckets, filter word, whether the marshal hit
-the cache)` will name the round where the device copy stops matching the
-heap.
+So it stays opt-in, for a reason that is about the OSR defect and not
+about the hook: turning it on would expose that miscompilation to every
+`--gpu` run. Once the OSR bug is fixed this should become the default —
+the 27-42x is real, and nothing in this feature is implicated in the
+wrong answer.
