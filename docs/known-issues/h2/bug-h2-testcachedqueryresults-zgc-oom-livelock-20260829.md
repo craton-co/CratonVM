@@ -23,9 +23,12 @@ Against this page's opening state: `98304` with **1497** ref-array
 2. **The SIGSEGV** that discharge exposed is a separate, older collector bug and
    has nothing to do with JIT roots: `relocate_stw`'s slide writes into a
    granule the arena DECOMMITTED, because the destination search screens by page
-   and liveness and never by commit state. `Arena::ensure_committed_span` fixes
-   it. Full evidence on
-   `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+   and liveness and never by commit state. `Arena::commit_for_relocation`
+   fixes it (dev's name for what this branch called
+   `ensure_committed_span`). Full evidence on the retired
+   `bug-box-unbox-intrinsic-segv-under-relocation-20260902` write-up and the
+   `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904`
+   record it points at.
 
 The credit never corrupted anything. It raises compaction, compaction runs
 slides, and slides are what land in a decommitted granule -- which is why the

@@ -1753,23 +1753,32 @@ impl Compiler {
                 // naming none of its live reference locals.
                 //
                 // That is the same asymmetry `LOCAL_MASK_UNSUPPORTED` was
-                // fixed for -- "one half of the machinery knew and the half
-                // that publishes the claim did not" -- and it is the unnamed
-                // root of `bug-box-unbox-intrinsic-segv-under-relocation-
-                // 20260902`: relocation rewrites the slots the map names, the
-                // unnamed live locals keep pointing into the vacated page, and
-                // reading one is the page-aligned SIGSEGV.
+                // fixed for: one half of the machinery knew and the half that
+                // publishes the claim did not. A safepoint that ships
+                // `fully_oop_covered` while naming none of its live reference
+                // locals is a use-after-free the moment relocation trusts it.
+                //
+                // NOT the root of `bug-box-unbox-intrinsic-segv-under-
+                // relocation-20260902`, which is what this comment claimed
+                // until 2026-09-05. That crash was a WRITE by `relocate_stw`'s
+                // own `ptr::copy` into a decommitted arena granule, fixed by
+                // `Arena::commit_for_relocation`; failing closed here was
+                // measured against it at 3 of 4, i.e. no effect. The hole is
+                // real on its own evidence and is fixed on its own merits.
                 //
                 // The counter reads ZERO on `probes/SafepointMapResidue.java`,
                 // which is why this was filed as a ruled-out hypothesis. It was
                 // ruled out on the wrong workload.
                 //
-                // Behind a flag because it is a REFUSAL: each such safepoint
-                // now diverts its cycle to the non-moving sweep. That is
-                // per-safepoint rather than the blanket
-                // `CRATONVM_ZGC_JIT_BLANKET_REFUSAL`, which costs ~9700
-                // fragmentation OOMs on this class, so the cost should be far
-                // smaller -- but it is a cost, and it is measured, not assumed.
+                // It is a REFUSAL -- each such safepoint diverts its cycle to
+                // the non-moving sweep -- so it was opt-in until the cost was
+                // measured rather than assumed. Measured 2026-09-05 on
+                // `TestCachedQueryResults`: ZERO fragmentation OOM in either
+                // arm, and no throughput difference (concurrent-pair ratios
+                // 0.97/0.99/1.00/1.00). Per-safepoint, not the blanket
+                // `CRATONVM_ZGC_JIT_BLANKET_REFUSAL`, which costs ~9700 OOMs on
+                // this class and never completes. Default ON on that evidence;
+                // `=0` restores the old claim.
                 if crate::x64::licm::local_mask_unreached_fail_closed_enabled() {
                     map_incomplete = true;
                 }

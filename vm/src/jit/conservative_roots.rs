@@ -6234,9 +6234,17 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
 /// crash it answers `verifier_oop=0` for all 2.8 M candidates -- it cannot see
 /// the root. This asks "did we move the object this word points at and leave
 /// the word pointing at the old address", which is the defect itself: a stale
-/// reference in a live compiled frame is exactly what
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` concluded the fault
-/// is, and what its page-aligned faulting `rdi` looks like.
+/// reference in a live compiled frame is a use-after-free in its own right.
+///
+/// It was built for the SIGSEGV of the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`, on that page's
+/// conclusion that the fault was such a reference being read. That conclusion
+/// was RETRACTED on 2026-09-04: the fault was a WRITE, by `relocate_stw`'s own
+/// `ptr::copy`, into an arena granule the give-back had decommitted -- see
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904`.
+/// This detector is kept because what it FOUND is real and independent of that
+/// crash (see `remap_unmapped_frame_dupes_enabled`), not because the crash is
+/// still open.
 ///
 /// A hit is only a candidate, not proof: a DEAD copy of a moved pointer left in
 /// a spill slot is stale and harmless. What makes it actionable is the slot
@@ -6439,9 +6447,15 @@ fn remap_one_jit_frame(
 /// oop map names only the canonical home. `TestCachedQueryResults.queryCounter`
 /// held one object at four slots -- a GPR safepoint spill, an operand spill and
 /// two below the locals boundary -- and the remap rewrote one. The rest keep
-/// pointing into the vacated page, which is the page-aligned SIGSEGV of
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`. Confirmed at
-/// scale: `duplicate_of_mapped=47946355`.
+/// pointing at the old address. Confirmed at scale:
+/// `duplicate_of_mapped=47946355`.
+///
+/// That is a use-after-free waiting to be read, and it is NOT the SIGSEGV it
+/// was found while hunting: the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` turned out to be a
+/// decommitted-granule WRITE inside `relocate_stw` itself. Its own numbers
+/// said so before the retraction did -- rewriting these duplicates left the
+/// crash at 3 of 4. Real, enormous, and a different defect.
 ///
 /// PINNING those objects was tried first and does not work: pins only withhold
 /// PAGES in the low compaction region (`relocate_stw`'s
@@ -8212,8 +8226,11 @@ fn scan_compiled_frame_bands(
 /// spill, an operand spill and two below the locals boundary all held
 /// `0x1fef6b70878` -- while the map names only the canonical home. Relocation
 /// rewrites that home and every duplicate keeps pointing at the vacated page.
-/// Reading one is the page-aligned SIGSEGV of
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`.
+/// Reading one is a use-after-free. It is not, as this comment said until
+/// 2026-09-05, the SIGSEGV of the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`: that one was a
+/// WRITE by the slide's own `ptr::copy` into a decommitted granule, and
+/// rewriting these duplicates did not move it.
 ///
 /// Map SELECTION is not the problem and was ruled out first: `NO_MAP_FOR_SP_ID`
 /// and `NO_SP_ID_SLOT` are both zero on that workload, and dev's

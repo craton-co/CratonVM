@@ -671,9 +671,15 @@ pub(super) fn stw_take_over_and_wait(
         // cursor into a `char[]` or `byte[]`) and its extent test is `addr <
         // end`, so a ONE-PAST-THE-END cursor resolves to no base at all.
         // Either leaves an object nothing pins, and relocation then moves it
-        // out from under the register naming it -- the page-ALIGNED SIGSEGV of
-        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902`, page-
-        // aligned because `compact_low_to` zeroes the span it vacates.
+        // out from under the register naming it -- a use-after-free.
+        //
+        // This comment used to call that the page-ALIGNED SIGSEGV of
+        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` and explain
+        // the alignment as `compact_low_to` zeroing the span it vacates. Both
+        // halves were wrong: the address was page-aligned because it was the
+        // BASE of a decommitted 2 MiB arena granule
+        // (`offset_into_span` 0x0 in every crash) and the access was the
+        // slide's own WRITE, not a read. The hazard below stands on its own.
         //
         // `resolve_interior_for_pin` accepts both. Over-approximating is the
         // SAFE direction here and the asymmetry is stark: a false positive
@@ -756,12 +762,18 @@ pub(super) fn stw_take_over_and_wait(
             // `unrewritable_peer_state` exists for one hazard, stated in its own
             // doc and in the comment above: "a frozen peer's registers can hold
             // only a derived/interior pointer whose base would otherwise be
-            // evacuated from under it, then zeroed and re-served". That is the
-            // crash signature of
+            // evacuated from under it, then zeroed and re-served". That
+            // hazard is real on its own terms.
+            //
+            // It was read as the crash signature of
             // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` exactly
-            // -- a page-ALIGNED fault address, because `compact_low_to` zeroes
-            // the vacated span on purpose, so the reader lands on a valid
-            // all-zero header rather than on a wild pointer.
+            // -- a page-ALIGNED fault address, explained as `compact_low_to`
+            // zeroing the vacated span so the reader lands on an all-zero
+            // header. That page RETRACTED the reading on 2026-09-04: the
+            // address was the BASE of a decommitted 2 MiB arena granule and
+            // the access was a WRITE by `relocate_stw` itself. A page-aligned
+            // fault address is not a signature -- two different mechanisms
+            // produce one.
             //
             // The discharge's argument -- an interior-resolving probe pins the
             // BASE, so a derived pointer is covered -- is an argument about the

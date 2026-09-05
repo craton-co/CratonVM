@@ -1380,7 +1380,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_LICM` | JIT | `CRATONVM_JIT=licm` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LOCAL_HANDLERS` | JIT | `CRATONVM_JIT=local-handlers` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` | JIT | `CRATONVM_JIT=local-mask-fail-closed` | default-on | on | behaviour | snapshot | jit |
-| `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` | JIT | `CRATONVM_JIT=local-mask-unreached-fail-closed` | opt-in | off | behaviour | snapshot | jit |
+| `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` | JIT | `CRATONVM_JIT=local-mask-unreached-fail-closed` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LOCAL_REGS` | JIT | `CRATONVM_JIT=local-regs` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LONG_BOX_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=long-box-direct-helpers` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_LOOP_WORK_TIERUP` | JIT | `CRATONVM_JIT=loop-work-tierup` | opt-in | off | behaviour | snapshot | vm |
