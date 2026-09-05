@@ -524,6 +524,47 @@ pub fn connect_str_normalized(target: &str) -> std::io::Result<std::net::TcpStre
 /// every candidate. The first `Ok` wins; the last error is returned
 /// otherwise.
 pub fn policy_connect(target: &str) -> Result<std::net::TcpStream, PolicyConnectError> {
+    policy_connect_with(target, None)
+}
+
+/// [`policy_connect`], but dialling an address the CALLER already resolved.
+///
+/// # Why this exists
+///
+/// `SocketChannel.connect(new InetSocketAddress(addr, port))` hands us a
+/// destination that is *already resolved* — `InetSocketAddress` holds an
+/// `InetAddress`. CratonVM used to throw that away: `decode_socket_address`
+/// reads the target with `getHostString()`, which yields the HOSTNAME whenever
+/// one is attached, so every dial re-entered `to_socket_addrs` and ran a fresh
+/// `getaddrinfo`. HotSpot performs no such lookup.
+///
+/// That cost a DNS round trip per connection on the VM's busiest connect path,
+/// and on Windows it also HUNG: the resolver stops returning after a few dozen
+/// rapid `localhost` lookups, and because the block is inside resolution rather
+/// than the dial, [`connect_timeout`]'s finite cap never applies. See
+/// `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+///
+/// # What is preserved, and why it is not just a literal substitution
+///
+/// The obvious fix — hand the literal IP to `policy_connect` instead of the
+/// name — would be a **security regression**. `check_outbound` is called on the
+/// target FIRST precisely so a name-based policy can refuse by name; the worked
+/// example in this module is `metadata.google.internal`. Substituting the
+/// literal at the call site would leave that policy never seeing the name.
+///
+/// So the NAME is still vetted here exactly as before, and only the RESOLUTION
+/// step is skipped. The per-address re-check below still runs against the
+/// pre-resolved address, so an embedder's policy gets both halves.
+///
+/// Skipping the re-resolution is also a small SSRF improvement in its own
+/// right: resolving a second time is a genuine TOCTOU between the address the
+/// caller vetted and the one we dial, which is the DNS-rebind window this
+/// module's own comments describe.
+pub fn policy_connect_with(
+    target: &str,
+    preresolved: Option<SocketAddr>,
+) -> Result<std::net::TcpStream, PolicyConnectError> {
+    // The NAME policy, unchanged and still first.
     check_outbound(target).map_err(PolicyConnectError::Denied)?;
 
     // Resolution: do it ourselves so we have a `SocketAddr` to feed to
@@ -531,11 +572,14 @@ pub fn policy_connect(target: &str) -> Result<std::net::TcpStream, PolicyConnect
     // `to_socket_addrs` short-circuits without DNS lookup.
     // Normalise BEFORE the per-address policy re-check below, so the address
     // that gets vetted is the one that actually gets dialled.
-    let addrs: Vec<SocketAddr> = target
-        .to_socket_addrs()
-        .map_err(PolicyConnectError::Io)?
-        .map(normalize_connect_addr)
-        .collect();
+    let addrs: Vec<SocketAddr> = match preresolved {
+        Some(addr) => vec![normalize_connect_addr(addr)],
+        None => target
+            .to_socket_addrs()
+            .map_err(PolicyConnectError::Io)?
+            .map(normalize_connect_addr)
+            .collect(),
+    };
 
     if addrs.is_empty() {
         return Err(PolicyConnectError::Io(std::io::Error::new(

@@ -462,6 +462,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "fc-fast-io-stats", on_key: Some("CRATONVM_FC_FAST_IO_STATS"), off_key: None, off_word: None, since: "2026-08-23" },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None, since: "2026-07-10" },
+    // The socket transfer / selector engagement census
+    // (`native-io::socket_fast_io::stats`). Diagnostic only: it prints counters
+    // at exit and changes nothing a program can observe.
+    E { group: Group::DBG, token: "sc-io-stats", on_key: Some("CRATONVM_SC_IO_STATS"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None, since: "2026-07-23" },
     E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "force-moving", on_key: Some("CRATONVM_DBG_FORCE_MOVING"), off_key: None, off_word: None, since: "2026-06-03" },
@@ -1240,6 +1244,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-carry-single-use", on_key: Some("CRATONVM_JIT_IR_CARRY_SINGLE_USE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-sink-late", on_key: Some("CRATONVM_JIT_IR_SINK_LATE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-alu-imm", on_key: Some("CRATONVM_JIT_IR_ALU_IMM"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "merged-call-sentinel", on_key: Some("CRATONVM_JIT_MERGED_CALL_SENTINEL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
@@ -1710,6 +1715,35 @@ pub const INVENTORY: &[E] = &[
     // opt-out-only, same shape as `vector-intrinsics` above: the switch gates
     // REGISTRATION so the off arm is the un-intercepted VM.
     E { group: Group::JIT, token: "fc-fast-io", on_key: Some("CRATONVM_FC_FAST_IO"), off_key: None, off_word: Some("0"), since: "2026-08-23" },
+    // The socket path's per-call cost removals, each separately switchable so
+    // its A/B is one binary and one variable. All default-ON and opt-out-only,
+    // the same shape as `fc-fast-io` above.
+    //
+    // `sc-scratch`      — reuse the thread's transfer buffer instead of
+    //                     allocating and zeroing one sized to the destination's
+    //                     remaining capacity on every call.
+    // `sc-bb-slots`     — memoize `ByteBuffer` field slots per (VM, class)
+    //                     instead of resolving them by name on every transfer.
+    // `sel-ready-cache` — mirror a selector's readiness into the process-global
+    //                     side table only when it CHANGED, not every key every
+    //                     tick.
+    // `sel-fast-keys`   — append ready keys straight into netty's own key set
+    //                     instead of re-entering the interpreter once per key.
+    //
+    // The last two are separate tokens rather than one: they are independent
+    // cuts to the same function, and `sel-ready-cache`'s failure mode (a latched
+    // cache suppressing a real readiness change) is silent, so an A/B that could
+    // only turn both off together could not attribute it.
+    E { group: Group::JIT, token: "sc-scratch", on_key: Some("CRATONVM_SC_SCRATCH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sc-bb-slots", on_key: Some("CRATONVM_SC_BB_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sel-ready-cache", on_key: Some("CRATONVM_SEL_READY_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sel-fast-keys", on_key: Some("CRATONVM_SEL_FAST_KEYS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    // `sc-preresolved` — dial the address an `InetSocketAddress` ALREADY holds
+    // instead of re-resolving its hostname on every connect. Default-ON and
+    // opt-out-only; `=0` restores the per-dial `getaddrinfo`, which is the
+    // "off" arm for
+    // `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+    E { group: Group::JIT, token: "sc-preresolved", on_key: Some("CRATONVM_SC_PRERESOLVED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-07-27" },
