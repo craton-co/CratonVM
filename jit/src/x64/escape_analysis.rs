@@ -1867,6 +1867,43 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
                 modified |= 1u64 << (code[pc + 1] as usize).min(63);
                 pc += 3;
             }
+            // wide — the prefix this scan had no arm for at all.
+            //
+            // AUDIT 2026-09-05, and it was WRONG CODE. Every arm above
+            // names a narrow-form store; `wide` re-encodes the same
+            // stores with a `u16` local index, and `wide iinc` with a
+            // `u16` index AND an `i16` delta. Without an arm they fell to
+            // the length-only default below: the walk stayed aligned, so
+            // nothing looked broken, and the local was never marked
+            // modified.
+            //
+            // javac reaches for `wide iinc` whenever the delta does not
+            // fit in a signed byte. `for (i = 0; i < n; i += 1024)` is
+            // exactly that, so its induction variable read as
+            // LOOP-INVARIANT to every consumer of this bitmask --
+            // including `find_arith_loop_hoists`, which then hoisted
+            // `i + r` into the pre-header and left every iteration
+            // replaying the first one's value. Stride 1 was correct and
+            // stride 1024 was not, which is what made it look like an
+            // addressing bug rather than an invariance one. See
+            // `test_classes/jit/OsrStridedValueMin.java` and
+            // `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+            //
+            // Over-marking is the safe direction here: this bitmask only
+            // ever DISABLES a hoist, so a wide form that turns out not to
+            // write a local costs a missed optimisation, never a wrong
+            // answer.
+            0xc4 if pc + 3 < end && pc + 3 < code.len() => {
+                let widened = code[pc + 1];
+                // `wide` operand layout: [c4][op][idx:u16] and, for iinc
+                // only, a further [const:i16].
+                let idx = u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize;
+                // istore/lstore/fstore/dstore/astore, and iinc.
+                if widened == 0x84 || (0x36..=0x3a).contains(&widened) {
+                    modified |= 1u64 << idx.min(63);
+                }
+                pc += if widened == 0x84 { 6 } else { 4 };
+            }
             // Other: advance by instruction length
             _ => pc += bytecode_len_at(code, pc),
         }
