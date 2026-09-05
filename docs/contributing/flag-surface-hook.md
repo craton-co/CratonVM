@@ -38,9 +38,11 @@ cargo test -q -p cratonvm-types \
   --test flag_declaration_guard \
   --test flag_docs_generated \
   --test flag_surface
+cargo test -q -p cratonvm-types --lib flag_groups
 ```
 
-Warm, about **1.8 s**. That number is the design constraint, not a footnote: a
+Warm, about **3 s** (2 s for the targets, 1 s for the lib filter). That number
+is the design constraint, not a footnote: a
 push-time gate that costs minutes gets `--no-verify`d permanently and is worse
 than no gate. Everything here is a source scan and a table comparison — no VM
 boots, no fixtures, no network, no non-determinism.
@@ -59,6 +61,24 @@ Those three targets cover the flag surface in **both** directions:
 
   It found `CRATONVM_JIT_IR_GATED_REF_STORE` on the day it was written, left
   behind when its reader was renamed to `CRATONVM_JIT_IR_REF_STORE`.
+
+The second invocation exists because the first cannot reach the invariants that
+are cheapest to get wrong. `flag_groups`'s unit tests check the INVENTORY table
+against *itself* - a row expands to something, `off_word` appears only on a
+default-ON knob with no opt-out key, no legacy variable is claimed by two
+tokens - and they live in the types crate's **lib**, which `--test <target>`
+never runs.
+
+That gap was not hypothetical. On 2026-09-04 three `CRATONVM_XT_*` rows named
+the same variable as both `on_key` and `off_key`, violating two of those
+invariants at once; they reached `dev` through this hook and stayed red until
+someone tripped over them while validating an unrelated merge.
+
+Folding `--lib` into the first invocation would run the whole types lib -
+measured **24 s** against the targets' 2 s, which is the kind of number that
+gets a hook `--no-verify`d permanently. Filtered to `flag_groups` in its own
+invocation it is ~1 s warm. (A first measurement said 8 s; that was a cold build
+of a test binary this hook had never built, not the steady state.)
 
 Note what "read" means: a name counts as read only where it is **read**, not
 where it is declared. `flag_groups.rs` is itself a Rust source, so every
