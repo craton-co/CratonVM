@@ -493,6 +493,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
+    // Coverage oracle for the slot list `static-root-slots` builds: after the
+    // fast path has patched the recorded slots, re-walk every static the slow
+    // way and report any that still names a moved address. A miss there is not
+    // a wrong number, it is a live static field left pointing at a vacated
+    // address, and a unit test cannot answer the question on a real class set.
+    E { group: Group::DBG, token: "static-slot-verify", on_key: Some("CRATONVM_DBG_STATIC_SLOT_VERIFY"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::DBG, token: "gcpart", on_key: Some("CRATONVM_DBG_GCPART"), off_key: None, off_word: None, since: "2026-07-22" },
     E { group: Group::DBG, token: "jni-localref", on_key: Some("CRATONVM_DBG_JNI_LOCALREF"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None, since: "2026-07-07" },
@@ -2064,6 +2070,30 @@ pub const INVENTORY: &[E] = &[
     // which classes actually did. Both exist because the first miscompile it
     // exposed cost a rebuild per hypothesis until they did not.
     E { group: Group::GC, token: "compact-tlab-sites", on_key: Some("CRATONVM_COMPACT_TLAB_SITES"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON opt-out: `collect_roots` records the ADDRESS of every static
+    // slot it finds holding an object, and `update_all_roots` walks that list
+    // instead of re-sweeping every slot of every class under the `statics`
+    // write lock. `=0` restores the full walk, so the two are one binary apart
+    // rather than one build apart. Statics are the first root class in this VM
+    // carried as a SLOT rather than a value -- see `memory::roots::
+    // STATIC_REF_SLOTS` for why they are the ones that can be.
+    // Default-ON opt-out since 2026-09-05: hand the evacuated young semi-space
+    // back to the OS at the end of
+    // each young collection instead of only zeroing it. The generational
+    // collector was the one backend that never gave memory back at all. Off by
+    // default for the same reason `g1-uncommit` is: it publishes the young
+    // arenas' full reserved range to the JIT, and a decommitted granule faults
+    // on touch rather than reading as zero.
+    // Default-ON opt-out since 2026-09-05: maintain an EXACT object-start bitmap
+    // on the arenas whose owner asks for one (a bit per 8
+    // bytes, set in `hand_out`, cleared in `add_free_block` and on reset) and
+    // let `is_object_address` answer from it instead of deducing the answer
+    // from header bytes. Consulted in the ACCEPT direction only -- a miss falls
+    // through to the deduction, because the bitmap is knowably incomplete for
+    // TLAB-allocated objects and using it to REJECT would drop live roots.
+    E { group: Group::GC, token: "object-starts", on_key: Some("CRATONVM_GC_OBJECT_STARTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::GC, token: "static-root-slots", on_key: Some("CRATONVM_GC_STATIC_ROOT_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },

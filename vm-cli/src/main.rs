@@ -276,6 +276,57 @@ fn maybe_dump_shutdown_reports() {
                     }
                 }
             }
+            // EXACT OBJECT-START answers (`CRATONVM_GC_OBJECT_STARTS`). The
+            // pair, because a hit count alone cannot say whether the bitmap is
+            // carrying the predicate or being consulted and ignored: a miss
+            // falls through to the header-shaped deduction that was there
+            // before, and on a conservative scan over zeroes, small integers
+            // and long bit patterns most candidates SHOULD miss. What the ratio
+            // cannot separate -- a genuine non-object from a real object the
+            // bitmap never saw because a TLAB bump-allocated it -- needs a
+            // workload, not another counter.
+            {
+                let (hits, misses, missed_objects) = cratonvm_vm::object_start_counts();
+                if hits != 0 || misses != 0 {
+                    eprintln!(
+                        "[cratonvm] exact object-start answers: hits={hits} misses={misses} (of which real objects: {missed_objects})"
+                    );
+                }
+            }
+            // MEMORY RETURNED TO THE OS by the generational young collector
+            // (`CRATONVM_GEN_UNCOMMIT`). Printed whenever a collection ran,
+            // zero included: a zero with the switch ON means every collection
+            // found the evacuated semi-space had no whole granule to give back,
+            // which is a real finding about the workload, and it is
+            // indistinguishable from the switch being off unless it is printed.
+            {
+                let bytes = cratonvm_vm::young_bytes_uncommitted();
+                if bytes != 0 {
+                    eprintln!(
+                        "[cratonvm] generational young uncommit: {bytes} bytes returned to the OS"
+                    );
+                }
+            }
+            // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
+            // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
+            // usual reason: `slots=0` alone cannot distinguish the kill switch
+            // being set, the scan/fix-up pairing being broken so every
+            // collection re-walks every static the old way, and a workload that
+            // simply has no static reference fields. `fallbacks` tells the
+            // first two from the third.
+            //
+            // Neither number says the recorded list was COMPLETE. Only
+            // `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` answers that, and no counter
+            // can stand in for it -- a list missing a slot looks identical here.
+            {
+                let (slots, fallbacks) =
+                    cratonvm_vm::memory::roots::static_root_slot_counts();
+                if slots != 0 || fallbacks != 0 {
+                    eprintln!(
+                        "[cratonvm] static root slots: patched={slots} full-walk-fallbacks={fallbacks}"
+                    );
+                }
+            }
             // TLAB object SHAPES. The pair plus the bytes, because "compact=0"
             // means either that `CRATONVM_COMPACT_TLAB_ALLOC` is off or that no
             // allocated class has a registered layout, and those are different

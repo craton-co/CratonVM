@@ -1565,6 +1565,66 @@ pub struct JitRegionBoundsTable {
     pub words: [AtomicUsize; 6],
 }
 
+/// Bytes the generational collector has returned to the OS, over the process.
+///
+/// The engagement number for `CRATONVM_GEN_UNCOMMIT`. A zero with the switch ON
+/// is a fact worth seeing — it means every collection found the evacuated
+/// semi-space had no whole granule to give back — and it is indistinguishable
+/// from the switch being off unless it is printed.
+pub static YOUNG_BYTES_UNCOMMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes returned to the OS by the generational young collector so far.
+pub fn young_bytes_uncommitted() -> u64 {
+    YOUNG_BYTES_UNCOMMITTED.load(Ordering::Relaxed)
+}
+
+/// `is_object_address` answers the exact bitmap gave, and answers it declined.
+///
+/// The engagement pair for `CRATONVM_GC_OBJECT_STARTS`. `hits` counts the
+/// candidates the bitmap accepted without reading a header byte; `misses`
+/// counts the ones it had no bit for and which therefore paid the full
+/// deduction anyway. A high miss ratio is not a fault -- it is what a
+/// conservative scan over zeroes, small integers and long bit patterns looks
+/// like, and it is also what TLAB-allocated objects look like, since a TLAB
+/// chunk is one `hand_out` and its contents never reach the bitmap.
+///
+/// Separating those two populations is the next measurement, and it needs a
+/// workload rather than another counter.
+pub static OBJECT_START_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static OBJECT_START_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Misses that the header-shaped deduction then ACCEPTED.
+///
+/// This is the recoverable half of the miss population, and it needs no new
+/// plumbing to measure: a candidate the bitmap had no bit for, which the full
+/// deduction went on to certify as a real object base, is by definition an
+/// object this arena allocated and the bitmap never saw. There is exactly one
+/// way for that to happen -- a TLAB chunk is one `hand_out` and the objects
+/// bump-allocated inside it never reach it.
+///
+/// The other half of a miss is a genuine non-object: a zero, a small integer, a
+/// long bit pattern. Those SHOULD miss, and no amount of work on the bitmap will
+/// change them. Reporting the two together is what made the raw miss count
+/// unactionable -- it could not say whether the bitmap was leaving coverage on
+/// the table or simply being asked about rubbish.
+pub static OBJECT_START_MISSED_OBJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(hits, misses, missed_objects)` for the exact object-start fast path.
+///
+/// `missed_objects` is the subset of `misses` the deduction went on to accept --
+/// the coverage the bitmap is leaving on the table, as opposed to the rubbish it
+/// is correctly declining. See [`OBJECT_START_MISSED_OBJECTS`].
+pub fn object_start_counts() -> (u64, u64, u64) {
+    (
+        OBJECT_START_HITS.load(Ordering::Relaxed),
+        OBJECT_START_MISSES.load(Ordering::Relaxed),
+        OBJECT_START_MISSED_OBJECTS.load(Ordering::Relaxed),
+    )
+}
+
 pub static JIT_REGION_BOUNDS: JitRegionBoundsTable = JitRegionBoundsTable {
     // Written out element-by-element (not `[const { ... }; 6]`) to stay under
     // the workspace MSRV — inline-const repeat expressions landed in 1.79.
@@ -2278,6 +2338,20 @@ pub struct GenerationalHeap {
     /// cannot leave a reader dereferencing freed memory. Only ever touched at
     /// publish time (STW), never on a read path.
     commit_bits_hold: Mutex<[Option<Arc<[AtomicU64]>>; 3]>,
+    /// Lock-free pointers to the two young arenas' exact object-start bitmaps,
+    /// and the `Arc`s that keep them alive.
+    ///
+    /// Same shape and the same reason as [`Self::commit_bits`]:
+    /// `is_object_address` is the VM's hottest validator and was deliberately
+    /// made lock-free, so it must reach the bitmap through a published pointer
+    /// rather than by locking the arena. `(0)` reads as "no bitmap", which is
+    /// the answer whenever `CRATONVM_GC_OBJECT_STARTS` is off and for the old
+    /// generation, which has no `Arena` at all.
+    ///
+    /// The pointer is retired BEFORE the `Arc` is dropped, so no reader can be
+    /// handed a pointer this heap is about to free.
+    object_starts: [AtomicUsize; 2],
+    object_starts_hold: Mutex<[Option<Arc<crate::heap_bitmap::HeapBitmap>>; 2]>,
     /// Card table covering the old generation's address space.
     ///
     /// T5.5.2 (HIGH-1 fix): the table now uses interior mutability for
@@ -2291,7 +2365,16 @@ pub struct GenerationalHeap {
     /// Next identity hash code.
     next_hash_code: AtomicI32,
     /// Young GC threshold in bytes.
-    young_gc_threshold: Mutex<usize>,
+    ///
+    /// An `AtomicUsize` rather than a `Mutex<usize>` because
+    /// [`Self::needs_gc_with_jit_allocation_frame`] reads it, and that runs on
+    /// the ALLOCATION path — a mutex there is a shared cache line taken
+    /// exclusive by every allocating thread to read one word that only ever
+    /// changes at a safepoint. Both writers (the post-collection pause-goal
+    /// feedback and the heap-expansion reset) run stop-the-world, so the
+    /// read-modify-writes they perform have no racing writer and a plain
+    /// load/store pair is exactly equivalent to what the lock provided.
+    young_gc_threshold: AtomicUsize,
     // Volatile field access uses `SeqCst` fences inside
     // `get_field_volatile`/`set_field_volatile`; no global lock is
     // needed (and the previous `Mutex<()>` here serialised every
@@ -2753,8 +2836,20 @@ impl GenerationalHeap {
 
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
-            young_from: Mutex::new(Arena::new(young_semi_size)),
-            young_to: Mutex::new(Arena::new(young_semi_size)),
+            // Armed here rather than in `Arena::new`: this collector's
+            // `is_object_address` is the only one that consults the bitmap, and
+            // charging every other `Arena` in the process for it (ZGC's whole
+            // heap among them) buys nothing. See `Arena::arm_object_starts`.
+            young_from: Mutex::new({
+                let mut a = Arena::new(young_semi_size);
+                a.arm_object_starts();
+                a
+            }),
+            young_to: Mutex::new({
+                let mut a = Arena::new(young_semi_size);
+                a.arm_object_starts();
+                a
+            }),
             old_gen: Mutex::new(old_gen),
             quarantine: Mutex::new(VecDeque::new()),
             evac_pool: std::sync::OnceLock::new(),
@@ -2769,9 +2864,11 @@ impl GenerationalHeap {
                 (AtomicUsize::new(0), AtomicUsize::new(0)),
             ],
             commit_bits_hold: Mutex::new([None, None, None]),
+            object_starts: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            object_starts_hold: Mutex::new([None, None]),
             card_table,
             next_hash_code: AtomicI32::new(1),
-            young_gc_threshold: Mutex::new(threshold),
+            young_gc_threshold: AtomicUsize::new(threshold),
             satb_queue: None,
             concurrent_gc_state: None,
             max_young_semi_size: max_young,
@@ -2860,6 +2957,69 @@ impl GenerationalHeap {
         }
     }
 
+    /// Hand the EVACUATED young semi-space back to the OS.
+    ///
+    /// `CRATONVM_GEN_UNCOMMIT` (opt-in). Returns the bytes released.
+    ///
+    /// # Why this collector had nothing like it
+    ///
+    /// It was the only backend that never gave memory back. ZGC decommits its
+    /// arena's un-bumped middle and free lists on every collection; G1 shrinks
+    /// its committed prefix on request (`CRATONVM_G1_UNCOMMIT`); `gen_heap.rs`
+    /// contained no `decommit` call at all, so a run that peaked and then idled
+    /// held its peak for the life of the process.
+    ///
+    /// # Why the inactive semi-space is the right target, and the old gen is not
+    ///
+    /// After the flip, `young_to` is the space the collection evacuated FROM.
+    /// Nothing live is in it — that is what the flip means — and the very next
+    /// thing this cycle does to it today is zero it
+    /// ([`Self::spawn_evacuated_wipe`]). Decommitting is the same statement
+    /// made to the OS instead of to the bytes: the pages go back, and the next
+    /// allocation into them arrives through [`crate::arena::Arena::alloc`] →
+    /// `hand_out`, which re-commits the granule it hands out.
+    ///
+    /// The OLD generation is not a candidate and cannot be made one here: it is
+    /// a `Vec<u8>`, committed in full at construction, with no reservation to
+    /// shrink. Giving it lazy commit is a change to its allocator, not a call
+    /// site.
+    ///
+    /// # What it costs, and why it is off by default
+    ///
+    /// A decommitted granule FAULTS on touch. It does not read back as zero —
+    /// `Arena::decommit_free_blocks` says so, and records that believing
+    /// otherwise is how two ZGC slides came to write into released granules.
+    /// This collector publishes its young arenas' FULL reserved range into
+    /// `JIT_REGION_BOUNDS` (inline reference stores) and `JIT_READ_BOUNDS`
+    /// (inline `getfield`), so a compiled access through a STALE reference into
+    /// the evacuated semi-space would fault rather than read a stale value.
+    ///
+    /// That window is not created by this method — the young arenas already
+    /// commit lazily in 2 MiB granules while the published bound covers the
+    /// whole reservation — but it is WIDENED by it, from "granules never yet
+    /// allocated into" to "granules that held objects one collection ago". The
+    /// interpreter's own probe is safe either way: `is_object_address` screens
+    /// every candidate through `region_range_committed` before it dereferences
+    /// anything, and declines an address in a released granule.
+    ///
+    /// Off by default because that trade is a measurement and not a judgement,
+    /// and because the switch is what lets it be made in one binary. Same
+    /// reasoning, and the same default, as `g1_uncommit`.
+    fn uncommit_evacuated_young(&self, evacuated: &mut Arena) -> usize {
+        if !gc_flags().gen_uncommit {
+            return 0;
+        }
+        // BOTH halves, for the reason ZGC's site gives: the middle is the space
+        // no allocation ever reached, the free lists are the space that WAS
+        // allocated and has since been freed. After an evacuating flip the
+        // second is most of it.
+        let released = evacuated.decommit_unbumped_middle() + evacuated.decommit_free_blocks();
+        if released != 0 {
+            YOUNG_BYTES_UNCOMMITTED.fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
+    }
+
     /// Wait for the off-pause wipe, if one is running. Idempotent and cheap
     /// when none is.
     fn join_evacuated_wipe(&self) {
@@ -2909,11 +3069,22 @@ impl GenerationalHeap {
             // two tables only diverge on G1 (read-only publish) and ZGC
             // (neither). See `JIT_READ_BOUNDS`.
             publish_jit_read_bounds(i, base, base.wrapping_add(cap));
+            // ...and the capability-free "where is the heap" table. Same three
+            // spans, but a DIFFERENT question -- see `heap_geometry`. This one
+            // every backend fills, which is what lets a consumer such as
+            // `compressed_oops::enable_for_live_heap` ask it without having to
+            // read a table whose emptiness under another collector is
+            // load-bearing.
+            crate::heap_geometry::publish_heap_span(i, base, base.wrapping_add(cap));
         }
         // Republish the commit bitmaps beside the bounds. The old gen (slot 2)
         // is a wholly-committed `Vec<u8>`, so it never needs a screen; the two
         // young arenas do whenever the reserve/commit backing store is in use.
         self.store_commit_bits_locked(yf.commit_bits(), yt.commit_bits());
+        // ...and the exact object-start bitmaps, on the same schedule and for
+        // the same reason: the arenas may have been swapped or re-backed, so a
+        // pointer published before this call can describe the wrong arena.
+        self.store_object_starts_locked(yf.object_starts(), yt.object_starts());
     }
 
     /// Publish the young arenas' commit bitmaps into the lock-free
@@ -2922,6 +3093,32 @@ impl GenerationalHeap {
     ///
     /// Split out of [`Self::store_region_bounds_locked`] only so the borrow of
     /// the arena guards ends before the hold lock is taken.
+    /// Publish the two young arenas' object-start bitmaps into the lock-free
+    /// [`Self::object_starts`] mirror. Mirror of
+    /// [`Self::store_commit_bits_locked`], with the same retire-then-drop
+    /// ordering.
+    fn store_object_starts_locked(
+        &self,
+        yf: Option<Arc<crate::heap_bitmap::HeapBitmap>>,
+        yt: Option<Arc<crate::heap_bitmap::HeapBitmap>>,
+    ) {
+        let mut hold = self.object_starts_hold.lock();
+        for (i, bits) in [yf, yt].into_iter().enumerate() {
+            match &bits {
+                Some(b) => {
+                    self.object_starts[i]
+                        .store(Arc::as_ptr(b) as usize, Ordering::Release);
+                }
+                None => {
+                    // Retire before dropping the old `Arc`, so no reader can be
+                    // handed a pointer this call is about to free.
+                    self.object_starts[i].store(0, Ordering::Release);
+                }
+            }
+            hold[i] = bits;
+        }
+    }
+
     fn store_commit_bits_locked(
         &self,
         yf: Option<Arc<[AtomicU64]>>,
@@ -4283,6 +4480,29 @@ impl GenerationalHeap {
         }
     }
 
+    /// Ask arena `slot`'s exact object-start bitmap about `addr`.
+    ///
+    /// `None` means "not tracked" -- the switch is off, or the arena was grown
+    /// and dropped its bitmap -- and is a different answer from `Some(false)`.
+    /// Only slots 0 and 1 (the young semi-spaces) are `Arena`s; slot 2 is the
+    /// old generation, which is a `Vec<u8>` with no arena and therefore no
+    /// bitmap.
+    fn arena_object_start(&self, slot: usize, addr: usize) -> Option<bool> {
+        // Slot 2 is the old generation, which is a `Vec<u8>` with no `Arena`
+        // and therefore no bitmap.
+        let cell = self.object_starts.get(slot)?;
+        let ptr = cell.load(Ordering::Acquire) as *const crate::heap_bitmap::HeapBitmap;
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: the pointer was published by `store_object_starts_locked`
+        // from an `Arc` that `object_starts_hold` still owns, and that publisher
+        // retires the pointer (stores 0) BEFORE it drops the `Arc`, so a
+        // non-null read here cannot name freed memory. `HeapBitmap` is `Sync`
+        // and `contains` takes `&self`.
+        Some(unsafe { (*ptr).contains(addr) })
+    }
+
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         // Reject obvious garbage.
         if addr == 0 {
@@ -4311,7 +4531,7 @@ impl GenerationalHeap {
         // zero, so a candidate there is declined outright. No live object is
         // ever in the inactive semi-space, so this changes no valid answer.
         let skip_inactive = self.wipe_in_flight.load(Ordering::Acquire);
-        let mut hit: Option<(usize, usize)> = None;
+        let mut hit: Option<(usize, usize, usize)> = None;
         for (i, (base, end)) in self.region_bounds.iter().enumerate() {
             if skip_inactive && i == 1 {
                 continue;
@@ -4319,11 +4539,14 @@ impl GenerationalHeap {
             let b = base.load(Ordering::Acquire);
             let e = end.load(Ordering::Acquire);
             if addr >= b && addr < e {
-                hit = Some((i, b));
+                // Carry the END out too. The extent check further down used to
+                // re-scan all three bounds pairs -- six more `Acquire` loads --
+                // to find the very region this loop just identified.
+                hit = Some((i, b, e));
                 break;
             }
         }
-        let Some((slot, region_base)) = hit else {
+        let Some((slot, region_base, region_end)) = hit else {
             return None;
         };
 
@@ -4343,6 +4566,7 @@ impl GenerationalHeap {
         if !self.region_range_committed(slot, region_base, addr, HEADER_SIZE) {
             return None;
         }
+
 
         // Validate raw enum tags before constructing an `ObjectHeader`
         // reference. Conservative root scans can land on arbitrary arena words;
@@ -4372,6 +4596,50 @@ impl GenerationalHeap {
         // the loose kind/slot checks below but fail one of these bytes.
         if !header_reserved_fields_plausible(header) {
             return None;
+        }
+
+        // EXACT ANSWER, once the bytes have been shown to be an object header.
+        //
+        // Everything BELOW this point exists to catch one thing: an address that
+        // is not an allocation base but whose bytes decode as a plausible one.
+        // The comment on the extent check names it -- an interior 16-byte
+        // `Value` cell of an `Object[]` gives `class_id=4` and `num_slots=4`,
+        // self-consistent and entirely coincidental -- and the way it is caught
+        // is by computing the claimed extent and proving it fits the arena and
+        // the commit map. That is the expensive half of this function.
+        //
+        // `Arena::is_object_start` settles the same question by construction: the
+        // bit was set in `hand_out` and cleared in `add_free_block`, so a hit
+        // means this arena really did hand `addr` out and has not taken it back.
+        // No interior address can hold that bit, so there is nothing left for
+        // the extent computation to catch.
+        //
+        // WHY IT IS HERE AND NOT BEFORE THE HEADER CHECKS, which is where it was
+        // first written. `hand_out` is the door for every allocation, not every
+        // OBJECT: a TLAB chunk is one hand-out, and its base carries the bit
+        // whether or not an object was ever bump-allocated at it. Accepting on
+        // the bit alone therefore hands a caller an `ObjectRef` to a chunk, whose
+        // first bytes are not an `ObjectHeader` -- the exact corruption this
+        // function exists to prevent, reintroduced by the thing meant to make it
+        // exact. The kind, element-type and reserved-field checks above are cheap
+        // byte tests and they are what rules that out; the extent arithmetic and
+        // the second commit probe are what the bitmap replaces.
+        //
+        // ACCEPT ONLY. `Some(false)` and `None` fall through unchanged, because
+        // the bitmap is knowably incomplete -- objects bump-allocated inside a
+        // TLAB chunk never reach `hand_out` -- and rejecting on it would drop
+        // live roots.
+        let mut bitmap_declined = false;
+        if let Some(hit) = self.arena_object_start(slot, addr) {
+            if hit {
+                OBJECT_START_HITS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: `raw` is inside a mapped arena region (checked above),
+                // its header decodes as a real object, and the bitmap confirms
+                // the arena handed this exact address out as an allocation base.
+                return Some(unsafe { ObjectRef::from_raw(raw as *mut u8) });
+            }
+            OBJECT_START_MISSES.fetch_add(1, Ordering::Relaxed);
+            bitmap_declined = true;
         }
 
         // Cap num_slots at a sanity limit so a stale word can't fool us
@@ -4445,11 +4713,25 @@ impl GenerationalHeap {
         // check above matched (not just "some" arena — a header claiming to
         // span from young into old gen is exactly the interior-cell false
         // positive this guards against).
-        let extent_fits = self.region_bounds.iter().any(|(base, end)| {
-            let b = base.load(Ordering::Acquire);
-            let e = end.load(Ordering::Acquire);
-            addr >= b && addr < e && obj_end <= e
-        });
+        //
+        // "The same arena" is the arena the containment loop already found, so
+        // ask it directly instead of re-scanning all three. The three arenas are
+        // separate allocations and therefore disjoint, so the old `any` could
+        // only ever have been satisfied by this same region — but the fallback
+        // below keeps the answer bit-identical without resting on that, at the
+        // cost of a scan that now runs only when the fast test fails, i.e.
+        // essentially never on a real heap.
+        //
+        // This function is the VM's hottest validator: it is what every
+        // conservative stack word, every ambiguous operand slot and every JIT
+        // helper probe goes through, and the loop it replaces was six `Acquire`
+        // loads on top of the six the containment check had already done.
+        let extent_fits = obj_end <= region_end
+            || self.region_bounds.iter().any(|(base, end)| {
+                let b = base.load(Ordering::Acquire);
+                let e = end.load(Ordering::Acquire);
+                addr >= b && addr < e && obj_end <= e
+            });
         if !extent_fits {
             return None;
         }
@@ -4463,6 +4745,12 @@ impl GenerationalHeap {
             return None;
         }
 
+        if bitmap_declined {
+            // The bitmap had no bit for an address the deduction just certified
+            // as a real object base. That is the recoverable half of the miss
+            // population -- see `OBJECT_START_MISSED_OBJECTS`.
+            OBJECT_START_MISSED_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: `raw` passed the region containment, header sanity, and
         // extent-containment checks above, so it points to a valid object
         // header within a heap arena.
@@ -6181,7 +6469,7 @@ impl GenerationalHeap {
         );
         let threshold = young_gc_trigger_bytes(
             from.capacity(),
-            *self.young_gc_threshold.lock(),
+            self.young_gc_threshold.load(Ordering::Relaxed),
             non_moving_young,
             young_pause_goal_ms() > 0,
         );
@@ -6459,10 +6747,14 @@ impl GenerationalHeap {
         // worse than the pause it was trying to avoid.
         let floor = (capacity / 16).max(1);
         let ceiling = capacity * young_trigger_percent() / 100;
-        let mut threshold = self.young_gc_threshold.lock();
-        let current = (*threshold).clamp(floor, ceiling.max(floor));
+        // STW: this is the post-collection feedback step, so the read and the
+        // store below cannot race a second writer.
+        let current = self
+            .young_gc_threshold
+            .load(Ordering::Relaxed)
+            .clamp(floor, ceiling.max(floor));
         let mut feedback = self.young_trigger_feedback.lock();
-        *threshold = next_young_trigger(
+        let next = next_young_trigger(
             &mut feedback,
             current,
             floor,
@@ -6472,12 +6764,13 @@ impl GenerationalHeap {
             goal_ms,
             bytes_copied,
         );
+        self.young_gc_threshold.store(next, Ordering::Relaxed);
         drop(feedback);
-        if gc_flags().dbg_gcpause && *threshold != current {
+        if gc_flags().dbg_gcpause && next != current {
             eprintln!(
                 "[gcpause] young trigger {}KB -> {}KB (pause={pause_ms}ms goal={goal_ms}ms)",
                 current / 1024,
-                *threshold / 1024
+                next / 1024
             );
         }
     }
@@ -8855,12 +9148,14 @@ impl GenerationalHeap {
                 // the smaller of the two: the goal keeps its say, and the new
                 // capacity still supplies the ceiling.
                 let default_for_new_cap = new_cap * young_trigger_percent() / 100;
-                let mut threshold = self.young_gc_threshold.lock();
-                *threshold = if young_pause_goal_ms() > 0 {
-                    (*threshold).min(default_for_new_cap)
+                // STW: heap expansion runs inside the collection pause.
+                let current = self.young_gc_threshold.load(Ordering::Relaxed);
+                let next = if young_pause_goal_ms() > 0 {
+                    current.min(default_for_new_cap)
                 } else {
                     default_for_new_cap
                 };
+                self.young_gc_threshold.store(next, Ordering::Relaxed);
             }
         }
 
@@ -8877,12 +9172,50 @@ impl GenerationalHeap {
         // final here. The bytes are zero long before the next cycle needs
         // them, and `collect_garbage_inner` joins the thread before it looks.
         if let Some(wipe) = deferred_wipe {
-            let spans = young_to.deferred_wipe_spans(&wipe);
+            let mut spans = young_to.deferred_wipe_spans(&wipe);
+            // GIVE BACK FIRST, THEN WIPE WHAT IS LEFT.
+            //
+            // `CRATONVM_GEN_UNCOMMIT`, off by default; see
+            // `uncommit_evacuated_young` for what it costs and why the default
+            // is a measurement rather than a judgement. This is the arena the
+            // collection evacuated FROM, so nothing live is in it, and the very
+            // next thing this cycle does to it is zero it -- which is the same
+            // statement made to the bytes instead of to the OS.
+            //
+            // The order is load-bearing, and the first attempt got it wrong in
+            // both available ways. Putting the give-back in an `else` of this
+            // `if` made it STRUCTURALLY DEAD: `deferred_wipe` is `Some` on the
+            // default path (it is the final `else` of the reset arm above), so
+            // the arm never ran and the census read zero for a switch that was
+            // on. Running both against overlapping spans is worse than dead --
+            // a released granule FAULTS on write, and the wipe thread would be
+            // writing into memory this call had returned.
+            //
+            // They are not interchangeable, which is why the wipe is not simply
+            // skipped: a released granule comes back from the OS zeroed, but
+            // `Arena::hand_out` does not zero, and the give-back only releases
+            // WHOLE granules rounded inward. The partial granules at a span's
+            // edges still hold the previous cycle's object bytes and still have
+            // to be written over. `retain_committed_spans` is exactly that
+            // remainder.
+            let released = self.uncommit_evacuated_young(&mut young_to);
+            if released != 0 {
+                spans = young_to.retain_committed_spans(spans);
+                tracing::debug!(
+                    target: "cratonvm::gc",
+                    bytes = released,
+                    "gen: returned the evacuated young semi-space to the OS",
+                );
+            }
             if mv_phase_on {
                 let bytes: usize = spans.iter().map(|&(_, l)| l).sum();
                 moving_phase_count_push("wipe_deferred_bytes", bytes as u128);
             }
             self.spawn_evacuated_wipe(spans);
+        } else {
+            // The synchronous-wipe and quarantine arms already zeroed (or
+            // parked) the arena, so there is no wipe to coordinate with.
+            let _ = self.uncommit_evacuated_young(&mut young_to);
         }
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC
@@ -13818,17 +14151,25 @@ impl GenerationalHeap {
                     .class_id
                     .as_u32(),
             );
-            for overlay_ref in
-                crate::external_roots::external_roots_for_owner(obj_ptr as usize, owner_class)
-            {
-                mark_and_push_old_gen(
-                    overlay_ref.as_ptr(),
-                    old_gen,
-                    &walked_bases,
-                    &mut worklist,
-                    "external-overlay(BFS owner)",
-                );
-            }
+            // `with_...` rather than `external_roots_for_owner`: this runs once
+            // per marked object and the returning form allocates a `Vec` for
+            // every one that owns anything. The scratch buffer behind this is
+            // per-thread and lives for the whole cycle.
+            crate::external_roots::with_external_roots_for_owner(
+                obj_ptr as usize,
+                owner_class,
+                |overlay_refs| {
+                    for overlay_ref in overlay_refs {
+                        mark_and_push_old_gen(
+                            overlay_ref.as_ptr(),
+                            old_gen,
+                            &walked_bases,
+                            &mut worklist,
+                            "external-overlay(BFS owner)",
+                        );
+                    }
+                },
+            );
             if loader_pin_on {
                 // SAFETY: `obj_ptr` is a marked old-gen object with a valid header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
