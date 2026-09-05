@@ -1083,6 +1083,7 @@ pub fn update_all_roots(
             // addresses into leaked blocks the map does not own the storage of,
             // and this runs stop-the-world with every mutator parked -- the same
             // conditions under which the scan read them.
+            let covered = slots.len();
             for addr in slots {
                 // SAFETY: recorded by `collect_roots` earlier in THIS pause as
                 // the address of a `Value` slot inside a leaked `StaticsBlock`.
@@ -1120,11 +1121,18 @@ pub fn update_all_roots(
                         }
                     }
                 }
-                if missed > 0 {
-                    eprintln!(
-                        "[static-slot-verify] {missed} static slot(s) held a moved                          reference the recorded slot list did not cover"
-                    );
-                }
+                // The SHAPE, not just the failures. A verifier that prints only
+                // when it finds something cannot distinguish "covered
+                // everything" from "the fast path never ran" -- and on this
+                // path the second one is the likelier way to get a silent zero,
+                // because `take_static_ref_slots` returns `None` whenever the
+                // scan recorded nothing and this whole arm is skipped. Printing
+                // the covered count alongside the miss count is what makes a
+                // zero mean something.
+                eprintln!(
+                    "[static-slot-verify] covered={covered} missed={missed}                      moved={moved} (covered = slots the scan recorded; moved =                      entries in this collection's pointer map)",
+                    moved = pointer_map.len(),
+                );
             }
         }
         None => {
