@@ -12004,6 +12004,13 @@ fn op_cannot_deopt(op: &Op) -> bool {
             | Op::D2F
             | Op::Cmp(_)
             | Op::LCmp
+            | Op::FCmp { .. }
+            // A return cannot trap. It was missing from the first cut, which
+            // is why `OsrTierBench.kernel` -- pure arithmetic and a `Return` --
+            // reported `graph_trap_free=false` and the optimization declined
+            // itself. The allowlist failing safe is the intended direction;
+            // this is the cost of that direction, paid once.
+            | Op::Return
             | Op::Dead
     )
 }
