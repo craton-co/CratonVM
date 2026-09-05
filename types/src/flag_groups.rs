@@ -598,6 +598,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-direct-binds", on_key: Some("CRATONVM_DBG_JIT_DIRECT_BINDS"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::DBG, token: "ir-graph", on_key: Some("CRATONVM_DBG_IR_GRAPH"), off_key: None, off_word: None, since: "2026-08-28" },
+    E { group: Group::DBG, token: "ir-sink", on_key: Some("CRATONVM_DBG_IR_SINK"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::DBG, token: "zgc-target", on_key: Some("CRATONVM_DBG_ZGC_TARGET"), off_key: None, off_word: None, since: "2026-08-28" },
     // The LARGE-OBJECT end's compactor, one line per engaged cycle: what it
     // moved and what the high free list looked like on either side of it.
@@ -1238,6 +1239,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-publish-at-def", on_key: Some("CRATONVM_JIT_IR_PUBLISH_AT_DEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-carry-single-use", on_key: Some("CRATONVM_JIT_IR_CARRY_SINGLE_USE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-sink-late", on_key: Some("CRATONVM_JIT_IR_SINK_LATE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "merged-call-sentinel", on_key: Some("CRATONVM_JIT_MERGED_CALL_SENTINEL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
