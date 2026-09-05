@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **IMPLEMENTED, NOT YET MEASURED.** Every cut below is in the tree behind its own kill switch, with a census that says whether it engaged. No throughput number has been taken, and none is claimed here |
+| **Status** | **IMPLEMENTED; the removed work is PRICED, the end-to-end effect is NOT.** Every cut below is in the tree behind its own kill switch, with a census that says whether it engaged. No throughput number has been taken, and none is claimed here |
 | **Opened** | 2026-09-04, from a source read of the socket path prompted by the HTTP clusters' gap against HotSpot |
 | **Touches** | `native-io/src/socket_fast_io.rs` (new), `native-io/src/socket_channel.rs`, `native-io/src/nio_selector.rs`, `native-api/src/registry.rs`, `vm/src/vm/vm_exec.rs`, `vm/src/vm/vm_init.rs` |
 | **Acceptance vector** | `regression-suite/src/RSocketFastIo.java` — 43 checks; passes on Temurin 25.0.3+9 and on CratonVM with byte-identical observables, in all four switch arms |
@@ -187,7 +187,66 @@ both make exactly ONE copy, and single-scratch is simpler and platform-neutral.
 same precondition as the paragraph above, and it should be built together with
 that, or not at all.
 
-## How to measure it — nothing here is measured yet
+## What is measured, and what is not
+
+### The removed work, priced directly
+
+`cargo test --release -p cratonvm-native-io --lib -- --ignored --nocapture scratch_cost`,
+on the merged tree, Windows 11, quiet host, minimum of three passes per row
+(the minimum measures the code; the mean measures the load):
+
+| offered capacity | alloc + zero | reuse | saved per call |
+|---|---:|---:|---:|
+| 128 B | 70 ns | 25 ns | 45 ns |
+| 1 KiB | 76 ns | 25 ns | 51 ns |
+| 8 KiB | 190 ns | 25 ns | 165 ns |
+| 64 KiB | 1 904 ns | 23 ns | **1 881 ns** |
+
+**The shape is the result, not the absolute numbers.** The old path's cost rises
+27x across the sweep because it is a function of the capacity the application
+OFFERED; the new path is flat at ~25 ns because it is a function of nothing.
+That is the defect and the fix stated in one table. 1 904 ns to zero 64 KiB is
+~34 GB/s effective, which is what an L2-resident `memset` should cost — the
+number is physically sensible rather than an artifact.
+
+The residual ~25 ns is `Scratch::new`'s thread-local take/put and its length
+check. It does not scale, so it does not participate in the defect.
+
+### What this does NOT establish
+
+This prices the work that was removed. It does NOT say what fraction of a real
+`read()` that is, because the surrounding syscall cost is untouched and is not
+measured here. At netty's 64 KiB buffer the saving is 1.88 us per read; whether
+that is 3% or 50% of a read depends on the syscall's own cost in the workload,
+and **this host cannot supply that figure** — see below. Multiplying 1.88 us by
+a call count from the census gives a CEILING on the saving, not a prediction.
+
+### The end-to-end probe, and why its number is not quoted
+
+`probes/SocketTransferCostProbe.java` exists and is committed, and its result
+is that **it cannot resolve this effect on this host**. Recorded because the
+next person will otherwise build it again:
+
+* one loopback write+read pair costs ~65 us here, and rounds drift 2x under
+  ambient load (one round read 130 us against another's 67 us);
+* the first design — sweep the capacity, compare rows — put a few-us effect
+  against a ~15% row-to-row spread;
+* the second — interleave both capacities inside one loop so common-mode noise
+  cancels, and report the difference — is a better instrument and still not
+  enough. **The HotSpot control, which has no per-call allocation and must
+  therefore show no capacity dependence at all, reported deltas from -4 350 to
+  +6 168 ns.**
+
+A quantity smaller than its own control's spread is not measured. The control
+is what makes that a finding rather than a disappointment: without it, this
+page would be quoting a CratonVM delta of the same magnitude and calling it a
+result.
+
+A quieter host, or a workload whose reads are served from an already-full
+receive buffer rather than a ping-pong round trip, would resolve it. The Azure
+hosts are the obvious candidates.
+
+## The A/B recipe, for when a real workload is available
 
 This page claims no speedup, and the code should not be described as having one
 until the following exists. The discipline is the `FileChannel` fast path's,
