@@ -25448,14 +25448,14 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // both spellings for the stream channels and this family did not. Both
     // point at the same body, which is what the JDK's own chain does.
     //
-    // What these rows DO NOT do: rescue a real `sun.nio.ch.DatagramChannelImpl`
-    // receiver. That class declares `implCloseSelectableChannel` itself, and
-    // the receiver-has-its-own-bytecode rule reaches that declaration before
-    // the walk gets to `DatagramChannel` -- measured with
-    // `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0`, which still dies on
-    // `"this.stateLock" is null`. They answer for a receiver whose class is the
-    // abstract `DatagramChannel` (what this factory minted before 2026-08-21)
-    // and they keep the two families' registration surfaces the same shape.
+    // These rows are load-bearing, and it took a control build to know it: with
+    // them and the `init_channel_locks` seeding in `native_dc_open` present,
+    // `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0` reads 0/4000 on
+    // `probes/ChannelCloseDevirtProbe.java`; with this file reverted to `dev`
+    // and the same screen off, 3487/4000. So the JDK `close()` bytecode does
+    // reach them -- `implCloseChannel` is dispatched virtually from
+    // `AbstractInterruptibleChannel.close()`, and the receiver walk finds the
+    // registration here.
     r.register(dc, "implCloseChannel", "()V", native_dc_close);
     r.register(dc, "implCloseSelectableChannel", "()V", native_dc_close);
 
@@ -26278,16 +26278,28 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
     // in `probes/CloseDevirtProbe.java`, each leaking a UDP socket and leaving
     // netty's `AbstractChannel.close()` to raise "close() must be invoked
     // after the channel is closed." over a channel that never closed.
-    // `invoke::final_devirt_native_shadow` now refuses that bind, and that is
-    // the fix. Seeding is defence in depth and is NOT a second one: with the
-    // screen off, a devirtualised `close()` gets one step further and dies on
-    // `"this.stateLock" is null` inside `DatagramChannelImpl
-    // .implCloseSelectableChannel`. Measured, not assumed --
-    // `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0` moves
-    // `probes/ChannelCloseDevirtProbe.java` from 0 to 3,493 failures in 4,000
-    // WITH these fields seeded. What seeding buys is that the fields a
-    // constructor would have assigned are assigned, for every reader that is
-    // not this one. Returns a possibly-relocated ref: seeding allocates.
+    // `invoke::final_devirt_native_shadow` refuses that bind, and this seeding
+    // is the SECOND, independent half -- not decoration. Measured 2026-09-05 by
+    // reverting this file's datagram changes and rebuilding, one binary per arm:
+    //
+    //                                       screen ON   screen OFF
+    //     ChannelCloseDevirtProbe datagram    0/4000    3487/4000 (first @512)
+    //     ChannelStateAfterCloseCensus        0/400000  399999/400000
+    //
+    // ...against 0 in BOTH arms once these lines are back. So either half alone
+    // covers the netty face; shipping both is deliberate, because they cover it
+    // at different levels (the screen stops compiled code reaching the JDK body
+    // at all; this makes the JDK body correct when something else reaches it).
+    //
+    // An earlier revision of this comment claimed the seeding was NOT sufficient
+    // -- that a devirtualised close got one step further and died on
+    // `"this.stateLock" is null` inside
+    // `DatagramChannelImpl.implCloseSelectableChannel`. That was true, and
+    // measured, on the tree this branch started from; a `dev` merge on the same
+    // day made the `implCloseSelectableChannel` registration below win that
+    // dispatch, and the claim went stale without anything in this file changing.
+    // Re-measured rather than re-reasoned. Returns a possibly-relocated ref:
+    // seeding allocates.
     let dc = crate::socket_channel::init_channel_locks(ctx, dc);
     // "A newly-created channel is always in blocking mode"
     // (`java.nio.channels.SelectableChannel`). Assert it rather than assume

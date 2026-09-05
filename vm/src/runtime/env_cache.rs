@@ -523,16 +523,28 @@ pub fn jit_final_devirt() -> bool {
 /// The B arm of an in-binary A/B, and the reason it is a SEPARATE switch from
 /// `CRATONVM_JIT_FINAL_DEVIRT`: turning the whole door off also removes every
 /// devirtualisation the screen would have admitted, so it cannot price the
-/// screen. With this at `0`, `probes/ChannelCloseDevirtProbe.java` returns to
-/// ~3,490 `NullPointerException`s in 4,000 datagram closes, against 0 at the
-/// default, on the same binary.
+/// screen.
 ///
-/// `probes/ChannelStateAfterCloseCensus.java` stays clean in BOTH arms, and
-/// that is not the screen being inert: `socket_channel::mark_jdk_channel_closed`
-/// now writes the JDK's own `closed` flag, so the body this arm devirtualises
-/// to reads the truth. The two fixes overlap on the `isOpen()` half by design;
-/// only the screen covers the `close()` half. Counter:
-/// [`cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`].
+/// **Read the B arm with the sibling fix in mind.** This screen and
+/// `socket_channel::mark_jdk_channel_closed` (plus `native_dc_open`'s field
+/// seeding) were measured to be INDEPENDENTLY sufficient for every face of the
+/// netty defect, so turning only one of them off leaves the other covering it
+/// and the probes read clean. Measured 2026-09-05 on one binary, by reverting
+/// the `native-io` half and rebuilding:
+///
+/// ```text
+///                                          screen ON   screen OFF
+///   ChannelCloseDevirtProbe, datagram         0/4000    3487/4000 (first @512)
+///   ChannelStateAfterCloseCensus, dc.isOpen  0/400000  399999/400000
+/// ```
+///
+/// With BOTH halves in, both arms read zero. That is the shipped state and it
+/// is why a `=0` run is not by itself evidence that this screen does nothing:
+/// the instrument that says what it DID is the engagement counter
+/// [`cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`], and
+/// `CRATONVM_DBG_JITC=1` names each refused site — on the regression fixture
+/// that is exactly `SelectableChannel.isOpen()Z` and `SelectableChannel.close()V`,
+/// both declared on `AbstractInterruptibleChannel`.
 pub fn jit_final_devirt_native_screen() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

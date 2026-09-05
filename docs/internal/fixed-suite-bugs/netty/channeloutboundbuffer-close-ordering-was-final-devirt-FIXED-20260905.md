@@ -144,17 +144,48 @@ the line above it.
    way `socket_channel.rs` does, and the datagram family registers
    `implCloseChannel`/`implCloseSelectableChannel`.
 
-(3) is defence in depth and is **not** a second fix. Measured with the screen
-off and the fields seeded, a devirtualised `close()` gets one step further and
-dies on `"this.stateLock" is null` inside
-`DatagramChannelImpl.implCloseSelectableChannel`, which the receiver declares
-itself and so reaches ahead of any native registered on `DatagramChannel` —
-3,493 of 4,000. The screen is the fix; the seeding is the fields a constructor
-would have assigned being assigned.
+### Two fixes, each independently sufficient — measured, not assumed
 
-(1) and (2) overlap on the `isOpen()` half deliberately: with the screen off,
-the census still reads clean because the flag is now truthful. Only the screen
-covers the `close()` half.
+(1) is a JIT-dispatch fix and (2)+(3) are a channel-state fix, and they cover
+the same faces from different levels. To find out whether either was
+decoration, the `native-io` half was reverted to `dev` and rebuilt, giving one
+binary per arm on the same tip:
+
+| probe / face | screen ON | screen OFF |
+|---|---:|---:|
+| `ChannelCloseDevirtProbe`, datagram close, **without** (2)+(3) | 0 / 4,000 | **3,487 / 4,000**, first at call 512 |
+| `ChannelStateAfterCloseCensus`, `DatagramChannel.isOpen`, **without** (2)+(3) | 0 / 400,000 | **399,999 / 400,000** |
+| both, **with** (2)+(3) — the shipped state | 0 | 0 |
+
+So the screen alone fixes it, and the state fix alone fixes it. Shipping both
+is deliberate: the screen stops compiled code reaching the JDK body at all and
+generalises past channels; the state fix makes that body CORRECT for anything
+else that reaches it (reflection, `end(boolean)`'s `AsynchronousCloseException`
+check, `close()`'s specified idempotence).
+
+**A note on how this table was wrong once.** An earlier revision of this page,
+and of the two code comments, said the seeding was *not* sufficient — that a
+devirtualised `close()` got one step further and died on `"this.stateLock" is
+null` inside `DatagramChannelImpl.implCloseSelectableChannel`. That was
+measured and true on the tree this branch started from. A same-day `dev` merge
+made the `implCloseChannel`/`implCloseSelectableChannel` registrations win that
+dispatch, and the claim went stale with nothing in this branch changing. It was
+caught by re-running the B arm after the merge rather than by review, which is
+the argument for re-measuring a kill switch's stated symptom every time the
+base moves — a B arm that no longer produces the symptom it documents reads as
+"the switch does nothing".
+
+**What the switch DOES do is a separate instrument**, and it is the one to
+trust when both halves are in: `CRATONVM_DBG_JITC=1` on the regression fixture
+prints exactly three refusals, and they are precisely the two methods this page
+is about —
+
+```text
+final-devirt REFUSED java/nio/channels/SelectableChannel.isOpen()Z  (declared on …AbstractInterruptibleChannel)   x2
+final-devirt REFUSED java/nio/channels/SelectableChannel.close()V   (declared on …AbstractInterruptibleChannel)   x1
+```
+
+with the count also available as `FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`.
 
 ### The one case the screen cannot see
 

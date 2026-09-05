@@ -13098,6 +13098,158 @@ impl GenerationalHeap {
                     );
                 }
             }
+
+            // INVERTED holder scan: every victim, in ONE pass over the heap.
+            //
+            // The per-victim scan above is O(victims x heap) and is therefore
+            // bounded to six. On a cycle that sweeps 20,000 objects that is a
+            // 0.03% sample, and it is the wrong 0.03%: it takes the six lowest
+            // addresses, which are whatever the arena happens to open with.
+            // Chasing `io.netty.util.internal.ObjectCleanerTest` on
+            // 2026-09-05 it reported "NO heap holder, NOT in roots" six times
+            // per cycle and never once looked at the object the run then died
+            // on — a lambda held by a live `java.util.Collections
+            // $ReverseComparator2`, which the very next use read back with an
+            // all-zero header.
+            //
+            // Turned inside out it is O(heap log victims) for ALL of them:
+            // build the dead SPANS once, walk young from-space and old gen
+            // once, and binary-search each word. Reports only victims that DO
+            // have a holder, because a swept object with a live holder is the
+            // defect and a swept object without one is the sweep working.
+            //
+            // Spans, not addresses, so an INTERIOR pointer counts: the earlier
+            // pass compared `word == victim` and would have missed a holder
+            // that points at a field rather than the header.
+            {
+                let mut spans: Vec<(usize, usize, u32)> = dead_regions
+                    .iter()
+                    .map(|&(off, sz, cid, _k, _n)| (from_base + off, from_base + off + sz, cid))
+                    .collect();
+                spans.sort_unstable_by_key(|&(start, _, _)| start);
+                let victim_span = |addr: usize| -> Option<(usize, u32)> {
+                    spans
+                        .partition_point(|&(start, _, _)| start <= addr)
+                        .checked_sub(1)
+                        .and_then(|i| spans.get(i))
+                        .filter(|&&(_, end, _)| addr < end)
+                        .map(|&(start, _, cid)| (start, cid))
+                };
+                let mut found = 0usize;
+                let mut reported = 0usize;
+                let mut report = |holder_desc: &dyn Fn() -> String,
+                                  slot: usize,
+                                  target: usize,
+                                  found: &mut usize,
+                                  reported: &mut usize| {
+                    if let Some((vstart, vcid)) = victim_span(target) {
+                        *found += 1;
+                        if *reported < 16 {
+                            *reported += 1;
+                            let vname = crate::gc::resolve_class_info(vcid)
+                                .map(|(n, _)| n)
+                                .unwrap_or_else(|| format!("cid{vcid:#x}"));
+                            eprintln!(
+                                "[sweep-census]   LIVE HOLDER -> DOOMED: {} slot@{slot:#x} \
+                                 -> {vname}@{target:#x} (span head {vstart:#x})",
+                                holder_desc()
+                            );
+                        }
+                    }
+                };
+                // Young from-space, walked as OBJECTS rather than as a flat
+                // word array. A bare word scan names an address and nothing
+                // else; the question is which OBJECT still points at a doomed
+                // one, and the answer is only actionable with its class and
+                // the slot offset. Survivorship is decided by the dead-span
+                // set itself — an object inside one is doomed, so a reference
+                // out of it is not evidence — which needs no mark bits and
+                // cannot disagree with what this sweep is about to free.
+                let from_hi = from_base + young_from.used();
+                let existing_free_inv = merge_skips(young_from.free_blocks_sorted());
+                let mut free_it_inv = existing_free_inv.iter().peekable();
+                let mut c = 0usize;
+                let used_inv = young_from.used();
+                while c < used_inv {
+                    if skip_free_blocks(&mut c, &mut free_it_inv).0 {
+                        continue;
+                    }
+                    let optr = from_base + c;
+                    // SAFETY: `c < used_inv` and the free-block list skips
+                    // reclaimed gaps, so this is a young object header (a
+                    // desynced one is caught by the size check below).
+                    let h = unsafe { &*(optr as *const ObjectHeader) };
+                    let tot = gen_object_total_size(h);
+                    if tot < HEADER_SIZE || c + tot > used_inv {
+                        break;
+                    }
+                    if victim_span(optr).is_none() {
+                        let hcid = h.class_id.as_u32();
+                        let mut w = optr + HEADER_SIZE;
+                        let hi = (optr + tot).min(from_hi);
+                        while w + 8 <= hi {
+                            // SAFETY: `[optr, optr + tot)` is this object's own
+                            // span inside the mapped arena, and `w` is 8-aligned.
+                            let word = unsafe { *(w as *const u64) } as usize;
+                            let off = w - optr;
+                            report(
+                                &|| {
+                                    let hname = crate::gc::resolve_class_info(hcid)
+                                        .map(|(n, _)| n)
+                                        .unwrap_or_else(|| format!("cid{hcid:#x}"));
+                                    format!(
+                                        "YOUNG {hname}@{optr:#x} (kind={} slots={} alen={})",
+                                        ObjectHeader::kind_tag(
+                                            h.mark_word.load(Ordering::Relaxed)
+                                        ),
+                                        h.num_slots(),
+                                        h.array_length(),
+                                    )
+                                },
+                                off,
+                                word,
+                                &mut found,
+                                &mut reported,
+                            );
+                            w += 8;
+                        }
+                    }
+                    c += tot;
+                }
+                // Old gen: walk objects so the holder can be NAMED.
+                for (optr, osz) in old_gen.walk_objects() {
+                    let lo = optr as usize;
+                    let mut w = lo + HEADER_SIZE;
+                    let hi = lo + osz;
+                    while w + 8 <= hi {
+                        // SAFETY: `[lo, hi)` is a live old-gen object's span.
+                        let word = unsafe { *(w as *const u64) } as usize;
+                        let off = w - lo;
+                        report(
+                            &|| {
+                                // SAFETY: `optr` is a live old-gen object header.
+                                let ocid = unsafe {
+                                    (*(optr as *const ObjectHeader)).class_id.as_u32()
+                                };
+                                let oname = crate::gc::resolve_class_info(ocid)
+                                    .map(|(n, _)| n)
+                                    .unwrap_or_else(|| format!("cid{ocid:#x}"));
+                                format!("OLD {oname}@{lo:#x}")
+                            },
+                            off,
+                            word,
+                            &mut found,
+                            &mut reported,
+                        );
+                        w += 8;
+                    }
+                }
+                eprintln!(
+                    "[sweep-census] cycle={sweep_zero_cycle} INVERTED holder scan: \
+                     {found} reference(s) from a SURVIVING object into a span this sweep \
+                     is about to free (0 is the only clean answer)"
+                );
+            }
         }
 
         // Coalesce adjacent free blocks into maximal spans. Selective promotion
