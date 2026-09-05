@@ -281,9 +281,10 @@ REJECT would drop live roots. Used to accept, incompleteness costs only the path
 that was already there.
 
 Off by default: a bit per 8 bytes is capacity/64 of side table, 64 MB for a 4 GB
-heap. **Still owed:** G1's own arena (the same `Arena` type, so the bitmap is
-already there — what is missing is G1's `is_object_address` consulting it), and
-the measurement that would justify a default. The miss half of the census cannot
+heap. **Still owed:** G1, which is NOT the one-line change it looks like — it does not
+allocate through `Arena` at all (its backing is a `ReservedHeap` carved into
+`RegionBuf` slices, and `alloc_in_region` never reaches `hand_out`), so it has no
+bitmap to consult; and the measurement that would justify a default. The miss half of the census cannot
 yet separate a genuine non-object from a real object the bitmap never saw
 because a TLAB bump-allocated it; that needs a workload, not another counter.
 
@@ -493,8 +494,12 @@ UNVERIFIED because no CI job compiles it — verified compiling.
    SHOULD miss) or a real object the bitmap never saw because a TLAB
    bump-allocated it. Only the second is recoverable, by inserting at the TLAB
    bump rather than only at `hand_out`, and only a workload can tell them apart.
-5. **G1's `is_object_address`.** Its regions are carved from the same `Arena`
-   type, so the bitmap is already maintained there — what is missing is the
-   consultation. It should be one call and the same accept-only rule; it is
-   listed separately because it needs its own engagement reading, not because it
-   needs new machinery.
+5. **G1's `is_object_address`** — and note that the obvious shortcut does not
+   exist. G1 does NOT allocate through `Arena`: its backing is a
+   `heap_reservation::ReservedHeap` carved into `RegionBuf` slices, and
+   `alloc_in_region` never reaches `Arena::hand_out`, so no bitmap is maintained
+   for it. Giving it one is a real change at its own allocation chokepoint, not
+   a consultation of something already there. It is also worth less: G1's
+   predicate is already the cheaper of the two — no extent computation and no
+   second commit probe — so the expensive half the bitmap replaces in
+   `gen_heap` is not there to replace. Measure before building it.
