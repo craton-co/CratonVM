@@ -18,6 +18,39 @@ use std::sync::atomic::AtomicU64;
 /// shrink of 2026-08-06.
 pub const HEADER_SIZE: usize = 16;
 
+/// Bytes of heap covered by one card, for EVERY card table and every emitter
+/// that indexes one.
+///
+/// # Why this lives here and not beside a card table
+///
+/// It had three homes and no owner. `gc::card_table::CARD_SIZE` was `512`;
+/// `gc::g1_cards::G1_CARD_SHIFT` was `9` with a doc comment reading "512 bytes,
+/// matching `crate::card_table::CARD_SIZE`"; and the x64 emitter had
+/// `emit_shr_r64_imm8(RCX, 9); // CARD_SIZE = 512`. Three constants that must
+/// agree, bound by two comments.
+///
+/// The third one is why this matters more than tidiness: it is a SHIFT BAKED
+/// INTO MACHINE CODE. A divergence would not surface as a mismatch between two
+/// Rust constants a reader could spot — it would be compiled into a barrier
+/// that dirties the wrong card, and a missed dirty card is a live cross-region
+/// (or old-to-young) edge the next collection never scans, whose referent is
+/// not evacuated and whose region is then freed.
+///
+/// `cratonvm-types` is the only crate all three can name: `cratonvm-jit`
+/// depends on it unconditionally, and `cratonvm-gc` does too.
+pub const CARD_SIZE_BYTES: usize = 512;
+
+/// log2 of [`CARD_SIZE_BYTES`] — the shift an emitter puts in a `shr`.
+pub const CARD_SHIFT: u32 = CARD_SIZE_BYTES.trailing_zeros();
+
+// `trailing_zeros` of a non-power-of-two silently rounds DOWN, so a
+// `CARD_SIZE_BYTES` of 768 would yield a 256-byte card with no diagnostic
+// anywhere. Fail the build instead.
+const _: () = assert!(
+    (1usize << CARD_SHIFT) == CARD_SIZE_BYTES,
+    "CARD_SIZE_BYTES must be a power of two: CARD_SHIFT is derived from it and      is baked into emitted machine code",
+);
+
 // JIT x64 emits array element offsets as a *signed* disp8 whose value is
 // HEADER_SIZE. If HEADER_SIZE exceeds 127 the disp8 wraps negative and the
 // emitted code addresses backwards from the object base. Convert the affected

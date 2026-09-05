@@ -101,6 +101,7 @@ pub use subsystem_config::{
 // state until 2026-07-26; see `arch-2026-07-26/header-shrink.md` §6.2 and the
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
+    CARD_SHIFT, CARD_SIZE_BYTES,
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     element_type_tag_at, kind_tag_at, object_kind_from_tag, oob_index_code,
     plausible_object_header_at,

@@ -40,9 +40,23 @@
 //! paths, for thirty lines.
 //!
 //! What DID need fixing is the part a comment was holding together: the card
-//! SIZE. `G1_CARD_SHIFT` was `= 9` beside a sentence saying it matched
-//! `CARD_SIZE`, and the JIT bakes that shift into emitted machine code. It is
-//! derived and const-asserted now. See [`G1_CARD_SHIFT`].
+//! SIZE. There were THREE copies, not two — `CARD_SIZE = 512` here's sibling,
+//! `G1_CARD_SHIFT = 9` in this file, and `emit_shr_r64_imm8(RCX, 9);
+//! // CARD_SIZE = 512` in the x64 emitter — bound by two comments. The third is
+//! the one that matters: it is a shift BAKED INTO MACHINE CODE, so a divergence
+//! would not read as a mismatch between two Rust constants, it would be a
+//! barrier that dirties the wrong card.
+//!
+//! All three now derive from [`cratonvm_types::CARD_SIZE_BYTES`], which is the
+//! only crate the emitter and both card tables can name.
+//!
+//! BOTH JIT PATHS ARE CURRENTLY LATENT, which is why this was a trap rather
+//! than a bug: `inline_card_mark_available()` is a deliberate constant `false`,
+//! so the emitter's sequence is unreachable; and the G1 inline barrier CALLs the
+//! lean helper rather than emitting a card store, so words `[3]` and `[4]` of
+//! `JIT_G1_BARRIER` (`card_table_base`, `card_shift`) are published with no
+//! reader. Whoever wires either path is the one who would have re-derived the
+//! constant by hand, at the moment they were thinking about something else.
 //!
 //! The two original reasons, kept because the first is dated history and the
 //! second is still true:
@@ -124,7 +138,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// two Rust constants; it would be compiled into machine code that dirties the
 /// wrong card, and a missed dirty card is a live cross-region edge Phase 2 never
 /// scans, whose referent is not evacuated and whose region is then freed.
-pub const G1_CARD_SHIFT: u32 = crate::card_table::CARD_SIZE.trailing_zeros();
+pub const G1_CARD_SHIFT: u32 = cratonvm_types::CARD_SHIFT;
 
 /// Bytes of heap one card covers.
 pub const G1_CARD_BYTES: usize = 1 << G1_CARD_SHIFT;
