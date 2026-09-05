@@ -520,12 +520,31 @@ land on the allocation path of every thread rather than one.
    reference slots; a real application has thousands, loads classes while
    collections are in flight, and exercises the deferral branch this records
    ahead of.
-4. **Split the miss half** of `exact object-start answers`. 1112587/799889 says
-   the bitmap carries the majority of the predicate, but a miss is either a
-   genuine non-object (a zero, a small integer, a long bit pattern — which
-   SHOULD miss) or a real object the bitmap never saw because a TLAB
-   bump-allocated it. Only the second is recoverable, by inserting at the TLAB
-   bump rather than only at `hand_out`, and only a workload can tell them apart.
+4. ~~Split the miss half~~ — **done, and it answers the question by closing it.**
+
+   `hits=1112587 misses=799889 (of which real objects: 799889)`. Every miss is a
+   real object base. So the bitmap's incompleteness on this workload is entirely
+   TLAB-allocated objects, and plumbing the TLAB bump would take coverage from
+   58% to essentially 100%.
+
+   **Read the denominator before reading that as 42% of all probes.** The
+   bitmap check sits *after* the kind, element-type and reserved-field tests, so
+   a zero or a small integer never reaches the miss counter — it is rejected
+   upstream. `misses` therefore counts only candidates that already look like
+   object headers, and among those "is a real object" is very nearly implied.
+   The number is still the one that matters (it says the recoverable population
+   is all of it) but it is not a false-positive rate for the predicate.
+
+   **And it should still not be built.** The cost lands on the wrong path.
+   `Tlab::alloc` is a pointer bump with no atomics, and `HeapBitmap::insert` is
+   a `fetch_or` — so recording TLAB objects means an atomic read-modify-write
+   per allocation. Worse, `cursor` and `end` are a JIT CONTRACT at byte offsets
+   0 and 8, and the x64 backend bumps them **inline in emitted code**
+   (`emit_inline_tlab_new_ir`); `Tlab::alloc` is not even on the compiled path.
+   Recovering the coverage would mean adding a locked RMW on a shared bitmap
+   word to the hottest emitted sequence in the VM, to speed up a validator that
+   runs during root scanning. That is the wrong trade, and the census is what
+   made it a decision instead of a guess.
 5. **G1's `is_object_address`** — and note that the obvious shortcut does not
    exist. G1 does NOT allocate through `Arena`: its backing is a
    `heap_reservation::ReservedHeap` carved into `RegionBuf` slices, and
