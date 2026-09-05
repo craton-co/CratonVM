@@ -194,12 +194,63 @@ a second way for the loop body's value computation to end up above the
 back-edge target that does not involve a live expression stack at the
 entry pc.
 
-The distinguishing feature of `OsrStridedValue` against the fixed `Min`
-is **three stores in one loop body**, so the expression stack empties
-between statements — an entry pc can satisfy the new rule and still be
-mid-body. Entering mid-body is only sound if the back edge re-enters at
-the HEADER and the header's code is complete; check what
-`pc_to_native[header]` holds when the walk entered below it, and whether
-the emitted back edge targets the header or the entry.
+### Minimised: `test_classes/jit/OsrStridedValueMin.java`
 
-`CRATONVM_JIT_OSR=0` remains the workaround for both.
+Two nested loops and **no calls at all**:
+
+```java
+for (int i = 0; i < n; i++) a[i] = 0;      // hot -> OSR
+for (int r = 0; r < 12; r++)
+    for (int i = 0; i < n; i += 1024) a[i] = i + r;
+```
+
+    --nojit   11 1035 2059 3083 4107
+    jit       11   11   11   11   11
+
+Three hypotheses tested and refuted while minimising:
+
+* **"three stores in one body"** — no. A three-store version
+  (`a[i]=r; b[i]=i+r; c[i]=i^r;`) with `i = 0` and a trivial call is
+  **correct**.
+* **"the inner loop starts at the outer IV"** — no. `i = 0` and
+  `i = r` both fail, sampled at the indices each actually writes. (An
+  earlier `i = 0` arm reported a vacuous "same" because it sampled
+  `11 + k*1024`, which that loop never touches.)
+* **"a call in the outer body is required"** — no longer. It was, before
+  cause 1 was fixed; the call-free shape fails now.
+
+### What the code shows
+
+`Min4.zeroStart`, inner loop bytecode `27: iload_3 … 44: goto 27`:
+
+```
+44e  xor eax,eax ; mov r12,rax      ; i = 0            (pc 25/26)
+457  mov rax,r12 ; mov [rbp-30h],rax ; push i          (pc 34)
+45e  mov rax,r13 ; mov [rbp-38h],rax ; push r          (pc 35)
+468  mov rax,[rbp-30h] ; add eax,ecx ; i + r           (pc 36)
+475  mov [rbp-28h],rax               ; -> value slot
+479  cmp r12d,r15d ; jge exit        ; the test        (pc 29)
+48a  mov rax,r14                     ; aload a         (pc 32)
+4a6  mov [rax+rcx*4+10h],edx         ; iastore, value from the slot
+4aa  add r12d,400h
+6ca  jmp 479                         ; BACK EDGE
+```
+
+The emitted order is pcs **34, 35, 36, then 29, then 32** — the value
+expression is emitted *before* the loop test and the array load, and the
+loop body from `479` onward **contains no code for pcs 33–36 at all**.
+The back edge re-enters at `479`, so those pcs never execute again.
+
+So this is not "the entry pc had a live stack" (cause 1, fixed): the
+compiled loop body is *missing* the value computation outright, and
+would be wrong from any entry point. The operands appear once, in what
+looks like an OSR-entry reconstruction of the expression stack for a
+resume at bci 37 (`iastore`), and the loop body then reads the slots
+that reconstruction filled.
+
+The question for the fix: why does the walk emit pcs 34–36 ahead of pc
+29, and why does the loop body it lays down afterwards skip them? Start
+from whatever seeds the simulated operand stack for an OSR resume bci
+and whether the subsequent walk treats those slots as already populated.
+
+`CRATONVM_JIT_OSR=0` remains the workaround for both causes.

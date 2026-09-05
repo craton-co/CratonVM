@@ -2405,6 +2405,31 @@ mod tests {
         detect_java_home_from_path()
     }
 
+    /// **ONE FILE, TWO TESTS, AND `cargo test` RUNS THEM AT THE SAME TIME.**
+    ///
+    /// `java_resolves_to_the_sibling_alias_before_path` and
+    /// `auto_detection_declines_when_java_is_this_process` both stand a decoy
+    /// at `<test binary's directory>/java.exe`, and neither can use a different
+    /// path: the behaviour under test is that `CreateProcessW` searches the
+    /// calling executable's OWN directory first, so the file has to be beside
+    /// this binary and has to be called `java.exe`.
+    ///
+    /// Unserialised they raced three ways, and the loudest was the simplest:
+    /// both reach `std::fs::write` / `std::fs::copy` on the same path, and
+    /// Windows refuses the second one rather than interleaving it. Measured at
+    /// **5 failures in 40 paired runs** before this lock, 0 in 200 after.
+    /// The quieter interleaving is the one that reads as a spelling bug: B
+    /// deletes the file between A's `resolve_java_executable` and A's
+    /// `canonicalize`, so A's `expected` falls through `unwrap_or` to the raw
+    /// path while `resolved` is the canonical `\?\` form, and the assertion
+    /// compares two spellings of the same file.
+    ///
+    /// `parking_lot`, so a panicking test poisons nothing: a failure in one of
+    /// these must fail ONE test, not convert the other into a lock-poisoning
+    /// error that hides its own result.
+    #[cfg(windows)]
+    static SIBLING_ALIAS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// The `java.exe`-beside-`cratonvm.exe` layout must not auto-detect.
     ///
     /// This is the configuration the `java-bin-alias` cargo feature
@@ -2421,6 +2446,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn java_resolves_to_the_sibling_alias_before_path() {
+        let _serialised = SIBLING_ALIAS.lock();
         let me = std::env::current_exe().expect("current_exe");
         let dir = me.parent().expect("exe has a parent").to_path_buf();
 
@@ -2442,8 +2468,11 @@ mod tests {
         // same file, and the assertion compared them: the resolved side carried
         // the Windows `\\?\` prefix and the expected side did not.
         //
-        // Windows-only, and it fails ALONE -- not a race with the sibling test
-        // that shares this alias path, which is what it looks like at first.
+        // Windows-only, and it also fails ALONE, which is why it was fixed
+        // separately from the race: the two causes are independent and closing
+        // either one leaves the other. The race is real -- see
+        // [`SIBLING_ALIAS`], which is what now closes it -- and an earlier
+        // revision of this comment asserted it was not.
         let expected = std::fs::canonicalize(&alias).unwrap_or_else(|_| alias.clone());
 
         if created {
@@ -2469,6 +2498,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn auto_detection_declines_when_java_is_this_process() {
+        let _serialised = SIBLING_ALIAS.lock();
         let me = std::env::current_exe().expect("current_exe");
         let dir = me.parent().expect("exe has a parent").to_path_buf();
         let alias = dir.join("java.exe");
