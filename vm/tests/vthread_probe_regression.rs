@@ -157,39 +157,55 @@ fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
             return None;
         }
     };
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "[vthread_probe_regression] {class_name} timed out after {:?}",
-                        timeout
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                eprintln!("[vthread_probe_regression] try_wait failed: {e}");
-                return None;
-            }
-        }
+    // DRAIN WHILE WAITING. The loop this replaces polled `try_wait` over piped
+    // stdio without reading it, which deadlocks the moment a child outruns the
+    // 64 KiB pipe — the child blocks in `write`, never exits, and the guard
+    // reports a "timeout" for a process that finished its work. That is not
+    // what is failing here today (this probe writes 175 bytes), but it is the
+    // same latent defect that cost `native_io_dis_read_fully_pin` 10 timeouts
+    // in 10 on Linux, and the next diagnostic anyone adds to the VM re-creates
+    // it. `common::wait_draining` reads both pipes on their own threads and
+    // returns what it captured even when the cap is hit.
+    let timed = common::wait_draining(child, timeout);
+    let stdout = String::from_utf8_lossy(&timed.output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&timed.output.stderr).into_owned();
+    if timed.timed_out {
+        panic!(
+            "[vthread_probe_regression] {class_name} timed out after {timeout:?}
+             stdout:
+{stdout}
+stderr:
+{stderr}"
+        );
     }
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("[vthread_probe_regression] wait_with_output failed: {e}");
-            return None;
-        }
-    };
-    Some((
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    Some((stdout, stderr))
 }
+
+/// The hang cap for `VthreadProbe`, and why it is not 60 seconds.
+///
+/// This is a LIVELOCK GUARD, not a performance assertion. The test asserts
+/// `counted=10000 ok=true`; the cap exists only so a scheduler that stops
+/// making progress fails fast instead of hanging the suite.
+///
+/// It was 60 s, and it flaked: 2 failures in 8 runs in the 2026-09-05 Linux
+/// sweep. Measured rather than guessed at — 20 consecutive runs on that box
+/// under six added spinners:
+///
+/// ```text
+/// 20/20 counted=10000 ok=true
+/// elapsed  min 3.36s   median ~5.5s   max 26.39s
+/// ```
+///
+/// Every run finished, and finished CORRECTLY. There is no livelock here; the
+/// distribution is heavy-tailed under contention, and 60 s sits inside that
+/// tail once the sweep adds parallel cargo test binaries on top of the load.
+/// A cap has to clear the tail or it is measuring the host, and 26 s observed
+/// with the box already busy is not a ceiling anyone has established.
+///
+/// 300 s still catches what it is for: a 1-carrier livelock does not finish in
+/// five minutes, or in any time. The cost when healthy is zero, because the
+/// cap is only ever reached on failure.
+const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(300);
 
 /// Memoize each probe run so all subtests targeting the same class share one
 /// VM spawn. Keyed by class name.
@@ -265,7 +281,7 @@ fn vthread_tiny_builder_start_join() {
 /// "Thread.sleep on a v-thread never resumes".
 #[test]
 fn vthread_probe_10000_all_increment() {
-    let (stdout, stderr) = match cached_run("VthreadProbe", Duration::from_secs(60)) {
+    let (stdout, stderr) = match cached_run("VthreadProbe", VTHREAD_PROBE_CAP) {
         Some(o) => o,
         None => return,
     };
