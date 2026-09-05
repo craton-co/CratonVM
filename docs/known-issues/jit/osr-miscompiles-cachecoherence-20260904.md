@@ -72,11 +72,25 @@ loop-invariant.
 14bd  add  r12d, 400h
 ```
 
-The body is duplicated per back edge. The **first** copy computes the
-value expressions into frame slots; the **second** advances `i` and
-replays the stores from those slots without recomputing. Note also
-`139a`/`13a3`: the `xor` reads and writes the *same* slot, so the slot is
-not a stable home for `i` either.
+### The back edge names the bug
+
+```
+16bc  jmp 0x...13AB
+```
+
+The loop's back edge targets **`13ab`** — the guard — which is *after*
+the value computation at `138d`. So this is **not** an unroll that
+dropped a copy: the value expressions are emitted **above the loop's
+back-edge target**, i.e. outside the loop, and the body from `13ab`
+onward never recomputes them. Every iteration replays the slots the
+pre-loop code wrote once.
+
+That makes it a **label placement** problem: the back-edge target for
+this loop is bound past the first expression of the loop body, so the
+first body expression is executed exactly once, on fall-through.
+
+Note also `139a`/`13a3`: the `xor` reads and writes the *same* slot, so
+that slot is not a stable home for `i` either.
 
 `iPlusRound`'s slot (`-70h`) is never written inside the loop at all —
 its value is produced before the loop and only read within it.
@@ -99,6 +113,12 @@ its value is produced before the loop and only read within it.
 No IR-tier optimisation switch moves it, and the emitted idiom
 (`add r12d,400h`, simulated-stack spills through `[rbp-0B0h]`) is the
 single-pass backend's. So this is the **single-pass OSR** path.
+
+Start at whatever binds the back-edge target for a counted loop in
+`jit/src/x64/bytecode_walk.rs` under an OSR compile, and ask why it
+lands one expression late. The three-way trigger (a call in the OUTER
+body, stride > 1, a value expression over the IV) most likely selects
+which pc the loop head is recorded at.
 
 ## Minimal trigger
 
