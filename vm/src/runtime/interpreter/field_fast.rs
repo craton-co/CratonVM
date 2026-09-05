@@ -980,8 +980,20 @@ pub(super) fn array_load_ref(
     if crate::runtime::env_cache::no_ref_array_fast() {
         return false;
     }
-    if index < 0 || zgc.load_barrier_armed() || cratonvm_gc::autobox::wrapper_exists() {
-        site_stats::bump(site_stats::REFARR_MISS_SCREEN);
+    if index < 0 {
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
+        return false;
+    }
+    // Named separately: both are process-wide latches, but one is armed by a
+    // collection cycle and the other by anything that ever boxed a primitive
+    // into a reference slot. A census that says only "screen" cannot tell a
+    // reader which, and the fixes have nothing in common.
+    if zgc.load_barrier_armed() {
+        site_stats::bump(site_stats::REFARR_MISS_BARRIER);
+        return false;
+    }
+    if cratonvm_gc::autobox::wrapper_exists() {
+        site_stats::bump(site_stats::REFARR_MISS_WRAPPER);
         return false;
     }
     let base = arr.as_ptr() as usize;
