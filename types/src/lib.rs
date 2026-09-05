@@ -1128,6 +1128,47 @@ pub mod gpu_jit_gate_census {
     /// `java/lang/Math.min(II)I` was one of them.
     static RELEASED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+    static TARGET_NEVER_CANDIDATE: AtomicU64 = AtomicU64::new(0);
+    static TARGET_BODY_REFUSED: AtomicU64 = AtomicU64::new(0);
+    static BODY_REFUSED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// One `invokestatic` target the analyzer refused on its SIGNATURE —
+    /// native, abstract, non-static, or a parameter/return type the GPU
+    /// has no representation for. Counted, never named.
+    ///
+    /// Every compiled static call in a program walks past these: one run
+    /// of `GpuIntensitySweep` refuses 169 of them, nearly all JDK
+    /// bootstrap. Naming them would bury the counter below in noise, and
+    /// "never a candidate" is not a refusal anyone can act on.
+    #[inline]
+    pub fn note_target_never_candidate() {
+        TARGET_NEVER_CANDIDATE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One target that had KERNEL SHAPE — static, GPU-representable
+    /// parameters and return — and was refused on its BODY.
+    ///
+    /// This is the actionable half, and the one that was missing. The
+    /// two counters below exist because a narrowing visible only as an
+    /// ABSENCE cannot be told from one that never fired; an analyzer
+    /// rejection was invisible the same way and had no counter at all.
+    /// That is how 2026-09-05's pool-free `analyze` went unnoticed: the
+    /// gate stopped registering every kernel whose body needed a
+    /// constant-pool constant, and printed a census byte-identical to a
+    /// healthy one. The only symptom was that `long[]` and `double[]`
+    /// kernels got slower.
+    ///
+    /// A `LoadConstant` or `Compare` here on a method that looks like
+    /// one of your kernels is the shape to be suspicious of.
+    #[inline]
+    pub fn note_target_body_refused(target: String) {
+        TARGET_BODY_REFUSED.fetch_add(1, Ordering::Relaxed);
+        let mut v = BODY_REFUSED_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+        if v.len() < MAX_NAMED && !v.iter().any(|t| *t == target) {
+            v.push(target);
+        }
+    }
+
     /// One caller NOT blocked because its eligible-looking callee fails a
     /// gate `try_dispatch` applies unconditionally. `target` is the
     /// callee, which is the interesting half: one bad target releases
@@ -1199,6 +1240,17 @@ pub mod gpu_jit_gate_census {
             );
             for t in RELEASED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).iter() {
                 eprintln!("[cratonvm] gpu jit gate:   eligible but never dispatchable: {t}");
+            }
+            let never = TARGET_NEVER_CANDIDATE.load(Ordering::Relaxed);
+            let body = TARGET_BODY_REFUSED.load(Ordering::Relaxed);
+            if never > 0 || body > 0 {
+                eprintln!(
+                    "[cratonvm] gpu jit gate: analyzer refused {} call target(s):                      never-a-candidate={never} (signature), kernel-shaped={body} (body)                      -- none registered with the offload hook",
+                    never + body
+                );
+                for t in BODY_REFUSED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+                    eprintln!("[cratonvm] gpu jit gate:   kernel-shaped, body refused: {t}");
+                }
             }
             let drains = DRAINS.load(Ordering::Relaxed);
             if drains > 0 || writers > 0 {
