@@ -17508,10 +17508,6 @@ mod tests {
         assert_eq!(sum(10), 45, "sum 0..9 = 45");
     }
 
-    // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
-    // header self-loops (the condition is at the bottom). Exercises the
-    // if-as-back-edge path + a block whose true edge targets its own head.
-    #[test]
     /// **The one that matters: enter the loop part-way and finish it.**
     ///
     /// `int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }`, whose
@@ -17594,6 +17590,9 @@ mod tests {
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
     }
 
+    // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
+    // header self-loops (the condition is at the bottom). Exercises the
+    // if-as-back-edge path + a block whose true edge targets its own head.
     #[test]
     fn test_lower_do_while_sum() {
         // int f(int n){ int s=0,i=0; do { s+=i; i++; } while(i<n); return s; }
