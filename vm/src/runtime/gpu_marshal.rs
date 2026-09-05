@@ -360,10 +360,21 @@ pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) 
         ObjectKind::Array,
         "host_view_i8: not an array"
     );
-    assert_eq!(
-        header.element_type(),
-        ArrayElementType::Byte,
-        "host_view_i8: not a byte[]"
+    // `boolean[]` shares this path with `byte[]` deliberately:
+    // `element_byte_size` is 1 for both, so the copy below is
+    // bit-identical. They diverge only on the DEVICE, where `bastore`
+    // into a boolean array masks to bit 0 (JVMS 6.5) -- see
+    // `ParamKind::BoolArray`. Asserting `== Byte` here made a
+    // `boolean[]` kernel PANIC at marshal time after the analyzer had
+    // already admitted it, which is the analyzer/marshaller split all
+    // over again, one layer lower than the agreement test can see.
+    assert!(
+        matches!(
+            header.element_type(),
+            ArrayElementType::Byte | ArrayElementType::Boolean
+        ),
+        "host_view_i8: not a byte[] or boolean[], got {:?}",
+        header.element_type()
     );
     let len = header.array_length() as usize;
     // PERF: bulk copy — see `host_view_i32` / `host_view_i16`. `byte[]`
@@ -698,10 +709,21 @@ pub fn write_back_i8(obj: ObjectRef, heap: &VmHeap, src: &[i8], _token: &Safepoi
         ObjectKind::Array,
         "write_back_i8: not an array"
     );
-    assert_eq!(
-        header.element_type(),
-        ArrayElementType::Byte,
-        "write_back_i8: not a byte[]"
+    // `boolean[]` shares this path with `byte[]` deliberately:
+    // `element_byte_size` is 1 for both, so the copy below is
+    // bit-identical. They diverge only on the DEVICE, where `bastore`
+    // into a boolean array masks to bit 0 (JVMS 6.5) -- see
+    // `ParamKind::BoolArray`. Asserting `== Byte` here made a
+    // `boolean[]` kernel PANIC at marshal time after the analyzer had
+    // already admitted it, which is the analyzer/marshaller split all
+    // over again, one layer lower than the agreement test can see.
+    assert!(
+        matches!(
+            header.element_type(),
+            ArrayElementType::Byte | ArrayElementType::Boolean
+        ),
+        "write_back_i8: not a byte[] or boolean[], got {:?}",
+        header.element_type()
     );
     let len = header.array_length() as usize;
     assert_eq!(
