@@ -116,6 +116,31 @@ pub fn now() -> u64 {
     0
 }
 
+thread_local! {
+    /// Per-thread accumulation, flushed to the shared counters in batches.
+    ///
+    /// # Why this is not a shared `fetch_add`
+    ///
+    /// The first version charged straight into [`CYCLES`]. A Relaxed
+    /// `fetch_add` on x86 is a `lock xadd` — tens of cycles — and there are
+    /// four of them per access on a path that costs about a hundred. The
+    /// instrument was a large fraction of what it measured, and it showed:
+    /// every phase read within one cycle of every other (50.1 / 49.2 / 49.5 /
+    /// 49.9, four equal quarters) for phases that do visibly different amounts
+    /// of work. Four equal quarters is what an instrument reports when it is
+    /// measuring its own boundaries rather than the code between them.
+    ///
+    /// `Cell<u64>` accumulation costs a load, an add and a store, and the
+    /// shared atomics are touched once per [`FLUSH_EVERY`] accesses.
+    static LOCAL: [std::cell::Cell<u64>; N] = [const { std::cell::Cell::new(0) }; N];
+    static LOCAL_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Accesses between flushes of the thread-local accumulators into the shared
+/// counters. A thread that exits mid-batch loses at most this many accesses'
+/// worth, which is noise against the millions these probes run.
+const FLUSH_EVERY: u64 = 4096;
+
 /// Charge `end - start` to `phase`. No-op when off, and when the counter went
 /// backwards (a migration between cores with unsynchronised TSCs).
 #[inline]
@@ -123,13 +148,40 @@ pub fn charge(phase: usize, start: u64, end: u64) {
     if !on() || end <= start {
         return;
     }
-    CYCLES[phase].fetch_add(end - start, Ordering::Relaxed);
+    let d = end - start;
+    LOCAL.with(|l| l[phase].set(l[phase].get() + d));
 }
 
 #[inline]
 pub fn count_access() {
-    if on() {
-        ACCESSES.fetch_add(1, Ordering::Relaxed);
+    if !on() {
+        return;
+    }
+    let n = LOCAL_N.with(|c| {
+        let v = c.get() + 1;
+        c.set(v);
+        v
+    });
+    if n % FLUSH_EVERY == 0 {
+        flush();
+    }
+}
+
+/// Fold this thread's accumulators into the shared counters and reset them.
+#[inline(never)]
+#[cold]
+fn flush() {
+    LOCAL.with(|l| {
+        for (i, c) in l.iter().enumerate() {
+            let v = c.replace(0);
+            if v != 0 {
+                CYCLES[i].fetch_add(v, Ordering::Relaxed);
+            }
+        }
+    });
+    let n = LOCAL_N.with(|c| c.replace(0));
+    if n != 0 {
+        ACCESSES.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -139,6 +191,9 @@ pub fn dump() {
     if !on() {
         return;
     }
+    // The dumping thread's own partial batch; other threads' tails are lost,
+    // which is bounded by `FLUSH_EVERY` per thread.
+    flush();
     let n = ACCESSES.load(Ordering::Relaxed);
     if n == 0 {
         eprintln!(

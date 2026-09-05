@@ -465,8 +465,30 @@ pub(super) fn getfield_fast_keyed(
     };
     let t_ptr = ph::now();
     ph::charge(ph::P_PTR, t_site, t_ptr);
+    // Charged at EVERY success exit, not just the compact tail.
+    //
+    // The first version of this instrument put the count on the compact path
+    // only, and `FieldBurn`'s receiver is legacy-layout — so it returned
+    // through `getfield_legacy`, the phases accumulated over millions of
+    // accesses, and the denominator counted ONE. It printed
+    // `accesses=1 total_cycles=1215177994`. That the count is printed at all
+    // is what made it obvious; a per-access figure alone would have looked
+    // merely surprising.
+    macro_rules! charged_hit {
+        () => {{
+            ph::charge(ph::P_READ, t_ptr, ph::now());
+            // CALIB last, under the conditions the phases above actually ran in.
+            let c0 = ph::now();
+            ph::charge(ph::P_CALIB, c0, ph::now());
+            ph::count_access();
+        }};
+    }
     let Some(storage) = site.storage else {
-        return getfield_legacy(shared, stack, fp, &site);
+        let hit = getfield_legacy(shared, stack, fp, &site);
+        if hit {
+            charged_hit!();
+        }
+        return hit;
     };
     // SAFETY (every raw load below): `fp` addresses the field inside a live,
     // header-validated compact object; the width is the layout's own.
@@ -481,6 +503,7 @@ pub(super) fn getfield_fast_keyed(
             let v = unsafe { load_u64(fp) } as i64;
             stack.pop_compact();
             stack.push_long_unchecked(v);
+            charged_hit!();
             site_stats::bump(site_stats::FAST_GET_HIT);
             return true;
         }
@@ -490,6 +513,7 @@ pub(super) fn getfield_fast_keyed(
             let v = f64::from_bits(unsafe { load_u64(fp) });
             stack.pop_compact();
             stack.push_double_unchecked(v);
+            charged_hit!();
             site_stats::bump(site_stats::FAST_GET_HIT);
             return true;
         }
@@ -536,12 +560,7 @@ pub(super) fn getfield_fast_keyed(
     };
     stack.pop_compact();
     stack.push_compact(pushed);
-    ph::charge(ph::P_READ, t_ptr, ph::now());
-    // CALIB last, so it measures two reads under the conditions the phases
-    // above actually ran in rather than at a cold cache.
-    let c0 = ph::now();
-    ph::charge(ph::P_CALIB, c0, ph::now());
-    ph::count_access();
+    charged_hit!();
     site_stats::bump(site_stats::FAST_GET_HIT);
     true
 }
