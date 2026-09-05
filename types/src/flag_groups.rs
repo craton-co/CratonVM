@@ -1230,6 +1230,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-phi-copy-regs", on_key: Some("CRATONVM_JIT_IR_PHI_COPY_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-skip-republish", on_key: Some("CRATONVM_JIT_IR_SKIP_REPUBLISH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-deopt-regs", on_key: Some("CRATONVM_JIT_IR_DEOPT_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "ir-osr-entry", on_key: Some("CRATONVM_JIT_IR_OSR_ENTRY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "osr-optimizing", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-drop-phi-home", on_key: Some("CRATONVM_JIT_IR_DROP_PHI_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "merged-call-sentinel", on_key: Some("CRATONVM_JIT_MERGED_CALL_SENTINEL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
@@ -1399,6 +1401,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-rpo-layout", on_key: Some("CRATONVM_JIT_IR_RPO_LAYOUT"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "ir-call-anewarray", on_key: Some("CRATONVM_JIT_IR_CALL_ANEWARRAY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "supersede-epoch-skip-useless", on_key: Some("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None, since: "2026-07-25" },
@@ -1762,10 +1765,19 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "verify-schedule", on_key: Some("CRATONVM_JIT_VERIFY_SCHEDULE"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::JIT, token: "verify-types", on_key: Some("CRATONVM_JIT_VERIFY_TYPES"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None, since: "2026-06-14" },
-    E { group: Group::JIT, token: "xt-helper-window-discharge", on_key: Some("CRATONVM_XT_HELPER_WINDOW_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-02" },
-    E { group: Group::JIT, token: "xt-pinned-peer-depth", on_key: Some("CRATONVM_XT_PINNED_PEER_DEPTH"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "xt-helper-window-discharge", on_key: Some("CRATONVM_XT_HELPER_WINDOW_DISCHARGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "xt-pinned-peer-depth", on_key: Some("CRATONVM_XT_PINNED_PEER_DEPTH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-pinned-peer-publish-only", on_key: Some("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY"), off_key: None, off_word: None, since: "2026-09-02" },
-    E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "dbg-stale-frame-words", on_key: Some("CRATONVM_DBG_STALE_FRAME_WORDS"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "pin-unnamed-frame-refs", on_key: Some("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "remap-unmapped-dupes", on_key: Some("CRATONVM_JIT_REMAP_UNMAPPED_DUPES"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "zgc-jit-blanket-refusal", on_key: Some("CRATONVM_ZGC_JIT_BLANKET_REFUSAL"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: Some("CRATONVM_BLOCKED_WAKE_JIT_REMAP"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "xt-keep-unrewritable-on-discharge", on_key: Some("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-04" },
+    E { group: Group::GC, token: "zgc-unrewritable-peer-refuses", on_key: Some("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES"), off_key: None, off_word: None, since: "2026-09-04" },
+    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "xt-helper-window-interior", on_key: Some("CRATONVM_XT_HELPER_WINDOW_INTERIOR"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-pin", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None, since: "2026-07-02" },
@@ -1904,6 +1916,11 @@ pub const INVENTORY: &[E] = &[
     // DISPATCHER could actually launch. The control arm for that
     // narrowing; see `offload_jit_gate::target_can_ever_dispatch`.
     E { group: Group::GC, token: "gpu-jit-gate-dispatchable", on_key: Some("CRATONVM_GPU_JIT_GATE_DISPATCHABLE"), off_key: None, off_word: None, since: "2026-09-04" },
+    // `=0` drops the caller-blocking half of `offload_jit_gate`: a caller
+    // of an eligible kernel compiles, and offload silently ends there.
+    // A CONTROL ARM, not a production setting -- it isolates the cost of
+    // the refusal from everything else `--gpu` changes.
+    E { group: Group::GC, token: "gpu-jit-gate-callers", on_key: Some("CRATONVM_GPU_JIT_GATE_CALLERS"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "gpu-critical-lease-ms", on_key: Some("CRATONVM_GPU_CRITICAL_LEASE_MS"), off_key: None, off_word: None, since: "2026-07-31" },
     E { group: Group::GC, token: "gpu-critical-wait-ms", on_key: Some("CRATONVM_GPU_CRITICAL_WAIT_MS"), off_key: None, off_word: None, since: "2026-07-31" },
     // A/B levers declared 2026-09-02 with the four GPU-subsystem fixes.
@@ -3111,6 +3128,85 @@ mod tests {
             c.resolve().get("CRATONVM_OLD_SWEEP_JIT"),
             Some(OsString::from("0"))
         );
+    }
+
+    /// **EVERY default-ON knob's off token must actually write the off word.**
+    ///
+    /// `default_on_knob_is_switched_off_by_value_not_by_unsetting` above pins
+    /// this for one row, which is one row's worth of protection: a NEW row
+    /// written in the wrong shape is not covered by it. Three were --
+    /// `xt-helper-window-discharge`, `xt-pinned-peer-depth` and
+    /// `xt-peer-shadow-scan` all named their own variable in `off_key` as well
+    /// as `on_key`, so `apply` took the "dedicated opt-out spelling" branch,
+    /// wrote `VAR=1`, then cleared `on_key` -- the same key -- and the knob came
+    /// out UNSET. Their parsers read unset as ON, so `CRATONVM_JIT=-<token>`
+    /// silently left three default-ON GC-root features running. Kill switches
+    /// that do not kill, which is worse than none: an arm that reads as
+    /// "the feature is not the cause" while the feature is still on.
+    ///
+    /// The structural gates caught the shape, and their message -- "off_word
+    /// only applies to a default-ON knob with no opt-out key" -- describes the
+    /// table, not the damage. This asserts the CONSEQUENCE, over every row that
+    /// has an `off_word` now or later, so the next one is reported as what it
+    /// costs rather than as a schema violation.
+    #[test]
+    fn every_default_on_knob_resolves_its_off_token_to_the_off_word() {
+        for e in INVENTORY {
+            let Some(word) = e.off_word else { continue };
+            let key = e
+                .on_key
+                .expect("checked by every_entry_can_be_switched_both_ways");
+            let c = case(&[(e.group.var(), &format!("-{}", e.token))]);
+            assert_eq!(
+                c.resolve().get(key),
+                Some(OsString::from(word)),
+                "{}=-{} must write {key}={word}. It resolved to {:?} instead, \
+                 which this knob's parser reads as ON -- the off token is inert.",
+                e.group.var(),
+                e.token,
+                c.resolve().get(key),
+            );
+        }
+    }
+
+    /// The three rows that were wrong, by name, because a table-driven test
+    /// keeps passing if a row is deleted. Each is a default-ON cross-thread
+    /// root-scan feature whose kill switch is the first thing an investigation
+    /// reaches for.
+    #[test]
+    fn the_xt_root_scan_kill_switches_actually_switch_off() {
+        for (group, token, key) in [
+            (
+                "CRATONVM_JIT",
+                "xt-helper-window-discharge",
+                "CRATONVM_XT_HELPER_WINDOW_DISCHARGE",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-pinned-peer-depth",
+                "CRATONVM_XT_PINNED_PEER_DEPTH",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-peer-shadow-scan",
+                "CRATONVM_XT_PEER_SHADOW_SCAN",
+            ),
+        ] {
+            let off = case(&[(group, &format!("-{token}"))]);
+            assert_eq!(
+                off.resolve().get(key),
+                Some(OsString::from("0")),
+                "{group}=-{token} must write {key}=0; the readers in \
+                 vm/src/jit/xt_root_scan.rs and conservative_roots.rs treat \
+                 anything else -- UNSET included -- as on"
+            );
+            let on = case(&[(group, token)]);
+            assert_eq!(
+                on.resolve().get(key),
+                Some(OsString::from("1")),
+                "{group}={token} must still write {key}=1"
+            );
+        }
     }
 
     #[test]

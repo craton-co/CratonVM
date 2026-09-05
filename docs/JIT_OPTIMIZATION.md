@@ -1997,6 +1997,65 @@ rather than a crash, and this section already records what happens when that
 class of work is begun without the instrument first. The census above is the
 instrument; the go is now on the record with a number behind it.
 
+#### The OSR route, measured: it works, it is correct, and it is 1.56x SLOWER
+
+The reach census said the optimizing tier never sees a loop entered by a back
+edge; the wiring made it possible; this is what it bought.
+`probes/OsrTierBench.java` is the shape the census named — a kernel entered
+ONCE, calling nothing, so a back edge is its only route to compiled code — and
+it is admissible under `ir_osr_sentinel_free`. Interleaved, seven rounds, the
+probe's own in-kernel `ms` so process startup is not in the number:
+
+| arm | median ms |
+|---|---|
+| control | 352 |
+| control again | 355 |
+| `CRATONVM_JIT_FORCE_C2=1` alone | 359 |
+| **door ON** | **551** |
+
+The two controls differ by 0.9%, and `FORCE_C2` alone lands inside that — so the
+confound is excluded and the door owns the difference. **1.56x slower, slowest
+in all seven rounds.** The answer is `ck=25500075088100865`, which is HotSpot's,
+so this is a speed result and not a correctness one.
+
+**This is the tier inversion again, and that is the point.** It is the same
+~1.5x this section has measured all along, now reproduced on a DIFFERENT probe
+through a DIFFERENT door — which is the independent confirmation the original
+number never had. The optimizing tier's loop body is worse than the single-pass
+tier's, and giving it more loops to compile makes things worse in proportion.
+
+So `CRATONVM_JIT_OSR_OPTIMIZING` stays off, and the reach work's payoff is
+GATED on the body, not on the route: the 1.57x register-residency share and the
+1.36x latency residual are what stand between this route and a win. The route
+is infrastructure that pays nothing until they are fixed — which is worth
+knowing now rather than after they are.
+
+#### And the phi work finally has a positive number
+
+The register-to-register phi copies, the suppressed re-publish, the register
+image and the dropped home all measured ZERO when they landed. They were
+measured on `FieldLoop`, where the optimizing tier was not running the hot loop
+— so the arms compared a body that barely mattered. This probe is the first
+workload where that tier owns a loop through OSR, and the same four switches on
+top of the door read:
+
+| arm | median ms |
+|---|---|
+| door ON (control) | 558 |
+| door ON again (control) | 575 |
+| **door ON + the four switches** | **526** |
+
+**`all` beat its paired `on` run in 11 of 12 rounds**, `P(all < control) = 0.743`
+over all pairs, against a 3.1% control-vs-control floor on a busier host. About
+**6%**, and the paired count is the statistic to read — under no effect it is a
+fair coin, and 11 of 12 is not.
+
+That does not rescue the 1.56x. It does say the work was sound and the earlier
+zeros were a measurement problem, not a design problem: **a change to the
+optimizing tier's loop body cannot be measured on a workload where that body is
+not what runs.** Every zero this section records against those switches was
+taken on one.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

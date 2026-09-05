@@ -114,6 +114,10 @@ const ALLOWED: &[(&str, &str)] = &[
         "kind 4: a TEST-HARNESS regeneration switch, not a VM knob.          `types/tests/doc_citation_paths.rs` reads it with a raw          `std::env::var_os` to rewrite `types/tests/dead-citation-baseline.txt`,          the ratchet of citations naming a page that exists nowhere. It is          deliberately outside the latched snapshot: the guard runs before any          VM exists, and a regenerating run FAILS on purpose, so routing it          through `VmFlags` would give a token to a switch the VM must never          honour. Nothing under any `src/` reads it.",
     ),
     (
+        "CRATONVM_TEST_PIPE_FLOOD",
+        "kind 4: a TEST-HARNESS re-entry switch, not a VM knob.          `vm/tests/class_loader_unload_regression.rs` re-executes ITS OWN test          binary with this set, which is what turns the otherwise-inert          `flood_helper` test into the child half of          `wait_draining_survives_a_child_that_outruns_the_pipe` -- there is no          shell command that floods a pipe on both Linux and Windows, so the          child has to be this binary. It is read with a raw `std::env::var_os`          before any VM exists and nothing under any `src/` reads it, so a          `CRATONVM_<GROUP>=` token for it would name a switch the VM can never          consult.",
+    ),
+    (
         "CRATONVM_RATCHET_ROWS",
         "kind 4: a TEST-HARNESS dump switch, not a VM knob. \
          `native-builtins/tests/stub_ratchet.rs` reads it with a raw \

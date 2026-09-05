@@ -3231,6 +3231,50 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // AsynchronousServerSocketChannel
 // ---------------------------------------------------------------------------
 
+/// **RESOLVED 2026-09-04 — this comment described a carrier this file no longer
+/// mints, and its advice would now steer a reader away from a repair that has
+/// already happened. The paragraphs below are kept because their reasoning is
+/// still the right reasoning; read this block first.**
+///
+/// Everything after this point argues from a receiver whose class NAME is the
+/// ABSTRACT `java.nio.channels.AsynchronousServerSocketChannel`, which declares
+/// exactly one instance field (`provider`) — so `F_OPEN` landed in that slot and
+/// the other three sat past the end of everything the class declares. That was
+/// true when it was written. It is not true now: `alloc_concrete` mints the
+/// CONCRETE impl, and both channels are byte-identical to HotSpot on the class
+/// name (MEASURED, `probes/AioClassProbe`):
+///
+/// ```text
+///                                    HotSpot 25                                CratonVM
+/// AsynchronousServerSocketChannel.open()  sun.nio.ch.UnixAsynchronousServerSocketChannelImpl  same
+/// AsynchronousSocketChannel.open()        sun.nio.ch.UnixAsynchronousSocketChannelImpl        same
+/// ```
+///
+/// The concrete impls declare 16 and 48 fields, so the four VM fields are now
+/// APPENDED past the real layout rather than overwriting slot 0 — which is
+/// exactly the "appended-slot idiom" the paragraph below says cannot be applied
+/// here. MEASURED with `CRATONVM_DBG_LAYOUT_ALIAS=1`:
+///
+/// ```text
+/// UnixAsynchronousServerSocketChannelImpl   requested 20   real 16   over  +4
+/// UnixAsynchronousSocketChannelImpl         requested 52   real 48   over  +4
+/// ```
+///
+/// `+4` is the four constants, and nothing shares a slot with `provider` any
+/// more. The residual `over` rows are the intended shape of appending, not a
+/// collision. `provider()` itself is separately registered on both classes (it
+/// answers the platform provider rather than reading the field at all), so the
+/// symptom this comment predicted — *"`provider()` … would return that Int"* —
+/// cannot occur either.
+///
+/// **What is still true:** the four constants are module-level and shared with
+/// `AsynchronousSocketChannel`, and three registrations bind the same native to
+/// both classes. Splitting the maps per class is still the tidier shape. It is
+/// no longer a CORRECTNESS repair, so the warning below that renumbering "is out
+/// of bounds" should not stop anyone — there is nothing broken left to break.
+///
+/// ---
+///
 /// LIVE 4-vs-1 over-allocation, MEASURED and deliberately NOT repaired.
 /// W7-66-live-over-allocations.md.
 ///
@@ -3276,6 +3320,34 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// answers `sun.nio.ch.WindowsAsynchronousServerSocketChannelImpl`. Since
 /// dispatch keys on the receiver's class, moving this class's 12 registrations
 /// onto the `Impl` strands every receiver this function returns.
+/// `AsynchronousSocketChannel.provider()` / `AsynchronousServerSocketChannel
+/// .provider()` — the platform provider, not `null`.
+///
+/// Both are `final` accessors over a `private final AsynchronousChannelProvider
+/// provider` field, and this file's own slot map parks `F_OPEN` in that slot
+/// (see `aio_assc_open`'s doc comment, which measures the collision and
+/// explains why renumbering it needs one change across two crates). The
+/// accessor therefore could not read a provider out of the field, and answered
+/// `null`.
+///
+/// Registering the accessor sidesteps the field entirely: the STATIC
+/// `AsynchronousChannelProvider.provider()` already resolves on this VM —
+/// MEASURED, it answers `sun.nio.ch.LinuxAsynchronousChannelProvider` — and it
+/// is the same singleton HotSpot hands back from the instance accessor. So
+/// this is a delegation to a working path, not a second source of truth, and
+/// it leaves the slot-map repair exactly as open as it was.
+///
+/// MEASURED on HotSpot 25 (`probes/ResidualProbe.java`): the static and both
+/// instance accessors return the SAME object.
+fn aio_channel_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ctx.invoke(
+        "java/nio/channels/spi/AsynchronousChannelProvider",
+        "provider",
+        "()Ljava/nio/channels/spi/AsynchronousChannelProvider;",
+        &[],
+    )
+}
+
 fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = job_sender();
     // Concrete, per `ASSC_IMPLS`. This is the site the doc comment above calls
@@ -3632,6 +3704,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         aio_asc_open_group,
     );
     r.register(asc, "isOpen", "()Z", aio_asc_is_open);
+    r.register(
+        asc,
+        "provider",
+        "()Ljava/nio/channels/spi/AsynchronousChannelProvider;",
+        aio_channel_provider,
+    );
     r.register(asc, "close", "()V", aio_asc_close);
     r.register(
         asc,
@@ -3718,6 +3796,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         aio_assc_open_group,
     );
     r.register(assc, "isOpen", "()Z", aio_asc_is_open);
+    r.register(
+        assc,
+        "provider",
+        "()Ljava/nio/channels/spi/AsynchronousChannelProvider;",
+        aio_channel_provider,
+    );
     r.register(assc, "close", "()V", aio_assc_close);
     r.register(
         assc,

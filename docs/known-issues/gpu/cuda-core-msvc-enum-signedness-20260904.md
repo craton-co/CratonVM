@@ -8,9 +8,13 @@ box while building the `cuda-oxide` backend (`cuda-bridge/src/backend_oxide.rs`)
 Linux-only until upstream fixes it; `--features cuda-oxide` will not
 build on Windows/MSVC.
 
-Reproduced deterministically: 17 errors, every one a signedness
-mismatch. Verified fixable with 13 mechanical edits, and verified
-working on this machine's GPU afterwards (see "It works once patched").
+Reproduced deterministically on BOTH the published `cuda-core` 0.3.1 and
+upstream `main` @ `cdc69c13a752` -- 17 errors, identical line numbers,
+every one a signedness mismatch. Verified fixable with 13 casts, and
+verified working on this machine's GPU afterwards (see "It works once
+patched").
+
+**A fix is prepared and ready to submit** -- see "Upstream" at the end.
 
 ## What happens
 
@@ -53,8 +57,37 @@ Linux shape and passes those constants where the FFI function signature
 says `unsigned int` (the C prototypes really do say `unsigned int Flags`),
 so the mismatch is between the enum constant and the parameter.
 
-This is consistent with the project's own stated support matrix —
+This is consistent with the project's own stated support matrix --
 cutile-rs's README lists **Linux (tested on Ubuntu 24.04)** only.
+
+### Upstream already fixed the same bug elsewhere
+
+cutile-rs PR **#204**, "fix: adapt CUDA driver flag types", merged
+2026-08-05, carries exactly this diagnosis: *"`cuda-core` exposes the
+flag aliases as `i32`, while bindgen generates the corresponding CUDA
+driver parameters as `c_uint` (`u32`). This prevents the crate from
+compiling with the current CUDA 13.3 SDK on the MSVC target."*
+
+It is merged and intact -- its six `as _` casts are present in 0.3.1 and
+on `main`. But it covered `cuda-core/src/cudarc_shim.rs` and
+`cuda-async/src/device_future.rs` only; the equivalent sites under
+`cuda-core/src/simt/` were not included, and those are the 17 errors
+here.
+
+That matters for how this gets reported: it is a **follow-up to a merged
+fix**, not a new bug and not a regression. A report that did not say so
+would likely be closed as already-fixed. It also settles the convention
+-- `as _`, which keeps the source portable instead of hard-coding either
+platform's choice.
+
+### `context.rs:293` is NOT affected
+
+Worth recording because it looks like it should be. `SyncPolicy::from_raw`
+takes `raw: CUctx_flags_enum`, so `raw & CU_CTX_SCHED_MASK` is
+`c_int & c_int` and is consistent on both platforms. An early draft of
+the upstream report listed it, inferred from a grep; building `main`
+proves the compiler never complains about it and the fix is clean
+without touching it.
 
 ## It works once patched
 
@@ -104,8 +137,43 @@ a fork of an NVIDIA crate for. Revisit if upstream declines the fix.
 - **Windows**: use the default `cuda` (cudarc) backend. If you need to
   build the oxide backend here, apply the 13 casts to a local checkout
   of `cuda-core` 0.3.1 and add a `[patch.crates-io]` entry for it.
-- **Upstream**: the fix is small and self-contained; worth reporting to
-  NVlabs/cutile-rs.
+- **Upstream**: prepared, not yet submitted (this box has no GitHub API
+  credentials). Two artefacts were produced on 2026-09-04:
+
+  * an issue write-up citing #204, the 17 errors, the 113/113 `c_int`
+    census, and the sm_75 / stable-toolchain findings;
+  * `0001-cuda-core-msvc-simt-flags.patch`, a `git am`-able commit
+    against `main` @ `cdc69c13a752`.
+
+  The patch was validated with upstream's own gates on this box:
+  `cargo build -p cuda-core` 0 errors 0 warnings, `cargo fmt --check`
+  clean, `cargo clippy` clean (they enforce `clippy::all`, PR #263), and
+  `git am` applies to a pristine checkout.
+
+  **Apply it with a plain `git am`.** cutile-rs's CONTRIBUTING requires a
+  DCO sign-off on every commit, and the patch already carries one:
+
+      From: victor-craton <victor@craton.com.ar>
+      Signed-off-by: victor-craton <victor@craton.com.ar>
+
+  Author and sign-off match, which is what a DCO bot checks (it compares
+  those two, not the committer, so re-applying under a different local
+  git identity is fine). The sign-off is baked in at the repository
+  owner's explicit direction -- it is the submitter's own certification,
+  so do NOT re-generate this patch under someone else's identity without
+  asking them first.
+
+## Files here
+
+Both are checked in beside this page so the fix is reproducible from the
+repo rather than from one machine's temp directory:
+
+- `0001-cuda-core-msvc-simt-flags.patch` — the 13-cast fix as a `git am`
+  commit against cutile-rs `main` @ `cdc69c13a752`. Line numbers are
+  identical in the published 0.3.1, so it also rebuilds the local
+  toolchain copy at `C:/craton/toolchain/cuda-core-0.3.1-win`.
+- `cuda-core-msvc-upstream-report.md` — the issue write-up, ready to file
+  at <https://github.com/NVlabs/cutile-rs/issues/new>.
 
 ## Pointers
 

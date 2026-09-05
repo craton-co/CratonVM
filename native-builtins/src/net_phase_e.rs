@@ -13636,6 +13636,186 @@ fn re5_ssl_parameter_ciphers(
 
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
+/// Start `sendAsync`'s request on its own thread, returning the INCOMPLETE
+/// future the caller gets back — or `None` when that could not be arranged, in
+/// which case the caller falls back to performing the request inline.
+///
+/// Every step can fail on a VM that has not loaded these classes, and each
+/// failure answers `None` rather than half-starting: a future handed out with
+/// no thread to complete it would hang the first `get()`.
+fn re5_start_async_send(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<cratonvm_types::ObjectRef> {
+    let future = match ctx.new_object_initialized(
+        "java/util/concurrent/CompletableFuture",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(f)))) => f,
+        _ => return None,
+    };
+    let future_root = ctx.add_global_root(future);
+    let task = match try_alloc_concurrent_synthetic(ctx, RE5_SEND_TASK, RE5_TASK_FIELDS) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+    ctx.set_field(task, RE5_TASK_FUTURE, Value::Object(Some(future)));
+    ctx.set_field(task, RE5_TASK_CLIENT, args.first().copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(task, RE5_TASK_REQUEST, args.get(1).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(task, RE5_TASK_HANDLER, args.get(2).copied().unwrap_or(Value::Object(None)));
+
+    let task_root = ctx.add_global_root(task);
+    let thread = match ctx.new_object_initialized(
+        "java/lang/Thread",
+        "(Ljava/lang/Runnable;)V",
+        &[Value::Object(Some(task))],
+    ) {
+        Ok(Some(Value::Object(Some(t)))) => t,
+        _ => return None,
+    };
+    // Daemon, so an in-flight request cannot hold the VM open at exit — the
+    // JDK's own HttpClient threads are daemons for the same reason.
+    let _ = ctx.invoke_virtual(thread, "setDaemon", "(Z)V", &[Value::Int(1)]);
+    if ctx.thread_start(thread).is_err() {
+        return None;
+    }
+    let _ = ctx.resolve_global_root(task_root);
+    ctx.resolve_global_root(future_root)
+}
+
+/// The class of the task object `sendAsync` hands to a `Thread`.
+const RE5_SEND_TASK: &str = "cratonvm/internal/HttpSendTask";
+const RE5_TASK_FUTURE: usize = 0;
+const RE5_TASK_CLIENT: usize = 1;
+const RE5_TASK_REQUEST: usize = 2;
+const RE5_TASK_HANDLER: usize = 3;
+const RE5_TASK_FIELDS: usize = 4;
+
+/// `Runnable.run()` for the task above: perform the request that `sendAsync`
+/// used to perform inline, then complete the future it already handed back.
+///
+/// Completion mirrors `native-io`'s async-channel path exactly, including the
+/// `postComplete` call: `completeThrowable` and `complete` are the real JDK
+/// primitives, and `postComplete` is bytecode, so it needs the bytecode-only
+/// resolver or the by-name native lookup misses it and waiters never wake.
+fn re5_send_task_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let future = match ctx.get_field(this, RE5_TASK_FUTURE) {
+        Value::Object(Some(f)) => f,
+        _ => return Ok(None),
+    };
+    let client = ctx.get_field(this, RE5_TASK_CLIENT);
+    let request = ctx.get_field(this, RE5_TASK_REQUEST);
+    let handler = ctx.get_field(this, RE5_TASK_HANDLER);
+
+    let future_root = ctx.add_global_root(future);
+    let outcome = re5_do_request(ctx, &[client, request, handler]);
+    let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+
+    match outcome {
+        Ok(resp) => {
+            let _ = ctx.invoke_virtual(
+                future,
+                "complete",
+                "(Ljava/lang/Object;)Z",
+                &[resp.unwrap_or(Value::Object(None))],
+            );
+        }
+        Err(failure) => {
+            let thrown = re5_throwable_for(ctx, failure);
+            let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+            if let Some(t) = thrown {
+                let _ = ctx.invoke_virtual(
+                    future,
+                    "completeThrowable",
+                    "(Ljava/lang/Throwable;)Z",
+                    &[Value::Object(Some(t))],
+                );
+            } else {
+                // Nothing to complete it WITH is still better than a future no
+                // one ever completes: a caller blocked in `get()` would hang.
+                let _ = ctx.invoke_virtual(
+                    future,
+                    "complete",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(None)],
+                );
+            }
+        }
+    }
+    let future = ctx.resolve_global_root(future_root).unwrap_or(future);
+    let _ = ctx.invoke_virtual_bytecode_only(future, "postComplete", "()V", &[]);
+    Ok(None)
+}
+
+/// Turn a native failure into a Java `Throwable`, or `None` when it is a VM
+/// fault rather than something a `catch` could name.
+///
+/// The common shape is `InternalError(VmError::Runtime(..))`, NOT an
+/// already-materialised `ExceptionThrown` — reading that wrong is why the first
+/// version of the `sendAsync` repair changed nothing observable.
+fn re5_throwable_for(
+    ctx: &mut dyn NativeContext,
+    failure: cratonvm_types::error::MethodCallFailed,
+) -> Option<cratonvm_types::ObjectRef> {
+    use cratonvm_types::error::{MethodCallFailed, VmError};
+    match failure {
+        MethodCallFailed::ExceptionThrown(t) => Some(t),
+        MethodCallFailed::InternalError(VmError::Runtime(re)) => {
+            let (class_name, message) = re.as_java_throwable()?;
+            let message = message.map(|m| m.into_owned());
+            let built = match &message {
+                Some(m) => {
+                    let msg_obj = ctx.create_string(m);
+                    ctx.new_object_initialized(
+                        class_name,
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(msg_obj))],
+                    )
+                }
+                None => ctx.new_object_initialized(class_name, "()V", &[]),
+            };
+            match built {
+                Ok(Some(Value::Object(Some(t)))) => Some(t),
+                _ => None,
+            }
+        }
+        MethodCallFailed::InternalError(_) => None,
+    }
+}
+
+/// `CompletableFuture.failedFuture(t)` — the future `sendAsync` hands back when
+/// the request failed.
+///
+/// MEASURED: `failedFuture` behaves identically to HotSpot on this VM
+/// (`probes/CfFailedProbe.java`) — `isCompletedExceptionally()` is `true` and
+/// `join()` raises `CompletionException` with the original cause — so the
+/// failure reaches the caller through the same channel it does on HotSpot.
+fn re5_failed_future(
+    ctx: &mut dyn NativeContext,
+    thrown: cratonvm_types::ObjectRef,
+) -> MethodCallResult {
+    let failed = ctx.invoke(
+        "java/util/concurrent/CompletableFuture",
+        "failedFuture",
+        "(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(thrown))],
+    );
+    match failed {
+        // If `failedFuture` itself cannot be reached, handing back the original
+        // throwable is better than inventing a successful future over no
+        // response — the caller at least still sees the failure.
+        Err(_) => Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            thrown,
+        )),
+        ok => ok,
+    }
+}
+
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let client = obj_arg(args, 0)?;
     let req = obj_arg(args, 1)?;
@@ -14047,14 +14227,102 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // request synchronously and hand back an already-completed real
     // CompletableFuture so the caller's `.get()` returns immediately.
     let send_async: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
-        let resp = re5_do_request(ctx, args)?.unwrap_or(Value::Object(None));
-        ctx.invoke(
-            "java/util/concurrent/CompletableFuture",
-            "completedFuture",
-            "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
-            &[resp],
-        )
+        // A FAILURE COMPLETES THE FUTURE; it does not come out of the call.
+        //
+        // `CompletableFuture<HttpResponse<T>> sendAsync(...)` declares no
+        // checked exception, so an `IOException` escaping it is a throwable no
+        // Java implementation of this method could ever produce, and no caller
+        // can catch without `catch (Throwable)`. `re5_do_request(...)?` did
+        // exactly that: this VM performs the request synchronously, and the
+        // `?` handed the synchronous failure to a caller expecting a future.
+        //
+        // MEASURED (`probes/ResidualProbe.java`), request to a refused port:
+        //   HotSpot 25   sendAsync returns jdk.internal.net.http.common.MinimalFuture
+        //   CratonVM     sendAsync threw java.io.IOException
+        //
+        // The failure now lands where the contract puts it — in the returned
+        // future — so `.get()`/`.join()` raise `ExecutionException`/
+        // `CompletionException` as they do on HotSpot, and a caller that only
+        // holds the future is no longer skipped past.
+        //
+        // NOT fixed here, and named rather than hidden: the request is still
+        // performed SYNCHRONOUSLY, so the future is already complete when it is
+        // handed back (`isDone()` is `true` where HotSpot's is `false`) and its
+        // class is `CompletableFuture` where HotSpot's is `MinimalFuture`. A
+        // caller that chains on it sees the continuation run on the calling
+        // thread. Making the send genuinely asynchronous is a different change.
+        // ASYNCHRONOUS when a thread can be started for it, synchronous when
+        // one cannot. The request runs on its own thread and completes the
+        // future the caller already holds, so N calls overlap instead of
+        // serialising and a continuation runs off the caller's thread — which
+        // is what `sendAsync` means. If the thread cannot be created the old
+        // synchronous path below runs unchanged, so the failure mode is the
+        // previous behaviour rather than a future nobody completes.
+        if let Some(future) = re5_start_async_send(ctx, args) {
+            return Ok(Some(Value::Object(Some(future))));
+        }
+        match re5_do_request(ctx, args) {
+            Ok(resp) => ctx.invoke(
+                "java/util/concurrent/CompletableFuture",
+                "completedFuture",
+                "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+                &[resp.unwrap_or(Value::Object(None))],
+            ),
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) => {
+                re5_failed_future(ctx, thrown)
+            }
+            // The common shape here is NOT an already-materialised throwable:
+            // `re5_do_request` reports its failures as `RuntimeError`s, which
+            // reach this point as `InternalError(VmError::Runtime(..))` and are
+            // turned into Java objects later, at the interpreter's own throw
+            // site. Completing a future needs the object NOW, so build it from
+            // the same table that site uses — `RuntimeError::as_java_throwable`
+            // — exactly as `lang_class.rs` does when it has to wrap a callee's
+            // failure in an `InvocationTargetException`. Reading the variant
+            // wrong is why the first version of this fix changed nothing: the
+            // `ExceptionThrown` arm above never matched.
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            )) => {
+                let Some((class_name, message)) = re.as_java_throwable() else {
+                    // Not a Java exception at all (a VM gap). Keep propagating.
+                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(re),
+                    ));
+                };
+                // Own the message so `re` is free again for the failure path.
+                let message = message.map(|m| m.into_owned());
+                let built = match &message {
+                    Some(m) => {
+                        let msg_obj = ctx.create_string(m);
+                        ctx.new_object_initialized(
+                            class_name,
+                            "(Ljava/lang/String;)V",
+                            &[Value::Object(Some(msg_obj))],
+                        )
+                    }
+                    // `None` means "no detail message": the no-arg ctor, so
+                    // `getMessage()` is null rather than "".
+                    None => ctx.new_object_initialized(class_name, "()V", &[]),
+                };
+                match built {
+                    Ok(Some(Value::Object(Some(thrown)))) => re5_failed_future(ctx, thrown),
+                    // Could not build the throwable — propagate the original
+                    // rather than invent a successful future over no response.
+                    _ => Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(re),
+                    )),
+                }
+            }
+            // Not a Java throwable, so it cannot complete a future. It is a VM
+            // fault and keeps propagating as one.
+            Err(internal) => Err(internal),
+        }
     };
+    // The task carrier's `run()`. Registered on its own class so dispatch —
+    // which keys on the receiver's runtime class — finds it when `Thread.run()`
+    // calls `target.run()`.
+    r.register(RE5_SEND_TASK, "run", "()V", re5_send_task_run);
     r.register(
         hc,
         "sendAsync",

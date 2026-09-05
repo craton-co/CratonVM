@@ -12,6 +12,15 @@
 # middle one is not optional:
 #
 #   HotSpot            the oracle
+#   cratonvm           the COMPILED CPU arm. Added 2026-09-04, after it
+#                      turned out no arm here had ever run this fixture
+#                      through the JIT: HotSpot is the oracle, `--nojit`
+#                      is interpreted by construction, and under `--gpu`
+#                      `offload_jit_gate` REFUSES to compile every
+#                      scenario that writes an array or calls a kernel --
+#                      which is all of them. An OSR miscompilation of
+#                      `cacheCoherence` sat behind that hole; see
+#                      docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md.
 #   cratonvm --nojit   the CONTROL. "The GPU disagrees with HotSpot" is
 #                      also what a host-side defect looks like; without
 #                      the control a difference cannot be attributed.
@@ -55,6 +64,8 @@ echo "CV=$CV"
     | grep '=' | tr -d '\r' > "$TMP/hs"
 "$CV" --java-home "$JDK" -cp "$TG" --nojit GpuRuntimeStress 0 "$N" 2>/dev/null \
     | grep '=' | tr -d '\r' > "$TMP/cpu"
+"$CV" --java-home "$JDK" -cp "$TG" GpuRuntimeStress 0 "$N" 2>/dev/null \
+    | grep '=' | tr -d '\r' > "$TMP/jit"
 "$CV" --java-home "$JDK" -cp "$TG" --gpu GpuRuntimeStress 0 "$N" 2>/dev/null \
     | grep '=' | tr -d '\r' > "$TMP/gpu"
 
@@ -75,6 +86,26 @@ if [ "$host" != "0" ]; then
 fi
 
 FAILS=0
+
+# The compiled CPU arm, against the same control. No `--gpu`, so nothing
+# here involves the device: a difference is a JIT defect, and one that
+# every other arm in this file is structurally unable to see.
+if [ -s "$TMP/jit" ]; then
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    want="$line"
+    got=$(grep "^$key=" "$TMP/jit" | head -1)
+    if [ "$got" != "$want" ]; then
+      echo "FAIL(jit) $key: control=${want#*=} jit=${got#*=}"
+      echo "       no --gpu in this arm -- this is a JIT miscompilation, not offload."
+      echo "       known: docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md"
+      FAILS=$((FAILS + 1))
+    fi
+  done < <(grep '=' "$TMP/cpu")
+else
+  echo "FAIL: the compiled CPU arm produced no output"
+  FAILS=$((FAILS + 1))
+fi
 while IFS= read -r line; do
   key="${line%%=*}"
   want="${line#*=}"

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -133,24 +133,33 @@ fn run(mode: &str) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn class-loader unloading probe");
-    let start = Instant::now();
-    loop {
-        match child.try_wait().expect("poll class-loader unloading probe") {
-            Some(_) => break,
-            None if start.elapsed() < Duration::from_secs(180) => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            None => {
-                let _ = child.kill();
-                panic!("class-loader unloading probe timed out in {mode} mode");
-            }
-        }
-    }
-    let output = child.wait_with_output().expect("collect probe output");
+    // DRAIN WHILE WAITING. The loop this replaces polled `try_wait` and only
+    // read the pipes afterwards, through `wait_with_output` — so the child
+    // blocked in `write` once it had produced 64 KiB (the Linux pipe capacity)
+    // and could never exit. This probe calls `System.gc()` about 180 times, and
+    // its stderr was 101,808 bytes of `[GC]` lines against 124 bytes of stdout,
+    // so it crossed that limit on every run: the test reported a 180 s timeout
+    // in both jit and nojit modes, deterministically, on a quiet host, and the
+    // probe had nothing to do with it. Run with its output to a file the same
+    // probe finishes in under 20 s and prints `ok=true`.
+    //
+    // See `common::wait_draining`. The GC noise is separately gated now, but
+    // that is not what makes this safe — a test must not depend on the process
+    // it drives staying under 64 KiB.
+    let timed = common::wait_draining(child, Duration::from_secs(180));
+    let output = timed.output;
     let combined = format!(
         "{}\n--- STDERR ---\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    // Reported BEFORE the exit-status check, and carrying what the child
+    // managed to say. The bare `panic!("timed out")` this replaces is why the
+    // pipe deadlock read as a class-unloading defect for as long as it did.
+    assert!(
+        !timed.timed_out,
+        "class-loader unloading probe timed out in {mode} mode. Output captured before \
+         the cap:\n{combined}"
     );
     assert!(output.status.success(), "{mode} probe failed:\n{combined}");
     assert!(
@@ -160,6 +169,74 @@ fn run(mode: &str) {
         "{mode} probe did not reclaim loader metadata:\n{combined}"
     );
     let _ = std::fs::remove_dir_all(classes);
+}
+
+/// Env var that turns [`flood_helper`] from inert into the child half of
+/// [`wait_draining_survives_a_child_that_outruns_the_pipe`].
+const FLOOD_VAR: &str = "CRATONVM_TEST_PIPE_FLOOD";
+
+/// The child half of the pipe-capacity guard below: write far more than a pipe
+/// can hold, then exit 0.
+///
+/// Inert unless the parent sets [`FLOOD_VAR`], so an ordinary run of this file
+/// costs one env lookup. Re-entering this same test binary is what keeps the
+/// guard portable — there is no shell command that floods a pipe on both Linux
+/// and Windows.
+#[test]
+fn flood_helper() {
+    if std::env::var_os(FLOOD_VAR).is_none() {
+        return;
+    }
+    let line = "x".repeat(1024);
+    for _ in 0..200 {
+        eprintln!("{line}");
+    }
+    println!("FLOOD DONE");
+}
+
+/// A child that outruns the pipe must still be waited for successfully.
+///
+/// This is the standing guard on the defect that made
+/// `class_loader_unload_regression` report a 180 s timeout in both modes: the
+/// parent captured both pipes and did not read either until the child had
+/// exited, so the child blocked in `write` at the 64 KiB pipe capacity and the
+/// two waited for each other. Nothing about it was specific to class unloading
+/// — it needed only a child that talks more than a pipe holds, which that probe
+/// became when the VM's `[GC]` logging started firing on every run.
+///
+/// Deliberately independent of the `cratonvm` binary and of any VM behaviour:
+/// gating the GC log fixed *that* child, and this asserts the property that
+/// makes the next one safe.
+#[test]
+fn wait_draining_survives_a_child_that_outruns_the_pipe() {
+    let exe = std::env::current_exe().expect("path to this test binary");
+    let child = Command::new(exe)
+        .args(["--exact", "flood_helper", "--nocapture", "--test-threads=1"])
+        .env(FLOOD_VAR, "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the flood helper");
+    let timed = common::wait_draining(child, Duration::from_secs(60));
+    let stderr_len = timed.output.stderr.len();
+    assert!(
+        !timed.timed_out,
+        "wait_draining deadlocked on a child that outran the pipe — the defect this \
+         guards is back. Captured {stderr_len} bytes of stderr before the cap."
+    );
+    // NON-VACUITY. If the helper did not actually flood, the test above passes
+    // while proving nothing — which is exactly how the original defect hid.
+    assert!(
+        stderr_len > 64 * 1024,
+        "the flood helper produced only {stderr_len} bytes, which a pipe holds \
+         comfortably — this test would pass without exercising anything. Raise the \
+         flood, or find out why the child's stderr is being swallowed."
+    );
+    assert!(
+        String::from_utf8_lossy(&timed.output.stdout).contains("FLOOD DONE"),
+        "the flood helper did not run to completion; stdout was:\n{}",
+        String::from_utf8_lossy(&timed.output.stdout)
+    );
 }
 
 #[test]

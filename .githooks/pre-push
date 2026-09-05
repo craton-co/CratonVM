@@ -79,11 +79,27 @@ if [ -z "$CARGO_BIN" ]; then
   exit 0
 fi
 
+# Two invocations, not one. The three integration targets check the surface
+# against the code and the docs; `flag_groups`'s own unit tests check the
+# INVENTORY table's internal invariants - that a row expands to something, that
+# `off_word` only appears on a default-ON knob with no opt-out key, and that no
+# legacy variable is claimed by two tokens.
+#
+# Those live in the types crate's LIB, so the target list below never ran them,
+# and the class went uncaught: on 2026-09-04 three `CRATONVM_XT_*` rows named
+# the same variable as BOTH `on_key` and `off_key` and reached `dev`, holding
+# two lib tests red until someone tripped over them downstream.
+#
+# Folding `--lib` into the one invocation would run the WHOLE types lib -
+# measured 24 s against the ~2 s the three targets cost, which is exactly the
+# number that gets a hook `--no-verify`d permanently. Filtered to `flag_groups`
+# in its own invocation it is ~1 s warm.
 echo "pre-push: checking the CRATONVM_* flag surface..." >&2
 if "$CARGO_BIN" test -q -p cratonvm-types \
      --test flag_declaration_guard \
      --test flag_docs_generated \
-     --test flag_surface; then
+     --test flag_surface \
+   && "$CARGO_BIN" test -q -p cratonvm-types --lib flag_groups; then
   exit 0
 fi
 

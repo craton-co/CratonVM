@@ -560,7 +560,19 @@ here, both recorded so the next reader does not have to re-find them:
 > `newHeapByteBuffer(base, start, size, seg)` produces. Two natives that are
 > registered in every mode were chosen deliberately over `slice(II)`, which this
 > VM registers for `CharBuffer`/`IntBuffer`/`LongBuffer`/`FloatBuffer` and **not**
-> for `ByteBuffer` — a gap this note records and does not close.
+> for `ByteBuffer`.
+>
+> **CORRECTION 2026-09-04 to the sentence that used to end here.** It called
+> that missing registration "a gap this note records and does not close", which
+> reads as a defect. It is not one on either shipping arm: measured with
+> `probes/SliceProbe.java`, `ByteBuffer.slice(int,int)` is **identical to
+> HotSpot** in Compatible and `--jdk-only` — capacity, `arrayOffset`, `get`,
+> `hasArray`, the direct-buffer rows, and both `IndexOutOfBoundsException`
+> messages — because the real JDK bytecode serves it. An absent REGISTRATION is
+> not an absent method; the siblings are registered for receivers that have no
+> bytecode to fall back on. The choice above still stands on its own reason
+> (`wrap`/`slice()` are registered in every mode, so the heap arm does not
+> depend on which mode it runs in), but nothing here is owed.
 >
 > A non-`byte[]` base is refused by name, as the oracle does
 > (`ofArray(int[8]).asByteBuffer()` is `UnsupportedOperationException` on

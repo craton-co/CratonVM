@@ -1858,8 +1858,10 @@ pub(crate) fn native_secure_random_get_instance_strong(
 ///
 /// MEASURED (`probes/RandomShadowCost.java`, one binary):
 ///
-///     new Random(i).nextInt()   shadow  632.6 ns/op   JDK bytecode 1655.6 ns/op
-///     shared Random.nextInt()   shadow  107.3 ns/op   JDK bytecode  827.3 ns/op
+/// ```text
+/// new Random(i).nextInt()   shadow  632.6 ns/op   JDK bytecode 1655.6 ns/op
+/// shared Random.nextInt()   shadow  107.3 ns/op   JDK bytecode  827.3 ns/op
+/// ```
 ///
 /// 2.6x and 7.7x the wrong way. The flag stays because it is the A/B, and
 /// because it will become the right default the moment `AtomicLong` stops being

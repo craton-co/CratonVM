@@ -4,6 +4,68 @@
 binary `/data/l7dod-target/debug/cratonvm` built from this tree, oracle Temurin
 25 on the same host. **VERIFIED AGAINST A BINARY 2026-09-03.**
 
+> **Both unrecorded divergences are addressed 2026-09-04 — one closed, one
+> narrowed, and the difference is stated rather than blurred.**
+>
+> **`LinuxAsynchronousChannelProvider` — CLOSED.** §4 recorded
+> `asc.provider()` answering `null` where HotSpot answers the platform
+> provider, and named the consequence: *"`NullPointerException` for any caller
+> that uses the documented `provider().openAsynchronousChannelGroup(…)`
+> route."* Measured now, both shipping arms:
+>
+> ```text
+>                                             HotSpot 25                        CratonVM
+> AsynchronousSocketChannel.provider()        LinuxAsynchronousChannelProvider  same
+> AsynchronousServerSocketChannel.provider()  LinuxAsynchronousChannelProvider  same
+> DatagramChannel.provider()                  EPollSelectorProvider             same
+> ```
+>
+> The third row was NOT in this record: `DatagramChannel.provider()` was `null`
+> too, and the probe that found the first two never asked. Recorded here because
+> a family with one member measured and two unmeasured is how the next one gets
+> missed.
+>
+> **`MinimalFuture` — NARROWED, not closed, and the remaining half is the
+> larger half.** §4 recorded that `HttpClient.sendAsync` returns *"a plain
+> `CompletableFuture` that is already done"* where HotSpot returns a
+> not-yet-complete `MinimalFuture`. Re-measuring found something worse that the
+> §4 table could not show, because §4 asked a reachable endpoint: against a
+> REFUSED port, `sendAsync` did not return a future at all —
+>
+> ```text
+>                     HotSpot 25                                  CratonVM (before)
+> sendAsync (refused)  jdk.internal.net.http.common.MinimalFuture  threw java.io.IOException
+> ```
+>
+> `CompletableFuture<HttpResponse<T>> sendAsync(...)` declares no checked
+> exception, so that is a throwable no Java implementation of the method could
+> produce and no caller can catch without `catch (Throwable)`. The failure now
+> completes the returned future instead, which is where the contract puts it —
+> `.get()`/`.join()` raise `ExecutionException`/`CompletionException` as on
+> HotSpot.
+>
+> Getting there needed the right variant: the failure arrives as
+> `InternalError(VmError::Runtime(..))`, not as an already-materialised
+> `ExceptionThrown`, so the first attempt matched an arm that never fired and
+> changed nothing observable. It is built through
+> `RuntimeError::as_java_throwable` — the same table the interpreter's own throw
+> site uses, so the two cannot drift.
+>
+> **What §4's original observation still stands on.** The request is performed
+> SYNCHRONOUSLY, so:
+>
+> ```text
+>                    HotSpot 25         CratonVM (now)
+> sendAsync.class    MinimalFuture      CompletableFuture
+> sendAsync.isDone   false              true
+> ```
+>
+> A caller that chains on the future still sees the continuation run on the
+> calling thread rather than a client thread, and one that inspects the type
+> still sees the wrong class. Making the send genuinely asynchronous is a
+> different change and is not attempted here. The two rows above are the
+> unclosed part, and they are the part §4 was written about.
+
 **Lane** L7. **Subject** the probes `W7-49` and `W7-66` name, and what running
 them says.
 

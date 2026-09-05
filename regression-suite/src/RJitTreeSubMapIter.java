@@ -2,13 +2,22 @@
  * Regression: a COMPILED `for (e : treeMap.tailMap(k).entrySet())` iterated
  * ZERO entries while `entrySet().size()` on the same object answered 6.
  *
- * Root cause: guarded monomorphic virtual/interface inlining
+ * Two causes, both fixed. Guarded monomorphic virtual/interface inlining
  * (`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`) defaulted ON from a commit whose own
  * subject reads "wip(pgo-02): plumbing ... (checkpoint, no codegen yet)", while
  * three places in `jit/src/lib.rs` documented the same flag as "default-off,
- * unsoaked" and reasoned about correctness on that basis. The speculated
- * `iterator()` body was spliced against a receiver whose `root` mirror it then
- * read as null, so the iterator came back empty.
+ * unsoaked" and reasoned about correctness on that basis; the default was
+ * restored. And the splice it admitted was wrong: `hasNext()` on a
+ * CratonVM-minted `java/util/TreeMap$EntryIterator` is declared one class up on
+ * `TreeMap$PrivateEntryIterator`, which carries no native, so the inline
+ * resolver's native screen -- which asked about the DECLARING class -- cleared,
+ * and the spliced JDK body walked a `next` chain the carrier never populates.
+ * `internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`.
+ *
+ * THIS VECTOR PINS THE DEFAULT, NOT THE SCREEN. It runs with the flag off, like
+ * every other suite arm, so it can only ever see the first cause.
+ * `vm/tests/jit_guarded_inline_native_shadow.rs` is the arm that sets the flag,
+ * and it is the one that can see the second.
  *
  * This is `org.h2.test.store.TestRandomMapOps` op:1033, which failed H2 in
  * 11-22 s and blocked the box/unbox SIGSEGV investigation, whose crash needs
