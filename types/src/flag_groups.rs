@@ -1512,6 +1512,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "zero-unset-locals", on_key: None, off_key: Some("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS"), off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "checkcast-inline", on_key: Some("CRATONVM_JIT_CHECKCAST_INLINE"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::JIT, token: "final-devirt", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT"), off_key: None, off_word: None, since: "2026-08-28" },
+    E { group: Group::JIT, token: "final-devirt-native-screen", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN"), off_key: None, off_word: None, since: "2026-09-05" },
     // Declared 2026-09-02. `final-devirt` above is `java/lang/String`'s
     // problem: String is final, so the rewrite it drives took EVERY String
     // access site away from the inline intrinsic. This is the opt-out for the
