@@ -200,7 +200,8 @@ An empty list, which is what `HotSpotAttachProvider` answers here and what the
 Linux leg has always answered. The probe's assertion is `list instanceof List`.
 
 **The path this now routes onto is a path that has already been debugged.**
-`docs/internal/fixed-bugs/java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`
+`java-agent-transformer-never-fires-and-attach-list-throws-FIXED-20260806.md`
+(in the internal tree, indexed by basename)
 is the same probe row going red on **Linux** in August, for an unrelated reason
 — `HotSpotAttachProvider.listVirtualMachines` died inside `Files.getAttribute`
 on the platform filesystem, and that was fixed there. So converging Windows
@@ -313,7 +314,48 @@ JNI coverage back off.
 
 ---
 
-## 7. What this does NOT claim
+## 7. The three suite arms on the merged tree, and the census nobody had taken here
+
+Landing protocol §5 step 2, run on a release build of the tree with
+`origin/dev` (67 commits) merged in — Windows, JDK 25:
+
+```text
+CRATONVM_ARGS=--jdk-only   129 passed, 1 failed   (RMapGcStress)
+SUITE=all                  130 passed, 0 failed
+SUITE=core                  90 passed, 0 failed
+```
+
+`RMapGcStress` is the shape `the-suite-ab-that-was-the-harness-20260902.md`
+already adjudicated, reproduced here on a different platform: it fails under
+concurrency and **passes alone**, in the same mode, on the same binary
+(`ONLY="RMapGcStress" CRATONVM_ARGS=--jdk-only` → `1 passed, 0 failed`). It also
+passed in `SUITE=all`, which schedules the identical 130 vectors and differs
+only in the flag — so the strict arm is not what fails it.
+
+The strict arm prints its own census, and this is the first time it has been
+taken on Windows. Over 129 vectors, union by triple:
+
+```text
+native-shadows-bytecode   1490 native-won   ·   480 bytecode-won
+                                                (27 of those NEVER native — the
+                                                 contract working; 453 also ran
+                                                 the native in another vector)
+synthetic-native-registered  1645
+interpreter_shadow_unenforced 11264
+compatibility_classes            0
+saturation: none — every bounded collection reported truncated: false
+```
+
+**`compatibility_classes: 0` across the whole corpus**, with `saturation: none`
+so it is a total rather than a floor. That is the definition-of-done predicate,
+which `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`
+established on five workloads **on Linux**. It holds on this platform too, on
+130 vectors. It is not the DoD itself — none of those three workloads is checked
+out here — but it is the predicate, on a platform where it had never been read.
+
+---
+
+## 8. What this does NOT claim
 
 * **Not a stage advance.** `docs/jdk-only-migration.md` §"Rollout stages" is
   untouched. Stage 3 wants "Windows filesystem/process/networking vectors
