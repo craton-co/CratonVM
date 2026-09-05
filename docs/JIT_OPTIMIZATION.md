@@ -2110,6 +2110,49 @@ tier does by colouring locals into callee-saved registers and is why it wins by
 this section's own conclusion has been "the live set has to move as a group, or
 not at all" since the four zeros.
 
+#### Reserving the carried set: the whole live set is in registers now
+
+The blocker the previous census named, taken on. `plan_register_residency`
+assigns a register to every LOOP-CARRIED value out of the ones the scan left
+free, before the parameter copy and after the scan — the same door the parameter
+copy already uses, and the same safety argument: **a register in this file that
+the accepted set does not name is written by nothing**, because emission is
+driven by `gp_reg_of` alone.
+
+The point is not that the scan decided badly. It is that it was asked the wrong
+question: it allocated four values that are needed on every iteration in
+competition with eleven transients under `peak_live=15`, so it split them, and
+the file refuses a split value because it has no reload machinery. Reserving
+asks instead — these few are needed every iteration, give each one a register
+and let everything else have the rest.
+
+On `probes/OsrTierBench.java`, with `CRATONVM_JIT_IR_RESERVE_CARRIED=1`:
+
+| | resident | carried_reserved |
+|---|---|---|
+| off | **1** (gp=1) | 0 |
+| on | **5** (gp=5) | 4 |
+
+All five registers in use, and each of the kernel's four loop-carried values has
+one. That is "the live set moves as a group" actually happening, after a
+section-length run of changes that each moved one value.
+
+**Correctness holds**: `ck=25500075088100865`, HotSpot's answer, with the
+reservation on — and the same under `--nojit`.
+
+**The timing is owed, again, and for the same reason.** The control-vs-control
+floor on the day was **6.3%** at host load 12–40 on 8 cores; the arms
+(`base` 691, `reserve` 752, `reserve`+the phi stack 677) all sit inside it. This
+file has now recorded three separate days where a contended host denied an arm,
+and the rule it keeps proving is that a number taken there is not a number.
+Default OFF until it is measured on a quiet one.
+
+**What the measurement should expect to see, when it happens.** Reserving
+removes the RELOADS of the carried set; the write-through home STORES remain
+unless `CRATONVM_JIT_IR_DROP_PHI_HOME` is also on, which is why the two want
+measuring together. The prediction the 1.57x implies is that the pair, not
+either alone, is what closes it.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

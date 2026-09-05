@@ -11920,6 +11920,26 @@ fn ir_residency_loop_weight_enabled() -> bool {
 ///
 /// Off is exactly the previous emission: the parameter reaches every use
 /// through its frame slot.
+/// Give every LOOP-CARRIED value a register of its own before the transients
+/// compete for one -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_RESERVE_CARRIED=1`.
+///
+/// The census said the residency file accepts ONE of the nineteen values the
+/// scan promotes on a loop kernel, and that two of the four loop-carried values
+/// are refused as SPLIT. With four carried values and five registers nothing
+/// needs splitting; the scan splits them only because it allocates them in
+/// competition with eleven transients. A better spill heuristic moves one value
+/// (`ls_carry_relief`); this moves the set, which is what
+/// `JIT_OPTIMIZATION.md`'s "the live set has to move as a group, or not at all"
+/// has meant since the four zeros.
+fn ir_reserve_carried_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_RESERVE_CARRIED").is_some()
+    })
+}
+
 fn ir_param_prologue_copy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -12535,6 +12555,89 @@ fn plan_register_residency(
         }
     }
 
+    // ── The loop-carried set, reserved out of what the scan left ─────
+    //
+    // Same door the parameter copy below uses, and the same safety argument:
+    // **a register in this file that the accepted set does not name is written
+    // by nothing.** Emission is driven by `gp_reg_of` alone, so a register the
+    // scan used only for values this file then REFUSED is not written by the
+    // emitted code either, and taking it here cannot alias anything.
+    //
+    // What it fixes is not a bad decision by the scan but a bad QUESTION put to
+    // it. The scan allocates the carried values in competition with every
+    // transient in the loop body, under `peak_live` far above the file size, so
+    // it splits them — and `plan_register_residency` refuses a split value
+    // outright, because this backend has no reload machinery. Reserving first
+    // asks instead: these few values are needed on every iteration, give each
+    // one a register and let everything else have the rest.
+    //
+    // Ordered by loop-weighted use count so that, when the carried set is
+    // larger than the file, the registers go to the values read most often
+    // inside the loop.
+    //
+    // Publishing is already handled and needs nothing new: a phi is published
+    // by `emit_phi_copies` at every incoming edge, and any other value by the
+    // generic publish at the end of its own `lower_data_node`. Both are keyed
+    // on `assigned_gpr`, which is what this writes.
+    let mut carried_reserved = 0usize;
+    if ir_reserve_carried_enabled() {
+        let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
+        taken.sort_unstable();
+        taken.dedup();
+        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+            .iter()
+            .copied()
+            .filter(|r| !taken.contains(r))
+            .collect();
+        let mut cands: Vec<(u64, usize)> = (0..n)
+            .filter(|&id| live.carried.get(id).copied().unwrap_or(false))
+            .filter(|&id| gp_reg_of.get(id).copied().flatten().is_none())
+            // Write-through needs a home to write, exactly as the main loop
+            // above requires.
+            .filter(|&id| plan.node_color.get(id).copied().flatten().is_some())
+            .filter(|&id| {
+                match graph.nodes.get(id) {
+                    // `Ref` is excluded for the safepoint reason the bank match
+                    // gives, not as tuning: `OopMapEntry` names frame slots
+                    // only. FP belongs to the other file.
+                    Some(node) => matches!(node.ty, IrType::Int | IrType::Long)
+                        // A constant is materialised as an immediate by every
+                        // reader, so its register could never be read.
+                        && !matches!(node.op, Op::Const(_))
+                        // A phi is only publishable when its edges publish it.
+                        && (ir_phi_residency_enabled() || !matches!(node.op, Op::Phi)),
+                    None => false,
+                }
+            })
+            .map(|id| (live.weight.get(id).copied().unwrap_or(0), id))
+            .collect();
+        cands.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, id) in cands {
+            let Some(range) = plan.range.get(id).copied().flatten() else {
+                continue;
+            };
+            // The same clobber question the demotion pass asks. Inert for this
+            // file today — every register in it is callee-saved and no fixed
+            // x86 operand names one — but asking it here keeps the two places
+            // that hand out a register from disagreeing about the rule.
+            let Some(pos) = free.iter().position(|r| {
+                let me = PhysReg::gp(*r);
+                !model
+                    .clobbers
+                    .iter()
+                    .any(|(p, regs)| *p >= range.lo && *p <= range.hi && regs.contains(&me))
+            }) else {
+                continue;
+            };
+            let reg = free.remove(pos);
+            gp_reg_of[id] = Some(reg);
+            carried_reserved += 1;
+            if free.is_empty() {
+                break;
+            }
+        }
+    }
+
     // ── Entry parameters, which the allocator cannot reach ───────────
     //
     // `MachineModel::pin_entry_params` pins every `Param` to its INCOMING ABI
@@ -12669,7 +12772,7 @@ fn plan_register_residency(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
-             spilled={skip_spilled} no_alloc={skip_no_alloc}"
+             spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}"
         );
         eprintln!(
             "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",

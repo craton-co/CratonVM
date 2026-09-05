@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-350 tokens.
+351 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -695,6 +695,7 @@ export inherited from a parent shell.
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
 | `ir-osr-entry` | `CRATONVM_JIT_IR_OSR_ENTRY` |
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
+| `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
