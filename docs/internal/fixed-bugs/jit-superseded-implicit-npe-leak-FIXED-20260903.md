@@ -2,72 +2,24 @@
 
 ## Status
 
-**FIXED 2026-09-03. Retired 2026-09-04.** `take_jit_pending_exception` now
-drops the implicit-trap signals when it hands out an exception. Regression
-vector: `regression-suite/src/RJitLambdaNpeSupersede.java`, in `run.sh`'s
+**FIXED 2026-09-03. Regressed and re-fixed 2026-09-04. Retired 2026-09-04.**
+`take_jit_pending_exception` drops the implicit-trap signals when it hands out
+an exception. Regression vector:
+`regression-suite/src/RJitLambdaNpeSupersede.java`, in `run.sh`'s
 `CORE_CLASSES`.
 
-Re-verified on `dev@04a5d4d02` before retiring, because this page's own finding
-is that a green suite was not evidence here -- the sibling tests kept the
-compiler busy and the arm never engaged. So the check that matters is the one
-this page named, run ALONE:
+Retired on `dev@9c66b0b7d`, against the check this page itself says is the only
+one that counts -- `test_npe_from_body` run **ALONE**, because with its eleven
+siblings the arm never engages and a green file proves nothing:
 
 ```
 cargo test --release -p cratonvm-vm --test lambda_jit_tierup_tests \
     test_npe_from_body -- --exact
 ```
 
-`test result: ok. 1 passed; 0 failed; 11 filtered out` -- the arm that used to
-fail. `drain_superseded_implicit_signals` is in `vm/src/jit/helpers.rs` beside
-`take_jit_pending_exception`, with the rule stated on it.
-
-**That re-verification found a SECOND defect on the same vector, and it had to
-be fixed before this page could retire.** On `dev@04a5d4d02` the same test,
-alone, failed 3 of 3 -- this time the real NPE escaping its own `catch` rather
-than a spurious one two iterations later. Nothing in the signal machinery had
-changed: `069e67b43` put the BOX_UNBOX intrinsic family back to default-ON that
-morning, and the intrinsic claims a site inside a `try` that the OSR compile's
-admission had already promised would publish a precise exception frame. Fixed
-and recorded at
-`osr-precise-frame-promise-broken-by-an-inline-intrinsic-FIXED-20260904.md`.
-
-This page's own warning is what caught it: **run this test alone.** A full-file
-run was green on the broken binary, exactly as it was for the defect above.
-
-`773ae4fcf` reached the same regression from the other end, through the suite
-vector rather than the unit test, and its evidence is kept here because it is
-the part neither line produced twice:
-
-```text
-$ cratonvm -cp build RJitLambdaNpeSupersede
-Exception in thread "main" java/lang/NullPointerException: ... "<local0>" is null
-
-$ CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1 cratonvm -cp build RJitLambdaNpeSupersede
-PASS RJitLambdaNpeSupersede (3 checks)
-```
-
-Bisected by build, five arms: PASS at `ec96716a8`, FAIL at `ded395383`,
-`b111a3514`, `842e6d0f9` and `04a5d4d02`. `ded395383` is dev's own line with no
-feature branch merged into it, which is what rules out everything landed beside
-it. `069e67b43` is the commit in that window, and the kill switch names it.
-
-**Its reading of the mechanism was wrong, and the difference matters for
-anyone touching the intrinsic.** That page said the intrinsic "is a second
-producer of the implicit trap signals, and it was not taught to drop them". It
-is not a producer of them at all: the BOX_UNBOX lowering in
-`jit/src/x64/bytecode_walk.rs` ends its null-receiver and guard edges with
-`self.deopt_stubs.push((p, pc, 6))` and touches no `JIT_SIGNALS` field. The
-`take_jit_pending_exception` discipline is intact and was never involved.
-
-Two measurements say so independently of reading the source.
-`CRATONVM_JIT_OSR_EXC_TABLE=0` and `CRATONVM_DEOPT_REAL=0` each make the vector
-clean while leaving the intrinsic fully on — neither flag can reach a signal
-drain. And the fix that repairs it refuses the intrinsic **only at sites inside
-a `try`**, leaving it live everywhere else; a leaked signal would not care where
-the site was.
-
-A kill switch that removes a symptom identifies an ingredient, not a mechanism.
-This one had three, and the one they share is the OSR admission.
+`ok. 1 passed; 11 filtered out`, 3 of 3, plus `regression-suite/run.sh` at
+90/90 including `RJitLambdaNpeSupersede`, and the reduced probe at checksum
+`1210000` against HotSpot's `1210000`.
 
 **REGRESSED 2026-09-04 by a DIFFERENT defect, and FIXED the same day.** The
 regression was real and this vector caught it, but the mechanism first written
@@ -122,6 +74,37 @@ Two hypotheses were built on that and both were wrong:
 
 `Object(0)` on the stack at the unbox is the null the caller should never have
 been handed.
+
+3. **"The BOX_UNBOX intrinsic claimed a site the OSR admission had already
+   promised."** Reached independently, from `test_npe_from_body` rather than
+   from the suite vector, and it is a true statement that is not the cause.
+   `compile_osr_artifact` admits a method with an exception table on the
+   promise that every throwing site inside a protected range publishes a
+   reason-9 precise frame, `first_unsupported_precise_frame_site` checks that
+   over the BYTECODE where the site is an ordinary `invokevirtual`, and the
+   intrinsic then substitutes a lowering whose edges are reason-6. Refusing the
+   intrinsic for a `pc` inside the exception table DOES make the vector pass --
+   and so does the one-line sentinel fix above, with the intrinsic left fully
+   on. Measured both ways: with `2422b006d` in and that refusal reverted,
+   `test_npe_from_body` alone is `ok` 3 of 3 and the suite is 90/90. So the
+   refusal removes an INGREDIENT (the Rust crossing at the unbox) and the
+   sentinel fix removes the DEFECT. It was dropped rather than landed beside
+   it, because it costs the intrinsic every site inside a `try` and buys
+   nothing once the caller returns the sentinel the check tests for.
+
+   Two things it left behind are worth keeping. Declining the intrinsic inside
+   `bytecode_walk`'s BOX_UNBOX region rather than at the resolution leaves
+   `callee_entry` holding the intrinsic sentinel and drops through to the plain
+   direct-call path, which emits a `CALL` to that value:
+   `SIGSEGV at pc=0xffffffffffffffc7`, `fault pc is in NO live registered code
+   buffer`. And a gate that reads the bytecode is a claim about the bytecode,
+   not about what a later stage decides to emit for it -- which is a real gap
+   in that admission even though it is not this defect.
+
+**Three arms each removed the symptom, and only one named the defect.**
+`CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1`, `CRATONVM_JIT_OSR_EXC_TABLE=0` and
+`CRATONVM_DEOPT_REAL=0` are all clean, and each supported a different story. A
+kill switch identifies an ingredient; only the trace above identified the cause.
 
 `probes/BoxUnboxNpeProbe.java` is the reduced repro: it needs only
 `lengthOf.apply(s)` (the vector's `stepFn` hop is not required), takes `-Dprobe.n`,

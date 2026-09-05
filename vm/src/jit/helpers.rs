@@ -20496,7 +20496,7 @@ unsafe fn try_lambda_site_direct_call(
                     // intrinsic default-ON removed the call — the unbox became
                     // an inline load with a null-receiver guard — and the
                     // exception escaped its own `catch`. See
-                    // `docs/known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`.
+                    // `internal/fixed-bugs/jit-superseded-implicit-npe-leak-FIXED-20260903.md`.
                     //
                     // `i64::MIN` is right for every return type: for a
                     // reference it cannot be a valid heap address, and for the
