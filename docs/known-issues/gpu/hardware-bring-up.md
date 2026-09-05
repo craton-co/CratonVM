@@ -158,7 +158,7 @@ Five gates, all on by default since 2026-09-05:
 | gate | what it catches | 2026-09-05 |
 |---|---|---|
 | a | `--gpu-info` sees a device (driver/hardware vanished) | PASS |
-| b | `GpuWarm` warm-timing + correctness — a **silent offload-to-CPU** regression | PASS, `warm_ms=7` vs HotSpot 1227 |
+| b | `GpuWarm` warm-timing + correctness — a **silent offload-to-CPU** regression | PASS, `warm_ms=7-8` across runs vs HotSpot 1227-1463 |
 | c | `GpuCompute` checksum at 2²⁶ | PASS, 209 ms vs HotSpot 5132 |
 | d | `BoundsDeopt2` integrity under `--gpu --nojit` | PASS |
 | e | dot-reduction checksum **and** a dispatch witness | PASS |
@@ -167,8 +167,8 @@ Gate (e) was off for two months on the premise that reduction dispatch
 "hadn't shipped". **That premise was stale**: `)I`/`)J` reductions have
 dispatched through `DispatchOutcome::HandledWithValue` since 2026-07-11,
 and the follow-ups item it cited had been marked DONE that same day. One
-run on hardware settled it, which is exactly what the ranked list below
-predicted it would take.
+run on hardware was enough to show the premise was false — but not enough
+to turn the gate on, for the reason below.
 
 Turning it on needed more than flipping the default, because the gate as
 written would have passed vacuously — `dotReduce` computes the same answer
