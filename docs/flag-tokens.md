@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-518 tokens.
+519 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -577,6 +577,7 @@ export inherited from a parent shell.
 | `invoke-cache-stats` | `CRATONVM_INVOKE_CACHE_STATS` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
+| `field-phases` | `CRATONVM_DBG_FIELD_PHASES` |
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
 | `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
 | `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
