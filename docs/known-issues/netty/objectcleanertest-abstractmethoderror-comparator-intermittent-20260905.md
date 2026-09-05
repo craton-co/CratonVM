@@ -179,14 +179,36 @@ clean, so it is not the shape alone — something about the real frame, thread, 
 class-init state matters.
 
 The next instrument should therefore be on the ROOT-GATHERING side rather than
-the sweep side: for the failing collection, dump every thread the STW root scan
-enumerated and every frame it scanned, and check that count against the thread
-list the VM believes it has. `CRATONVM_DBG_MTROOTS` publishes the GC's
-initiating thread and its blocked-thread count and is the obvious place to
-start; note that the `[sweep-zero]` record for this defect prints
-`gc reason=unknown initiator_tid=0 blocked_threads=0`, i.e. the collection did
-NOT come through the path that publishes that context, which is itself worth
-chasing.
+the sweep side. Two things are already known about it, and both are traps that
+cost time here:
+
+* **`CRATONVM_DBG_MTROOTS=1` runs, and the thread census is COMPLETE.** With it
+  armed the failing collection reports
+  `GC reason=1 initiator_tid=0 alive=3 blocked=2 frames=72` and
+  `thread-census (3 alive, 2 in_blocked): t0R(177) t2B(9) t1B(17)` — every
+  thread accounted for, the initiator running and the other two parked at the
+  barrier. So "a thread the STW scan never enumerated" is **not** the
+  explanation. It also confirms the collection is a `System.gc()` (reason 1)
+  raised from the test's own loop.
+* **A `[sweep-zero]` record reading `gc reason=unknown initiator_tid=0
+  blocked_threads=0` means only that `CRATONVM_DBG_MTROOTS` was OFF.**
+  `mtroots_set_gc_ctx` is the sole publisher of that context and it is gated on
+  that flag. It is not evidence of a collection taking an unusual path — an
+  earlier revision of this page read it that way.
+* **`CRATONVM_DBG_MARK_WHY_CLASS=<name>` watches the class's LOADER address,
+  not instances of the class** (it is armed in `add_mirror_pin`). Pointing it at
+  `java/util/Collections$ReverseComparator2` to ask "why was this comparator
+  marked" prints nothing and means nothing; it answers a loader-reachability
+  question instead.
+
+So the open question is narrower than "which root source": every thread was
+scanned, and the object is reachable from a `private static final` field of a
+loaded class. What has NOT been checked is whether that STATIC is in the root
+set for this collection, and whether the BFS out of it reaches the
+`ReverseComparator2`'s single `cmp` slot. A per-collection root census that
+names the static-field channel — comparable to G1's
+`CRATONVM_G1_DBG_ROOTCENSUS`, which the Generational path has no equivalent of
+— is the missing instrument.
 
 Two diagnostics were sharpened while chasing this and are now permanent (both
 opt-in, both in `gc/src/gen_heap.rs`):
