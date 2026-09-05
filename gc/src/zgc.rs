@@ -6279,7 +6279,9 @@ impl ZgcRealHeap {
                         // INSIDE a decommitted granule, the access is a WRITE,
                         // `offset_into_span` is 0x0 in every crash, and the
                         // frame is this one. See
-                        // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+                        // the retired
+                        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902`
+                        // write-up, and the root-cause record it points at.
                         Some(to) if arena.commit_for_relocation(to - base, size) => {
                             debug_assert!(to < from, "the slide must never move an object UP");
                             // SAFETY: `size` bytes are live at `from`, `to` is
@@ -9976,10 +9978,19 @@ pub mod relocation_skip_reason {
 /// compact under JIT" means "never defragment" -- measured as an
 /// `OutOfMemoryError` on a heap 97 % free.
 ///
-/// It is a flag rather than a fix because it is a TRADE, and the point is to
-/// price it: it should remove the relocation-under-live-JIT SIGSEGV that
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` tracks, and restore
-/// the fragmentation OOM that the pinned-peer credit had just eliminated.
+/// It is a flag rather than a fix because it is a TRADE, and the point was to
+/// price it. It did remove the SIGSEGV the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` was hunting --
+/// 0 of 4, against a same-binary control that crashed -- and it restored the
+/// fragmentation OOM the pinned-peer credit had just eliminated: ~9700 of
+/// them, with no run completing.
+///
+/// Read that 0-of-4 carefully, because it was read wrongly at the time. It was
+/// taken as evidence that the defect lived in a population only this guard
+/// covers (peers in compiled code). It did not: the fault was `relocate_stw`
+/// sliding into a decommitted arena granule, and this guard removes it by
+/// removing COMPACTION, which is what runs slides. Every arm that suppressed
+/// relocation suppressed that crash, which is why three unrelated ones did.
 /// `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES=1` -- make `unrewritable_peer_state()`
 /// a refusal term in its own right, not merely an input to the page-pinnable
 /// question.

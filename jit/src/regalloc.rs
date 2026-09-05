@@ -5166,8 +5166,9 @@ impl Allocation {
 const SPILL_DISTANCE_SCALE: u64 = 1024;
 
 /// How much a LOOP-CARRIED value's next-use distance is discounted when
-/// choosing a spill victim -- **default 0, i.e. OFF**; opt in with
-/// `CRATONVM_JIT_LS_CARRY_RELIEF=64`.
+/// choosing a spill victim -- **default 64, i.e. ON** since 2026-09-05;
+/// `CRATONVM_JIT_LS_CARRY_RELIEF=0` restores the distance-only rule and is the
+/// kill switch.
 ///
 /// Off by default because it is not shown to PAY, not because it is wrong. It
 /// moves the residency census deterministically (`resident=1` to `2`,
@@ -5188,9 +5189,11 @@ fn ls_carry_relief() -> u64 {
     use std::sync::OnceLock;
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
+        // 2026-09-05: DEFAULT 64, i.e. ON. `=0` restores the old
+        // distance-only rule and is the kill switch.
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LS_CARRY_RELIEF") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(0),
-            Err(_) => 0,
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(64),
+            Err(_) => 64,
         }
     })
 }
