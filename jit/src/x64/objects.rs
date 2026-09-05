@@ -138,7 +138,16 @@ impl Compiler {
 
         self.emit_mov_r64_r64(RCX, source_reg);
         self.emit_sub_r64_r64(RCX, R10);
-        self.emit_shr_r64_imm8(RCX, 9); // CARD_SIZE = 512
+        // NOT a literal `9`. This shift is baked into machine code, and it has
+        // to equal the card size every card table in the VM is indexed by --
+        // `gc::card_table::CARD_SIZE` and `gc::g1_cards::G1_CARD_SHIFT`, both of
+        // which now derive from the same constant. It was `9` with a
+        // `// CARD_SIZE = 512` comment beside it, which is a binding a compiler
+        // cannot check: a divergence would not read as a mismatch between two
+        // Rust constants, it would be a barrier that dirties the WRONG card, and
+        // a missed dirty card is a reachable young object the next collection
+        // reclaims.
+        self.emit_shr_r64_imm8(RCX, cratonvm_types::CARD_SHIFT as u8);
         self.emit_mov_imm64_full(R11, self.helpers.jit_card_table_addr as i64);
         self.emit_mov_mem8_indexed_imm8(R11, RCX, 1); // CARD_DIRTY
 
