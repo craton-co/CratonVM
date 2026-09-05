@@ -114,6 +114,7 @@ pub mod lambda_adapter;
 pub mod loop_analysis;
 pub mod metrics;
 pub mod null_check_elim;
+pub mod offload_hook;
 pub mod osr_coords;
 pub mod pgo;
 pub mod platform;
@@ -24345,7 +24346,27 @@ fn try_compile_inner(
                                 }
                             }
                         }
-                        if let Some((entry, callee_needs_ctx)) = direct_target {
+                        // A GPU kernel keeps its dispatch helper.
+                        //
+                        // A raw `CALL` to the callee's entry is the one door in
+                        // this backend that bypasses `jit_invoke_dispatch` for a
+                        // statically-bound site, and that helper is where the
+                        // offload hook now lives. Binding this site directly
+                        // would compile the caller and silently end offload --
+                        // which is exactly what `offload_jit_gate` used to
+                        // refuse to compile the whole method to prevent.
+                        //
+                        // Unarmed (no `--gpu`, or nothing registered) this is
+                        // one relaxed bool. See `crate::offload_hook`.
+                        let site_is_gpu_kernel = is_static
+                            && crate::offload_hook::is_kernel(
+                                cn.as_str(),
+                                mn.as_str(),
+                                desc.as_str(),
+                            );
+                        if let Some((entry, callee_needs_ctx)) =
+                            direct_target.filter(|_| !site_is_gpu_kernel)
+                        {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             if !direct_target_is_thin_helper {
                                 ir_direct_callee_entries

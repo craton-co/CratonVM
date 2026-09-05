@@ -7267,29 +7267,31 @@ impl ZgcRealHeap {
 
     /// Snapshot of the pinned addresses, for the relocation-set filter.
     ///
-    /// # A CRITICAL PIN DOES NOT KEEP ANYTHING ALIVE, and it should
+    /// # THIS IS THE IMMOVABILITY HALF ONLY -- and that is correct
     ///
-    /// This is the only reader, and its one caller is inside `relocate_stw`.
-    /// So `pin_critical` makes an object IMMOVABLE and nothing else: the mark
-    /// phase never sees these addresses, so an object whose only reference is
-    /// the raw pointer a native is holding is unreachable, gets swept,
-    /// free-listed, and -- since the reserve/commit store shipped -- has its
-    /// granules handed back to the OS. The native's next write then faults on
-    /// `PROT_NONE` rather than scribbling on stale bytes.
+    /// This is the only reader of [`ZgcCounters::critical_pins`], and its one
+    /// caller is inside `relocate_stw`. So a `pin_critical` keeps an object
+    /// where it is and does not, by itself, keep it ALIVE. Read from this end
+    /// alone that looks like a hole in `GetPrimitiveArrayCritical`'s contract,
+    /// which promises the array stays valid until `Release` -- a liveness
+    /// promise, not just an immovability one. It has been read that way, and
+    /// wrongly.
     ///
-    /// On a DEFAULT run the pin is inert entirely, because relocation is
-    /// opt-in (`CRATONVM_ZGC_RELOCATE`): nothing consults this at all.
-    /// `GetPrimitiveArrayCritical`'s contract is that the array stays valid
-    /// until `Release`, which is a liveness promise and not just an immovability
-    /// one, so these addresses belong in the root set as well as in the
-    /// relocation filter.
+    /// The liveness half is a DIFFERENT MECHANISM taken at the SAME call site.
+    /// `jni_get_primitive_array_critical` calls `VmHeap::pin_critical_region`
+    /// (this table) and then `pin_critical_array`, which pins the object in
+    /// `cratonvm_gc::pinned`; `vm/src/memory/roots.rs` section 9c splices that
+    /// set into the root set for the generational, G1 and ZGC backends alike.
+    /// The two are complementary and neither substitutes for the other:
+    /// removing this one lets a slide move an array a native is about to be
+    /// copied back into, and removing that one lets the array be reclaimed
+    /// under it.
     ///
-    /// Not fixed here because the fix wants its own change and its own test --
-    /// the one the current code would fail, which is
-    /// `docs/known-issues/gc-critical-pin-does-not-keep-the-object-alive-20260904.md`.
-    /// JNI's own array path does NOT depend on this: it hands out a detached
-    /// copy and mints a global ref as the keep-alive (`vm/src/native/jni.rs`),
-    /// which is why this has not been a crash.
+    /// Do not "fix" the apparent gap by rooting these addresses here as well.
+    /// It would double-root every pinned object and put the keep-alive in two
+    /// places that can disagree. If you are here because the pin looks inert,
+    /// the test that says otherwise is
+    /// `roots::tests::a_jni_critical_pin_keeps_its_object_alive_with_no_other_reference`.
     fn critical_pin_addrs(&self) -> Vec<usize> {
         let pins = self.counters.critical_pins.lock();
         if pins.is_empty() {
