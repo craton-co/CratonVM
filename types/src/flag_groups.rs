@@ -1596,6 +1596,11 @@ pub const INVENTORY: &[E] = &[
     // `field-fast-path` — off restores the full `op_getfield` / `op_putfield`
     // handler on every instance field access.
     E { group: Group::JIT, token: "field-fast-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_FAST_PATH"), off_word: None, since: "2026-09-02" },
+    // `field-addr-elide` — off restores the object-start registry probe the
+    // quickened field and array arms ran on every receiver. The handler those
+    // arms replace (`ZgcRealHeap::get_field`) never made that test, and the
+    // header comparison beside it is what actually validates the site.
+    E { group: Group::JIT, token: "field-addr-elide", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_ADDR_ELIDE"), off_word: None, since: "2026-09-05" },
     // `osr-inline-gate` — off calls `try_osr_with_backoff` on every backward
     // branch instead of only past the smallest OSR threshold.
     E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },

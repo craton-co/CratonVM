@@ -1876,6 +1876,37 @@ cached_is_set!(no_backedge_poll_gate, "CRATONVM_JIT_NO_BACKEDGE_POLL_GATE");
 /// Token: `CRATONVM_JIT=-field-fast-path`.
 cached_is_set!(no_field_fast_path, "CRATONVM_JIT_NO_FIELD_FAST_PATH");
 
+/// `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE` -- restore the object-start registry
+/// probe the quickened field and array arms used to run on every receiver.
+///
+/// `field_ptr_for` and `prim_elem_ptr` opened with
+/// `ZgcRealHeap::is_object_address`, which on the bitmap arm is one `Acquire`
+/// load of a word of the object-start bitmap -- one bit per 8 arena bytes, so
+/// ~16 MB of bitmap for a 1 GiB heap, indexed by the receiver's own address.
+/// A probe with two live objects keeps that word in L1; a real working set
+/// makes it a random access into a structure sized by the heap.
+///
+/// It is not a check the arms are obliged to make. The handler they exist to
+/// replace -- `ZgcRealHeap::get_field` -- dereferences the receiver's header
+/// with no membership test at all (`self.header(obj)` is a bare pointer cast),
+/// and so does `set_field`. What actually establishes that this receiver
+/// matches this site is the header comparison immediately after the probe:
+/// `class_id`, `num_slots` and the compact flag, all three, on every access.
+///
+/// The one thing the probe did buy incidentally was a stale-receiver screen: a
+/// relocated address is pruned from the registry, so it missed and fell back to
+/// `op_getfield`, which heals the receiver with `load_and_forward`. That heal
+/// exists for a window the fast arms do not have -- `op_getfield` pops the
+/// receiver into a bare Rust local and then calls `resolve_field_ref`, which
+/// can load a class, allocate, and provoke a collection while the local is
+/// invisible to the root scan. Between `peek_compact` and the header read the
+/// quickened arm allocates nothing, takes no lock and calls nothing that can
+/// reach a safepoint, so its window is zero-length and the operand-stack slot
+/// it read is one the collector has already updated.
+///
+/// Token: `CRATONVM_JIT=-field-addr-elide`.
+cached_is_set!(no_field_addr_elide, "CRATONVM_JIT_NO_FIELD_ADDR_ELIDE");
+
 /// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
 /// backward branch instead of only once `Frame::backward_count` has reached
 /// the smallest threshold the call could accept. Token:

@@ -87,8 +87,13 @@
 //!   falls back, so the corrupt-cell census and its report stay with the
 //!   handler that owns them.
 //!
-//! Kill switch: `CRATONVM_JIT_NO_FIELD_FAST_PATH=1` (`CRATONVM_JIT=
-//! -field-fast-path`). Engagement: `CRATONVM_DBG_FIELD_SITE=1` prints
+//! Kill switches: `CRATONVM_JIT_NO_FIELD_FAST_PATH=1` (`CRATONVM_JIT=
+//! -field-fast-path`) turns the arms off entirely;
+//! `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE=1` (`CRATONVM_JIT=-field-addr-elide`)
+//! keeps them but restores the per-receiver object-start registry probe they
+//! used to open with — see [`registry_probe_restored`] for why that probe is
+//! not what makes the header read sound.
+//! Engagement: `CRATONVM_DBG_FIELD_SITE=1` prints
 //! `fast-field: get hit/miss/fill put hit/miss/fill unusable`, and names the
 //! first few reasons a site could not be quickened.
 
@@ -199,12 +204,73 @@ unsafe fn store_ref(p: *mut u8, raw: u64) {
 /// one cache: a site filled against a legacy receiver refuses a compact one
 /// and vice versa, even at the same class id.
 #[inline(always)]
+/// Is the object-start registry probe restored on the quickened field and
+/// array arms? `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE=1`
+/// (`CRATONVM_JIT=-field-addr-elide`); default `false`, i.e. elided.
+///
+/// # Why the probe went
+///
+/// `ZgcRealHeap::is_object_address` is `ZObjectStartBits::contains`: on the
+/// bitmap arm, one `Acquire` load of a word of the object-start bitmap,
+/// indexed by the receiver's own address. That bitmap is one bit per 8 arena
+/// bytes — about 16 MB for a 1 GiB heap — so the load is a random access into
+/// a structure sized by the HEAP, taken on the two most frequent bytecodes in
+/// object-oriented code. (The `overflow_len` load beside it is only reached
+/// when the bitmap says no, so the hit path is one load, not two.)
+///
+/// # Why it is not load-bearing
+///
+/// Three arguments, in the order they were checked:
+///
+/// 1. **The handler these arms replace does not make this test.**
+///    `ZgcRealHeap::get_field` is `let header = self.header(obj)` — a bare
+///    pointer cast — followed by `check_field_index` against that header.
+///    `set_field` is the same. So the quickened arms were paying for a
+///    validation the spec-complete path they stand in for never performed,
+///    and eliding it restores parity rather than weakening it.
+///
+/// 2. **The site check is the header comparison, not the registry.** What
+///    makes the recorded offset legal for THIS receiver is the triple compare
+///    immediately below — `class_id`, `num_slots`, and the compact flag — and
+///    for arrays the `kind` / `element_type` / `array_length` tests. Those run
+///    unchanged. A mismatch still falls back to the full handler, which
+///    refills the site.
+///
+/// 3. **The stale-receiver screen it incidentally provided has no window to
+///    cover here.** A relocated address is pruned from the registry, so the
+///    probe used to miss on one and fall back to `op_getfield`, whose
+///    `load_and_forward` heals it. That heal exists for a window these arms do
+///    not have: `op_getfield` pops the receiver into a bare Rust local and
+///    then calls `resolve_field_ref`, which can load a class, allocate, and
+///    provoke a collection while the local is invisible to the root scan
+///    (GCBARRIER-CDLWAIT-FIX, 2026-07-17). Between `peek_compact` and the
+///    header read below there is no allocation, no lock and no call that can
+///    reach a safepoint, so the operand-stack slot read here is one the
+///    collector has already updated through the pointer map.
+///
+/// # What this does NOT claim
+///
+/// It does not claim the probe was worthless as a debugging net. A wild or
+/// smuggled pointer that would previously have been declined into the slow
+/// path now reaches the header comparison, which will almost certainly reject
+/// it — but by dereferencing it first. That is the same exposure every other
+/// header read in this collector already carries, which is the point of
+/// argument 1, and it is the reason this is a switch rather than a deletion.
+#[inline]
+fn registry_probe_restored() -> bool {
+    crate::runtime::env_cache::no_field_addr_elide()
+}
+
 fn field_ptr_for(zgc: &ZgcRealHeap, ptr: u64, site: &FastFieldSite) -> Option<*mut u8> {
-    if zgc.is_object_address(ptr as usize).is_none() {
+    if registry_probe_restored() && zgc.is_object_address(ptr as usize).is_none() {
         return None;
     }
-    // SAFETY: `ptr` was just confirmed to be a registered object start on
-    // this heap, so its first `HEADER_SIZE` bytes are a live `ObjectHeader`.
+    // SAFETY: `ptr` is the receiver of a verified `getfield` / `putfield`, so
+    // it is a live object reference and its first `HEADER_SIZE` bytes are an
+    // `ObjectHeader` — the same premise `ZgcRealHeap::get_field` dereferences
+    // on, and on the same operand-stack slot. See `registry_probe_restored`
+    // for why the registry test that used to precede this is not what makes
+    // the read sound, and for the stale-receiver argument.
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     if header.class_id != site.receiver_class_id
         || header.num_slots() != site.num_slots
@@ -729,10 +795,14 @@ fn prim_elem_ptr(zgc: &ZgcRealHeap, arr: ObjectRef, index: i32, opcode: u8) -> O
         return None;
     }
     let base = arr.as_ptr() as usize;
-    if zgc.is_object_address(base).is_none() {
+    if registry_probe_restored() && zgc.is_object_address(base).is_none() {
         return None;
     }
-    // SAFETY: registered object start, live header.
+    // SAFETY: `arr` is the array reference of a verified `*aload` / `*astore`,
+    // popped from the operand stack in this same safepoint-free window; its
+    // first `HEADER_SIZE` bytes are a live header. The `kind()`,
+    // `element_type()` and `array_length()` tests below are what establish the
+    // element address is in bounds. See `registry_probe_restored`.
     let header = unsafe { &*(base as *const ObjectHeader) };
     if header.kind() != ObjectKind::Array {
         return None;
