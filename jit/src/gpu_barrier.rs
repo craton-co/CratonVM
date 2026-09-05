@@ -112,16 +112,54 @@ pub const BARRIER_LEN: usize = 51;
 /// several VMs in one process: `ADDR_FILTER` and the dirty table are
 /// process-global (the drain evicts by bucket across every VM's table),
 /// so every caller publishes the same two values.
+///
+/// # Not from a test in a shared test binary
+///
+/// "Publishes the same two values" is a statement about VM STARTUP. A test
+/// that arms, reads and disarms is doing something else entirely, and there
+/// is no save-and-restore that makes it safe:
+///
+/// * cargo runs a binary's tests as parallel THREADS in one process, so two
+///   such tests interleave — each saves what the other just published and
+///   restores it over the other's arming;
+/// * worse, while the pair is armed, EVERY other thread in that binary that
+///   compiles a primitive array store gets 51 extra bytes, because
+///   `x64/arrays.rs` and `ir_lower.rs` consult [`barrier_bytes`] at emit
+///   time. The blast radius is not the arming test.
+///
+/// Four unit tests here and two in `vm/src/runtime/offload_jit_gate.rs` did
+/// exactly this until 2026-09-05. `cargo test -p cratonvm-jit --lib` failed
+/// a DIFFERENT pair of them on roughly one run in three, and passed under
+/// `--test-threads=1` — the signature of scheduling, not of a defect.
+///
+/// Test the encoder through [`barrier_bytes_for`] and the predicate through
+/// [`pair_is_armed`]; both are pure. The globals themselves are covered by
+/// `jit/tests/gpu_barrier_arming.rs`, which is its OWN PROCESS and holds no
+/// codegen tests to disturb.
 pub fn arm(filter_addr: usize, dirty_addr: usize) {
     FILTER_ADDR.store(filter_addr, Ordering::Release);
     DIRTY_ADDR.store(dirty_addr, Ordering::Release);
+}
+
+/// Is a given pair armed? Pure, so a test can ask without publishing.
+///
+/// Both halves must be present: a partially-published pair would emit a
+/// sequence that stores through a null pointer. [`barrier_bytes_for`]
+/// returns `Some` exactly when this returns `true`, and the two are pinned
+/// against each other rather than merely written to agree.
+#[inline]
+pub fn pair_is_armed(filter_addr: usize, dirty_addr: usize) -> bool {
+    filter_addr != 0 && dirty_addr != 0
 }
 
 /// Is the barrier armed? `false` means every array store compiles exactly
 /// as it did before this module existed.
 #[inline]
 pub fn is_armed() -> bool {
-    FILTER_ADDR.load(Ordering::Acquire) != 0 && DIRTY_ADDR.load(Ordering::Acquire) != 0
+    pair_is_armed(
+        FILTER_ADDR.load(Ordering::Acquire),
+        DIRTY_ADDR.load(Ordering::Acquire),
+    )
 }
 
 /// The bytes to emit after an inline primitive array store, or `None`
@@ -130,9 +168,21 @@ pub fn is_armed() -> bool {
 /// See the module docs for the sequence, its register contract (RAX in,
 /// R10/R11/flags clobbered) and the two relative jumps' arithmetic.
 pub fn barrier_bytes() -> Option<Vec<u8>> {
-    let filter = FILTER_ADDR.load(Ordering::Acquire);
-    let dirty = DIRTY_ADDR.load(Ordering::Acquire);
-    if filter == 0 || dirty == 0 {
+    barrier_bytes_for(
+        FILTER_ADDR.load(Ordering::Acquire),
+        DIRTY_ADDR.load(Ordering::Acquire),
+    )
+}
+
+/// The same bytes, for an explicitly supplied pair.
+///
+/// This is the whole encoder; [`barrier_bytes`] is a two-line wrapper that
+/// supplies the published pair. Split out 2026-09-05 so the encoding can be
+/// tested without touching process state — see [`arm`] for what that cost
+/// before, and `jit/tests/gpu_barrier_arming.rs` for what still covers the
+/// globals.
+pub fn barrier_bytes_for(filter: usize, dirty: usize) -> Option<Vec<u8>> {
+    if !pair_is_armed(filter, dirty) {
         return None;
     }
     let mut b = Vec::with_capacity(BARRIER_LEN);
@@ -173,18 +223,22 @@ pub fn barrier_bytes() -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Arming is process-global, so the encoder is exercised through a
-    /// saved-and-restored pair rather than by calling `arm` and leaving
-    /// the rest of this test binary's codegen changed.
+    /// The encoder, for a pair supplied here rather than published.
+    ///
+    /// This used to save the two globals, `arm` its own pair, encode, and
+    /// restore — which is not safe in a binary whose tests are parallel
+    /// THREADS. Two of these interleaved would each restore over the
+    /// other's arming, and while either was armed any other thread
+    /// compiling a primitive array store would emit 51 bytes it should
+    /// not. `cargo test -p cratonvm-jit --lib` failed a different pair of
+    /// these on about one run in three and was green under
+    /// `--test-threads=1`. See [`arm`]'s doc.
+    ///
+    /// Nothing below touches `FILTER_ADDR` or `DIRTY_ADDR`. If a test in
+    /// this module ever needs to, it belongs in
+    /// `jit/tests/gpu_barrier_arming.rs` instead — a separate process.
     fn encode_with(filter: usize, dirty: usize) -> Vec<u8> {
-        let saved = (
-            FILTER_ADDR.load(Ordering::Acquire),
-            DIRTY_ADDR.load(Ordering::Acquire),
-        );
-        arm(filter, dirty);
-        let out = barrier_bytes().expect("armed");
-        arm(saved.0, saved.1);
-        out
+        barrier_bytes_for(filter, dirty).expect("armed pair")
     }
 
     #[test]
@@ -224,18 +278,40 @@ mod tests {
 
     /// A partially-published pair must emit nothing rather than a
     /// sequence that stores through a null pointer.
+    ///
+    /// Both halves are asserted against `pair_is_armed`, not merely
+    /// alongside it: `barrier_bytes_for` returning `Some` for a pair the
+    /// predicate calls unarmed would be a barrier emitted where
+    /// `offload_jit_gate` believes there is none, which is the
+    /// refuse-to-compile fallback silently not applying.
     #[test]
     fn a_half_armed_pair_emits_nothing() {
-        let saved = (
-            FILTER_ADDR.load(Ordering::Acquire),
-            DIRTY_ADDR.load(Ordering::Acquire),
-        );
-        arm(0x1000, 0);
-        assert!(barrier_bytes().is_none());
-        assert!(!is_armed());
-        arm(0, 0x2000);
-        assert!(barrier_bytes().is_none());
-        assert!(!is_armed());
-        arm(saved.0, saved.1);
+        for (filter, dirty) in [(0x1000usize, 0usize), (0, 0x2000), (0, 0)] {
+            assert!(
+                barrier_bytes_for(filter, dirty).is_none(),
+                "({filter:#x}, {dirty:#x}) must emit nothing"
+            );
+            assert!(!pair_is_armed(filter, dirty));
+        }
+        assert!(pair_is_armed(0x1000, 0x2000));
+        assert!(barrier_bytes_for(0x1000, 0x2000).is_some());
+    }
+
+    /// `barrier_bytes_for` answers `Some` exactly when `pair_is_armed`
+    /// says so. The two are read in different places — the emitters call
+    /// the first, `offload_jit_gate` calls the second through
+    /// `is_armed` to choose its array-writer policy — so a disagreement
+    /// is a gate that stands down while nothing takes its place.
+    #[test]
+    fn the_predicate_and_the_encoder_agree_on_every_corner() {
+        for filter in [0usize, 1, 0x1000, usize::MAX] {
+            for dirty in [0usize, 1, 0x2000, usize::MAX] {
+                assert_eq!(
+                    barrier_bytes_for(filter, dirty).is_some(),
+                    pair_is_armed(filter, dirty),
+                    "disagreed on ({filter:#x}, {dirty:#x})"
+                );
+            }
+        }
     }
 }
