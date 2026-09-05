@@ -2014,6 +2014,13 @@ pub const INVENTORY: &[E] = &[
     // rather than one build apart. Statics are the first root class in this VM
     // carried as a SLOT rather than a value -- see `memory::roots::
     // STATIC_REF_SLOTS` for why they are the ones that can be.
+    // Opt-IN: hand the evacuated young semi-space back to the OS at the end of
+    // each young collection instead of only zeroing it. The generational
+    // collector was the one backend that never gave memory back at all. Off by
+    // default for the same reason `g1-uncommit` is: it publishes the young
+    // arenas' full reserved range to the JIT, and a decommitted granule faults
+    // on touch rather than reading as zero.
+    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "static-root-slots", on_key: Some("CRATONVM_GC_STATIC_ROOT_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },

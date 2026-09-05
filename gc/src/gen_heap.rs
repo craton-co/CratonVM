@@ -1565,6 +1565,20 @@ pub struct JitRegionBoundsTable {
     pub words: [AtomicUsize; 6],
 }
 
+/// Bytes the generational collector has returned to the OS, over the process.
+///
+/// The engagement number for `CRATONVM_GEN_UNCOMMIT`. A zero with the switch ON
+/// is a fact worth seeing — it means every collection found the evacuated
+/// semi-space had no whole granule to give back — and it is indistinguishable
+/// from the switch being off unless it is printed.
+pub static YOUNG_BYTES_UNCOMMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes returned to the OS by the generational young collector so far.
+pub fn young_bytes_uncommitted() -> u64 {
+    YOUNG_BYTES_UNCOMMITTED.load(Ordering::Relaxed)
+}
+
 pub static JIT_REGION_BOUNDS: JitRegionBoundsTable = JitRegionBoundsTable {
     // Written out element-by-element (not `[const { ... }; 6]`) to stay under
     // the workspace MSRV — inline-const repeat expressions landed in 1.79.
@@ -2867,6 +2881,69 @@ impl GenerationalHeap {
                 self.wipe_in_flight.store(false, Ordering::Release);
             }
         }
+    }
+
+    /// Hand the EVACUATED young semi-space back to the OS.
+    ///
+    /// `CRATONVM_GEN_UNCOMMIT` (opt-in). Returns the bytes released.
+    ///
+    /// # Why this collector had nothing like it
+    ///
+    /// It was the only backend that never gave memory back. ZGC decommits its
+    /// arena's un-bumped middle and free lists on every collection; G1 shrinks
+    /// its committed prefix on request (`CRATONVM_G1_UNCOMMIT`); `gen_heap.rs`
+    /// contained no `decommit` call at all, so a run that peaked and then idled
+    /// held its peak for the life of the process.
+    ///
+    /// # Why the inactive semi-space is the right target, and the old gen is not
+    ///
+    /// After the flip, `young_to` is the space the collection evacuated FROM.
+    /// Nothing live is in it — that is what the flip means — and the very next
+    /// thing this cycle does to it today is zero it
+    /// ([`Self::spawn_evacuated_wipe`]). Decommitting is the same statement
+    /// made to the OS instead of to the bytes: the pages go back, and the next
+    /// allocation into them arrives through [`crate::arena::Arena::alloc`] →
+    /// `hand_out`, which re-commits the granule it hands out.
+    ///
+    /// The OLD generation is not a candidate and cannot be made one here: it is
+    /// a `Vec<u8>`, committed in full at construction, with no reservation to
+    /// shrink. Giving it lazy commit is a change to its allocator, not a call
+    /// site.
+    ///
+    /// # What it costs, and why it is off by default
+    ///
+    /// A decommitted granule FAULTS on touch. It does not read back as zero —
+    /// `Arena::decommit_free_blocks` says so, and records that believing
+    /// otherwise is how two ZGC slides came to write into released granules.
+    /// This collector publishes its young arenas' FULL reserved range into
+    /// `JIT_REGION_BOUNDS` (inline reference stores) and `JIT_READ_BOUNDS`
+    /// (inline `getfield`), so a compiled access through a STALE reference into
+    /// the evacuated semi-space would fault rather than read a stale value.
+    ///
+    /// That window is not created by this method — the young arenas already
+    /// commit lazily in 2 MiB granules while the published bound covers the
+    /// whole reservation — but it is WIDENED by it, from "granules never yet
+    /// allocated into" to "granules that held objects one collection ago". The
+    /// interpreter's own probe is safe either way: `is_object_address` screens
+    /// every candidate through `region_range_committed` before it dereferences
+    /// anything, and declines an address in a released granule.
+    ///
+    /// Off by default because that trade is a measurement and not a judgement,
+    /// and because the switch is what lets it be made in one binary. Same
+    /// reasoning, and the same default, as `g1_uncommit`.
+    fn uncommit_evacuated_young(&self, evacuated: &mut Arena) -> usize {
+        if !gc_flags().gen_uncommit {
+            return 0;
+        }
+        // BOTH halves, for the reason ZGC's site gives: the middle is the space
+        // no allocation ever reached, the free lists are the space that WAS
+        // allocated and has since been freed. After an evacuating flip the
+        // second is most of it.
+        let released = evacuated.decommit_unbumped_middle() + evacuated.decommit_free_blocks();
+        if released != 0 {
+            YOUNG_BYTES_UNCOMMITTED.fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
     }
 
     /// Wait for the off-pause wipe, if one is running. Idempotent and cheap
@@ -8917,12 +8994,50 @@ impl GenerationalHeap {
         // final here. The bytes are zero long before the next cycle needs
         // them, and `collect_garbage_inner` joins the thread before it looks.
         if let Some(wipe) = deferred_wipe {
-            let spans = young_to.deferred_wipe_spans(&wipe);
+            let mut spans = young_to.deferred_wipe_spans(&wipe);
+            // GIVE BACK FIRST, THEN WIPE WHAT IS LEFT.
+            //
+            // `CRATONVM_GEN_UNCOMMIT`, off by default; see
+            // `uncommit_evacuated_young` for what it costs and why the default
+            // is a measurement rather than a judgement. This is the arena the
+            // collection evacuated FROM, so nothing live is in it, and the very
+            // next thing this cycle does to it is zero it -- which is the same
+            // statement made to the bytes instead of to the OS.
+            //
+            // The order is load-bearing, and the first attempt got it wrong in
+            // both available ways. Putting the give-back in an `else` of this
+            // `if` made it STRUCTURALLY DEAD: `deferred_wipe` is `Some` on the
+            // default path (it is the final `else` of the reset arm above), so
+            // the arm never ran and the census read zero for a switch that was
+            // on. Running both against overlapping spans is worse than dead --
+            // a released granule FAULTS on write, and the wipe thread would be
+            // writing into memory this call had returned.
+            //
+            // They are not interchangeable, which is why the wipe is not simply
+            // skipped: a released granule comes back from the OS zeroed, but
+            // `Arena::hand_out` does not zero, and the give-back only releases
+            // WHOLE granules rounded inward. The partial granules at a span's
+            // edges still hold the previous cycle's object bytes and still have
+            // to be written over. `retain_committed_spans` is exactly that
+            // remainder.
+            let released = self.uncommit_evacuated_young(&mut young_to);
+            if released != 0 {
+                spans = young_to.retain_committed_spans(spans);
+                tracing::debug!(
+                    target: "cratonvm::gc",
+                    bytes = released,
+                    "gen: returned the evacuated young semi-space to the OS",
+                );
+            }
             if mv_phase_on {
                 let bytes: usize = spans.iter().map(|&(_, l)| l).sum();
                 moving_phase_count_push("wipe_deferred_bytes", bytes as u128);
             }
             self.spawn_evacuated_wipe(spans);
+        } else {
+            // The synchronous-wipe and quarantine arms already zeroed (or
+            // parked) the arena, so there is no wipe to coordinate with.
+            let _ = self.uncommit_evacuated_young(&mut young_to);
         }
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC

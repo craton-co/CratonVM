@@ -1032,6 +1032,24 @@ pub struct GcFlags {
     /// switch even though the ordering that makes it safe is written down and
     /// tested.
     pub g1_uncommit: bool,
+    /// `CRATONVM_GEN_UNCOMMIT` — return the EVACUATED young semi-space to the
+    /// OS at the end of each young collection, instead of only zeroing it.
+    ///
+    /// The generational collector was the one backend that never gave memory
+    /// back: ZGC does it by default, G1 on request ([`Self::g1_uncommit`]), and
+    /// `gen_heap.rs` contained no `decommit` call at all. Its old generation
+    /// still cannot — that is a `Vec<u8>`, committed in full at construction,
+    /// with no reservation to shrink — but the two young semi-spaces are
+    /// `HeapStore`-backed and the INACTIVE one is, by construction, entirely
+    /// dead the moment the flip completes.
+    ///
+    /// Off by default, and the reason is the same one `g1_uncommit`'s doc
+    /// gives: this collector publishes its young arenas' FULL reserved range
+    /// into `JIT_REGION_BOUNDS` and `JIT_READ_BOUNDS`, and a decommitted
+    /// granule FAULTS on touch rather than reading as zero. Deciding the
+    /// default is a measurement, not a judgement, and the switch is how it gets
+    /// made in one binary.
+    pub gen_uncommit: bool,
     /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
     /// source walks against a per-arena CARD TABLE, instead of walking every
     /// byte of every named source region. Default **ON**
@@ -1583,6 +1601,7 @@ impl GcFlags {
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
+            gen_uncommit: present(src, "CRATONVM_GEN_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
             g1_card_screen_jit_pinned: on_unless_zero(

@@ -3055,6 +3055,66 @@ impl Arena {
         self.data.commit_bits()
     }
 
+    /// Clip absolute `(addr, len)` spans to the parts of them that are still
+    /// COMMITTED, dropping anything that is not.
+    ///
+    /// # Why a caller needs this
+    ///
+    /// The deferred young wipe and the give-back are two ways of saying the
+    /// same thing to the same bytes, and running both is a race rather than
+    /// belt-and-braces: the wipe thread `memset`s spans of this arena, and a
+    /// granule the give-back has released FAULTS on write.
+    ///
+    /// They are not interchangeable either. A released granule comes back from
+    /// the OS zeroed, so it needs no wipe — but `hand_out` does not zero, and
+    /// the give-back only releases WHOLE granules rounded inward, so whatever
+    /// sits in the partial granules at a span's edges is still the previous
+    /// cycle's object bytes and still has to be written over.
+    ///
+    /// So: give back first, then wipe what is left. This is "what is left".
+    /// On the wholly-committed fallback store (no reservation, nothing ever
+    /// released) every span is returned unchanged, which is exactly the
+    /// pre-give-back behaviour.
+    pub fn retain_committed_spans(&self, spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        let Some(bits) = self.data.commit_bits() else {
+            // No per-granule tracking: the store is wholly committed and
+            // nothing can have been released from it.
+            return spans;
+        };
+        let base = self.data.as_ptr() as usize;
+        let g = crate::reservation::GRANULE;
+        let mut out = Vec::with_capacity(spans.len());
+        for (addr, len) in spans {
+            if len == 0 || addr < base {
+                continue;
+            }
+            let start = addr - base;
+            let end = start + len;
+            // Walk granule by granule and coalesce the committed runs, so a
+            // span straddling a released granule yields its two live halves
+            // rather than being dropped whole.
+            let mut cur: Option<(usize, usize)> = None;
+            let mut off = start;
+            while off < end {
+                let gran = off / g;
+                let gran_end = ((gran + 1) * g).min(end);
+                if crate::reservation::granule_committed(&bits, gran) {
+                    match &mut cur {
+                        Some((_, e)) => *e = gran_end,
+                        None => cur = Some((off, gran_end)),
+                    }
+                } else if let Some((s, e)) = cur.take() {
+                    out.push((base + s, e - s));
+                }
+                off = gran_end;
+            }
+            if let Some((s, e)) = cur.take() {
+                out.push((base + s, e - s));
+            }
+        }
+        out
+    }
+
     /// Bytes of this arena's capacity that are actually committed.
     ///
     /// Equal to `capacity()` on the wholly-committed fallback store; below it,

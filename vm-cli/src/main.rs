@@ -276,6 +276,20 @@ fn maybe_dump_shutdown_reports() {
                     }
                 }
             }
+            // MEMORY RETURNED TO THE OS by the generational young collector
+            // (`CRATONVM_GEN_UNCOMMIT`). Printed whenever a collection ran,
+            // zero included: a zero with the switch ON means every collection
+            // found the evacuated semi-space had no whole granule to give back,
+            // which is a real finding about the workload, and it is
+            // indistinguishable from the switch being off unless it is printed.
+            {
+                let bytes = cratonvm_vm::young_bytes_uncommitted();
+                if bytes != 0 {
+                    eprintln!(
+                        "[cratonvm] generational young uncommit: {bytes} bytes returned to the OS"
+                    );
+                }
+            }
             // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
             // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
             // usual reason: `slots=0` alone cannot distinguish the kill switch
