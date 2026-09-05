@@ -1,7 +1,7 @@
 # Every blocking `connect` re-resolves the destination hostname, and Windows stalls after a few dozen
 
 **Status: FIXED 2026-09-05.** Found while building F3's
-acceptance curve for `performance/socket-transfer-per-call-costs-20260904.md`.
+acceptance curve for `socket-transfer-per-call-costs-20260904.md`.
 **Not caused by that work** — the exoneration arm is below and is one command.
 
 The page's first revision said "connect/accept stalls near 128 connections".
