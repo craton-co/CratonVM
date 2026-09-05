@@ -968,6 +968,21 @@ impl VmHeap {
     /// whose header is transiently unreadable (interior pointers, mid-
     /// initialisation slots, or stale-bit-pattern Long slots that the GC
     /// is well-equipped to ignore via its own size-sanity guard).
+    /// Resolve `addr` to the base of the object it points into, for PINNING.
+    ///
+    /// More permissive than [`Self::is_heap_addr`]: it accepts a MISALIGNED
+    /// interior pointer and a ONE-PAST-THE-END cursor, both of which that
+    /// method rejects and both of which a frozen peer's registers hold. See
+    /// `ZgcRealHeap::resolve_interior_for_pin`. Non-ZGC arms fall back, so this
+    /// is a no-op there.
+    pub fn resolve_interior_for_pin(&self, addr: usize) -> Option<ObjectRef> {
+        match self {
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.resolve_interior_for_pin(addr),
+            other => other.is_heap_addr(addr),
+        }
+    }
+
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         match self {
             VmHeap::Generational(h) => h.is_heap_addr(addr),

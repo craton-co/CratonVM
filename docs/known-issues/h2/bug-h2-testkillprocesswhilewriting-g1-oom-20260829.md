@@ -669,6 +669,52 @@ starts at 60% of the heap, so the young generation is not supposed to be
 collected at that granularity. Why the trigger fires that often, and why Mixed
 almost never runs, is the next question on this page.
 
+## PLATFORM GAP 2026-09-04: the fix is verified on LINUX only; the Windows arm still fails
+
+This page's `FIXED 2026-09-02 / passes 3/3` was measured on the Azure Linux host
+-- its own `## Reproducing` block says so (`source /data/toolchain/env.sh`,
+`cd /data/cratonvm/apps/h2database/h2`), and the 605-716 s pass and the 392 s
+default-collector comparison are both from there.
+
+**On Windows the class fails, and it fails at the SAME COMMIT that claims it
+passes.** `-XX:+UseG1GC --Xmx 1g`, local H2 corpus, 3 runs per arm:
+
+| build | results |
+|---|---|
+| `8287cf2b7` -- the merge titled "passes under `-XX:+UseG1GC`" | rc 127 / 124 / 1 |
+| current dev + the ZGC branch | rc 127 / 139 / 1 |
+
+Identical faces, identical timings, `FATAL: heap exhausted allocating
+java/lang/String` on both `rc=127` runs. **There is no regression between them**
+-- which is why no bisect was run over the 357 commits separating them: the
+known-good endpoint was verified FIRST and did not reproduce its own claim here.
+
+Three suspects were eliminated cheaply on the way, and are recorded so nobody
+re-tests them:
+
+| suspect | verdict |
+|---|---|
+| the ZGC branch's three new default-ON flags | exonerated -- 3/3 fail with all three forced off |
+| dev's `feat/g1-inline-barrier-default-on-20260904` | exonerated -- 3/3 fail with `CRATONVM_G1_INLINE_BARRIER=0` |
+| a dev regression since 2026-09-02 | refuted -- the known-good endpoint fails identically |
+
+The failure face varies exactly as this page already warns: `rc` of 1, 124, 127
+and 139 across twelve runs. Score only SIGSEGV as BAD if anyone does bisect
+something here.
+
+**What this means for the page.** The corruption and cap faces are fixed and the
+Linux evidence for that stands; nothing here contradicts it. What is NOT
+established is that the fix holds on Windows, where the class still exhausts the
+heap. That arm is OPEN and this page cannot be retired until it is either
+verified on Linux again (where the claim was made) or repaired on Windows.
+
+Also worth reading before assuming the clamp closed everything: the Windows runs
+emit `evacuation ref-scan CLAMPED a holder's element walk` repeatedly, and
+`pause ran with a live compiled frame and an EMPTY JIT root publication:
+pin_addrs=0 ... this pause evacuated against a root set it could not prove`. The
+clamp is the 2026-09-01 fix working, but it firing this often means the
+header-vs-region disagreement it contains is still happening.
+
 ## Status
 
 **FIXED 2026-09-02 — the class PASSES under `-XX:+UseG1GC`, 3/3 (605-716 s, against 392 s for the default collector on the same host and binary), with zero dangling references and zero implausible headers.** Two independent defects had to close: the CORRUPTION face (section 4d — G1 evacuated a conservative root pointing INSIDE a reference array and fabricated an object from the element) and the CAP face (section 4f — one live finalizable object disabled eager humongous reclaim for the whole process, leaving the heap 81% humongous and Eden at one region). Historical status below.

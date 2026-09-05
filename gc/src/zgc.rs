@@ -5731,6 +5731,16 @@ impl ZgcRealHeap {
             Some(relocation_skip_reason::SWITCH_OFF)
         } else if !crate::gc_quiescence::moving_young_enabled() {
             Some(relocation_skip_reason::MOVING_YOUNG_DISABLED)
+        } else if zgc_unrewritable_peer_state_refuses()
+            && crate::gc_quiescence::unrewritable_peer_state()
+        {
+            // AHEAD of the coverage test, deliberately. This is a statement
+            // about peer state that a PASSING proof does not answer: the proof
+            // says every compiled frame's oops are published and rewritable,
+            // and this says a frozen peer holds a derived pointer whose base
+            // nothing can name. A cycle that discharges the former still owes
+            // the latter.
+            Some(relocation_skip_reason::UNREWRITABLE_PEER_STATE)
         } else if crate::gc_quiescence::moving_young_coverage_incomplete()
             && !self.coverage_incompleteness_is_page_pinnable()
         {
@@ -5797,6 +5807,16 @@ impl ZgcRealHeap {
         let assume_rewritable =
             cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_ASSUME_REWRITABLE").is_some();
         let frames_are_rewritable = refusal.is_none() || assume_rewritable;
+        // The blanket guard short-circuits the proof entirely: a live compiled
+        // frame refuses, proven rewritable or not. Attributed to its own reason
+        // code so a run under it is not mistaken for a coverage failure.
+        let blanket = zgc_jit_blanket_refusal_enabled();
+        let refusal = if blanket && compiled_frames_live {
+            Some(relocation_skip_reason::JIT_ACTIVE_BLANKET)
+        } else {
+            refusal
+        };
+        let frames_are_rewritable = frames_are_rewritable && !(blanket && compiled_frames_live);
         if compiled_frames_live && !frames_are_rewritable {
             self.counters.relocation_skipped_jit.fetch_add(1, Ordering::Relaxed);
             if let Some(r) = refusal {
@@ -6227,6 +6247,26 @@ impl ZgcRealHeap {
                         }
                     }
                     match chosen {
+                        // The match GUARD commits the destination, which is
+                        // dev's independently-arrived-at form of the same fix
+                        // this branch built (`ensure_committed_span`, dropped in
+                        // the merge as the duplicate it became). Keeping the
+                        // evidence, because it is what turned this from a
+                        // suspicion into a diagnosis:
+                        //
+                        // "Inside the arena" is not "mapped". The arena commits
+                        // granules on demand and hands them back via
+                        // `decommit_unbumped_middle` / `decommit_free_blocks`
+                        // while their addresses stay reserved, so a destination
+                        // screened only by page and liveness can name memory
+                        // returned to the OS.
+                        //
+                        // Observed, not inferred: a fault-time witness
+                        // (`reservation::recent_decommit_covering`) reports the faulting address
+                        // INSIDE a decommitted granule, the access is a WRITE,
+                        // `offset_into_span` is 0x0 in every crash, and the
+                        // frame is this one. See
+                        // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
                         Some(to) if arena.commit_for_relocation(to - base, size) => {
                             debug_assert!(to < from, "the slide must never move an object UP");
                             // SAFETY: `size` bytes are live at `from`, `to` is
@@ -8014,6 +8054,64 @@ impl ZgcRealHeap {
     /// un-retired chunk tail is invisible to it rather than fatal. Retiring
     /// from a mutator query would also be actively wrong: it would close every
     /// thread's buffer on a conservative-root probe.
+    /// Resolve `addr` to the base of the object it points INTO, for PINNING a
+    /// frozen peer's conservative roots.
+    ///
+    /// Deliberately more permissive than [`Self::is_heap_addr`] in exactly two
+    /// ways, both of which that method rejects for good reasons that do not
+    /// apply here:
+    ///
+    /// 1. **Misalignment is accepted.** `VmHeap::is_heap_addr`'s ZGC arm drops
+    ///    `addr & 0x7 != 0` to converge on the contract Generational and G1
+    ///    already had. That is right for deciding whether an ambiguous operand
+    ///    word is a reference; it is wrong for deciding whether an object may
+    ///    MOVE. A compiled loop's cursor into a `char[]` or `byte[]` is
+    ///    routinely misaligned, and if its base is not pinned the array is
+    ///    relocated out from under the register holding it.
+    ///
+    /// 2. **One-past-the-end is accepted** (`addr <= end`, not `addr < end`).
+    ///    A loop cursor that has advanced past the last element names no byte
+    ///    of the object, so `is_heap_addr` correctly answers `None` -- and the
+    ///    object it was walking still must not move.
+    ///
+    /// Over-approximating here is the SAFE direction: the result is used to
+    /// withhold a page from relocation, so a false positive costs one page of
+    /// compaction and a false negative costs a use-after-free. That asymmetry
+    /// is the whole argument, and it is the one
+    /// `coverage_incompleteness_is_page_pinnable` already makes for pinning by
+    /// raw address value: "it does not matter whether the address is a base, an
+    /// interior pointer or a `long` that happens to look like one, because the
+    /// page it falls in is not evacuated either way".
+    ///
+    /// Measured motivation: with the helper-window discharge on, this workload
+    /// SIGSEGVs on a page-ALIGNED fault -- the signature of reading a span
+    /// `compact_low_to` vacated and zeroed -- and six repairs aimed at frame
+    /// slots, oop maps and remap paths changed nothing, because a derived
+    /// pointer has no base anywhere in the frame to find, pin or rewrite.
+    pub fn resolve_interior_for_pin(&self, addr: usize) -> Option<ObjectRef> {
+        if addr == 0 {
+            return None;
+        }
+        if self.registry.contains(addr) {
+            // SAFETY: the registry contains only live allocation bases.
+            return Some(unsafe { ObjectRef::from_raw(addr as *mut u8) });
+        }
+        if !self.registry.has_spill() && (addr < self.arena_base || addr > self.arena_end) {
+            return None;
+        }
+        let base = self.registry.nearest_base_at_or_below(addr)?;
+        // SAFETY: `nearest_base_at_or_below` yields a live registered base.
+        let header = unsafe { &*(base as *const ObjectHeader) };
+        let size = Self::alloc_size(header)?;
+        let end = base.checked_add(size)?;
+        // `<=`, not `<`: one-past-the-end still names the object for pinning.
+        if addr >= base && addr <= end {
+            // SAFETY: the registry contains only live bases.
+            return Some(unsafe { ObjectRef::from_raw(base as *mut u8) });
+        }
+        None
+    }
+
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         // Fast path: an exact object base (the overwhelmingly common probe).
         if self.registry.contains(addr) {
@@ -9810,8 +9908,34 @@ pub mod relocation_skip_reason {
     /// thread's chunk is still reserved and invisible to the collector. See
     /// `ZArenaTlabRegistry`-side `retire_all_tlabs_at_safepoint`.
     pub const TLAB_RETIRE_INCOMPLETE: usize = 5;
+    /// `CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` -- the collection refused because a
+    /// compiled frame was live AT ALL, without consulting the coverage proof.
+    ///
+    /// This is the rule `gen_heap` and `g1` use
+    /// (`is_active() || unregistered_jit_frame_on_stack()`), which this
+    /// collector replaced with the per-cycle proof on 2026-08-21 precisely
+    /// because `is_active()` is true in every steady-state workload. It exists
+    /// as a flag to PRICE that trade: it is expected to remove the
+    /// relocation-under-live-JIT SIGSEGV and to bring the fragmentation
+    /// `OutOfMemoryError` back with it.
+    pub const JIT_ACTIVE_BLANKET: usize = 6;
+    /// A frozen peer declared UNREWRITABLE PEER STATE, independently of whether
+    /// the coverage proof passed.
+    ///
+    /// Until 2026-09-04 `unrewritable_peer_state()` was consulted in exactly one
+    /// place on this collector -- inside
+    /// [`ZgcRealHeap::coverage_incompleteness_is_page_pinnable`] -- so it could
+    /// only ever bite on a cycle whose proof had ALREADY failed. A cycle that
+    /// discharged its proof never consulted it at all, and the derived-pointer
+    /// hazard it guards ("a frozen peer's registers can hold only a
+    /// derived/interior pointer whose base would otherwise be evacuated from
+    /// under it, then zeroed and re-served") went unchecked.
+    ///
+    /// It is a statement about peer STATE, not about proof completeness, so it
+    /// belongs in the chain on its own.
+    pub const UNREWRITABLE_PEER_STATE: usize = 7;
     /// One past the highest code; sizes the counter array.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 8;
 
     /// Human-readable label, for the summary line.
     pub fn label(code: usize) -> &'static str {
@@ -9822,9 +9946,46 @@ pub mod relocation_skip_reason {
             FORCED_NON_MOVING_ROOTS => "forced-non-moving-jit-roots",
             UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
             TLAB_RETIRE_INCOMPLETE => "tlab-retire-incomplete-at-safepoint",
+            JIT_ACTIVE_BLANKET => "jit-active-blanket-refusal",
+            UNREWRITABLE_PEER_STATE => "unrewritable-peer-state",
             _ => "unknown",
         }
     }
+}
+
+/// `CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` -- refuse relocation whenever a compiled
+/// frame is live, without consulting the per-cycle coverage proof.
+///
+/// The rule `gen_heap` and `g1` both apply and this collector does not. ZGC
+/// replaced it with the proof on 2026-08-21 because `gc_quiescence::is_active()`
+/// is true in every steady-state workload once the JIT engages, and on a
+/// collector where compaction is the only defragmentation there is, "never
+/// compact under JIT" means "never defragment" -- measured as an
+/// `OutOfMemoryError` on a heap 97 % free.
+///
+/// It is a flag rather than a fix because it is a TRADE, and the point is to
+/// price it: it should remove the relocation-under-live-JIT SIGSEGV that
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` tracks, and restore
+/// the fragmentation OOM that the pinned-peer credit had just eliminated.
+/// `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES=1` -- make `unrewritable_peer_state()`
+/// a refusal term in its own right, not merely an input to the page-pinnable
+/// question.
+///
+/// Pairs with `CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE`: that one restores
+/// the flag on a discharged cycle, this one gives it teeth when the proof
+/// passes. Either alone is inert.
+fn zgc_unrewritable_peer_state_refuses() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES").is_some()
+    })
+}
+
+fn zgc_jit_blanket_refusal_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_JIT_BLANKET_REFUSAL").is_some()
+    })
 }
 
 fn targeted_compaction_enabled() -> bool {
