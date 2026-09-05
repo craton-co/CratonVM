@@ -237,14 +237,55 @@ resting on the arenas being disjoint. This is the VM's hottest validator: every
 conservative stack word, every ambiguous operand slot and every JIT helper probe
 goes through it.
 
-**Not landed:** the actual fix — an allocation-time object-start bitmap, which
-makes the predicate one shift and one bit test, exact, with **no** false
-positives, and removes the entire "plausible header" heuristic family. The
-enabling refactor is finding 4's `HeapBitmap`. What remains is per-collector:
-allocation-time `insert` and sweep-time `remove` in both Generational and G1,
-which is a change to the single most safety-critical predicate in the GC and
-needs a soak with an engagement census (bitmap-answered vs heuristic-answered)
-before it can be trusted. Shipping it unsoaked would be the wrong trade.
+**Also landed:** the actual fix. `CRATONVM_GC_OBJECT_STARTS` (opt-in) maintains
+an exact object-start bitmap per arena — a bit per 8 bytes, set in `hand_out`,
+the single door every allocation funnels through, cleared in `add_free_block`,
+the single door every free does, and cleared wholesale on all three reset paths.
+The removal half is not optional: without it a larger object later allocated over
+a freed base would see the stale bit, be accepted at an interior address, and
+take a mark-bit write into the middle of a live object — the corruption the
+extent check exists to stop.
+
+```text
+[cratonvm] exact object-start answers: hits=1112587 misses=799889
+```
+
+58% of calls answered without the extent arithmetic or the second commit probe;
+nothing at all with the switch off.
+
+**Two things the first version got wrong**, both caught by building the
+instrument before trusting the change, and both worth recording because they are
+the traps this shape has:
+
+* It consulted the bitmap **before** the header checks. `hand_out` is the door
+  for every ALLOCATION, not every OBJECT: a TLAB chunk is one hand-out and its
+  base carries the bit whether or not an object was ever bump-allocated at it.
+  Accepting on the bit alone hands the caller an `ObjectRef` to a chunk whose
+  first bytes are not an `ObjectHeader` — the exact corruption the function
+  exists to prevent, reintroduced by the thing meant to make it exact. The fast
+  path now sits after the kind, element-type and reserved-field tests, which are
+  cheap byte loads; what it skips is the expensive half. The hit count is
+  unchanged by the move, so nothing was being accepted that those tests would
+  have rejected.
+* It reached the bitmap by **locking the arena**. This function was made
+  lock-free on purpose — its own comment records that the triple-mutex
+  containment check it replaced "contended catastrophically" with the allocator
+  — and a `try_lock` is still an atomic read-modify-write on a line every
+  allocating thread wants. The bitmaps are now published into a lock-free
+  pointer slot beside `commit_bits`, with the same retire-before-drop ordering.
+
+**ACCEPT ONLY**, and that asymmetry is the safety argument. A miss falls through
+to the deduction unchanged. The bitmap is knowably incomplete — objects
+bump-allocated inside a TLAB chunk never reach `hand_out` — so using it to
+REJECT would drop live roots. Used to accept, incompleteness costs only the path
+that was already there.
+
+Off by default: a bit per 8 bytes is capacity/64 of side table, 64 MB for a 4 GB
+heap. **Still owed:** G1's own arena (the same `Arena` type, so the bitmap is
+already there — what is missing is G1's `is_object_address` consulting it), and
+the measurement that would justify a default. The miss half of the census cannot
+yet separate a genuine non-object from a real object the bitmap never saw
+because a TLAB bump-allocated it; that needs a workload, not another counter.
 
 ## 6. Parallel marking is currently a regression, and the cause is shared
 
@@ -281,10 +322,9 @@ be true.
 **Correction:** the review said "only ZGC returns memory to the OS". G1 has a
 complete, correctly-ordered heap-shrink path —
 `uncommit_trailing_free_regions_within`, opt-in behind `CRATONVM_G1_UNCOMMIT`.
-The accurate statement is: **ZGC does it by default, G1 can on request, and the
-Generational collector cannot at all** (no `decommit`/`uncommit` call anywhere in
-`gen_heap.rs`, and `OldGen` is a plain `Vec<u8>` — wholly committed at startup,
-with no reservation to shrink).
+The accurate statement was: **ZGC does it by default, G1 can on request, and the
+Generational collector could not at all** — no `decommit`/`uncommit` call
+anywhere in `gen_heap.rs`. It can now; see below.
 
 **Found and landed instead — a fault, not a slowdown.** `ZgcRealHeap::
 with_capacity` publishes `[arena_base, arena_end)` into `JIT_READ_BOUNDS` slot 0,
@@ -307,10 +347,42 @@ an unpublished collector already gets, and the fail-safe direction. Pinned by a
 source witness, because `JIT_READ_BOUNDS` is process-global and this crate's
 tests share one process.
 
-**Not landed:** generational uncommit. It needs `OldGen` to become
-reservation-backed (`Vec<u8>` → `HeapStore`, 33 `self.data` sites) so it can
-prefix-shrink the way G1 does. Interior decommit is *not* the shortcut: it walks
-straight into the hazard above.
+**Also landed:** generational uncommit. `CRATONVM_GEN_UNCOMMIT` (opt-in) hands
+the EVACUATED young semi-space back at the end of each young collection. That
+arena is the one the collection evacuated FROM, so nothing live is in it by
+construction, and the very next thing the cycle does to it today is zero it —
+this is the same statement made to the OS instead of to the bytes.
+
+```text
+[cratonvm] generational young uncommit: 31457280 bytes returned to the OS
+```
+
+30 MiB of a 96 MB heap, against no line at all with the switch off.
+
+**The ordering, which the first attempt got wrong in both available ways.**
+Putting the give-back in an `else` of the deferred-wipe branch made it
+STRUCTURALLY DEAD — `deferred_wipe` is `Some` on the default path — so the arm
+never ran and the census read zero for a switch that was on. It was caught only
+because the census was there to read. Running both against overlapping spans is
+worse than dead: a released granule faults on write, and the wipe thread would be
+writing into memory the give-back had returned. And they are not interchangeable,
+so the wipe is not simply skipped — a released granule comes back from the OS
+zeroed, but `Arena::hand_out` does not zero and the give-back only releases WHOLE
+granules rounded inward, so the partial granules at a span's edges still hold the
+previous cycle's object bytes. Give back first, then wipe the remainder;
+`Arena::retain_committed_spans` is that remainder.
+
+Off by default for the reason `g1_uncommit` gives about itself: this collector
+publishes its young arenas' full reserved range into `JIT_REGION_BOUNDS` and
+`JIT_READ_BOUNDS`, and a decommitted granule faults on touch. That window is not
+created here — the young arenas already commit lazily while the published bound
+covers the whole reservation — but it is WIDENED, from "granules never yet
+allocated into" to "granules that held objects one collection ago".
+
+**Still owed:** the old generation, which cannot be done at a call site. It is a
+`Vec<u8>`, committed in full at construction, with no reservation to shrink;
+giving it lazy commit is a change to its allocator (33 `self.data` sites plus
+commit-on-demand plumbing), not a wiring change.
 
 ## 8. Smaller shared items
 
@@ -415,6 +487,14 @@ UNVERIFIED because no CI job compiles it — verified compiling.
    reference slots; a real application has thousands, loads classes while
    collections are in flight, and exercises the deferral branch this records
    ahead of.
-4. The **engagement census** for a bitmap-backed `is_object_address` — how many
-   probes the bitmap answers versus the heuristic — before finding 5's real fix
-   is written, not after.
+4. **Split the miss half** of `exact object-start answers`. 1112587/799889 says
+   the bitmap carries the majority of the predicate, but a miss is either a
+   genuine non-object (a zero, a small integer, a long bit pattern — which
+   SHOULD miss) or a real object the bitmap never saw because a TLAB
+   bump-allocated it. Only the second is recoverable, by inserting at the TLAB
+   bump rather than only at `hand_out`, and only a workload can tell them apart.
+5. **G1's `is_object_address`.** Its regions are carved from the same `Arena`
+   type, so the bitmap is already maintained there — what is missing is the
+   consultation. It should be one call and the same accept-only rule; it is
+   listed separately because it needs its own engagement reading, not because it
+   needs new machinery.
