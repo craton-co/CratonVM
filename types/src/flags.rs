@@ -1519,6 +1519,26 @@ pub struct GcFlags {
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,
     /// `CRATONVM_G1_DBG_REACH`
+    /// `CRATONVM_G1_VERIFY_HOLDERS` — re-validate a worklist holder's header
+    /// before walking its slots (ten-findings item 4).
+    ///
+    /// Default OFF. The holder is a to-space copy `evacuate_object` already
+    /// screened at both ends, and the slot loops clamp their bounds to the
+    /// holder's own region rather than trusting its header, so the check buys
+    /// no safety in the pause -- only one cold cache line per holder. It stays
+    /// as an instrument for the one defect that would otherwise be invisible:
+    /// a copy overwritten WITHIN the pause that made it.
+    /// `CRATONVM_G1_HUMONGOUS_MARKS` — mark a humongous span "referenced" as
+    /// the pause's slot loops scan into it (ten-findings item 1).
+    ///
+    /// Default **OFF**. Correct and cheap in isolation, but it reads
+    /// `regions[idx].region_type` for every scanned slot, which after item 4 is
+    /// the only region-table access left on the old->old path. Measured
+    /// engagement on 2026-09-05 was ZERO spans decided, on every workload
+    /// tried: a humongous span's holders are old objects the pause never scans,
+    /// which is exactly why the remembered-set walk exists.
+    pub g1_humongous_marks: bool,
+    pub g1_verify_holders: bool,
     pub g1_dbg_reach: bool,
     /// `CRATONVM_G1_DBG_ROOTCENSUS`
     pub g1_dbg_rootcensus: bool,
@@ -1663,6 +1683,8 @@ impl GcFlags {
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
             g1_dbg_accessor: present(src, "CRATONVM_DBG_G1ACCESSOR"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
+            g1_humongous_marks: present(src, "CRATONVM_G1_HUMONGOUS_MARKS"),
+            g1_verify_holders: present(src, "CRATONVM_G1_VERIFY_HOLDERS"),
             g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
             g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
             g1_dbg_zero: present(src, "CRATONVM_G1_DBG_ZERO"),
