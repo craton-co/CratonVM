@@ -95,7 +95,7 @@ pub use class_manager::synthetic_stub_field_model;
 pub use class_manager::{
     any_annotation_proxy_defined,
     any_class_redefined,
-    any_duplicate_class_name, class_is_java_util,
+    any_duplicate_class_name, class_is_java_lang_system, class_is_java_util,
     bump_jit_supersede_epoch,
     class_definition_epoch,
     drain_pending_class_hooks,
