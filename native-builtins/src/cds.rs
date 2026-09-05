@@ -716,8 +716,10 @@ fn native_cds_is_using_archive(ctx: &mut dyn NativeContext, _args: &[Value]) -> 
 /// This is a real `private static native` on JDK 25's `CDS`, and it was the
 /// most load-bearing member of the class that this registrar did not cover:
 ///
-///     $ javap -p jdk.internal.misc.CDS | grep getCDSConfigStatus
-///       private static native int getCDSConfigStatus();
+/// ```text
+/// $ javap -p jdk.internal.misc.CDS | grep getCDSConfigStatus
+///   private static native int getCDSConfigStatus();
+/// ```
 ///
 /// It is called from `CDS.<clinit>` — `private static final int configStatus =
 /// getCDSConfigStatus();` (jdk25src java.base/jdk/internal/misc/CDS.java:55) —
@@ -748,9 +750,11 @@ fn native_cds_get_config_status(_ctx: &mut dyn NativeContext, _args: &[Value]) -
 /// F17-1 (2026-08-13). The second real native the public-only baseline could not
 /// see:
 ///
-///     $ javap -p jdk.internal.misc.CDS | grep needsClassInitBarrier
-///       public static boolean needsClassInitBarrier(java.lang.Class<?>);
-///       private static native boolean needsClassInitBarrier0(java.lang.Class<?>);
+/// ```text
+/// $ javap -p jdk.internal.misc.CDS | grep needsClassInitBarrier
+///   public static boolean needsClassInitBarrier(java.lang.Class<?>);
+///   private static native boolean needsClassInitBarrier0(java.lang.Class<?>);
+/// ```
 ///
 /// Note the pair: the *public* half is on the baseline and the native half is
 /// not, so a name-keyed audit sees `needsClassInitBarrier` as covered while the
