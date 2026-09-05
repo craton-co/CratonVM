@@ -6548,8 +6548,20 @@ impl<'a> Lowerer<'a> {
         self.cur_def = Some(id);
         self.cur_def_published = false;
         self.lower_data_node(id);
+        // A CARRIED value satisfies its dropped home the other way: it is left
+        // in RAX or RCX for its one consumer rather than published into a
+        // register of its own, so `cur_def_published` is false for it and
+        // always will be. `live_carry` naming this node as the producer is the
+        // carry having just started — the stale-carry case below is what
+        // catches one that never gets read.
+        //
+        // Found by flipping these switches on together: the probe this was
+        // built on has a frame state naming every intermediate, so no carried
+        // value's home was ever dropped there and the two mechanisms never met.
+        let started_carry = matches!(self.live_carry, Some((prod, _, _, _)) if prod == id);
         if self.home_dropped.get(id as usize).copied().unwrap_or(false)
             && !self.cur_def_published
+            && !started_carry
             && !matches!(
                 self.graph.nodes.get(id as usize).map(|n| &n.op),
                 Some(Op::Phi)
