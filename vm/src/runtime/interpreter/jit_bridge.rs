@@ -3485,6 +3485,14 @@ fn osr_optimizing_refusal_key(
 
 /// Has this door already built and refused an optimizing artifact here?
 fn osr_optimizing_already_refused(key: (u32, u64, usize)) -> bool {
+    // Kill switch, so the memo can be A/B'd inside ONE binary. Comparing an
+    // intermittent event across two builds is not a comparison.
+    if matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING_MEMO").as_deref(),
+        Ok("0") | Ok("false")
+    ) {
+        return false;
+    }
     OSR_OPTIMIZING_REFUSED
         .get_or_init(Default::default)
         .lock()

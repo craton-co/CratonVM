@@ -20284,9 +20284,16 @@ unsafe fn install_lambda_inline_cache(
     if installed {
         crate::runtime::interpreter::lambda_site_bump_adapter(site.num_captures());
         if mic_prof::enabled() {
+            // The call counts AT THE MOMENT OF INSTALL. `site_adapters`
+            // alone cannot tell "installed early and served" from
+            // "installed after the workload was over", which is exactly
+            // what an intermittent `site_direct` failure asks.
+            let (fast_returns, site_direct, _) =
+                crate::runtime::interpreter::lambda_jit_engagement();
             eprintln!(
                 "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
-                 captures={} sam_args={sam_args} entry={entry:#x} impl={}",
+                 captures={} sam_args={sam_args} entry={entry:#x} impl={} \
+                 at site_direct={site_direct} fast_returns={fast_returns}",
                 site.num_captures(),
                 class_name,
             );
