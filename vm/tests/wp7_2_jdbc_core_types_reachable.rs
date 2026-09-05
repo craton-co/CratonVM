@@ -3,7 +3,7 @@
 
 //! WP7.2 — `java.sql.*` core types reachable under reflection.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` §10 (Wave 7 — JDBC +
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` §10 (Wave 7 — JDBC +
 //! ServiceLoader-based SPI).
 //!
 //! Surface audited (per WP7.2):

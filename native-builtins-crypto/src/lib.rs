@@ -13,7 +13,7 @@
 // on its behalf, so the ambient-category footgun cannot bite here. The
 // classification of anything backed by these kernels is decided at the
 // `native-builtins` call site, not here.
-// See audits/jdk-only-ambient-category-audit.md.
+// See jdk-only-ambient-category-audit.md.
 pub mod bc_aes;
 pub mod bc_chacha;
 pub mod bc_digest;

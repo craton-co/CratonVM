@@ -16,7 +16,7 @@
 //! * `gc/src/class_unloading.rs` is not the production unloader. Its own module
 //!   header says so in capitals — it has no caller anywhere in the workspace and
 //!   every table in it is permanently empty in a running VM. It is scaffolding
-//!   kept deliberately (see `arch-2026-07-26/refs-metaspace-unloading.md`).
+//!   kept deliberately (see `refs-metaspace-unloading.md`).
 //! * The real unload transaction lives in `vm/`, not `gc/`, so no amount of
 //!   grepping the collector finds it.
 //!

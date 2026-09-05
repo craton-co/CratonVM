@@ -4,7 +4,7 @@
 //! GPU-offload JIT admission gate.
 //!
 //! Follow-up item 2 in
-//! `fixed-suite-bugs/gpu-offload-followups-20260711.md` ("JIT-compiled
+//! `gpu-offload-followups-20260711.md` ("JIT-compiled
 //! callers bypass the offload hook"): the transparent GPU-offload hook
 //! ([`crate::runtime::offload::try_dispatch`]) only fires from the
 //! *interpreter's* `execute_invokestatic` slow path. If the **caller**
@@ -348,30 +348,43 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             continue;
         };
 
-        // Annotation-free, but CONSTANT-POOL-AWARE — see "Known
-        // limitations" for why hint-loosened kernels are still not
-        // covered.
+        // Annotation-free, but CONSTANT-POOL AWARE -- and the pool has to
+        // be the TARGET's, not this caller's.
         //
-        // The pool is not optional here. `analyze` has no constant pool,
-        // so it rejects EVERY `ldc`/`ldc_w`/`ldc2_w` with
-        // `Reason::LoadConstant` whatever it targets, while the
-        // dispatcher this gate exists to PREDICT calls
-        // `analyze_with_annotations_and_pool` and admits a numeric
-        // literal. Until 2026-09-05 the gate used the pool-free entry
-        // point, so any kernel whose body needed a constant-pool
-        // constant was judged ineligible, never registered with
-        // `offload_hook`, and its compiled call sites bound directly and
-        // went dark.
+        // AUDIT 2026-09-05. This called the CP-free `analyze`, which
+        // rejects `ldc`/`ldc_w`/`ldc2_w` unconditionally because it has
+        // no pool to resolve them against. `lookup_or_compile` -- the
+        // dispatcher this gate exists to serve -- calls
+        // `analyze_with_pool`, which admits a numeric literal (AUDIT
+        // C31). So the two disagreed, silently, about any kernel
+        // containing a constant-pool constant.
         //
-        // That read as "the compiled caller drops long[] and double[]",
+        // `bench-gpu/GpuFloatDivChain.divChain` is one such kernel: its
+        // `x = x / d + 1.0000001` is an `ldc2_w`, so the gate saw
+        // INELIGIBLE while the interpreter saw `Eligible` and offloaded.
+        // Its int twin's `+ 12345` is a `sipush` with no pool entry, so
+        // that one agreed and worked. Measured at N=2^24: 9,276 ms
+        // against the int twin's 8 ms, and 28 ms with `CRATONVM_JIT_OSR=0`
+        // (which keeps the caller interpreted, where the CP-aware verdict
+        // is the one that runs).
+        //
+        // NOT an FP-only disagreement, though both symptoms that found it
+        // were. The boundary is the CONSTANT POOL, not the type: an
+        // `int[]` kernel whose constant is above `sipush` range needs an
+        // `ldc` and went dark too, while a `long[]` kernel using only
+        // `lconst_1` never touched the pool and offloaded normally. Both
+        // measured on `test_classes/gpu/GpuLdcSplit.java`, which exists
+        // to break that correlation -- the same defect was independently
+        // scoped as "the compiled caller drops long[] and double[]",
         // because a `long`/`double` literal has no small-immediate form
-        // — `3L` and `3.0` are `ldc2_w` while `3` is `bipush` — so the
-        // 64-bit kernels were simply the ones that always tripped it.
-        // The element width was never the variable: an `int[]` kernel
-        // using a constant above `sipush` range goes dark too, and a
-        // `long[]` kernel using only `lconst_1` offloads normally. Both
-        // measured — see
+        // and so always trips it. See
         // docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md.
+        //
+        // The disagreement was always wrong, and it became load-bearing
+        // when this scan started ARMING the compiled-tier hook rather
+        // than merely blocking: a target the gate cannot see is one the
+        // compiler binds directly, and the hook is then lost for the life
+        // of the process.
         let sig = match jit_cuda::analyzer::analyze_with_pool(
             target_method,
             &target_class.constant_pool,
@@ -382,12 +395,12 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             // narrowing that shows up only as an ABSENCE cannot be told
             // from one that never fired, and this one had no counter at
             // all. That is how the pool-free `analyze` above went
-            // unnoticed — a run whose kernels had all silently stopped
+            // unnoticed -- a run whose kernels had all silently stopped
             // registering printed a census identical to a healthy one.
             jit_cuda::OffloadVerdict::Rejected(reason) => {
                 // Split, because a census that folds "never a candidate"
                 // into "refused" is one nobody reads: one run of
-                // `GpuIntensitySweep` walks past ~170 signature-refused
+                // `GpuIntensitySweep` walks past ~154 signature-refused
                 // JDK targets, and naming those would bury the handful
                 // that matter.
                 use jit_cuda::analyzer::Reason;
@@ -411,6 +424,7 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
                 }
                 continue;
             }
+        };
         };
 
         // ...and then the DISPATCHER's own gates. `Eligible` answers

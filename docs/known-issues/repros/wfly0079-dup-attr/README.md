@@ -7,7 +7,7 @@ WFLYCTL0079 / WFLYCTL0043: An attribute named 'hornetq-store-enable-async-io'
 is already registered at location '/subsystem=transactions'
 ```
 
-See `fixed-suite-bugs/wildfly/wflyctl0079-duplicate-attribute-registration.md`
+See `wflyctl0079-duplicate-attribute-registration.md`
 for the analysis. The short version: that message is reachable only if
 `TransactionSubsystemRootResourceDefinition.registerAttributes()`'s
 `attributesWithoutMutuals.remove(HORNETQ_STORE_ENABLE_ASYNC_IO)` failed to

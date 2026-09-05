@@ -22,7 +22,7 @@
 //! fixture lays memory out at the old offsets while the JIT under test emits
 //! the new ones, and the accesses run past the end of the backing `Vec` instead
 //! of tripping a clean assertion. See
-//! `arch-2026-07-26/header-shrink.md` §6.5 and the layout-drift
+//! `header-shrink.md` §6.5 and the layout-drift
 //! tripwires at the bottom of this file.
 
 use cratonvm_jit::x64::{compile, is_jit_compatible};

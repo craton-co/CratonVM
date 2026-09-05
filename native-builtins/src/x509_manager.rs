@@ -272,7 +272,7 @@ static NEXT_TM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 // identical `pub(crate)`-promotion precedent already applied to
 // `jca::provider_chain::find`/`make_provider` for the sibling
 // `KeyManagerFactory.getProvider()` fix (see this crate's
-// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+// `tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
 pub(crate) fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
     KM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -5216,7 +5216,7 @@ fn check_server_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// clears the JDK's own checker of any part in it: called directly it answers
 /// `No name matching localhost found` on this VM too — it was simply never
 /// reached. See
-/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+/// `ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
 fn check_server_trusted_extended(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     do_check_trusted(ctx, args)?;
     check_extended_tm_endpoint_identity(ctx, args, false)
@@ -5293,7 +5293,7 @@ fn classify_extended_tm_peer(
 /// `TLSv1.3 x useTasks=false`, on BOTH loopback families, so it is not the
 /// transport. Since the VM fix, the same probe's `@@REPRO` rows — a trust
 /// manager that makes the call deliberately — are `rows_failed=0`. Full record:
-/// `fixed-suite-bugs/netty/nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`
+/// `nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`
 ///
 /// The field read below runs no Java, allocates nothing and enters no native,
 /// so on a netty engine this function costs what it cost before the fix — which

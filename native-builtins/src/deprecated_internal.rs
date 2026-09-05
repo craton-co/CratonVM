@@ -1448,7 +1448,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // `Throwable.toString()`) silently reverted to the ORIGINAL short
     // constructor message, dropping the SQL-statement suffix (and any
     // password the test asserts is present in it). See
-    // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md.
+    // bug-h2-suite-residual-fail-triage-FIXED.md.
 
     // JBoss Modules JDKModuleFinder.findModule — bypass.
     //

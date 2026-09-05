@@ -62,7 +62,7 @@ correctness bug (a silently-dropped `getAndSet`) is filed next to real `rc=139`
 segfaults. It should not be. (The same misclassification shape — a harness
 that cannot distinguish "printed a panic string but kept running" from "the
 process actually died" — is exactly what
-`docs/internal/fixed-bugs/generational-validator-dereferenced-uncommitted-heap-FIXED-20260903.md`
+`generational-validator-dereferenced-uncommitted-heap-FIXED-20260903`
 diagnosed for the Spring-suite `ABEND` label; this is the Tomcat harness's own
 version of the same defect and is a candidate to fix in `run-suite.sh`
 independent of the AtomicReference bug itself.)

@@ -24,7 +24,7 @@ pub enum GcAlgorithm {
     /// being true when the `zgc` default landed, and it is load-bearing: a
     /// reader who believes it attributes a default-build measurement to the
     /// wrong collector, which is what happened while root-causing
-    /// `bug-g1-evacuates-live-jit-reference-20260819.md`
+    /// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`
     /// (three arms recorded as "generational" were ZGC runs).
     Generational,
     /// G1 (Garbage-First) region-based collector.
@@ -188,7 +188,7 @@ impl std::fmt::Display for JdkMode {
 /// `-version` banner ([`JdkMode::describe`]) all said "~300 truly-native
 /// methods". That figure is wrong by about an order of magnitude, and it was
 /// being used to size proposals (see
-/// `arch-2026-07-26/jdk-mode-determinism.md` §7.4, which
+/// `jdk-mode-determinism.md` §7.4, which
 /// scopes a `native-essentials` crate split against it). The number now
 /// lives in one place with its derivation attached.
 ///
@@ -233,7 +233,7 @@ pub const LAUNCHER_DEFAULT_JDK_MODE: JdkMode = JdkMode::Real;
 /// embedders that ship no JDK do not start resolving JMODs from whatever
 /// JDK the build machine has. The difference is *declared here* rather
 /// than being an emergent property of two unrelated code paths — see
-/// `arch-2026-07-26/jdk-mode-determinism.md`.
+/// `jdk-mode-determinism.md`.
 pub const EMBEDDED_DEFAULT_JDK_MODE: JdkMode = JdkMode::Synthetic;
 
 /// The `cratonvm` launcher's fixed default compatibility mode.
@@ -434,7 +434,7 @@ pub struct VmConfig {
     /// explicitly; real JDK then defaults the cap to `-Xmx` (`max_heap_size`),
     /// and `vm_init` resolves it the same way when wiring up
     /// `native_io::direct_buffer`'s accounting. See
-    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md —
+    /// bug-h2-largeblob-direct-memory-oom.md —
     /// previously this cap was a hardcoded 256 MiB regardless of `-Xmx`,
     /// which OOM'd direct-buffer-heavy workloads (H2 MVStore chunk writes)
     /// that HotSpot handles fine at the same `-Xmx`.
@@ -1061,7 +1061,7 @@ impl VmConfig {
     /// out-of-crate callers (`libcratonvm`, `cratonvm-embed` docs) keep
     /// compiling; new code should call [`VmConfig::for_launcher`] and pair
     /// it with [`require_real_jdk`]. See
-    /// `arch-2026-07-26/jdk-mode-determinism.md` for the
+    /// `jdk-mode-determinism.md` for the
     /// migration note.
     pub fn with_host_jdk_default() -> Self {
         Self::for_launcher()
@@ -1415,7 +1415,7 @@ fn posix_drive_tail(rest: &str) -> Option<String> {
 ///
 /// # Why `jmods/` is still preferred over `lib/modules` (2026-07-26)
 ///
-/// `arch-2026-07-26/startup-and-diagnostics.md` §6.1 asked for
+/// `startup-and-diagnostics.md` §6.1 asked for
 /// the opposite: put `lib/modules` (checked below, after the jmods branch)
 /// *first*, because `ClassPath::load_jmod` used to inflate every `classes/`
 /// entry of all 70 JMODs at load time — 27,962 entries, ~136 MB, 15-21 s
@@ -1441,7 +1441,7 @@ fn posix_drive_tail(rest: &str) -> Option<String> {
 /// removed where it originated: `load_jmod` now builds a decompression-free
 /// name index and inflates per lookup, the same shape the JAR path has used
 /// since the O(jars x zip-probes) scan was closed. Same win, same reader,
-/// same bytes. See `arch-2026-07-26/boot-classpath-lazy.md`.
+/// same bytes. See `boot-classpath-lazy.md`.
 ///
 /// This is unconditional — there is no flag and no env var for it, and no
 /// opt-in. Reverting to eager inflation means reverting that commit.
@@ -2863,7 +2863,7 @@ mod tests {
         assert_ne!(
             EMBEDDED_DEFAULT_JDK_MODE, LAUNCHER_DEFAULT_JDK_MODE,
             "the launcher and embedding defaults differ by design; see \
-             arch-2026-07-26/jdk-mode-determinism.md"
+             jdk-mode-determinism.md"
         );
         assert_eq!(LAUNCHER_DEFAULT_JDK_MODE, JdkMode::Real);
     }

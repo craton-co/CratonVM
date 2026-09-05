@@ -2025,7 +2025,7 @@ pub(crate) fn is_loader_aware_resolution_eligible(
     // `loader_aware_resolution()` below. Route through that single
     // in-crate copy (which itself now delegates to
     // `cratonvm_classloading::loader_aware_resolution`, the workspace
-    // source of truth) instead. See `fixed-suite-bugs/loader-identity.md`.
+    // source of truth) instead. See `loader-identity.md`.
     if loader_aware_resolution() {
         return true;
     }
@@ -2092,8 +2092,8 @@ pub fn loader_unload_enabled() -> bool {
 /// loader_aware_resolution` flipped to default ON for the `context.groovy`
 /// bug-cluster fix), silently disabling this crate's share of the
 /// loader-faithful fixes by default -- see
-/// `fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
-/// and `fixed-suite-bugs/loader-identity.md`. Kept as a thin wrapper (rather
+/// `hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
+/// and `loader-identity.md`. Kept as a thin wrapper (rather
 /// than switching call sites over to the classloading path directly) so
 /// this crate's `#[inline]`/`pub(crate)` call sites and doc cross-references
 /// do not need to change.
@@ -3212,7 +3212,7 @@ fn cl_load_class_base_delegation(
 /// to iterate scoped child loaders), which is where `CRATONVM_DBG_STALE_OBJREF`
 /// caught a stale deref. Root both for the whole body and re-read them after
 /// every dispatch. See
-/// fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md.
+/// map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md.
 fn cl_load_class_base_delegation_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -4377,7 +4377,7 @@ pub(crate) fn define_class_via_full(
             // `ObjectRef` captured above and returned again below) must be
             // rooted across the call — same Family-1 stale-ObjectRef
             // pattern as the sibling `lk_ensure_initialized` fix. See
-            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+            // wildfly-parallel-boot-stale-objectref-residual.md.
             let mirror_pin = ctx.pin_native_root(mirror);
             if initialize {
                 if let Err(msg) = ctx.initialize_class(cid) {
@@ -9011,8 +9011,7 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // `ServiceLoader` then read a registration for a provider it could not load
     // and raised `ServiceConfigurationError: ... Provider ... not found` where
     // HotSpot finds no providers at all. See
-    // `fixed-suite-bugs/springboot/
-    // classpath-exclusions-flat-scan-and-module-provides-leak-FIXED-20260810.md`.
+    // `classpath-exclusions-flat-scan-and-module-provides-leak-FIXED-20260810.md`.
     //
     // The SINGULAR `findResource` has drawn this line since the ModifiedClassPath
     // work (see its `object_extends(.., "java/net/URLClassLoader")` early return);
@@ -9555,7 +9554,7 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // `target_class` is a raw `ObjectRef` captured above and was being
     // returned again after this call without being refreshed — exactly the
     // "held across a GC-triggering call" pattern documented in
-    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+    // wildfly-parallel-boot-stale-objectref-residual.md.
     // Root and re-read it around the call.
     let target_class_pin = ctx.pin_native_root(target_class);
     // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>` failure

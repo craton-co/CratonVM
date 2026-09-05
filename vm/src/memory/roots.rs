@@ -185,7 +185,7 @@ fn dbg_jit_rootscan() -> bool {
 /// cycles the bit is spent, the oracle is not looking.
 ///
 /// This switch exists so the difference costs one binary to measure, not two.
-/// See `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`.
+/// See `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`.
 fn dbg_precise_only_roots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -203,7 +203,7 @@ fn dbg_precise_only_roots() -> bool {
 /// output, so skipping the scan leaves the pause with no protection at all
 /// rather than with a different one". That is still a true description of the
 /// mechanism, but it was not the defect. The defect
-/// (`bug-g1-evacuates-live-jit-reference-20260819.md`) was that G1's coverage
+/// (`bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`) was that G1's coverage
 /// proof was VACUOUS: the frame-band verifier classifies a spill-band word with
 /// `gen_heap::addr_is_movable`, G1 published neither table it reads, so every
 /// word answered "not movable" and the verifier reported a frame clean without
@@ -222,7 +222,7 @@ fn dbg_precise_only_roots() -> bool {
 /// rests on `CompiledMethod::fully_oop_covered`, a PRESENCE test rather than a
 /// completeness one, and that the runtime oracle which would settle it does not
 /// run on the cycles the bit is spent
-/// (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`). That
+/// (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`). That
 /// is a JIT-wide question, not a collector one, and it is what a soak would
 /// have to answer before either default moves. Kept as an opt-in so the
 /// difference can be A/B'd in one binary — and note that this switch alone does
@@ -1068,7 +1068,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // so likewise gets a vacuous coverage proof (see the fail-closed guard in
     // `conservative_roots::moving_young_unpublished_frame_oop_present`).
     //
-    // `bug-g1-evacuates-live-jit-reference-20260819.md`
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`
     // states this restriction as though it were already implemented ("requires
     // `is_generational()`, so under G1 it is false"). It was true of the
     // siblings and false here; this is the line that makes the record true.
@@ -1088,7 +1088,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // the conservative JIT-frame scan? That one stays generational-only. G1
     // needs the scan for its pin set and ZGC needs it as the backstop for
     // everything the precise map does not name; the restriction is what
-    // `bug-g1-evacuates-live-jit-reference-20260819.md` asked for.
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` asked for.
     //
     // The two were computed by one short-circuiting chain, so on a G1 or ZGC
     // cycle `refresh_moving_young_coverage_for_collection()` was NEVER CALLED
@@ -1181,7 +1181,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // every candidate failed `is_object_address` (`chain>0 added=0`). Those are
     // three different defects and the collector-side line reads identically for
     // all three. See
-    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
         let labels: Vec<&str> = frames.iter().map(|f| f.label.as_str()).collect();
@@ -1233,7 +1233,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             // never described" from "a peer thread happened to be in compiled
             // code at this safepoint", and those want completely different
             // work: the first is a codegen gap, the second is the cross-thread
-            // coverage handshake `arch-2026-07-26/moving-young-precise-roots.md`
+            // coverage handshake `moving-young-precise-roots.md`
             // specifies and nobody has built.
             reason = cratonvm_gc::gc_quiescence::incomplete_reason::label(
                 cratonvm_gc::gc_quiescence::moving_young_incomplete_reason(),

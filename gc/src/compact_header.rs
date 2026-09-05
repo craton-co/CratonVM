@@ -776,7 +776,7 @@ impl NarrowKlassTable {
     /// [`CompactAllocator`] has no caller outside this file — exactly the
     /// condition under which such a table gets wired up without anyone
     /// rechecking the invariant. See
-    /// `arch-2026-07-26/refs-metaspace-unloading.md` §3/§R3.
+    /// `refs-metaspace-unloading.md` §3/§R3.
     ///
     /// # `next_id` is deliberately NOT rewound or recycled
     ///

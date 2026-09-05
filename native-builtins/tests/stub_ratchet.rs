@@ -618,7 +618,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// that reads the WRAPPER as the collection and reports it EMPTY. Registering
 /// them `Bridge` would make them win over the real class and silently drop the
 /// synchronization. See
-/// `fixed-suite-bugs/netty/collection-view-carrier-residuals-FIXED-20260813.md`.
+/// `collection-view-carrier-residuals-FIXED-20260813.md`.
 ///
 /// ## Merge 2026-08-16: the constants below are the re-freeze, and (d) is NOT in them
 ///

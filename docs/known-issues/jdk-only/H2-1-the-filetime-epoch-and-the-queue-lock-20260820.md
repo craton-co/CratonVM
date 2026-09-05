@@ -293,8 +293,7 @@ never wrote `reparseTag` at all.
   in the JDK's own encoding" is **source-unverified here**. What I can say is
   in-tree and checkable: `unix_attr_store_time`/`unix_attr_time_fields` already
   write the split `st_mtime_sec`/`st_mtime_nsec` pairs and `st_mode`, and their
-  doc comment records a Linux measurement (`fixed-suite-bugs/springboot/
-  jarmode-tools-extract-timestamp-preservation-FIXED.md`) that closed exactly
+  doc comment records a Linux measurement (`jarmode-tools-extract-timestamp-preservation-FIXED.md`) that closed exactly
   the analogous defect for the *names*. No FILETIME-shaped unit bug can exist
   there, because seconds-plus-nanos is the encoding the real class uses. That is
   an argument, not a measurement.

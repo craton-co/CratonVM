@@ -181,7 +181,7 @@ gpu-offload = ["dep:cratonvm-cuda-bridge"]
 # suite comparison (2026-08-07, same binary, same 1975 classes) measured
 # 1860 PASS / 49 HANG / 22 FAIL under `-XX:+UseZGC` against 1902 / 18 / 11 on
 # the then-default collector — see
-# `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+# `zgc-real-fullsuite-regression-RETIRED-20260807.md`.
 # That gap is why the feature was off, and the measurement is worth keeping. It
 # is NOT a description of today: the default flipped three days later, on
 # 2026-08-10, and this file went on saying "DEFAULT-OFF because it is not yet at

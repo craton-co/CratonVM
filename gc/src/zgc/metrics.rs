@@ -6,7 +6,7 @@
 //!
 //! # Why this module exists
 //!
-//! `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md` records the first
+//! `zgc-real-fullsuite-regression-RETIRED-20260807.md` records the first
 //! full-suite comparison of `-XX:+UseZGC` against the default Generational
 //! backend: same binary, same 1975 Spring Boot classes, **50 status changes,
 //! 46 of them regressions** — 35 `PASS -> HANG` concentrated on
@@ -1150,7 +1150,7 @@ impl ZgcMetrics {
     ///
     /// **Intent: direct comparability across collector arms.** The Spring Boot
     /// and H2 suite harnesses already aggregate per-class `results.tsv` files
-    /// (see the paths in `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
+    /// (see the paths in `zgc-real-fullsuite-regression-RETIRED-20260807.md`).
     /// Emitting one row per VM here means a full-suite `-XX:+UseZGC` run can be
     /// joined against a Generational run with `sort`/`join` instead of by
     /// hand-parsing `[GC-SUMMARY]` lines out of 1975 logs — which is exactly the

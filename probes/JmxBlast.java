@@ -1,5 +1,5 @@
 // Companion to
-// `bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-server-20260822.md`.
+// `bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-server-20260822-FIXED-20260901.md`.
 //
 // The record's point is that a refusal thrown from
 // `VM$BufferPoolsHolder.<clinit>` is not scoped to buffer pools — it takes out

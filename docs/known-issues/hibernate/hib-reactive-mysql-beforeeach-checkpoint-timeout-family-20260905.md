@@ -3,7 +3,7 @@
 ## Status
 
 **OPEN, newly characterized 2026-09-05.** Not found under `docs/known-issues/`
-or `docs/internal/` by class name, by `VertxTestContext`/checkpoint-timeout
+or the internal tree by class name, by `VertxTestContext`/checkpoint-timeout
 text, or by "mysql" (the closest relative, a stale-schema cross-class
 cascade in the **Hibernate ORM** classic suite's own MySQL runner, was
 checked directly and ruled out as the cause here — see below). This page
@@ -96,7 +96,7 @@ family** (different, already-characterized causes):
 
 `NoLiveTransactionValidationErrorTest`'s presence here is worth flagging: it
 was previously named in
-`docs/internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`'s
+`hib-reactive-3gc-run-regressions-FIXED-20260824`'s
 opening section as one of three classes with "the ZGC-only `@BeforeEach`
 timeouts ... not reproduced in isolation ... look like Testcontainers/Docker
 resource contention under 6-way concurrent shard load," explicitly left
@@ -110,7 +110,7 @@ version of that same, previously-parked observation.
 
 **Not a stale cross-class schema leak.** The Hibernate ORM classic suite has
 a well-documented MySQL-specific defect of this shape
-(`docs/internal/fixed-suite-bugs/hibernate/mysql-cross-class-stale-schema-shared-worker-db-20260822.md`,
+(`mysql-cross-class-stale-schema-shared-worker-db-20260822`,
 fixed in that suite's own runner): a killed/timed-out class leaks its schema
 into a shared worker database, poisoning later classes with mismatched
 tables. The hibernate-reactive suite runner's own comment
@@ -145,7 +145,7 @@ the breadth of unrelated feature areas affected identically, a
 CratonVM-side reactive-dispatch or Vert.x-event-loop timing issue (in the
 same general family as the already-extensively-documented
 `CompletableFuture`/lambda composition cost problems in
-`docs/internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`)
+`hib-reactive-3gc-run-regressions-FIXED-20260824`)
 is a plausible next hypothesis, but this session did not instrument
 `VertxExtension` itself, did not run any affected class in isolation to check
 whether it reproduces outside the full-suite/shard context, and did not
@@ -175,10 +175,10 @@ columns (`awk -F'\t' 'NR>1 && $3=="FAIL"{print $2,$4,$5,$6}' results.tsv`).
 
 ## Related
 
-* `docs/internal/fixed-suite-bugs/hibernate/mysql-cross-class-stale-schema-shared-worker-db-20260822.md`
+* `mysql-cross-class-stale-schema-shared-worker-db-20260822`
   — the superficially similar, already-fixed ORM-suite defect; checked and
   ruled out as this page's cause.
-* `docs/internal/fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`
+* `hib-reactive-3gc-run-regressions-FIXED-20260824`
   — its opening section's "ZGC-only `@BeforeEach` timeouts ... not yet
   reproduced in isolation" note is the small, tentative seed this page grows
   from; that framing (ZGC-only) does not hold given this run's Generational

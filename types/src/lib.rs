@@ -98,7 +98,7 @@ pub use subsystem_config::{
 // and left off this list is not merely inconvenient — it is unreachable from
 // every other crate, i.e. an accidental default-off landing. `MARK_FORWARDED`,
 // `FORWARDING_PTR_MASK` and `IDENTITY_HASH_CODE_OFFSET` were in exactly that
-// state until 2026-07-26; see `arch-2026-07-26/header-shrink.md` §6.2 and the
+// state until 2026-07-26; see `header-shrink.md` §6.2 and the
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,

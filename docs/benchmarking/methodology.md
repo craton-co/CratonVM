@@ -60,7 +60,7 @@ reason every check in the reliability gate exists:
   recommended has nothing in it. **Why the original readings were ~5x too slow
   was never established** — the obvious candidate (a CPU-13 pin collision with
   another session) was tested directly and showed no difference. Detail:
-  `performance/hashmap-half-gap-20260730.md`.
+  `hashmap-half-gap-20260730.md`.
 - **The un-re-measured String/Regex row.** The `7.7x` figure (from a `3.57x`
   predecessor) comes from the *same session* as the retracted
   HashMap number. It has never been re-measured. It survives in the table only

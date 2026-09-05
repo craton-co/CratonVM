@@ -25,7 +25,7 @@ import org.h2.mvstore.MVStore;
  * forces interpretation (`--nojit`, `CRATONVM_JIT_DENY=org/h2`) therefore ends
  * as "no failure in T seconds, zero passes", which is not a result: the run may
  * simply be slower than the defect is deep. The box/unbox page (retired as
- * `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`)
+ * `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`)
  * records exactly that arm being voided, and names the missing progress signal
  * as the thing to build. This is it.
  *

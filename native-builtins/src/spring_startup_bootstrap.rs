@@ -666,8 +666,7 @@ fn get_or_create_bean_factory(
 ) -> Result<ObjectRef, MethodCallFailed> {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
-    // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
-    // cluster.md Bug B investigation): logs every call's receiver class and
+    // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-cluster-FIXED.md Bug B investigation): logs every call's receiver class and
     // whether the loader-identity recovery path below (see the 2026-07-20
     // comment further down, fixed once in 65d738bb5 for a different symptom)
     // actually runs, vs. the bytecode constructor already having set the field.
