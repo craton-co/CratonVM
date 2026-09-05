@@ -46,6 +46,13 @@ coverage verifier `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` re-walks the slow way and
 reports any slot the recorded list missed (the same shape
 `CRATONVM_DBG_ROOTSNAP_VERIFY` uses for the frozen-frame cache).
 
+The verifier prints the SHAPE, not just its failures — covered, missed, and the
+size of the collection's pointer map. A silent run on this path has two very
+different explanations and the likelier one is not "covered everything": it is
+that `take_static_ref_slots` returned `None`, the fast arm was skipped, and the
+verifier never ran. That is the difference between a coverage oracle and a line
+that has never fired.
+
 **Not landed:** the collector-side half — a relocating collector storing the new
 address *through* the slot, retiring the `PointerMap` for that root class
 entirely. That is an ABI change to `collect_garbage` and belongs with a
@@ -125,6 +132,22 @@ The audit gate stays and moves into the open: `vm_init` now says the backend has
 not been audited for 4-byte reference slots, rather than implying the geometry is
 missing. Two gates that were one by accident are now two, and the second can be
 moved one backend at a time.
+
+Checked against the built VM rather than asserted. `CRATONVM_COMPRESSED_OOPS=1`
+with `-XX:+UseGenerationalGC` still reports *"compressed oops ON: HeapBased
+base=0x1ae75591000 shift=3 … 386 class layouts re-laid out"* — the check that
+mattered, since that path now derives its window from `heap_geometry` and from
+nothing else, so a backend that failed to publish would have turned a working
+configuration OFF. On the default collector it reports the audit gate by name.
+
+Guarded by a source witness that all three backends call `publish_heap_span`,
+because the defect this module exists to undo is *a call that does not happen* —
+nothing was broken when `enable_for_live_heap` answered "no live heap regions
+published" for G1 and ZGC; nobody had written the publish. No runtime assertion
+can see that, and a behavioural test cannot be written here either: the table is
+process-global and this crate's tests share one process. (The tests added with
+the module raced each other on that very property and had to be serialised — the
+first run after the witness landed caught it.)
 
 **Correction to the original review:** `VmHeap::conservative_addr_span`'s ZGC arm
 was cited as still returning `None`. It was fixed on 2026-08-07 and now delegates
