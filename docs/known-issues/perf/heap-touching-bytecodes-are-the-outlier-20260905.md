@@ -150,6 +150,25 @@ So the elide is worth one load, everywhere, and never more. A corollary worth
 carrying to the rest of this page's list: *no* interpreter change here should be
 justified by a cache-locality argument until the per-bytecode floor comes down.
 
+### Correctness
+
+`regression-suite/run.sh` against the branch binary, elide on (the new
+default): **90 of 90 scheduled vectors passed, 0 failed**, no list/coverage
+errors and no harness-blindness flags. That suite is a HotSpot differential —
+a vector passes only when CratonVM's output matches the oracle's — so it is
+the right gate for a change that alters how a field is read.
+
+Two harness notes for whoever repeats it, because the first attempt was
+worthless and did not look it:
+
+* `JDK=` must be a **Windows** path. A POSIX one is accepted by the launcher
+  and then rejected behind it, and all 90 vectors fail identically with
+  `HARNESS FAULT — VM REJECTED THE JDK IMAGE`. Use
+  `JDK=$(cygpath -m "$(dirname "$(dirname "$(command -v javap)")")")`. The
+  harness diagnoses this itself in its own footer; read the footer.
+* Do not pipe `run.sh` into `tail`. The pipeline reports `tail`'s exit status,
+  so a 0-of-90 run exits 0 and reads as success.
+
 ## Two corrections to the tree
 
 * **`field_fast.rs`'s module doc is stale.** It opens by explaining that
