@@ -16,9 +16,9 @@ intact; re-iterating the same view object in another method gave 6.
 
 This is H2 `org.h2.test.store.TestRandomMapOps` `seed:0 op:1033`, which is
 also `h2/bug-testrandommapops-deterministic-1810-null-…` (retired beside this
-one), and it blocked
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-by killing the workload well before that page's window opened.
+one), and it blocked `bug-box-unbox-intrinsic-segv-under-relocation-20260902`
+(retired beside this one too, 2026-09-05) by killing the workload well before
+that page's window opened.
 
 ## Root cause
 

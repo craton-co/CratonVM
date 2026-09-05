@@ -2743,21 +2743,62 @@ pub(super) fn inline_oop_coverage_enabled() -> bool {
 /// alone -- publishing a map that named none of its reference locals while
 /// `fully_oop_covered` read TRUE. See
 /// `map_incomplete_cause::LOCAL_MASK_UNSUPPORTED` for the measurement.
-/// `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1` -- a safepoint whose
-/// local-oop dataflow was never REACHED must not ship a map claiming complete
-/// frame-slot coverage.
+/// A safepoint whose local-oop dataflow was never REACHED must not ship a map
+/// claiming complete frame-slot coverage.
 ///
 /// Sibling of [`local_mask_fail_closed_enabled`], which covers the case where
 /// the dataflow never ran for the METHOD. This one covers a pc inside a method
-/// it did run on. Default OFF (that one defaults ON) because this population is
-/// larger and its refusal cost is still being priced -- see the call site in
-/// `x64::safepoint` for the measurement that motivated it.
+/// it did run on, and **defaults ON since 2026-09-05**, like that one.
+/// `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=0` restores the old
+/// optimistic claim.
+///
+/// It was opt-in from 2026-09-03 for a stated reason -- "this population is
+/// larger and its refusal cost is still being priced" -- and the pricing is
+/// done. On `org.h2.test.jdbc.TestCachedQueryResults` at `--Xmx 1g`, which is
+/// where the population was found (`local_mask_unreached` 117 and climbing to
+/// 147 in one run):
+///
+/// * fragmentation `OutOfMemoryError`: **0**, in every run of both arms, 8
+///   sequential runs plus 4 concurrent pairs. That was the cost worth fearing
+///   -- the blanket refusal one flag over costs ~9700 and never completes.
+/// * throughput: **no difference**. Ratios of 0.97, 0.99, 1.00 and 1.00 from
+///   arms run CONCURRENTLY, which is the only design that works on this host;
+///   a sequential ABBA read 1.9x and was measuring other agents' load. See the
+///   retired `bug-box-unbox-intrinsic-segv-under-relocation-20260902`.
+///
+/// AND IT IS NOT INERT, which those two zeros on their own would not tell you
+/// -- `relocation_skipped_jit` (28 vs 30), `relocation_on_proven_jit` (191 vs
+/// 191) and `compaction_cycles` (190 vs 190) are the same either way, so the
+/// collector's decisions do not move. What moves is the CLAIM, which is the
+/// point. `CRATONVM_DBG_OOPCOV=1`, 90 s each:
+///
+/// | | `frameslot=false` | `frameslot=true` |
+/// |---|---:|---:|
+/// | default (ON) | **101** | 12 |
+/// | `=0` | 50 | 65 |
+///
+/// Fifty-one methods stop advertising complete frame-slot coverage they did
+/// not have. Relocation barely notices because the per-cycle proof only
+/// consults a method while one of its frames is LIVE, and these rarely are on
+/// this workload -- which is why the honesty costs nothing here, and equally
+/// why it is worth having before a workload arrives where they are.
+///
+/// What it does NOT buy is that page's SIGSEGV, which was a decommitted-granule
+/// write inside `relocate_stw` and is fixed elsewhere. This closes a soundness
+/// hole on its own evidence: the SHADOW half of the same machinery already
+/// refuses this exact population, so until now the two halves disagreed and the
+/// half that publishes the claim was the optimistic one.
 pub(super) fn local_mask_unreached_fail_closed_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED")
-            .is_some()
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
     })
 }
 
