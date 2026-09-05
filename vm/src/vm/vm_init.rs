@@ -4951,6 +4951,15 @@ fn resolution_invalidate_adapter(class_id: u32) {
 /// `clear_all` retires evicted methods rather than freeing their code
 /// immediately, so any still-active frame stays valid.
 fn jit_invalidate_adapter(class_id: u32) {
+    // The socket path's `ByteBuffer` layout cache is keyed by `ClassId` and
+    // holds resolved FIELD SLOTS, so it is invalidated by exactly the events
+    // this hook fires on — a redefine, or a synthetic stub being replaced by
+    // real bytecode with a different field count or order. Its failure mode
+    // without this is the silent one: a transfer reading `position` from a
+    // slot that now holds something else, which desynchronises a channel
+    // rather than raising anything.
+    cratonvm_native_io::socket_fast_io::invalidate_bb_slot_cache();
+
     // Same fan-out rationale as `resolution_invalidate_adapter`: the hook has
     // no VM identity, and `clear_all` retires rather than frees, so evicting
     // another VM's compiled code is a recompile cost, not a hazard. Missing

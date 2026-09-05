@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-516 tokens.
+517 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -190,6 +190,7 @@ export inherited from a parent shell.
 | `fbref` | `CRATONVM_DBG_FBREF` |
 | `fc-fast-io-stats` | `CRATONVM_FC_FAST_IO_STATS` |
 | `field-get` | `CRATONVM_DBG_FIELD_GET` |
+| `sc-io-stats` | `CRATONVM_SC_IO_STATS` |
 | `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
@@ -582,7 +583,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-361 tokens.
+366 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -875,6 +876,11 @@ export inherited from a parent shell.
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
 | `fc-fast-io` | `CRATONVM_FC_FAST_IO` |
+| `sc-scratch` | `CRATONVM_SC_SCRATCH` |
+| `sc-bb-slots` | `CRATONVM_SC_BB_SLOTS` |
+| `sel-ready-cache` | `CRATONVM_SEL_READY_CACHE` |
+| `sel-fast-keys` | `CRATONVM_SEL_FAST_KEYS` |
+| `sc-preresolved` | `CRATONVM_SC_PRERESOLVED` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
