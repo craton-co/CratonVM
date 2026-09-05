@@ -3563,6 +3563,27 @@ pub(super) fn try_osr(
     let compiled = match ir_osr {
         Some(c) => {
             cratonvm_jit::metrics::record_osr_event("osr_entered_optimizing");
+            // Dump the body this door is about to ENTER, under a label that
+            // distinguishes it from the single-pass one.
+            //
+            // Without this the optimizing artifact is invisible to
+            // `CRATONVM_DBG_JIT_DISASM`: the only `osr` dump comes from inside
+            // `compile_osr_artifact`, which this arm SKIPS — and the background
+            // tier worker calls that function anyway, so a dump appears, is
+            // labelled `osr`, and is the single-pass body. Reading it while the
+            // door was on showed code that did not change when the residency
+            // flags changed, which is exactly the wrong conclusion and cost
+            // several rounds to catch. The counter said the door had engaged
+            // and the disassembly said it had not; the disassembly was of
+            // another artifact.
+            crate::jit::disasm::maybe_dump(
+                "osr-optimizing",
+                &class_name_arc,
+                &method_name_arc,
+                &descriptor_arc,
+                c.entry_ptr(),
+                c.code_bytes(),
+            );
             c
         }
         None => compile_osr_artifact(

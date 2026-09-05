@@ -953,16 +953,21 @@ mod tests {
         const FILTER: usize = 0x0000_7FF0_0020_0000;
         const DIRTY: usize = 0x0000_7FF0_0020_0040;
 
-        // Arming is process-global; save and restore so this test does
-        // not change what the rest of this binary would emit.
-        let armed_before = cratonvm_jit::gpu_barrier::is_armed();
-        assert!(
-            !armed_before,
-            "no test in this binary should have armed the barrier"
-        );
-        cratonvm_jit::gpu_barrier::arm(FILTER, DIRTY);
-        let bytes = cratonvm_jit::gpu_barrier::barrier_bytes().expect("armed");
-        cratonvm_jit::gpu_barrier::arm(0, 0);
+        // Encode from an explicit pair. This used to arm the process
+        // globals and restore them, with a comment saying save-and-restore
+        // kept the rest of the binary safe. It does not: cargo runs these
+        // tests as parallel THREADS, so this and `the_barrier_never_writes_rax`
+        // interleave -- and `armed_before` was itself the race, asserting
+        // "no test in this binary should have armed the barrier" while the
+        // sibling test had. Meanwhile `array_writer_policy` below reads
+        // `is_armed()` in PRODUCTION, so an arming window here silently
+        // moves the policy any concurrent test observes.
+        //
+        // `barrier_bytes_for` is the same encoder without the globals; see
+        // `gpu_barrier::arm`'s doc, and `jit/tests/gpu_barrier_arming.rs`
+        // for what covers the publishing itself.
+        let bytes =
+            cratonvm_jit::gpu_barrier::barrier_bytes_for(FILTER, DIRTY).expect("armed pair");
 
         let mut decoder = Decoder::with_ip(64, &bytes, BASE, DecoderOptions::NONE);
         let decoded: Vec<_> = decoder.iter().collect();
@@ -1058,9 +1063,10 @@ mod tests {
     fn the_barrier_never_writes_rax() {
         use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
 
-        cratonvm_jit::gpu_barrier::arm(0x1000, 0x2000);
-        let bytes = cratonvm_jit::gpu_barrier::barrier_bytes().expect("armed");
-        cratonvm_jit::gpu_barrier::arm(0, 0);
+        // No arming: see the sibling test above for why this binary must
+        // not publish to the process globals.
+        let bytes =
+            cratonvm_jit::gpu_barrier::barrier_bytes_for(0x1000, 0x2000).expect("armed pair");
 
         let mut decoder = Decoder::with_ip(64, &bytes, 0x1_0000, DecoderOptions::NONE);
         for insn in decoder.iter() {

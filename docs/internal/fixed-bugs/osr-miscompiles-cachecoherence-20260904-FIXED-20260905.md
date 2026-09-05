@@ -123,6 +123,30 @@ in `types/src/flag_groups.rs` as the JIT token `osr-empty-stack-entry`, so
 when somebody leaves it on. The point is not that the rule is doubtful; it
 is that re-opening the question should not require rebuilding the VM.
 
+**And the switch has a witness, because it changes no answer** (2026-09-05).
+The paragraph above this one is what makes that necessary: with cause 2 fixed
+every reproducer is correct in *both* arms, so a run with the switch set and a
+run without it are byte-identical in output, and "did the switch do anything?"
+cannot be answered from the results at the moment you are relying on it to
+decide whether this rule is responsible for a miscompile.
+
+`x64::osr::OSR_EMPTY_STACK_REFUSALS` counts every refusal, and under
+`CRATONVM_DBG_JITC=1` each is named in the same stream as the other OSR
+refusals:
+
+```
+[cratonvm-jitc] osr-refuse (operand-stack-live) pc=1 depth=1 #1
+```
+
+| fixture | rule ON | `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` | answers |
+|---|---:|---:|---|
+| `OsrStridedValue` | 88 refusals | 0 | identical, both == HotSpot |
+| `OsrStridedValueMin` | 32 refusals | 0 | identical, both == HotSpot |
+
+That table is the whole argument: the left two columns are the only place the
+switch is visible at all, and the right column is why. Gates: regression suite
+90/90, `cratonvm-jit --lib` 2257, citation and flag-declaration guards green.
+
 ## The adjacent hole the same audit turned up
 
 `find_modified_locals` recorded only the LOWER slot of a `long`/`double`

@@ -2153,6 +2153,51 @@ unless `CRATONVM_JIT_IR_DROP_PHI_HOME` is also on, which is why the two want
 measuring together. The prediction the 1.57x implies is that the pair, not
 either alone, is what closes it.
 
+#### The measurement a contended host cannot deny: the loop body itself
+
+Three days of timing arms have been refused by host load. The emitted code is
+not: it is a deterministic function of the compile, so counting it settles what
+a stopwatch could not. Doing that first required fixing an instrument.
+
+**The OSR door's optimizing artifact was invisible to `CRATONVM_DBG_JIT_DISASM`.**
+The only `osr` dump comes from inside `compile_osr_artifact`, which the door
+SKIPS when it takes an optimizing body — and the background tier worker calls
+that function anyway, so a dump appears, is labelled `osr`, and is the
+single-pass body. It is byte-identical with the door on and off, which reads as
+"the door changes nothing" while `osr_entered_optimizing=1` and a 1.56x timing
+gap say it changes everything. The door now dumps what it actually enters, under
+`osr-optimizing`.
+
+With that, `OsrTierBench.kernel`'s loop body, counted:
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 138 | 52 | 22 | 19 |
+| **+ reserve the carried set** | 152 | **60** | 26 | 23 |
+| + reserve + the phi/home-drop stack | 146 | 50 | 20 | 19 |
+
+**Reserving the carried set ALONE makes the loop worse**, and the mechanism is
+the one this section named long ago: residency is a **write-through read cache
+over a frame-slot-first model**. Promoting a value adds a PUBLISH at its
+definition and does not remove its home STORE, so promoting four more values
+buys four more memory operations per iteration and removes reads only where a
+read already went through `gp_load_value`. `resident=1 → 5` is a real census
+movement and a regression in emitted traffic.
+
+That is a direct correction to the expectation set when the reservation landed,
+which predicted the pair would close the 1.57x. The pair is better than
+reserving alone — 50 against 60 — but it is only 52 → 50 against doing neither,
+on a kernel with four live values whose loop still performs **fifty** frame
+operations. The gap is not going to be closed by promoting more values into a
+cache that cannot remove the stores underneath them.
+
+So both switches stay OFF, and the next move is not another promotion policy.
+It is the one the design page named and the census keeps re-deriving: a value
+that lives in a register for its whole range should have **no home slot and no
+store**. `CRATONVM_JIT_IR_DROP_PHI_HOME` does that for phis, at one site; the
+other forty-nine store sites are what the loop's remaining fifty frame
+operations are made of.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
