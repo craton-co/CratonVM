@@ -3,7 +3,7 @@
 ## Status
 
 **OPEN, newly diagnosed 2026-09-05.** Not previously documented anywhere under
-`docs/known-issues/` or `docs/internal/` (grepped for `stateLock` and
+`docs/known-issues/` or the internal tree (grepped for `stateLock` and
 `SocketChannelImpl` — no hit). `docs/known-issues/tomcat/nonpassed-class-census.md`
 explicitly lists the HTTP/2 family this affects as **"Not diagnosed."** This
 page supplies that diagnosis for 3 of its 4 classes and adds a 4th class from
@@ -88,7 +88,7 @@ Object();`, assigned in the class's own constructor and used to guard nearly
 every state-changing/state-reading method on the class (`toString`,
 `implConfigureBlocking`, `close`, `connect`, ...). Grep confirms **zero**
 prior mentions of `stateLock` anywhere in `docs/known-issues/` or
-`docs/internal/`.
+the internal tree.
 
 ## What this actually breaks (not just a log-formatting cosmetic)
 
@@ -127,7 +127,7 @@ and a given failing sub-test was not traced line-by-line in this session.
 
 ## Relationship to the already-fixed `keyLock` bug (BUG-DF01) — related family, NOT the same field
 
-`docs/internal/fixed-suite-bugs/CRATONVM_BUGS/BUG-DF01-nio-keyfor-keylock-null-selector-loop.md`
+`BUG-DF01-nio-keyfor-keylock-null-selector-loop`
 documents an already-fixed sibling defect: `AbstractSelectableChannel.keyLock`
 reading null inside `keyFor()`, killing the NIO poller loop outright (HANG,
 not FAIL). That fix added a native `keyFor(Selector)` override so the real
@@ -175,7 +175,7 @@ grep -c 'stateLock' *.log
 
 ## Related
 
-* `docs/internal/fixed-suite-bugs/CRATONVM_BUGS/BUG-DF01-nio-keyfor-keylock-null-selector-loop.md`
+* `BUG-DF01-nio-keyfor-keylock-null-selector-loop`
   — the fixed sibling (`keyLock`, not `stateLock`).
 * `docs/known-issues/tomcat/nonpassed-class-census.md` — lists this HTTP/2
   cluster as undiagnosed; this page is that diagnosis.

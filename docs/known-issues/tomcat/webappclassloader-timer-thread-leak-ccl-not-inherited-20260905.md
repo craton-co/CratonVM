@@ -4,7 +4,7 @@
 
 **OPEN, still reproducing 2026-09-05.** This is not a new defect — it was
 fully root-caused on 2026-06-23 in an internal-only page,
-`docs/internal/fixed-suite-bugs/CRATONVM_BUGS/BUG-TC0622-webapp-classloader-timer-thread-leak.md`,
+`BUG-TC0622-webapp-classloader-timer-thread-leak`,
 but despite living under a `fixed-suite-bugs/` path its own status header
 reads **"Status on CratonVM: FAIL. HotSpot: PASS"** (never marked FIXED), and
 today's `dev` tip (`7acc0b27c`) still fails both classes identically. It was
@@ -85,7 +85,7 @@ already does this inheritance) runs end-to-end.
 
 ## Related
 
-* `docs/internal/fixed-suite-bugs/CRATONVM_BUGS/BUG-TC0622-webapp-classloader-timer-thread-leak.md`
+* `BUG-TC0622-webapp-classloader-timer-thread-leak`
   — full root-cause analysis and reproduction (internal tree, not linked —
   cite by path only, see house convention).
 * `docs/known-issues/tomcat/nonpassed-class-census.md` — lists this pair as
