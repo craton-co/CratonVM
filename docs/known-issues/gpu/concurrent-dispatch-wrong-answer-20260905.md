@@ -2,8 +2,10 @@
 
 ## Status
 
-**Found 2026-09-05 on real hardware. Dominant cause found and fixed the
-same day; a much rarer residual remains open — see the last section.**
+**Found and FIXED 2026-09-05 on real hardware.** Two independent races,
+both in `input_cache`, both of the same family: state guarding a
+mutex-protected structure was mutated outside that mutex. The second was
+only visible once the first was fixed.
 
 Four Java threads dispatching through one `OffloadCache` intermittently
 produced a wrong checksum under `--gpu`: a *different* wrong value nearly
@@ -103,24 +105,20 @@ The scenario is deterministic by construction: each thread writes only
 walks the array in index order.
 
 Before and after are two builds from the same worktree differing **only**
-by the fix, so there is no cross-binary confound.
+by the fix, so there is no cross-binary confound. The `after` column here
+is after the FIRST fix only — the Generational row is what the second race
+below accounts for, and the final numbers are under "Verification".
 
-| arm | before | after |
+| arm | before | after 1st fix |
 | --- | ---: | ---: |
 | default (ZGC, pool off) | 12 / 30 | **0 / 30** |
 | `-XX:+UseZGC`, pool off | 7 / 20 | **0 / 40** |
-| `-XX:+UseGenerationalGC`, pool off | 13 / 20 | 4 / 205 |
+| `-XX:+UseGenerationalGC`, pool off | 13 / 20 | 4 / 205 (see below) |
 | `-XX:+UseG1GC`, pool off | 0 / 40 | **0 / 40** |
 | `--gpu` default config | 2 / 20 | — |
 
 Controls, before the fix: `--nojit` 0/20 and JIT-without-device 0/20, so
 the defect was always in the offload path rather than host-side threading.
-
-Whole battery on the fixed binary: `ci-gate.sh` 5/5, `runtime-stress.sh`,
-`marshal-stress.sh`, `residency-gc.sh` (all three collectors),
-`jit-writer-stale.sh`, both `cuda-bridge` integration suites, and
-`cargo test -p cratonvm-vm --features gpu-offload --lib -- offload`
-(40 passed).
 
 ## The gate that let it through, and what changed
 
@@ -137,30 +135,87 @@ gate should use the sensitive one. At 53% per run, five repeats miss a
 regression of that size about 2% of the time; one run missed it 47% of
 the time.
 
-## Still open: a ~2% residual under Generational, with the JIT on
+## The second race: the compiled-store drain cleared its flags too early
 
-The fix does not take Generational to zero. On the fixed binary,
-`-XX:+UseGenerationalGC` with the pool off:
+Fixing the filter bit left a residual — ~2% under `-XX:+UseGenerationalGC`
+with the JIT on, and 0/100 under `--nojit`. That comparison was suggestive
+and nothing more (at 2%, 100 clean runs happen 13% of the time by chance),
+so it was not treated as a diagnosis.
 
-| arm | mismatches |
-| --- | ---: |
-| JIT on | 4 / 205 (~2%) |
-| `--nojit` | 0 / 100 |
+The mechanism was confirmed with the tree's own kill switch,
+`CRATONVM_JIT_GPU_ARRAY_BARRIER=0`, which un-arms the compiled-store
+barrier and restores `offload_jit_gate`'s refuse-to-compile behaviour.
+**Alternating arms, one binary, 300 runs each**, Generational, pool off:
 
-Two things to keep in mind about that comparison. It is **suggestive, not
-conclusive**: at a 2% rate, 100 clean `--nojit` runs would happen about
-13% of the time by chance even if the JIT were irrelevant. And the
-failing runs again show **no collections**, so whatever this is, it is
-not relocation either.
+| arm | before | after |
+| --- | ---: | ---: |
+| barrier armed (default) | **12 / 300** | **0 / 300** |
+| `CRATONVM_JIT_GPU_ARRAY_BARRIER=0` | 0 / 300 | 0 / 300 |
 
-The obvious next suspect is the other half of the eviction machinery, the
-one `--nojit` removes: the compiled-store barrier's `DIRTY` byte array.
-`drain_compiled_writes` reads and clears those bytes **outside** the
-cache mutex and only then takes the lock, so a compiled store that sets
-its bucket between the drain's `swap` and a concurrent `get_*` could have
-its eviction missed. That is the same family of bug as the one fixed
-here, one level down, and it has not been confirmed — nothing in that
-path has been instrumented yet.
+Eight distinct wrong values among the twelve. A 0/300 result if the true
+rate were 4% has probability ~5e-6, so the arms are genuinely different.
+The barrier is not dormant in this scenario either — the census reports 6
+array writers admitted behind it, 27 drains and 28 buckets evicted.
 
-Reproducing it wants a much larger sample than anything above: at 2%,
-telling 0 from 2 apart needs several hundred runs per arm.
+### What was wrong
+
+`drain_compiled_writes` cleared the `DIRTY` bytes with `swap(0)` and only
+*then* took the cache mutex to perform the eviction those flags
+authorised:
+
+```
+thread A: drain                thread B: get_i32(X)
+  swap DIRTY[b] -> 0
+                                 drain: DIRTY all clear, returns early
+                                 lock; reads X   <- STALE: the eviction
+                                   A owes has not happened yet
+  lock; evict bucket b
+```
+
+The getters compounded it a second way: each did
+`drain_compiled_writes(); let g = map().lock();` — two separate
+acquisitions, so even a correctly ordered drain released the lock before
+the lookup reacquired it, leaving a gap a compiled store could land in.
+
+### The fix
+
+`drain_locked(&mut tables)` does the read-clear **and** the eviction with
+the mutex already held, and the seven getters now take one lock across
+drain-then-lookup. `drain_compiled_writes` keeps its unlocked
+`DIRTY.iter().any(...)` pre-filter, which stays sound: it can only produce
+a false *positive* (a wasted lock), never a false negative.
+`remap_and_sweep` drains under its own lock too, still before the re-key.
+
+`vm/src/memory/addr_keyed.rs`'s census caught the new `&mut` parameter as
+a fourth `ObjectRef`-table declaration in the file and had to be
+re-audited — correctly, and worth noting as a guard that works: it is
+still one table, borrowed, so the existing remap+sweep disposition
+covers it.
+
+## Verification
+
+Post-fix, `GpuRuntimeStress` scenario 1, `n=65536`, pool off, 100 runs per
+collector: **0/100 on Generational, ZGC and G1**. Plus the 300+300
+alternating A/B above.
+
+Whole battery on the final binary: `ci-gate.sh` 5/5, `runtime-stress.sh`
+(including the new repeat arm), `marshal-stress.sh`, `residency-gc.sh`
+(all three collectors), `jit-writer-stale.sh`, both `cuda-bridge` driver
+suites, and `cargo test -p cratonvm-vm --features gpu-offload --lib`
+(2699 passed).
+
+## The shape worth remembering
+
+Both bugs are the same mistake in two places: a cheap lock-free
+side-channel guarding an expensive locked structure, updated outside that
+structure's lock.
+
+* `ADDR_FILTER` — a bit OR'd in before the lock, erased by a concurrent
+  rebuild-and-store.
+* `DIRTY` — flags cleared before the lock, so the eviction they
+  authorised had not happened when the next reader looked.
+
+Neither is visible single-threaded, neither needs a GC, and neither
+changes an answer that any single-threaded test checks. When a fast path
+exists to let callers skip a lock, the state that fast path reads is part
+of the locked invariant and has to be maintained under the same lock.
