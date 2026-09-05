@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-515 tokens.
+516 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -293,6 +293,7 @@ export inherited from a parent shell.
 | `jit-direct-binds` | `CRATONVM_DBG_JIT_DIRECT_BINDS` |
 | `jit-ea` | `CRATONVM_DBG_JIT_EA` |
 | `ir-graph` | `CRATONVM_DBG_IR_GRAPH` |
+| `ir-sink` | `CRATONVM_DBG_IR_SINK` |
 | `zgc-target` | `CRATONVM_DBG_ZGC_TARGET` |
 | `zgc-high` | `CRATONVM_DBG_ZGC_HIGH` |
 | `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
@@ -581,7 +582,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-359 tokens.
+360 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -701,6 +702,7 @@ export inherited from a parent shell.
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
 | `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
+| `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |

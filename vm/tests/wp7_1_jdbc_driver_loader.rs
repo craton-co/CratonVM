@@ -185,13 +185,21 @@ fn first_discovered_provider_matches_descriptor() {
 fn jdbc_driver_natives_export_service_loader() {
     use cratonvm_native_api::NativeMethodRegistry;
     let mut r = NativeMethodRegistry::new();
+    // A bare registry is SYNTHETIC by default, and the retirement below is a
+    // real-JDK one. Say which mode this test is asking about; without this line
+    // the rows are registered and the assertions read as a regression.
+    r.set_drop_real_layout_synthetic(true);
     cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
     // INVERTED 2026-08-30, same reason as the sibling assertions in
     // `wp7_3_sql_types_datetime` and `wp8_11_ejbca_bootstrap_smoke`:
-    // `register_service_loader_natives`' body is
-    // `#[cfg(feature = "synthetic-jdk")]` because in a real-JDK build these
-    // natives shadowed correct bytecode with a WRONG iterator
+    // `register_service_loader_natives` does not register these in a real-JDK
+    // run, because there they shadowed correct bytecode with a WRONG iterator
     // (`ArrayList$Itr` for HotSpot's `ServiceLoader$2`, losing laziness).
+    // (2026-09-05: that gate was a `#[cfg(feature = "synthetic-jdk")]` until
+    // it was found to be answering about the BUILD — a default build running
+    // synthetic mode has no `ServiceLoader` bytecode for the retirement to
+    // defer to. It now reads `drops_real_layout_synthetic`, which is why this
+    // test has to set it.)
     //
     // What this test still guards is real and unchanged: the registrar must
     // wire its OWN fixture helper. That is the regression the doc comment

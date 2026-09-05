@@ -554,10 +554,16 @@ mod tests {
     ///
     /// The JDBC-side helpers stay: they are this registrar's own natives, not a
     /// shadow over anything the JDK provides.
-    #[cfg(not(feature = "synthetic-jdk"))]
+    ///
+    /// 2026-09-05: this was `#[cfg(not(feature = "synthetic-jdk"))]` and read a
+    /// bare registry. Both halves moved: the retirement is now keyed on the
+    /// RUN's JDK mode (`drops_real_layout_synthetic`), so the test says which
+    /// mode it is asking about instead of inheriting it from the build, and it
+    /// compiles in both.
     #[test]
     fn service_loader_is_left_to_the_jdk_in_a_real_jdk_build() {
         let mut r = NativeMethodRegistry::new();
+        r.set_drop_real_layout_synthetic(true);
         register_jdbc_driver_natives(&mut r);
         for (name, desc) in [
             ("load", "(Ljava/lang/Class;)Ljava/util/ServiceLoader;"),
@@ -565,7 +571,10 @@ mod tests {
                 "load",
                 "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
             ),
-            ("loadInstalled", "(Ljava/lang/Class;)Ljava/util/ServiceLoader;"),
+            (
+                "loadInstalled",
+                "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+            ),
             ("iterator", "()Ljava/util/Iterator;"),
             ("forEach", "(Ljava/util/function/Consumer;)V"),
             ("stream", "()Ljava/util/stream/Stream;"),
@@ -589,7 +598,12 @@ mod tests {
             .is_some());
     }
 
-    #[cfg(feature = "synthetic-jdk")]
+    /// The synthetic half of the same contract, and the reason the pair is
+    /// worth keeping: a change that dropped the rows in BOTH modes would
+    /// satisfy the real-JDK test above on its own.
+    ///
+    /// 2026-09-05: was `#[cfg(feature = "synthetic-jdk")]`; a bare registry is
+    /// synthetic by default, so it now runs in every build.
     #[test]
     fn driver_natives_registered() {
         let mut r = NativeMethodRegistry::new();

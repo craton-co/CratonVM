@@ -2419,6 +2419,90 @@ refusing the compile. Making these values droppable means also not building the
 unreachable points — at which point the trap/poll classification above is
 load-bearing rather than backstopped, and it deserves its own pass.
 
+#### The loop was computing its own return value, every iteration
+
+Reading the whole emitted loop rather than only its frame operations found
+something bigger than either of the previous two sections was chasing:
+
+```text
+27  mov rax,rbx          ; sum
+28  mov ecx,0F4243h      ; 1000003
+29  imul rax,rcx         ; sum * 1000003L
+30  mov [rbp-0E8h],rax
+31  mov rax,[rbp-80h]
+32  movsxd rax,eax       ; (long) acc
+33  mov [rbp-0F0h],rax
+34  mov rcx,rax
+35  mov rax,[rbp-0E8h]
+36  add rax,rcx
+37  mov [rbp-0F8h],rax
+```
+
+That is `return sum * 1000003L + acc` — the method's **exit expression** —
+computed and discarded on every one of two hundred million iterations. Eleven
+of the loop's fifty-five instructions and three of its fifteen frame
+operations.
+
+**`ir_schedule`'s own header says a data node is "placed as late as possible
+(to minimize register pressure)". It is not.** `find_best_block` picks the
+deepest block that all of a node's INPUTS dominate, which is schedule-EARLY. For
+a value whose inputs are a loop phi and a constant, that is inside the loop —
+whatever its uses do.
+
+`CRATONVM_JIT_IR_SINK_LATE` moves a pure node to the shallowest loop nesting on
+the dominator path between where its inputs put it and where its uses need it,
+and **only when the depth strictly decreases**. The classic schedule-late also
+prefers the latest block at equal depth, to shorten live ranges; that is a
+different trade with a different risk, and leaving it out keeps this pass's
+effect attributable to the one thing it claims.
+
+The obligation it discharges is the safepoint one. A frame state resolves a
+value it names from that value's HOME WORD, and the home is written wherever
+the node is emitted — so a moved node must still dominate every block that can
+anchor a safepoint naming it. That is checked against the final placement, and a
+violation reverts the **whole method** rather than the offending node: reverting
+one node can break another's dominance, so undoing the lot is the only revert
+that is obviously correct.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| **+ sink alone** | 50 | 25 | 14 | 11 |
+| + carry + the residency stack | 55 | 15 | 5 | 10 |
+| **+ all three** | **44** | **10** | **3** | **7** |
+
+`moved=3 reverted_for_safepoints=0`, and `ck=5100017428506113` — HotSpot's
+answer — in all four arms.
+
+**Priced in CPU time, which is what a contended host leaves usable.** Two
+wall-clock runs at load 23–36 produced control-vs-control floors of 3.7% and
+10.0% — unusable for a magnitude, though the paired counts held (the sink arm
+beat its door arm in 17 of 18 rounds). User CPU over the same five interleaved
+arms, nine rounds:
+
+| arm | user CPU (s) |
+|---|---|
+| single-pass OSR | 0.564 |
+| single-pass OSR (control) | 0.568 |
+| optimizing door, switches off | 0.812 |
+| **+ sink alone** | **0.743** |
+| **+ sink + carry + the residency stack** | **0.621** |
+
+The floor is **0.60%**, and every comparison separates in **9 of 9** rounds:
+the sink alone is **8.5%**, all three together **23.5%**. In CPU time the tier
+inversion is **1.435x → 1.097x** — the optimizing tier is now within ten per
+cent of the single-pass body it was 1.7x behind when this arc started. (The
+wall-clock figures earlier in this file are wall clock; on this host CPU time is
+the instrument that survives the load, and it puts the door arm at 1.435x rather
+than 1.70x. Different instruments, not a correction.)
+
+**Engagement outside the probe is small, and that is the reason it stays OFF.**
+Across forty regression-suite classes and 112 optimizing compiles, exactly
+**one** compile sank anything, with zero reverts. The pass is correct and free
+when it does not fire, but a default-on codegen change wants evidence broader
+than one constructed kernel, and this is a targeted fix for a specific shape:
+a loop whose method computes something after it.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
