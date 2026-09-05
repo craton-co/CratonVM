@@ -14837,18 +14837,55 @@ impl G1Collector {
     }
 
     fn recompute_old_gen_bytes(&self, regions: &[G1Region]) {
-        let old_bytes: usize = regions
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.region_type,
-                    RegionType::Old
-                        | RegionType::HumongousStart
-                        | RegionType::HumongousContinuation
-                )
-            })
-            .map(|r| r.cursor())
-            .sum();
+        // OCCUPANCY IS REGIONS CONSUMED, NOT BYTES LIVE IN THEM.
+        //
+        // IHOP is a percentage of the HEAP (`ihop_percent`, 70 by default, so
+        // 179 MB of a 256 MB heap), and the heap is a fixed set of REGIONS. An
+        // Old region is unavailable to the allocator whether it is 100% full or
+        // 5% full, so summing each region's `cursor()` measures something the
+        // threshold is not about -- and under fragmentation the two diverge
+        // until the trigger can never fire.
+        //
+        // Measured on `org.h2.test.store.TestMVStoreTool` at -Xmx256m,
+        // 2026-09-05: 211 Old regions holding 44.7 MB between them -- 21% full
+        // on average. Against a 179 MB threshold that reads as 25% occupancy,
+        // so IHOP never fires, no concurrent mark starts, `marking_complete` is
+        // never set, `needs_mixed_gc()` is never true, and NO MIXED COLLECTION
+        // EVER RUNS. Meanwhile the region supply is gone: `free=0` with 245 of
+        // 256 regions Old, 18-54 to-space exhaustions per run and 17 evacuation
+        // failures, each of which also declines eager humongous reclaim.
+        //
+        // Counted in region-size units so it stays comparable with a threshold
+        // derived from `heap_size`. A humongous span contributes one unit per
+        // region it occupies (start plus continuations), which is exactly what
+        // it costs the allocator.
+        let old_bytes: usize = if gc_flags().g1_ihop_counts_regions {
+            regions
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.region_type,
+                        RegionType::Old
+                            | RegionType::HumongousStart
+                            | RegionType::HumongousContinuation
+                    )
+                })
+                .count()
+                .saturating_mul(self.config.region_size)
+        } else {
+            regions
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.region_type,
+                        RegionType::Old
+                            | RegionType::HumongousStart
+                            | RegionType::HumongousContinuation
+                    )
+                })
+                .map(|r| r.cursor())
+                .sum()
+        };
         self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
     }
 

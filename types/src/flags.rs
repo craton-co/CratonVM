@@ -1538,6 +1538,23 @@ pub struct GcFlags {
     /// tried: a humongous span's holders are old objects the pause never scans,
     /// which is exactly why the remembered-set walk exists.
     pub g1_humongous_marks: bool,
+    /// `CRATONVM_G1_IHOP_COUNTS_REGIONS=0` — measure old-generation occupancy
+    /// for IHOP by summing live bytes instead of counting the regions the old
+    /// generation has taken.
+    ///
+    /// Default **OFF**, on measurement rather than on principle. The argument
+    /// for it is sound -- an Old region is unavailable whether it is 5% or
+    /// 100% full, and 211 regions holding 44.7 MB read as 25% of a 179 MB
+    /// threshold they can never cross -- and it does what it claims: concurrent
+    /// marking engaged in 2 of 6 H2 runs against 0 of 6 for the byte count.
+    ///
+    /// But engaging is not helping. `to_space_exhausted` over the same 12 runs
+    /// was 28/40/37/45/30/98 with it on against 4/21/55/22/25/16 with it off --
+    /// no better, plausibly worse, on the only outcome that matters here. A
+    /// mark cycle that starts is still not a mixed collection that reclaims,
+    /// and until the rest of that chain is understood this changes when G1
+    /// spends effort without changing what it gets back.
+    pub g1_ihop_counts_regions: bool,
     pub g1_verify_holders: bool,
     pub g1_dbg_reach: bool,
     /// `CRATONVM_G1_DBG_ROOTCENSUS`
@@ -1684,6 +1701,7 @@ impl GcFlags {
             g1_dbg_accessor: present(src, "CRATONVM_DBG_G1ACCESSOR"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
             g1_humongous_marks: present(src, "CRATONVM_G1_HUMONGOUS_MARKS"),
+            g1_ihop_counts_regions: present(src, "CRATONVM_G1_IHOP_COUNTS_REGIONS"),
             g1_verify_holders: present(src, "CRATONVM_G1_VERIFY_HOLDERS"),
             g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
             g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
