@@ -205,7 +205,7 @@ impl ReservedHeap {
         // `want`. Reporting the LOWER figure is the safe direction — every
         // caller treats `committed_len` as "may be touched", and touching less
         // than is mapped is harmless where the reverse is a fault.
-        let _released = store.decommit_range(want, current - want);
+        let _released = store.decommit_range(want, current - want, "heap-shrink");
         true
     }
 }

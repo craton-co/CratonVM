@@ -898,6 +898,13 @@ pub(super) fn compile_osr_artifact(
                 // method-entry path's `rbc6-handler-reads-unsafe-local` bail
                 // does. A bare "OSR denied" here is what cost this defect a
                 // six-arm shape bisect to find in the first place.
+                // x86-64 only: `first_unsupported_precise_frame_site` is
+                // `#[cfg(target_arch = "x86_64")]`, because the precise-frame
+                // publication it screens for is a property of that backend's
+                // lowering. On another architecture there is no OSR at all (the
+                // aarch64 backend publishes no `osr_pc_to_native`), so there is
+                // nothing to deny and nothing to name.
+                #[cfg(target_arch = "x86_64")]
                 if let Some((pc, op)) = cratonvm_jit::first_unsupported_precise_frame_site(
                     &code,
                     code_len,
@@ -3646,7 +3653,30 @@ pub(super) fn try_osr(
             // `validate_osr_entry` on THIS artifact with THIS state just above, so
             // every seeded slot's JVM type has been checked against the compiled
             // entry's contract and `osr_state.locals` matches `osr_num_locals`.
-            unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
+            //
+            // x86-64 only: `osr_enter_planned` is `#[cfg(target_arch =
+            // "x86_64")]`. Reaching here off x86-64 would mean an artifact
+            // published OSR entry points, and no other backend does, so
+            // `should_try_osr` refuses long before here.
+            #[cfg(target_arch = "x86_64")]
+            {
+                unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
+            }
+            // `None`, NOT `unreachable!()`. The reasoning above is sound and
+            // the panic was still the wrong answer twice over. `None` is this
+            // call's existing word for "no entry was taken" -- the caller
+            // matches `Ok(None) => return None` and the interpreter carries on
+            // in the frame it is already in -- so an argument that turns out to
+            // be wrong on some future backend degrades to running the loop
+            // interpreted instead of aborting the VM. And the panic-free gate
+            // over this module is a TEXT scanner: it does not evaluate `cfg`,
+            // so a site compiled out of every x86-64 build still counted
+            // against a budget of zero and turned the gate red for everyone.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (&osr_state, &plan, thread_ptr, vm_ptr);
+                None
+            }
         }));
         // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
         // that did not pop). Before this site's own guard drops, depth should be

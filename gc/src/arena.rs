@@ -344,6 +344,14 @@ pub struct Arena {
     /// The cursor value the most recent retractions moved away from, maxed --
     /// see [`Self::low_high_water`], which is the only reader.
     pre_retract_high: usize,
+    /// The HIGH cursor's mirror of [`Self::pre_retract_high`]: the lowest that
+    /// cursor has been since [`Self::reset_high_low_water`], minned -- see
+    /// [`Self::high_low_water`], which is the only reader.
+    ///
+    /// The high end bumps DOWN, so its water mark is a MINIMUM and a retraction
+    /// RAISES the cursor away from it. `usize::MAX` is the "no retraction since
+    /// the last reset" identity for `min`.
+    pre_retract_low: usize,
     /// Reclaimed regions at or above [`Self::high_cursor`] — the large-object
     /// end's free list.
     ///
@@ -745,6 +753,7 @@ impl Arena {
             coalesce_threshold: COALESCE_THRESHOLD_MIN,
             high_cursor: capacity,
             pre_retract_high: 0,
+            pre_retract_low: usize::MAX,
             free_high: Vec::new(),
             high_max: 0,
             high_pushed: 0,
@@ -1399,17 +1408,6 @@ impl Arena {
     #[must_use = "a refused commit must fail the allocation"]
     #[inline]
     fn hand_out(&mut self, offset: usize, size: usize) -> Option<*mut u8> {
-        {
-            // Clear the decommit witness for this range: it is mapped again, so
-            // a read of it no longer faults. Without this the bitmap would only
-            // ever accumulate and its answer would decay to "everything".
-            let base = self.data.as_ptr() as usize;
-            crate::reloc_witness::note_arena_base(base);
-            crate::reloc_witness::note_committed(
-                base.wrapping_add(offset),
-                base.wrapping_add(offset + size),
-            );
-        }
         if !self.data.commit_range(offset, size) {
             return None;
         }
@@ -1424,24 +1422,18 @@ impl Arena {
     /// **The caller must have proved the span holds nothing live and is on no
     /// free list.** Both callers satisfy that by construction: they pass space
     /// a cursor has just retracted past, which is un-bumped by definition.
-    fn decommit_span(&mut self, lo: usize, hi: usize) -> usize {
+    ///
+    /// `site` names WHICH of those proofs was made. It is remembered with the
+    /// span and printed by the crash handler when a fault lands inside it
+    /// (`crate::reservation::recent_decommit_covering`), because the two
+    /// families fail differently: a span released from the FREE LIST that was
+    /// still reachable is a missing root, while one released behind a RETRACTED
+    /// CURSOR that was still reachable is a sweep that mis-sized the live set.
+    fn decommit_span(&mut self, lo: usize, hi: usize, site: &'static str) -> usize {
         if hi <= lo {
             return 0;
         }
-        // WITNESS the decommit, in ABSOLUTE addresses. This -- not the vacate --
-        // is the memory whose read FAULTS: a vacated span is zeroed but still
-        // mapped and yields zeros, while a decommitted one is gone from the
-        // address space. A page-ALIGNED SIGSEGV needs the latter.
-        // See `crate::reloc_witness`.
-        {
-            let base = self.data.as_ptr() as usize;
-            crate::reloc_witness::note_arena_base(base);
-            crate::reloc_witness::note_decommitted(
-                base.wrapping_add(lo),
-                base.wrapping_add(hi),
-            );
-        }
-        self.data.decommit_range(lo, hi - lo)
+        self.data.decommit_range(lo, hi - lo, site)
     }
 
     fn is_high(&self, offset: usize) -> bool {
@@ -1673,9 +1665,18 @@ impl Arena {
         self.high_max = self.free_high.iter().map(|b| b.size).max().unwrap_or(0);
         let old_high = self.high_cursor;
         self.high_cursor += give;
+        // Remember where the cursor was, for the same reason the LOW retraction
+        // does (see `low_high_water`): a bitmap pass bounded by the cursor after
+        // this retraction would skip `[old_high, high_cursor)`, and the MARK
+        // bitmap has bits there -- set during the cycle, while the cursor was
+        // still low. Leaving them uncleared means a later cycle, once the cursor
+        // has bumped back DOWN over that span, reads a fresh object as
+        // already-marked and never traces it, so everything reachable only
+        // through it is swept while live.
+        self.pre_retract_low = self.pre_retract_low.min(old_high);
         // As the low retraction: `[old_high, high_cursor)` is un-bumped again
         // and off the free list, so its whole granules go back to the OS.
-        self.decommit_span(old_high, self.high_cursor);
+        self.decommit_span(old_high, self.high_cursor, "high-cursor-retract");
         if give < block.size {
             self.push_high(FreeBlock {
                 offset: block.offset + give,
@@ -2390,6 +2391,29 @@ impl Arena {
         self.cursor.max(self.pre_retract_high)
     }
 
+    /// The lowest the HIGH bump cursor has been since
+    /// [`Self::reset_high_low_water`] -- the bottom of the span any bitmap over
+    /// the large-object end may have bits set in.
+    ///
+    /// The mirror of [`Self::low_high_water`], and it exists for exactly the
+    /// same reason, arriving from the opposite direction. The high end bumps
+    /// DOWN, so its live span is `[high_cursor, capacity)` and
+    /// [`Self::retract_high_cursor_into_free_head`] RAISES the cursor, which
+    /// SHRINKS that span. A bitmap pass bounded by the raw cursor after a
+    /// retraction therefore skips the bytes the retraction just gave back, and
+    /// the mark bitmap has bits there.
+    ///
+    /// Left un-mirrored when `low_high_water` landed. It bites a workload whose
+    /// large-object end fragments: once the cursor bumps back down over an
+    /// uncleared span, a fresh object there reads as already-marked, the marker
+    /// never traces it, and whatever is reachable only through it is swept
+    /// while live. Latent rather than measured -- no workload here reproduces
+    /// it, because it needs allocations at or above `ZGC_LARGE_OBJECT_MIN` to
+    /// fragment that end.
+    pub(crate) fn high_low_water(&self) -> usize {
+        self.high_cursor.min(self.pre_retract_low)
+    }
+
     /// Forget the retraction history, so the next
     /// [`Self::low_high_water`] starts from the current cursor.
     ///
@@ -2398,6 +2422,12 @@ impl Arena {
     /// longer covers the bits it has to reach.
     pub(crate) fn reset_low_high_water(&mut self) {
         self.pre_retract_high = 0;
+    }
+
+    /// [`Self::reset_low_high_water`] for the large-object end, with the same
+    /// "call it AFTER every bitmap is clear" obligation.
+    pub(crate) fn reset_high_low_water(&mut self) {
+        self.pre_retract_low = usize::MAX;
     }
 
     /// `vacated` is the third argument and the reason it exists is the whole
@@ -2440,23 +2470,6 @@ impl Arena {
         // Zero the vacated span. A slid-down survivor leaves its old bytes
         // behind verbatim, including a valid-looking `ObjectHeader`, and a
         // conservative scanner that met one would resurrect a corpse.
-        // WITNESS the vacated span before it is zeroed, in ABSOLUTE addresses.
-        //
-        // A read through a reference into this span is the crash
-        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` reports, and
-        // its fault address is page-ALIGNED precisely because the fill below
-        // makes the reader land on a valid all-zero header. Recording the span
-        // lets the crash handler say WHICH cycle vacated the memory that was
-        // read, instead of leaving the next person to guess which reference
-        // went stale -- seven such guesses have now been measured and none was
-        // right. See `crate::reloc_witness`.
-        {
-            let base = self.data.as_ptr() as usize;
-            crate::reloc_witness::note_vacated(
-                base.wrapping_add(new_cursor),
-                base.wrapping_add(self.cursor),
-            );
-        }
         self.data.fill_zero(new_cursor, self.cursor);
         let old_cursor = self.cursor;
         self.cursor = new_cursor;
@@ -2796,14 +2809,6 @@ impl Arena {
     #[must_use = "a refused commit must send the cycle down the serial path"]
     pub fn commit_parallel_evacuation_region(&mut self, bytes: usize) -> bool {
         debug_assert!(bytes <= self.low_bump_headroom());
-        {
-            let base = self.data.as_ptr() as usize;
-            crate::reloc_witness::note_arena_base(base);
-            crate::reloc_witness::note_committed(
-                base.wrapping_add(self.cursor),
-                base.wrapping_add(self.cursor + bytes),
-            );
-        }
         self.data.commit_range(self.cursor, bytes)
     }
 
@@ -2878,7 +2883,7 @@ impl Arena {
         let reclaimed = old_cursor - new_cursor;
         self.cursor = new_cursor;
         self.pre_retract_high = self.pre_retract_high.max(old_cursor);
-        self.decommit_span(new_cursor, old_cursor);
+        self.decommit_span(new_cursor, old_cursor, "low-cursor-retract");
         reclaimed
     }
 
@@ -2914,7 +2919,7 @@ impl Arena {
         // to the OS: without it a process that peaks and then idles holds its
         // peak forever, because `retract_cursor_into_free_tail` moved a number
         // and nothing else.
-        self.decommit_span(off, old_cursor);
+        self.decommit_span(off, old_cursor, "free-tail-retract");
         size
     }
 
@@ -2934,7 +2939,7 @@ impl Arena {
     /// and zero on a heap whose middle is smaller than a granule.
     pub fn decommit_unbumped_middle(&mut self) -> usize {
         let (lo, hi) = (self.cursor, self.high_cursor);
-        self.decommit_span(lo, hi)
+        self.decommit_span(lo, hi, "unbumped-middle")
     }
 
     /// Hand the whole granules inside every FREE-LIST block back to the OS.
@@ -2968,8 +2973,16 @@ impl Arena {
     ///
     /// WHOLE granules only, rounded INWARD: a block's ends usually share a
     /// granule with a live object, and rounding outward would take it too --
-    /// silently, because a decommitted page reads as zero rather than
-    /// faulting on the platforms that map it back on touch.
+    /// and taking it is not survivable, because a released granule FAULTS on
+    /// touch. `reservation::platform_decommit` is `madvise(MADV_DONTNEED)`
+    /// followed by `mprotect(PROT_NONE)` on Unix and
+    /// `VirtualFree(MEM_DECOMMIT)` on Windows; neither leaves a page that reads
+    /// back as zero.
+    ///
+    /// (This paragraph used to say the opposite -- "a decommitted page reads as
+    /// zero rather than faulting" -- and that belief is how the slides came to
+    /// write into released granules at all. See
+    /// `Self::commit_for_relocation`.)
     ///
     /// **Call at a safepoint**, after the sweep has coalesced: the lists are
     /// then a handful of maximal spans rather than one entry per dead object,
@@ -2980,7 +2993,7 @@ impl Arena {
         let mut released = 0usize;
         let low: Vec<(usize, usize)> = self.low_blocks_sorted();
         for (off, size) in low {
-            released += self.decommit_span(off, off + size);
+            released += self.decommit_span(off, off + size, "free-list-low");
         }
         let high: Vec<(usize, usize)> = self
             .free_high
@@ -2988,7 +3001,7 @@ impl Arena {
             .map(|b| (b.offset, b.size))
             .collect();
         for (off, size) in high {
-            released += self.decommit_span(off, off + size);
+            released += self.decommit_span(off, off + size, "free-list-high");
         }
         released
     }
@@ -3309,6 +3322,128 @@ mod prefer_bump_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A high-end retraction must widen the bitmap bound, exactly as a low-end
+    /// one does.**
+    ///
+    /// `live_bitmap_bounds` passes over `[0, low_high_water)` and
+    /// `[high_low_water, capacity)`. The low half has used a water mark since
+    /// the bounds landed; the high half used the RAW cursor, and
+    /// `retract_high_cursor_into_free_head` RAISES that cursor -- so the span
+    /// the retraction gave back fell outside the next clear and kept this
+    /// cycle's mark bits. Once the cursor bumps back down over them, a fresh
+    /// object there reads as already-marked, `mark` never hands it to the
+    /// worklist, and everything reachable only through it is swept while live.
+    ///
+    /// Latent rather than measured: found while root-causing
+    /// `ZGC-RELOC-DECOMMIT.1`, which it did not cause -- that workload allocates
+    /// nothing at or above `ZGC_LARGE_OBJECT_MIN`, so this cursor never
+    /// retracts there. It needs a workload that fragments the large-object end.
+    #[test]
+    fn a_high_end_retraction_keeps_the_bitmap_bound_over_the_span_it_gave_back() {
+        let mut arena = Arena::new(8192);
+        let _live = arena.alloc_high(1024, 8).expect("live");
+        let dead_a = arena.alloc_high(1024, 8).expect("dead a") as usize;
+        let dead_b = arena.alloc_high(1024, 8).expect("dead b") as usize;
+        let base = arena.base_ptr() as usize;
+        let low_of_dead = (dead_b - base).min(dead_a - base);
+        let cursor_before = arena.high_cursor();
+        assert_eq!(
+            arena.high_low_water(),
+            cursor_before,
+            "with no retraction yet the water mark IS the cursor"
+        );
+
+        arena.add_free_block(dead_a - base, 1024);
+        arena.add_free_block(dead_b - base, 1024);
+        assert_eq!(arena.coalesce_high(), 1, "the dead spans must merge");
+        let handed_back = arena.retract_high_cursor_into_free_head();
+        assert_eq!(handed_back, 2048, "the merged span starts at the cursor");
+        assert!(
+            arena.high_cursor() > cursor_before,
+            "a high-end retraction RAISES the cursor"
+        );
+
+        // The bound must still reach down over the span just given back --
+        // that is where this cycle's mark bits are.
+        assert_eq!(
+            arena.high_low_water(),
+            low_of_dead,
+            "the bound must cover the retracted span, or its mark bits survive \
+             the clear and a later cycle reads them as a live object's"
+        );
+        assert!(
+            arena.high_low_water() < arena.high_cursor(),
+            "the water mark is BELOW the raised cursor, which is the whole point"
+        );
+
+        // And a reset (after every bitmap is clear) hands the next cycle the
+        // tighter bound back.
+        arena.reset_high_low_water();
+        assert_eq!(
+            arena.high_low_water(),
+            arena.high_cursor(),
+            "reset must return the bound to the current cursor, or the saving decays"
+        );
+    }
+
+    /// **A decommitted free block reads as UNMAPPED, and `commit_for_relocation` is
+    /// what a direct writer must call before touching it.**
+    ///
+    /// The unit-level half of the `relocate_stw` destination-commit bug (see
+    /// `ZgcRealHeap`'s `the_slide_commits_a_destination_the_give_back_had_decommitted`).
+    /// `decommit_free_blocks` documents its contract as "every path that hands
+    /// one out again goes through `hand_out`, which commits" -- so any path
+    /// that does NOT go through `hand_out`, as the compacting slide does not,
+    /// has to commit for itself. This pins both directions of that: the
+    /// give-back really does leave the granule unreadable, and
+    /// `commit_for_relocation` really does bring it back.
+    ///
+    /// Skipped on a wholly-committed fallback store, where the whole question
+    /// is vacuous -- `is_readable_at` is unconditionally `true` there.
+    #[test]
+    fn commit_for_relocation_restores_a_granule_the_give_back_released() {
+        use crate::reservation::GRANULE;
+        // Several granules, so there is a whole one strictly inside the hole
+        // after `decommit_free_blocks` rounds inward.
+        let mut arena = Arena::new(8 * GRANULE);
+        let live = arena.alloc(1024, 8).expect("live head");
+        let base = arena.base_ptr() as usize;
+        let live_off = live as usize - base;
+        let hole_off = live_off + 1024;
+        let hole_len = 5 * GRANULE;
+        let _dead = arena.alloc(hole_len, 8).expect("dead span");
+
+        arena.add_free_block(hole_off, hole_len);
+        arena.coalesce_free_list();
+        let released = arena.decommit_free_blocks();
+        if released == 0 {
+            // Fallback (non-reserving) store: nothing can be decommitted and
+            // nothing can fault, so there is nothing to assert.
+            assert!(arena.is_readable_at(hole_off + GRANULE));
+            return;
+        }
+
+        let probe = (hole_off + GRANULE) & !(GRANULE - 1);
+        assert!(
+            !arena.is_readable_at(probe),
+            "a released granule must report as unmapped, or the write-side \
+             hazard this guards would be invisible"
+        );
+        assert!(
+            arena.commit_for_relocation(probe, 64),
+            "the OS must give a released granule back on request"
+        );
+        assert!(
+            arena.is_readable_at(probe),
+            "commit_for_relocation must leave the destination safe to write"
+        );
+        // And the re-committed bytes read as zero, which is what a caller
+        // handed a reused block is entitled to.
+        let p = (base + probe) as *const u8;
+        assert_eq!(unsafe { *p }, 0, "a re-committed granule reads as zero");
+    }
+
     use super::*;
 
     /// **A compaction may only drop the holes it wrote into.**

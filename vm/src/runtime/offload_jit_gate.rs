@@ -310,6 +310,11 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         }
     }
 
+    // `CallerGateMode::Off` skips the scan entirely. See the enum.
+    if caller_gate_mode() == CallerGateMode::Off {
+        return false;
+    }
+
     let cp_indices = scan_invokestatic_cp_indices(&code_attr.code);
     if cp_indices.is_empty() {
         return false;
@@ -362,20 +367,40 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             continue;
         }
 
-        {
-            cratonvm_types::gpu_jit_gate_census::note_blocked_name(
-                format!(
-                    "{}.{}{} -> calls {}.{}{}",
-                    class.name,
-                    method.name,
-                    method.descriptor,
+        // A kernel the dispatcher really can launch. What that costs
+        // the caller is now a POLICY -- see [`CallerGateMode`].
+        match caller_gate_mode() {
+            CallerGateMode::Block => {
+                cratonvm_types::gpu_jit_gate_census::note_blocked_name(
+                    format!(
+                        "{}.{}{} -> calls {}.{}{}",
+                        class.name,
+                        method.name,
+                        method.descriptor,
+                        target_class_name,
+                        target_method_name,
+                        target_descriptor
+                    ),
+                    cratonvm_types::gpu_jit_gate_census::BlockReason::CallsEligibleKernel,
+                );
+                return true;
+            }
+            CallerGateMode::CompiledHook => {
+                // Register the TARGET, not the caller. The compiler then
+                // keeps every site aimed at it on the dispatch helper, and
+                // the helper consults the offload hook -- so the caller
+                // compiles AND the site still offloads.
+                //
+                // No `return`: a method can call several kernels, and each
+                // one has to be registered or the sites aimed at the
+                // unregistered ones get bound directly and go dark.
+                cratonvm_jit::offload_hook::note_kernel(
                     target_class_name,
                     target_method_name,
-                    target_descriptor
-                ),
-                cratonvm_types::gpu_jit_gate_census::BlockReason::CallsEligibleKernel,
-            );
-            return true;
+                    target_descriptor,
+                );
+            }
+            CallerGateMode::Off => {}
         }
     }
     false
@@ -554,11 +579,11 @@ fn scan_code(code: &[u8]) -> (Vec<u16>, bool) {
                 break;
             }
         }
-        // iastore / lastore / fastore / dastore, plus bastore (0x54) and
-        // sastore (0x56) since `short[]`/`byte[]` became cacheable.
+        // iastore / lastore / fastore / dastore, plus bastore (0x54),
+        // castore (0x55) and sastore (0x56) since `short[]`/`byte[]`
+        // and then `char[]` became cacheable.
         // Reached only on a real instruction boundary, so an operand
         // byte that happens to equal one of these cannot false-positive.
-        // 0x55 (castore) is excluded on purpose — see the doc above.
         if (0x4f..=0x52).contains(&op) || op == 0x54 || op == 0x56 || op == 0x55 {
             writes_array = true;
         }
@@ -725,6 +750,93 @@ enum ArrayWriterPolicy {
     /// the process. See
     /// [`crate::runtime::offload::input_cache::disable_for_jit_array_writer`].
     AllowJit,
+}
+
+/// What a caller of a real, dispatchable GPU kernel costs.
+///
+/// # The measurement that moved the default
+///
+/// `GpuHookOverheadBench` under `--gpu`, one binary, this switch as the
+/// only difference. `base_ns_per_call` is a loop over an **ineligible**
+/// target, so the offload hook is not in it at all:
+///
+/// | | `base_ns_per_call` |
+/// |---|---:|
+/// | [`CallerGateMode::Block`] (the default) | 407.9 |
+/// | [`CallerGateMode::Off`] | 10.2 |
+/// | no `--gpu` | 9.0 |
+///
+/// 40x, and it is charged to every line of the enclosing method rather
+/// than to the kernel call it was refused for. The refusal is a whole
+/// method's compilation spent protecting one call site.
+///
+/// [`CallerGateMode::CompiledHook`] is what that measurement argues for,
+/// and it works -- 9,005 kernel launches from compiled callers on the
+/// same bench, all three scenarios 27-42x better than `Block`:
+///
+/// | | `base` | `small` | `big` |
+/// |---|---:|---:|---:|
+/// | `Block` | 358.5 | 13534.8 | 127257.4 |
+/// | `CompiledHook` | 13.2 | 358.5 | 79983.0 |
+/// | no `--gpu` | 15.4 | 28.5 | 2030.7 |
+///
+/// It is still not the default, because it fails a correctness
+/// scenario. See that variant's own comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerGateMode {
+    /// Compile the caller, and let the COMPILED dispatch helper consult
+    /// the offload hook: the caller runs compiled and the site still
+    /// offloads, so there is no trade left to make.
+    ///
+    /// `CRATONVM_GPU_JIT_GATE_CALLERS=hook`. **Opt-in, and not the
+    /// default**, on one measurement:
+    /// `bench-gpu/runtime-stress.sh`'s `cache_coherence` scenario FAILS
+    /// under it (`control=-6705490297358015087
+    /// gpu=-8633255346386885231`), and passes under every other arm.
+    ///
+    /// What the scenario needs to fail is a method that BOTH writes a
+    /// primitive array from compiled code AND offloads from compiled
+    /// code -- `cacheCoherence` does its host writes inline, in the same
+    /// method as the `scale(in, out)` call. Two switches localise it and
+    /// neither is the retirement policy:
+    ///
+    /// * `CRATONVM_GPU_JIT_ARRAY_WRITERS=refuse` (writers stay
+    ///   interpreted, so their stores invalidate the residency cache
+    ///   directly) -- PASSES.
+    /// * `CRATONVM_GPU_MIN_WORK_GIVEUP=0` (never retire a site) --
+    ///   still FAILS.
+    ///
+    /// So the compiled-tier array barrier's deferred dirty mark and the
+    /// compiled-tier offload do not compose, and that is not yet
+    /// root-caused. The 27-42x this mode is worth is not worth shipping
+    /// a wrong answer for, so it waits behind a flag with the repro
+    /// written down.
+    CompiledHook,
+    /// Refuse the caller JIT admission. The pre-2026-09-04 behaviour and
+    /// still the default -- see [`CallerGateMode::CompiledHook`] for the
+    /// scenario that keeps it that way.
+    /// `CRATONVM_GPU_JIT_GATE_CALLERS=block`, or unset.
+    Block,
+    /// Compile the caller and consult nothing: offload silently ends at
+    /// every compiled site. NOT a production setting --
+    /// `CRATONVM_GPU_JIT_GATE_CALLERS=0` -- it exists because the cost of
+    /// the refusal cannot be attributed by comparing `--gpu` against no
+    /// `--gpu`, which differ in everything else the device touches.
+    Off,
+}
+
+fn caller_gate_mode() -> CallerGateMode {
+    static M: std::sync::OnceLock<CallerGateMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_GPU_JIT_GATE_CALLERS")
+            .ok()
+            .as_deref()
+        {
+            Some("0") => CallerGateMode::Off,
+            Some("hook") => CallerGateMode::CompiledHook,
+            _ => CallerGateMode::Block,
+        }
+    })
 }
 
 /// See [`ArrayWriterPolicy`].
