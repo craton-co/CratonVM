@@ -275,6 +275,99 @@ is high enough to hide these loads, and until it comes down the levers that
 pay are the ones that delete a *path* — a dispatch, a representation
 conversion, a re-read — not the ones that delete a load.
 
+## The latch that was armed at bootstrap, and the two arms it had killed
+
+This is the largest finding on the page and it was produced by a counter, not
+a clock. It also corrects the section above it.
+
+### What the census said
+
+`field_fast::array_load_ref` was written to serve `aaload`. Its first census
+run, `probes/ArrBurn.java` at 2 M iterations:
+
+```
+arraylength: hit=2000374 miss=0 | aaload: hit=0 miss=2000146
+```
+
+**It never fired once.** The A/B that was queued behind it would have reported a
+clean zero, indistinguishable from an arm that does not exist — and the same
+instrument had already been the only thing standing between this branch and a
+wrong conclusion once before.
+
+Naming the cause took two more splits, and reproducing the same defect at each
+level is worth recording: `miss` folded three refusals into one number, and
+after splitting it, `miss_screen` folded two process-wide latches into one.
+**The rule that a skip census must not fold "never a candidate" into a refusal
+reason has to be applied at every level of the refusal, not once.** Reasoning
+did not settle it either — the hypothesis was right, but a reference-field probe
+appeared to contradict it (its receiver was legacy-layout and never reached the
+compact arm), and only the split counter was decisive:
+
+```
+aaload: hit=0 miss_barrier=0 miss_wrapper=2000146 miss_shape=0 miss_word=0
+```
+
+### The premise is false
+
+`autobox::wrapper_exists()` is **true in every process**. The class-mirror
+populator puns a `ClassId` (and `Int(-1)` for primitive mirrors) into slot 0 of
+an object stamped `java/lang/Class`; that store goes through
+`box_for_reference_slot`, which arms the latch unconditionally, at bootstrap,
+before any application code runs. The latch's own module note justifies it on
+the premise that "a process that never boxes — the overwhelming majority — pays
+one relaxed load ... and never touches the address validator". There is no such
+process here.
+
+Three fast paths were screened on it, and all three were dead:
+
+| | |
+|---|---|
+| `array_load_ref` | never fired; added on this branch |
+| the array autobox latch | a permanent no-op — **the complete explanation for its measuring exactly nothing** |
+| the compact `getfield` reference arm | **pre-existing**, and has never served a non-null reference field on a compact object since it was written |
+
+### The fix, and what it is not
+
+The screen asked the wrong question. "Has anything ever boxed" is a
+process-wide latch; what a reader needs is "is the value I just loaded a
+wrapper", which is one header compare on an object it already holds.
+`autobox::header_is_wrapper` is that test — the same discriminator
+`autobox_payload` applies, minus the `is_object_address` probe that finding 01
+established is not needed for parity. Semantics are unchanged: a wrapper still
+declines to the handler that un-boxes it. What changes is that everything which
+is *not* a wrapper — every reference value in an ordinary program — reaches the
+quickened path instead of being turned away by a latch about something else.
+
+After it, `aaload: hit=2000146` and every miss counter zero.
+
+### The measurements, on a host at 1% load
+
+`probes/ArrBurn.java`, N = 30 M, eight interleaved passes, arms alternated per
+pass, wall ms, min-of-8.
+
+**`aaload`** — `CRATONVM_JIT=-ref-array-fast`. `iaload` and `ctl` are the arms
+the switch cannot reach.
+
+| | min-of-8 | pairwise |
+|---|---:|---|
+| quickened | 2685 ms | — |
+| general path | 3222 ms | **8/8** |
+
+**537 ms over 30 M loads ≈ 18 ns per `aaload`**, and it halves the gap to
+`iaload` in the same run (35 ns → 16 ns).
+
+**`arraylength`** — `CRATONVM_JIT=-arraylength-fast`, engaged at 100%.
+
+| | min-of-8 | pairwise |
+|---|---:|---|
+| quickened | 1890 ms | — |
+| general path | 2032 ms | **8/8, no overlap** |
+
+**142 ms ≈ 4.7 ns per `arraylength`**, with the control flat at 1774–1855 ms in
+both arms. The quickened arm's worst pass (1944) beats the general path's best
+(2032). This page predicted "around one nanosecond, below what this host
+resolves"; that was wrong by a factor of five, in the conservative direction.
+
 ## Three findings resolved without a change, and why
 
 These were on the original ranked list. Each was read to the point of a verdict
