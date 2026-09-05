@@ -1595,12 +1595,33 @@ pub static OBJECT_START_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static OBJECT_START_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Misses that the header-shaped deduction then ACCEPTED.
+///
+/// This is the recoverable half of the miss population, and it needs no new
+/// plumbing to measure: a candidate the bitmap had no bit for, which the full
+/// deduction went on to certify as a real object base, is by definition an
+/// object this arena allocated and the bitmap never saw. There is exactly one
+/// way for that to happen -- a TLAB chunk is one `hand_out` and the objects
+/// bump-allocated inside it never reach it.
+///
+/// The other half of a miss is a genuine non-object: a zero, a small integer, a
+/// long bit pattern. Those SHOULD miss, and no amount of work on the bitmap will
+/// change them. Reporting the two together is what made the raw miss count
+/// unactionable -- it could not say whether the bitmap was leaving coverage on
+/// the table or simply being asked about rubbish.
+pub static OBJECT_START_MISSED_OBJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-/// `(hits, misses)` for the exact object-start fast path.
-pub fn object_start_counts() -> (u64, u64) {
+/// `(hits, misses, missed_objects)` for the exact object-start fast path.
+///
+/// `missed_objects` is the subset of `misses` the deduction went on to accept --
+/// the coverage the bitmap is leaving on the table, as opposed to the rubbish it
+/// is correctly declining. See [`OBJECT_START_MISSED_OBJECTS`].
+pub fn object_start_counts() -> (u64, u64, u64) {
     (
         OBJECT_START_HITS.load(Ordering::Relaxed),
         OBJECT_START_MISSES.load(Ordering::Relaxed),
+        OBJECT_START_MISSED_OBJECTS.load(Ordering::Relaxed),
     )
 }
 
@@ -4608,6 +4629,7 @@ impl GenerationalHeap {
         // the bitmap is knowably incomplete -- objects bump-allocated inside a
         // TLAB chunk never reach `hand_out` -- and rejecting on it would drop
         // live roots.
+        let mut bitmap_declined = false;
         if let Some(hit) = self.arena_object_start(slot, addr) {
             if hit {
                 OBJECT_START_HITS.fetch_add(1, Ordering::Relaxed);
@@ -4617,6 +4639,7 @@ impl GenerationalHeap {
                 return Some(unsafe { ObjectRef::from_raw(raw as *mut u8) });
             }
             OBJECT_START_MISSES.fetch_add(1, Ordering::Relaxed);
+            bitmap_declined = true;
         }
 
         // Cap num_slots at a sanity limit so a stale word can't fool us
@@ -4722,6 +4745,12 @@ impl GenerationalHeap {
             return None;
         }
 
+        if bitmap_declined {
+            // The bitmap had no bit for an address the deduction just certified
+            // as a real object base. That is the recoverable half of the miss
+            // population -- see `OBJECT_START_MISSED_OBJECTS`.
+            OBJECT_START_MISSED_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: `raw` passed the region containment, header sanity, and
         // extent-containment checks above, so it points to a valid object
         // header within a heap arena.

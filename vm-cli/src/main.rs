@@ -286,10 +286,10 @@ fn maybe_dump_shutdown_reports() {
             // bitmap never saw because a TLAB bump-allocated it -- needs a
             // workload, not another counter.
             {
-                let (hits, misses) = cratonvm_vm::object_start_counts();
+                let (hits, misses, missed_objects) = cratonvm_vm::object_start_counts();
                 if hits != 0 || misses != 0 {
                     eprintln!(
-                        "[cratonvm] exact object-start answers: hits={hits} misses={misses}"
+                        "[cratonvm] exact object-start answers: hits={hits} misses={misses} (of which real objects: {missed_objects})"
                     );
                 }
             }
