@@ -493,6 +493,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
+    E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
     // way and report any that still names a moved address. A miss there is not
