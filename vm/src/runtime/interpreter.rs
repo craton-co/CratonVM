@@ -5960,8 +5960,22 @@ fn execute_frame_from_index(
                             }
                         }
                     }
-                    // iload_X; arraylength → get array length directly
+                    // iload_X; arraylength → get array length directly.
+                    // Pushes the local's raw slot and lets the quickened arm
+                    // read the header, rather than decoding to `Value` and
+                    // paying the `VmHeap` dispatch; on a decline the push is
+                    // undone so the stack is exactly as it was.
                     if b1 == 0xbe {
+                        if fast_field_zgc.is_some() {
+                            frame
+                                .stack
+                                .push_compact(frame.get_local_compact_unchecked(local_idx));
+                            if field_fast::arraylength_fast(&mut frame.stack) {
+                                frame.pc = saved_pc + 2;
+                                continue;
+                            }
+                            frame.stack.pop_compact();
+                        }
                         let arr_val = frame.get_local_unchecked(local_idx);
                         if let Value::Object(Some(arr_ref)) = arr_val {
                             let len = shared.mem.heap.array_length(arr_ref);
@@ -7480,6 +7494,16 @@ fn execute_frame_from_index(
                 }
                 // arraylength (0xbe) — direct int push on the success path.
                 0xbe => {
+                    // Quickened arm first: reads the length out of the header
+                    // at the address already in the slot, with no `Value`
+                    // round trip and no `VmHeap` dispatch. Declines a null or
+                    // non-array receiver so the general path below keeps the
+                    // NPE and the corrupt-header diagnosis. See
+                    // `field_fast::arraylength_fast`.
+                    if fast_field_zgc.is_some() && field_fast::arraylength_fast(&mut frame.stack) {
+                        frame.pc = saved_pc + 1;
+                        continue;
+                    }
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
                         let len = shared.mem.heap.array_length(arr_ref);

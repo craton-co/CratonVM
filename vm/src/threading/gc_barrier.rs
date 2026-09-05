@@ -22,9 +22,63 @@ use crate::threading::thread_state::{self, ThreadExecState};
 /// The barrier uses a cheap `AtomicBool` flag (`stw_requested`) that threads
 /// poll at safepoints. When set, threads deposit their roots and wait for
 /// the GC initiator to finish collection.
+/// A cache-line-isolated `AtomicBool`.
+///
+/// `stw_requested` is the single hottest load in the VM: every interpreter
+/// thread reads it **once per bytecode** at the top of the dispatch loop, and
+/// compiled code polls the very same byte through
+/// [`GcBarrier::stw_requested_flag_addr`]. Its three neighbours in `GcBarrier`
+/// are all written by other threads — `gc_generation` every collection,
+/// `threads_blocked` on every `enter_blocked`/`leave_blocked` (so every
+/// blocking native op: `Object.wait`, `Thread.sleep`, `LockSupport.park`,
+/// selector `select`, …), and `inner`, whose `parking_lot::Mutex` word is
+/// written on every lock and unlock. All four sat inside the first 64 bytes:
+/// `AtomicBool` at offset 0, 7 bytes of alignment padding, then the two
+/// `AtomicU64`s at 8 and 16 and the mutex at 24.
+///
+/// So a write to any of them invalidated, on every interpreting core, the line
+/// carrying the flag those cores read every bytecode. The writes are not
+/// per-nanosecond, which is why this is insurance rather than a measured bug —
+/// but it is free insurance, and the tree already owns the idiom for exactly
+/// this reason (`gc/src/zgc/census.rs` and `gc/src/collector.rs` both carry
+/// `#[repr(align(64))]` so unrelated counters cannot share a line).
+///
+/// 64 rather than 128: the two in-tree precedents use 64 and 128 respectively,
+/// and the destructive-interference size on x86-64 is 64. A single `bool` in
+/// its own line costs 63 bytes once per process.
+#[repr(align(64))]
+pub struct CacheLineFlag(AtomicBool);
+
+impl CacheLineFlag {
+    const fn new(v: bool) -> Self {
+        Self(AtomicBool::new(v))
+    }
+    /// The flag itself, for the ordinary atomic API.
+    #[inline(always)]
+    pub fn flag(&self) -> &AtomicBool {
+        &self.0
+    }
+    #[inline(always)]
+    pub fn load(&self, order: Ordering) -> bool {
+        self.0.load(order)
+    }
+    #[inline(always)]
+    pub fn store(&self, v: bool, order: Ordering) {
+        self.0.store(v, order)
+    }
+    #[inline(always)]
+    pub fn swap(&self, v: bool, order: Ordering) -> bool {
+        self.0.swap(v, order)
+    }
+}
+
 pub struct GcBarrier {
     /// Cheap flag polled at every safepoint. Only requires an atomic load.
-    pub stw_requested: AtomicBool,
+    ///
+    /// On its own cache line — see [`CacheLineFlag`] for why. It stays the
+    /// FIRST field so `stw_requested_flag_addr`, which compiled code bakes in,
+    /// keeps pointing at the same byte of the same allocation.
+    pub stw_requested: CacheLineFlag,
     /// GC generation counter — incremented after each collection.
     /// Threads compare their local generation to detect missed GCs.
     pub gc_generation: AtomicU64,
@@ -132,13 +186,13 @@ impl GcBarrier {
     /// as an immediate into generated code. The pointer must NOT outlive
     /// the `Arc<SharedVm>` it was obtained from.
     pub fn stw_requested_flag_addr(&self) -> *const u8 {
-        &self.stw_requested as *const AtomicBool as *const u8
+        self.stw_requested.flag() as *const AtomicBool as *const u8
     }
 
     /// Create a new GC barrier with no active STW.
     pub fn new() -> Self {
         Self {
-            stw_requested: AtomicBool::new(false),
+            stw_requested: CacheLineFlag::new(false),
             gc_generation: AtomicU64::new(0),
             threads_blocked: AtomicU64::new(0),
             inner: Mutex::new(GcBarrierInner {
@@ -415,7 +469,7 @@ impl GcBarrier {
     {
         let mut inner = self.inner.lock();
         Self::wait_out_pause_locked(
-            &self.stw_requested,
+            self.stw_requested.flag(),
             &self.gc_generation,
             &self.gc_complete,
             &mut inner,
@@ -891,7 +945,7 @@ impl Drop for BlockedGuard<'_> {
         // `GcBarrier::wait_out_pause_locked`.
         let mut inner = self.barrier.inner.lock();
         GcBarrier::wait_out_pause_locked(
-            &self.barrier.stw_requested,
+            self.barrier.stw_requested.flag(),
             &self.barrier.gc_generation,
             &self.barrier.gc_complete,
             &mut inner,

@@ -285,6 +285,77 @@ fn field_ptr_for(zgc: &ZgcRealHeap, ptr: u64, site: &FastFieldSite) -> Option<*m
     Some(unsafe { (ptr as *mut u8).add(HEADER_SIZE + site.offset as usize) })
 }
 
+/// Quickened `arraylength`.
+///
+/// Replaces the array reference on top of the operand stack with its length
+/// and returns `true`, or leaves the stack untouched and returns `false` so the
+/// caller keeps the general path (which owns the null-receiver NPE).
+///
+/// # Why this arm exists
+///
+/// `arraylength` has no resolution, no site cache, no barrier and no
+/// allocation: it reads one word out of a header and pushes an int. Measured
+/// 2026-09-05 it cost **24.4 ns against HotSpot's 0.39** — 62x, the worst
+/// ratio of any bytecode in the interpreter's operation table, and about three
+/// and a half straight-line bytecodes' worth of time to perform one load.
+///
+/// What it was spending it on, all of it avoidable:
+///
+/// * `frame.stack.pop_unchecked()` decodes the 8-byte `CompactValue` into the
+///   16-byte `Value` enum, and the arm's own fall-through pushes it back — so
+///   the wide value stays live across the arm and needs a stack slot.
+/// * `shared.mem.heap.array_length(arr)` goes through the `VmHeap` enum
+///   `dispatch!` to reach a collector method whose entire body is
+///   `self.header(obj).array_length()`.
+///
+/// This reads the header at the address already in the slot and pushes the
+/// length. `ObjectHeader::array_length` is a pure header read on every
+/// collector (`shape`, guarded by `kind()`), but this arm is admitted only
+/// under the same `fast_field_zgc` gate as the field and array-element arms so
+/// it inherits their contract: any per-access diagnostic that turns those off
+/// turns this off too, and only ZGC is served.
+///
+/// A non-array receiver declines rather than pushing `0`: `array_length()`
+/// answers `0` for a non-array, and the general path's own
+/// `Value::Object(Some(_))` arm would have asked the collector, whose
+/// `debug_assert` documents that a non-array here is a bug. Declining keeps
+/// that question with the code that owns it.
+#[inline]
+pub(super) fn arraylength_fast(stack: &mut ValueStack) -> bool {
+    if crate::runtime::env_cache::no_arraylength_fast() {
+        return false;
+    }
+    if stack.len() == 0 {
+        return false;
+    }
+    // `None` for a null receiver (`SUB_NULL` is not `SUB_OBJECT`), which is
+    // what routes the NPE to the general path.
+    let Some(ptr) = stack.peek_compact().as_object_ptr() else {
+        return false;
+    };
+    if ptr == 0 {
+        return false;
+    }
+    // SAFETY: `ptr` is the receiver of a verified `arraylength`, so it is a
+    // live object reference and its first `HEADER_SIZE` bytes are an
+    // `ObjectHeader` — the same premise `ZgcRealHeap::array_length` reads on,
+    // from the same operand-stack slot, in the same safepoint-free window.
+    // See `registry_probe_restored` for the full argument.
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.kind() != ObjectKind::Array {
+        return false;
+    }
+    // JVMS: `arraylength` pushes an int, and an array length is bounded by
+    // `Integer.MAX_VALUE`. A header claiming more is corrupt; decline to the
+    // path that owns that diagnosis rather than wrapping it negative.
+    let Ok(len) = i32::try_from(header.array_length()) else {
+        return false;
+    };
+    stack.pop_compact();
+    stack.push_int_unchecked(len);
+    true
+}
+
 /// Quickened `getfield`. Replaces the receiver on top of the operand stack
 /// with the field value and returns `true`, or leaves the stack untouched and
 /// returns `false` so the caller runs `op_getfield`.

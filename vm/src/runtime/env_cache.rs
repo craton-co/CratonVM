@@ -1907,6 +1907,19 @@ cached_is_set!(no_field_fast_path, "CRATONVM_JIT_NO_FIELD_FAST_PATH");
 /// Token: `CRATONVM_JIT=-field-addr-elide`.
 cached_is_set!(no_field_addr_elide, "CRATONVM_JIT_NO_FIELD_ADDR_ELIDE");
 
+/// `CRATONVM_JIT_NO_ARRAYLENGTH_FAST` -- route `arraylength` back through the
+/// `Value` round trip and the `VmHeap` enum dispatch.
+///
+/// The quickened arm reads the length out of the header at the address already
+/// in the operand-stack slot. The path it replaces decoded that slot into the
+/// 16-byte `Value` enum (and pushed it back on the non-object path, keeping it
+/// live across the arm), then went through `dispatch!` to reach a collector
+/// method whose whole body is `self.header(obj).array_length()`. Measured
+/// 2026-09-05 the opcode cost 24.4 ns against HotSpot's 0.39 -- 62x, the worst
+/// ratio in the interpreter's operation table, for one header read.
+/// Token: `CRATONVM_JIT=-arraylength-fast`.
+cached_is_set!(no_arraylength_fast, "CRATONVM_JIT_NO_ARRAYLENGTH_FAST");
+
 /// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
 /// backward branch instead of only once `Frame::backward_count` has reached
 /// the smallest threshold the call could accept. Token:
