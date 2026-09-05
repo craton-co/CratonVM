@@ -1400,6 +1400,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-rpo-layout", on_key: Some("CRATONVM_JIT_IR_RPO_LAYOUT"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "ir-call-anewarray", on_key: Some("CRATONVM_JIT_IR_CALL_ANEWARRAY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "supersede-epoch-skip-useless", on_key: Some("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None, since: "2026-07-14" },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None, since: "2026-07-25" },
