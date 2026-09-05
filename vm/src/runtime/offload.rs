@@ -5238,7 +5238,8 @@ fn dispatch_method_inner(
         | ParamKind::F32Array
         | ParamKind::F64Array
         | ParamKind::I16Array
-        | ParamKind::I8Array => {
+        | ParamKind::I8Array
+        | ParamKind::BoolArray => {
             // Void: no ret_ptr param at all. Array returns: not yet
             // wired (see `SerializedResult`'s doc comment) — the
             // analyzer/lowering pairing for those shapes is a later
@@ -8182,7 +8183,7 @@ pub fn is_marshallable_array_element(t: cratonvm_types::ArrayElementType) -> boo
     use cratonvm_types::ArrayElementType as A;
     matches!(
         t,
-        A::Int | A::Long | A::Float | A::Double | A::Short | A::Byte | A::Char
+        A::Int | A::Long | A::Float | A::Double | A::Short | A::Byte | A::Char | A::Boolean
     )
 }
 
@@ -8339,7 +8340,14 @@ fn marshal_array_arg(
             "i16",
             2
         ),
-        ArrayElementType::Byte => arm!(
+        // `boolean[]` shares every byte of `byte[]`'s path deliberately:
+        // `element_byte_size` is 1 for both, so the upload, the cache
+        // buffer and the write-back are bit-identical. The two types
+        // diverge only on the DEVICE, where `bastore` into a boolean
+        // array must mask to bit 0 (JVMS 6.5) -- which is why the
+        // analyzer gives `boolean[]` its own `ParamKind::BoolArray` while
+        // the marshaller does not need to tell them apart.
+        ArrayElementType::Byte | ArrayElementType::Boolean => arm!(
             i8,
             I8,
             gpu_marshal::upload_obj_i8,
@@ -8453,11 +8461,11 @@ mod marshaller_analyzer_agreement {
             ArrayElementType::Short,
             ArrayElementType::Byte,
             ArrayElementType::Char,
+            ArrayElementType::Boolean,
         ] {
             assert!(is_marshallable_array_element(t), "{t:?} must be marshallable");
         }
         for t in [
-            ArrayElementType::Boolean,
             ArrayElementType::Reference,
         ] {
             assert!(!is_marshallable_array_element(t), "{t:?} must not be marshallable");

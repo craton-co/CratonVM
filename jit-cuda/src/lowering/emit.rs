@@ -528,7 +528,8 @@ impl<'a> Emitter<'a> {
                 | ParamKind::F32Array
                 | ParamKind::F64Array
                 | ParamKind::I16Array
-                | ParamKind::I8Array => {
+                | ParamKind::I8Array
+                | ParamKind::BoolArray => {
                     // AUDIT 2026-05-24 (C31): array references are JVM
                     // category-1 (one operand-stack slot each), but they
                     // live in a `RegKind::U64` PTX register because the
@@ -4570,7 +4571,7 @@ impl<'a> Emitter<'a> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let (param_idx, kind) = self.array_param_of(&array_ref)?;
         // Phase 10 #2 — see `array_store` for rationale.
         self.writes_param_mask |= if param_idx < 64 {
             1u64 << param_idx
@@ -4579,13 +4580,30 @@ impl<'a> Emitter<'a> {
         };
         self.emit_bounds_check(&index, param_idx);
         let addr = self.emit_element_addr(&index, &array_ref, 1);
+        // JVMS 6.5, `bastore`: "if the array is a boolean array, then the
+        // int value is narrowed by taking the bitwise AND with 1".
+        //
+        // This is the ONLY place the two types `bastore` serves diverge,
+        // and the opcode cannot tell them apart -- which is why
+        // `boolean[]` has its own `ParamKind` while `char[]` reuses
+        // `I16Array`. Without the mask, `arr[i] = (x != 0)` compiled to a
+        // non-0/1 int would store that int verbatim and every later
+        // `baload` would read a "true" that is not 1, which HotSpot never
+        // produces.
+        let stored = if kind == ParamKind::BoolArray {
+            let masked = self.regs.fresh_reg(RegKind::S32);
+            writeln!(
+                self.body,
+                "    and.b32 {}, {}, 1;",
+                masked.name, value.name
+            )
+            .unwrap();
+            masked.name
+        } else {
+            value.name.clone()
+        };
         // Truncate value to s8 implicitly via st.global.s8 (PTX OK).
-        writeln!(
-            self.body,
-            "    st.global.s8 [{}], {};",
-            addr.name, value.name
-        )
-        .unwrap();
+        writeln!(self.body, "    st.global.s8 [{}], {};", addr.name, stored).unwrap();
         Ok(())
     }
 

@@ -336,7 +336,8 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
             | ParamKind::F32Array
             | ParamKind::F64Array
             | ParamKind::I16Array
-            | ParamKind::I8Array => {
+            | ParamKind::I8Array
+            | ParamKind::BoolArray => {
                 out.push(PtxParam {
                     name: make_name(&mut buf, i, "_ptr"),
                     kind: PtxParamKind::U64Ptr,
@@ -362,7 +363,8 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
         | ParamKind::F32Array
         | ParamKind::F64Array
         | ParamKind::I16Array
-        | ParamKind::I8Array => {
+        | ParamKind::I8Array
+        | ParamKind::BoolArray => {
             out.push(PtxParam {
                 name: "ret_ptr".to_string(),
                 kind: PtxParamKind::U64Ptr,

@@ -2987,6 +2987,49 @@ mod tests {
         assert!(state::with(|s| s.streams.get(&handle).is_none()));
     }
 
+    /// The submission drain must stay wired, and only the shim can keep it
+    /// wired.
+    ///
+    /// Two tables are keyed by the same handle: this crate's `state::futures`
+    /// and the offload runtime's `offload::SUBMISSIONS`. `builtin_release_future`
+    /// is the ONLY thing that touches both, so if the `ctx.gpu_release_submission`
+    /// call is ever dropped, the registry silently stops draining and every async
+    /// submission leaks its CUDA stream and event for the life of the process.
+    ///
+    /// That is not hypothetical. It is how the defect `f6061f7b3` fixed was
+    /// born: `b6133b92d` moved the synchronous path onto `dispatch_method_sync`,
+    /// which never registers a submission and so correctly had nothing to
+    /// release — and that happened to delete the last caller of
+    /// `release_submission`. Nothing was watching, so it went unnoticed until a
+    /// test-only-public-API ratchet reported the orphaned function weeks later.
+    /// This is the thing that would have been watching.
+    ///
+    /// Asserted at the SHIM boundary deliberately: the VM-side override reads
+    /// `CRATONVM_GPU_NO_SUBMISSION_DRAIN`, so asserting further in would make
+    /// this test a test of that flag. The contract here is "the shim forwards
+    /// the handle it was given", which is the half that was missing.
+    #[test]
+    fn release_future_forwards_the_drain_to_the_registry() {
+        let mut ctx = MockNativeContext::new();
+        let handle: u64 = 90125;
+        state::with(|s| {
+            s.futures.insert(handle, state::FutureState::Pending);
+        });
+
+        builtin_release_future(&mut ctx, &[Value::Long(handle as i64)]).unwrap();
+
+        assert_eq!(
+            ctx.gpu_release_submission_calls(),
+            vec![handle],
+            "builtin_release_future must forward the handle to the offload \
+             registry's drain, not only drop this crate's own record of it"
+        );
+        assert!(
+            state::with(|s| s.futures.get(&handle).is_none()),
+            "the local bookkeeping entry must go too"
+        );
+    }
+
     #[test]
     fn new_stream_wraps_the_real_handle_when_a_device_is_available() {
         // With `gpu_stream_create` scripted to succeed, the handle
