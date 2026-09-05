@@ -12,8 +12,10 @@ import java.util.ServiceLoader;
  * synthetic class library compiled in, so there is no bytecode behind these
  * names and the essential Rust natives are the whole implementation — and
  * {@code vm_init} was applying the real-JDK "drop the native, the bytecode will
- * answer it" policy over them anyway. See
- * {@code docs/internal/fixed-bugs/string-length-nosuchmethoderror-in-a-default-build-synthetic-vm-FIXED-20260905.md}.
+ * answer it" policy over them anyway. Recorded in
+ * {@code docs/known-issues/jdk-only/F30-1-the-registrar-call-graph-and-the-drifted-arm-20260813.md}
+ * &sect;9, and in the internal tree at
+ * {@code fixed-bugs/string-length-nosuchmethoderror-in-a-default-build-synthetic-vm-FIXED-20260905.md}.
  *
  * <p>Deliberately trivial, and deliberately NOT a String conformance fixture:
  * it asks only whether these names RESOLVE. Conformance is a question for a

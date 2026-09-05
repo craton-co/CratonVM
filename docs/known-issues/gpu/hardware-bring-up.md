@@ -332,8 +332,8 @@ is the useful part of the estimate.
 ## Known residual in this page's neighbourhood
 
 Several public files still cite
-`docs/known-issues/gpu-offload-followups-20260711.md`, which has moved to
-`docs/internal/fixed-suite-bugs/` and so is stripped from public history —
+`docs/known-issues/gpu-offload-followups-20260711.md`, which has moved into the
+internal tree under `fixed-suite-bugs/` and so is stripped from public history —
 `bench-gpu/ci-gate.sh`, `bench-gpu/run-gpu-comparison.sh`,
 `bench-gpu/run-gpu-warm.sh`, `.github/workflows/gpu-selfhosted.yml`,
 `cratonvm-embed/README.md` and `CHANGELOG.md` among them. Left alone here
