@@ -509,8 +509,53 @@ land on the allocation path of every thread rather than one.
 
 ## What a follow-up should measure first
 
-1. Re-run the **+153 % four-worker mark** number now that the provider lock is
-   gone. Everything in finding 6's second half depends on whether it survived.
+1. ~~Re-run the +153 % four-worker number~~ — **attempted, and it produced two
+   results: one about the collector and one about the instrument.**
+
+   **The instrument first, because it invalidates prior work.** G1 counted
+   NOTHING about which evacuator ran — no `workers=` in `[GC-STAT]`, no census in
+   `evac_pool.rs`, nothing in the dispatcher. And the nearest-looking counter
+   belongs to someone else: `[GC] par_evac` is the GENERATIONAL evacuator's, in
+   `gen_evac.rs`, and reads zero under G1 whatever G1 did. Read as G1's it says
+   "the parallel evacuator never runs", which is striking and false — a zero from
+   an instrument armed where it cannot fire.
+
+   With `[GC] g1 young evacuation: parallel=N serial=N workers_last=N` added,
+   two of the three worker-count levers turn out not to reach this path at all:
+
+   | lever | `workers_last` |
+   |---|---|
+   | `CRATONVM_GC_PAR_THREADS=1` / `=16` | 23, 23 — **inert** |
+   | `-XX:ParallelGCThreads=1` / `=8` | 23, 23 — **inert** |
+   | `CRATONVM_G1_WORKERS=1` / `=8` | 1, 8 — engages |
+
+   `CRATONVM_GC_PAR_THREADS` is the generational young collector's knob, and
+   `gc_worker_threads_for` reads `config.gc_worker_threads` while `vm_init` sets
+   `parallel_gc_threads` from `-XX:ParallelGCThreads` — a separate field. **Any
+   previous G1 worker-count A/B run on either of the first two compared a binary
+   against itself.**
+
+   **The collector.** `G1ChurnPauseProbe 96 100`, `-Xmx 256m`, debug binary,
+   five interleaved reps per arm, engagement printed on every run (18-19 parallel
+   cycles, `workers_last` 1 vs 8):
+
+   | | median pause | p90 pause | total pause | wall |
+   |---|---|---|---|---|
+   | 1 worker | 381 ms | 2201 ms | **12.7 s** | 34 s |
+   | 8 workers | 389 ms | **2836 ms** | **15.6 s** | 33 s |
+
+   Adding workers leaves the median and the wall clock unchanged and makes the
+   TAIL and the total pause time worse — +23 % total, +29 % p90, in the same
+   direction in 4 of 5 reps for both. So "more workers is better" is not
+   supported here, and the August +153 % figure points the same way.
+
+   **What this is not.** It measures parallel EVACUATION; the +153 % figure was
+   about parallel MARKING, so this informs that question without answering it.
+   Debug binary, one workload, 19 pauses per run — the medians are stable, a p90
+   from 19 samples is coarse. And it does NOT retire finding 6's second half: a
+   shared work-stealing pool is a different design from more workers on the
+   existing one, and this says the existing one does not scale, not that nothing
+   would.
 2. A per-cycle **`MarkBitmap::clear` timing** on a G1 workload with many freed
    regions — the `any_marked` early return should show up as a step change in
    cleanup cost, and if it does not, the bitmap was not where the time went.
