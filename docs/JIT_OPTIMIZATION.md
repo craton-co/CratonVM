@@ -2503,6 +2503,93 @@ when it does not fire, but a default-on codegen change wants evidence broader
 than one constructed kernel, and this is a targeted fix for a specific shape:
 a loop whose method computes something after it.
 
+#### The constant operands, and the end of the tier inversion
+
+Every binary arithmetic arm in `ir_lower` reads its second operand through
+`gp_load_value(RCX, ..)` and then works register-to-register. When that operand
+is a constant, `ir_const_imm` turns the read into `mov ecx, imm` — so the
+emitted code carries a whole instruction per constant operand that x86 has an
+addressing form for:
+
+```text
+mov ecx,1Fh  / imul eax,ecx        becomes   imul eax,eax,1Fh
+mov ecx,1    / add eax,ecx         becomes   add eax,1
+mov ecx,0FFh / and rax,rcx         becomes   and rax,0FFh
+```
+
+`CRATONVM_JIT_IR_ALU_IMM` folds it. Nine arms, three encoders: the accumulator
+short form for ADD/SUB/AND/OR/XOR (one column of the opcode map, so one helper),
+`IMUL r, r/m, imm32`, and `C1 /digit ib` for the shifts.
+
+**Unlike everything else in this arc it is not shaped like a loop.** The
+residency work, the carry and the sink each need a particular structure to fire
+— a loop-carried value, an adjacent single-use consumer, work that outlives its
+loop. This is every `x + 1`, `x & 0xFF` and `x * 31` in every compiled method.
+
+Two details are load-bearing. The shift count is masked **here**, to 5 bits for
+`ishl`/`ishr`/`iushr` and 6 for the `l` forms: x86 masks a shift count the same
+way, which is exactly what makes the existing `CL` form correct without a mask,
+and an immediate form that inherited that assumption silently would be a
+coincidence rather than a reason. And a `long` constant outside `i32` falls back
+to the register form, because every immediate form here SIGN-EXTENDS its
+`imm32` — `0xFFFFFFFFL` is the case that separates a correct fallback from a
+truncating one. `probes/AluImmProbe.java` checks both against HotSpot, along
+with negative shift counts and the two's-complement edges; it agrees in all five
+arms, `--nojit` included.
+
+Only the SECOND operand folds, never the first, even for the commutative ops.
+`gp_load_value(RAX, node.inputs[0])` being unconditional is what
+`op_reads_rax_then_rcx` and the carry's RAX contract rest on — and it is what
+keeps this change and the RCX carry disjoint by construction, since a carry to
+RCX is planned only when `inputs[1]` is the carried node, which is never a
+constant.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| + the fold alone | 53 | 31 | 17 | 14 |
+| + everything else | 44 | 10 | 3 | 7 |
+| **+ everything** | **40** | **10** | **3** | **7** |
+
+`alu immediates folded: 5`, and `ck=5100017428506113` in every arm.
+
+**And this is where the arc ends.** User CPU, five interleaved arms, nine
+rounds, single-pass run twice as its own control:
+
+| arm | user CPU (s) |
+|---|---|
+| single-pass OSR | 0.586 |
+| single-pass OSR (control) | 0.583 |
+| optimizing door, switches off | 0.916 |
+| + the fold alone | 0.837 |
+| + everything except the fold | 0.663 |
+| **+ everything** | **0.579** |
+
+The floor is **0.39%**. The fold alone is 8.6% (8 of 9 rounds) and 12.7% on top
+of the rest (9 of 9). Within this run the tier inversion goes **1.566x to
+0.990x** — the optimizing tier now **matches** the single-pass body on this
+kernel, where it started 1.7x behind.
+
+Parity, not a win: 0.990 is inside the spread between the two single-pass arms,
+so the honest statement is that the gap this whole section set out to explain is
+gone rather than reversed. Compare within a run and not across runs — the door
+arm alone measured 0.812 s earlier the same day and 0.916 s here, which is more
+drift than several of the effects being measured.
+
+**What it took, in order of size:** taking work out of the loop that was never
+loop work (the sink, 11 instructions), not spilling values whose live range is
+one instruction (the carry), folding constant operands (this, 5), and only then
+the register residency this section spent three days on. The frame traffic fell
+from 31 operations to 10, and the instruction count from 58 to 40 — and the
+first of those was worth less than the second, which is the opposite of the
+premise the work started from.
+
+**Everything above is still default OFF.** Eleven switches, every one measured
+positive on this kernel, none of them defaulted on — because the engagement
+censuses say what a single kernel cannot: the sink fires on 1 optimizing compile
+in 112 across the regression suite. Defaulting these on wants a measurement on a
+real workload, and that is the next thing this file should record.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
