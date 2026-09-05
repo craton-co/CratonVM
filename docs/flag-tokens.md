@@ -582,7 +582,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-351 tokens.
+352 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -865,6 +865,7 @@ export inherited from a parent shell.
 | `sc-bb-slots` | `CRATONVM_SC_BB_SLOTS` |
 | `sel-ready-cache` | `CRATONVM_SEL_READY_CACHE` |
 | `sel-fast-keys` | `CRATONVM_SEL_FAST_KEYS` |
+| `sc-preresolved` | `CRATONVM_SC_PRERESOLVED` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |

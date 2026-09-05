@@ -2452,7 +2452,9 @@ fn sc_connect_bound(
     let local = stream
         .local_addr()
         .map_err(|e| map_err("bound local address", e))?;
-    let remote = resolve_and_vet(&target)?
+    // No `InetSocketAddress` in scope here (this path re-dials an already-bound
+    // socket from a host string), so there is nothing pre-resolved to reuse.
+    let remote = resolve_and_vet(&target, None)?
         .into_iter()
         .find(|addr| addr.is_ipv4() == local.is_ipv4())
         .ok_or_else(|| {
@@ -2546,6 +2548,68 @@ fn sc_connect_bound(
 // SocketChannel.connect / finishConnect
 // ---------------------------------------------------------------------------
 
+/// Is the caller's already-resolved destination reused instead of re-resolved?
+/// `CRATONVM_SC_PRERESOLVED=0` restores the re-resolution.
+fn preresolved_engaged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_SC_PRERESOLVED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+/// The literal IP an `InetSocketAddress` ALREADY holds, if it holds one.
+///
+/// `decode_socket_address` answers with `getHostString()`, which is the
+/// HOSTNAME whenever one is attached — so the resolved `InetAddress` the caller
+/// built the address from is discarded and the connect path re-resolves the
+/// name on every dial. This reads that address back instead.
+///
+/// `None` means "no reusable address": an unresolved `InetSocketAddress` (the
+/// `createUnresolved` shape, which genuinely must be resolved at dial time), a
+/// synthetic layout with no such accessors, or the switch being off. Every
+/// `None` falls back to exactly the previous behaviour, so this can only remove
+/// a lookup, never add one.
+///
+/// Uses the public accessors rather than reading fields, matching
+/// `decode_socket_address`'s own preferred path: whatever state the JDK
+/// constructor populated is what the JDK's own getters report.
+fn decode_resolved_literal(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option<String> {
+    if !preresolved_engaged() {
+        return None;
+    }
+    // An unresolved address has no InetAddress to reuse, and resolving it at
+    // dial time is its defined behaviour — not something to optimise away.
+    if let Ok(Some(Value::Int(1))) = ctx.invoke_virtual(sa, "isUnresolved", "()Z", &[]) {
+        return None;
+    }
+    let ia = match ctx.invoke_virtual(sa, "getAddress", "()Ljava/net/InetAddress;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(ia, "getHostAddress", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(str_obj)))) => ctx.read_string(str_obj),
+        _ => None,
+    }
+}
+
+/// Build the `SocketAddr` to dial from a resolved literal, or `None`.
+///
+/// `connect_target_host` is applied to the literal for the same reason it is
+/// applied to the name: a wildcard destination is a valid bind target and not a
+/// valid connect one, and Windows refuses it outright.
+fn preresolved_socket_addr(literal: Option<String>, port: u16) -> Option<SocketAddr> {
+    let literal = connect_target_host(literal?);
+    let spelled = if literal.contains(':') {
+        format!("[{literal}]:{port}")
+    } else {
+        format!("{literal}:{port}")
+    };
+    spelled.parse::<SocketAddr>().ok()
+}
+
 /// H3b: resolve a `host:port` target to one or more `SocketAddr`s and
 /// vet every resolved address against the outbound-host policy, mirroring
 /// `outbound_policy::policy_connect`'s resolution loop. The blocking path
@@ -2560,7 +2624,10 @@ fn sc_connect_bound(
 /// fires), reusing the public policy API rather than duplicating the
 /// link-local range logic. A denial maps to the same IOException the
 /// rest of the connect path uses.
-fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
+fn resolve_and_vet(
+    target: &str,
+    preresolved: Option<SocketAddr>,
+) -> Result<Vec<SocketAddr>, MethodCallFailed> {
     // First-pass policy check on the literal target — cheap, and rejects
     // a direct link-local IP before we even resolve.
     if let Err(reason) = crate::outbound_policy::check_outbound(target) {
@@ -2572,11 +2639,17 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
     // one (WSAEADDRNOTAVAIL), and real JDK never produces such a destination
     // because `InetAddress` collapses the literal to an `Inet4Address`. See
     // `outbound_policy::normalize_connect_addr`.
-    let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {
-        Ok(it) => it
-            .map(crate::outbound_policy::normalize_connect_addr)
-            .collect(),
-        Err(e) => return Err(map_err(target, e)),
+    // Reuse the caller's already-resolved address when there is one. The NAME
+    // policy above has already run, so an embedder's name-based rule still
+    // fires; only the lookup is skipped. See `policy_connect_with`.
+    let addrs: Vec<SocketAddr> = match preresolved {
+        Some(addr) => vec![crate::outbound_policy::normalize_connect_addr(addr)],
+        None => match target.to_socket_addrs() {
+            Ok(it) => it
+                .map(crate::outbound_policy::normalize_connect_addr)
+                .collect(),
+            Err(e) => return Err(map_err(target, e)),
+        },
     };
     if addrs.is_empty() {
         return Err(ioex(format!("no addresses resolved for {target}")));
@@ -2683,6 +2756,12 @@ fn sc_connect_inner(
     let (host, port) = decode_socket_address(ctx, sa)?;
     let host = connect_target_host(host);
     let target = format!("{host}:{port}");
+    // The address the caller ALREADY resolved, if any. `decode_socket_address`
+    // answers with the hostname, so without this every dial re-runs
+    // `getaddrinfo` on a name the JDK had already turned into an address —
+    // a lookup HotSpot never performs, and on Windows one that wedges the
+    // resolver after a few dozen rapid calls.
+    let preresolved = preresolved_socket_addr(decode_resolved_literal(ctx, sa), port);
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
 
     if let Some(id) = read_reg_id(ctx, this) {
@@ -2749,9 +2828,14 @@ fn sc_connect_inner(
         //                                      `create_string`, which
         //                                      ALLOCATES and can therefore
         //                                      reach a collection
-        connect_dbg(format!("dial-enter target={target}"));
+        connect_dbg(format!(
+            "dial-enter target={target} preresolved={}",
+            preresolved
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none".into())
+        ));
         ctx.begin_blocking_region();
-        let connect_result = crate::outbound_policy::policy_connect(&target);
+        let connect_result = crate::outbound_policy::policy_connect_with(&target, preresolved);
         ctx.end_blocking_region();
         connect_dbg(format!(
             "dial-return target={target} ok={}",
@@ -2800,7 +2884,13 @@ fn sc_connect_inner(
     // through (DNS-rebind SSRF). So we resolve here, vet every resolved
     // IP against the outbound policy, and dial the *vetted* SocketAddr(s)
     // directly — never re-resolving the original hostname downstream.
-    let mut vetted = resolve_and_vet(&target)?;
+    connect_dbg(format!(
+        "dial-enter(nonblocking) target={target} preresolved={}",
+        preresolved
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "none".into())
+    ));
+    let mut vetted = resolve_and_vet(&target, preresolved)?;
     // Prefer IPv4 addresses first — this matches HotSpot's default resolution
     // order (`java.net.preferIPv4Stack` semantics) and, critically, the
     // address CratonVM's `InetAddress.getLoopbackAddress()` hands out for the
@@ -7245,15 +7335,15 @@ mod tests {
         // Direct link-local IP must be denied before any dial.
         crate::outbound_policy::reset_policy();
         assert!(
-            resolve_and_vet("169.254.169.254:80").is_err(),
+            resolve_and_vet("169.254.169.254:80", None).is_err(),
             "expected AWS IMDS literal to be denied"
         );
         assert!(
-            resolve_and_vet("169.254.170.2:80").is_err(),
+            resolve_and_vet("169.254.170.2:80", None).is_err(),
             "expected 169.254.0.0/16 neighbour to be denied"
         );
         assert!(
-            resolve_and_vet("[fd00:ec2::254]:80").is_err(),
+            resolve_and_vet("[fd00:ec2::254]:80", None).is_err(),
             "expected IPv6 AWS metadata to be denied"
         );
     }
@@ -7263,7 +7353,7 @@ mod tests {
         // Loopback resolves and passes the policy; the returned addrs are
         // concrete literals (no hostname left to re-resolve downstream).
         crate::outbound_policy::reset_policy();
-        let addrs = resolve_and_vet("127.0.0.1:9").expect("loopback should be allowed");
+        let addrs = resolve_and_vet("127.0.0.1:9", None).expect("loopback should be allowed");
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|a| a.ip().is_loopback()));
     }

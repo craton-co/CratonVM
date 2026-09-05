@@ -1,6 +1,6 @@
 # Every blocking `connect` re-resolves the destination hostname, and Windows stalls after a few dozen
 
-**Status: ROOT-CAUSED 2026-09-05, fix not yet written.** Found while building F3's
+**Status: FIXED 2026-09-05.** Found while building F3's
 acceptance curve for `performance/socket-transfer-per-call-costs-20260904.md`.
 **Not caused by that work** — the exoneration arm is below and is one command.
 
@@ -97,7 +97,44 @@ this tree is trying to close a gap on, and it would not show up as a stall
 anywhere the resolver happens to be fast — it would just be slower than HotSpot
 for no visible reason.
 
-## Fix direction, and the trap in it
+## The fix, and its verification
+
+`decode_resolved_literal` reads back the address the `InetSocketAddress`
+already holds and `policy_connect_with` / `resolve_and_vet` dial it instead of
+re-resolving the name. **Both** connect paths are fixed — the non-blocking one
+had the same defect through `resolve_and_vet`, and that is the one netty uses,
+so fixing only the blocking path would have landed at the wrong level.
+
+The name is still what `check_outbound` sees; only the resolution is skipped.
+The trace shows both halves at once:
+
+```
+[CONNECT-DBG] dial-enter target=localhost:64382 preresolved=127.0.0.1:64382
+```
+
+Verified with the falsifier running in BOTH directions, same binary, same
+server process:
+
+| arm | result |
+|---|---|
+| fix on, hostname (`localhost`) | **`CLIENT_OK connected=150`** |
+| fix on, literal (`127.0.0.1`) — the control that already passed | `CLIENT_OK connected=150` |
+| `CRATONVM_SC_PRERESOLVED=0`, hostname | **still stalls at connect #43** |
+
+The third row is the one that matters: with the fix disabled the stall returns,
+so the repair is attributable to this change and not to something else that
+moved.
+
+Regression suite, twelve net vectors, all cross-VM diffed against HotSpot:
+`RJdkNet RJdkNio RSocketFastIo RChannelInterrupt RSocketChannelInterrupt
+RJdkAsyncChannel RNioNoFollow RDirectBufferElem RFileChannelFastIo
+RNetIfaceScope RSslLiveSession RSslNullSession` — **12 passed, 0 failed.**
+`RJdkNet` was run specifically because this changes which address every
+outbound connection dials: the old path tried each resolved address in turn,
+and the pre-resolved path dials the one the caller chose, which is what the JDK
+specifies for a resolved `InetSocketAddress` but is still a behaviour change.
+
+## Fix direction as originally recorded, and the trap in it
 
 Dial the address the caller already resolved instead of re-resolving its name.
 `InetSocketAddress.getAddress()` returns the `InetAddress`;
