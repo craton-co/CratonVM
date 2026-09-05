@@ -73,7 +73,7 @@
 //! Once T19.7.c lands, swap `io_thread_stub_body` for a direct call to
 //! `cratonvm_native_builtins::xnio_io_thread::run_io_loop(handle)`.
 //!
-//! See `history/roadmap-100.md` T19.7.b.
+//! See `roadmap-100.md` T19.7.b.
 
 #![allow(clippy::needless_pass_by_value)]
 

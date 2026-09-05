@@ -346,8 +346,8 @@ Both are internal records, cited by their path relative to the internal tree's
 own root (they are not published, so a `docs/`-rooted path would be a link no
 public reader can follow):
 
-* `fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md:119`
-* `fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:102`
+* `bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md:119`
+* `treemap-treeset-range-snapshot-stale-objectref-FIXED.md:102`
 
 The fact this section rests on does not depend on reaching either page: **both
 vectors pass on a broken VM without their extra argument**, for the two reasons
@@ -597,8 +597,8 @@ with
 # and must stay an unmodified reference run, so it never receives them.
 #
 # Both of these gates are INERT without their argument. See the internal records
-# fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md
-# and fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:
+# bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md
+# and treemap-treeset-range-snapshot-stale-objectref-FIXED.md:
 # on the default heap no collection happens during the walk, and with a live JIT
 # frame on the stack the young generation falls back to a non-moving sweep under
 # which a stale reference still resolves. Either way the vector passes on a

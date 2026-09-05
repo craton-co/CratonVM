@@ -1,28 +1,5 @@
 # The box/unbox intrinsic SIGSEGVs under a relocating collector
 
-**Status:** RESOLVED 2026-09-05. Retired from `known-issues/jit/`. **The title
-is wrong twice over** and is kept because eight source comments and three
-sibling pages cite this page by that name: it was neither the intrinsic nor
-relocation-under-live-JIT. The root cause has its own record,
-`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904`; this
-page is the HUNT, kept for what it cost and what it turned up on the way.
-
-**What this page produced that outlived it, and where each stands:**
-
-| finding | disposition |
-|---|---|
-| the crash itself | FIXED — `Arena::commit_for_relocation` |
-| the box/unbox intrinsic mitigation | REVERSED — default ON again 2026-09-04 |
-| `op:1033`, the blocker that hid the window | FIXED — `testrandommapops-deterministic-1810-null-FIXED-20260904` |
-| the blocked-wake JIT remap | LANDED — `apply_pending_blocked_fixups` remaps frames, registers and shadow |
-| `local_mask_unreached` fail-closed | LANDED default-ON 2026-09-05, re-priced on the post-fix tree -- last section |
-| duplicate reference homes (`duplicate_of_mapped=47946355`) | REAL, unfixed, and NOT this crash — see below |
-| `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` | kept as a priced diagnostic, never shippable |
-
-Everything below the next heading is the record as it was written, with the
-superseded reasoning marked. Read the root-cause record first if you want the
-answer rather than the hunt.
-
 ## ROOT CAUSE FOUND 2026-09-04 -- it is not a stale root at all
 
 The compaction SLIDE writes into a granule the arena DECOMMITTED.
@@ -98,17 +75,31 @@ first crash dump.
 **When repeated targeted fixes all fail to move a defect, that is evidence the
 CATEGORY is wrong, not that the next candidate inside it is closer.**
 
-## Status as it stood on 2026-09-02 (SUPERSEDED)
+## Status
 
-> **OPEN (root cause), MITIGATED (default flipped) 2026-09-02.** [...]
-> `CRATONVM_JIT_BOX_UNBOX_INTRINSIC` is now opt-in. The crash it causes is gone
-> from the shipped default; the reason the inline sequence is unsafe under a
-> moving collector is NOT yet established, and that is what stays open.
+**RESOLVED 2026-09-04** — root cause found and fixed (the section above:
+`relocate_stw` slid a survivor into a granule the arena had decommitted;
+`Arena::ensure_committed_span` commits the destination first). The intrinsic is
+back at its shipped default of **ON** since `069e67b43`, and the crash does not
+reproduce.
 
-Both halves are now wrong. The intrinsic never caused it and is default-ON
-again; the inline sequence is not unsafe under a moving collector, and the
-section below headed "why it cannot be right as stated" had already shown why
-the mechanism could not be what the title says.
+**Everything below this line is the investigation, not the answer.** It is kept
+because most of it is refuted hypotheses with the measurements that refuted
+them, and because two of those refutations cost days. Read it as history: the
+sections dated 2026-09-02 and 2026-09-03 reason from a stale-root framing that
+the root-cause section retires outright, and they say so in place.
+
+Three of the things this page left for a next reader are now closed:
+
+| item | state |
+|---|---|
+| the root cause | fixed 2026-09-04, `ensure_committed_span` |
+| the intrinsic's default | back ON, `069e67b43` |
+| the blocked-wake JIT remap | landed (`vm_exec::apply_pending_blocked_fixups` now remaps JIT frames and the register image) |
+| the `op:1033` blocker on the repro | fixed — it was the guarded-inline native screen asking the declaring class, `internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md` |
+
+The one item still open is `local_mask_unreached` — see **What is still open**
+at the end.
 
 ## What happens
 
@@ -492,34 +483,34 @@ Two ruled-out-by-checking notes for whoever takes it:
   which is what confirms whatever suppresses the crash in the guard arm is the
   PEER coverage and not per-safepoint map completeness.
 
-## The mitigation, and its REVERSAL
+## The mitigation — SUPERSEDED, the default is back ON
 
-`box_unbox_intrinsic_disabled()` defaulted to disabled from 2026-09-02. **That
-was reversed on 2026-09-04**: `jit/src/lib.rs` says "DEFAULT ON AGAIN", because
-the crash the mitigation existed for was not this intrinsic's. It was
-`ZgcRealHeap`'s relocation slides writing into decommitted arena granules.
-`CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off.
+For two days `box_unbox_intrinsic_disabled()` defaulted to disabled and
+`CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` turned the family back on. **That is no
+longer the shipped state.** `069e67b43` restored the default to ON once the
+crash was root-caused to the collector rather than to this intrinsic: the
+intrinsic's only part was raising allocation pressure enough to make the slide
+run, which is why turning it off hid the crash and why turning it off was never
+a fix.
 
-The line this section ended on -- "the measured speedup is recoverable the
-moment the sequence is made relocation-safe" -- was right about the outcome and
-wrong about the condition. The sequence needed no change at all. What the
-mitigation actually bought was two days of a perf feature switched off for a
-defect it did not have, which is the ordinary price of a correct
-correctness-first call made on a wrong diagnosis, and worth paying again.
+`CRATONVM_JIT_NO_BOX_UNBOX_INTRINSIC=1` still forces it off and still means the
+same thing, so any script that already sets it is unaffected.
 
-## The repro was BLOCKED by an earlier failure (2026-09-02) -- CLEARED
+The speedup this section promised was "recoverable the moment the sequence is
+made relocation-safe". The sequence never was the problem; it was recovered by
+fixing the collector.
 
-`seed:0 op:1033 java.lang.AssertionError: (1810, null)` was fixed on
-2026-09-04; see `testrandommapops-deterministic-1810-null-FIXED-20260904`. With
-it out of the way the SIGSEGV window opens immediately -- the root-cause record
-measures **3/3 in 7 s** where this page measured 25-183 s. The instruction
-below to "clear that first" was followed, and it was the right order: the
-blocker was a wrong ANSWER, and a run that ends in a wrong answer cannot be
-scored for a crash.
+## The repro was BLOCKED by an earlier failure (2026-09-02) — CLEARED
 
-The rest of this section is the record as written.
+**That blocker is fixed.** `seed:0 op:1033 AssertionError: (1810, null)` was the
+guarded-inline native screen asking the callee's DECLARING class when the native
+is registered on the concrete receiver class, so a compiled
+`for (e : treeMap.tailMap(k).entrySet())` iterated zero entries:
+`internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`.
+The section below is kept for its method note — which is still the right advice
+for scoring a bisect — and its "whoever takes this page next has to clear that
+first" instruction no longer applies.
 
-### As written, 2026-09-02
 
 Run on `dev@08a1711e5`, `livedbg`, quiet host, against H2 built at
 `apps/h2database/h2`. **It cannot reach the window this page measures in.**
@@ -586,99 +577,57 @@ lever this repo has been bitten by before.
 `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` still works but now warns; the supported
 spelling is the token above.
 
-**As of 2026-09-02 this did not reach the SIGSEGV** -- see "The repro was
-BLOCKED by an earlier failure". That blocker was fixed on 2026-09-04 and the
-crash it hid was fixed the same day, so this command now simply passes.
+**As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
+currently BLOCKED by an earlier failure".
 
-## 2026-09-05: the last open item, re-priced and landed
+## What is still open
 
-This page recommended landing `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED`
-default-ON, on "4 runs, ZERO OOM on every arm [...] it costs nothing
-measurable". It stayed opt-in anyway, and `x64::licm`'s doc said why: *"its
-refusal cost is still being priced"*. Two claims about the same flag, in the
-page and in the code, disagreeing about whether the pricing was done.
+**One item: `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` should default ON,
+and the evidence for flipping it is stale.**
 
-It is done now, and it had to be redone rather than believed: the original
-price was taken while the SIGSEGV was still live and attributed to this hole,
-on a tree where relocation behaved differently — `Arena::commit_for_relocation`
-had not landed, so a slide that could not find a committed destination left the
-object where it was. A price measured against different relocation behaviour is
-not this tree's price.
+This page found and priced a real correctness hole that is not this crash: a
+safepoint whose local-oop dataflow was never REACHED ships a map claiming
+complete frame-slot coverage while naming none of its live reference locals
+(`map_incomplete_cause::LOCAL_MASK_UNREACHED`, 125 on `TestCachedQueryResults`
+and dominant, while the SHADOW half counted the same population and refused).
+Its sibling — `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED`, the same hole for a method
+the dataflow never ran on at all — already **defaults ON** with a `=0` opt-out.
+This one is still opt-in, and `licm.rs` says why: *"this population is larger
+and its refusal cost is still being priced"*.
 
-**Is the arm even armed?** `CRATONVM_DBG_OOPCOV=1`, one run: the counter reads
-**117 and climbing to 147**. The refusal fires on this workload, so the arm is
-not vacuous — which is the first thing to check about a flag whose price you
-are about to call zero.
+The page's own pricing said ZERO OOM on 4 runs and 88/88, and recommended
+default-ON. **That pricing is no longer usable, and not because it was wrong.**
+It was taken on 2026-09-03, before the root-cause fix at the top of this page
+moved the OOM baseline on this very workload from 1497 to 0. A refusal's cost
+has to be measured against the collector that ships, and the collector changed
+underneath it. The whole reason to price this at all is that the blanket guard
+— the other refusal measured on this family — bought its safety at ~9700
+fragmentation OOMs and total loss of completion.
 
-**The result.** `org.h2.test.jdbc.TestCachedQueryResults`, `--Xmx 1g`, release:
+**Attempted 2026-09-05 and not obtained.** An ABBA-interleaved re-pricing on
+`org.h2.test.jdbc.TestCachedQueryResults --Xmx 256m` was started on host `vm1`
+at load average 29-33. The first arm **timed out at the 1300 s cap** on a
+workload this page records completing in 462-728 s quiet, so every arm would
+have timed out and a timed-out arm yields no OOM or completion figure to
+compare. The run was stopped rather than reported. This page's own repro note
+already says it: *"A CONTENDED host hides it."*
 
-| | fragmentation OOM | SIGSEGV | throughput |
-|---|---|---|---|
-| default (OFF) | 0 in 8 runs | 0 | — |
-| fail-closed (ON) | **0 in 8 runs** | 0 | **no difference** |
+To finish it, on a quiet host (load < 5):
 
-Landed default-ON. `=0` restores the old claim.
+```
+CVM=<release cratonvm> JDK=$JDK25
+H=apps/h2database/h2
+CP="$H/target/test-classes:$H/target/classes:$(cat $H/craton-testcp.txt)"
+# ABBA, 4 runs per arm, from a scratch cwd; count OutOfMemoryError and `actual`
+for arm in A B B A; do
+  case $arm in A) F= ;; B) F=CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1 ;; esac
+  env $F CRATONVM_GC_STATS=1 timeout 1300 "$CVM" --java-home "$JDK" --Xmx 256m \
+      -cp "$CP" org.h2.test.jdbc.TestCachedQueryResults
+done
+```
 
-### How the throughput number was got, because the first answer was wrong
-
-A sequential ABBA of 4+4 read the ON arm at **1.9x slower** (off 743/593,
-on 1282/1250). That was host load, not the flag. The next ON run came in at
-390 s — faster than every OFF run in the batch — and the within-arm spread
-ended at 3.3x, larger than any effect being looked for.
-
-ABBA cancels a monotone DRIFT. The disturbance on this host is other agents'
-work, which is spiky, and a spike parked in the block's two middle positions is
-indistinguishable from the treatment. A second round recorded the 1-minute load
-per run and watched it DOUBLE inside a single run.
-
-What works is running the two arms **concurrently** and comparing within the
-pair. They contend with each other, so neither time is a throughput number —
-but the ratio is a comparison, and it sees the same host in the same seconds:
-
-| pair | load at start | off | on | ratio |
-|---|---:|---:|---:|---:|
-| 1 | 17.9 | 1512 s | 1468 s | 0.97 |
-| 2 (order swapped) | 66.0 | 1466 s | 1456 s | 0.99 |
-| 3 | 24.0 | 714 s | 717 s | 1.00 |
-| 4 (order swapped) | 15.1 | 632 s | 633 s | 1.00 |
-
-Launch order is swapped on the even pairs so a start-order effect cannot
-masquerade as the treatment. Pair 4 ran at the lowest load of the set and is
-the only one where the workload passed outright (`rc=0`, both arms).
-
-**Worth keeping past this flag:** on a host shared with ~20 other agents, a
-sequential A/B is measuring the neighbours. Run the arms at the same time and
-report the ratio, or do not report a throughput number at all.
-
-### It is not inert, and the zeros alone could not have told you that
-
-Two zeros and four ratios of ~1.00 are equally consistent with "the refusal is
-free" and with "the flag reaches no read site". The GC counters do not separate
-them either -- `relocation_skipped_jit` 28 vs 30, `relocation_on_proven_jit`
-191 vs 191, `compaction_cycles` 190 vs 190, i.e. identical.
-
-`CRATONVM_DBG_OOPCOV=1` does, because it prints the CLAIM per method
-(`frameslot=<bool>` is `fully_oop_covered`). Same binary, 90 s each:
-
-| | `frameslot=false` | `frameslot=true` |
-|---|---:|---:|
-| default (ON) | **101** | 12 |
-| `=0` | 50 | 65 |
-
-Fifty-one methods stop advertising complete frame-slot coverage they did not
-have. The collector's decisions do not move because the per-cycle proof
-consults a method only while one of its frames is LIVE, and these rarely are on
-this workload. So the flip removes 51 false claims and changes no measured
-outcome — which is the best shape a soundness fix can have, and is also exactly
-the shape that would have hidden an inert flag if the check had stopped at the
-zeros.
-
-### What this does NOT close
-
-The hole is real and now fails closed, but the REPAIR is still a refusal: a
-safepoint whose local-oop dataflow was never reached diverts its cycle to the
-non-moving sweep rather than naming its live reference locals correctly. The
-fix at the right level is to make the dataflow reach those pcs. Nothing here
-measured what that would be worth, because with the refusal costing nothing
-there is no pressure to find out — which is exactly how a thin slice stays thin
-until a workload arrives where it is not.
+Flip it when the fail-closed arm shows no OOM increase and still completes —
+inverting `local_mask_unreached_fail_closed_enabled` in `jit/src/x64/licm.rs`
+to the `=0`-opt-out shape its sibling already uses, and changing the
+`flag_groups.rs` row from `on_key` to `off_key`. **Do not flip it on the
+2026-09-03 numbers.**

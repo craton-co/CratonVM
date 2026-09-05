@@ -852,7 +852,7 @@ The discriminator then split THAT into two defects: **10 of 13 such frames have
 pointer sitting in the reserved slot.** It is not a shifted `rbp`.
 
 Split out 2026-08-29 from
-`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which is
+`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`, which is
 retired: that page's own class passes 2/2 and the four fragmentation defects it
 ended on are fixed. **This class is not fixed by them.**
 
@@ -1246,7 +1246,7 @@ It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting.
 > relocation slides were copying into arena granules
 > `Arena::decommit_free_blocks` had already returned to the OS, and both slides
 > now commit their destination first. See
-> `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+> `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
 >
 > This section's own evidence points the same way and is worth re-reading with
 > that in hand: the fault signature recorded below is `rdi` page-aligned at the
@@ -1357,7 +1357,7 @@ the identification, the three failed repairs, and what remains.
 | discharge only (control) | 0 / 3 |
 
 Relocation is REQUIRED -- the same 0/3 that
-`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
+`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
 switch. And the fault signature matches that page's: `rdi` page-aligned at the
 fault (`0x232ECD30000`, `0x28DEA7B0000`, `0x1CA01BB0000`), which that page reads
 as "a read through a reference into a page the collector has already vacated".
@@ -1398,7 +1398,7 @@ Two traps this cost, worth not repeating:
 The conclusion below is withdrawn. It is not known to be wrong; it is not
 supported by the evidence that was offered for it.
 
-`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
 landed on dev the same day: the box/unbox intrinsic SIGSEGVs under a relocating
 collector, **11 of 11 runs, 25-183 s**, and it takes BOTH relocation and that
 intrinsic -- neither alone. Dev flipped the intrinsic to opt-in as the
@@ -1521,7 +1521,7 @@ style of depth accounting that produced a false positive earlier on this page.
 
 ## Related
 
-- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of: the whole fragmentation diagnosis, the four
   repairs, and the counters to read.
 - `docs/known-issues/gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md`

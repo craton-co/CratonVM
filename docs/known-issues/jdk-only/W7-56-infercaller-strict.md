@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | **CLOSED BY MEASUREMENT 2026-08-12 (A34). Built, run, green in all three arms.** The "still unbuilt" status this row used to carry is retired: `scratchpad/bin/cratonvm-merged-dev.exe` (15:27) carries all three parts, and every row of §"What to rebuild, and what the probes must become" now reads its **must become** value. See §8. |
 | **Vector** | `regression-suite/src/RJdkLogging.java`, `formattedOutputIsRealBytes` — the last red in the `--jdk-only` strict corpus (69 passed / 1 failed). |
-| **Predecessor** | retired/jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md (the handoff; both of its candidate causes are refuted below). It is no longer in this directory — it was retired to the internal tree on 2026-08-12 and carries a SUPERSEDED marker pointing here. |
+| **Predecessor** | jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md (the handoff; both of its candidate causes are refuted below). It is no longer in this directory — it was retired to the internal tree on 2026-08-12 and carries a SUPERSEDED marker pointing here. |
 | **Oracle** | HotSpot 25.0.3.9 renders `RJdkLogging formattedOutputIsRealBytes`. |
 
 ## The symptom

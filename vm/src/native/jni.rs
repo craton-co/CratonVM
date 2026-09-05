@@ -543,7 +543,7 @@ thread_local! {
     /// OUTERMOST Java call: `0` means the thread is idle (between calls, parked
     /// in the host event loop) and is modelled as GC-blocked.
     static FOREIGN_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// CR-VXC-3 (`arch-2026-07-26/vm-exec-closeout.md` §5.3): the
+    /// CR-VXC-3 (`vm-exec-closeout.md` §5.3): the
     /// crash handler's publication guard for a foreign-attached thread.
     ///
     /// `crash_handler::java_stack_lines` renders whatever the *faulting* OS
@@ -5668,7 +5668,7 @@ struct JNINativeMethod {
 ///
 /// This was the process global `static JNI_NATIVE_METHODS` here until
 /// 2026-08-06 — `JDK-ONLY-WAVE2` §6 (retired record:
-/// feature-designs/jdk-only-wave2/additional-wave2-markers-not-in-the-original-inventory.md).
+/// additional-wave2-markers-not-in-the-original-inventory.md).
 /// Contract §2 forbids process globals for this feature's state, and the
 /// concrete hazard was that two VMs in one process saw each other's
 /// `RegisterNatives`: a library loaded by VM A bound its pointers for VM B too.
@@ -9027,7 +9027,7 @@ mod tests {
     /// context.
     ///
     /// This is the unit-level statement of
-    /// `fixed-suite-bugs/netty/nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`:
+    /// `nested-jni-call-cleared-the-enclosing-natives-context-FIXED-20260828.md`:
     /// `set_jni_context` + an unconditional `clear_jni_context` on exit is
     /// wrong for a call that nests, and the shape nests whenever a native calls
     /// back into Java. The failure is silent — `with_jni_context` answers

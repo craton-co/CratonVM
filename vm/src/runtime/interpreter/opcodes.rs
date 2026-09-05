@@ -2822,7 +2822,7 @@ pub(super) fn op_checkcast(
                 // reclaimed object usually surfaces as a failed CAST
                 // first, and that path reported nothing — so setting
                 // the flag and reproducing still produced silence. See
-                // audits/old-sweep-liveness.md section 7.
+                // old-sweep-liveness.md section 7.
                 // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
                 // below is too narrow. A block freed while still
                 // referenced only reads back as `java.lang.Object`
@@ -3647,8 +3647,7 @@ pub(super) fn op_putfield(
     // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
     // real putfield to any Page/RootReference field, unconditional
     // (not tied to a construction-site guess or a GC-move-fragile
-    // address watch list). See fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-suite-residual-fail-triage-FIXED.md.
+    // address watch list). See bug-h2-suite-residual-fail-triage-FIXED.md.
     if crate::runtime::env_cache::dbg_field_watch() {
         diag_putfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value, old_value)?;
     }
@@ -4182,11 +4181,34 @@ pub(super) fn op_getstatic(
     // on the three standard streams and return our pre-built
     // synthetic PrintStream objects. `System.in` uses the same
     // early pinning strategy via [`ensure_system_stdin_object`].
-    let field_name_for_intercept = {
+    //
+    // The screen is a one-integer compare, NOT a class-manager lookup.
+    //
+    // This used to take a `class_manager` **read lock**, call `get_class`, and
+    // compare the class's name against the literal `"java/lang/System"` — on
+    // every `getstatic` in the program — to decide whether this was one of
+    // three bootstrap fields. Measured 2026-09-05, a `getstatic` + `putstatic`
+    // pair cost 86.4 ns against HotSpot's 3.45 (25x).
+    //
+    // `class_is_java_lang_system` is the same trade the class-definition path
+    // already makes for `is_annotation_proxy_class` and `class_is_java_util`:
+    // one name comparison when a class is DEFINED (a few thousand times per
+    // process) in exchange for a relaxed load and a compare here. The lock and
+    // the `to_string` now happen only for a field of `java/lang/System`
+    // itself, which is where they were always going.
+    let field_name_for_intercept = if crate::runtime::env_cache::no_system_class_latch() {
+        // The pre-2026-09-05 path, verbatim, so the two arms are comparable
+        // inside one binary. A cross-binary comparison is not an A/B.
         let cm = shared.classes.class_manager.read();
         cm.get_class(field.declaring_class_id)
             .filter(|c| &*c.name == "java/lang/System")
             .and_then(|c| c.fields.get(field.field_index).map(|f| f.name.to_string()))
+    } else if crate::classloading::class_is_java_lang_system(field.declaring_class_id) {
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(field.declaring_class_id)
+            .and_then(|c| c.fields.get(field.field_index).map(|f| f.name.to_string()))
+    } else {
+        None
     };
     // T10.9.D K3 — Resolve the field's declared descriptor byte so
     // category-2 primitives (J/D) get pushed with the correct

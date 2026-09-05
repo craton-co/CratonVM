@@ -1,5 +1,5 @@
 // Companion measurement for the encoding-fidelity residual of
-// `bug-printstream-charset-answers-the-abstract-base-20260825.md` §5.
+// `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md` §5.
 //
 // The system properties are only half the claim; what matters is the BYTES
 // `System.out.println` actually puts on fd 1. Under a C/POSIX locale HotSpot

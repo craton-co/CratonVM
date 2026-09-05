@@ -4,7 +4,7 @@
 //! Native shims for `craton.gpu.internal.Native` (Phase 3 — Item P3-4).
 //!
 //! These are the Rust-side handlers behind every `Native.*` method the
-//! Phase-3 Java surface declares (see `gpu/phase3-spec.md` §2.2).
+//! Phase-3 Java surface declares (see `phase3-spec.md` §2.2).
 //!
 //! The whole module is gated behind the `gpu-offload` Cargo feature. On
 //! a default build it compiles down to an empty `register()` that does
@@ -53,7 +53,7 @@
 //! that finalizes a submission inline once the device event is ready,
 //! instead of requiring a blocking `futureSynchronize`/`get()` call
 //! first (see `docs/gpu/async-api.md`'s "Completion model" note and
-//! `fixed-suite-bugs/gpu-offload-followups-20260711.md` items #1/#3).
+//! `gpu-offload-followups-20260711.md` items #1/#3).
 //!
 //! This file's contribution:
 //!   * `FutureState::DoneScalar` — a local-registry counterpart to
@@ -119,7 +119,7 @@
 //! int)` (a device-side allocation with no host source array) but no
 //! matching native shim existed — `register()` above only ever declared
 //! `arrayWrapInt/Long/Float/Double` (upload from an existing Java
-//! array). Neither `gpu/phase3-spec.md` §2.2 nor any
+//! array). Neither `phase3-spec.md` §2.2 nor any
 //! later phase spec defines an `allocate*` native name or descriptor
 //! (`arrayWrap*` is the only `GpuArray`-backing surface either ever
 //! lists), so the names below (`arrayAllocateInt/Long/Float/Double`,
@@ -1639,7 +1639,7 @@ fn record_failed_future_with_message(message: &str) -> u64 {
 /// round-trips through `closeStream`, matching every other
 /// stub-executor "inert but doesn't throw" contract in this file.
 ///
-/// Reachability note: per `gpu/phase3-spec.md` §2.2,
+/// Reachability note: per `phase3-spec.md` §2.2,
 /// `GpuStream`'s only members are `handle()` and `close()` — there is
 /// no `submit`/`synchronize` in the implemented spec or anywhere in
 /// the registered `Native.*` surface, so nothing today lets Java code

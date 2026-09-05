@@ -1433,7 +1433,7 @@ pub(crate) fn spring_class_utils_for_name_impl(
     // "is X absent from a restricted loader" check (e.g.
     // `LogbackRuntimeHints#registerHints` gating on whether logback is on
     // the given loader — see
-    // fixed-suite-bugs/springboot/classutils-forname-platform-loader-false-positive.md).
+    // classutils-forname-platform-loader-false-positive.md).
     if let Some(loader) = loader {
         let is_platform_or_boot = matches!(
             ctx.class_name_arc_of_id(ctx.class_id_of_object(loader))

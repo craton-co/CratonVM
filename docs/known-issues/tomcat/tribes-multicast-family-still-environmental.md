@@ -10,7 +10,7 @@
 
 4 classes fail, consistent with the long-standing "Tribes multicast
 clustering doesn't work on this network — env; HotSpot also fails"
-characterization (`fixed-suite-bugs/tomcat/05-suite-rerun-fail-triage.md`):
+characterization (`05-suite-rerun-fail-triage.md`):
 
 ```
 TestDataIntegrity        expected:<10000> but was:<0>       (5 failures)

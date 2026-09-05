@@ -383,5 +383,5 @@ CRATONVM_DBG_JIT_DISASM=CallArgCostProbe.armInt1 cratonvm --java-home <jdk> -cp 
   — the family page for the same wall.
 * [`interpreted-invoke-cost-350ns-20260825.md`](interpreted-invoke-cost-350ns-20260825.md)
   — the same question one tier down, for calls that never reach compiled code.
-* `performance/a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
+* `a-compiled-call-goes-out-to-rust-two-causes-RETIRED-20260817.md`
   (internal) — the previous per-call cost to be measured and closed.

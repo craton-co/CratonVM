@@ -145,7 +145,7 @@ The other class this page's suite-consequence section names,
 is, and its profile is allocation rate, not bignum.
 
 Found triaging the Apache Commons Math test suite
-(the suite run recorded in retired/commons-math-suite-run-RETIRED-20260818.md): `LegendreHighPrecisionTest` (2 JUnit
+(the suite run recorded in commons-math-suite-run-RETIRED-20260818.md): `LegendreHighPrecisionTest` (2 JUnit
 methods, computing 60-digit-precision Gauss-Legendre quadrature rules via
 `java.math.BigDecimal` Newton-Raphson root-finding) never finishes — still
 making genuine forward progress after 90s+, a legitimate bounded ~119-frame
@@ -457,7 +457,7 @@ breakdown is needed.
 
 ## Related
 
-* retired/commons-math-suite-run-RETIRED-20260818.md — the suite run this was found from, now closed.
+* commons-math-suite-run-RETIRED-20260818.md — the suite run this was found from, now closed.
 * `bobyqa-numeric-kernel-is-80x-slower-than-hotspot-20260817.md`, now closed
   — the other CratonVM-only "hang" found in the same run. It was first filed as
   an OSR refusal; that gate was real and is now fixed, and the wall time did not

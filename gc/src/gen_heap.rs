@@ -567,7 +567,7 @@ pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 /// while a conservative root still points into it. That is a premature
 /// reclamation, and it is silent: the object's span is zeroed, so the next read
 /// through the stale reference sees an all-zero header, i.e. `ClassId(0)` /
-/// `java.lang.Object`. See audits/old-sweep-liveness.md section 7 for the
+/// `java.lang.Object`. See old-sweep-liveness.md section 7 for the
 /// old-generation twin of this, which was the H2 `MVStore` cache defect.
 ///
 /// Non-zero here means the oracle's interval verification failed on a live
@@ -1101,7 +1101,7 @@ pub static OLD_FREE_LIST_OVERLAPS: AtomicU64 = AtomicU64::new(0);
 /// discriminant — i.e. the mark BFS was handed an address that is not an object
 /// base and decoded whatever bytes were there as an `ObjectHeader`.
 ///
-/// See `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// See `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 /// A non-zero value here means a side table is holding a dangling old-gen
 /// address, or a reference slot holds a non-base word.
 pub static OLDMARK_BAD_KIND_HITS: AtomicU64 = AtomicU64::new(0);
@@ -1274,7 +1274,7 @@ fn promo_seed_dbg() -> bool {
 }
 
 /// 2026-08-03 (`HIB-MAPRESIZE-STALE.1`, see
-/// fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md
+/// map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md
 /// Follow-up 4): whether `OldGen::compact` (the sliding mark-compact
 /// collector) is permitted to run at all. Default **disabled** —
 /// `major_gc` now runs the in-place, non-compacting arm of `old_gen_gc`
@@ -1593,7 +1593,7 @@ pub fn jit_region_bounds_addr() -> usize {
 ///
 /// [`JIT_REGION_BOUNDS`] is doing two jobs. Its *documented* job is the
 /// READ-side question "is this address mapped, so a raw load cannot fault".
-/// Its load-bearing job since `audits/g1-audit.md` §8.1 (G1-2) is the
+/// Its load-bearing job since `g1-audit.md` §8.1 (G1-2) is the
 /// STORE-side question "may an inline reference store skip the collector's
 /// write barrier" — and G1/ZGC answer that by leaving the table **empty**, so
 /// that under those collectors no inline reference-store fast path is
@@ -1663,7 +1663,7 @@ pub fn jit_read_bounds_addr() -> usize {
 /// # Why a THIRD table, and not either of the two above
 ///
 /// [`JIT_REGION_BOUNDS`]'s emptiness under G1 is load-bearing: it is what
-/// closes defect G1-2 (`audits/g1-audit.md` 8.1), by making every
+/// closes defect G1-2 (`g1-audit.md` 8.1), by making every
 /// generational-style barrier-free inline reference store unreachable there.
 /// Nothing may be written into it for G1, ever, and the sibling
 /// [`JIT_READ_BOUNDS`] exists precisely because the previous attempt to reuse
@@ -1830,7 +1830,7 @@ pub fn clear_jit_read_bounds_owned_by(owned_base: usize) {
 /// Filling [`JIT_REGION_BOUNDS`] would fix the verifier and break something
 /// else: that table's load-bearing second job is the STORE-side question "may
 /// an inline reference store skip the collector's write barrier", which G1 and
-/// ZGC answer by leaving it empty (`audits/g1-audit.md` §8.1, G1-2). One table,
+/// ZGC answer by leaving it empty (`g1-audit.md` §8.1, G1-2). One table,
 /// two questions, opposite answers — which is the same reason
 /// [`JitReadBoundsTable`] exists rather than the read side being folded in.
 /// This is the third question and it gets the third table.
@@ -1981,7 +1981,7 @@ pub fn movable_bounds_are_live() -> bool {
 /// **every address in the process**, so the verifier walks every verifiable
 /// slot, classifies none of them as movable, and returns "nothing unpublished"
 /// without having inspected anything — a vacuous pass, which is exactly the
-/// chain `bug-g1-evacuates-live-jit-reference-20260819.md` traces from an
+/// chain `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` traces from an
 /// empty table to an evacuated live reference.
 ///
 /// The difference is only in how the table came to be useless. An EMPTY table
@@ -2207,8 +2207,8 @@ pub struct GenerationalHeap {
     /// worse, a same-slot-reused unrelated object) once that memory is
     /// actually reclaimed. Ordered oldest-first; the front arena's grace
     /// period has elapsed and its memory is the next to be reused. See
-    /// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
-    /// and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md.
+    /// wildfly-parallel-boot-stale-objectref-residual.md
+    /// and wildfly-stale-objectref-debug-assertion-scoping.md.
     quarantine: Mutex<VecDeque<Arena>>,
     /// Persistent worker threads for the parallel young copy phase (see
     /// [`crate::evac_pool`]), created on first use.
@@ -3064,7 +3064,7 @@ impl GenerationalHeap {
     /// `gc_quiescence`'s `missing-exact-rbp` fallback), so shrinking the
     /// semispace just multiplies how often that expensive fallback fires,
     /// which costs more than the page-fault savings recoup. See
-    /// `performance/binarytrees-bt18-half-gap-20260730.md`.
+    /// `binarytrees-bt18-half-gap-20260730.md`.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let total = total_bytes.max(4096);
         // Young takes 1/2 of total, split across from+to semi-spaces (so
@@ -3907,7 +3907,7 @@ impl GenerationalHeap {
         // caller is holding a raw `ObjectRef` local across a GC-triggering
         // call without `pin_native_root`/`read_native_pin` — exactly the
         // "Family 1" stale-ObjectRef pattern documented in
-        // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+        // wildfly-parallel-boot-stale-objectref-residual.md.
         // Only reachable when the quarantine dance in `collect_garbage_inner`
         // is active (see the `quarantine` field), since without it the
         // evacuated memory would already have been zeroed by the time a
@@ -4070,7 +4070,7 @@ impl GenerationalHeap {
                  kind={fwd_kind}), but native/interpreter code \
                  dereferenced the OLD address. This means a raw ObjectRef local was held \
                  across a GC-triggering call without pin_native_root/read_native_pin. See \
-                 fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.\
+                 wildfly-parallel-boot-stale-objectref-residual.md.\
                  \nHolder scan:{holders}",
                 obj_ref.as_ptr(),
                 fwd_ptr,
@@ -4118,7 +4118,7 @@ impl GenerationalHeap {
     /// `VarHandle` root dedup in `vm_exec.rs`) would otherwise have to
     /// derive one from the object's current address — which silently goes
     /// stale the moment a moving GC relocates the object. See
-    /// `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
+    /// `tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
         let header = self.get_header(obj_ref);
         // The hash lives in the upper bits of a NEUTRAL mark word, installed
@@ -4180,7 +4180,7 @@ impl GenerationalHeap {
     /// given `[from_base, from_end)` window, sorted ascending, and **coalesced
     /// so no two entries overlap**. Empty on the normal collection path.
     ///
-    /// # Why the coalesce is load-bearing (TLAB audit, `audits/tlab-and-card-audit.md`)
+    /// # Why the coalesce is load-bearing (TLAB audit, `tlab-and-card-audit.md`)
     ///
     /// Both consumers merge this list with `Arena::free_blocks_sorted()` and
     /// then feed the result to [`skip_free_blocks`], whose contract is a list of
@@ -5101,7 +5101,7 @@ impl GenerationalHeap {
         debug_assert!(index < self.get_header(obj_ref).num_slots() as usize);
         // FIELD-WATCH (TestUpgrade RootReference/MVMap residual, software
         // watchpoint — see cratonvm_types::field_watch and
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md).
+        // bug-h2-suite-residual-fail-triage-FIXED.md).
         // Zero cost unless CRATONVM_DBG_FIELD_WATCH is set AND obj_ref was
         // explicitly registered via field_watch::watch() at construction.
         // Every write is reported (not deduped) — a count reaching 2 for a
@@ -5373,7 +5373,7 @@ impl GenerationalHeap {
                 // Offsets come from the named header constants, not literals:
                 // this diagnostic prints what a heap walker would have decoded,
                 // so it must follow the header layout if it ever shifts (see
-                // arch-2026-07-26/header-shrink.md).
+                // header-shrink.md).
                 let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
                     let class_id_raw = (obj_ptr as *const u32).read_unaligned();
                     let kind_byte = cratonvm_types::kind_tag_at(obj_ptr);
@@ -5869,7 +5869,7 @@ impl GenerationalHeap {
     /// reclaims dead blocks IN PLACE, during a YOUNG collection, whenever a live
     /// JIT frame blocks the moving young collector — and it does not zero what
     /// it frees. Use this predicate for liveness; see
-    /// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     pub fn is_live_old_gen_addr(&self, addr: usize) -> bool {
         self.old_gen.lock().is_allocated_addr(addr as *const u8)
     }
@@ -6419,7 +6419,7 @@ impl GenerationalHeap {
     /// **Why feedback rather than a smaller semi-space.** Capping the initial
     /// young semi was tried before and measured a NET REGRESSION for large
     /// `-Xmx` workloads (see `with_capacity`'s note and
-    /// `performance/binarytrees-bt18-half-gap-20260730.md`): those workloads
+    /// `binarytrees-bt18-half-gap-20260730.md`): those workloads
     /// fall back to the non-moving sweep, and a smaller semi just fires that
     /// expensive fallback more often. Reacting to the pause we actually
     /// measured cannot repeat that mistake — a workload whose cycles are
@@ -6923,7 +6923,7 @@ impl GenerationalHeap {
             // branch that actually decides, so `gc_metrics::
             // collector_decision_report()` can never drift from the code the
             // way `docs/GC.md` and `ARCHITECTURE.md` drifted from each other
-            // (see `audits/tlab-and-card-audit.md` §3). The order of the arms
+            // (see `tlab-and-card-audit.md` §3). The order of the arms
             // below mirrors the order of the terms in `divert_non_moving`, so
             // the reported reason is the FIRST one that forced the diversion —
             // the one an operator has to fix to get a moving cycle back.
@@ -7353,7 +7353,7 @@ impl GenerationalHeap {
         let start_skips = {
             let mut v = young_from.free_blocks_sorted();
             let tails = self.jit_tlab_skip_offsets(young_base, young_base + young_used);
-            // TLAB AUDIT TRIPWIRE (audits/tlab-and-card-audit.md §1, defect
+            // TLAB AUDIT TRIPWIRE (tlab-and-card-audit.md §1, defect
             // T-3). We are on the MOVING path: from-space is about to be
             // evacuated, swapped and reset. A published reserved tail means
             // some ALIVE thread still owns a TLAB `[cursor, end)` in the arena
@@ -7380,7 +7380,7 @@ impl GenerationalHeap {
             //    young_used)` — this exact from-space. A non-empty result IS
             //    the hazard condition, not a proxy for it.
             //  * It is expected to be unreachable. Per the transition table in
-            //    `audits/tlab-and-card-audit.md` §1.2 every alive thread
+            //    `tlab-and-card-audit.md` §1.2 every alive thread
             //    retires at its exclusion point, and the one intentional
             //    un-retired case (an OS-frozen in-JIT peer) makes the VM call
             //    `mark_moving_young_coverage_incomplete`, which sends the cycle
@@ -11536,7 +11536,7 @@ impl GenerationalHeap {
                     // one 16-byte span, `young_free_list=0` and
                     // `freed == promoted` exactly, until old gen bled out into
                     // `OutOfMemoryError` at 68 MB live in a 1 GB heap. See
-                    // fixed-suite-bugs/vm/jit-young-heap-exhaustion-after-header-16-FIXED-20260807.md
+                    // jit-young-heap-exhaustion-after-header-16-FIXED-20260807.md
                     //
                     // Resume at the next allocator-recorded object start
                     // instead: on-grid by construction (see `next_grid_anchor`
@@ -12554,7 +12554,7 @@ impl GenerationalHeap {
         // header — `ClassId(0)`, which renders as `java.lang.Object` and
         // surfaces minutes later on another thread as
         // `java.lang.Object cannot be cast to <something>`
-        // (audits/old-sweep-liveness.md §7).
+        // (old-sweep-liveness.md §7).
         // Every existing guard stays quiet: the header is plausible, the extent
         // fits, no slot goes out of bounds, nothing segfaults.
         //
@@ -13236,7 +13236,7 @@ impl GenerationalHeap {
         //
         // ADDITIVE, and on the shadow only. Two things went wrong the first
         // time this was attempted (defect 4 in
-        // `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`):
+        // `map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`):
         // rewriting the CALLER's slice corrupted a root snapshot that outlives
         // this call, and seeding destinations was itself destabilising because
         // that seed loop did not validate what it marked. The second cause is
@@ -13304,8 +13304,7 @@ impl GenerationalHeap {
     ) -> cratonvm_types::PointerMap {
         // See `oldgen_compact_enabled`: compaction is disabled by default as
         // of 2026-08-03 pending root-cause attribution of the corruption it
-        // was found to cause (fixed-suite-bugs/hibernate/
-        // map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
+        // was found to cause (map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md).
         Self::old_gen_gc(
             roots,
             young_from,
@@ -13382,7 +13381,7 @@ impl GenerationalHeap {
         // in `old_gen_mark_candidate_plausible` and EVERY push site into the
         // mark worklist goes through it, because the seven that did not were
         // still doing exactly what the paragraph above describes — see
-        // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+        // `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
         //
         // NOTE this predicate deliberately does NOT require a non-zero first
         // header word (unlike `mark_young`'s zero-word0 side-mark split):
@@ -13428,7 +13427,7 @@ impl GenerationalHeap {
         // the in-place sweep on the cycles `has_conservative_roots` catches and
         // lets every OTHER cycle fall through to the compactor, which is where
         // the measured victim was actually lost. Full argument and
-        // measurements: audits/old-sweep-liveness.md section 7.
+        // measurements: old-sweep-liveness.md section 7.
         //
         // Pinning is pure over-retention: the object does not move, and a
         // false positive retains one block for one cycle, which is what
@@ -13488,7 +13487,7 @@ impl GenerationalHeap {
                     "old-gen major GC: {} root(s) are INTERIOR words of live old-gen objects, \
                      so this cycle reclaims IN PLACE instead of compacting — a slid object \
                      would leave those roots dangling and they cannot be rewritten. See \
-                     audits/old-sweep-liveness.md section 7.",
+                     old-sweep-liveness.md section 7.",
                     interior_pins.len(),
                 );
             }
@@ -13725,7 +13724,7 @@ impl GenerationalHeap {
             // This sweep decided liveness purely from `GC_FLAG_MARKED`, and the
             // mark that set it has NINE worklist push sites of which only two
             // validate their input (see
-            // fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
+            // gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
             // If the mark misses a root, this loop hands a still-referenced
             // block back to the free list and the damage surfaces only much
             // later, at whichever unlucky reader dereferences it next — exactly
@@ -13878,7 +13877,7 @@ impl GenerationalHeap {
                     "in-place old-gen sweep: the mark phase missed {} of {} walked block(s) \
                      that a LIVE old-gen object still references; retaining them. This is a \
                      mark push-site gap, not floating garbage — see \
-                     audits/old-sweep-liveness.md.",
+                     old-sweep-liveness.md.",
                     rescued,
                     objects.len(),
                 );
@@ -13896,7 +13895,7 @@ impl GenerationalHeap {
                         "in-place old-gen sweep ({} walked objects): a live old-gen object \
                          references an in-old-gen address the object walk did not yield — an \
                          EARLIER reclamation already freed a live block. See \
-                         `old_gen::COMPACT_ESCAPE_HITS` and audits/old-sweep-liveness.md.",
+                         `old_gen::COMPACT_ESCAPE_HITS` and old-sweep-liveness.md.",
                         objects.len(),
                     );
                 }
@@ -13970,7 +13969,7 @@ impl GenerationalHeap {
                     // an all-zero `ClassId(0)` header, i.e. `java.lang.Object`.
                     // Always on, and cheap: an in-place old sweep only runs past
                     // 75 % occupancy, and the record is one relaxed `fetch_add`
-                    // plus five relaxed stores. See audits/old-sweep-liveness.md.
+                    // plus five relaxed stores. See old-sweep-liveness.md.
                     if interior_pins.contains(&(obj_ptr as usize)) {
                         // Only reachable with `CRATONVM_GC_NO_OLD_INTERIOR_PINS`
                         // set: the pin above marks these, so the free loop never
@@ -14327,7 +14326,7 @@ impl GenerationalHeap {
         // discriminant was never an object base: some push site handed us a
         // dangling or interior address. This was long COUNTED but not
         // rejected here — see
-        // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
+        // `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`,
         // which explicitly deferred the reject as follow-up work. Deferring it
         // left the door open for the exact hazard that doc's Half 2 fix was
         // written to close: `gen_object_total_size(header)` below reads
@@ -14338,7 +14337,7 @@ impl GenerationalHeap {
         // (`HIB-DCAST-LATEPHASE.1`: reached this way as a SIGSEGV reading
         // through a garbage `array_length` treated as a slot/byte count).
         // Reject now, mirroring `OldGen::scan_region`'s equivalent fix in
-        // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
+        // `defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`:
         // validate the raw tag bytes through
         // `object_kind_from_tag`/`array_element_type_from_tag` before ever
         // forming a `&ObjectHeader` reference.
@@ -14757,7 +14756,7 @@ impl GenerationalHeap {
         // safety net — leaving an untracked zeroed sliver between the TLAB's
         // filler and the next region that derails the non-moving walk (the
         // trigger-ON bt18 corruption; see
-        // fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md).
+        // tlab-trigger-gc-young-walk-corruption-FIXED.md).
         let actual_size = requested_size.min(available) & !7;
         if actual_size == 0 {
             return None;
@@ -15060,7 +15059,7 @@ impl GenerationalHeap {
         // bytes through `object_kind_from_tag`/`array_element_type_from_tag`
         // — the same fix already applied to `OldGen::scan_region` and
         // `scan_object_for_old_refs` (see
-        // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
+        // `defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`)
         // — before ever reading either field as a typed enum.
         // SAFETY: `old_ptr` is confirmed inside young from-space via
         // `young_object_starts.contains` above, so the two single-byte tag
@@ -16424,7 +16423,7 @@ pub(crate) fn fwd_resolve_strict() -> bool {
 /// loop, and after a possible major GC — printing per-phase counts. A count
 /// that JUMPS at a specific phase localizes the SEEDING collector path
 /// (minor Cheney/promotion vs. major mark-compact) — see
-/// gaps/bc-math-ec-gc-0x4-handoff.md §6.4.
+/// bc-math-ec-gc-0x4-handoff.md §6.4.
 #[inline]
 fn seedhunt_enabled() -> bool {
     gc_flags().dbg_seedhunt
@@ -16556,7 +16555,7 @@ fn seedhunt_scan_young(
 /// object's PAYLOAD (an `int` field `0x41414141` becomes `0x43414141`), and
 /// those payload bytes are decoded as a header, which is how a byte that is not
 /// a valid `ObjectKind` discriminant reaches `gen_object_total_size`. See
-/// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+/// `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
 ///
 /// The root seed and the young->old conservative word scan already defended
 /// themselves (and their comments name this hazard as the reason); this is that
@@ -16932,7 +16931,7 @@ fn note_interior_old_root(root: *mut u8, base: usize, size: usize) {
         "old-gen mark: conservative root {root:p} is an INTERIOR word of the live object at \
          {base:#x}+{size:#x} (interior_off={}, class_id={}, kind={}) — pinning the containing \
          object. Without this the in-place sweep frees it under a root it cannot rewrite; see \
-         audits/old-sweep-liveness.md section 7",
+         old-sweep-liveness.md section 7",
         root as usize - base,
         header.class_id.as_u32(),
         ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
@@ -16987,7 +16986,7 @@ fn note_rescued_old_mark_candidate(ptr: *mut u8, site: &'static str) {
             "old-gen mark [{site}]: candidate {ptr:p} FAILED the plausibility screen but IS an \
              object base the walk yielded (class_id={}, kind={}, shape={}, gc_flags={:#04x}) — \
              marking it. Without this the in-place sweep would free a live object; see \
-             audits/old-sweep-liveness.md.",
+             old-sweep-liveness.md.",
             header.class_id.as_u32(),
             ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
             header.num_slots(),
@@ -17101,7 +17100,7 @@ fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
             "old-gen mark: rejecting {} candidate {:p} — not a plausible object \
              base (aligned={}, w0=0x{:016x} w1=0x{:016x} w2=0x{:016x}). A side \
              table or reference slot is holding a stale old-gen address; see \
-             fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
+             gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md",
             site,
             ptr,
             (ptr as usize) & 7 == 0,
@@ -17145,7 +17144,7 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
     // still read *as an enum* first. Validate both raw tag bytes through
     // `object_kind_from_tag`/`array_element_type_from_tag` before ever
     // constructing a typed `&ObjectHeader`, mirroring every other fix in
-    // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
+    // `defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
     // SAFETY: bounds-checked by `old_gen.contains(neighbor)` above.
     let kind_tag = unsafe { cratonvm_types::kind_tag_at(neighbor) };
     let elem_tag = unsafe { cratonvm_types::element_type_tag_at(neighbor) };
@@ -19156,7 +19155,7 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
     // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::write::<Value>`,
     // a non-atomic 16-byte copy that could tear against a concurrent plain
     // `get_field` from another mutator thread -- see
-    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix).
     cratonvm_types::write_value_atomic(ptr as *mut Value, value);
 }
@@ -19669,7 +19668,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // TLAB audit (audits/tlab-and-card-audit.md) — reserved-tail skip
+    // TLAB audit (tlab-and-card-audit.md) — reserved-tail skip
     // regions must reach the walkers ascending, disjoint and non-empty.
     // -----------------------------------------------------------------
 
@@ -21053,7 +21052,7 @@ mod tests {
     /// A later attempt (2026-07-30) to additionally cap the *initial* young
     /// semi at 512 MiB (to cut eager-paging RSS on large `-Xmx` heaps) was
     /// measured to be a net wall-clock regression — see
-    /// `performance/binarytrees-bt18-half-gap-20260730.md` —
+    /// `binarytrees-bt18-half-gap-20260730.md` —
     /// because this workload's young GC already always falls back to a
     /// non-moving sweep, and a smaller semispace just means more of those
     /// expensive fallbacks. Reverted; `with_capacity`'s *initial* semi stays
@@ -21979,7 +21978,7 @@ mod tests {
     /// and needs a different answer; see
     /// `an_interior_conservative_root_forbids_old_gen_compaction`. That is the
     /// reproduction in
-    /// audits/old-sweep-liveness.md section 7, whose H2 `MVStore` reproduction
+    /// old-sweep-liveness.md section 7, whose H2 `MVStore` reproduction
     /// needs `CRATONVM_NO_MOVING_YOUNG=1` **with the JIT on** precisely
     /// because that is the configuration in which this sweep runs against
     /// conservative roots.
@@ -22586,7 +22585,7 @@ mod tests {
         }
     }
 
-    /// T-3 (audits/tlab-and-card-audit.md §1.3) — a MOVING young collection
+    /// T-3 (tlab-and-card-audit.md §1.3) — a MOVING young collection
     /// must REFUSE to run while a reserved TLAB tail is published inside the
     /// from-space it is about to evacuate, swap and reset.
     ///
@@ -23206,7 +23205,7 @@ mod tests {
     /// `gc_reconcile_defining_loaders` — RETAINS the entry for a just-freed
     /// object, leaving a dangling old-gen address for a later mark to decode.
     ///
-    /// See `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// See `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     /// Fixed by giving `is_addr_live` a free-list-aware old-gen predicate
     /// (`GenerationalHeap::is_live_old_gen_addr` -> `OldGen::is_allocated_addr`).
     /// `is_old_gen_addr` itself is deliberately UNCHANGED: it answers "which

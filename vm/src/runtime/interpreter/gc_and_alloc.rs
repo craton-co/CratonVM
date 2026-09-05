@@ -530,7 +530,7 @@ pub(super) fn stw_take_over_and_wait(
     // the whole frozen window, and the non-moving sweep zeroed the still-live
     // object in place (WildFly parallel-extension-add: fresh
     // StringBuilder/Reader receivers reading back all-zero — see
-    // fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
+    // wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
     // Walk each frozen peer's interpreter frames directly into `xt_roots`.
     //
     // SAFETY: each address was published by its owning thread with the
@@ -1640,8 +1640,7 @@ pub(super) fn maybe_gc_forced_at(
     // `OutOfMemoryError` on a heap that is almost entirely garbage. Restores
     // part 3 of a9c580aff, which d8092acba ("fix-tests-real-jdk-contracts")
     // reverted in this file while leaving both accessors in place and
-    // caller-less; see fixed-suite-bugs/tomcat/
-    // 24-stringcache-oom-under-load-FIXED.md.
+    // caller-less; see 24-stringcache-oom-under-load-FIXED.md.
     let before_live = shared.mem.heap.live_bytes_estimate();
     let before_promoted = shared.mem.heap.bytes_promoted_total();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
@@ -2433,7 +2432,7 @@ fn run_finalizers_impl(shared: &SharedVm, thread: &mut JvmThread, forced: bool) 
 /// `WeakCache`'s `WeakHashMap.get()` permanently stuck inside
 /// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
 /// `createLayoutFromConfigClass` test). See
-/// fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
+/// thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
 pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
     let cm = shared.classes.class_manager.read();
     cm.find_bootstrap_class_by_name("java/lang/ref/Reference")
@@ -2528,7 +2527,7 @@ pub(super) fn process_references_after_gc(
         // collections `is_marked` already agrees are dead.
         //
         // NOTE: this does NOT fully close
-        // `fixed-suite-bugs/tomcat/defaultinstancemanager-classunloading-count-mismatch-FIXED.md`.
+        // `defaultinstancemanager-classunloading-count-mismatch-FIXED.md`.
         // `roots.rs` step 17 itself has a separate, deeper bug this session
         // found but did not fix: `gc_scan_collection_overlay_roots` roots
         // EVERY element of EVERY overlay-backed collection unconditionally,
@@ -2641,7 +2640,7 @@ pub(super) fn process_references_after_gc(
     // obtainable bytes diverge. Read *before* taking the reference-processor
     // lock: the accessor reaches into the heap's own generation stats, and
     // there is no reason to nest those acquisitions.
-    // See `arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
+    // See `refs-metaspace-unloading.md` §2/§R1.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     // ClassManager is rank L10 and the reference processor is L7, so resolve
     // the JDK field before acquiring the lower-ranked processor lock.
@@ -2694,7 +2693,7 @@ pub(super) fn process_references_after_gc(
     // whatever now occupies the memory: the measured corruption was THIS
     // loop's `Object(None)` referent-clear landing mis-gridded — victim
     // payload = 0x4 (the Object discriminant), next word nulled (hexdump in
-    // gaps/h2-testscript-segv-findings.md). The earlier
+    // h2-testscript-segv-findings.md). The earlier
     // `num_fields < 2` guard was too weak (a phantom header at the stale
     // address can read num_slots >= 2). PRECISE criterion: a pre-GC address
     // in EITHER young semispace that is NOT a pointer-map key did not
@@ -3856,7 +3855,7 @@ const NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES: u64 = 4 * 1024 * 1024;
 /// unaligned TLAB sizes whose free-list split remnants sat off the 8-byte
 /// object grid (plus an untracked `Tlab::new` round-down sliver), derailing
 /// the non-moving walk and truncating the mark oracle. See
-/// fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
+/// tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
 /// now enforces grid alignment end-to-end and the mark oracle fails safe
 /// above a truncated walk's frontier.
 fn tlab_gc_trigger_enabled() -> bool {
@@ -4465,7 +4464,7 @@ pub(super) fn tlab_alloc_shaped_inner(
 /// only report that names legacy allocations — which is exactly what happened
 /// to `org/bouncycastle/crypto/digests/SHA256Digest`, 100% of `jit_getfield`'s
 /// receivers on Generational and nowhere in the census. See
-/// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+/// every-jit-getfield-takes-the-helper-FIXED-20260820.md.
 ///
 /// Sixteen slots, linear scan, first-come, and only touched under
 /// `CRATONVM_DBG_COMPACT_LEGACY`: the registry lookup it performs is far too
@@ -5470,7 +5469,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // SEGV — that crash was experimentally shown to be NOT a GC reclamation /
     // relocation bug (it reproduces with the young sweep capturing these JIT
     // roots and with the concurrent old-gen collector disabled). See
-    // fixed-bugs/real-raf-segv-root-cause.md.
+    // real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
         // `update_root_snapshot` is also called at ordinary native-call
         // boundaries, not only immediately before a safepoint.  Its JIT-root

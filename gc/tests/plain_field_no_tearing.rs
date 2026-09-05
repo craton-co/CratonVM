@@ -3,7 +3,7 @@
 
 //! Regression test for the plain-field 16-byte slot tearing fix
 //! (2026-07-06, see
-//! fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md #3).
+//! elasticsearch-lucene-binary-docvalues-range-hangs.md #3).
 //!
 //! `GenerationalHeap::get_field`/`set_field` (the interpreter's plain,
 //! non-`volatile` field accessors) used to read/write the 16-byte `Value`

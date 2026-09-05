@@ -6,7 +6,7 @@
 //! ## Why this exists
 //!
 //! The P0 "JIT correctness" lane of the C2 review
-//! (`feature-designs/c2/deep-research-vm-c2.md`) asks for *"a universal IR
+//! (`deep-research-vm-c2.md`) asks for *"a universal IR
 //! verifier … run after parsing and every mutating pass in stress builds; run
 //! before lowering in all builds"*, with the exit criterion that *"invalid IR
 //! or ABI state causes a deterministic compilation bailout, never silent wrong
@@ -1136,7 +1136,7 @@ fn check_types(graph: &Graph, v: &mut Violations) {
 /// Three things are checked: that snapshot bcis are **unique** (both consumers
 /// key on the bci and break ties by position, so a duplicate silently discards
 /// one frame state), that slot counts are `u16`-plausible, and that every named
-/// node is in range and live. See `audits/deopt-metadata-audit.md` §5.
+/// node is in range and live. See `deopt-metadata-audit.md` §5.
 fn check_frame_states(graph: &Graph, v: &mut Violations) {
     // Snapshot bcis must be unique, because both consumers key on the bci and
     // resolve ties by *position*:

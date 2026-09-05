@@ -64,7 +64,7 @@
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::GcFlags`], parsed once at first use. Before the typed
 /// config existed each of these was an independent `cratonvm_types::flags::runtime_var_os` call
-/// wrapped in its own `OnceLock`; see `audits/flag-census.md` for the
+/// wrapped in its own `OnceLock`; see `flag-census.md` for the
 /// inventory and `cratonvm_types::flags` for the latching rules.
 #[inline]
 pub(crate) fn gc_flags() -> &'static cratonvm_types::GcFlags {

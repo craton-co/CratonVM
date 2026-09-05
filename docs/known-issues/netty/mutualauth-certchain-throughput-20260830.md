@@ -54,7 +54,7 @@ it in one run, and would have answered it before the build rather than after.
 **3. "The live `modPow` computes on decimal strings."** True of
 `math_bignum.rs`'s implementation — square-and-multiply with a decimal
 schoolbook multiply and long division per exponent bit, exactly the ~100x
-representation loss `gaps/biginteger-limb-rewrite-scope.md` identified in May.
+representation loss `biginteger-limb-rewrite-scope.md` identified in May.
 But **there are two registrations of `modPow`** and last-write-wins:
 `phases_late.rs`'s is already limb-based Montgomery ("rewrite step 3"), and it
 is the live one. Routing the decimal one through `BigInt` anyway is this

@@ -1327,7 +1327,7 @@ fn real_rsa_key_from_components(
 /// whose `getEncoded()` is an incomplete 572-byte PKCS#8 (only n and d; e and
 /// all CRT params encoded as INTEGER 0) that rustls rejects
 /// (`failed to parse private key as RSA`) — the root cause behind
-/// fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md. A
+/// http-server-sslengine-identity-singleton-clobber-FIXED.md. A
 /// freshly generated key HAS its CRT parameters, so build the CRT spec and get
 /// a real `RSAPrivateCrtKeyImpl` with a complete `getEncoded()`.
 ///

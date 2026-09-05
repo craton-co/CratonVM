@@ -4,7 +4,7 @@
 //! Phase E — Networking natives (roadmap items RE.1 .. RE.10).
 //!
 //! This module implements the ten Phase-E items from
-//! `history/roadmap-any-java-app.md` as ten self-contained subphases, each with
+//! `roadmap-any-java-app.md` as ten self-contained subphases, each with
 //! its own register function. Every function carries a real OS-backed
 //! implementation (TCP, UDP, DNS, HTTP/1.1, TLS, NIO Selector, network-
 //! interface enumeration, and `com.sun.net.httpserver`). There are no stubs:
@@ -210,7 +210,7 @@ const CLIENT_SUPPORTED_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
+    // rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -262,7 +262,7 @@ pub(crate) struct SockSide {
     // invokes methods on a String receiver instead of a SocketImpl,
     // producing a NoSuchMethodError that names String for a method that
     // plainly does not exist on it (e.g. create(Z)V). See
-    // fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md.
+    // bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md.
     pub host: String,
     pub port: i32,
     pub local_port: i32,
@@ -1440,7 +1440,7 @@ fn populate_inet_holder(
     // answered **null** while `isUnresolved()` still answered false, and
     // `sun.nio.ch.Net.bind`'s first act — `addr.isLinkLocalAddress()` — threw
     // `NullPointerException: … because "addr" is null`. See
-    // `fixed-suite-bugs/serversocket-bind-null-inetaddress-net-sockets-FIXED.md`.
+    // `serversocket-bind-null-inetaddress-net-sockets-FIXED.md`.
     //
     // Returns the CURRENT (post-GC) address of `ia` so the caller propagates
     // the live reference instead of its own stale copy.
@@ -1650,7 +1650,7 @@ pub(crate) fn inet_addr_scoped_text(
 /// `pub(crate)` because the duplicate registration in `phases_early.rs` must
 /// answer identically — `getHostName` had six registrations and the winning
 /// pair was on the concrete subclasses (see
-/// `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
+/// `inetaddress-tostring-hostname-literal-addresses-FIXED.md`),
 /// so a scope fix applied to only one of them is invisible half the time.
 pub(crate) fn inet_addr_host_address_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     // `inet_addr_field` keeps the legacy fallback: an address object we never
@@ -1688,7 +1688,7 @@ pub(crate) fn inet_addr_host_address_value(ctx: &mut dyn NativeContext, this: Ob
 /// reintroducing the very divergence this file was corrected for, at an
 /// unpredictable moment. A stable `toString()` is worth the one lost mutation;
 /// the difference is recorded in
-/// `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`.
+/// `inetaddress-tostring-hostname-literal-addresses-FIXED.md`.
 fn inet_addr_host_name_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     let name = inet_addr_field_string_or(ctx, this, IA_HOST, "");
     if !name.is_empty() {
@@ -6508,7 +6508,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // `String` and throws a bogus `NoSuchMethodError:
     // java/lang/String.getOption(I)Ljava/lang/Object;` (observed via Apache
     // HttpClient5's connection setup calling this — see
-    // fixed-suite-bugs/netty-client-socket-write-after-close-nsme-FIXED.md).
+    // netty-client-socket-write-after-close-nsme-FIXED.md).
     // We don't track the real local bind IP for this client-side socket
     // (the TLS connect never does an explicit local bind), so return
     // loopback — a real client socket connecting to a loopback server
@@ -8196,7 +8196,7 @@ fn http_build_request(
 /// a fully-framed response (keep-alive) -- reading until EOF unconditionally
 /// hangs forever on such a connection even though the whole response
 /// already arrived. See
-/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
+/// spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #2 (`JdkClientHttpRequestFactoryTests` hang): confirmed via a
 /// live `strace` against a real `MockWebServer` that the server sent a
 /// complete 38-byte `Content-Length`-framed response and went straight back
@@ -8671,7 +8671,6 @@ fn http_exchange_rustls(
     // root-scan `SIGUSR2` surfaced here as
     // `IOException: TLS handshake read: Interrupted system call (os error 4)`.
     // See `cratonvm_native_io::eintr` and
-    // `fixed-suite-bugs/springboot/`
     // `jdk-httpclient-sslbundle-tls-handshake-eintr-FIXED-20260806.md`.
     while tls.conn.is_handshaking() {
         if tls.conn.wants_write() {
@@ -12196,7 +12195,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // `antlr_groovy_atn_special_slot`), so `groovy.*` presence is now decided
     // honestly by Spring's bytecode implementation below and `.groovy` bean scripts load
     // through the real `GenericGroovyXmlContextLoader`. See
-    // fixed-suite-bugs/test-context-constructor-param-annotation-offset.md.
+    // test-context-constructor-param-annotation-offset.md.
     r.register(
         "org/springframework/util/ClassUtils",
         "isPresent",
@@ -14551,7 +14550,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // `HttpClient.send`) hit `AbstractMethodError: method
     // java/net/http/HttpRequest.method()Ljava/lang/String; has no Code
     // attribute` — see
-    // fixed-suite-bugs/springboot/cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror-FIXED.md
+    // cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror-FIXED.md
     // (Hazelcast's `RestClient.call` calls `request.method()` purely for its
     // own logging/retry bookkeeping after building the request).
     r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
@@ -16213,7 +16212,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // consulting a live KeyManager. Only `http_url_connection::
             // perform` (the path `HttpsURLConnection`/`TestClientCert` uses)
             // does the latter today — see
-            // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+            // tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
             // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): honour a
             // version-pinned `SSLContext.getInstance(...)` on THIS path.
             // `phases_late::ssl_security` registers the same
@@ -16303,7 +16302,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // own empty-`wanted` fallback) — that would tear down a working
     // connection for no enforcement benefit. Known, currently unclosable gap
     // for TLS 1.2 DHE-suite restriction specifically; see
-    // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+    // tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
     r.register(
         "javax/net/ssl/SSLSocket",
         "setEnabledCipherSuites",
@@ -16604,7 +16603,7 @@ pub(crate) fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // `native-builtins/src/lib.rs`). Guarded by
     // `native-builtins/tests/registry_contracts.rs::
     // ssl_default_factory_and_context_have_the_documented_single_owner`.
-    // See `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+    // See `sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 }
 
 // ===========================================================================
@@ -19002,7 +19001,7 @@ fn re8_make_interface(
         // `/fe80:…%eth0` for every row of `getInetAddresses()`. Labelling them
         // `localhost` / `<hostname>` — which this loop used to do — is the
         // exact divergence
-        // `fixed-suite-bugs/inetaddress-tostring-hostname-literal-addresses-FIXED.md`
+        // `inetaddress-tostring-hostname-literal-addresses-FIXED.md`
         // removed everywhere else; this call site was missed. `getHostName()`
         // still answers the numeric text, because that is its no-name
         // fallback.

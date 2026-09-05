@@ -170,7 +170,7 @@ claim.
 
 ### 3.2 How a green record froze the divergence
 
-fixed-suite-bugs/elasticsearch-suite/stackwalker-option-enum-constants-null-blocks-es-suite-FIXED.md
+stackwalker-option-enum-constants-null-blocks-es-suite-FIXED.md
 closed this area on 2026-07-10 by adding `$VALUES` to the same native, and its
 Verification section records, as evidence of success:
 

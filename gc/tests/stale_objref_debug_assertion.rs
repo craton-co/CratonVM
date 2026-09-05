@@ -3,7 +3,7 @@
 
 //! Integration test for `CRATONVM_DBG_STALE_OBJREF` (see
 //! `gc/src/stale_objref_debug.rs` and
-//! fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
+//! wildfly-parallel-boot-stale-objectref-residual.md).
 //!
 //! Still a SEPARATE test binary (one file under `gc/tests/`, one test
 //! function) rather than a `#[test]` inside `gen_heap.rs`'s own module: the

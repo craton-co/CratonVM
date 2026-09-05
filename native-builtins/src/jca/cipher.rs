@@ -4279,7 +4279,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             // instead of the catchable `OutOfMemoryError` HotSpot throws. Use
             // the fallible `try_new_array` (same `try_new_ref_array`/
             // `try_alloc_array_full` idiom as the `ArrayList(int)` abend fix,
-            // see `gaps/crash-01-arraylist-capacity-oom-abend.md`)
+            // see `crash-01-arraylist-capacity-oom-abend.md`)
             // and throw a catchable OOME on `None` instead. (There is a
             // second, near-identical `cipher_do_final` in
             // `native-builtins/src/phases_early.rs` with the same pattern —
@@ -6054,7 +6054,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     //
     // and `getInstance` resolved for all fourteen, which is why a gap census
     // that scores on `getInstance` could not see it
-    // (`jca-provider-population-gap-20260830.md`; `apps/probes/JcaMacVectors`
+    // (`jca-provider-population-gap-20260830-FIXED.md`; `apps/probes/JcaMacVectors`
     // is what does).
     //
     // The `<init>` shim below stays: it is the copy-the-array fix, and it is

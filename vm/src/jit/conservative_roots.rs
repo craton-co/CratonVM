@@ -749,7 +749,7 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
 /// Per-disjunct breakdown of why [`moving_young_osr_method_needs_fallback`]
 /// returned true, so the single `osr-shadow-coverage-unproven` reason code the
 /// collector sees can be split apart without a debugger. Filed 2026-08-21:
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s own
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`'s own
 /// measurement found this reason blocking 234/263 collections and could not
 /// say which of the (then three) disjuncts was responsible, only that "H2's
 /// MVStore loops are OSR-compiled constantly." Attribution is by the same
@@ -835,7 +835,7 @@ fn moving_young_osr_method_needs_fallback(
     // Measured on `TestKillProcessWhileWriting` with `CRATONVM_DBG_OOPCOV=1`:
     // 439 of 449 coverage failures are that one shape, and through this term
     // they refused relocation on 725 of 759 collections. That is the
-    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual,
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` residual,
     // and the page's own guess (a cross-thread peer) was measured at 0 of 759.
     //
     // The staged argument is not the caller's live value any more — it is the
@@ -1491,7 +1491,7 @@ struct JitScanCache {
     /// `(filled_gen, chain_len, collection_count)` happen to match on the
     /// other side, hands VM A's object addresses to VM B's collector as
     /// roots — the `oscache` failure mode from
-    /// `feature-designs/vm-process-global-state.md`, but pointed at the mark
+    /// `vm-process-global-state.md`, but pointed at the mark
     /// phase. `collection_count` cannot stand in for this: it is
     /// `heap.collection_count()`, a *different* counter per heap, so two young
     /// heaps trivially agree on it.
@@ -1776,7 +1776,7 @@ fn jit_scan_cache_enabled() -> bool {
         // real bug is a register-resident JIT root that conservative scanning —
         // cached, fresh, or even whole-stack (`CRATONVM_DBG_FULLSTACK_SCAN`) —
         // cannot see; it needs precise oop maps / the shadow stack. See
-        // `fixed-suite-bugs/wildfly/bug-06b-jit-scan-cache-unsound.md`.) So the
+        // `bug-06b-jit-scan-cache-unsound.md`.) So the
         // cache stays enabled for its perf benefit; `collection_count` keying
         // (see `JitScanCache`) keeps it from republishing freed addresses across
         // a GC. `CRATONVM_NO_JIT_SCAN_CACHE` force-disables it for bisection.
@@ -2752,7 +2752,7 @@ fn returned_from_direct_self_call(ret_addr: usize, entry_ptr: usize) -> bool {
 /// misaligned slot, a stored id no map matches, and a matched map that does
 /// not claim coverage. They are four different repairs, and after the
 /// 2026-08-23 OSR fix these two codes are what
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s remaining
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`'s remaining
 /// classes (`TestMVStoreTool`, 5 of 8 collections) refuse on, so the split is
 /// the next question rather than a nicety.
 pub mod frame_coverage_reason {
@@ -2831,7 +2831,7 @@ fn moving_young_frame_coverage_complete_at(
         frame_coverage_reason::NO_MAP_FOR_STORED_ID.fetch_add(1, Relaxed);
         // WHICH frame, and what id was standing in its slot. This is the last
         // obligation blocking `TestMVStoreTool`
-        // (`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`):
+        // (`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`):
         // `no_map=9 incomplete=0 ok=46`, so no map ever refuses on its own
         // claim — nine frames simply cannot be located. A count cannot say
         // whether that is a frame that has not reached a safepoint yet, a call
@@ -4371,7 +4371,7 @@ const fn peer_jit_frames_present(global_depth: usize, local_depth: usize) -> boo
 /// Until 2026-08-23 neither mechanism gave the *initiator* a positive proof at
 /// the moment it decides whether to relocate, so the rule was: **any** peer in
 /// JIT makes the cycle unproven. That is the
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual —
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` residual —
 /// on a many-threaded workload it fires on nearly every cycle, and on ZGC,
 /// where relocation is the only defragmentation there is, the consequence is an
 /// `OutOfMemoryError` on a heap that is 97 % free.
@@ -5724,7 +5724,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                     // per-call cost climbing from ~13us to ~64us over a
                     // 400k-call `LockTest` run, vs. a flat ~2us with `--nojit`
                     // or with compilation never completing). See
-                    // fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md's
+                    // hib-misc-residuals-20260716-FIXED.md's
                     // `LockTest` section for the full investigation.
                     //
                     // Falls back to the original full-range `[search_lo, high)`
@@ -8106,7 +8106,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // INTO. The narrowing rests on "their roots are published by their own
     // mechanisms", which does not hold for an object that has been allocated
     // and not yet stored anywhere tracked — see
-    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }
@@ -9372,7 +9372,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // JIT-scan cache keying (audits/vm-jit-cache-keying.md)
+    // JIT-scan cache keying (vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     fn filled_scan_cache(heap_id: usize) -> JitScanCache {

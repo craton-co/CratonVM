@@ -65,7 +65,7 @@ const VOLATILE_STRIPE_COUNT: usize = 64;
 /// lines in pairs, so a 64-byte stride still lets two stripes travel together.
 /// The whole pool is 8 KiB.
 ///
-/// See `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
+/// See `varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
 #[repr(align(128))]
 struct VolatileStripe(parking_lot::Mutex<()>);
 

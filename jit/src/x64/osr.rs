@@ -45,6 +45,34 @@ pub(super) fn osr_empty_stack_entry_enabled() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY").is_none()
 }
 
+/// How many OSR entry pcs the empty-operand-stack rule has refused this process.
+///
+/// [`osr_empty_stack_entry_enabled`]'s switch exists so the rule can be
+/// bisected against. It has a property that makes it hard to trust when you
+/// finally need it: **flipping it changes no observable answer.** That is the
+/// retired page's own finding — with the `wide iinc` cause fixed, both
+/// reproducers are correct in every arm — so a run with the switch set and a
+/// run without it produce identical output, and "did the switch do anything?"
+/// cannot be answered from the results.
+///
+/// This counter answers it. Non-zero with the rule on, zero with
+/// `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1`; under `CRATONVM_DBG_JITC=1` each
+/// refusal is also named in the same stream as the other OSR refusals, with its
+/// pc and stack depth. Measured on `test_classes/jit/OsrStridedValue.java`:
+/// **88 refusals on, 0 off.**
+///
+/// A kill switch whose engagement cannot be observed is one you have to take on
+/// faith at exactly the moment you are using it to decide whether a rule is
+/// responsible for a miscompile.
+/// `internal/fixed-bugs/osr-miscompiles-cachecoherence-20260904-FIXED-20260905.md`
+pub static OSR_EMPTY_STACK_REFUSALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read the refusal counter — see [`OSR_EMPTY_STACK_REFUSALS`].
+pub fn osr_empty_stack_refusals() -> usize {
+    OSR_EMPTY_STACK_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Deopt points, exception checks and the stub block
@@ -433,7 +461,7 @@ pub(super) fn publish_entry_metadata(
     // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
     // avoided clobbering the live owner, but the resulting coalesced state
     // transition was not proven safe -- see
-    // fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // jit-osr-linux-regression-triad.md). The
     // hazard that argument rests on is *sharing*: a dead local whose register
     // is also some live local's home. A dead local that owns its register
     // outright has no coalesced state to reconstruct -- nothing reads it before

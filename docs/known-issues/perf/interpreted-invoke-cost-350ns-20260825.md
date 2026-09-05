@@ -1505,7 +1505,7 @@ repaired"*; the code comment reads *"the wrong answers this
 door produced were the receiver profile it was not recording, and it records it
 now"*), and the H2 wrong answer that justified switching it off is fixed and its
 page retired to
-`fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md` — the
+`testrandommapops-deterministic-1810-null-FIXED-20260904.md` — the
 root cause was the guarded-inline native screen asking the declaring class, not
 the door's argument transfer at all.
 

@@ -561,7 +561,7 @@ pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 /// 14 @GC_STRESS=4096` → `3222190` clean, and the Fork6 GC_STRESS outcome A/B is
 /// 14/15 ALL-OK on == off (the higher young-mark marker count under precise-on is
 /// benign guard-contained over-retention, not worse outcomes). See BUG-01 doc:
-/// `fixed-suite-bugs/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+/// `bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
 ///
 /// History: default-OFF (d53c0e96) for BUG-01: the per-invocation
 /// `frame_record` + per-safepoint sp-id/flush codegen was a ~6× throughput tax on
@@ -749,7 +749,7 @@ pub fn zgc_codegen_honours_read_barrier() -> bool {
 /// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
 /// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
 ///
-/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`audits/g1-audit.md`
+/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`g1-audit.md`
 /// §8.1, 2026-07-31). The previous wording claimed the guarded-getfield
 /// receiver check was prepended by "both inline arms"; three emitters did not
 /// have it, and the `region_bounds_addr != 0` test it named is not a backend
@@ -762,7 +762,7 @@ pub fn zgc_codegen_honours_read_barrier() -> bool {
 /// scanned wholesale — but a region held OUT of the CSet by a JNI pin is
 /// reachable only through its remembered set, so an inline store that skips
 /// `post_write_barrier_rset` loses that edge and the next pause frees a live
-/// referent (`audits/g1-audit.md` §2, §5).
+/// referent (`g1-audit.md` §2, §5).
 ///
 /// **What actually gates the backend.** NOT `helpers.region_bounds_addr != 0`:
 /// that field is the ADDRESS of the process-global `JIT_REGION_BOUNDS` static
@@ -804,7 +804,7 @@ pub fn inline_putfield_enabled() -> bool {
 
 /// Does the GC backend have LIVE heap-region bounds published right now?
 ///
-/// G1-2 (`audits/g1-audit.md` §8.1). This is the predicate the inline
+/// G1-2 (`g1-audit.md` §8.1). This is the predicate the inline
 /// reference-store emitters need and `helpers.region_bounds_addr != 0` is not.
 /// That field holds the address of the process-global `JIT_REGION_BOUNDS`
 /// static (`gc/src/gen_heap.rs`), which `vm/src/jit/helpers.rs` assigns from
@@ -1095,7 +1095,7 @@ pub fn inline_getfield_enabled() -> bool {
 ///
 /// The READ table, not `JIT_REGION_BOUNDS`, since 2026-08-18: that table's
 /// emptiness under G1/ZGC is what keeps inline reference STORES unreachable
-/// (`audits/g1-audit.md` 8.1), so it could never be filled to make inline
+/// (`g1-audit.md` 8.1), so it could never be filled to make inline
 /// READS reachable. `JIT_READ_BOUNDS` answers only the read question -- is
 /// this address mapped -- and G1 fills it with its single contiguous arena
 /// span. ZGC still publishes nothing, which keeps this path unreachable
@@ -1122,7 +1122,7 @@ pub fn inline_getfield_enabled() -> bool {
 /// `is_ref=false` fell into the int-category match arm and got a 32-bit
 /// `MOVSXD` load of half a `Value` cell, producing exactly this "small-int
 /// garbage used as a pointer" shape. See
-/// fixed-suite-bugs/wildfly/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
+/// wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
 /// for the full chain. Re-verified clean with
 /// `CRATONVM_JIT_GUARDED_GETFIELD=1` against the exact IVF-KNN repro (no
 /// SIGSEGV, no dmesg segfault entry — only the separate, still-OPEN,
@@ -2176,7 +2176,7 @@ pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
 /// VM B's statics would bake the address of an unrelated class's slot into VM
 /// A's code — the same cross-VM aliasing that made the process-global
 /// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
-/// `audits/vm-jit-cache-keying.md`). There is no correct answer to give once two
+/// `vm-jit-cache-keying.md`). There is no correct answer to give once two
 /// VMs share the process, so the mechanism turns itself off for BOTH and every
 /// static read goes back to the helper: slower, never wrong.
 static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =
@@ -2324,7 +2324,7 @@ pub(super) fn sp_tailcall_enabled() -> bool {
 /// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call (a `JMP`
 /// into ANOTHER method's entry), this one governs a method jumping back into
 /// itself. See
-/// `fixed-suite-bugs/jit/jit-eliminates-self-tail-call-frames-FIXED-20260820.md`.
+/// `jit-eliminates-self-tail-call-frames-FIXED-20260820.md`.
 pub(super) fn self_tailcall_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();

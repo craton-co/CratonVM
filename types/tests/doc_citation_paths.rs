@@ -92,10 +92,19 @@
 //! reader can follow — the same dead-end this file exists to prevent, one step
 //! further out.
 //!
-//! Citations to an internal record therefore drop the prefix and keep the
-//! record's own path (`fixed-suite-bugs/foo-FIXED.md`), which is what it is
-//! called relative to the internal tree's own root. Anyone holding those docs
-//! can still find it; nobody else is sent to a path that is not there.
+//! Citations to an internal record therefore keep the FILENAME and drop every
+//! directory: `foo-FIXED-20260803.md`, not
+//! `docs/internal/fixed-suite-bugs/foo-FIXED-20260803.md`, and not
+//! `fixed-suite-bugs/foo-FIXED-20260803.md` either. Dropping only the prefix
+//! was the old rule and it did not hold -- `fixed-suite-bugs/` ships nowhere
+//! either, so the shorter path is the same dead end one directory in.
+//!
+//! The filename is the half worth keeping. It stays greppable for anyone
+//! holding the internal tree, it survives the record moving between internal
+//! directories (often enough that [`relocated_to`] exists to chase it), and --
+//! because internal records are indexed BY BASENAME -- it is still mechanically
+//! checkable. Dropping the `.md` as well would have cost exactly that, which is
+//! the one thing this file exists to protect.
 //!
 //! Bare prose mentions of the directory (`move its document under
 //! docs/internal`, with no trailing slash) are deliberately still allowed:
@@ -551,6 +560,57 @@ fn no_source_file_links_into_docs_internal() {
         }
     }
 
+    // DROPPING THE PREFIX DOES NOT MAKE IT CITABLE. `fixed-suite-bugs/foo.md`
+    // names a file that ships nowhere just as surely as the full path does; the
+    // reader is simply sent to a relative path instead of an absolute one.
+    //
+    // Resolved against the internal tree's own listing, so only an EXACT hit
+    // counts. A public page whose name matches an internal one is untouched,
+    // because the lookup uses the full relative path rather than the basename --
+    // and five directory names do live in both trees: gpu, jdk-only, repros,
+    // springboot and tomcat.
+    let mut internal_pages = Vec::new();
+    doc_pages(&internal, &internal, &mut internal_pages);
+    assert!(
+        internal_pages.len() > 100,
+        "only found {} pages under {} -- the walk is not reaching the internal \
+         tree, so this half of the guard would pass vacuously",
+        internal_pages.len(),
+        internal.display()
+    );
+    let internal_set: std::collections::HashSet<&str> =
+        internal_pages.iter().map(String::as_str).collect();
+
+    let mut anchored = Vec::new();
+    for path in &files {
+        if path.file_name() == Some(this_file) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (cited, line) in md_paths(&text) {
+            if internal_set.contains(cited.as_str()) {
+                anchored.push(format!("{rel}:{line}\n    -> {cited}"));
+            }
+        }
+    }
+    assert!(
+        anchored.is_empty(),
+        "{} line(s) outside docs/internal/ reach an internal record through a \
+         directory. That is still a link into a tree that never ships. Keep the \
+         FILENAME and drop every directory -- the name survives the record \
+         moving between internal directories, and it stays checkable because \
+         internal records are indexed by basename.\n\n{}\n",
+        anchored.len(),
+        anchored.join("\n\n")
+    );
+
     assert!(
         offenders.is_empty(),
         "{} line(s) outside docs/internal/ carry a docs/internal/ path. Those \
@@ -681,9 +741,22 @@ fn every_relocatable_doc_citation_points_at_the_page() {
                         ));
                     }
                 }
-                // A bare filename carries no anchor at all, so it is counted
-                // when it resolves and never accused when it does not.
-                None if internal_root.join(&cited).is_file() => live_internal += 1,
+                // A bare FILENAME is now the citation form for an internal
+                // record, so it resolves through the basename index rather than
+                // as a path -- and unlike before it IS accused when it resolves
+                // nowhere, because the form is deliberate now rather than an
+                // accident of prose.
+                None => {
+                    if internal_exact.contains_key(cited.as_str()) {
+                        live_internal += 1;
+                    } else if let Some(target) =
+                        relocated_to(&cited, &internal_exact, &internal_loose)
+                    {
+                        dead.push(format!(
+                            "{rel}:{line}\n    cites {cited}\n    moved to {target}"
+                        ));
+                    }
+                }
                 _ => {}
             }
         }

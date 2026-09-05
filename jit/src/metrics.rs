@@ -5,7 +5,7 @@
 //!
 //! ## Why this exists
 //!
-//! The C2 review (`feature-designs/c2/deep-research-vm-c2.md`) has a P0 lane
+//! The C2 review (`deep-research-vm-c2.md`) has a P0 lane
 //! "Measure compilation quality", whose acceptance criterion is: *"Per-method
 //! compiler report is available without parsing debug logs."* Before this
 //! module the only way to learn what the compiler did to a method was to set
@@ -1538,7 +1538,7 @@ pub fn record_osr_event(event: &str) {
 /// `loop_xform_not_armed` equals `loop_xform_compiles` and the rest are zero,
 /// which is the honest answer rather than a gap.
 ///
-/// See `feature-designs/c2/loop-02-planner-admission-gates.md`.
+/// See `loop-02-planner-admission-gates.md`.
 pub const LOOP_XFORM_EVENTS: [&str; 12] = [
     // Denominator: compiles that reached the planner at all.
     "loop_xform_compiles",

@@ -57,4 +57,4 @@ other two probes are vacuous. That is how the `getReason() == null` defect was f
 the native was writing to a field that does not exist, so the write silently no-opped and every
 `FileSystemException` reached Java with the OS's explanation stripped out. It had been sitting
 under two "not a CratonVM bug" triage docs. See
-`fixed-suite-bugs/springboot/configtree-applicationtemp-windows-symlink-privilege-RETIRED-20260809.md`.
+`configtree-applicationtemp-windows-symlink-privilege-RETIRED-20260809.md`.

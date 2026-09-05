@@ -632,7 +632,7 @@ checks and nothing else. Say so, and point the corpus run at
 ### NOM E33-4 — the `docs/internal` removal will turn `the_committed_baseline_document_and_this_table_agree` red
 
 Whoever removes `docs/internal` from history must move
-`gaps/jdk-regression-baseline.md` to a surviving path and update the two
+`jdk-regression-baseline.md` to a surviving path and update the two
 candidates in `baseline_document()` (`vm/tests/jck_conformance.rs`). Deleting it
 outright is also a legitimate choice — but then `jck_regression_gate`'s failure
 message, which names the document as the thing it enforces, has to go too. The

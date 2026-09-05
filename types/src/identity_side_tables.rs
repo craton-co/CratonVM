@@ -18,7 +18,7 @@
 //! to `Runtime.freeMemory`, and to every Java-side heap metric an operator would
 //! look at, and it makes any long-lived service that calls `new Random()` per
 //! request grow without bound. See
-//! `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`.
+//! `jpalargeblob-random-state-side-table-FIXED-20260830.md`.
 //!
 //! # Why the eviction signal comes from the collector
 //!

@@ -22,9 +22,90 @@ use crate::threading::thread_state::{self, ThreadExecState};
 /// The barrier uses a cheap `AtomicBool` flag (`stw_requested`) that threads
 /// poll at safepoints. When set, threads deposit their roots and wait for
 /// the GC initiator to finish collection.
+/// A cache-line-isolated `AtomicBool`.
+///
+/// `stw_requested` is the single hottest load in the VM: every interpreter
+/// thread reads it **once per bytecode** at the top of the dispatch loop, and
+/// compiled code polls the very same byte through
+/// [`GcBarrier::stw_requested_flag_addr`]. Its three neighbours in `GcBarrier`
+/// are all written by other threads — `gc_generation` every collection,
+/// `threads_blocked` on every `enter_blocked`/`leave_blocked` (so every
+/// blocking native op: `Object.wait`, `Thread.sleep`, `LockSupport.park`,
+/// selector `select`, …), and `inner`, whose `parking_lot::Mutex` word is
+/// written on every lock and unlock. All four sat inside the first 64 bytes:
+/// `AtomicBool` at offset 0, 7 bytes of alignment padding, then the two
+/// `AtomicU64`s at 8 and 16 and the mutex at 24.
+///
+/// So a write to any of them invalidated, on every interpreting core, the line
+/// carrying the flag those cores read every bytecode.
+///
+/// # What it is worth, bounded rather than guessed
+///
+/// This cannot be A/B'd the way everything else on its branch was: a struct
+/// layout is not a runtime toggle, so there is no kill switch to write. It was
+/// therefore bounded arithmetically, from a measured write rate.
+///
+/// `probes/SharedLine.java` runs compute threads in tight interpreted loops
+/// (reading this flag once per bytecode) alongside an **untimed** wait/notify
+/// ping-pong, whose every hop crosses `enter_blocked`/`leave_blocked`. Untimed
+/// deliberately — a timed wait on Windows is tick-quantized to ~15 ms, which
+/// would cap the churn at ~66/s and make the probe vacuous. Measured
+/// 2026-09-05: **116,025 handoffs in 4 s ≈ 29,000/s**, so ~58,000 writes/s to
+/// this line, from a synthetic ping-pong doing nothing else. Real code does
+/// not exceed that by orders of magnitude.
+///
+/// At 8 interpreting threads and a ~70 ns single-socket coherence miss, that
+/// is `58_000 * 8 * 70ns` ≈ **32 ms of aggregate CPU per second across 8
+/// cores — about 0.4%**, which is below what the harness resolves.
+///
+/// The cost scales as `writers x readers x miss_latency`, so it grows with
+/// core count and again across sockets — but not dramatically: 64 readers at a
+/// ~200 ns cross-socket miss is still only ~1%. **This is a small effect, and
+/// the honest claim is a bound, not a win.**
+///
+/// It is kept because it costs 63 bytes once per process and cannot regress
+/// anything, and because the tree already owns the idiom for exactly this
+/// reason (`gc/src/zgc/census.rs` and `gc/src/collector.rs` both carry
+/// `#[repr(align(64))]` so unrelated counters cannot share a line). Anyone
+/// with a many-core box can put a number on it with the probe; that is the
+/// only way this one gets measured rather than bounded.
+///
+/// 64 rather than 128: the two in-tree precedents use 64 and 128 respectively,
+/// and the destructive-interference size on x86-64 is 64. A single `bool` in
+/// its own line costs 63 bytes once per process.
+#[repr(align(64))]
+pub struct CacheLineFlag(AtomicBool);
+
+impl CacheLineFlag {
+    const fn new(v: bool) -> Self {
+        Self(AtomicBool::new(v))
+    }
+    /// The flag itself, for the ordinary atomic API.
+    #[inline(always)]
+    pub fn flag(&self) -> &AtomicBool {
+        &self.0
+    }
+    #[inline(always)]
+    pub fn load(&self, order: Ordering) -> bool {
+        self.0.load(order)
+    }
+    #[inline(always)]
+    pub fn store(&self, v: bool, order: Ordering) {
+        self.0.store(v, order)
+    }
+    #[inline(always)]
+    pub fn swap(&self, v: bool, order: Ordering) -> bool {
+        self.0.swap(v, order)
+    }
+}
+
 pub struct GcBarrier {
     /// Cheap flag polled at every safepoint. Only requires an atomic load.
-    pub stw_requested: AtomicBool,
+    ///
+    /// On its own cache line — see [`CacheLineFlag`] for why. It stays the
+    /// FIRST field so `stw_requested_flag_addr`, which compiled code bakes in,
+    /// keeps pointing at the same byte of the same allocation.
+    pub stw_requested: CacheLineFlag,
     /// GC generation counter — incremented after each collection.
     /// Threads compare their local generation to detect missed GCs.
     pub gc_generation: AtomicU64,
@@ -132,13 +213,13 @@ impl GcBarrier {
     /// as an immediate into generated code. The pointer must NOT outlive
     /// the `Arc<SharedVm>` it was obtained from.
     pub fn stw_requested_flag_addr(&self) -> *const u8 {
-        &self.stw_requested as *const AtomicBool as *const u8
+        self.stw_requested.flag() as *const AtomicBool as *const u8
     }
 
     /// Create a new GC barrier with no active STW.
     pub fn new() -> Self {
         Self {
-            stw_requested: AtomicBool::new(false),
+            stw_requested: CacheLineFlag::new(false),
             gc_generation: AtomicU64::new(0),
             threads_blocked: AtomicU64::new(0),
             inner: Mutex::new(GcBarrierInner {
@@ -415,7 +496,7 @@ impl GcBarrier {
     {
         let mut inner = self.inner.lock();
         Self::wait_out_pause_locked(
-            &self.stw_requested,
+            self.stw_requested.flag(),
             &self.gc_generation,
             &self.gc_complete,
             &mut inner,
@@ -891,7 +972,7 @@ impl Drop for BlockedGuard<'_> {
         // `GcBarrier::wait_out_pause_locked`.
         let mut inner = self.barrier.inner.lock();
         GcBarrier::wait_out_pause_locked(
-            &self.barrier.stw_requested,
+            self.barrier.stw_requested.flag(),
             &self.barrier.gc_generation,
             &self.barrier.gc_complete,
             &mut inner,

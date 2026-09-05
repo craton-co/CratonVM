@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-515 tokens.
+517 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -190,6 +190,7 @@ export inherited from a parent shell.
 | `fbref` | `CRATONVM_DBG_FBREF` |
 | `fc-fast-io-stats` | `CRATONVM_FC_FAST_IO_STATS` |
 | `field-get` | `CRATONVM_DBG_FIELD_GET` |
+| `sc-io-stats` | `CRATONVM_SC_IO_STATS` |
 | `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
@@ -293,6 +294,7 @@ export inherited from a parent shell.
 | `jit-direct-binds` | `CRATONVM_DBG_JIT_DIRECT_BINDS` |
 | `jit-ea` | `CRATONVM_DBG_JIT_EA` |
 | `ir-graph` | `CRATONVM_DBG_IR_GRAPH` |
+| `ir-sink` | `CRATONVM_DBG_IR_SINK` |
 | `zgc-target` | `CRATONVM_DBG_ZGC_TARGET` |
 | `zgc-high` | `CRATONVM_DBG_ZGC_HIGH` |
 | `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
@@ -581,7 +583,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-352 tokens.
+366 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -698,6 +700,11 @@ export inherited from a parent shell.
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
+| `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
+| `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
+| `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
+| `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
+| `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -824,6 +831,10 @@ export inherited from a parent shell.
 | `descriptor-facts` | `CRATONVM_JIT_NO_DESCRIPTOR_FACTS` |
 | `backedge-poll-gate` | `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` |
 | `field-fast-path` | `CRATONVM_JIT_NO_FIELD_FAST_PATH` |
+| `field-addr-elide` | `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE` |
+| `arraylength-fast` | `CRATONVM_JIT_NO_ARRAYLENGTH_FAST` |
+| `ref-array-fast` | `CRATONVM_JIT_NO_REF_ARRAY_FAST` |
+| `system-class-latch` | `CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_INVOKE_FAST_DOOR / CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `door-receiver-record` | `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD` |
@@ -865,6 +876,11 @@ export inherited from a parent shell.
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
 | `fc-fast-io` | `CRATONVM_FC_FAST_IO` |
+| `sc-scratch` | `CRATONVM_SC_SCRATCH` |
+| `sc-bb-slots` | `CRATONVM_SC_BB_SLOTS` |
+| `sel-ready-cache` | `CRATONVM_SEL_READY_CACHE` |
+| `sel-fast-keys` | `CRATONVM_SEL_FAST_KEYS` |
+| `sc-preresolved` | `CRATONVM_SC_PRERESOLVED` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
@@ -940,7 +956,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-141 tokens.
+142 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1085,6 +1101,7 @@ export inherited from a parent shell.
 | `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
 | `noflag-deposit-skip-jit-scan` | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` |
 | `identity-hash-evict` | `CRATONVM_IDENTITY_HASH_EVICT` |
+| `array-autobox-latch` | `CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH` |
 
 ## `CRATONVM_REAL`
 

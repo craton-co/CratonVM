@@ -4,7 +4,7 @@
 //! WP3.5 — `java.nio.DirectByteBuffer` allocation, accounting, pooling, and
 //! Cleaner-style reclamation.
 //!
-//! Acceptance criterion (from `gaps/wildfly-ejbca-roadmap.md` §6 WP3.5):
+//! Acceptance criterion (from `wildfly-ejbca-roadmap.md` §6 WP3.5):
 //! a tight loop of `ByteBuffer.allocateDirect(4096)` for 1M iterations must
 //! keep native RSS bounded. Achieving that requires four pieces working
 //! together:
@@ -94,7 +94,7 @@ fn bits() -> &'static Bits {
 /// `DEFAULT_MAX_DIRECT_BYTES` for any caller (e.g. unit tests) that never
 /// boots a full VM and so never calls this.
 ///
-/// See fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md:
+/// See bug-h2-largeblob-direct-memory-oom.md:
 /// before this, the cap was hardcoded to 256 MiB regardless of `-Xmx`, so a
 /// `-Xmx 1g` H2 MVStore workload with genuine ~250 MiB peak direct-buffer
 /// usage (chunk writer thread) hit a ceiling HotSpot doesn't impose at the

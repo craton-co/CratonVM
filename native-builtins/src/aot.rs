@@ -965,7 +965,7 @@ static AOT_PRODUCTION: AtomicBool = AtomicBool::new(false);
 // call sites.
 //
 // See `native-builtins/tests/lock_discipline_ratchet.rs` for the ratchet and
-// `arch-2026-08-04/architecture-review-a1-a9.md` §A6 for the remaining backlog.
+// `architecture-review-a1-a9.md` §A6 for the remaining backlog.
 static AOT_CACHE_INPUT_PATH: OrderedPlMutex<Option<String>> =
     OrderedPlMutex::new(None, LockLevel::Scratch);
 static AOT_CACHE_OUTPUT_PATH: OrderedPlMutex<Option<String>> =

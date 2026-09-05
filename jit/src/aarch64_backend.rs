@@ -33,9 +33,9 @@
 //! 202 and lacks only `frem`, `drem`, `jsr`, `ret`, `wide`, `goto_w`, `jsr_w`.
 //! (`pop2`, `dup2_x1` and `dup2_x2` were on that list until the commons-math
 //! throughput fix and the `dup2_x2` fix added x64 arms for them — see
-//! `fixed-suite-bugs/bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816-FIXED.md`
+//! `bug-commonsmath-accuratemathtest-psquarepercentiletest-interpreter-throughput-cliff-20260816-FIXED.md`
 //! and
-//! `fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md`.
+//! `dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md`.
 //! `x64::tests::scan_admitted_opcodes_are_lowered_or_declared` now fails if a
 //! scan-admitted opcode ever loses its x64 arm again.)
 //!

@@ -302,7 +302,7 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
 // 10_000 distinct `Properties` objects had EVER been registered in this
 // process's lifetime, every subsequent brand-new object silently lost all
 // `put`/`getProperty` calls forever (no exception, no eviction). See
-// fixed-suite-bugs/h2-suite-bugs/bug-h2-properties-sidetable-global-cap-silent-drop-FIXED.md.
+// bug-h2-properties-sidetable-global-cap-silent-drop-FIXED.md.
 // H2's `TestAnalyzeTableTx` (10_000 connections in a loop, each constructing
 // a JDBC-properties object) crosses that watermark and starts reading back
 // empty username/password, which H2 correctly reports as "Wrong user name or
@@ -2478,7 +2478,7 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     //
     // A clone must be as CHM-less as the thing it was cloned from, and this is
     // the whole of
-    // `jdk-only/system-properties-clone-enumerates-in-a-different-order-than-its-source-20260829.md`
+    // `system-properties-clone-enumerates-in-a-different-order-than-its-source-20260829.md`
     // (retired to docs internal on 2026-08-30, so the prefix is dropped).
     // Enumeration prefers the CHM when there is one and the side-table's
     // insertion order when there is not, so building the clone a CHM the source
@@ -2902,7 +2902,7 @@ fn build_string_collection(
 /// `try_native_hashset_remove`/real bytecode rather than to the plain
 /// `native_hs_*` body. See `native_linkedhashset_remove` for the `PRESENT`
 /// sentinel mismatch that makes the difference, and the record at
-/// `fixed-suite-bugs/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
+/// `suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
 fn native_linkedhashset_retain_all(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4603,7 +4603,7 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         // back to Quartz's own default, silently wiring up `RAMJobStore`
         // instead of `LocalDataSourceJobStore` even though the
         // `spring.quartz.job-store-type=jdbc` customizer ran successfully.
-        // See fixed-suite-bugs/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
+        // See quartzautoconfigurationtests-jdbc-jobstore-not-applied-FIXED.md.
         registry.register(
             "java/util/Properties",
             "putIfAbsent",

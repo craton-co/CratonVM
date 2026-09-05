@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Craton Software Company.
 
 //! Root/identity audit regressions for the collection side tables
-//! (2026-08-01, `feature-designs/native-collections-root-audit.md`).
+//! (2026-08-01, `native-collections-root-audit.md`).
 //!
 //! Two distinct failure modes are covered here, and they want opposite fixes:
 //!

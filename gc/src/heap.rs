@@ -13,7 +13,7 @@
 //! written here. It is used symbolically throughout this file on purpose: the
 //! header has already shrunk twice, 32 -> 24 (2026-08-06) and 24 -> 16
 //! (completed 2026-08-07), and until 2026-08-07 this very paragraph still read
-//! "32 today, a shrink to 24 is mapped out in `arch-2026-07-26/header-shrink.md`"
+//! "32 today, a shrink to 24 is mapped out in `header-shrink.md`"
 //! — i.e. it was itself an instance of the staleness that document's §6.9
 //! catalogues, wrong about both the current value and the pending one. Anything
 //! below that needs the number must read the constant.
@@ -2444,7 +2444,7 @@ unsafe fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 /// tear-free (e.g. `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
 /// `firstReaderHoldCount`, published via a nearby `volatile`/CAS write to
 /// `state` — see
-/// fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+/// elasticsearch-lucene-binary-docvalues-range-hangs.md
 /// #3). Delegates to the same already-proven `read_value_atomic` helper.
 ///
 /// # Safety

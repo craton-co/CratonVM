@@ -30,7 +30,7 @@ import java.util.concurrent.CountDownLatch;
  *     `LifecycleBase.start()` — which is `synchronized` on that very object.
  *     The later lookup missed and `getContext()` returned null, so Tomcat's
  *     `TestNamingContext` died on a NullPointerException two frames away. See
- *     tomcat/testnamingcontext-contextbindings-lookup-returns-null-CLOSED.md.
+ *     testnamingcontext-contextbindings-lookup-returns-null-CLOSED.md.
  *   * Spring Boot's `TomcatWebServer` parks connectors in a
  *     `Map<Service,Connector[]>` from the same `synchronized` method. The missed
  *     lookup made `Tomcat.getConnector()` fabricate a default port-8080

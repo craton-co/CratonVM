@@ -544,8 +544,8 @@ mod loader_lookup_tests {
 /// linking, verifier hierarchy lookup) by default even though the
 /// interpreter half of the same fix was live — a production desync between
 /// three independently-read env-var copies. See
-/// `fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
-/// and `fixed-suite-bugs/loader-identity.md` for the consolidation. Flip on
+/// `hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
+/// and `loader-identity.md` for the consolidation. Flip on
 /// links an enhanced subclass to its same-loader (enhanced) supertype copy
 /// rather than the un-enhanced global one returned by `get_loaded_class_id`.
 ///
@@ -1390,6 +1390,45 @@ pub fn class_is_java_util(id: ClassId) -> Option<bool> {
     }
 }
 
+/// The `ClassId` of `java/lang/System`, or `u32::MAX` before it is defined.
+///
+/// # Why a whole static for one class
+///
+/// `op_getstatic` has to know whether the field it resolved is one of
+/// `System.out` / `err` / `in`, because those three are intercepted during
+/// bootstrap. It asked by taking a `class_manager` **read lock**, calling
+/// `get_class`, and comparing the class's name against the literal
+/// `"java/lang/System"` — on **every `getstatic` in the program**. Measured
+/// 2026-09-05, a `getstatic` + `putstatic` pair cost 86.4 ns against HotSpot's
+/// 3.45 (25x), the second-worst ratio in the interpreter's operation table.
+///
+/// This is the same trade the two lines above it already make for
+/// `is_annotation_proxy_class` and `class_is_java_util`: one name comparison
+/// on the class-DEFINITION path, which runs a few thousand times per process,
+/// buys a one-integer-compare answer on a path that runs millions of times a
+/// second.
+///
+/// `u32::MAX` is the "not defined yet" sentinel rather than `0`, because `0`
+/// is a real `ClassId`. A getstatic executed before `java/lang/System` is
+/// defined therefore compares unequal and takes the ordinary path, which is
+/// correct: there are no `System.out` reads before the class exists.
+static SYSTEM_CLASS_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Record `java/lang/System`'s id. Called once, from the definition path.
+fn note_system_class(id: ClassId) {
+    SYSTEM_CLASS_ID.store(id.as_u32(), Ordering::Relaxed);
+}
+
+/// Is `id` `java/lang/System`? One relaxed load and one compare, no lock.
+///
+/// A `false` before the class is defined is correct (see [`SYSTEM_CLASS_ID`]),
+/// and the store happens on the defining thread before any code that could
+/// read the class's fields can run.
+#[inline]
+pub fn class_is_java_lang_system(id: ClassId) -> bool {
+    SYSTEM_CLASS_ID.load(Ordering::Relaxed) == id.as_u32()
+}
+
 static ANY_DUPLICATE_CLASS_NAME: AtomicBool = AtomicBool::new(false);
 
 /// True once two distinct `ClassId`s have shared a binary name. Single
@@ -1975,7 +2014,7 @@ pub struct DefineClassOptions {
     /// by the application loader), so the resulting `$ProxyN` type-checks
     /// (`interfaceClass.isInstance(proxy)`) and `Method.invoke` against the
     /// requested interface both fail — see "Residual issue B" in
-    /// `fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
+    /// `mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
     /// (found via annotation-proxy work but is a general `CRATONVM_REAL_PROXY`
     /// bug, reproducible with a plain `Proxy.newProxyInstance` + custom
     /// `ClassLoader`, independent of annotations).
@@ -6302,7 +6341,7 @@ impl ClassManager {
                 // exposed via reflection. `RuntimeInvisibleAnnotations` carry
                 // @Retention(CLASS) types which JVMS requires NOT be visible
                 // through Class.getAnnotation / isAnnotationPresent — see
-                // gaps/gap-annotation-retention-policy.md.
+                // gap-annotation-retention-policy.md.
                 Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
@@ -9043,7 +9082,7 @@ impl ClassManager {
     /// advisory only (no `deny(warnings)` anywhere in the workspace, so this
     /// cannot break the centrally-run build) — it exists to surface the ~50
     /// remaining external call sites for follow-up migration. See
-    /// `fixed-suite-bugs/loader-identity.md` for the current per-file tally.
+    /// `loader-identity.md` for the current per-file tally.
     ///
     /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
     /// entry in `loaded_classes` linearly for each key (O(n · keys)).
@@ -9193,7 +9232,7 @@ impl ClassManager {
     /// falls through to `ClassLoader.loadClass` via
     /// `native-builtins::classloader::defining_loader_for` when this kind
     /// of lookup misses) rather than expecting this crate to resolve it.
-    /// See `fixed-suite-bugs/loader-identity.md`.
+    /// See `loader-identity.md`.
     pub fn find_class_by_name_for_loader(
         &self,
         name: &str,
@@ -9407,6 +9446,10 @@ impl ClassManager {
         }
         if name.starts_with("java/util/") {
             note_java_util_class(id);
+        }
+        // Same trade again, for `op_getstatic`'s System.out/err/in intercept.
+        if &*name == "java/lang/System" {
+            note_system_class(id);
         }
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();
@@ -10728,7 +10771,7 @@ impl ClassManager {
         // report a duplicate-define `LinkageError` where it currently mints a
         // second copy. That is arguably the JVMS-correct outcome, but it is a
         // behaviour change on the hottest path in the VM and is out of scope
-        // here — see `feature-designs/classloading-identity-audit.md`.
+        // here — see `classloading-identity-audit.md`.
         if let (Some(previous_loader_id), Some(registered_name)) =
             (previous_loader_id, registered_name)
         {
@@ -13741,7 +13784,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // one way no value-tag census can see: a `ThreadGroup` reference over a
         // `String` reference and an `int` over an `int` both type-check. The
         // L4 shadow-layout diff reported all four
-        // (`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
+        // (`jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
         //
         // The natives in `native-builtins/src/phases_late/concurrent.rs`
         // resolve these by NAME first and only fall back to a hard-coded index,
