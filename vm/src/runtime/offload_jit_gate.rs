@@ -771,58 +771,42 @@ enum ArrayWriterPolicy {
 /// method's compilation spent protecting one call site.
 ///
 /// [`CallerGateMode::CompiledHook`] is what that measurement argues for,
-/// and it works -- 9,005 kernel launches from compiled callers on the
-/// same bench, all three scenarios 27-42x better than `Block`:
+/// and it is the default since 2026-09-05 -- 9,005 kernel launches from
+/// compiled callers on the same bench, all three scenarios 27-42x
+/// better than `Block`:
 ///
 /// | | `base` | `small` | `big` |
 /// |---|---:|---:|---:|
 /// | `Block` | 358.5 | 13534.8 | 127257.4 |
 /// | `CompiledHook` | 13.2 | 358.5 | 79983.0 |
 /// | no `--gpu` | 15.4 | 28.5 | 2030.7 |
-///
-/// It is still not the default, because it fails a correctness
-/// scenario. See that variant's own comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallerGateMode {
     /// Compile the caller, and let the COMPILED dispatch helper consult
     /// the offload hook: the caller runs compiled and the site still
     /// offloads, so there is no trade left to make.
     ///
-    /// `CRATONVM_GPU_JIT_GATE_CALLERS=hook`. **Opt-in, and not the
-    /// default** -- but NOT because anything here is wrong.
+    /// Compile the caller, and let the COMPILED dispatch helper consult
+    /// the offload hook: the caller runs compiled and the site still
+    /// offloads, so there is no trade left to make. **The default since
+    /// 2026-09-05.**
     ///
-    /// `bench-gpu/runtime-stress.sh`'s `cache_coherence` fails under
-    /// this mode. The first reading of that (recorded here, and wrong)
-    /// was that the compiled-tier array barrier's deferred dirty mark
-    /// does not compose with a compiled-tier offload. Two further arms
-    /// refuted it:
+    /// It was opt-in for one day, on one scenario:
+    /// `bench-gpu/runtime-stress.sh`'s `cache_coherence` failed under
+    /// it. That was never this feature. It was a JIT miscompilation --
+    /// `wide iinc` was invisible to `find_modified_locals`, so LICM
+    /// hoisted a loop's induction variable -- and this mode was simply
+    /// the first thing that ever compiled the method, because
+    /// [`CallerGateMode::Block`] had kept every scenario in that file
+    /// interpreted. Fixed 2026-09-05; see
+    /// `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
     ///
-    /// * `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` disables the residency
-    ///   cache outright -- and the answer is still wrong, so no cache
-    ///   is going stale.
-    /// * `--gpu-min-work 999999`, where nothing can offload at all --
-    ///   still wrong.
-    ///
-    /// And then the arm that settles it: **`cratonvm` with no `--gpu`,
-    /// JIT on, is also wrong**, while `--nojit` is right.
-    /// `GpuRuntimeStress.cacheCoherence` is miscompiled by OSR
-    /// (`CRATONVM_JIT_OSR=0` fixes it; `CRATONVM_JIT_DENY` on that one
-    /// method fixes it; denying its callees does not). That is a
-    /// pre-existing JIT defect with nothing to do with GPU offload --
-    /// see `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
-    ///
-    /// This gate was HIDING it: all three of that suite's arms avoid
-    /// compiling the method, the `--gpu` one because
-    /// [`CallerGateMode::Block`] refuses it. Turning this mode on would
-    /// expose the miscompilation to every `--gpu` run, so it stays
-    /// opt-in until the OSR defect is fixed -- and then it should
-    /// become the default, because the 27-42x is real and nothing here
-    /// is implicated in the wrong answer.
+    /// With it fixed, all seven `runtime-stress.sh` scenarios pass under
+    /// this mode, as do `jit-writer-stale.sh` and the rest.
     CompiledHook,
-    /// Refuse the caller JIT admission. The pre-2026-09-04 behaviour and
-    /// still the default -- see [`CallerGateMode::CompiledHook`] for the
-    /// scenario that keeps it that way.
-    /// `CRATONVM_GPU_JIT_GATE_CALLERS=block`, or unset.
+    /// Refuse the caller JIT admission. The pre-2026-09-05 behaviour,
+    /// kept as the control arm and as the way back.
+    /// `CRATONVM_GPU_JIT_GATE_CALLERS=block`.
     Block,
     /// Compile the caller and consult nothing: offload silently ends at
     /// every compiled site. NOT a production setting --
@@ -840,8 +824,8 @@ fn caller_gate_mode() -> CallerGateMode {
             .as_deref()
         {
             Some("0") => CallerGateMode::Off,
-            Some("hook") => CallerGateMode::CompiledHook,
-            _ => CallerGateMode::Block,
+            Some("block") => CallerGateMode::Block,
+            _ => CallerGateMode::CompiledHook,
         }
     })
 }
