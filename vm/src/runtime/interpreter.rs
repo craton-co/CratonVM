@@ -7225,8 +7225,8 @@ fn execute_frame_from_index(
                     // message.
                     if let Some(zgc) = fast_field_zgc {
                         if frame.stack.len() >= 2 {
-                            let idx_cv = frame.stack.peek_compact();
-                            let arr_cv = frame.stack.peek_compact_at(1);
+                            let (idx_cv, idx_kind) = frame.stack.peek_with_kind_at(0);
+                            let (arr_cv, arr_kind) = frame.stack.peek_with_kind_at(1);
                             if let (Some(index), Some(aptr)) =
                                 (idx_cv.as_int(), arr_cv.as_object_ptr())
                             {
@@ -7254,12 +7254,23 @@ fn execute_frame_from_index(
                                         continue;
                                     }
                                     // Declined. Restore both operand slots
-                                    // bit-for-bit; neither an array reference
-                                    // nor an `int` index is category-2, so the
-                                    // kind mark `push_compact` writes is the
-                                    // one they already had.
-                                    frame.stack.push_compact(arr_cv);
-                                    frame.stack.push_compact(idx_cv);
+                                    // bit-for-bit AND kind-for-kind.
+                                    //
+                                    // `push_compact` would have been correct on
+                                    // the verifier's guarantee that an `*aload`
+                                    // sees `(arrayref, int)`, neither of which
+                                    // is category-2 — but it writes
+                                    // `KIND_UNKNOWN`, and the one shape that
+                                    // guarantee excludes is exactly the one the
+                                    // kind array exists for: a collision-shaped
+                                    // `long` is bit-identical to `Value::Int(0)`
+                                    // (see `ValueStack::kinds`), so an unmarked
+                                    // one with reference-looking bits is what a
+                                    // GC root scan would relocate. Restoring a
+                                    // slot is not the place to spend a
+                                    // guarantee.
+                                    frame.stack.push_with_kind_unchecked(arr_cv, arr_kind);
+                                    frame.stack.push_with_kind_unchecked(idx_cv, idx_kind);
                                 }
                             }
                         }

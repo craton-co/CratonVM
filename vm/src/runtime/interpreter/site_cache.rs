@@ -551,9 +551,21 @@ pub mod site_stats {
     /// armed load barrier, a process that has boxed, and any element word that
     /// is neither zero nor a plausible heap pointer.
     pub const REFARR_HIT: usize = 42;
-    pub const REFARR_MISS: usize = 43;
+    /// A decline the arm could never have served: the load barrier is armed or
+    /// the process has boxed (`autobox::wrapper_exists`). Split out from the
+    /// other two because it is a PROCESS-WIDE latch, not a property of this
+    /// access — folding it in produced a census reading `miss=2000146` with no
+    /// way to tell "declined 2 M times for 2 M different reasons" from
+    /// "declined because a global says never".
+    pub const REFARR_MISS_SCREEN: usize = 43;
+    /// A decline on this receiver's shape: not a reference array, or the index
+    /// is out of bounds. The general path raises the AIOOBE.
+    pub const REFARR_MISS_SHAPE: usize = 44;
+    /// The element word is neither zero nor a plausible heap pointer, so the
+    /// three-way cold decode owns it.
+    pub const REFARR_MISS_WORD: usize = 45;
 
-    const N: usize = 44;
+    const N: usize = 46;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -579,7 +591,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={} | install: reuse={} emplace={} byvalue={} | arraylength: hit={} miss={} | aaload: hit={} miss={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={} | install: reuse={} emplace={} byvalue={} | arraylength: hit={} miss={} | aaload: hit={} miss_screen={} miss_shape={} miss_word={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -624,7 +636,9 @@ pub mod site_stats {
             COUNTS[ARRLEN_HIT].load(Ordering::Relaxed),
             COUNTS[ARRLEN_MISS].load(Ordering::Relaxed),
             COUNTS[REFARR_HIT].load(Ordering::Relaxed),
-            COUNTS[REFARR_MISS].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_SCREEN].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_SHAPE].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_WORD].load(Ordering::Relaxed),
         );
     }
 

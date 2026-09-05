@@ -981,7 +981,7 @@ pub(super) fn array_load_ref(
         return false;
     }
     if index < 0 || zgc.load_barrier_armed() || cratonvm_gc::autobox::wrapper_exists() {
-        site_stats::bump(site_stats::REFARR_MISS);
+        site_stats::bump(site_stats::REFARR_MISS_SCREEN);
         return false;
     }
     let base = arr.as_ptr() as usize;
@@ -992,16 +992,16 @@ pub(super) fn array_load_ref(
     if header.kind() != ObjectKind::Array
         || header.element_type() != ArrayElementType::Reference
     {
-        site_stats::bump(site_stats::REFARR_MISS);
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
         return false;
     }
     let index = index as usize;
     if index >= header.array_length() as usize {
-        site_stats::bump(site_stats::REFARR_MISS);
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
         return false;
     }
     let Some(offset) = index.checked_mul(cratonvm_types::narrow_oop::ref_element_size()) else {
-        site_stats::bump(site_stats::REFARR_MISS);
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
         return false;
     };
     // SAFETY: `index < length` and the stride is the one `read_prim_element`
@@ -1015,13 +1015,13 @@ pub(super) fn array_load_ref(
         match CompactValue::try_from_pointer(raw) {
             Some(cv) => cv,
             None => {
-                site_stats::bump(site_stats::REFARR_MISS);
+                site_stats::bump(site_stats::REFARR_MISS_WORD);
                 return false;
             }
         }
     } else {
         // The three-way cold decode above; not reproduced here.
-        site_stats::bump(site_stats::REFARR_MISS);
+        site_stats::bump(site_stats::REFARR_MISS_WORD);
         return false;
     };
     stack.push_compact(cv);
