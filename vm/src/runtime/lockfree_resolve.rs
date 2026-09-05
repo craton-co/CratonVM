@@ -450,17 +450,31 @@ impl SharedResolutionState {
         }
     }
 
-    /// Clear promoted invoke entries whose caller class or receiver class
-    /// matches `class_id` — used by CHA invalidation / class redefinition.
-    ///
-    /// Sweeps every shard: the key's shard is a hash of the *whole* key, so a
-    /// class's entries are deliberately spread across all of them.
-    pub fn invalidate_promoted_for_class(&self, class_id: ClassId) {
-        for shard in self.shards.iter() {
-            let mut guard = shard.map.write();
-            guard.retain(|(caller, _, _, rcv), _| *caller != class_id && *rcv != Some(class_id));
-        }
-    }
+    // There is deliberately NO class-scoped sweep beside this one.
+    //
+    // `invalidate_promoted_for_class(class_id)` lived here until 2026-09-05,
+    // documented as "used by CHA invalidation / class redefinition" and called
+    // by nothing but its own two tests. The retired
+    // `promoted-invoke-resolutions-survive-class-redefinition-20260903`
+    // write-up read that absence as a defect — a redefinition would leave
+    // promoted entries in place until the next GC cleared them wholesale — and
+    // said outright that nobody had checked `get_promoted_invoke`'s consumers
+    // before calling it one.
+    //
+    // They are checked now, and the sweep was never the mechanism. Every
+    // promoted entry carries a `RedefineGate` snapshotted on the class whose
+    // body it caches; `get_promoted_invoke` compares generations on EVERY hit
+    // and removes the entry instead of returning it. `redefine_class` bumps
+    // that counter (step 7), so the eviction is immediate and per-entry.
+    // Measured end to end against HotSpot with a `java.lang.instrument` agent
+    // (`test_classes/redefine/`), reading from a freshly started thread whose
+    // own `invoke_cache` is empty and which therefore MUST come through this
+    // map: both VMs answer with the post-redefinition body.
+    //
+    // Restoring it would also not have closed what it was imagined to close.
+    // It keyed on the CALLER and RECEIVER classes, and what goes stale under a
+    // redefinition is the DECLARING class's body — a different class in every
+    // inherited-method case, and precisely the one the gate already watches.
 }
 
 impl Default for SharedResolutionState {
@@ -577,44 +591,57 @@ mod tests {
         }
     }
 
+    /// A redefinition of the class an entry is bound to makes that entry stale,
+    /// and the next read evicts it rather than serving it.
+    ///
+    /// This replaces `t10_shared_resolution_invalidate_for_class_drops_both_ends`,
+    /// which drove `invalidate_promoted_for_class` — a function no production
+    /// path ever called, deleted above. The retired
+    /// `promoted-invoke-resolutions-survive-class-redefinition-20260903`
+    /// write-up inferred a stale-dispatch window from that absence and said, to
+    /// its credit, that nobody had looked at `get_promoted_invoke`'s consumers
+    /// yet. This is what looking finds: the eviction is per-entry, on use, and
+    /// immediate.
+    ///
+    /// The assertion that earns its place is the second one. Returning `None`
+    /// alone would leave the stale entry for every sibling thread to re-discover
+    /// and re-evict; the read path removes it, so the count goes to zero.
     #[test]
-    fn t10_shared_resolution_invalidate_for_class_drops_both_ends() {
+    fn a_redefine_generation_bump_evicts_the_promoted_entry_on_the_next_read() {
         let state = SharedResolutionState::new();
-        // Caller = class 10, receiver = class 30.
-        let k1: PromotedInvokeKey = (ClassId::new(10), 7, false, Some(ClassId::new(30)));
-        // Caller = class 40, receiver = class 30 (so invalidating 30 drops it).
-        let k2: PromotedInvokeKey = (ClassId::new(40), 7, false, Some(ClassId::new(30)));
-        // Caller = class 50, receiver = class 60 (untouched by invalidation).
-        let k3: PromotedInvokeKey = (ClassId::new(50), 7, false, Some(ClassId::new(60)));
+        // The handle `ClassManager::class_redefine_generation_handle` hands to
+        // the populate path for the DECLARING class, and that `redefine_class`
+        // bumps with `Release` in its step 7.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let key: PromotedInvokeKey = (ClassId::new(10), 7, false, Some(ClassId::new(30)));
         state.insert_promoted_invoke(
-            k1,
+            key,
             CachedInvokeTarget::VirtualBytecode {
                 receiver_class_id: ClassId::new(30),
                 cached: sample_bytecode_method(30),
-                gate: crate::classloading::resolution::RedefineGate::never_stale(),
+                gate: crate::classloading::resolution::RedefineGate::snapshot(
+                    std::sync::Arc::clone(&counter),
+                ),
             },
         );
-        state.insert_promoted_invoke(
-            k2,
-            CachedInvokeTarget::VirtualBytecode {
-                receiver_class_id: ClassId::new(30),
-                cached: sample_bytecode_method(30),
-                gate: crate::classloading::resolution::RedefineGate::never_stale(),
-            },
+        assert!(
+            state.get_promoted_invoke(&key).is_some(),
+            "a fresh entry is served"
         );
-        state.insert_promoted_invoke(
-            k3,
-            CachedInvokeTarget::VirtualBytecode {
-                receiver_class_id: ClassId::new(60),
-                cached: sample_bytecode_method(60),
-                gate: crate::classloading::resolution::RedefineGate::never_stale(),
-            },
+        assert_eq!(state.promoted_invoke_count(), 1);
+
+        // `class_manager::redefine_class` step 7, in one line.
+        counter.fetch_add(1, std::sync::atomic::Ordering::Release);
+
+        assert!(
+            state.get_promoted_invoke(&key).is_none(),
+            "the pre-redefinition target must not be served"
         );
-        state.invalidate_promoted_for_class(ClassId::new(30));
-        assert!(state.get_promoted_invoke(&k1).is_none());
-        assert!(state.get_promoted_invoke(&k2).is_none());
-        // k3 (class 60 / caller 50) must survive.
-        assert!(state.get_promoted_invoke(&k3).is_some());
+        assert_eq!(
+            state.promoted_invoke_count(),
+            0,
+            "and the stale entry is evicted on detection, not left until the next GC"
+        );
     }
 
     /// Wholesale clear empties the live cache.
@@ -788,7 +815,10 @@ mod tests {
 
         // A miss must not be memoized as a negative anywhere: after
         // invalidation the same key simply re-misses and can be re-promoted.
-        state.invalidate_promoted_for_class(ClassId::new(1));
+        // (Was `invalidate_promoted_for_class(ClassId::new(1))`; the wholesale
+        // clear is the same operation on a map holding one key, and it is the
+        // only invalidation entry point this type still has.)
+        state.invalidate_promoted();
         assert!(state.get_promoted_invoke(&key).is_none());
         state.insert_promoted_invoke(
             key,
