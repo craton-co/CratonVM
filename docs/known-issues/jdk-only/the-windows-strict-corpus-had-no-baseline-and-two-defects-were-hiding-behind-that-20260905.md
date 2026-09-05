@@ -316,32 +316,37 @@ JNI coverage back off.
 
 ## 7. The three suite arms on the merged tree, and the census nobody had taken here
 
-Landing protocol §5 step 2, run on a release build of the tree with
-`origin/dev` (67 commits) merged in — Windows, JDK 25:
+Landing protocol §5 step 2, run twice on release builds of the merged tree —
+Windows, JDK 25. The second is the tree that lands.
 
 ```text
-CRATONVM_ARGS=--jdk-only   129 passed, 1 failed   (RMapGcStress)
-SUITE=all                  130 passed, 0 failed
-SUITE=core                  90 passed, 0 failed
+                          dev merged at aeaaf87e9      dev merged at e8e68a486
+CRATONVM_ARGS=--jdk-only   129 passed, 1 failed         131 passed, 0 failed
+SUITE=all                  130 passed, 0 failed         131 passed, 0 failed
+SUITE=core                  90 passed, 0 failed          91 passed, 0 failed
 ```
 
-`RMapGcStress` is the shape `the-suite-ab-that-was-the-harness-20260902.md`
-already adjudicated, reproduced here on a different platform: it fails under
-concurrency and **passes alone**, in the same mode, on the same binary
+**Both columns are reported, and the left one is the more useful.** Its single
+failure, `RMapGcStress`, is the shape
+`the-suite-ab-that-was-the-harness-20260902.md` already adjudicated, reproduced
+here on a platform that page never ran on: it fails under concurrency and
+**passes alone**, in the same mode, on the same binary
 (`ONLY="RMapGcStress" CRATONVM_ARGS=--jdk-only` → `1 passed, 0 failed`). It also
-passed in `SUITE=all`, which schedules the identical 130 vectors and differs
-only in the flag — so the strict arm is not what fails it.
+passed in `SUITE=all`, which schedules the identical vectors and differs only in
+the flag. Then it passed in every arm of the next run without anything being
+done to it. A green second run is not evidence that it is fixed; it is the same
+intermittent, and quoting only the right-hand column would hide that.
 
 The strict arm prints its own census, and this is the first time it has been
-taken on Windows. Over 129 vectors, union by triple:
+taken on Windows. Over 131 vectors, union by triple:
 
 ```text
-native-shadows-bytecode   1490 native-won   ·   480 bytecode-won
+native-shadows-bytecode   1494 native-won   ·   483 bytecode-won
                                                 (27 of those NEVER native — the
-                                                 contract working; 453 also ran
-                                                 the native in another vector)
+                                                 contract working; the rest also
+                                                 ran the native in another vector)
 synthetic-native-registered  1645
-interpreter_shadow_unenforced 11264
+interpreter_shadow_unenforced 11376
 compatibility_classes            0
 saturation: none — every bounded collection reported truncated: false
 ```
@@ -350,7 +355,7 @@ saturation: none — every bounded collection reported truncated: false
 so it is a total rather than a floor. That is the definition-of-done predicate,
 which `the-definition-of-done-run-on-the-three-real-workloads-20260828.md`
 established on five workloads **on Linux**. It holds on this platform too, on
-130 vectors. It is not the DoD itself — none of those three workloads is checked
+131 vectors. It is not the DoD itself — none of those three workloads is checked
 out here — but it is the predicate, on a platform where it had never been read.
 
 ---
