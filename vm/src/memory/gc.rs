@@ -1136,6 +1136,7 @@ pub fn update_all_roots(
             }
         }
         None => {
+            crate::memory::roots::note_static_slot_fallback();
             let mut statics = shared.classes.statics.write();
             for fields in statics.values_mut() {
                 for val in fields.iter_mut() {

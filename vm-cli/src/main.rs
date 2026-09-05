@@ -276,6 +276,26 @@ fn maybe_dump_shutdown_reports() {
                     }
                 }
             }
+            // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
+            // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
+            // usual reason: `slots=0` alone cannot distinguish the kill switch
+            // being set, the scan/fix-up pairing being broken so every
+            // collection re-walks every static the old way, and a workload that
+            // simply has no static reference fields. `fallbacks` tells the
+            // first two from the third.
+            //
+            // Neither number says the recorded list was COMPLETE. Only
+            // `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` answers that, and no counter
+            // can stand in for it -- a list missing a slot looks identical here.
+            {
+                let (slots, fallbacks) =
+                    cratonvm_vm::memory::roots::static_root_slot_counts();
+                if slots != 0 || fallbacks != 0 {
+                    eprintln!(
+                        "[cratonvm] static root slots: patched={slots} full-walk-fallbacks={fallbacks}"
+                    );
+                }
+            }
             // TLAB object SHAPES. The pair plus the bytes, because "compact=0"
             // means either that `CRATONVM_COMPACT_TLAB_ALLOC` is off or that no
             // allocated class has a registered layout, and those are different

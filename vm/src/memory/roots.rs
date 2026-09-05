@@ -316,6 +316,41 @@ pub fn static_root_slots_enabled() -> bool {
     })
 }
 
+/// Static ref slots recorded across the process, and the fix-ups that had to
+/// fall back to the full walk because there were none to take.
+///
+/// # Why the pair, and why it is not enough on its own
+///
+/// `slots=0` has two meanings that call for opposite next steps: the kill
+/// switch is set (or something broke the scan/fix-up pairing, and every
+/// collection is doing the old full walk), or this workload simply has no
+/// static reference fields. `fallbacks` separates them — a run with
+/// `slots=0 fallbacks=N` did N collections the old way, and a run with
+/// `slots=0 fallbacks=0` never collected at all.
+///
+/// Neither number says whether the recorded slots were COMPLETE. That is the
+/// verifier's job (`CRATONVM_DBG_STATIC_SLOT_VERIFY=1`), and no counter can
+/// stand in for it: a list that is missing a slot is indistinguishable here
+/// from one that is not.
+static STATIC_SLOTS_RECORDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static STATIC_SLOT_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(slots_recorded, full_walk_fallbacks)` — see [`STATIC_SLOTS_RECORDED`].
+pub fn static_root_slot_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        STATIC_SLOTS_RECORDED.load(Ordering::Relaxed),
+        STATIC_SLOT_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// Count a fix-up that found no recorded list and re-walked every static.
+pub fn note_static_slot_fallback() {
+    STATIC_SLOT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Begin recording static ref slots for a fresh scan.
 fn reset_static_ref_slots() {
     STATIC_REF_SLOTS.with(|c| {
@@ -345,6 +380,7 @@ pub fn take_static_ref_slots() -> Option<Vec<usize>> {
         if v.is_empty() {
             return None;
         }
+        STATIC_SLOTS_RECORDED.fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Some(std::mem::take(&mut *v))
     })
 }
