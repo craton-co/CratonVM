@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const CLASS_NAME: &str = "DisReadFullyPinProbe";
 
@@ -209,24 +209,36 @@ fn data_input_stream_read_fully_reloads_pinned_byte_array() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().expect("spawn cratonvm");
-    let start = Instant::now();
-    let timeout = Duration::from_secs(90);
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("DisReadFullyPinProbe timed out after {timeout:?}");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-
-    let out = child.wait_with_output().expect("wait_with_output");
+    let child = cmd.spawn().expect("spawn cratonvm");
+    // DRAIN THE PIPES WHILE WAITING. A `try_wait` poll loop over piped stdio
+    // deadlocks the moment the child outruns the pipe: it blocks in `write`,
+    // never exits, and the loop reports a TIMEOUT for a process that finished
+    // its work in seconds.
+    //
+    // Which is what happened here, deterministically, on LINUX only:
+    // 10 runs, 10 timeouts at 90 s, while the identical command run from a
+    // shell passes in seconds. The release binary emits one `[GC] zgc-pause`
+    // line per cycle and this probe drives 256 of them — 92 210 bytes of
+    // stderr against a 65 536-byte pipe. The debug binary writes 150 bytes,
+    // which is why the same test is green on a debug build and why chasing
+    // this with the wrong binary reads as "the probe is fine".
+    //
+    // `common::wait_draining` exists for exactly this and carries its own
+    // regression test (`wait_draining_survives_a_child_that_outruns_the_pipe`).
+    // Its doc states the rule this harness broke: a test must not depend on the
+    // process it drives staying under 64 KiB.
+    let timed = common::wait_draining(child, Duration::from_secs(90));
+    let out = timed.output;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !timed.timed_out,
+        "DisReadFullyPinProbe timed out after 90s
+stdout:
+{stdout}
+stderr:
+{stderr}"
+    );
     assert_eq!(
         out.status.code(),
         Some(0),
