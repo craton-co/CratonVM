@@ -1499,6 +1499,11 @@ pub struct GcFlags {
     pub dbg_sweep_edges: bool,
     /// `CRATONVM_DBG_SWEEP_ZERO`
     pub dbg_sweep_zero: bool,
+    /// `CRATONVM_GC_LATE_RESOLVE_DROPPED` -- also run the late grid-resolution
+    /// pass over the candidates `mark_young` DROPPED as free/gap space inside a
+    /// proved anchor span, not only the ones it left unresolved. Over-retention
+    /// only. Default off; see `gen_heap.rs` for the defect it was opened for.
+    pub late_resolve_dropped: bool,
     /// `CRATONVM_DBG_WATCHREF`
     pub dbg_watchref: bool,
     /// `CRATONVM_DBG_WATCH_CELL` — hex address to watch, `0` when disabled.
@@ -1682,6 +1687,7 @@ impl GcFlags {
             dbg_sweep_census: present(src, "CRATONVM_DBG_SWEEP_CENSUS"),
             dbg_sweep_edges: present(src, "CRATONVM_DBG_SWEEP_EDGES"),
             dbg_sweep_zero: present(src, "CRATONVM_DBG_SWEEP_ZERO"),
+            late_resolve_dropped: present(src, "CRATONVM_GC_LATE_RESOLVE_DROPPED"),
             dbg_watchref: present(src, "CRATONVM_DBG_WATCHREF"),
             dbg_watch_cell: hex_addr_or_zero(src, "CRATONVM_DBG_WATCH_CELL"),
             dbg_youngstate: present(src, "CRATONVM_DBG_YOUNGSTATE"),

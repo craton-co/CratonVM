@@ -735,6 +735,15 @@ static COMPACT_DOWNGRADE_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// phase let through; they are retained instead. See the invariant in
 /// `sweep_young_non_moving`.
 pub static ROOT_IN_DEAD_SPANS: AtomicU64 = AtomicU64::new(0);
+
+/// Object bases recovered by the `CRATONVM_GC_LATE_RESOLVE_DROPPED` arm --
+/// candidates `mark_young` dropped as free/gap space inside a PROVED span that
+/// the arena object grid then said were real objects. Every one is a live
+/// object the default arm would have freed, so a non-zero reading here is the
+/// anchor oracle's proof being wrong, not this arm being generous.
+pub static LATE_RESOLVE_DROPPED_RECOVERED: AtomicU64 = AtomicU64::new(0);
+/// Bounded report counter for [`LATE_RESOLVE_DROPPED_RECOVERED`].
+static LATE_RESOLVE_DROPPED_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// Bounded report counter for [`ROOT_IN_DEAD_SPANS`].
 static ROOT_IN_DEAD_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// H2-CID0-BLOCKED — the benign half of the same measurement: a root pointing
@@ -10257,6 +10266,72 @@ impl GenerationalHeap {
             }
         }
         report_phase("mark-late-resolve");
+
+        // EXPERIMENT (`CRATONVM_GC_LATE_RESOLVE_DROPPED=1`, default OFF): give
+        // the DROPPED candidates the same late-resolution pass the UNRESOLVED
+        // ones get.
+        //
+        // `mark_young` has two ways to decline a conservative candidate the
+        // object grid does not cover, and only one of them has a second chance.
+        // A candidate OUTSIDE every proved span is recorded as `unresolved` and
+        // re-resolved above. A candidate INSIDE a proved span is `dropped`: the
+        // anchor walk was verified end to end, so an address it does not cover
+        // "is free/gap space -- not an object", and the closure returns having
+        // marked nothing and recorded nothing for the pass above to look at.
+        //
+        // That reasoning is sound exactly as far as the proof is. This arm
+        // exists to price the assumption rather than argue with it: run the
+        // dropped addresses through the SAME grid resolver, and mark whatever
+        // it says is a real object base. If every proof holds, the resolver
+        // finds no base, nothing is marked, and the arm is free; if one does
+        // not, the object is retained instead of freed. Over-retention only --
+        // it can never free something the default arm keeps.
+        //
+        // Opened for `io.netty.util.internal.ObjectCleanerTest`, which reclaims
+        // a live lambda in its FIRST young collection under both
+        // `-XX:+UseGenerationalGC` and `-XX:+UseG1GC` (5/5 each) and never under
+        // ZGC, with `[sweep-edges]` reporting `root=11 ... REACHABLE NODE WILL
+        // BE SWEPT` in 10 of 10 failing runs and `root=0` in the one that
+        // passed. Every other explanation has been measured and refused -- see
+        // the known-issues page. This is the one path left by which an address
+        // the sweep-edges scan still sees as a root becomes an object the sweep
+        // frees.
+        if gc_flags().late_resolve_dropped && !dropped_snapshot.is_empty() {
+            let (bases, leftover, _interior) = resolve_candidate_bases(
+                from_base,
+                used_bytes,
+                &exact_skips,
+                &dropped_snapshot,
+            );
+            let recovered = bases.len();
+            for base in bases {
+                mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist, "late-dropped");
+            }
+            if !worklist.is_empty() {
+                crate::young_mark::drain_parallel(
+                    std::mem::take(&mut worklist),
+                    mark_threads,
+                    |addr, work| scan_young_object(addr, &mark_ctx, &side_bits, work),
+                );
+            }
+            if recovered > 0 || !leftover.is_empty() {
+                LATE_RESOLVE_DROPPED_RECOVERED.fetch_add(recovered as u64, Ordering::Relaxed);
+                let n = LATE_RESOLVE_DROPPED_REPORTS.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    tracing::warn!(
+                        target: "cratonvm::gc::guard",
+                        dropped = dropped_snapshot.len(),
+                        recovered_bases = recovered,
+                        still_unresolvable = leftover.len(),
+                        "young non-moving sweep: a candidate the anchor oracle dropped as \
+                         free/gap space INSIDE a proved span resolved to a real object base \
+                         after all. The proof was wrong, or the span was not the one the \
+                         candidate is in. Marked rather than freed.",
+                    );
+                }
+            }
+        }
+        report_phase("mark-late-resolve-dropped");
 
         // Sorted view of the side mark set for O(1)-amortized lockstep checks
         // in the linear walks below (same pattern as the free-block skip).
