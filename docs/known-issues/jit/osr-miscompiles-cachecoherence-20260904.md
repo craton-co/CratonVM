@@ -1,95 +1,150 @@
-# OSR miscompiles `GpuRuntimeStress.cacheCoherence` — and the GPU gate was hiding it
+# OSR: a strided loop's stored VALUE is computed once and reused
 
-**Status:** open, reproducible, unrelated to GPU offload.
-**Found:** 2026-09-04, while investigating what looked like a defect in
-the compiled-caller offload hook. It was not that.
+**Status:** open, root-caused to the emitted code, not yet fixed.
+**Reproducer:** `test_classes/jit/OsrStridedValue.java` (self-contained,
+no GPU, no `--gpu`).
+**Found:** 2026-09-04, chasing what looked like a GPU offload defect. It
+was not one.
+
+## The defect, in one line
+
+In an OSR-compiled body, a strided loop whose stored value is an
+expression over the induction variable emits that expression **once**;
+subsequent iterations advance the index and re-read the value from the
+frame slot the first iteration wrote.
 
 ## Repro
 
 ```bash
-CV=target-gpu/release/cratonvm.exe   # or any build; --gpu is NOT needed
-JDK=<jdk25>
-TG=test_classes/gpu
-
-"$JDK/bin/javac" -d "$TG" test_classes/gpu/GpuRuntimeStress.java
-"$CV" --java-home "$JDK" -cp "$TG" GpuRuntimeStress 2 65536
+javac -d test_classes/jit test_classes/jit/OsrStridedValue.java
+cratonvm --java-home <jdk25> -cp test_classes/jit --nojit OsrStridedValue 65536
+cratonvm --java-home <jdk25> -cp test_classes/jit         OsrStridedValue 65536
 ```
 
-| arm | `cache_coherence` |
-|---|---|
-| HotSpot | `-6705490297358015087` |
-| `cratonvm --nojit` | `-6705490297358015087` |
-| **`cratonvm` (JIT on, no `--gpu`)** | **`-8633255346386885231`** |
-| `cratonvm CRATONVM_JIT_OSR=0` | `-6705490297358015087` |
-| `cratonvm CRATONVM_JIT_DENY=GpuRuntimeStress.cacheCoherence` | `-6705490297358015087` |
-
-Denying only `cacheCoherence` fixes it; denying `scale`, `sum` or `mix`
-does not. `CRATONVM_JIT_OSR=0` fixes it; `CRATONVM_JIT_IR_ENABLE=0` and
-`CRATONVM_JIT_OSR_DEAD_LOCALS=0` do not.
-
-**So: the OSR compilation of `cacheCoherence` is wrong.** One method,
-one tier, no GPU.
-
-## The method
-
 ```java
-static long cacheCoherence(int n) {
-    int[] in = new int[n];
-    int[] out = new int[n];
-    for (int i = 0; i < n; i++) in[i] = i % 1013;
-    long h = 0;
-    for (int round = 0; round < 12; round++) {
-        scale(in, out);
-        h = mix(h, sum(out));
-        in[round] = 999_000 + round;
-        for (int i = round; i < n; i += 1024) in[i] = i ^ round;
-        if (round == 6) {
-            for (int i = 0; i < n; i++) in[i] = (i * 7 + round) % 4099;
-        }
+for (int round = 0; round < 12; round++) {
+    scale(in, out);                       // a call is REQUIRED to trigger it
+    h = mix(h, sum(out));
+    for (int i = round; i < n; i += 1024) {
+        justRound[i]  = round;            // correct
+        iPlusRound[i] = i + round;        // WRONG
+        in[i]         = i ^ round;        // WRONG
     }
-    return h;
 }
 ```
 
-Three nested loop shapes in one method, an outer loop carrying a `long`
-accumulator, a strided inner loop whose start depends on the outer
-induction variable, and a conditional third loop entered once. The
-answer is a hash of every round, so any one wrong element anywhere
-changes it — which is why this is a good detector and a poor localiser.
+Sampling the addresses the last round (`round == 11`) wrote:
 
-## Why nothing caught it
+```
+            addresses 11, 1035, 2059, 3083, 4107, 5131
+--nojit   round    11 11 11 11 11 11        <- correct
+          i+round  22 1046 2070 3094 4118 5142
+          i^round  0 1024 2048 3072 4096 5120
+jit       round    11 11 11 11 11 11        <- correct
+          i+round  22 22 22 22 22 22        <- frozen at i = 11
+          i^round  0 0 0 0 0 0              <- frozen at i = 11
+```
 
-`bench-gpu/runtime-stress.sh` runs three arms, and **not one of them
-compiles this method**:
+The **addresses are right** and the **values are frozen at the first
+iteration's `i`**. `round` is right because it genuinely is
+loop-invariant.
 
-* HotSpot — the oracle.
-* `cratonvm --nojit` — the control, interpreted by construction.
-* `cratonvm --gpu` — the arm under test, where
-  `runtime::offload_jit_gate` **refuses to compile** `cacheCoherence`:
-  it both writes a primitive array and calls the offload-eligible kernel
-  `scale`, so both of that gate's reasons fire.
+## In the emitted code
 
-The GPU gate was masking a JIT correctness bug. That is the general
-lesson and it is worth more than this one defect: a gate that keeps
-methods interpreted removes them from every differential suite that runs
-the compiled tier only through that gate.
+`CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=OsrStridedValue.body`.
+`r12` is `i`, `r13` is `round`:
 
-It surfaced because `CRATONVM_GPU_JIT_GATE_CALLERS=hook`
-(`docs/known-issues/perf/gpu-compiled-caller-offload-hook-20260904.md`)
-lets such a caller compile for the first time. That mode is opt-in, so
-nothing regressed — but the reason it is opt-in is now THIS defect, not
-anything wrong with the hook.
+```
+138d  mov  rax, r13              ; round
+139a  mov  rax, [rbp-80h]        ; the value expression's `i` operand
+139e  xor  eax, ecx              ;   i ^ round
+13a3  mov  [rbp-80h], rax        ; -> slot
+13a7  mov  [rbp-78h], rax        ; -> slot
+      ... guard ...
+13cc  mov  rdx, r13              ; justRound[i] = round      RECOMPUTED
+13d3  mov  rax, [rbp-70h]        ; iPlusRound value FROM SLOT
+1401  mov  rax, [rbp-78h]        ; in value FROM SLOT
+142f  add  r12d, 400h            ; i += 1024
+      ... guard ...
+145a  mov  rdx, r13              ; justRound[i] = round      RECOMPUTED
+1461  mov  rax, [rbp-70h]        ; iPlusRound value FROM SLOT  <-- stale
+148f  mov  rax, [rbp-78h]        ; in value FROM SLOT          <-- stale
+14bd  add  r12d, 400h
+```
 
-## Next step
+### The back edge names the bug
 
-Narrow inside the method. The three loops can be bisected by editing a
-copy of the fixture — drop the `round == 6` loop, then the strided loop,
-then the single-element store — and re-running each against `--nojit`.
-`CRATONVM_JIT_OSR_SINGLE_PC` and the `CRATONVM_DBG_OSR_*` family will
-say which back edge the OSR entry bound to, which is the other half of
-the question.
+```
+16bc  jmp 0x...13AB
+```
 
-Worth checking first whether the strided loop's `i += 1024` with a
-non-zero start (`i = round`) is the trigger: an OSR entry into a loop
-whose induction variable did not start at zero is the least-travelled
-shape here.
+The loop's back edge targets **`13ab`** — the guard — which is *after*
+the value computation at `138d`. So this is **not** an unroll that
+dropped a copy: the value expressions are emitted **above the loop's
+back-edge target**, i.e. outside the loop, and the body from `13ab`
+onward never recomputes them. Every iteration replays the slots the
+pre-loop code wrote once.
+
+That makes it a **label placement** problem: the back-edge target for
+this loop is bound past the first expression of the loop body, so the
+first body expression is executed exactly once, on fall-through.
+
+Note also `139a`/`13a3`: the `xor` reads and writes the *same* slot, so
+that slot is not a stable home for `i` either.
+
+`iPlusRound`'s slot (`-70h`) is never written inside the loop at all —
+its value is produced before the loop and only read within it.
+
+## What it is NOT — every one of these was tested and refuted
+
+| suspect | switch | result |
+|---|---|---|
+| GPU offload / the residency cache | `--gpu` absent entirely | still wrong |
+| the compiled-tier array barrier | `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` | still wrong |
+| IR loop-invariant code motion | `CRATONVM_JIT_LICM=0` | still wrong |
+| IR loop unrolling | `CRATONVM_JIT_UNROLL=0` | still wrong |
+| IR affine strength reduction | `CRATONVM_JIT_REASSOC=0` | still wrong |
+| OSR frame-slot seeding | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS=0/1` | still wrong |
+| OSR dead-local masking | `CRATONVM_JIT_OSR_DEAD_LOCALS=0`, `..._DEAD_MASK_BLANKET=0` | still wrong |
+| OSR single-pc binding | `CRATONVM_JIT_OSR_SINGLE_PC=1` | still wrong |
+| **OSR itself** | `CRATONVM_JIT_OSR=0` | **correct** |
+| **that one method** | `CRATONVM_JIT_DENY=...body` | **correct** |
+
+No IR-tier optimisation switch moves it, and the emitted idiom
+(`add r12d,400h`, simulated-stack spills through `[rbp-0B0h]`) is the
+single-pass backend's. So this is the **single-pass OSR** path.
+
+Start at whatever binds the back-edge target for a counted loop in
+`jit/src/x64/bytecode_walk.rs` under an OSR compile, and ask why it
+lands one expression late. The three-way trigger (a call in the OUTER
+body, stride > 1, a value expression over the IV) most likely selects
+which pc the loop head is recorded at.
+
+## Minimal trigger
+
+Bisected from `GpuRuntimeStress.cacheCoherence` by deletion. All three
+are required:
+
+* a **call** in the outer loop body (`scale(in, out)`) — remove it and
+  the answer is correct;
+* a **stride greater than 1** — `i += 1` is correct, `i += 1024` is not;
+* a stored value that is an **expression over the induction variable** —
+  `in[i] = 5` is correct, `in[i] = i` is correct, `in[i] = i + round` and
+  `in[i] = i ^ round` are not.
+
+Neither the loop's start value (`i = round` vs `i = 0` vs `i = h & 7`)
+nor its bound (`n` vs a literal) matters; both were tested.
+
+## Why no suite caught it
+
+`bench-gpu/runtime-stress.sh` ran three arms and **none of them compiled
+the method**: HotSpot, `cratonvm --nojit` (interpreted by construction),
+and `cratonvm --gpu`, where `runtime::offload_jit_gate` refuses to
+compile every scenario in that file — they all write a primitive array
+or call an offload-eligible kernel, which is both of that gate's
+reasons.
+
+A fourth **compiled CPU arm** was added on 2026-09-04 and is what now
+reports this. The general lesson is worth more than the defect: a gate
+that keeps methods interpreted removes them from every differential
+suite that reaches the compiled tier only through that gate.
