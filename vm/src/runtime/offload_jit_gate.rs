@@ -789,28 +789,35 @@ enum CallerGateMode {
     /// offloads, so there is no trade left to make.
     ///
     /// `CRATONVM_GPU_JIT_GATE_CALLERS=hook`. **Opt-in, and not the
-    /// default**, on one measurement:
-    /// `bench-gpu/runtime-stress.sh`'s `cache_coherence` scenario FAILS
-    /// under it (`control=-6705490297358015087
-    /// gpu=-8633255346386885231`), and passes under every other arm.
+    /// default** -- but NOT because anything here is wrong.
     ///
-    /// What the scenario needs to fail is a method that BOTH writes a
-    /// primitive array from compiled code AND offloads from compiled
-    /// code -- `cacheCoherence` does its host writes inline, in the same
-    /// method as the `scale(in, out)` call. Two switches localise it and
-    /// neither is the retirement policy:
+    /// `bench-gpu/runtime-stress.sh`'s `cache_coherence` fails under
+    /// this mode. The first reading of that (recorded here, and wrong)
+    /// was that the compiled-tier array barrier's deferred dirty mark
+    /// does not compose with a compiled-tier offload. Two further arms
+    /// refuted it:
     ///
-    /// * `CRATONVM_GPU_JIT_ARRAY_WRITERS=refuse` (writers stay
-    ///   interpreted, so their stores invalidate the residency cache
-    ///   directly) -- PASSES.
-    /// * `CRATONVM_GPU_MIN_WORK_GIVEUP=0` (never retire a site) --
-    ///   still FAILS.
+    /// * `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` disables the residency
+    ///   cache outright -- and the answer is still wrong, so no cache
+    ///   is going stale.
+    /// * `--gpu-min-work 999999`, where nothing can offload at all --
+    ///   still wrong.
     ///
-    /// So the compiled-tier array barrier's deferred dirty mark and the
-    /// compiled-tier offload do not compose, and that is not yet
-    /// root-caused. The 27-42x this mode is worth is not worth shipping
-    /// a wrong answer for, so it waits behind a flag with the repro
-    /// written down.
+    /// And then the arm that settles it: **`cratonvm` with no `--gpu`,
+    /// JIT on, is also wrong**, while `--nojit` is right.
+    /// `GpuRuntimeStress.cacheCoherence` is miscompiled by OSR
+    /// (`CRATONVM_JIT_OSR=0` fixes it; `CRATONVM_JIT_DENY` on that one
+    /// method fixes it; denying its callees does not). That is a
+    /// pre-existing JIT defect with nothing to do with GPU offload --
+    /// see `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+    ///
+    /// This gate was HIDING it: all three of that suite's arms avoid
+    /// compiling the method, the `--gpu` one because
+    /// [`CallerGateMode::Block`] refuses it. Turning this mode on would
+    /// expose the miscompilation to every `--gpu` run, so it stays
+    /// opt-in until the OSR defect is fixed -- and then it should
+    /// become the default, because the 27-42x is real and nothing here
+    /// is implicated in the wrong answer.
     CompiledHook,
     /// Refuse the caller JIT admission. The pre-2026-09-04 behaviour and
     /// still the default -- see [`CallerGateMode::CompiledHook`] for the
