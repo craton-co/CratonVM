@@ -170,7 +170,10 @@ errors and no harness-blindness flags. That suite is a HotSpot differential —
 a vector passes only when CratonVM's output matches the oracle's — so it is
 the right gate for a change that alters how a field is read.
 
-**Final gates, whole branch.** `regression-suite/run.sh` on the finished
+**Final gates, whole branch (re-run after the two follow-ups).** `difftest
+gate` clean; regression suite **90/90 default, 90/90 G1**.
+
+**Final gates, first pass.** `regression-suite/run.sh` on the finished
 binary: **90/90 on the default collector and 90/90 under
 `--XX:UseGc G1`**. And `cratonvm-difftest gate --corpus difftest/seeds`:
 **clean, exit 0**, across `jit-on`, `nojit` and `interp-decoded`. That last
