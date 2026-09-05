@@ -1,6 +1,6 @@
-# Client-side blocking `connect` stalls after a few dozen connections — Windows only
+# Every blocking `connect` re-resolves the destination hostname, and Windows stalls after a few dozen
 
-**Status: OPEN, characterised 2026-09-05.** Found while building F3's
+**Status: ROOT-CAUSED 2026-09-05, fix not yet written.** Found while building F3's
 acceptance curve for `performance/socket-transfer-per-call-costs-20260904.md`.
 **Not caused by that work** — the exoneration arm is below and is one command.
 
@@ -48,7 +48,74 @@ is timing- or state-dependent, not a resource ceiling** — which means the
 original "≈128 connections" framing was an artefact of the first probe printing
 only every 32 connections. Do not go looking for a constant to raise.
 
-## The strongest lead, stated as a contradiction
+## The cause
+
+`decode_socket_address` reads the destination with
+**`InetSocketAddress.getHostString()`**, which returns the HOSTNAME whenever the
+address carries one. The already-resolved `InetAddress` the caller supplied is
+discarded, and `sc_connect_inner` hands `policy_connect` a *name*:
+
+```
+[CONNECT-DBG] dial-enter target=localhost:52708      <- not 127.0.0.1
+```
+
+`policy_connect` then calls `to_socket_addrs()` on that name, so **every single
+`connect` performs a fresh `getaddrinfo`.** HotSpot never does: an
+`InetSocketAddress` built from a resolved `InetAddress` already holds the
+address, and the JDK dials it directly.
+
+On Windows the resolver stops returning after a few dozen rapid lookups, and
+because the block is inside `to_socket_addrs` rather than the dial, the 30 s
+`connect_timeout` never applies — which is exactly the contradiction this page
+was stuck on.
+
+### The falsifier, and it fired
+
+Same binary, same server process, same minute. The ONLY difference is whether
+the destination carries a hostname:
+
+| destination | `getHostString()` yields | result |
+|---|---|---|
+| `InetAddress.getLoopbackAddress()` | `localhost` | **stalls at connect #43** |
+| `InetAddress.getByName("127.0.0.1")` | `127.0.0.1` | **150/150 connect, RC=0** |
+
+```bash
+./target/release/cratonvm.exe -cp /tmp/p WinConnectStallProbe client <p> 150
+./target/release/cratonvm.exe -cp /tmp/p WinConnectStallProbe client <p> 150 literal
+```
+
+This also explains every earlier observation: Windows-only (Linux resolves
+`localhost` from the hosts file and does not wedge), no fixed threshold (it is
+resolver state, not a resource ceiling), unaffected by heap or TIME_WAIT, a long
+NATIVE call with no exception, and HotSpot unaffected on the same machine.
+
+## It is a throughput defect too, not only a stall
+
+Independently of the hang: **a DNS lookup on every outbound connect that
+HotSpot does not perform.** That is per-connection overhead on exactly the path
+this tree is trying to close a gap on, and it would not show up as a stall
+anywhere the resolver happens to be fast — it would just be slower than HotSpot
+for no visible reason.
+
+## Fix direction, and the trap in it
+
+Dial the address the caller already resolved instead of re-resolving its name.
+`InetSocketAddress.getAddress()` returns the `InetAddress`;
+`getHostAddress()` gives the literal. Fall back to `getHostString()` only when
+`isUnresolved()`.
+
+**The trap:** `policy_connect` currently vets the hostname AND every resolved
+IP, and a name-based outbound policy (the worked example in its own comments is
+`metadata.google.internal`) would stop seeing the name if the literal were
+simply substituted at the call site. So the fix is not a one-line swap of what
+`decode_socket_address` returns — it needs to keep passing the NAME to
+`check_outbound` while dialling the RESOLVED address, which means threading
+both through `policy_connect` rather than just changing the string.
+
+Done that way it is also a small SSRF improvement: today's re-resolution is a
+genuine TOCTOU between the address the caller vetted and the one we dial.
+
+## Superseded lead (kept, because it was wrong in an instructive way)
 
 `sc_connect_inner`'s blocking path routes through
 `outbound_policy::policy_connect`, which dials with
@@ -74,15 +141,15 @@ Instrumenting either is cheap: a print on both sides of the dial separates
 "never dialled" from "dialled and never returned", and that single bit chooses
 between the two bullets.
 
-## What was NOT established
+## Two corrections to this page's own earlier revisions
 
-The cause. `CRATONVM_DBG_NET=1` produced no output on this path, so the
-existing net tracing does not cover it — worth fixing on the way past, since
-its absence is what made this expensive to localise.
-
-Also untested: whether the stall needs a *fresh* connect per iteration, or
-whether holding the earlier connections open is what matters. Closing each
-connection before opening the next would answer it in one run.
+* **"`CRATONVM_DBG_NET=1` produced no output, so this path has no tracing."**
+  False. The path had traces on both sides of the dial all along (`ipc_dbg`),
+  gated on `CRATONVM_SUREFIRE_IPC_DBG`. The silence meant *wrong flag*, not
+  *no instrument*, and reading it the other way cost most of the localisation.
+  The `connect_dbg` checkpoints added since answer to BOTH flags.
+* **"stalls near 128 connections."** There is no threshold; see the drift table
+  above. The number was an artefact of a probe printing every 32 connections.
 
 ## Why it matters
 

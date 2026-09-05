@@ -58,7 +58,8 @@ public class WinConnectStallProbe {
         if (args.length > 0 && "client".equals(args[0])) {
             int port = Integer.parseInt(args[1]);
             int want = Integer.parseInt(args[2]);
-            clientOnly(port, want);
+            boolean literal = args.length > 3 && "literal".equals(args[3]);
+            clientOnly(port, want, literal);
             return;
         }
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 256;
@@ -135,9 +136,23 @@ public class WinConnectStallProbe {
         }
     }
 
-    /** Connect `n` times to an already-listening port in another process. */
-    static void clientOnly(int port, int n) throws Exception {
-        InetAddress lo = InetAddress.getLoopbackAddress();
+    /**
+     * Connect `n` times to an already-listening port in another process.
+     *
+     * `literal` selects how the destination address is spelled, which is the
+     * whole experiment: `InetAddress.getLoopbackAddress()` carries the
+     * hostname "localhost", and CratonVM's `decode_socket_address` reads the
+     * destination back with `getHostString()` — so it hands its connect path a
+     * HOSTNAME and re-resolves it on every dial. `getByName("127.0.0.1")`
+     * carries no hostname, so `getHostString()` yields the literal and no
+     * resolution can happen. If the stall follows the hostname and not the
+     * literal, the per-connect lookup is the cause.
+     */
+    static void clientOnly(int port, int n, boolean literal) throws Exception {
+        InetAddress lo = literal
+                ? InetAddress.getByName("127.0.0.1")
+                : InetAddress.getLoopbackAddress();
+        System.out.println("client addr=" + lo + " literal=" + literal);
         List<SocketChannel> held = new ArrayList<>();
         try {
             for (int i = 0; i < n; i++) {
