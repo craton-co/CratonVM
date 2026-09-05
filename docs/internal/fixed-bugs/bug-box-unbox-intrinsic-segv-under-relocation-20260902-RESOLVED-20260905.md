@@ -98,8 +98,23 @@ Three of the things this page left for a next reader are now closed:
 | the blocked-wake JIT remap | landed (`vm_exec::apply_pending_blocked_fixups` now remaps JIT frames and the register image) |
 | the `op:1033` blocker on the repro | fixed — it was the guarded-inline native screen asking the declaring class, `internal/fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md` |
 
-The one item still open is `local_mask_unreached` — see **What is still open**
-at the end.
+**RETIRED from `known-issues/jit/` on 2026-09-05**, which the previous
+revision of this block explicitly conditioned on: it kept the page in
+known-issues for one item, `local_mask_unreached`, and said the flip must not
+be made on the 2026-09-03 numbers. It was re-priced on a quiet host with the
+recipe that section gave (and one it did not: concurrent pairs), and it landed
+default-ON. See **The last open item, CLOSED 2026-09-05** at the end. Nothing
+is outstanding.
+
+`known-issues/jit/` is empty as a result. Eight source comments and three
+sibling pages cite this page by name; the citations were rewritten to NAME the
+write-up rather than its path, since a page under the internal tree is not
+citable by path from outside it.
+
+One correction to the root-cause line above, for anyone grepping: the fix
+landed under dev's name `Arena::commit_for_relocation`, not
+`ensure_committed_span`, which was this branch's name for the same thing and
+was dropped in the merge as the duplicate it had become.
 
 ## What happens
 
@@ -580,54 +595,103 @@ spelling is the token above.
 **As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
 currently BLOCKED by an earlier failure".
 
-## What is still open
+## The last open item, CLOSED 2026-09-05
 
-**One item: `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` should default ON,
-and the evidence for flipping it is stale.**
+**`CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED` now defaults ON.** This
+section replaces "What is still open", which asked for a re-pricing on a quiet
+host and said, correctly, **do not flip it on the 2026-09-03 numbers**. The
+numbers below are new.
 
-This page found and priced a real correctness hole that is not this crash: a
-safepoint whose local-oop dataflow was never REACHED ships a map claiming
-complete frame-slot coverage while naming none of its live reference locals
-(`map_incomplete_cause::LOCAL_MASK_UNREACHED`, 125 on `TestCachedQueryResults`
-and dominant, while the SHADOW half counted the same population and refused).
-Its sibling — `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED`, the same hole for a method
-the dataflow never ran on at all — already **defaults ON** with a `=0` opt-out.
-This one is still opt-in, and `licm.rs` says why: *"this population is larger
-and its refusal cost is still being priced"*.
+The hole, unchanged: a safepoint whose local-oop dataflow was never REACHED
+shipped a map claiming complete frame-slot coverage while naming none of its
+live reference locals, and the SHADOW half of the same machinery already
+refused that exact population. Two halves of one mechanism disagreeing, with
+the half that publishes the claim being the optimistic one.
 
-The page's own pricing said ZERO OOM on 4 runs and 88/88, and recommended
-default-ON. **That pricing is no longer usable, and not because it was wrong.**
-It was taken on 2026-09-03, before the root-cause fix at the top of this page
-moved the OOM baseline on this very workload from 1497 to 0. A refusal's cost
-has to be measured against the collector that ships, and the collector changed
-underneath it. The whole reason to price this at all is that the blanket guard
-— the other refusal measured on this family — bought its safety at ~9700
-fragmentation OOMs and total loss of completion.
+### The arm is armed
 
-**Attempted 2026-09-05 and not obtained.** An ABBA-interleaved re-pricing on
-`org.h2.test.jdbc.TestCachedQueryResults --Xmx 256m` was started on host `vm1`
-at load average 29-33. The first arm **timed out at the 1300 s cap** on a
-workload this page records completing in 462-728 s quiet, so every arm would
-have timed out and a timed-out arm yields no OOM or completion figure to
-compare. The run was stopped rather than reported. This page's own repro note
-already says it: *"A CONTENDED host hides it."*
+Checked first, because a refusal that never fires prices as free for the wrong
+reason. `CRATONVM_DBG_OOPCOV=1` on `TestCachedQueryResults`:
+`local_mask_unreached` reads **117 and climbs to 147**.
 
-To finish it, on a quiet host (load < 5):
+### The cost, at both heaps
 
-```
-CVM=<release cratonvm> JDK=$JDK25
-H=apps/h2database/h2
-CP="$H/target/test-classes:$H/target/classes:$(cat $H/craton-testcp.txt)"
-# ABBA, 4 runs per arm, from a scratch cwd; count OutOfMemoryError and `actual`
-for arm in A B B A; do
-  case $arm in A) F= ;; B) F=CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1 ;; esac
-  env $F CRATONVM_GC_STATS=1 timeout 1300 "$CVM" --java-home "$JDK" --Xmx 256m \
-      -cp "$CP" org.h2.test.jdbc.TestCachedQueryResults
-done
-```
+Concurrent pairs — the two arms started within two seconds of each other on one
+host, compared within the pair. Launch order swapped on the even pairs.
 
-Flip it when the fail-closed arm shows no OOM increase and still completes —
-inverting `local_mask_unreached_fail_closed_enabled` in `jit/src/x64/licm.rs`
-to the `=0`-opt-out shape its sibling already uses, and changing the
-`flag_groups.rs` row from `on_key` to `off_key`. **Do not flip it on the
-2026-09-03 numbers.**
+`--Xmx 1g` (the configuration the H2 page records this workload completing in):
+
+| pair | load | off | on | ratio | off OOM | on OOM |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 17.9 | 1512 s | 1468 s | 0.97 | 0 | 0 |
+| 2 | 66.0 | 1466 s | 1456 s | 0.99 | 0 | 0 |
+| 3 | 24.0 | 714 s | 717 s | 1.00 | 0 | 0 |
+| 4 | 15.1 | 632 s | 633 s | 1.00 | 0 | 0 |
+
+`--Xmx 256m` (the heap the previous section's recipe named — the harsher arm
+for a FRAGMENTATION question, so a 1g-only answer would be the easy case):
+
+| pair | load | off | on | off OOM | on OOM | off `actual` | on `actual` |
+|---|---:|---:|---:|---:|---:|---|---|
+| 1 | 5.2 | **2400 s, capped** | 734 s | **45725** | **0** | never completed | 99999 |
+| 2 | 4.8 | 1017 s | 1008 s | 2 | **0** | 99973 | 99965 |
+
+**What that does and does not say.** Across six pairs at two heaps the
+fail-closed arm produced **zero** fragmentation `OutOfMemoryError` in every
+single run, and no throughput difference. The cost this flag was held back for
+does not exist.
+
+It does **not** say the refusal prevents the OOM livelock. Pair 1's control is
+one instance of exactly the failure
+`h2/bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md` exists for, and
+pair 2's control did not reproduce it (2 OOMs, completed). One occurrence in
+two runs is a coin, not a mechanism. Recorded because it is the opposite of the
+direction this flag was feared to move things, and because that page may want
+the arm.
+
+### And it is not inert, which those zeros alone cannot tell you
+
+Zeros and ratios of ~1.00 are equally consistent with "the refusal is free" and
+with "the flag reaches no read site". The GC counters do not separate them —
+`relocation_skipped_jit` 28 vs 30, `relocation_on_proven_jit` 191 vs 191,
+`compaction_cycles` 190 vs 190. `CRATONVM_DBG_OOPCOV=1` does, because it prints
+the claim per method (`frameslot` is `fully_oop_covered`). Same binary, 90 s:
+
+| | `frameslot=false` | `frameslot=true` |
+|---|---:|---:|
+| default (ON) | **101** | 12 |
+| `=0` | 50 | 65 |
+
+Fifty-one methods stop advertising coverage they did not have, and the
+collector's decisions barely move — because the per-cycle proof consults a
+method only while one of its frames is LIVE, and these rarely are here. That is
+the best shape a soundness fix can have, and also the shape that would have
+hidden an inert flag from a check that stopped at the zeros.
+
+### Two notes for whoever reads the diff
+
+* The previous section said to change the `flag_groups.rs` row "from `on_key`
+  to `off_key`". It is `on_key` **plus `off_word: Some("0")`** — the same shape
+  the sibling `local-mask-fail-closed` row already uses. `off_key` is for a
+  knob spelled only `CRATONVM_X_NO_Y`, and this one is spelled positively.
+* A sequential ABBA was tried first and gave a WRONG answer: 1.9x slower for
+  the fail-closed arm (off 743/593, on 1282/1250). The next ON run came in at
+  390 s, faster than every OFF run in that batch, and the within-arm spread
+  ended at 3.3x. ABBA cancels a monotone drift; the disturbance on this host is
+  other agents' work, which is spiky, and a spike parked in the block's two
+  middle positions is indistinguishable from the treatment. A later round
+  watched the 1-minute load DOUBLE inside a single run. **On a box shared with
+  ~20 agents, run the arms at the same time and report the ratio, or report no
+  throughput number at all.**
+
+### What is NOT closed by this
+
+The hole now fails closed, but the repair is still a refusal: such a safepoint
+diverts its cycle to the non-moving sweep rather than naming its live reference
+locals correctly. The fix at the right level is to make the dataflow reach
+those pcs. Nothing here measures what that would be worth — and with the
+refusal costing nothing there is no pressure to find out, which is how a thin
+slice stays thin until a workload arrives where it is not.
+
+That is a new question, not this page's residual, and it is recorded in
+`x64::licm`'s doc beside the flag.
