@@ -399,7 +399,7 @@ devirtualised code stays **correct** without the eviction — an exact class-id
 guard rechecks the receiver, and a MIC/PIC re-targets — so the only symptom was
 code that should have been retired staying resident, paying a guard that now
 always misses. A capability that reads as landed but never runs is precisely
-what `audits/flag-census.md` tracks.
+what `flag-census.md` tracks.
 
 Both are fixed: `load_class` now walks the **full supertype closure**
 (superclasses and interfaces) by name. The closure is bounded by hierarchy

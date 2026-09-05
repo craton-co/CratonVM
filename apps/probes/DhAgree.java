@@ -6,7 +6,7 @@ import java.util.HexFormat;
 /**
  * A full Diffie-Hellman key agreement, end to end.
  *
- * `jca-provider-population-gap-20260830.md` measured that SunJCE's
+ * `jca-provider-population-gap-20260830-FIXED.md` measured that SunJCE's
  * `KeyAgreement` type is absent here, and `JcaGapSizer` then showed its one
  * implementation class -- `com.sun.crypto.provider.DHKeyAgreement` -- LOADS on
  * this VM exactly as it does on HotSpot. That makes the gap look like a missing

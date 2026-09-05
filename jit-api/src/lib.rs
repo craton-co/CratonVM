@@ -197,7 +197,7 @@ mod descriptor_contract_tests {
 /// capture path safe. Index verification is by *name*, so a redefinition that
 /// reorders an overload set across the capture/read window is the one case
 /// verification cannot catch, and eager capture has no such window. See
-/// `arch-2026-07-26/cross-owner-closeout.md` §6.
+/// `cross-owner-closeout.md` §6.
 ///
 /// # Descriptor facts
 ///
@@ -482,7 +482,7 @@ pub struct CachedBytecodeMethod {
     /// registry generation instead, so a stale negative self-heals at the cost
     /// of one `u32` compare -- the same argument
     /// [`Self::jit_probe_generation`] below already relies on. See
-    /// `arch-2026-07-26/native-dispatch-memoization.md` §3
+    /// `native-dispatch-memoization.md` §3
     /// Steps 0 and 2 (sites A1-A3).
     ///
     /// # ONE CELL, ONE TRIPLE
@@ -508,7 +508,7 @@ pub struct CachedBytecodeMethod {
     /// all read `std::sync::OnceLock::new()`, which type-infers unchanged. The
     /// rename to `native_call_site` is a pure mechanical follow-up; see the
     /// cross-owner request in
-    /// `arch-2026-07-26/interpreter-completion.md`.
+    /// `interpreter-completion.md`.
     ///
     /// # JDK-only: this cell does NOT lose the `NativeKind`
     ///
@@ -1517,7 +1517,7 @@ pub struct JitRuntimeHelpers {
     /// [`Self::region_bounds_addr`] is doing two jobs whose answers diverge.
     /// Its documented job is "is this address mapped, so a raw load cannot
     /// fault" — a READ question. Its load-bearing job since G1-2
-    /// (`audits/g1-audit.md` §8.1) is "may an inline reference STORE skip the
+    /// (`g1-audit.md` §8.1) is "may an inline reference STORE skip the
     /// collector's write barrier", and G1/ZGC answer that by leaving the table
     /// EMPTY: a JNI-pinned, CSet-excluded G1 region is reachable only through
     /// its remembered set, so an inline store that skips
@@ -2087,7 +2087,7 @@ mod tests {
         Ok(None)
     }
 
-    /// Step 0 of `arch-2026-07-26/native-dispatch-memoization.md`
+    /// Step 0 of `native-dispatch-memoization.md`
     /// §3: the per-entry native-dispatch memo must be substitutable for
     /// `registry.find(class, method, descriptor)` — on a miss, on a hit, and
     /// warm.

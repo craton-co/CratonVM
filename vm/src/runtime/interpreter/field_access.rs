@@ -1104,7 +1104,7 @@ pub(super) fn decode_arg_kind_aware(cv: CompactValue, kind: u8, pd_byte: u8) -> 
 /// `execute_invokevirtual_vtable_fast`) popped args the same way but never
 /// re-validated them before building the callee frame. Root-caused via
 /// `org.h2.test.unit.TestUpgrade`'s residual `NoSuchMethodError` — see
-/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`.
+/// `bug-h2-suite-residual-fail-triage-FIXED.md`.
 #[inline]
 pub(super) fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     for value in args.iter_mut() {

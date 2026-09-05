@@ -248,7 +248,7 @@ first assertion that actually went red:
 | `RJdkNet` | `AssertionError: echo reply: null` |
 | `RJdkJmx` | `NoSuchMethodError RJdkJmx$Counter.getAttribute(Ljava/lang/String;)Ljava/lang/Object;` (+2 more, one call site, `registerAndInvoke()V` @pc=129) |
 | `RJdkDefineClass` | `internal error: ByteBuffer missing backing array (field 0 returned Int(-1) for object ObjectRef)` |
-| `RJdkLogging` | not in scope — the `Formatter.formatMessage` half landed on dev after this measurement; the `inferCaller` half is tracked separately in W7-56-infercaller-strict.md, which fixed it (its predecessor record was retired to retired/jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md) |
+| `RJdkLogging` | not in scope — the `Formatter.formatMessage` half landed on dev after this measurement; the `inferCaller` half is tracked separately in W7-56-infercaller-strict.md, which fixed it (its predecessor record was retired to jdk-only-jul-logrecord-infercaller-SUPERSEDED-20260812.md) |
 
 **All six in scope pass on the DEFAULT (non-synthetic) binary, in both modes.**
 That is the load-bearing fact and it shaped every fix here: the question was

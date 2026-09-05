@@ -35,7 +35,7 @@
 //!
 //! See `docs/architecture/class-loader-unloading.md` for the
 //! invariants that transaction upholds, and
-//! `arch-2026-07-26/refs-metaspace-unloading.md` for why this
+//! `refs-metaspace-unloading.md` for why this
 //! scaffolding is being kept (correct, tested, and the natural home should the
 //! GC ever need to own loader bookkeeping) rather than deleted.
 //!

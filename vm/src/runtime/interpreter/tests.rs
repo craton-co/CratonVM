@@ -318,7 +318,7 @@ fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
 /// `org.h2.test.db.TestTempTables`: `Arrays.copyOf(long[], int)`'s
 /// `original.clone()` dispatching into the mirror's inherited `Thread.clone`,
 /// i.e. `CloneNotSupportedException`. See
-/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+/// `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
 ///
 /// Restoring the old gate (dropping the header term from
 /// `stale_mirror_recovery_applies`) fails the first assertion below.

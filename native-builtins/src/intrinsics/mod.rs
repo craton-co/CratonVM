@@ -16,7 +16,7 @@
 //! delegate to the same `crate::lang_*` / `crate::util_*` native functions
 //! the registry would have invoked.
 //!
-//! See `gaps/feature_roadmap_interpreter_intrinsic_table.md` and
+//! See `feature_roadmap_interpreter_intrinsic_table.md` and
 //! `intrinsic_table_contract.md`.
 
 pub mod integer;

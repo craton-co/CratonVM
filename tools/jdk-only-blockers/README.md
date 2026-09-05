@@ -1,7 +1,7 @@
 # jdk-only-blockers
 
 Generates — and ratchets — the two per-JDK blocker artifacts required by
-[`audits/jdk-only-audit.md`](../../audits/jdk-only-audit.md) §6:
+[`jdk-only-audit.md`](../../audits/jdk-only-audit.md) §6:
 
 ```text
 target/jdk-only-audit/jdk-<feature>-missing-natives.json
@@ -414,6 +414,6 @@ new origin must be classified by a human, not defaulted into "allowed".
 ## See also
 
 - [`docs/feature-designs/jdk-only-mode.md`](../../docs/feature-designs/jdk-only-mode.md) — the normative contract
-- [`audits/jdk-only-audit.md`](../../audits/jdk-only-audit.md) — the reproducible audit, §6 defines these artifacts
+- [`jdk-only-audit.md`](../../audits/jdk-only-audit.md) — the reproducible audit, §6 defines these artifacts
 - [`docs/jdk-only-native-review.md`](../../docs/jdk-only-native-review.md) — the per-native promotion checklist
 - [`docs/known-issues/jdk-only/runtime-services-blocker-inventory.md`](../../docs/known-issues/jdk-only/runtime-services-blocker-inventory.md) — the blocker inventory

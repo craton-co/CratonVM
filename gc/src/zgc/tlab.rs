@@ -30,7 +30,7 @@
 //! Every one of those carries a scar from a real defect. Re-deriving them here
 //! would mean re-deriving the defects, and the two copies would then have to be
 //! fixed twice — which is exactly the failure the in-tree
-//! `audits/tlab-and-card-audit.md` was written about. So this file adds only
+//! `tlab-and-card-audit.md` was written about. So this file adds only
 //! what is genuinely ZGC-specific and cannot live in the shared type:
 //!
 //! 1. **The refill source.** A generational TLAB is carved from the young
@@ -56,7 +56,7 @@
 //! The generational and G1 backends have TLABs; ZGC has none. On the most
 //! allocation-heavy workload in the suite (Spring `ApplicationContext` boot and
 //! teardown churn) the ZGC-only regression is 46 classes with 35 PASS -> HANG
-//! (`fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
+//! (`zgc-real-fullsuite-regression-RETIRED-20260807.md`).
 //!
 //! **This module does not claim to be the cause of that.** The leading
 //! hypothesis is the missing generational split, and a sibling agent is

@@ -468,7 +468,7 @@ impl Compiler {
         // gates it — `can_deopt_resume` is
         // `!deopt_points.is_empty() && !has_elided_monitor` and says nothing
         // about the local count. Audited 2026-08-18 (see
-        // fixed-suite-bugs/jit/bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-FIXED-20260817.md,
+        // bobyqa-hot-loop-refused-osr-because-of-a-bare-athrow-FIXED-20260817.md,
         // "Residuals"); what actually holds is three other things, and a reader
         // about to widen or delete any of them should know which:
         //

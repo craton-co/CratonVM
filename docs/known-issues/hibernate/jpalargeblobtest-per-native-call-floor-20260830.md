@@ -10,7 +10,7 @@ on every single call — measured, `out_special_bc_refused` equal to the exact
 call count — at roughly 1150 ns each. The fixture's `read()` autoboxes, so its
 `Long.valueOf`/`longValue` sit one call deeper and pay that. Sections 9 and 11
 are the trail; section 12 is the finding and the only one to act on.** This is the residual of
-`fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`, which is retired: both of
+`jpalargeblob-random-state-side-table-FIXED-20260830.md`, which is retired: both of
 that page's own findings are fixed, the test got 1.35x faster, and it still
 fails. What is left is not a defect in `Random`, in blobs, or in H2 — it is this
 VM's per-native-call cost, and it needs a JIT change nobody has scheduled.
@@ -264,7 +264,7 @@ java -Diters=2000000 -cp . BlobStreamCost      # HotSpot, for the control column
 
 ## Related
 
-* `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`
+* `jpalargeblob-random-state-side-table-FIXED-20260830.md`
   — the page this came out of: the native-memory leak, the entropy-draw spec
   divergence, the Random-shadow retirement that was built and left off, and the
   measurement mistakes made along the way.

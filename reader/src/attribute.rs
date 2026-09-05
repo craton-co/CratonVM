@@ -1038,7 +1038,7 @@ pub fn decode_attribute(
 /// refcount bump and two `usize` copies per payload, with no memcpy.
 /// (Round-4 wave-2 used `Arc::from(&source[range])` here, which
 /// silently allocated a fresh `ArcInner<[u8]>` and memcpy'd the slice;
-/// see `history/round5-reader.md` CRIT-1.)
+/// see `round5-reader.md` CRIT-1.)
 pub fn decode_attribute_with_source(
     name: &str,
     source: &SharedBytes,

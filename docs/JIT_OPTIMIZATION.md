@@ -2198,6 +2198,311 @@ store**. `CRATONVM_JIT_IR_DROP_PHI_HOME` does that for phis, at one site; the
 other forty-nine store sites are what the loop's remaining fifty frame
 operations are made of.
 
+#### The forty-nine store sites, and what removing them did not buy
+
+`CRATONVM_JIT_IR_DROP_PHI_HOME` dropped one frame store, at the one site
+(`emit_copy_op`) where this backend knew both that RAX held a value and *which*
+value it was. Every other definition writes its home through `store_rax`, which
+knew neither. Both facts were available and neither was being passed:
+`lower_data_node_tracked` now records the definition being lowered, and
+`publish_def_at_store` recognises the store whose offset is that definition's
+own home — at which point RAX provably holds it, because the only thing a home
+word is ever written with is its own value.
+
+That makes two per-definition frame operations reachable without editing fifty
+arms:
+
+* `CRATONVM_JIT_IR_PUBLISH_AT_DEF` publishes the register from RAX **at the
+  store**, instead of the generic publish site reloading the word the arm just
+  wrote — the register-to-register publish that site's own comment has called
+  cheaper since it landed;
+* `CRATONVM_JIT_IR_DROP_HOME` then drops the store itself for any value the
+  deopt register image can name, extending the phi case to the arithmetic arms.
+
+`op_home_is_one_store_rax` is an audit of the arms whose lowering writes its
+home exactly once through `store_rax` with RAX holding the value. Arms with a
+home write on one path and not another (`Op::Load`, `Op::CheckCast`,
+`Op::Call`), arms that reach the home another way (`Op::Const`'s immediate
+store, `Op::Param`'s `gp_store_value`, every FP `fp_store_value`), and the
+comparisons — whose home write is conditional on a fusion decision made in
+`lower_terminator` — are all absent. Getting that list wrong is **not silent**:
+`lower_data_node_tracked` refuses the compile when a dropped-home value reaches
+the end of its own lowering unpublished, and `value_home_droppable` additionally
+requires `ir_phi_copy_regs_enabled`, because `gather_phi_copies` is the one
+reader exempt from `slot_of`'s fail-closed refusal.
+
+**First, an instrument correction, because it reverses a published verdict.**
+The loop-body counts in the section above were taken over the range between a
+back edge's target and the jump that takes it — choosing the OUTERMOST such
+pair. On an artifact that carries OSR entry stubs that is the wrong range: a
+stub is emitted AFTER the body and ends by jumping to the loop header, which
+reads as a back edge spanning the loop, the epilogue and the stub. The numbers
+in that table therefore counted the stub's local-zeroing and the epilogue's
+callee-saved restores. Taking the INNERMOST back edge instead:
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| + the phi/register stack | 57 | 29 | 15 | 14 |
+| + `DROP_PHI_HOME` | 56 | 28 | 15 | 13 |
+| + `DROP_HOME` as well | 56 | 28 | 15 | 13 |
+| + reserve the carried set (no drops) | 60 | **25** | 11 | 14 |
+| **reserve + publish-at-def + drop home** | 56 | **19** | 9 | 10 |
+
+**Reserving the carried set alone is not a regression.** Over the real loop it
+takes 31 frame operations to 25 — it removes six RELOADS, exactly what it was
+built to do — and the earlier "52 → 60" was the entry stub being counted, which
+grows with the number of reserved registers because there are more seeds to
+copy. That verdict is withdrawn.
+
+The rest behaves as the design predicts and the census confirms it engaged:
+`dropped_values=4 stores_skipped=6 read_refusals=0 def_publishes=2
+def_stores_skipped=2` with `resident=5 (gp=5)`. Reserving removes the reloads,
+write-through leaves all fourteen stores, and dropping the home removes four of
+them and two more loads. **31 → 19 frame operations, a 39% cut**, with the
+instruction count also down (58 → 56), and `ck=5100017428506113` — HotSpot's
+answer — identical across all six arms.
+
+**And it is worth about 6%.** Four interleaved arms at `n=200,000,000`, nine
+rounds, host load 11–17 on 8 cores, with the single-pass arm run twice as its
+own control:
+
+| arm | mean ms |
+|---|---|
+| single-pass OSR | 398 |
+| single-pass OSR (control) | 408 |
+| optimizing door, switches off | 675 |
+| **optimizing door, full stack** | **630** |
+
+The control-vs-control floor is **2.4%**; the full stack beats the door arm by
+6.7% and does so in 7 of 9 rounds. Real, and far outside the floor.
+
+**It does not close the gap, and that is the finding.** The tier inversion goes
+from 1.68x to 1.56x. Removing 39% of the loop's frame traffic bought 6.7% —
+which refutes, with a number, the assumption this whole line of work has been
+built on: that the optimizing tier's loops are slow *because* they go through
+frame words.
+
+**What the control says instead.** The single-pass body for the same kernel,
+counted the same way, is unrolled two ways and runs **~30 instructions per
+iteration with ZERO frame operations in the hot path** — `i`, `acc`, `sum` and
+`n` live in `r12`, `r13`, `r14`, `r15` from entry to exit, and the only
+`[rbp-...]` traffic in its loop is the safepoint poll's spill on the slow side
+of a `je`. Against that, the optimizing body is 56 instructions and 19 frame
+operations.
+
+So the remaining distance is not one more promotion policy either. Reading what
+those nineteen operations are makes the next target concrete:
+
+```text
+mov [rbp-0C0h],rax      ; store a value
+mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+```
+
+They are SINGLE-USE INTERMEDIATES — the result of an `Op::Add` or `Op::And`
+that feeds exactly one consumer — written to a frame word and reloaded on the
+next instruction. `plan_register_residency` skips every one of them by policy
+(`single_use=20` in its census), and it is right to: they do not want a
+register. They want not to be spilled at all, which is a question about the
+shape of `lower_data_node`'s value model rather than about who gets a register.
+That, and the 2:1 instruction count against a tier that unrolls, is what the
+1.56x is made of.
+
+Both switches stay OFF pending that.
+
+#### The single-use intermediates, and the frame states that pin them
+
+The previous section ended by naming what the optimizing tier's loop still
+spends its frame traffic on: pairs of the shape
+
+```text
+mov [rbp-0C0h],rax      ; store the result of an Add
+mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+```
+
+`plan_register_residency` skips every one of these (`single_use` in its census)
+and is right to — their live range is one instruction, so they do not want a
+register, they want not to be written to memory. `CRATONVM_JIT_IR_CARRY_SINGLE_USE`
+is `fused_cmp`'s move generalised to them: when a value has exactly one use and
+its consumer is the very next node in the same block, it stays in the register
+the arm computed it in. RAX when the consumer reads it first, RCX when it reads
+it second — one register move that still removes a memory access.
+
+Neither half of the contract is trusted. The read refuses unless it is the
+planned consumer asking for the planned register, and — for an RAX carry —
+unless `buf.pos()` proves nothing was emitted in between, which is a proof
+rather than an audit of what the arms do. A carry that outlives its consumer,
+or reaches a block boundary or a terminator, refuses too. Both allowlists have
+source-scanning tests that check them against the arms they name.
+
+**The first cut planned ZERO carries, and why is the more useful half of this
+section.** The screen was `deopt_named`, and the IR graph says every candidate
+fails it:
+
+```text
+20: Mul : Int <- [13, 19]  bci=Some(16)
+safepoint[12] bci=17 locals=[3, 12, -, 13, 14] stack=[20]
+safepoint[15] bci=22 locals=[3, 12, -, 13, 14] stack=[20, 22]
+safepoint[16] bci=23 locals=[3, 12, -, 13, 14] stack=[23]
+```
+
+`graph.safepoints` records the **full operand stack at every bci**, so an
+intermediate is named by a frame state from its definition until its consumer
+pops it. That is the same wall the residency file hit — its `blocked_deopt`
+census — reached from a different direction.
+
+And it is worth reading beside what the door reports for this very method:
+`sentinel_free=true`, which is `deopt_stub_patches.is_empty() &&
+call_exc_patches.is_empty()` — **this body emits no deopt stub at all**.
+Thirty-three frame states, not one of them reachable from inside the code, and
+they are what pins every intermediate to memory.
+
+So the change splits in two, and the split is the point. Eliding the LOAD asks
+nothing of the frame: the home word is still written, every frame state still
+resolves through it, and a read of a word RAX already holds becomes no
+instruction. Dropping the STORE keeps the `deopt_named` screen. On this kernel
+that is `planned=4 ... stores_dropped=0 still_deopt_named=4`.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| **+ carry alone** | 57 | 27 | 13 | 14 |
+| + the residency stack | 56 | 19 | 9 | 10 |
+| **+ both** | 55 | **15** | **5** | 10 |
+
+Four carries, four loads gone, `refused=0`, and `ck=5100017428506113` — HotSpot's
+answer — in all four arms.
+
+**And this one is unambiguous on the clock.** Five interleaved arms at
+`n=200,000,000`, nine rounds, host load ~10–12 on 8 cores, single-pass run twice
+as its own control:
+
+| arm | mean ms |
+|---|---|
+| single-pass OSR | 385.7 |
+| single-pass OSR (control) | 385.4 |
+| optimizing door, switches off | 657.4 |
+| **+ carry alone** | **592.4** |
+| **+ carry + the residency stack** | **557.9** |
+
+The control-vs-control floor is **0.08%** — the quietest measurement this file
+has recorded. The carry alone is **9.9%** and beats the door arm in **9 of 9**
+rounds; with the residency stack it is **15.1%**, also 9 of 9. The tier
+inversion goes **1.70x to 1.45x**.
+
+That also revises the previous section's conclusion, in the direction of the
+evidence rather than away from it. Frame stores alone did not explain the gap —
+39% of them bought 6.7%. But frame *round trips on the critical path* do: these
+four loads are each one instruction's distance from the store that fed them, so
+every one is a store-forwarding stall in the middle of a serial recurrence, and
+removing four of them is worth more than removing twelve stores that nothing
+was waiting on.
+
+**What the remaining ten stores are, and the exact rule that would remove
+them.** They are home writes for values named only by frame states no deopt can
+reach. The precise condition is not "no safepoint names it" but *no safepoint
+that names it sits where a deopt can actually be taken* — which is the union of
+
+* **trap bcis**: `Op::Guard`, the `Op::Div`/`Op::Rem` zero guard, calls,
+  allocations, array and field access, `checkcast`, the monitor ops;
+* **safepoint-poll bcis**: the back-edge terminators, where the runtime can
+  transfer a frame out from under the compiled body.
+
+For `OsrTierBench.kernel` the first set is empty and the second is the single
+`If` at bci 10, whose stack is `[14, 3]` — a phi and a parameter, neither of
+them an intermediate. All four carried values would become droppable.
+
+It is a separate change because it removes a backstop rather than adding one.
+`build_deopt_points` currently builds a point for **every** safepoint with a
+native anchor, so a dropped home is caught there today by `frame_value_of`
+refusing the compile. Making these values droppable means also not building the
+unreachable points — at which point the trap/poll classification above is
+load-bearing rather than backstopped, and it deserves its own pass.
+
+#### The loop was computing its own return value, every iteration
+
+Reading the whole emitted loop rather than only its frame operations found
+something bigger than either of the previous two sections was chasing:
+
+```text
+27  mov rax,rbx          ; sum
+28  mov ecx,0F4243h      ; 1000003
+29  imul rax,rcx         ; sum * 1000003L
+30  mov [rbp-0E8h],rax
+31  mov rax,[rbp-80h]
+32  movsxd rax,eax       ; (long) acc
+33  mov [rbp-0F0h],rax
+34  mov rcx,rax
+35  mov rax,[rbp-0E8h]
+36  add rax,rcx
+37  mov [rbp-0F8h],rax
+```
+
+That is `return sum * 1000003L + acc` — the method's **exit expression** —
+computed and discarded on every one of two hundred million iterations. Eleven
+of the loop's fifty-five instructions and three of its fifteen frame
+operations.
+
+**`ir_schedule`'s own header says a data node is "placed as late as possible
+(to minimize register pressure)". It is not.** `find_best_block` picks the
+deepest block that all of a node's INPUTS dominate, which is schedule-EARLY. For
+a value whose inputs are a loop phi and a constant, that is inside the loop —
+whatever its uses do.
+
+`CRATONVM_JIT_IR_SINK_LATE` moves a pure node to the shallowest loop nesting on
+the dominator path between where its inputs put it and where its uses need it,
+and **only when the depth strictly decreases**. The classic schedule-late also
+prefers the latest block at equal depth, to shorten live ranges; that is a
+different trade with a different risk, and leaving it out keeps this pass's
+effect attributable to the one thing it claims.
+
+The obligation it discharges is the safepoint one. A frame state resolves a
+value it names from that value's HOME WORD, and the home is written wherever
+the node is emitted — so a moved node must still dominate every block that can
+anchor a safepoint naming it. That is checked against the final placement, and a
+violation reverts the **whole method** rather than the offending node: reverting
+one node can break another's dominance, so undoing the lot is the only revert
+that is obviously correct.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| **+ sink alone** | 50 | 25 | 14 | 11 |
+| + carry + the residency stack | 55 | 15 | 5 | 10 |
+| **+ all three** | **44** | **10** | **3** | **7** |
+
+`moved=3 reverted_for_safepoints=0`, and `ck=5100017428506113` — HotSpot's
+answer — in all four arms.
+
+**Priced in CPU time, which is what a contended host leaves usable.** Two
+wall-clock runs at load 23–36 produced control-vs-control floors of 3.7% and
+10.0% — unusable for a magnitude, though the paired counts held (the sink arm
+beat its door arm in 17 of 18 rounds). User CPU over the same five interleaved
+arms, nine rounds:
+
+| arm | user CPU (s) |
+|---|---|
+| single-pass OSR | 0.564 |
+| single-pass OSR (control) | 0.568 |
+| optimizing door, switches off | 0.812 |
+| **+ sink alone** | **0.743** |
+| **+ sink + carry + the residency stack** | **0.621** |
+
+The floor is **0.60%**, and every comparison separates in **9 of 9** rounds:
+the sink alone is **8.5%**, all three together **23.5%**. In CPU time the tier
+inversion is **1.435x → 1.097x** — the optimizing tier is now within ten per
+cent of the single-pass body it was 1.7x behind when this arc started. (The
+wall-clock figures earlier in this file are wall clock; on this host CPU time is
+the instrument that survives the load, and it puts the door arm at 1.435x rather
+than 1.70x. Different instruments, not a correction.)
+
+**Engagement outside the probe is small, and that is the reason it stays OFF.**
+Across forty regression-suite classes and 112 optimizing compiles, exactly
+**one** compile sank anything, with zero reverts. The pass is correct and free
+when it does not fire, but a default-on codegen change wants evidence broader
+than one constructed kernel, and this is a targeted fix for a specific shape:
+a loop whose method computes something after it.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

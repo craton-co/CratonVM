@@ -23,7 +23,7 @@ pub const HEADER_SIZE: usize = 16;
 // emitted code addresses backwards from the object base. Convert the affected
 // emitters to disp32 before allowing HEADER_SIZE to grow beyond this limit;
 // the authoritative site inventory is
-// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §6.2
+// `x64-flag-skew-and-contracts.md` §6.2
 // (the older "jit/src/x64.rs:6690-6813" citation was stale — that range holds
 // loop/BCE analysis, not an emitter).
 const _: () = assert!(
@@ -65,7 +65,7 @@ const _: () = assert!(
 // MARK_INFLATED != 0` test would have aliased FORWARDED onto INFLATED and
 // handed a relocation address to `inflated_monitor()` as a `Monitor*`. Every
 // consumer in `vm/src/threading/monitor.rs` was audited for this before the
-// state was claimed; see `arch-2026-07-26/header-shrink.md` §4.
+// state was claimed; see `header-shrink.md` §4.
 
 /// Mark word state: no lock held. Identity hash code may live in upper bits
 /// (caller-managed).
@@ -80,7 +80,7 @@ pub const MARK_INFLATED: u64 = 0b10;
 /// **Not yet produced by anything.** This is the encoding half of the
 /// `ObjectHeader` 32→24 shrink; the `forwarding_ptr` field is still the live
 /// mechanism and remains the single source of truth until the consumers listed
-/// in `arch-2026-07-26/header-shrink.md` §6 are migrated in one
+/// in `header-shrink.md` §6 are migrated in one
 /// atomic change. It is landed now, with round-trip coverage, so the second
 /// pass adopts a tested encoding instead of inventing one.
 pub const MARK_FORWARDED: u64 = 0b11;
@@ -121,7 +121,7 @@ pub const FORWARDING_PTR_MASK: u64 = !MARK_STATE_MASK;
 // upper bits of a `MARK_NEUTRAL` mark word -- HotSpot's design, and half of what
 // getting `HEADER_SIZE` to 16 needs (`identity_hash_code` is 4 of the 8 bytes
 // that have to go; see
-// `arch-2026-07-26/header-16-and-field-packing-20260806.md` section 2).
+// `header-16-and-field-packing-20260806.md` section 2).
 //
 // # Why this needs no change to the locking fast path
 //
@@ -334,7 +334,7 @@ pub const MAX_SEQUENTIAL_CLASS_ID: u32 = u32::MAX;
 /// elements start". They are the same integer, so **the source does not record
 /// which site means which** — and the 24 → 16 shrink needs them to differ. A
 /// 16-byte header cannot hold a 31-bit array length (see
-/// `arch-2026-07-26/header-16-and-field-packing-20260806.md` §2: `class_id`
+/// `header-16-and-field-packing-20260806.md` §2: `class_id`
 /// (32) + length (31) + `kind`/`element_type`/`gc_age`/`gc_flags` (14) is 77
 /// bits, while `AtomicU64` alignment leaves only 64 ahead of the mark word), so
 /// the length has to move into an 8-byte prefix at the head of the array's
@@ -894,7 +894,7 @@ pub struct ObjectHeader {
     /// reappear as padding". That was true and it was not a reason to stop:
     /// the fold buys zero ALONE and is a prerequisite for the 8 that the
     /// quartet's move then paid out. See
-    /// `arch-2026-07-26/header-16-and-field-packing-20260806.md` §4.
+    /// `header-16-and-field-packing-20260806.md` §4.
     pub mark_word: AtomicU64,
 }
 
@@ -1027,7 +1027,7 @@ impl ObjectHeader {
     /// This obligation did not exist while forwarding lived in its own field
     /// (the two words were distinct), and it is the reason the encoding was
     /// landed inert in 2026-07-26 rather than wired up opportunistically. See
-    /// `arch-2026-07-26/header-shrink.md` §4.3.
+    /// `header-shrink.md` §4.3.
     pub fn set_forwarding_address(&self, target: *mut u8) {
         let prev = self.mark_word.load(std::sync::atomic::Ordering::Relaxed);
         self.mark_word.store(
@@ -1523,7 +1523,7 @@ impl ObjectHeader {
     /// strong `Arc<Monitor>` reference the mark word owns to the destination
     /// copy; it must not be released against the source afterwards, or the
     /// live destination is left with a dangling `Monitor*`. See
-    /// `arch-2026-07-26/header-shrink.md` §4.
+    /// `header-shrink.md` §4.
     #[inline(always)]
     pub fn make_forwarded(prev: u64, target: usize) -> u64 {
         assert!(
@@ -2792,7 +2792,7 @@ mod tests {
     // ---------------------------------------------------------------------
     //  Header-shrink contracts (arch-2026-07-26, slug `header-shrink`)
     //
-    //  See arch-2026-07-26/header-shrink.md. These pin the
+    //  See header-shrink.md. These pin the
     //  layout arithmetic the shrink depends on and the mark-word encoding it
     //  will adopt, so a wrong offset trips a test instead of miscomputing a
     //  heap address.

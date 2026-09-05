@@ -680,7 +680,7 @@ struct Lowerer<'a> {
     /// The READ table, not `JIT_REGION_BOUNDS`: this tier emits no inline
     /// reference STORE, so it asks only "is this address mapped, so a raw load
     /// cannot fault". The store question -- which G1/ZGC answer by leaving
-    /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
+    /// `JIT_REGION_BOUNDS` empty (`g1-audit.md` 8.1) -- has no site
     /// here to ask it.
     ///
     /// **Since 2026-09-02 there is such a site** — `emit_gated_ir_ref_putfield`
@@ -906,6 +906,39 @@ struct Lowerer<'a> {
     /// finding from "it fired and did not pay".
     phi_copy_reg_reads: usize,
     phi_copy_reg_publishes: usize,
+    /// The value `lower_data_node` is currently emitting, so `store_rax` can
+    /// tell the one store that writes a value's OWN home word from the many
+    /// that write an argument stage word, a shadow-stack word, or somebody
+    /// else's slot. `None` everywhere outside a data node's lowering, which is
+    /// what keeps `emit_copy_op`'s store out of this.
+    cur_def: Option<NodeId>,
+    /// Whether that store has happened and published the register.
+    cur_def_published: bool,
+    /// ENGAGEMENT: registers published from RAX at the definition rather than
+    /// reloaded from the home word, and home stores skipped there.
+    reg_publishes_at_def: usize,
+    homes_dropped_at_def: usize,
+    /// `carry_of[id]` = `(register, consumer)`: this single-use value reaches
+    /// its one consumer in `register` and never touches its home word. Empty
+    /// unless [`ir_carry_single_use_enabled`]. See that function for why this
+    /// is not a residency decision.
+    carry_of: Vec<Option<(u8, NodeId)>>,
+    /// The carry in flight: `(producer, consumer, register, buffer position
+    /// when it started)`. At most one is ever live, because a carry is planned
+    /// only between ADJACENT nodes.
+    live_carry: Option<(NodeId, NodeId, u8, usize)>,
+    /// ENGAGEMENT, and its fail-closed counterpart. A refusal is not a
+    /// miscompile — the value's home is `home_dropped`, so the fallback read
+    /// refuses the compile as well — but it means the contract this planned
+    /// under did not hold, which is a bug in the plan, not in the emission.
+    carries_taken: usize,
+    carries_read: usize,
+    carries_refused: usize,
+    carry_stores_dropped: usize,
+    /// Why an adjacent pair was not carried, per cause, and how many carried
+    /// values still had to write their home because a frame state names them.
+    carry_skips: [usize; 6],
+    carry_named: usize,
     /// `deopt_nameable[id]` — a deopt frame may describe `id` as living in its
     /// register rather than in its home word.
     ///
@@ -1426,6 +1459,18 @@ impl<'a> Lowerer<'a> {
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
+            cur_def: None,
+            cur_def_published: false,
+            reg_publishes_at_def: 0,
+            homes_dropped_at_def: 0,
+            carry_of: Vec::new(),
+            live_carry: None,
+            carries_taken: 0,
+            carries_read: 0,
+            carries_refused: 0,
+            carry_stores_dropped: 0,
+            carry_skips: [0; 6],
+            carry_named: 0,
             deopt_nameable: Vec::new(),
             deopt_reg_named: std::cell::Cell::new(0),
             home_dropped: Vec::new(),
@@ -1487,16 +1532,17 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        // Two passes: `phi_home_droppable` borrows `&self`.
+        // Two passes: the droppability predicates borrow `&self`.
         let droppable: Vec<usize> = (0..self.home_dropped.len())
-            .filter(|id| {
-                matches!(
-                    self.graph.nodes.get(*id).map(|n| &n.op),
-                    Some(crate::ir::Op::Phi)
-                )
-            })
             // Cast: an index into the node arena is a `NodeId`.
-            .filter(|id| self.phi_home_droppable(*id as NodeId))
+            .filter(|id| {
+                let id = *id as NodeId;
+                match self.graph.nodes.get(id as usize).map(|n| &n.op) {
+                    Some(crate::ir::Op::Phi) => self.phi_home_droppable(id),
+                    Some(_) => self.value_home_droppable(id),
+                    None => false,
+                }
+            })
             .collect();
         for id in droppable {
             self.home_dropped[id] = true;
@@ -1535,6 +1581,48 @@ impl<'a> Lowerer<'a> {
             self.graph.nodes.get(phi as usize).map(|n| n.ty),
             Some(IrType::Int) | Some(IrType::Long)
         )
+    }
+
+    /// May this ORDINARY value's home word go unwritten?
+    ///
+    /// The same conjunction as [`Self::phi_home_droppable`] with the phi's
+    /// publisher swapped for this one's. A phi is published by `emit_copy_op`
+    /// at every incoming edge; every other value is published by `store_rax`
+    /// at its single home write, which is what `ir_publish_at_def_enabled`
+    /// arranges and what `op_home_is_one_store_rax` certifies exists.
+    ///
+    /// `ir_skip_live_republish_enabled` is required for the same reason it is
+    /// there: without it the generic publish at the end of `lower_data_node`
+    /// would reload the home word nothing wrote, over the top of the register
+    /// this value's definition had just published correctly.
+    fn value_home_droppable(&self, id: NodeId) -> bool {
+        if !(ir_drop_home_enabled()
+            && ir_publish_at_def_enabled()
+            && ir_deopt_regs_enabled()
+            && ir_skip_live_republish_enabled()
+            // `gather_phi_copies` is the ONE reader that is exempt from
+            // `slot_of`'s refusal: it takes the would-be offset from
+            // `slot_of_unwritten` to identify a copy destination. `emit_copy_op`
+            // then reads the SOURCE out of its register -- but only under this
+            // switch. With it off, a dropped-home value used as a phi source
+            // would be loaded from the word nothing wrote, which is the one
+            // silent miscompile this area can produce.
+            && ir_phi_copy_regs_enabled())
+        {
+            return false;
+        }
+        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+            return false;
+        }
+        let Some(node) = self.graph.nodes.get(id as usize) else {
+            return false;
+        };
+        // `Ref` is named by frame slots in the oop map and FP lives in the
+        // other file -- the same two exclusions the phi predicate makes.
+        if !matches!(node.ty, IrType::Int | IrType::Long) {
+            return false;
+        }
+        op_home_is_one_store_rax(&node.op)
     }
 
     /// Describe `id` as living in its register, if that is provably where it
@@ -1706,6 +1794,37 @@ impl<'a> Lowerer<'a> {
     /// which is a missed optimization and never wrong code: the home word is
     /// written unconditionally.
     fn gp_load_value(&mut self, dst: u8, id: NodeId) {
+        // ── A carried value is already in `dst`, and only in `dst` ────
+        //
+        // Every clause below is checked rather than argued, because a carried
+        // value exists in exactly one place and a wrong answer here would read
+        // a frame word nothing wrote:
+        //
+        // * this really is the consumer the carry was planned for;
+        // * it is asking for the register the plan chose;
+        // * and for an RAX carry, NOTHING has been emitted since the producer
+        //   left the value there — `buf.pos()` proves it, and no audit of what
+        //   the arms emit can be wrong about it. An RCX carry cannot use that
+        //   proof (the consumer's first read is emitted in between) and rests
+        //   on `op_reads_rax_then_rcx` instead: that read writes RAX only.
+        if let Some((prod, cons, reg, pos)) = self.live_carry {
+            if prod == id {
+                if self.cur_def != Some(cons) {
+                    self.refuse_carry("read outside its planned consumer");
+                } else if dst != reg {
+                    self.refuse_carry("read into a register the plan did not choose");
+                } else if reg == RAX && pos != self.buf.pos() {
+                    self.refuse_carry("something was emitted between the two");
+                } else {
+                    self.live_carry = None;
+                    self.carries_read += 1;
+                    // The value is in `dst`. That is the whole optimization:
+                    // no store, no load, and for an RAX carry no instruction
+                    // at all.
+                    return;
+                }
+            }
+        }
         // 2026-09-02: a constant is an IMMEDIATE, not a frame word. The
         // `Op::Const` arm still writes its home (a deopt frame may name it,
         // and some sites still read slots directly), but no reader of a
@@ -3578,7 +3697,7 @@ impl<'a> Lowerer<'a> {
     /// `plan_object_alloc`, so a class with a perfectly good registered compact
     /// layout is still allocated legacy. An arm that inlines only compact
     /// receivers therefore inlines almost nothing. See
-    /// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+    /// every-jit-getfield-takes-the-helper-FIXED-20260820.md.
     ///
     /// The legacy read is the uniform 16-byte `Value` cell at
     /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
@@ -3650,7 +3769,7 @@ impl<'a> Lowerer<'a> {
         //
         // Note what this does NOT do: it does not publish `JIT_REGION_BOUNDS`
         // on a non-publishing collector. That table's emptiness is load-bearing
-        // — per `audits/g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
+        // — per `g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
         // every inline reference-STORE fast path unreachable under G1/ZGC, so a
         // JNI-pinned CSet-excluded region cannot lose its remembered-set edge.
         // Filling it to speed up loads would silently re-enable those stores.
@@ -4288,9 +4407,111 @@ impl<'a> Lowerer<'a> {
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
-        let mut bytes = FrameAccess::new();
-        enc_frame_store(RAX, offset, &mut bytes);
-        self.buf.emit(bytes.as_slice());
+        // Two independent decisions, deliberately kept apart. Whether this
+        // definition is CARRIED to its consumer decides where the consumer
+        // reads it; whether its home was DROPPED decides if the word is
+        // written at all. A carried value normally still writes its home,
+        // because `graph.safepoints` names it.
+        let carry = self.carry_at_store(offset);
+        let drop_store = carry.is_some_and(|(id, _, _)| {
+            self.home_dropped.get(id as usize).copied().unwrap_or(false)
+        });
+        if !drop_store && !self.publish_def_at_store(offset) {
+            let mut bytes = FrameAccess::new();
+            enc_frame_store(RAX, offset, &mut bytes);
+            self.buf.emit(bytes.as_slice());
+        }
+        if let Some((id, reg, cons)) = carry {
+            // RAX already holds it — that is what the store was about to
+            // write. RCX costs one register move and still removes a load.
+            if reg != RAX {
+                self.emit_mov_reg_reg64(reg, RAX);
+            }
+            self.live_carry = Some((id, cons, reg, self.buf.pos()));
+            self.carries_taken += 1;
+            if drop_store {
+                self.carry_stores_dropped += 1;
+            }
+        }
+    }
+
+    /// Is this store the home write of a value planned to be carried, and if
+    /// so, `(the value, the register, its consumer)`?
+    fn carry_at_store(&self, offset: i32) -> Option<(NodeId, u8, NodeId)> {
+        let id = self.cur_def?;
+        let (reg, cons) = self.carry_of.get(id as usize).copied().flatten()?;
+        let home = self
+            .node_slot
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .map(|off| off.get() as i32)?;
+        (home == offset).then_some((id, reg, cons))
+    }
+
+    /// Refuse the compile because a carry did not reach its consumer the way it
+    /// was planned to.
+    ///
+    /// Never a wrong answer, always a coverage loss, and `carries_refused`
+    /// names it. The fallback is safe on its own terms too: a carried value's
+    /// home is `home_dropped`, so any read that gets past here refuses in
+    /// `slot_of_checked`.
+    fn refuse_carry(&mut self, why: &'static str) {
+        if let Some((prod, cons, _, _)) = self.live_carry.take() {
+            self.carries_refused += 1;
+            self.latch_bailout(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: prod },
+                format!("n{prod}'s carry to n{cons} did not hold: {why}"),
+            ));
+        }
+    }
+
+    /// Recognise the store that writes the CURRENT definition's own home word,
+    /// publish RAX into its register there, and answer whether the store itself
+    /// may now be skipped.
+    ///
+    /// This is what makes the other forty-nine `store_rax` sites reachable
+    /// without editing forty-nine arms. The two facts the register image needed
+    /// -- that RAX holds a particular value, and WHICH value -- are both present
+    /// here and nowhere else in this file: `cur_def` supplies the identity, and
+    /// "the offset is that value's home" supplies the rest, because the only
+    /// thing a home word is ever written with is its own value.
+    ///
+    /// Writing the register cannot disturb an operand still to be read. Every
+    /// input of `id` is live at its definition, and the allocator gives one
+    /// register to one value across its live range, so no input of `id` is in
+    /// `id`'s register. (`deopt_nameable`, which a dropped home requires, is
+    /// stronger still: no value ANYWHERE holds it.)
+    fn publish_def_at_store(&mut self, offset: i32) -> bool {
+        if !ir_publish_at_def_enabled() {
+            return false;
+        }
+        let Some(id) = self.cur_def else {
+            return false;
+        };
+        let home = self
+            .node_slot
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .map(|off| off.get() as i32);
+        if home != Some(offset) {
+            return false;
+        }
+        let Some(reg) = self.assigned_gpr(id) else {
+            // Not resident: nothing to publish, and nothing may be dropped.
+            return false;
+        };
+        self.emit_mov_reg_reg64(reg, RAX);
+        self.mark_gp_reg_live(id);
+        self.reg_publishes_at_def += 1;
+        self.cur_def_published = true;
+        if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
+            self.homes_dropped_at_def += 1;
+            self.home_stores_dropped += 1;
+            return true;
+        }
+        false
     }
 
     /// `MOV qword [RBP - offset], imm32` (sign-extended), or `false` when the
@@ -4525,6 +4746,10 @@ impl<'a> Lowerer<'a> {
     // ── Node lowering ────────────────────────────────────────────────
 
     fn lower_block(&mut self, block_idx: usize) {
+        // A carry never spans a block — `carry_of` is planned between adjacent
+        // nodes of one block's list — so one left here is a planning bug, and
+        // the block boundary is a branch target besides.
+        self.refuse_carry("a block began while it was still in flight");
         self.block_offsets[block_idx] = self.buf.pos();
         // A receiver proof is block-local: control can enter this block from a
         // predecessor that never proved it.
@@ -5603,7 +5828,7 @@ impl<'a> Lowerer<'a> {
             if self.mir_mode == MirMode::Verify {
                 let shadow = self.mir_shadow_tile_bytes(block_idx, id);
                 let before = self.buf.pos();
-                self.lower_data_node(id);
+                self.lower_data_node_tracked(id);
                 let after = self.buf.pos();
                 if let Some(shadow) = shadow {
                     self.mir_shadow_tiles += 1;
@@ -5612,7 +5837,7 @@ impl<'a> Lowerer<'a> {
                 }
                 return;
             }
-            self.lower_data_node(id);
+            self.lower_data_node_tracked(id);
             return;
         };
         self.mir_tiles += 1;
@@ -5620,7 +5845,7 @@ impl<'a> Lowerer<'a> {
             // The per-opcode arm is still the thing that emits, so this mode
             // cannot produce a wrong instruction — only a wrong verdict.
             let before = self.buf.pos();
-            self.lower_data_node(id);
+            self.lower_data_node_tracked(id);
             let after = self.buf.pos();
             let agreed = self
                 .buf
@@ -6018,6 +6243,124 @@ impl<'a> Lowerer<'a> {
                 fused_cmp[cond as usize] = true;
             }
         }
+        // ── Single-use intermediates, carried to their consumer ──────
+        //
+        // Same three questions the fusion above asks, and the same answers
+        // make it safe: exactly one use, no frame state naming it, and nothing
+        // scheduled in between. The difference is only where the value ends up
+        // — a fused compare is recomputed at the branch, a carried value is
+        // simply left where the arm already put it.
+        let n_nodes = self.graph.nodes.len();
+        let mut carry_of: Vec<Option<(u8, NodeId)>> = vec![None; n_nodes];
+        // Per-cause, because a bare zero from this planner cannot be acted on:
+        // [not-single-use, wrong-type, producer-arm, already-resident,
+        //  consumer-arm, wrong-operand-position].
+        let mut carry_skips = [0usize; 6];
+        let mut carry_named = 0usize;
+        let mut carry_droppable: Vec<NodeId> = Vec::new();
+        if ir_carry_single_use_enabled() {
+            for block in &self.schedule.blocks {
+                for w in 1..block.nodes.len() {
+                    let prod = block.nodes[w - 1];
+                    let cons = block.nodes[w];
+                    if use_count.get(prod as usize).copied().unwrap_or(0) != 1 {
+                        carry_skips[0] += 1;
+                        continue;
+                    }
+                    let Some(pn) = self.graph.nodes.get(prod as usize) else {
+                        continue;
+                    };
+                    if !matches!(pn.ty, IrType::Int | IrType::Long) {
+                        carry_skips[1] += 1;
+                        continue;
+                    }
+                    // The producer's result must be in RAX at its home store,
+                    // which is exactly what this predicate certifies.
+                    if !op_home_is_one_store_rax(&pn.op) {
+                        carry_skips[2] += 1;
+                        continue;
+                    }
+                    // A value the residency file gave a register publishes
+                    // there instead; that path already removes the reload and
+                    // the two must not both claim the store.
+                    if self.assigned_gpr(prod).is_some() {
+                        carry_skips[3] += 1;
+                        continue;
+                    }
+                    let Some(cn) = self.graph.nodes.get(cons as usize) else {
+                        continue;
+                    };
+                    if !op_reads_rax_then_rcx(&cn.op) {
+                        carry_skips[4] += 1;
+                        continue;
+                    }
+                    // Those arms take an FP path for an FP result, and that
+                    // path reads through `fp_load_value`, which knows nothing
+                    // about a carry.
+                    if !matches!(cn.ty, IrType::Int | IrType::Long) {
+                        carry_skips[4] += 1;
+                        continue;
+                    }
+                    let reg = if cn.inputs.first() == Some(&prod) {
+                        RAX
+                    } else if cn.inputs.get(1) == Some(&prod) {
+                        RCX
+                    } else {
+                        carry_skips[5] += 1;
+                        continue;
+                    };
+                    carry_of[prod as usize] = Some((reg, cons));
+                    // ── And, separately, may the home STORE go too? ──
+                    //
+                    // Eliding the LOAD needs nothing from the frame: the home
+                    // word is still written and every frame state still
+                    // resolves through it. Dropping the STORE needs the
+                    // stronger claim that nothing else can ever want the word
+                    // — and `graph.safepoints` records the FULL OPERAND STACK
+                    // at every bci, so an intermediate is named by a frame
+                    // state from its definition until its consumer pops it.
+                    //
+                    // That is why this is a separate question with its own
+                    // census line rather than a clause above. On a loop kernel
+                    // it answers no every time, and the reason is worth having
+                    // in front of you: the method emits no deopt stub at all
+                    // (`ir_osr_sentinel_free`), so all of those frame states
+                    // are unreachable — and they still pin every intermediate
+                    // to memory.
+                    //
+                    // The consumer must also be unable to TRAP. `Op::Div` and
+                    // `Op::Rem` emit their zero guard AFTER reading both
+                    // operands, and that guard is a deopt point whose frame
+                    // state names them — so a dropped home there would hand
+                    // the resume a word nothing wrote. Today `deopt_named`
+                    // already answers no for those operands (the bci's frame
+                    // state lists them), and this clause is what makes that
+                    // agreement a rule rather than a coincidence.
+                    let consumer_traps = matches!(cn.op, Op::Div | Op::Rem);
+                    if consumer_traps || deopt_named.get(prod as usize).copied().unwrap_or(true) {
+                        carry_named += 1;
+                    } else {
+                        carry_droppable.push(prod);
+                    }
+                }
+            }
+        }
+        // A value whose home store is dropped has ONE readable location, so
+        // every other reader must refuse rather than take the word.
+        // `home_dropped` is that refusal and it already exists; sizing it here
+        // matters because residency may be off entirely, and this path does not
+        // depend on it.
+        if !carry_droppable.is_empty() {
+            if self.home_dropped.len() < n_nodes {
+                self.home_dropped.resize(n_nodes, false);
+            }
+            for id in &carry_droppable {
+                self.home_dropped[*id as usize] = true;
+            }
+        }
+        self.carry_skips = carry_skips;
+        self.carry_named = carry_named;
+        self.carry_of = carry_of;
         self.use_count = use_count;
         self.deopt_named = deopt_named;
         self.fused_cmp = fused_cmp;
@@ -6112,6 +6455,47 @@ impl<'a> Lowerer<'a> {
         if ir_receiver_guard_cse_enabled() && !self.guarded_receivers.contains(&base) {
             self.guarded_receivers.push(base);
         }
+    }
+
+    /// Lower one data node, with `cur_def` set across it so `store_rax` can
+    /// recognise the node's own home write.
+    ///
+    /// The verification at the bottom is the reason `op_home_is_one_store_rax`
+    /// may be an audited list rather than a proof. If a value whose home was
+    /// dropped finishes its own lowering without its register having been
+    /// published, then nothing wrote the value anywhere and the artifact is
+    /// wrong -- so the compile is refused here, deterministically, at the node
+    /// that did it, rather than later at whichever reader happened to notice.
+    /// A phi is exempt: `lower_data_node` deliberately emits nothing for one
+    /// (`emit_phi_copies` owns it), which is not the same event.
+    fn lower_data_node_tracked(&mut self, id: NodeId) {
+        let prev = self.cur_def;
+        let prev_published = self.cur_def_published;
+        self.cur_def = Some(id);
+        self.cur_def_published = false;
+        self.lower_data_node(id);
+        if self.home_dropped.get(id as usize).copied().unwrap_or(false)
+            && !self.cur_def_published
+            && !matches!(
+                self.graph.nodes.get(id as usize).map(|n| &n.op),
+                Some(Op::Phi)
+            )
+        {
+            self.latch_bailout(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: id },
+                format!("n{id}'s home was dropped but its lowering published no register"),
+            ));
+        }
+        // A carry that outlives the node that was supposed to read it is a
+        // value with nowhere to be. `prod == id` is the carry this node just
+        // STARTED, waiting for the next one.
+        if let Some((prod, _, _, _)) = self.live_carry {
+            if prod != id {
+                self.refuse_carry("its consumer finished without reading it");
+            }
+        }
+        self.cur_def = prev;
+        self.cur_def_published = prev_published;
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
@@ -6797,7 +7181,7 @@ impl<'a> Lowerer<'a> {
                 // no-op here — but this arm was the ONLY one resolving from a
                 // raw bci, and a raw bci inside a spliced body is the exact
                 // shape that produced
-                // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+                // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
                 // A fence and an asymmetry is one fence away from the bug;
                 // agreeing with the other emitters costs nothing.
                 let bci = self.resume_bci(bci);
@@ -7958,6 +8342,9 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_terminator(&mut self, term: NodeId, block_idx: usize) {
+        // Same net at the other end of the block: a terminator is never a
+        // planned consumer.
+        self.refuse_carry("the block's terminator was reached first");
         if self.schedule.blocks[block_idx]
             .successors
             .iter()
@@ -9181,9 +9568,7 @@ impl<'a> Lowerer<'a> {
     /// # One stub per DISTINCT throw-site bci, not one shared stub
     ///
     /// This is the IR half of RBC.6, and it was the gap cov-07's closeout doc
-    /// flagged and did not own (`fixed-suite-bugs/hibernate/
-    /// offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-
-    /// 20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
+    /// flagged and did not own (`offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
     /// as *this* method's throw site and range-tested against `[start_pc,
     /// end_pc)` of every entry in this method's own exception table. Until this
     /// stub stamped it, that field still held whatever the CALLEE's compiled
@@ -11106,6 +11491,174 @@ fn ir_drop_phi_home_enabled() -> bool {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
     }
+}
+
+/// Publish a resident value into its register AT ITS DEFINITION, out of RAX,
+/// instead of reloading the home word this backend just wrote -- **default
+/// OFF**, opt in with `CRATONVM_JIT_IR_PUBLISH_AT_DEF=1`.
+///
+/// The generic publish at the end of `lower_data_node` is a LOAD of the word
+/// the arm above it stored, and its own comment has said since it landed that
+/// "a per-arm register-to-register publish would be cheaper still". Doing it
+/// per arm meant editing fifty call sites; doing it in `store_rax` means
+/// recognising, at the one place that writes a home word from RAX, that the
+/// offset being written is the current definition's own home -- at which point
+/// RAX provably holds that value and the copy is free of any question about
+/// where it came from.
+///
+/// It is also the precondition for dropping the store: with the publish reading
+/// the home, a home that is never written cannot be published from.
+fn ir_publish_at_def_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PUBLISH_AT_DEF") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Extend the dropped home from phis to ORDINARY VALUES -- **default OFF**, opt
+/// in with `CRATONVM_JIT_IR_DROP_HOME=1`.
+///
+/// `CRATONVM_JIT_IR_DROP_PHI_HOME` removes one frame store, at the one site
+/// (`emit_copy_op`) where this backend knew both that RAX held the value and
+/// which value it was. Every other definition writes its home through
+/// `store_rax`, which knew neither -- so the loop bodies this tier emits still
+/// perform a store per arithmetic node whose result never leaves its register.
+/// With [`ir_publish_at_def_enabled`] supplying the first fact and
+/// `Lowerer::cur_def` the second, the same conjunction can be asked of any
+/// value: see [`Lowerer::value_home_droppable`].
+fn ir_drop_home_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_HOME") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Does lowering `op` write its result home EXACTLY ONCE, through `store_rax`,
+/// with RAX holding the value at that store?
+///
+/// The list is an audit of `lower_data_node`'s arms, not a guess, and it is the
+/// reason a dropped home is safe for a value that is not a phi. Two shapes are
+/// deliberately absent:
+///
+/// * arms with more than one home write, or a home write on one path and not
+///   another (`Op::Load`, `Op::CheckCast`, `Op::Call`) -- the register would be
+///   published on one path and stale on the other;
+/// * arms that reach the home by a route other than `store_rax`
+///   (`Op::Const`'s immediate store, `Op::Param`'s `gp_store_value`, every FP
+///   result's `fp_store_value`) -- nothing would publish the register at all.
+///
+/// `Op::Cmp`/`Op::LCmp`/`Op::FCmp` are absent for a third reason: a comparison
+/// fused into its consuming `Op::If` emits NOTHING, so its home write is
+/// conditional on a fusion decision made elsewhere. They are single-use by
+/// construction and the residency file does not promote them, so the omission
+/// costs nothing.
+///
+/// Getting this list wrong is not silent: `lower_data_node_tracked` refuses the
+/// compile when a value whose home was dropped reaches the end of its own
+/// lowering unpublished.
+/// Let a SINGLE-USE intermediate reach its one consumer in a register instead
+/// of through its home word -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_CARRY_SINGLE_USE=1`.
+///
+/// The residency work removed the frame traffic it could and then measured what
+/// was left: the loop's remaining `[rbp-...]` operations are pairs of the shape
+///
+/// ```text
+/// mov [rbp-0C0h],rax      ; store the result of an Add
+/// mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+/// ```
+///
+/// `plan_register_residency` skips every one of them (`single_use` in its
+/// census) and is right to: they do not want a register for their whole live
+/// range, they want not to be written to memory at all. Their range is one
+/// instruction long.
+///
+/// So this is not a promotion policy. It is the same move `fused_cmp` already
+/// makes for a comparison consumed by its branch, generalised: when a value has
+/// exactly one use and its consumer is the very next node in the same block,
+/// the value can stay in the register the arm computed it in and the consumer
+/// can read it there.
+///
+/// **Two decisions, deliberately separate.** Eliding the LOAD asks nothing of
+/// the frame — the home word is still written and every frame state still
+/// resolves through it — so it applies to every carried value. Dropping the
+/// STORE needs the stronger claim that nothing else can want the word, and
+/// `graph.safepoints` records the FULL OPERAND STACK at every bci, so an
+/// intermediate is named by a frame state from its definition until its
+/// consumer pops it. On a loop kernel that answers no every time, which the
+/// census reports as `still_deopt_named` — and it is worth reading beside
+/// `ir_osr_sentinel_free`, because such a method emits no deopt stub at all.
+/// Every one of those frame states is unreachable, and they still pin every
+/// intermediate to memory.
+fn ir_carry_single_use_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_SINGLE_USE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Does lowering `op` read its first input into RAX, and its second (if it has
+/// one) into RCX, before emitting anything else?
+///
+/// The consumer half of the carry contract, and — like
+/// [`op_home_is_one_store_rax`] — an audit of the arms rather than a guess.
+/// Every op here has the same shape: `alloc_slot`, `gp_load_value(RAX,
+/// inputs[0])`, `gp_load_value(RCX, inputs[1])`, the ALU, `store_rax`. That is
+/// what makes both carry registers safe:
+///
+/// * RAX, because NOTHING is emitted between the producer's last instruction
+///   and the consumer's first read — checked, not argued: the read refuses
+///   unless `buf.pos()` is still where the producer left it;
+/// * RCX, because the only thing emitted before the second read is the first
+///   read, and a `gp_load_value` into RAX writes RAX and nothing else.
+///
+/// `Op::Cmp`, `Op::LCmp` and `Op::FCmp` are absent: a comparison may be fused
+/// into its branch and then emits nothing at all. `Op::Load`, `Op::ArrayLoad`
+/// and `Op::Call` are absent because they read their operands in another order
+/// or through another path.
+fn op_reads_rax_then_rcx(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+    )
+}
+
+fn op_home_is_one_store_rax(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+            | Op::F2I
+            | Op::F2L
+            | Op::D2I
+            | Op::D2L
+            | Op::ArrayLength
+    )
 }
 
 /// Emit an OSR entry stub for every bci this body can safely be entered at --
@@ -13123,7 +13676,7 @@ pub fn last_lower_bail() -> Option<&'static str> {
 /// interpreted forever. A single Spring Boot suite class produced **8072** such
 /// warnings in one run, every one of them from this estimate (the report that
 /// first noticed the flood,
-/// `fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// `basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
 /// attributed them to the single-pass backend's estimate — that one accounted
 /// for 10).
 ///
@@ -13430,7 +13983,7 @@ pub(crate) fn lower_inner_with_scopes(
     // reference, the cell then holds a primitive under a reference's name, and
     // the fault appears much later in whatever dereferences it — a compiled
     // `arraylength` on `Int(1)`, faulting at `addr=0x5`
-    // (`fixed-suite-bugs/tomcat/punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
+    // (`punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
     // Nothing in the report points back here, because a wrong-slot write leaves
     // no trace of having chosen the wrong slot.
     //
@@ -13538,7 +14091,7 @@ pub(crate) fn lower_inner_with_scopes(
         // found no matching deopt point, defaulted the reason to
         // `UnreachedCode`, and refused the replay against a bci nothing
         // could resume at. See
-        // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+        // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
         spliced_ranges,
         sr_map,
         direct_calls,
@@ -13567,7 +14120,7 @@ pub(crate) fn lower_inner_with_scopes(
     // 300_000. Downstream it silently emptied Spring Boot's property binding,
     // because `BindHandler.onSuccess(name, target, context, result)` is
     // `aload 4; areturn` over five slots — see
-    // `fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // `webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
     // for the trail from there to `BindResult.isBound() == false` for every
     // property.
     //
@@ -13969,10 +14522,31 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.deopt_regs_base,
         );
         eprintln!(
-            "[ir-ls] homes: dropped_values={} stores_skipped={} read_refusals={}",
+            "[ir-ls] homes: dropped_values={} stores_skipped={} read_refusals={} \
+             def_publishes={} def_stores_skipped={}",
             lowerer.home_dropped.iter().filter(|d| **d).count(),
             lowerer.home_stores_dropped,
             lowerer.home_read_refusals.get(),
+            lowerer.reg_publishes_at_def,
+            lowerer.homes_dropped_at_def,
+        );
+    }
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+        eprintln!(
+            "[ir-ls] carries: planned={} taken={} read={} refused={} \
+             stores_dropped={} still_deopt_named={}",
+            lowerer.carry_of.iter().filter(|c| c.is_some()).count(),
+            lowerer.carries_taken,
+            lowerer.carries_read,
+            lowerer.carries_refused,
+            lowerer.carry_stores_dropped,
+            lowerer.carry_named,
+        );
+        let s = lowerer.carry_skips;
+        eprintln!(
+            "[ir-ls] carry skips: multi_use={} wrong_type={} producer_arm={} \
+             already_resident={} consumer_arm={} operand_position={}",
+            s[0], s[1], s[2], s[3], s[4], s[5],
         );
     }
 
@@ -20369,6 +20943,195 @@ mod tests {
              this test would now pass vacuously"
         );
         out
+    }
+
+    /// `op_home_is_one_store_rax` claims a property of SOURCE the compiler
+    /// cannot check, and it is the whole safety argument for dropping the home
+    /// word of a value that is not a phi: the arm writes its result home
+    /// exactly once, through `store_rax`, with RAX holding the value. So check
+    /// the source.
+    ///
+    /// A second home write on another path would publish the register on one
+    /// path and leave it stale on the other; a home reached by
+    /// `gp_store_value` or `emit_store_frame_imm32` instead would not go
+    /// through `publish_def_at_store` at all, so nothing would publish the
+    /// register and the value would exist nowhere. `fp_store_value` is allowed
+    /// and deliberately so — `Op::Div`, `Op::Rem` and `Op::Neg` take an FP path
+    /// that returns early, and `value_home_droppable` admits only `Int` and
+    /// `Long`, so that path is unreachable for a dropped home.
+    ///
+    /// A failure here is not cosmetic. It says the allowlist has drifted from
+    /// the arms and `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never
+    /// writes a value it later reads.
+    #[test]
+    fn every_droppable_op_writes_its_home_once_through_store_rax() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        // Split at match-arm depth — twelve spaces — on the same convention
+        // `ops_with_a_lowering_arm` documents. A `| Op::` line continues the
+        // arm above it rather than opening one.
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let opens = line.starts_with("            Op::");
+            let continues = line.starts_with("            | Op::");
+            if continues {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if opens {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed and \
+             this test would now pass vacuously"
+        );
+
+        let claimed_src = src
+            .split("fn op_home_is_one_store_rax(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_home_is_one_store_rax is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the allowlist scan found nothing — `op_home_is_one_store_rax` \
+             changed shape and this test would now pass vacuously"
+        );
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| {
+                    panic!("`op_home_is_one_store_rax` claims Op::{name}, which has no arm")
+                });
+            let stores = arm.1.matches("self.store_rax(slot);").count();
+            assert_eq!(
+                stores, 1,
+                "Op::{name}'s arm writes its home through `store_rax` {stores} times, \
+                 not once — `op_home_is_one_store_rax` must not claim it"
+            );
+            for forbidden in ["gp_store_value(", "emit_store_frame_imm32("] {
+                assert!(
+                    !arm.1.contains(forbidden),
+                    "Op::{name}'s arm reaches its home through `{forbidden}`, which \
+                     `publish_def_at_store` never sees — \
+                     `op_home_is_one_store_rax` must not claim it"
+                );
+            }
+        }
+    }
+
+    /// `op_reads_rax_then_rcx` is the consumer half of the carry contract, and
+    /// it is the half that cannot be proved by `buf.pos()`: an RCX carry has
+    /// the consumer's FIRST read emitted in between, and is safe only because
+    /// that read writes RAX and nothing else. So check the source says so.
+    ///
+    /// The required shape, in order, before anything else is emitted:
+    ///
+    /// ```text
+    /// let slot = self.alloc_slot(id);
+    /// self.gp_load_value(RAX, node.inputs[0]);
+    /// self.gp_load_value(RCX, node.inputs[1]);   // when it has a second
+    /// ```
+    ///
+    /// A single-input op (`Op::Neg`, `Op::I2L`, `Op::L2I`) has only the first.
+    /// `alloc_slot` emits nothing, which is what lets the RAX carry's position
+    /// check hold across the arm's opening line.
+    #[test]
+    fn every_carry_consumer_reads_rax_then_rcx() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let opens = line.starts_with("            Op::");
+            let continues = line.starts_with("            | Op::");
+            if continues {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if opens {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(!arms.is_empty(), "the arm scan found nothing");
+
+        let claimed_src = src
+            .split("fn op_reads_rax_then_rcx(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_reads_rax_then_rcx is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the consumer scan found nothing — `op_reads_rax_then_rcx` changed \
+             shape and this test would now pass vacuously"
+        );
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| panic!("`op_reads_rax_then_rcx` claims Op::{name}, no arm"));
+            let reads: Vec<&str> = arm
+                .1
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("self.gp_load_value("))
+                .collect();
+            assert_eq!(
+                reads.first().copied(),
+                Some("self.gp_load_value(RAX, node.inputs[0]);"),
+                "Op::{name}'s arm does not open by reading its first input into \
+                 RAX — a carry planned onto it would read a stale register"
+            );
+            if reads.len() > 1 {
+                assert_eq!(
+                    reads.get(1).copied(),
+                    Some("self.gp_load_value(RCX, node.inputs[1]);"),
+                    "Op::{name}'s arm does not read its second input into RCX \
+                     next — an RCX carry planned onto it has no proof left"
+                );
+            }
+        }
     }
 
     /// Every `Op::X` named in `op_defines_result_slot`'s body.

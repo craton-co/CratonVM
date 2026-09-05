@@ -26,7 +26,7 @@
 //! explanations with nothing to separate them. `CRATONVM_DBG_CCE_BT` prints a
 //! rich dump there, but only if it was set BEFORE the run, which is never true
 //! of the run that actually reproduces. See
-//! `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
+//! `bug-h2-classid0-stale-address-family-FIXED.md`.
 //!
 //! Both `checkcast` reporters had already drifted from each other (the
 //! interpreter's consults the young-sweep ring, the JIT's does not), which is

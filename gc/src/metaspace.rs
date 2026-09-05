@@ -40,7 +40,7 @@
 //!
 //! The model is kept because it is the natural home for real accounting and its
 //! chunking/GC policy is already tested; see
-//! `arch-2026-07-26/refs-metaspace-unloading.md` for the wiring
+//! `refs-metaspace-unloading.md` for the wiring
 //! sketch and its prerequisites.
 
 use std::collections::HashMap;

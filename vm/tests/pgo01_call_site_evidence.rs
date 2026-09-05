@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! PGO-01 (feature-designs/c2/pgo-01-call-site-evidence-gap.md, retired to
+//! PGO-01 (pgo-01-call-site-evidence-gap.md, retired to
 //! docs/internal): per-call-site evidence for `invokestatic`/`invokespecial`.
 //!
 //! `MethodProfile::call_sites` (jit/src/profile.rs) is fed exclusively from

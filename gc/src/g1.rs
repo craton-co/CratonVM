@@ -77,7 +77,7 @@ fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
 /// so — fourteen call sites made that assumption silently.
 ///
 /// The rename is the whole of option **C** in
-/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// `what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4: no runtime cost, no behaviour change, and fourteen silent assumptions
 /// become fourteen readable ones. A caller that *does* hold region geometry
 /// should use [`for_each_flat_object_reference_capped`] with
@@ -143,7 +143,7 @@ fn for_each_flat_object_reference_capped(
                  SLOT_SIZE over {} elements of array payload and decoded each as a `Value`. \
                  Every caller pre-branches on kind, so this is a kind confusion, not an \
                  intended array walk; see \
-                 fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
+                 what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
                 obj_ptr as usize,
                 header.class_id.as_u32(),
                 header.element_type(),
@@ -484,7 +484,7 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// That is not a hypothetical pairing: the corrupt-`Value`-cell producer closed
 /// on 2026-08-22 was exactly this kind confusion, identified as
 /// `receiver_class=java/lang/String receiver_kind=Array`
-/// (`fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
+/// (`corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
 ///
 /// # Why refusing is safe, and why the census-only form was wrong to hedge
 ///
@@ -509,7 +509,7 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// comparison, on a tag already loaded.
 ///
 /// This is option **D** of
-/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// `what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4, paired with option C (the `_trusting_header` rename). **Expected to be
 /// ZERO.** Observed zero on 2026-08-26 across the regression suite run once per
 /// collector (72/72 on each of ZGC, G1 and Generational) and across a G1 arm
@@ -530,7 +530,7 @@ pub fn flat_walks_refused_for_array() -> usize {
 /// [`G1Collector::record_outgoing_rset_edges`] a self-forwarded address that is
 /// region-resident but is not an object start — which, before the guard, was a
 /// SIGSEGV inside that walk (see the internal record
-/// `fixed-suite-bugs/h2-suite-bugs/g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
+/// `g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
 pub static KEPT_SEED_REJECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`KEPT_SEED_REJECTED`].
@@ -3301,7 +3301,7 @@ pub struct G1Collector {
     /// entirely garbage. The generational collector hides the same gap behind
     /// its young→old spill fallback (`gen_heap::alloc_object`); G1 has no
     /// equivalent, so it aborted outright. See
-    /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`.
+    /// `g1-native-alloc-no-safepoint-oom-FIXED.md`.
     native_alloc_pressure: AtomicBool,
 
     /// Per-region `(reuse_epoch, cursor, region_type)` snapshot captured at
@@ -4127,7 +4127,7 @@ impl G1Collector {
         // collector's lifetime and needs no refresh at GC boundaries.
         //
         // Deliberately NOT `JIT_REGION_BOUNDS`: that table is what G1-2
-        // (`audits/g1-audit.md` §8.1) keeps EMPTY under G1 so no inline
+        // (`g1-audit.md` §8.1) keeps EMPTY under G1 so no inline
         // reference-STORE fast path is reachable and a JNI-pinned,
         // CSet-excluded region cannot lose its remembered-set edge. Publishing
         // reads here leaves that gate exactly as it was — see
@@ -6181,7 +6181,7 @@ impl G1Collector {
         // young source (every young region is in this CSet, so the holder is
         // traced) but NOT for a young source held out of the CSet by a JNI
         // pin, which is reached only through its remembered set. Closing it
-        // requires a `jit/` change (see `audits/g1-audit.md`, defect G1-2);
+        // requires a `jit/` change (see `g1-audit.md`, defect G1-2);
         // the debug-only `verify_no_dangling_into_cset` below is the tripwire
         // in the meantime.
         let dbg_phases = gc_flags().g1_dbg_reach;
@@ -6828,7 +6828,7 @@ impl G1Collector {
         // does too; a region it does not walk keeps the entries it had. The
         // rebuild has never been what makes THIS pause sound (a missing
         // barrier entry is a UAF in this pause and repaired for the next —
-        // `audits/g1-audit.md` §2.1); it repairs for later pauses, and it still
+        // `g1-audit.md` §2.1); it repairs for later pauses, and it still
         // does. `CRATONVM_G1_NARROW_FIXUP=0` restores the wide walk for both.
         let narrow = self.phase4_regions_to_walk(&regions, Some(&pre_evac), &narrow_sources);
         let census =
@@ -10333,7 +10333,7 @@ impl G1Collector {
     ///       collection: the smoking gun.
     ///
     /// ROOT CAUSE (full writeup + ruled-out fixes:
-    /// `fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`):
+    /// `g1-parallel-evac-persistent-forwarding-root-remap.md`):
     /// the parallel evacuator dedups via the PERSISTENT `forwarding_ptr` header
     /// field (serial uses the per-cycle `pointer_map`). A fast-path hit returns a
     /// forward — possibly left over from a PRIOR cycle — WITHOUT recording it in
@@ -10659,7 +10659,7 @@ impl G1Collector {
         // `cid=0x41414141 kind=Array len=0x41414141`, and the element loop then
         // read 1094795585 references from it and walked off the end of the
         // arena. That is the SIGSEGV in
-        // fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md —
+        // g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md —
         // produced by this diagnostic, in a run that only crashed because the
         // diagnostic was on.
         //
@@ -12876,7 +12876,7 @@ impl G1Collector {
         // Publish the remembered-set size gauge for G1. Until now
         // `remembered_set_bytes` described only the generational card table, so
         // `rset_bytes_per_live_byte` read as zero under `-XX:+UseG1GC` — the
-        // reconciliation item left open by `audits/tlab-and-card-audit.md`
+        // reconciliation item left open by `tlab-and-card-audit.md`
         // §2.3. Measured here (once per mark cycle, after the prune) rather
         // than per pause: this is the point at which the set is smallest and
         // final, and it costs one lock per region on a path that just walked
@@ -15694,7 +15694,7 @@ impl G1Collector {
     /// `PolynomialTest` failure was (`pin_addrs=0` was the process-wide total),
     /// but it is real, and it is a reason to prefer candidate fix 2 — repairing
     /// the scan — over widening this predicate. See
-    /// `bug-g1-evacuates-live-jit-reference-20260819.md`.
+    /// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     fn empty_jit_publication(&self) -> bool {
         // "A compiled frame is live." `is_active()` counts only JIT entries
         // that pushed a `JitEntryGuard`; a frame reached without one (the
@@ -16493,7 +16493,7 @@ impl G1Collector {
         // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
         // a non-atomic 16-byte copy that could tear against a concurrent
         // plain `set_field` from another mutator thread -- see
-        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
         // which covered g1::scan_object_refs but not this mutator-side path).
         let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
@@ -16992,7 +16992,13 @@ impl GarbageCollector for G1Collector {
         // Un-box the auto-box wrapper the store side installs for a non-Object
         // value — see `set_array_element`, and `GenerationalHeap::
         // get_array_element` for the same read.
-        if element_type == ArrayElementType::Reference {
+        // Latched for the same reason as the two ZGC sites: `autobox_payload`
+        // opens with `is_object_address`, a region/registry probe, and can only
+        // answer `Some` if a wrapper was ever created — which is what sets the
+        // latch. See `crate::autobox::array_read_may_hold_wrapper`.
+        if element_type == ArrayElementType::Reference
+            && crate::autobox::array_read_may_hold_wrapper()
+        {
             if let Value::Object(Some(boxed)) = value {
                 if let Some(inner) = self.autobox_payload(boxed) {
                     return Ok(inner);
@@ -24020,7 +24026,7 @@ mod tests {
     }
 
     // -- Native-allocation pressure latch --
-    // (fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md)
+    // (g1-native-alloc-no-safepoint-oom-FIXED.md)
 
     /// Fill the first `count` regions so they read as fully-consumed Eden,
     /// leaving `num_regions - count` Free. Mirrors what a running mutator
@@ -27699,7 +27705,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // G1 maturation (arch-2026-07-26/g1-maturation.md)
+    // G1 maturation (g1-maturation.md)
     // -----------------------------------------------------------------------
 
     /// Overwrite the mark-start (TAMS) snapshot so a test can place TAMS at an
@@ -28266,7 +28272,7 @@ mod tests {
     }
 
     // =======================================================================
-    // G1 correctness audit (audits/g1-audit.md)
+    // G1 correctness audit (g1-audit.md)
     // =======================================================================
 
     use crate::gc_metrics::{g1_cycle_kind, g1_degraded, last_g1_cycle};
@@ -30069,7 +30075,7 @@ mod tests {
     }
     // -----------------------------------------------------------------------
     // The flat 16-byte-slot walk refuses an ARRAY header (option D of
-    // `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
+    // `what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
     // -----------------------------------------------------------------------
 
     /// Build a legacy-layout body of `slots` `Value::Object` cells behind a

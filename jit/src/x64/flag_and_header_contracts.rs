@@ -7,7 +7,7 @@
 //! Flag-skew and header-offset contracts
 //! ---------------------------------------------------------------------------
 //!
-//! Companion doc: `arch-2026-07-26/x64-flag-skew-and-contracts.md`.
+//! Companion doc: `x64-flag-skew-and-contracts.md`.
 //!
 //! These tests defend two properties that no build error would catch:
 //!
@@ -861,7 +861,7 @@ fn locals_past_the_bitset_never_receive_a_register_home() {
 
 /// Inventory tripwire for the 32→16-byte `ObjectHeader` shrink. If these
 /// counts change, the site list in
-/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5 is
+/// `x64-flag-skew-and-contracts.md` §5 is
 /// stale and the shrink has an unaudited emission site.
 #[test]
 fn header_offset_emission_site_inventory_matches_the_doc() {
@@ -904,7 +904,7 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
             found, expected,
             "{needle} appears {found}x across the x64 backend sources, doc records \
              {expected}x. Update \
-             arch-2026-07-26/x64-flag-skew-and-contracts.md §5 (the \
+             x64-flag-skew-and-contracts.md §5 (the \
              header-offset site list) in the same change — it is the map the \
              ObjectHeader 32→16 shrink navigates by."
         );
@@ -1070,7 +1070,7 @@ fn ir_lower_header_offset_sites_are_inventoried_too() {
             "{needle} appears {found}x in ir_lower.rs, the header-shrink audit \
              records {expected}x. ir_lower.rs emits array/field displacements \
              exactly as x64.rs does; update \
-             arch-2026-07-26/header-shrink.md §6 in the same change."
+             header-shrink.md §6 in the same change."
         );
     }
 }

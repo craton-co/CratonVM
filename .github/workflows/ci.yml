@@ -930,7 +930,7 @@ jobs:
       # OS leg would re-prove the same compile. Behavioural parity with
       # `Generational` is not asserted anywhere in CI and deliberately so: the
       # backend is default-off precisely because it is not at parity yet
-      # (fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md).
+      # (zgc-real-fullsuite-regression-RETIRED-20260807.md).
       - name: Build the cratonvm launcher with the ZGC backend compiled in
         run: cargo build -p cratonvm-cli --features zgc
 

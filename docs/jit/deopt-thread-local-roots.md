@@ -15,12 +15,12 @@ defence outlived its cause: it discarded the reason-9 frame the compiled body
 had just published, so RBC.6's `getfield`/`putfield` admission let a
 NullPointerException escape a handler that catches it, for every compiled
 `try`-wrapped field access in the tree. Fixed by keeping the frame — see
-`fixed-bugs/rbc6-getfield-putfield-npe-escape-FIXED-20260818.md`. A status
+`rbc6-getfield-putfield-npe-escape-FIXED-20260818.md`. A status
 line is load-bearing; this one was read as permission to defend against a
 hazard that was already closed.
 
 This is the `jit/`-crate sibling of
-`fixed-bugs/jit-signals-root-gap.md`, which moved the JIT's pending
+`jit-signals-root-gap.md`, which moved the JIT's pending
 throwable off a `thread_local!` and onto `JvmThread`. Same defect, same
 consequence, different crate — and, because `jit/` cannot depend on `vm/`, a
 different fix shape.

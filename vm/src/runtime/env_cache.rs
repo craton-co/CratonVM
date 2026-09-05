@@ -261,7 +261,7 @@ pub fn osr_backedge_enabled() -> bool {
 /// independent copies of the same env-var parse (this file, a
 /// `classloading::class_manager` copy, and a `native-builtins::classloader`
 /// copy) — they drifted out of lock-step at least once in production (see
-/// `fixed-suite-bugs/loader-identity.md`). `cratonvm_classloading::
+/// `loader-identity.md`). `cratonvm_classloading::
 /// loader_aware_resolution` is now the single source of truth; this
 /// function is kept (same name, same signature, own doc history below) so
 /// none of ITS callers have to change, but it simply forwards to the
@@ -283,8 +283,7 @@ pub fn osr_backedge_enabled() -> bool {
 /// global fast path, so this only engages for classes defined by custom
 /// loaders — but that still covers web-app / OSGi / proxy loaders broadly,
 /// which is why this shipped gated (default off) pending an app-gauntlet
-/// soak; see `fixed-suite-bugs/hibernate/
-/// hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md`.
+/// soak; see `hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md`.
 ///
 /// **Why the default flipped:** every Apache Groovy dynamic-DSL script run
 /// (e.g. Spring's `GroovyBeanDefinitionReader`/`GenericGroovyApplicationContext`)
@@ -443,7 +442,7 @@ pub fn osr_athrow_allowed() -> bool {
 /// refusal, so one binary can A/B the lift — the arm that answers "did this
 /// change the answer, or only the speed?". Read once and cached.
 ///
-/// See fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md.
+/// See osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md.
 #[inline]
 pub fn osr_exception_table_allowed() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
@@ -1148,7 +1147,7 @@ pub fn tier_pgo_receivers() -> bool {
 // Turning it off cost ~8.4x on ordinary instance-method bytecode — measured on
 // `CalleeTierUpProbe`, 2 432 ns on / 18 047 ns off — because `recycle()`-shaped
 // methods (plain field stores, no handlers) are exactly the ones the ban was
-// never about. See `fixed-suite-bugs/tomcat/32-doc04-residual-perf-assertions-CLOSED.md`.
+// never about. See `32-doc04-residual-perf-assertions-CLOSED.md`.
 //
 // Off-switch for diagnosis/bisection: `CRATONVM_JIT_VIRTUAL_TIERUP=0`.
 #[inline]
@@ -1197,7 +1196,7 @@ pub fn jit_virtual_tierup() -> bool {
 /// counter at all.
 ///
 /// The 2026-08-05 measurement that refused to narrow the `java/util/` prefix
-/// (`retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3, a
+/// (`aqs-thread-handoff-latency-RETIRED-20260805.md` item 3, a
 /// `ReentrantLock` loop 30 % SLOWER with tier-up admitted) priced ADMITTING
 /// THE PROMOTION. This gate does not admit it: `promotion_barred` still
 /// suppresses the `jit_cache` probe and the inline upgrade for exactly the
@@ -1255,7 +1254,7 @@ pub fn hot_lookup_cache() -> bool {
 /// where the prefix is a performance policy.
 ///
 /// It exists because the policy has never been priced on its own.
-/// `retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
+/// `aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
 /// `ReentrantLock` against a user subclass `MyLock extends ReentrantLock` and
 /// found the subclass 0.77x — but those are two receiver classes in two loop
 /// methods, so the comparison carries "different class, different call site,
@@ -1401,7 +1400,7 @@ pub fn jit_lambda_capture_adapter() -> bool {
 ///
 /// This flag stays as a ROLLBACK LEVER, not because the defect is expected
 /// back. See
-/// `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
+/// `completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
 /// for the evidence that retired it.
 #[inline]
 pub fn jit_fjp_subclass_blocklist() -> bool {
@@ -1755,7 +1754,7 @@ cached_is_set!(jit_real_new_site_flags, "CRATONVM_JIT_REAL_NEW_SITE_FLAGS");
 /// suspect whenever an interpreter-only run starts producing nondeterministic
 /// wrong answers. Being able to A/B it within ONE binary is what let the
 /// Hibernate HQL mis-parse be attributed to the moving young collector instead
-/// (see `fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`);
+/// (see `hib-bytebuddy-20260730-FIXED.md`);
 /// keep the switch so the next such question costs one run, not one build.
 #[inline]
 pub fn trivial_getter_fast_path() -> bool {
@@ -1876,6 +1875,70 @@ cached_is_set!(no_backedge_poll_gate, "CRATONVM_JIT_NO_BACKEDGE_POLL_GATE");
 /// Token: `CRATONVM_JIT=-field-fast-path`.
 cached_is_set!(no_field_fast_path, "CRATONVM_JIT_NO_FIELD_FAST_PATH");
 
+/// `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE` -- restore the object-start registry
+/// probe the quickened field and array arms used to run on every receiver.
+///
+/// `field_ptr_for` and `prim_elem_ptr` opened with
+/// `ZgcRealHeap::is_object_address`, which on the bitmap arm is one `Acquire`
+/// load of a word of the object-start bitmap -- one bit per 8 arena bytes, so
+/// ~16 MB of bitmap for a 1 GiB heap, indexed by the receiver's own address.
+/// A probe with two live objects keeps that word in L1; a real working set
+/// makes it a random access into a structure sized by the heap.
+///
+/// It is not a check the arms are obliged to make. The handler they exist to
+/// replace -- `ZgcRealHeap::get_field` -- dereferences the receiver's header
+/// with no membership test at all (`self.header(obj)` is a bare pointer cast),
+/// and so does `set_field`. What actually establishes that this receiver
+/// matches this site is the header comparison immediately after the probe:
+/// `class_id`, `num_slots` and the compact flag, all three, on every access.
+///
+/// The one thing the probe did buy incidentally was a stale-receiver screen: a
+/// relocated address is pruned from the registry, so it missed and fell back to
+/// `op_getfield`, which heals the receiver with `load_and_forward`. That heal
+/// exists for a window the fast arms do not have -- `op_getfield` pops the
+/// receiver into a bare Rust local and then calls `resolve_field_ref`, which
+/// can load a class, allocate, and provoke a collection while the local is
+/// invisible to the root scan. Between `peek_compact` and the header read the
+/// quickened arm allocates nothing, takes no lock and calls nothing that can
+/// reach a safepoint, so its window is zero-length and the operand-stack slot
+/// it read is one the collector has already updated.
+///
+/// Token: `CRATONVM_JIT=-field-addr-elide`.
+cached_is_set!(no_field_addr_elide, "CRATONVM_JIT_NO_FIELD_ADDR_ELIDE");
+
+/// `CRATONVM_JIT_NO_ARRAYLENGTH_FAST` -- route `arraylength` back through the
+/// `Value` round trip and the `VmHeap` enum dispatch.
+///
+/// The quickened arm reads the length out of the header at the address already
+/// in the operand-stack slot. The path it replaces decoded that slot into the
+/// 16-byte `Value` enum (and pushed it back on the non-object path, keeping it
+/// live across the arm), then went through `dispatch!` to reach a collector
+/// method whose whole body is `self.header(obj).array_length()`. Measured
+/// 2026-09-05 the opcode cost 24.4 ns against HotSpot's 0.39 -- 62x, the worst
+/// ratio in the interpreter's operation table, for one header read.
+/// Token: `CRATONVM_JIT=-arraylength-fast`.
+cached_is_set!(no_arraylength_fast, "CRATONVM_JIT_NO_ARRAYLENGTH_FAST");
+
+/// `CRATONVM_JIT_NO_REF_ARRAY_FAST` -- route `aaload` back through
+/// `VmHeap::get_array_element`.
+///
+/// `aaload` sits in the same `0x2e..=0x35` dispatch arm as `iaload`, but that
+/// arm's quickened half declines it (`prim_elem_for_opcode` has no reference
+/// entry), so every reference element load took the full path. Measured
+/// 2026-09-05 at 99.9 ns per iteration against `iaload`'s 79.0 in the identical
+/// loop -- 21 ns, where HotSpot has the two identical to within noise.
+/// Token: `CRATONVM_JIT=-ref-array-fast`.
+cached_is_set!(no_ref_array_fast, "CRATONVM_JIT_NO_REF_ARRAY_FAST");
+
+/// `CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH` -- restore the class-manager read lock
+/// and name comparison `op_getstatic` used to perform on EVERY `getstatic` to
+/// decide whether the field was one of `System.out` / `err` / `in`.
+///
+/// Measured 2026-09-05, a `getstatic` + `putstatic` pair cost 86.4 ns against
+/// HotSpot's 3.45 (25x); `op_putstatic` never had the screen, so the pair's
+/// cost is the get half. Token: `CRATONVM_JIT=-system-class-latch`.
+cached_is_set!(no_system_class_latch, "CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH");
+
 /// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
 /// backward branch instead of only once `Frame::backward_count` has reached
 /// the smallest threshold the call could accept. Token:
@@ -1921,7 +1984,7 @@ cached_is_set!(no_door_recv_memo, "CRATONVM_JIT_NO_DOOR_RECV_MEMO");
 ///
 /// The line-level defect is NOT yet identified, which is why this is a default
 /// flip and not a repair. See
-/// `fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`.
+/// `testrandommapops-deterministic-1810-null-FIXED-20260904.md`.
 cached_is_set!(invoke_fast_door_opt_in, "CRATONVM_JIT_INVOKE_FAST_DOOR");
 
 /// `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` -- disable the monomorphic
@@ -2369,11 +2432,11 @@ pub fn jit_ir_call_virtual() -> bool {
 /// `entrySet().size()` on the same object said 6, deterministically from
 /// iteration ~502. That is `org.h2.test.store.TestRandomMapOps` op:1033, which
 /// failed H2 in 11-22 s and blocked
-/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`,
+/// `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`,
 /// whose SIGSEGV needs 25-183 s to appear.
 ///
 /// **That defect is FIXED**
-/// (`fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`).
+/// (`guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`).
 /// It was not the receiver's `root` mirror, which is what this comment used to
 /// say and which no measurement ever supported: `resolve_inline_site_from`
 /// screened for a registered native on the callee's DECLARING class, and the
@@ -2520,7 +2583,7 @@ impl RealSelector {
 // `perf record -F 999` attributed ~3.5% of the run to `getenv` and its
 // callers. This is the same defect class as the 2026-07-23 fix for
 // `callee_saved_gpr_local_homes_enabled()` in `vm/src/jit/skip_list.rs` — see
-// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`,
+// `bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`,
 // which is where that one was found and where these were.
 //
 // NOTE: like every other helper in this module, these read the legacy

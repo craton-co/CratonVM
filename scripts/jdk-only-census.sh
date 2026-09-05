@@ -5,7 +5,7 @@
 # jdk-only-census.sh — produce the JDK-only mode audit artifacts.
 #
 # See docs/feature-designs/jdk-only-mode.md (the normative contract) and
-# audits/jdk-only-audit.md §3 and §6 (the reproducible audit).
+# jdk-only-audit.md §3 and §6 (the reproducible audit).
 #
 # ---------------------------------------------------------------------------
 # ONE INVOCATION PER POLICY. ALL FOUR DUMPS PER INVOCATION.
@@ -51,11 +51,11 @@
 # `report-{real,strict}.json`. The old names said nothing about which policy
 # produced them, which is exactly how they came to be paired with the
 # permissive `registry-real.json`. `registry-strict.json` is the strict registry
-# under the name audits/jdk-only-audit.md §3.2 uses for it; `registry-no-stubs.json`
+# under the name jdk-only-audit.md §3.2 uses for it; `registry-no-stubs.json`
 # is kept as an alias because CI's zero-stub gate reads that path.
 #
 # ---------------------------------------------------------------------------
-# Derived artifacts (audits/jdk-only-audit.md §6)
+# Derived artifacts (jdk-only-audit.md §6)
 # ---------------------------------------------------------------------------
 #
 # tools/jdk-only-blockers/blockers.py turns one *coherent* dump set into:
@@ -428,7 +428,7 @@ if [ -n "$missing" ]; then
     exit 4
 fi
 
-# --- derived blocker artifacts (audits/jdk-only-audit.md §6) -----------------
+# --- derived blocker artifacts (jdk-only-audit.md §6) -----------------
 BLOCKERS="${BLOCKERS:-generate}"
 blocker_status=0
 
@@ -442,7 +442,7 @@ case "$BLOCKERS" in
         if PY="$(find_python)"; then :; else
             echo "ERROR: no python interpreter found (tried \$PYTHON, python3, python)." >&2
             echo "       The dumps above were written, but the per-JDK blocker artifacts" >&2
-            echo "       required by audits/jdk-only-audit.md §6 were NOT generated." >&2
+            echo "       required by jdk-only-audit.md §6 were NOT generated." >&2
             echo "       That is a gap in this run, not a clean result. Install python or" >&2
             echo "       set BLOCKERS=off to declare the omission deliberate." >&2
             exit 5

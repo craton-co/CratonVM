@@ -6,7 +6,7 @@ in `MakeNotCompilable` — is **CLOSED 2026-08-25**. It was not the bimorphic
 receiver this page said it was, and the fix is worth **6.6x on the value loop
 and 2.6x on the name loop**, with the class's deopt census going from
 6 236–123 832 entries to **19**. See
-`fixed-suite-bugs/jit/string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`.
+`string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`.
 
 **The class still does not finish.** With the fix it exceeds a **5 400 s** cap,
 against the harness's 180 s wall and HotSpot's 53 s. Everything specific to this
@@ -220,10 +220,10 @@ CRATONVM_DBG_DEOPT=1 cratonvm --java-home <jdk> @common.args io.netty.handler.co
 
 ## Related
 
-* `fixed-suite-bugs/jit/string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`
+* `string-receiver-guard-speculated-with-no-evidence-FIXED-20260825.md`
   — what this page's third blocker turned out to be, the fix, and the
   measurement that sets its 90% evidence bar.
-* `fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
+* `osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md`
   — this page's first blocker. It also records the two vacuous greens that fix
   passed through, both caught by an engagement counter.
 * [`httpresponsestatustest-exhaustive-loop-timeout-20260816.md`](httpresponsestatustest-exhaustive-loop-timeout-20260816.md)

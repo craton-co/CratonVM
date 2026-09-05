@@ -854,9 +854,9 @@ impl VmHeap {
             // 8-byte stack word instead calls `ZgcRealHeap::is_object_address`
             // (`zgc.rs:1892`), whose first act is `self.registry.lock()`: one
             // mutex acquire PER STACK WORD, per root-gathering pass, per
-            // thread. `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
+            // thread. `zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
             // as a competing explanation for the 35 PASS→HANG classes in
-            // `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`,
+            // `zgc-real-fullsuite-regression-RETIRED-20260807.md`,
             // whose ApplicationContext boot/teardown shape is exactly deep
             // stacks × many threads. `zgc.rs:1467-1474` records that the same
             // shape already "read as a hang at scale" once — that fix covered
@@ -1005,9 +1005,9 @@ impl VmHeap {
             // `interpreter/gc_and_alloc.rs:4260`), whose dominant population
             // is zeros, small integers and long bit patterns — every one of
             // which currently buys a full walk of the heap.
-            // `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
+            // `zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
             // instrument-separable hypotheses for the 35 PASS→HANG classes in
-            // `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+            // `zgc-real-fullsuite-regression-RETIRED-20260807.md`.
             //
             // Why it cannot lose a root. The guard only ever returns `None`
             // sooner; it can never turn a `None` into a `Some`, so no interior
@@ -2088,7 +2088,7 @@ impl VmHeap {
     /// (`G1Collector::native_alloc_pressure`) — without it, a workload that
     /// allocates only from inside natives never reaches ANY safepoint and G1's
     /// infallible allocator aborts the process on a heap full of garbage (see
-    /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
+    /// `g1-native-alloc-no-safepoint-oom-FIXED.md`).
     ///
     /// ZGC: the same defect was live here, verbatim. `ZgcRealHeap` is an
     /// infallible allocator too — `alloc_object` and `alloc_array` end in
@@ -2622,7 +2622,7 @@ impl VmHeap {
     /// `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
     /// holds a live JIT frame — the steady state at a 500-invocation JIT
     /// threshold; compaction's correctness blocker closed 2026-07-26
-    /// (`fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+    /// (`moving-young-gen-drops-jit-held-oops-FIXED.md`),
     /// and moving-young is now the default. Under a
     /// non-moving, fragmenting heap "unused bytes" and "bytes an
     /// allocation can actually obtain" diverge without bound: a heap can be 60%
@@ -2657,7 +2657,7 @@ impl VmHeap {
     /// `last_observed_clock_ms` field doc there.) Until that lands, the soft-ref
     /// policy runs on a constant 64 MB of assumed headroom and therefore does
     /// not respond to memory pressure at all. Tracked in
-    /// `arch-2026-07-26/refs-metaspace-unloading.md`.
+    /// `refs-metaspace-unloading.md`.
     pub fn soft_ref_policy_free_mb(&self) -> usize {
         const MB: usize = 1024 * 1024;
         let (young_used, young_cap) = self.young_gen_stats();
@@ -3831,7 +3831,7 @@ impl VmHeap {
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
         // ("per-cycle coverage proof, moving is possible") disagreement for
-        // THIS run — see `audits/tlab-and-card-audit.md` §3.
+        // THIS run — see `tlab-and-card-audit.md` §3.
         //
         // Under G1 this used to be uninformative by construction:
         // `G1Collector::collect_garbage` passed the constant
@@ -3877,7 +3877,7 @@ impl VmHeap {
             // the young generation never actually copied anything, which is the
             // exact way the 2026-07-01 validation declared moving-young working
             // while it was inert (see
-            // `arch-2026-07-26/moving-young-corruption-rootcause.md`
+            // `moving-young-corruption-rootcause.md`
             // section 6). The histogram then names what stopped it.
             let cycles = crate::gc_quiescence::moving_young_cycle_count();
             eprintln!("[GC] moving_young: cycles={cycles} coverage_fallbacks={fallbacks}");
@@ -3954,7 +3954,7 @@ impl VmHeap {
             // frame blocks the moving young collector — so a freed block kept
             // answering "live" and no consumer of this predicate ever pruned a
             // dangling old-gen entry. See
-            // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+            // `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
             //
             // Young-GC live-reclaim ROOT FIX (2026-07-07): also recognize
             // kept-in-place young survivors of the NON-MOVING sweep (which
@@ -4031,7 +4031,7 @@ impl VmHeap {
     /// victim was the zeroed tail, and a silent dangling-pointer store into a
     /// live object otherwise (`SIGSEGV` /
     /// `gen_heap::read_slot: corrupt Value cell`, the HIB-CV-32 family; see
-    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
+    /// `bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
     ///
     /// Both old-gen paths now emit an identity `pointer_map` entry for every
     /// watched address that survived without moving, so once
@@ -4174,7 +4174,7 @@ impl VmHeap {
     /// class-lock/condy object with no other reference), it is silently
     /// reclaimed and its memory reused by the very next allocation —
     /// producing a live object that reads back as a DIFFERENT, unrelated
-    /// type. See `fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`'s
+    /// type. See `spb1-springframework-util-investigation-FIXED.md`'s
     /// repro-3 follow-up for the observed corruption shape (a `ClassUtils`
     /// static field, loaded via a user-defined `ClassLoader`, read back as
     /// an unrelated live object from later in the same `<clinit>`).

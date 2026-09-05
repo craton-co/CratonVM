@@ -576,7 +576,7 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 // Per-group verdicts are annotated on each `register_*_natives` below and were
 // derived from `javap -p -s` against JDK 25; they are static evidence only and
 // must be confirmed with schema-v2 `invocations` counts before any group is
-// retagged. See audits/jdk-only-ambient-category-audit.md.
+// retagged. See jdk-only-ambient-category-audit.md.
 pub fn register_all(registry: &mut NativeMethodRegistry) {
     // EXPERIMENT (P0 over-tagging, per-group split)
     registry.with_category(NativeKind::Bridge, register_toolkit_natives);
@@ -824,7 +824,7 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
 // never "dead" — which is why `scripts/jdk-only-dead-sweep.py` now refuses an
 // image set that omits one.
 //
-// See retired/l5-native-io-bridge-residuals-RETIRED-20260810.md.
+// See l5-native-io-bridge-residuals-RETIRED-20260810.md.
 fn register_headless_natives(registry: &mut NativeMethodRegistry) {
     // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessProperty()Z — the JDK
     // consults this when `java.awt.headless` is unset. On a host with no

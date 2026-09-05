@@ -1050,8 +1050,7 @@ fn native_login_context_init_name_handler(
     // <init>(String, CallbackHandler)V — the overload H2's
     // `JaasCredentialsValidator` uses. Previously unregistered, so it ran as
     // un-intercepted real JDK bytecode and never populated the side-table
-    // `login()` depends on (see fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
+    // `login()` depends on (see bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
     let this = obj_arg(args, 0)?;
     let name_obj = optional_obj_arg(args, 1);
     let handler_obj = optional_obj_arg(args, 2);
@@ -1410,7 +1409,7 @@ fn run_java_configuration_login(
 /// relies on exactly this path via the 2-arg `(String, CallbackHandler)`
 /// constructor — it calls `Configuration.setConfiguration(...)` itself and
 /// never touches the Rust-side security-domain registry (see
-/// fixed-suite-bugs/h2-suite-bugs/bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
+/// bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
 /// Only consulted by the caller when the Rust-side registry
 /// (`LoginContext::modules`, populated by WildFly/Keycloak bootstrap) has no
 /// entry for `name`, so WildFly/Keycloak's own domains are unaffected.
@@ -1759,8 +1758,7 @@ pub fn register_jdk_security_natives(r: &mut NativeMethodRegistry) {
     // JDK-legal construction path has to populate the side-table before
     // `login()` (unconditionally a native override) can find it. H2's
     // `JaasCredentialsValidator` uses the 2-arg (String, CallbackHandler)
-    // form; see fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-jaas-logincontext-two-arg-ctor-gap.md.
+    // form; see bug-h2-jaas-logincontext-two-arg-ctor-gap.md.
     r.register(
         lc,
         "<init>",

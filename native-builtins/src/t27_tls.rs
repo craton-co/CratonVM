@@ -2462,7 +2462,7 @@ pub(crate) fn build_client_config(
 /// `HttpsURLConnection.setDefaultSSLSocketFactory` would silently accept a
 /// revoked server certificate — exactly the fail-open gap this feature
 /// fixes. See
-/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
+/// `tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
 #[derive(Debug)]
 struct OcspAwareServerCertVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -3794,7 +3794,7 @@ pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
+    // rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -3824,7 +3824,7 @@ pub(crate) const JSSE_APPLICATION_BUFFER_SIZE_NEGOTIATED: i32 = 16676;
 
 /// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
 /// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
-/// see `fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`.
+/// see `rustls-cbc-cipher-suites-not-supported.md`.
 /// Every call site that used to construct `rustls::crypto::ring::default_provider()`
 /// directly now goes through this instead, so the CBC suites are negotiable
 /// (not just reported) everywhere TLS connections get set up.
@@ -4415,7 +4415,7 @@ pub(crate) fn rustls_client_connect(
 /// `TestNetUtils.testFrequentConnections` starts a background `Task` thread
 /// looping `serverSocket.accept()`, and its client-side workers can all
 /// finish/bail without ever connecting, e.g. after a *different*, since-fixed
-/// bug — see `bug-h2-netutils-dsa-privatekey-tls-unsupported.md` — left them
+/// bug — see `bug-h2-netutils-dsa-privatekey-tls-unsupported-FIXED.md` — left them
 /// throwing before they ever reached the network). The test's own `finally`
 /// block then calls `serverSocket.close()` from the main thread, which needs
 /// that SAME mutex (`rustls_listener_close`) to remove the listener entry —
@@ -7167,7 +7167,7 @@ fn lookup_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef) -> Option<String> 
 /// architectural defect already fixed once in this file for
 /// `engine_table`/`sslparams_alpn_table` via `engine_objref_key` (see its
 /// doc comment, and
-/// `fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
+/// `reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
 /// — that earlier fix's scope note explicitly left
 /// `ssl_server_socket_states`, `sock_alpn_table`, `session_peer_certs_table`,
 /// and `SSLSession.getId()`'s seed unfixed; this closes those.
@@ -12640,7 +12640,7 @@ enum BbBacking {
 /// server engine never saw the ClientHello Netty delivered and its first
 /// `unwrap` returned `BUFFER_UNDERFLOW consumed=0`, upon which Netty closed
 /// the connection (client saw "TLS handshake failed: unexpected EOF"). See
-/// `fixed-suite-bugs/reactive-netty-https-sslengine-handshake-underflow-FIXED.md`.
+/// `reactive-netty-https-sslengine-handshake-underflow-FIXED.md`.
 struct BbView {
     backing: BbBacking,
     layout: BbLayout,
@@ -13691,8 +13691,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // `beginHandshake()` call was ALSO silently discarded on the
                     // CratonVM side even before hitting that rustls wall — see
                     // this crate's
-                    // `fixed-suite-bugs/tls-ocsp-clientcert-
-                    // validation-not-enforced-FIXED.md`, "Residual #2 implementation"
+                    // `tls-ocsp-clientcert-validation-not-enforced-FIXED.md`, "Residual #2 implementation"
                     // point 2, for the full trace evidence.
                     //
                     // True wire-level renegotiation is therefore not
@@ -15240,7 +15239,7 @@ fn jsse_owns_endpoint_identification(
         // `x509_manager::check_server_trusted_extended` now reads
         // `SSLParameters.getEndpointIdentificationAlgorithm()` off it and runs
         // the name check, which is what closed the netty OpenSSL hole
-        // (`fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`).
+        // (`ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`).
         //
         // This arm STAYS `true` regardless. The shim identifies only when it
         // can find a host on the peer, and this VM's own `SSLEngine` object
@@ -16761,7 +16760,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     // reaches the connection's promise), which is why this specific NPE
     // manifested as an indefinite hang/silent-exit crash rather than a
     // visible test failure — see
-    // fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md.
+    // http-client-connector-teardown-hang-crash-FIXED.md.
     // Real JDK's `getHandshakeSession()` returns the session being negotiated,
     // and NULL outside a handshake — which the sentence above already said and
     // the code below then did not do. It returned a populated synthetic
@@ -18880,7 +18879,7 @@ pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
 /// `IllegalStateException: SSLSocketFactory has no owning SSLContext`
 /// instead of connecting. Converting the idiom rather than each site is what
 /// keeps a future fourth caller from re-introducing it. See
-/// `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
+/// `sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 pub(crate) fn default_ssl_context_or_create(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
 ) -> Result<ObjectRef, MethodCallFailed> {

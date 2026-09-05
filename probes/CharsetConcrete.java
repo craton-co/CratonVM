@@ -1,4 +1,4 @@
-// Residual of `bug-printstream-charset-answers-the-abstract-base-20260825.md`
+// Residual of `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md`
 // §5: "`charset_alloc`'s other callers are untouched."
 //
 // `java.nio.charset.Charset` is ABSTRACT. Any CratonVM path that fabricates an

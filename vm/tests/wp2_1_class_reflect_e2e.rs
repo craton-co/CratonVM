@@ -3,7 +3,7 @@
 
 //! WP2.1-narrow — `Class.getDeclaredMethods()` end-to-end dispatch.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1).
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1).
 //!
 //! # What this suite anchors
 //!

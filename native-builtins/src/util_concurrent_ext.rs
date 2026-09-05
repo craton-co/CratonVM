@@ -506,10 +506,10 @@ pub(crate) fn register_atomic_reference_natives(r: &mut NativeMethodRegistry) {
     // `AtomicReference.compareAndSet` is one line --
     // `return VALUE.compareAndSet(this, expectedValue, newValue);` -- and that
     // `VarHandle.compareAndSet` is now thin-direct-bound (see
-    // `performance/varhandle-compareandset-thin-direct-bind-FIXED-20260828.md`),
+    // `varhandle-compareandset-thin-direct-bind-FIXED-20260828.md`),
     // so running the real bytecode is now FASTER than this synthetic stub, not
     // slower. A previous attempt at this exact change (recorded in
-    // `performance/juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`,
+    // `juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md`,
     // "What was tried and refuted") measured the stub WINNING (257 vs 289 ns)
     // because at the time the CAS underneath the real bytecode was still
     // funnel-served at ~233 ns; that arithmetic flips now that the bind exists.

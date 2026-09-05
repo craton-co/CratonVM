@@ -226,7 +226,7 @@ pub fn publish_moving_young_enabled(on: bool) {
 /// COMPLETE rewritable precise root map via the shadow stack and the
 /// conservative frame scan is suppressed (see the vm crate's
 /// `conservative_roots::moving_young_enabled` and
-/// `arch-2026-07-26/moving-young-precise-roots.md`).
+/// `moving-young-precise-roots.md`).
 ///
 /// Reads what the VM published from the codegen gate; before the first publish
 /// it falls back to `gc_flags().moving_young`. Never an independent policy
@@ -356,7 +356,7 @@ fn unrewritable_peer_state_set(v: bool) {
 // the initiator cannot walk a peer's `JIT_ENTRY_CHAIN` (it is a thread-local)
 // and cannot rewrite a peer's registers. On a many-threaded workload that is
 // nearly every cycle, which is how
-// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ends with an
+// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` ends with an
 // `OutOfMemoryError` on a heap that is 97 % free.
 //
 // The missing half was never the REWRITE. A peer that parks COOPERATIVELY at
@@ -833,7 +833,7 @@ fn read_reason_counts() -> [usize; incomplete_reason::COUNT] {
 ///
 /// Paired with [`moving_young_cycle_count`] this is the whole runtime answer to
 /// "is the young generation a copying collector, and if not, what is stopping
-/// it?" — see `arch-2026-07-26/moving-young-corruption-rootcause.md`.
+/// it?" — see `moving-young-corruption-rootcause.md`.
 pub fn moving_young_fallback_reason_counts() -> [usize; incomplete_reason::COUNT] {
     read_reason_counts()
 }
@@ -996,7 +996,7 @@ pub fn moving_young_coverage_incomplete() -> bool {
 /// **Emits at `warn` level, ON BY DEFAULT.** A silent regression to the
 /// non-moving sweep is precisely how the moving young generation stayed
 /// switched off while the architecture docs advertised it (see
-/// `arch-2026-07-26/moving-young-precise-roots.md`): the only
+/// `moving-young-precise-roots.md`): the only
 /// signal was a `tracing::debug!` line reading "compaction deferred" and a
 /// counter behind `CRATONVM_MOVING_YOUNG_FALLBACKS`, which nobody set.
 /// Rate-limited (every occurrence up to 8, then powers of two) so a genuinely
@@ -1778,7 +1778,7 @@ pub fn xt_cycle_pinned_jit_root_count() -> usize {
 // RandomizedContext.getPerThread()` returning null for its OWN WeakHashMap
 // key — the running suite thread's `java.lang.Thread` mirror — well after
 // the entry was legitimately created (see
-// fixed-suite-bugs/elasticsearch-suite/elasticsearch-randomizedcontext-per-thread-null.md).
+// elasticsearch-randomizedcontext-per-thread-null.md).
 //
 // Fix: the VM publishes the currently-registered Weak/Soft/Phantom referent
 // addresses here immediately before a collection (same thread that will run

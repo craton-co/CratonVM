@@ -7,7 +7,7 @@ load-sensitive process-wide hazard has been **named** — the page's previous
 rule-out of it does not hold. Successor to
 `unit-test-load-sensitive-flakes-20260815.md`, which paired this with a monitor
 test that IS root-caused and fixed — see
-`fixed-bugs/monitor-inflation-test-timed-its-contention-instead-of-arranging-it-FIXED-20260818.md`.
+`monitor-inflation-test-timed-its-contention-instead-of-arranging-it-FIXED-20260818.md`.
 
 | test | crate | shape |
 | --- | --- | --- |
