@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-515 tokens.
+516 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -215,6 +215,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `jni-localref` | `CRATONVM_DBG_JNI_LOCALREF` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -937,7 +938,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-141 tokens.
+142 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1041,6 +1042,7 @@ export inherited from a parent shell.
 | `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `compact-tlab-alloc` | `CRATONVM_COMPACT_TLAB_ALLOC` |
 | `compact-tlab-sites` | `CRATONVM_COMPACT_TLAB_SITES` |
+| `static-root-slots` | `CRATONVM_GC_STATIC_ROOT_SLOTS` |
 | `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
