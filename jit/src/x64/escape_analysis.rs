@@ -1832,9 +1832,36 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
                 modified |= 1 << (code[pc] - 0x3b);
                 pc += 1;
             }
-            // lstore_0..lstore_3
+            // lstore_0..lstore_3.
+            //
+            // A `long` or `double` occupies TWO local slots, and this mask
+            // recorded only the lower one until 2026-09-05. The upper one is
+            // the "dead high half" — dead to the reader, written by the store
+            // all the same — so a consumer asking about slot k+1 was told the
+            // loop does not write it. `loop_analysis::modified_locals_strict`,
+            // the reviewed twin of this function, has always marked it, with
+            // the reason in its doc: an invariance check built on a set that
+            // quietly forgot a write is not a check.
+            //
+            // It was not hypothetical. `find_fp_loop_hoists` admits a
+            // `dload k` on the strength of bit k alone, and TWO tests in this
+            // tree (`p87_fp_loop_hoist_detection`,
+            // `p87_fp_hoist_double_and_float`) asserted that a `dload_1` is
+            // hoistable out of a loop whose body contains `dstore_0` — with
+            // the comment "this modifies 0, but doesn't affect 1". `dstore_0`
+            // writes slots 0 AND 1. Both tests were written from what the
+            // implementation did, and both pinned an unsound hoist.
+            //
+            // Reachability, stated honestly: javac cannot emit that shape.
+            // After `dstore_0` slot 1 holds TOP, so a later `dload_1` (or
+            // `iload_1`) fails verification unless something re-stores the
+            // slot first — which marks it anyway. So this costs nothing in
+            // practice and buys agreement between the two masks. Like every
+            // other arm here it can only ADD bits, i.e. only ever refuse a
+            // hoist.
             0x3f..=0x42 => {
                 modified |= 1 << (code[pc] - 0x3f);
+                modified |= 1 << (code[pc] - 0x3f + 1);
                 pc += 1;
             }
             // fstore_0..fstore_3
@@ -1842,9 +1869,10 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
                 modified |= 1 << (code[pc] - 0x43);
                 pc += 1;
             }
-            // dstore_0..dstore_3
+            // dstore_0..dstore_3 — the high half too; see `lstore_0` above.
             0x47..=0x4a => {
                 modified |= 1 << (code[pc] - 0x47);
+                modified |= 1 << (code[pc] - 0x47 + 1);
                 pc += 1;
             }
             // astore_0..astore_3
@@ -1852,13 +1880,18 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
                 modified |= 1 << (code[pc] - 0x4b);
                 pc += 1;
             }
-            // istore/lstore/fstore/dstore/astore (wide index)
+            // istore/lstore/fstore/dstore/astore (1-byte index operand)
             0x36..=0x3a => {
                 // Local index is 0..255; clamp the shift like every other
                 // shift-by-local site (a high local saturates to bit 63, which
                 // is conservatively treated as "some local >= 63 modified").
                 // Widening: u8 -> wider int (bytecode operand byte, value fits)
-                modified |= 1u64 << (code[pc + 1] as usize).min(63);
+                let slot = code[pc + 1] as usize;
+                modified |= 1u64 << slot.min(63);
+                // `lstore`/`dstore` write the high half too; see `lstore_0`.
+                if matches!(code[pc], 0x37 | 0x39) {
+                    modified |= 1u64 << (slot + 1).min(63);
+                }
                 pc += 2;
             }
             // iinc
@@ -1887,7 +1920,7 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
             // stride 1024 was not, which is what made it look like an
             // addressing bug rather than an invariance one. See
             // `test_classes/jit/OsrStridedValueMin.java` and
-            // `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+            // the retired `osr-miscompiles-cachecoherence-20260904` write-up.
             //
             // Over-marking is the safe direction here: this bitmask only
             // ever DISABLES a hoist, so a wide form that turns out not to
@@ -1901,6 +1934,11 @@ pub(super) fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64
                 // istore/lstore/fstore/dstore/astore, and iinc.
                 if widened == 0x84 || (0x36..=0x3a).contains(&widened) {
                     modified |= 1u64 << idx.min(63);
+                }
+                // `wide lstore`/`wide dstore` write the high half too; see
+                // the `lstore_0..lstore_3` arm above for why that matters.
+                if matches!(widened, 0x37 | 0x39) {
+                    modified |= 1u64 << (idx + 1).min(63);
                 }
                 pc += if widened == 0x84 { 6 } else { 4 };
             }

@@ -362,14 +362,49 @@ fn t8_3_3_rmi_activation() {
 // T8.4 — Deprecated sun.* / jdk.internal.*
 // ===========================================================================
 
+/// **T8.4.1 asserts ABSENCE, not presence.**
+///
+/// No supported JDK image (17 / 21 / 25, three platforms) declares
+/// `sun.misc.Unsafe.defineClass` — it went in JDK 11 — so a native standing in
+/// front of it could never be dispatched, and the VM's own `NoSuchMethodError`
+/// is the correct answer. `deprecated_verify`'s manifest adjudicated that and
+/// retired the registration; this file kept asserting the registration was
+/// there, and had been red ever since.
 #[test]
-fn t8_4_1_unsafe_define_class() {
+fn t8_4_1_unsafe_define_class_is_retired() {
     let r = full_registry();
-    assert!(r.find(
-        "sun/misc/Unsafe", "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-    ).is_some());
-    eprintln!("[t8] T8.4.1 Unsafe.defineClass: registered");
+    assert!(
+        r.find(
+            "sun/misc/Unsafe",
+            "defineClass",
+            "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
+        )
+        .is_none(),
+        "T8.4.1: `sun/misc/Unsafe.defineClass` is absent from every supported          image, so registering a native for it would shadow the          NoSuchMethodError that is the right answer"
+    );
+    eprintln!("[t8] T8.4.1 Unsafe.defineClass: retired, correctly absent");
+}
+
+/// **EVERY retired triple, checked against the one adjudicated list.**
+///
+/// The two assertions this file got wrong were wrong the same way: it kept a
+/// hand-maintained copy of `deprecated_verify`'s manifest, and a copy drifts
+/// the moment an API is retired. This reads the manifest instead, so a future
+/// retirement needs no edit here and cannot leave a stale claim behind.
+#[test]
+fn every_triple_absent_from_the_images_is_unregistered() {
+    let r = full_registry();
+    let absent = cratonvm_native_builtins::deprecated_verify::absent_from_all_supported_images();
+    assert!(
+        !absent.is_empty(),
+        "the adjudicated absent list is empty — this test would pass vacuously"
+    );
+    for (class, method, descriptor) in absent {
+        assert!(
+            r.find(class, method, descriptor).is_none(),
+            "{class}.{method}{descriptor} is registered, but no supported JDK              image declares it — the native can never be dispatched and only              hides the NoSuchMethodError"
+        );
+    }
 }
 
 #[test]
@@ -421,10 +456,11 @@ fn t8_5_1_deprecated_api_count() {
     let total = r.len();
     eprintln!("[t8] Total native methods (including deprecated): {total}");
     // Spot-check: all deprecated sub-sections should be present
-    assert!(
-        r.find("java/lang/Thread", "destroy", "()V").is_some(),
-        "T8.1.3 missing"
-    );
+    // T8.1.3 — `Thread.destroy()V` is RETIRED (2026-08-21): no supported image
+    // declares it, so its ABSENCE is the property. Covered by
+    // `every_triple_absent_from_the_images_is_unregistered` above, which reads
+    // the adjudicated manifest rather than naming triples here.
+
     assert!(
         r.find("java/util/Date", "getYear", "()I").is_some(),
         "T8.2.2 missing"

@@ -203,6 +203,14 @@ fn wp7_3_sqlTime_millis_roundtrip() {
 #[test]
 fn wp7_3_jdbc_essential_natives_registered() {
     let mut r = NativeMethodRegistry::new();
+    // 2026-09-05: that gate is no longer `#[cfg(feature = "synthetic-jdk")]` --
+    // it reads `NativeMethodRegistry::drops_real_layout_synthetic()`, because a
+    // DEFAULT build running synthetic mode (`VmConfig::default()`, i.e. every
+    // in-tree test and every plain `Vm::new`) has no `ServiceLoader` bytecode
+    // for the retirement to defer to and raised `NoSuchMethodError` instead.
+    // A bare registry answers "synthetic", so a test asking the real-JDK
+    // question has to say so.
+    r.set_drop_real_layout_synthetic(true);
     cratonvm_native_builtins::register_essential_natives(&mut r);
     // INVERTED 2026-08-30. `register_service_loader_natives`' body is
     // `#[cfg(feature = "synthetic-jdk")]`, and its header explains why: in a

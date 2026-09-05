@@ -143,6 +143,14 @@ fn wp8_11_file_channel_map0_registered_for_h2() {
 #[test]
 fn wp8_11_service_loader_iterator_registered_for_resteasy() {
     let mut r = NativeMethodRegistry::new();
+    // 2026-09-05: that gate is no longer `#[cfg(feature = "synthetic-jdk")]` --
+    // it reads `NativeMethodRegistry::drops_real_layout_synthetic()`, because a
+    // DEFAULT build running synthetic mode (`VmConfig::default()`, i.e. every
+    // in-tree test and every plain `Vm::new`) has no `ServiceLoader` bytecode
+    // for the retirement to defer to and raised `NoSuchMethodError` instead.
+    // A bare registry answers "synthetic", so a test asking the real-JDK
+    // question has to say so.
+    r.set_drop_real_layout_synthetic(true);
     cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
 
     // INVERTED 2026-08-30. `register_service_loader_natives`' body is

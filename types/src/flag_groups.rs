@@ -604,6 +604,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-direct-binds", on_key: Some("CRATONVM_DBG_JIT_DIRECT_BINDS"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::DBG, token: "jit-ea", on_key: Some("CRATONVM_DBG_JIT_EA"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::DBG, token: "ir-graph", on_key: Some("CRATONVM_DBG_IR_GRAPH"), off_key: None, off_word: None, since: "2026-08-28" },
+    E { group: Group::DBG, token: "ir-sink", on_key: Some("CRATONVM_DBG_IR_SINK"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::DBG, token: "zgc-target", on_key: Some("CRATONVM_DBG_ZGC_TARGET"), off_key: None, off_word: None, since: "2026-08-28" },
     // The LARGE-OBJECT end's compactor, one line per engaged cycle: what it
     // moved and what the high free list looked like on either side of it.
@@ -1238,8 +1239,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-deopt-regs", on_key: Some("CRATONVM_JIT_IR_DEOPT_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-osr-entry", on_key: Some("CRATONVM_JIT_IR_OSR_ENTRY"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ls-carry-relief", on_key: Some("CRATONVM_JIT_LS_CARRY_RELIEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-reserve-carried", on_key: Some("CRATONVM_JIT_IR_RESERVE_CARRIED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "osr-optimizing", on_key: Some("CRATONVM_JIT_OSR_OPTIMIZING"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-drop-phi-home", on_key: Some("CRATONVM_JIT_IR_DROP_PHI_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "ir-publish-at-def", on_key: Some("CRATONVM_JIT_IR_PUBLISH_AT_DEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-carry-single-use", on_key: Some("CRATONVM_JIT_IR_CARRY_SINGLE_USE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-sink-late", on_key: Some("CRATONVM_JIT_IR_SINK_LATE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "merged-call-sentinel", on_key: Some("CRATONVM_JIT_MERGED_CALL_SENTINEL"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-cold-arg-stage", on_key: Some("CRATONVM_JIT_IR_COLD_ARG_STAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-long", on_key: Some("CRATONVM_JIT_IR_LONG"), off_key: None, off_word: None, since: "2026-06-21" },
@@ -1305,6 +1311,13 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `stackwalker::osr_frame_dedupe_enabled` treats the key's
     // PRESENCE as "report the OSR continuation twice again".
     E { group: Group::JIT, token: "osr-frame-dedupe", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_FRAME_DEDUPE"), off_word: None, since: "2026-08-20" },
+    // Default-ON: an OSR entry pc must have an EMPTY abstract expression stack
+    // (`x64::osr::osr_empty_stack_entry_enabled`, presence-parsed, so `=0`
+    // still turns the rule OFF and `off_word` must stay `None`). A soundness
+    // rule HotSpot also enforces — declared because it is default-on CODEGEN
+    // that landed without a failure of its own, and the page that opened the
+    // question named the missing switch as its last open item.
+    E { group: Group::JIT, token: "osr-empty-stack-entry", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY"), off_word: None, since: "2026-09-05" },
     // Default-ON: `jit_bridge::osr_pc_refresh_enabled` treats the key's
     // PRESENCE as "stop publishing OSR continuations; report the back-edge".
     // Separate from the dedupe row above because the two answer different
@@ -1603,6 +1616,21 @@ pub const INVENTORY: &[E] = &[
     // `field-fast-path` — off restores the full `op_getfield` / `op_putfield`
     // handler on every instance field access.
     E { group: Group::JIT, token: "field-fast-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_FAST_PATH"), off_word: None, since: "2026-09-02" },
+    // `field-addr-elide` — off restores the object-start registry probe the
+    // quickened field and array arms ran on every receiver. The handler those
+    // arms replace (`ZgcRealHeap::get_field`) never made that test, and the
+    // header comparison beside it is what actually validates the site.
+    E { group: Group::JIT, token: "field-addr-elide", on_key: None, off_key: Some("CRATONVM_JIT_NO_FIELD_ADDR_ELIDE"), off_word: None, since: "2026-09-05" },
+    // `arraylength-fast` — off routes `arraylength` back through the `Value`
+    // round trip and the `VmHeap` enum dispatch, for one header read.
+    E { group: Group::JIT, token: "arraylength-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_ARRAYLENGTH_FAST"), off_word: None, since: "2026-09-05" },
+    // `ref-array-fast` — off routes `aaload` back through
+    // `VmHeap::get_array_element`; the `0x2e..=0x35` arm's primitive half
+    // declines reference elements by construction.
+    E { group: Group::JIT, token: "ref-array-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_REF_ARRAY_FAST"), off_word: None, since: "2026-09-05" },
+    // `system-class-latch` — off restores the class-manager read lock and name
+    // comparison `op_getstatic` performed on every getstatic.
+    E { group: Group::JIT, token: "system-class-latch", on_key: None, off_key: Some("CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH"), off_word: None, since: "2026-09-05" },
     // `osr-inline-gate` — off calls `try_osr_with_backoff` on every backward
     // branch instead of only past the smallest OSR threshold.
     E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },
@@ -2404,6 +2432,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None, since: "2026-08-24" },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
+    // `array-autobox-latch` — off restores the unconditional `autobox_payload`
+    // probe on every non-null reference-ARRAY element read. That probe opens
+    // with `is_object_address` and can only answer `Some` when a wrapper
+    // exists, which is what the latch records; the FIELD read paths have been
+    // latched since the latch was introduced and the array ones were not.
+    E { group: Group::GC, token: "array-autobox-latch", on_key: None, off_key: Some("CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH"), off_word: None, since: "2026-09-05" },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0"), since: "2026-07-27" },
     // Default-ON, off for the exact untrimmed string `0` only — the

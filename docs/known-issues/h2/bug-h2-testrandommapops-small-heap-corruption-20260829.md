@@ -19,6 +19,19 @@ load ~3** — against the inherited base rate of "roughly one in three runs of
 lever is host quietness, not a flag, and it is the difference between a defect
 nobody could bisect and one anybody can.
 
+**ONE OF THE THREE FACES IS CLOSED (2026-09-05): the SIGSEGV.** It was
+`ZGC-RELOC-DECOMMIT.1` -- the compaction slide memmoving into granules the
+give-back had returned -- and it is fixed by `Arena::commit_for_relocation`.
+Measured here, interleaved P/F, 10 reps per arm at `--Xmx 256m`:
+**SIGSEGV 5/10 pre-fix against 0/10 fixed** (Fisher's exact p = 0.016),
+while this page's `rc=1` faces were UNCHANGED at 1 against 2 -- which is the
+correct result, since nothing in that fix addresses them. See
+`../../internal/fixed-suite-bugs/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904.md` for the root
+cause and the guard-ON/OFF A/B that pins it. **Neither arm produced a passing
+run**, so this page's standing "no passing CratonVM run at any heap" still
+holds and the `NullPointerException` / `AssertionError` faces below remain
+OPEN and unexplained. Do not re-chase the segfault.
+
 **READ BOTH 2026-09-02 ADDENDA, THE "(later)" ONE FIRST.** Where things stand:
 the fail-closed fix REDUCED this defect and did not close it — the
 `NullPointerException` face still reproduces at the shipped default at
@@ -506,7 +519,7 @@ All on the post-`COLL-REFRESH`-fix binary, default collector (ZGC),
 |---|---|---|
 | 1 | 1300 s | clean to cap |
 | 2 | 1300 s | clean to cap |
-| 3 | — | **SIGSEGV at 155 s** |
+| 3 | — | **SIGSEGV at 155 s** — CLOSED 2026-09-05, see the top of this page |
 | (earlier) | 1500 s | clean to cap |
 | (earlier) | — | `NoSuchMethodError` at 845 s |
 | (earlier, `dev`) | — | `NullPointerException: "d" is null` at 823 s |

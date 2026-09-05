@@ -87,8 +87,13 @@
 //!   falls back, so the corrupt-cell census and its report stay with the
 //!   handler that owns them.
 //!
-//! Kill switch: `CRATONVM_JIT_NO_FIELD_FAST_PATH=1` (`CRATONVM_JIT=
-//! -field-fast-path`). Engagement: `CRATONVM_DBG_FIELD_SITE=1` prints
+//! Kill switches: `CRATONVM_JIT_NO_FIELD_FAST_PATH=1` (`CRATONVM_JIT=
+//! -field-fast-path`) turns the arms off entirely;
+//! `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE=1` (`CRATONVM_JIT=-field-addr-elide`)
+//! keeps them but restores the per-receiver object-start registry probe they
+//! used to open with — see [`registry_probe_restored`] for why that probe is
+//! not what makes the header read sound.
+//! Engagement: `CRATONVM_DBG_FIELD_SITE=1` prints
 //! `fast-field: get hit/miss/fill put hit/miss/fill unusable`, and names the
 //! first few reasons a site could not be quickened.
 
@@ -134,34 +139,76 @@ pub(super) fn fast_field_zgc(shared: &SharedVm) -> Option<&ZgcRealHeap> {
     Some(zgc)
 }
 
+/// The raw field accessors below all carry the same obligation, stated once
+/// here and referenced by each.
+///
+/// # Safety
+///
+/// `p` must be a field address produced by [`field_ptr_for`] for a receiver it
+/// accepted, and the width must be the one that receiver's layout records for
+/// that field. `field_ptr_for` is what discharges it: it refuses an address the
+/// heap does not know (`is_object_address`), then refuses a header whose class
+/// id, slot count or compact flag disagrees with the site — so the offset it
+/// adds belongs to the layout the site was filled against, and the bytes are
+/// inside a live object body on a committed page.
+///
+/// Every access is `Relaxed` through an atomic of the field's own width, which
+/// is what makes a torn read impossible when another thread writes the same
+/// slot; ordering is the interpreter's business, not this helper's.
+///
+/// Passing a pointer from anywhere else — a stale operand-stack value, an
+/// address into a decommitted span, a width that disagrees with the layout —
+/// is undefined behaviour, and reads as silent field corruption rather than a
+/// fault.
 #[inline(always)]
 unsafe fn load_u8(p: *mut u8) -> u8 {
     (*(p as *const AtomicU8)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn load_u16(p: *mut u8) -> u16 {
     (*(p as *const AtomicU16)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn load_u32(p: *mut u8) -> u32 {
     (*(p as *const AtomicU32)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn load_u64(p: *mut u8) -> u64 {
     (*(p as *const AtomicU64)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u8(p: *mut u8, v: u8) {
     (*(p as *const AtomicU8)).store(v, Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u16(p: *mut u8, v: u16) {
     (*(p as *const AtomicU16)).store(v, Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u32(p: *mut u8, v: u32) {
     (*(p as *const AtomicU32)).store(v, Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u64(p: *mut u8, v: u64) {
     (*(p as *const AtomicU64)).store(v, Ordering::Relaxed)
@@ -169,6 +216,13 @@ unsafe fn store_u64(p: *mut u8, v: u64) {
 
 /// Raw reference slot read, honouring compressed oops the way
 /// `read_compact_field` does.
+///
+/// # Safety
+///
+/// As [`load_u8`], and the slot must be a REFERENCE slot: the width read is
+/// decided by `narrow_oops_enabled()` rather than by the argument, so reading a
+/// primitive slot through this would use the wrong width whenever compressed
+/// oops are on.
 #[inline(always)]
 unsafe fn load_ref(p: *mut u8) -> u64 {
     if cratonvm_types::narrow_oop::narrow_oops_enabled() {
@@ -180,6 +234,12 @@ unsafe fn load_ref(p: *mut u8) -> u64 {
 
 /// Raw reference slot write, honouring compressed oops the way
 /// `write_compact_field` does (probe included).
+///
+/// # Safety
+///
+/// As [`load_ref`]. `raw` must be a heap reference or 0 — `narrow_oop::probe`
+/// asserts that in debug builds, and in release an unencodable value would be
+/// truncated by `encode` into a pointer to somewhere else.
 #[inline(always)]
 unsafe fn store_ref(p: *mut u8, raw: u64) {
     cratonvm_types::narrow_oop::probe(raw);
@@ -199,12 +259,55 @@ unsafe fn store_ref(p: *mut u8, raw: u64) {
 /// one cache: a site filled against a legacy receiver refuses a compact one
 /// and vice versa, even at the same class id.
 #[inline(always)]
+/// Is the object-start registry probe restored on the quickened **array**
+/// arms? `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE=1`
+/// (`CRATONVM_JIT=-field-addr-elide`); default `false`, i.e. elided.
+///
+/// # The field half of this was REVERTED, and the reason is the interesting part
+///
+/// This gate originally covered [`field_ptr_for`] too, on the argument that
+/// the handler those arms replace does not make the test either:
+/// `ZgcRealHeap::get_field` is `self.header(obj)`, a bare pointer cast, with no
+/// membership check. That argument was **wrong, and it was wrong by looking one
+/// level too low.**
+///
+/// The handler a quickened `getfield` actually stands in for is `op_getfield`,
+/// not `get_field`. Its second act, right after popping the receiver, is
+/// `shared.mem.heap.load_and_forward(obj_ref)` — and `load_and_forward_inner`
+/// opens with `if !pre_validated && self.is_object_address(..).is_none()`.
+/// `op_putfield` does the same. So the slow path **does** probe the receiver;
+/// it just does it a level up from where the comparison was made. Eliding it on
+/// the field arms was a robustness regression, not a parity restoration, and
+/// the measured benefit was weak (1-4 ns, 8/10 pairwise). It is reverted.
+///
+/// Two comments on this file said so at the time and were overruled by that
+/// bad argument — `field_ptr_for`'s own doc ("it keeps a stale operand-stack
+/// reference to an uncommitted page from faulting where the slow handler would
+/// have answered `class 0`") and the `# Safety` contract on the raw accessors,
+/// which names the probe as its first discharging leg. **Both were right.**
+///
+/// # Why the ARRAY arms keep the elide
+///
+/// The array slow paths genuinely do not validate. The `0x2e..=0x35` arm reaches
+/// `VmHeap::get_array_element` and the `0xbe` arm reaches `VmHeap::array_length`
+/// with **no** `load_and_forward` and no probe anywhere between the pop and the
+/// header read — grep says zero call sites in either. So for
+/// [`prim_elem_ptr`] and [`array_load_ref`] the parity argument holds as
+/// originally stated, and the probe stays elided there.
+///
+/// That asymmetry is the finding: "does the slow path check this?" has a
+/// different answer for fields than for arrays, and one gate covered both.
+#[inline]
+fn registry_probe_restored() -> bool {
+    crate::runtime::env_cache::no_field_addr_elide()
+}
+
 fn field_ptr_for(zgc: &ZgcRealHeap, ptr: u64, site: &FastFieldSite) -> Option<*mut u8> {
     if zgc.is_object_address(ptr as usize).is_none() {
         return None;
     }
-    // SAFETY: `ptr` was just confirmed to be a registered object start on
-    // this heap, so its first `HEADER_SIZE` bytes are a live `ObjectHeader`.
+    // SAFETY: `ptr` was just confirmed to be a registered object start on this
+    // heap, so its first `HEADER_SIZE` bytes are a live `ObjectHeader`.
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     if header.class_id != site.receiver_class_id
         || header.num_slots() != site.num_slots
@@ -217,6 +320,83 @@ fn field_ptr_for(zgc: &ZgcRealHeap, ptr: u64, site: &FastFieldSite) -> Option<*m
     // is `field_index * SLOT_SIZE` with `field_index < num_slots` checked at
     // fill. Either way it lies inside the object body.
     Some(unsafe { (ptr as *mut u8).add(HEADER_SIZE + site.offset as usize) })
+}
+
+/// Quickened `arraylength`.
+///
+/// Replaces the array reference on top of the operand stack with its length
+/// and returns `true`, or leaves the stack untouched and returns `false` so the
+/// caller keeps the general path (which owns the null-receiver NPE).
+///
+/// # Why this arm exists
+///
+/// `arraylength` has no resolution, no site cache, no barrier and no
+/// allocation: it reads one word out of a header and pushes an int. Measured
+/// 2026-09-05 it cost **24.4 ns against HotSpot's 0.39** — 62x, the worst
+/// ratio of any bytecode in the interpreter's operation table, and about three
+/// and a half straight-line bytecodes' worth of time to perform one load.
+///
+/// What it was spending it on, all of it avoidable:
+///
+/// * `frame.stack.pop_unchecked()` decodes the 8-byte `CompactValue` into the
+///   16-byte `Value` enum, and the arm's own fall-through pushes it back — so
+///   the wide value stays live across the arm and needs a stack slot.
+/// * `shared.mem.heap.array_length(arr)` goes through the `VmHeap` enum
+///   `dispatch!` to reach a collector method whose entire body is
+///   `self.header(obj).array_length()`.
+///
+/// This reads the header at the address already in the slot and pushes the
+/// length. `ObjectHeader::array_length` is a pure header read on every
+/// collector (`shape`, guarded by `kind()`), but this arm is admitted only
+/// under the same `fast_field_zgc` gate as the field and array-element arms so
+/// it inherits their contract: any per-access diagnostic that turns those off
+/// turns this off too, and only ZGC is served.
+///
+/// A non-array receiver declines rather than pushing `0`: `array_length()`
+/// answers `0` for a non-array, and the general path's own
+/// `Value::Object(Some(_))` arm would have asked the collector, whose
+/// `debug_assert` documents that a non-array here is a bug. Declining keeps
+/// that question with the code that owns it.
+#[inline]
+pub(super) fn arraylength_fast(stack: &mut ValueStack) -> bool {
+    if crate::runtime::env_cache::no_arraylength_fast() {
+        return false;
+    }
+    if stack.len() == 0 {
+        site_stats::bump(site_stats::ARRLEN_MISS);
+        return false;
+    }
+    // `None` for a null receiver (`SUB_NULL` is not `SUB_OBJECT`), which is
+    // what routes the NPE to the general path.
+    let Some(ptr) = stack.peek_compact().as_object_ptr() else {
+        site_stats::bump(site_stats::ARRLEN_MISS);
+        return false;
+    };
+    if ptr == 0 {
+        site_stats::bump(site_stats::ARRLEN_MISS);
+        return false;
+    }
+    // SAFETY: `ptr` is the receiver of a verified `arraylength`, so it is a
+    // live object reference and its first `HEADER_SIZE` bytes are an
+    // `ObjectHeader` — the same premise `ZgcRealHeap::array_length` reads on,
+    // from the same operand-stack slot, in the same safepoint-free window.
+    // See `registry_probe_restored` for the full argument.
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    if header.kind() != ObjectKind::Array {
+        site_stats::bump(site_stats::ARRLEN_MISS);
+        return false;
+    }
+    // JVMS: `arraylength` pushes an int, and an array length is bounded by
+    // `Integer.MAX_VALUE`. A header claiming more is corrupt; decline to the
+    // path that owns that diagnosis rather than wrapping it negative.
+    let Ok(len) = i32::try_from(header.array_length()) else {
+        site_stats::bump(site_stats::ARRLEN_MISS);
+        return false;
+    };
+    stack.pop_compact();
+    stack.push_int_unchecked(len);
+    site_stats::bump(site_stats::ARRLEN_HIT);
+    true
 }
 
 /// Quickened `getfield`. Replaces the receiver on top of the operand stack
@@ -293,6 +473,8 @@ pub(super) fn getfield_fast_keyed(
             return true;
         }
         FieldStorageKind::Double => {
+            // SAFETY: as the group above — `fp` is this site's validated
+            // field address, and `Double` is an 8-byte slot.
             let v = f64::from_bits(unsafe { load_u64(fp) });
             stack.pop_compact();
             stack.push_double_unchecked(v);
@@ -300,21 +482,39 @@ pub(super) fn getfield_fast_keyed(
             return true;
         }
         FieldStorageKind::Reference => {
+            // SAFETY: as the group above, and the arm is `Reference`, so the
+            // slot is the reference slot `load_ref`'s width rule expects.
             let raw = unsafe { load_ref(fp) };
             if raw == 0 {
                 CompactValue::null()
             } else {
                 // A wrapper may sit in a reference slot; `get_field` unboxes
-                // it and this arm does not.
-                if cratonvm_gc::autobox::wrapper_exists() {
-                    return false;
-                }
+                // it and this arm does not — so it must decline when the value
+                // it loaded IS one.
+                //
+                // This used to ask `autobox::wrapper_exists()`, the
+                // process-wide latch, which is armed at bootstrap by the
+                // class-mirror populator and is therefore true in every
+                // process. The screen was permanently closed and this arm never
+                // served a non-null reference field at all. Measured on the
+                // sibling `aaload` arm, which carried the identical screen:
+                // `hit=0 miss_barrier=0 miss_wrapper=2000146`.
+                //
+                // The precise question costs one header compare on the object
+                // just loaded. See `autobox::header_is_wrapper`.
+                //
                 // SAFETY: a non-zero reference slot of a live compact object
                 // holds an object address the collector maintains.
                 let obj = shared
                     .mem
                     .heap
                     .load_and_forward(unsafe { ObjectRef::from_raw(raw as *mut u8) });
+                // SAFETY: `load_and_forward` returned a live object address;
+                // its first `HEADER_SIZE` bytes are a header.
+                let obj_header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+                if cratonvm_gc::autobox::header_is_wrapper(obj_header) {
+                    return false;
+                }
                 match CompactValue::try_from_pointer(obj.as_ptr() as u64) {
                     Some(cv) => cv,
                     None => return false,
@@ -458,36 +658,45 @@ pub(super) fn putfield_fast(
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: `fp` came from `field_ptr_for`, and `Boolean` is the
+            // layout's own 1-byte slot for this field.
             unsafe { store_u8(fp, (v & 1) as u8) };
         }
         FieldStorageKind::Byte => {
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: as above; `Byte` is a 1-byte slot.
             unsafe { store_u8(fp, v as u8) };
         }
         FieldStorageKind::Char | FieldStorageKind::Short => {
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: as above; both `Char` and `Short` are 2-byte slots.
             unsafe { store_u16(fp, v as u16) };
         }
         FieldStorageKind::Float => {
             let Some(f) = val.as_float() else {
                 return false;
             };
+            // SAFETY: as above; `Float` is a 4-byte slot, written as bits.
             unsafe { store_u32(fp, f.to_bits()) };
         }
         FieldStorageKind::Long => {
             if kind != ValueStack::KIND_MARK_LONG {
                 return false;
             }
+            // SAFETY: as above; `Long` is an 8-byte slot, and the stack kind
+            // was just checked so `as_long_unchecked` is entitled.
             unsafe { store_u64(fp, val.as_long_unchecked() as u64) };
         }
         FieldStorageKind::Double => {
             if kind != ValueStack::KIND_MARK_DOUBLE {
                 return false;
             }
+            // SAFETY: as above; `Double` is an 8-byte slot, and the stack kind
+            // was just checked.
             unsafe { store_u64(fp, val.raw_bits()) };
         }
         FieldStorageKind::Reference => {
@@ -500,11 +709,17 @@ pub(super) fn putfield_fast(
                 return false;
             };
             if zgc.mark_active() {
+                // SAFETY: as above, on the `Reference` arm, so the slot is a
+                // reference slot. The pre-barrier needs the OLD value before
+                // the store overwrites it.
                 let old = unsafe { load_ref(fp) };
                 if old != 0 {
                     zgc.satb_pre_barrier(old as usize);
                 }
             }
+            // SAFETY: as above, on the `Reference` arm; `raw` is either 0 or
+            // an object pointer taken from `as_object_ptr`, which is what
+            // `store_ref`'s encode step requires.
             unsafe { store_ref(fp, raw) };
         }
     }
@@ -729,10 +944,14 @@ fn prim_elem_ptr(zgc: &ZgcRealHeap, arr: ObjectRef, index: i32, opcode: u8) -> O
         return None;
     }
     let base = arr.as_ptr() as usize;
-    if zgc.is_object_address(base).is_none() {
+    if registry_probe_restored() && zgc.is_object_address(base).is_none() {
         return None;
     }
-    // SAFETY: registered object start, live header.
+    // SAFETY: `arr` is the array reference of a verified `*aload` / `*astore`,
+    // popped from the operand stack in this same safepoint-free window; its
+    // first `HEADER_SIZE` bytes are a live header. The `kind()`,
+    // `element_type()` and `array_length()` tests below are what establish the
+    // element address is in bounds. See `registry_probe_restored`.
     let header = unsafe { &*(base as *const ObjectHeader) };
     if header.kind() != ObjectKind::Array {
         return None;
@@ -780,6 +999,130 @@ pub(super) fn array_load_prim(
     true
 }
 
+/// Quickened `aaload`.
+///
+/// Pushes the reference element and returns `true`, or leaves the stack
+/// untouched and returns `false` so the caller keeps `VmHeap::get_array_element`
+/// (which owns every exception and every cold decode).
+///
+/// # Why this exists
+///
+/// `aaload` is in the dispatch loop's `0x2e..=0x35` arm, but that arm's
+/// quickened half declines it: `prim_elem_for_opcode` has no reference entry,
+/// so until now every `aaload` fell through to the full path. Measured
+/// 2026-09-05 on `probes/ArrBurn.java`, 30 M iterations: `aaload` 99.9 ns per
+/// iteration against `iaload`'s 79.0 in the identical loop shape — **21 ns**,
+/// where HotSpot has the two identical to within noise.
+///
+/// The first attempt at this row blamed the autobox screen
+/// (`get_array_element` called `autobox_payload`, whose first act is
+/// `is_object_address`, unlatched). Latching it was correct and is kept, but
+/// it measured **nothing** — 3/8 pairwise, 20 ms in 2960. The cost is not one
+/// probe, it is the whole slow path: a `VmHeap` enum `dispatch!`, the
+/// collector's own header and bounds re-reads, an `Acquire` load for the
+/// barrier arm, `read_prim_element`'s match, and a 16-byte `Value` returned to
+/// be re-encoded into an 8-byte stack slot.
+///
+/// # What it declines, and why each one has to
+///
+/// * **`load_barrier_armed()`** — the barrier arm of `get_array_element`
+///   self-heals the slot through `load_barrier_slot` and has different
+///   semantics from a plain read. Nothing in a default run arms it, but when
+///   something does, this arm must not be the one answering.
+/// * **`autobox::wrapper_exists()`** — a wrapper in a reference slot must be
+///   un-boxed, which is the work the latch beside this screens for. Same
+///   screen, same reason as the compact reference-field arm above.
+/// * **A word that is neither zero nor a plausible heap pointer** — that is
+///   `ref_element_word_implausible`'s population, and it is not one answer but
+///   three: a well-formed ZGC colored word (a hard failure naming the missing
+///   barrier), stale garbage (a counted degrade to null), and the counter that
+///   separates them. Reproducing any of that here would be a second copy of a
+///   diagnosis; declining keeps it in one place.
+///
+/// `raw == 0` is handled rather than declined, because an ordinary null
+/// element is the common case and `decode_ref_element_word`'s cold arm returns
+/// `Object(None)` for it without counting anything.
+#[inline]
+pub(super) fn array_load_ref(
+    zgc: &ZgcRealHeap,
+    stack: &mut ValueStack,
+    arr: ObjectRef,
+    index: i32,
+) -> bool {
+    if crate::runtime::env_cache::no_ref_array_fast() {
+        return false;
+    }
+    if index < 0 {
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
+        return false;
+    }
+    // Named separately: both are process-wide latches, but one is armed by a
+    // collection cycle and the other by anything that ever boxed a primitive
+    // into a reference slot. A census that says only "screen" cannot tell a
+    // reader which, and the fixes have nothing in common.
+    if zgc.load_barrier_armed() {
+        site_stats::bump(site_stats::REFARR_MISS_BARRIER);
+        return false;
+    }
+    // NOT `autobox::wrapper_exists()`. That latch is armed at bootstrap by the
+    // class-mirror populator, so it is true in every process and a screen keyed
+    // on it is permanently closed — measured `aaload: hit=0 miss_barrier=0
+    // miss_wrapper=2000146` before this. The precise question is asked below,
+    // on the element this access actually loaded, for one header compare.
+    let base = arr.as_ptr() as usize;
+    // SAFETY: `arr` is the array reference of a verified `aaload`, popped from
+    // the operand stack in this same safepoint-free window; its first
+    // `HEADER_SIZE` bytes are a live header. See `registry_probe_restored`.
+    let header = unsafe { &*(base as *const ObjectHeader) };
+    if header.kind() != ObjectKind::Array
+        || header.element_type() != ArrayElementType::Reference
+    {
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
+        return false;
+    }
+    let index = index as usize;
+    if index >= header.array_length() as usize {
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
+        return false;
+    }
+    let Some(offset) = index.checked_mul(cratonvm_types::narrow_oop::ref_element_size()) else {
+        site_stats::bump(site_stats::REFARR_MISS_SHAPE);
+        return false;
+    };
+    // SAFETY: `index < length` and the stride is the one `read_prim_element`
+    // uses for a reference element, so the slot lies inside the array body.
+    let raw = unsafe {
+        cratonvm_types::narrow_oop::read_ref_slot((base as *const u8).add(cratonvm_types::ARRAY_DATA_OFFSET + offset))
+    };
+    let cv = if raw == 0 {
+        CompactValue::null()
+    } else if cratonvm_types::plausible_heap_pointer(raw) {
+        // SAFETY: a plausible, non-zero element word of a live reference array
+        // addresses an object whose first `HEADER_SIZE` bytes are a header —
+        // the same premise `autobox_payload` reads on.
+        let elem_header = unsafe { &*(raw as usize as *const ObjectHeader) };
+        if cratonvm_gc::autobox::header_is_wrapper(elem_header) {
+            // A wrapper must be un-boxed, which is `get_array_element`'s job.
+            site_stats::bump(site_stats::REFARR_MISS_WRAPPER);
+            return false;
+        }
+        match CompactValue::try_from_pointer(raw) {
+            Some(cv) => cv,
+            None => {
+                site_stats::bump(site_stats::REFARR_MISS_WORD);
+                return false;
+            }
+        }
+    } else {
+        // The three-way cold decode above; not reproduced here.
+        site_stats::bump(site_stats::REFARR_MISS_WORD);
+        return false;
+    };
+    stack.push_compact(cv);
+    site_stats::bump(site_stats::REFARR_HIT);
+    true
+}
+
 /// Quickened primitive `*astore`: stores `val` (already peeked with its kind
 /// mark) and returns `true`, or returns `false` so the caller keeps the
 /// general path.
@@ -813,12 +1156,15 @@ pub(super) fn array_store_prim(
             let Some(f) = val.as_float() else {
                 return false;
             };
+            // SAFETY: `p` is this static's slot address, resolved above, and
+            // `Float` is its 4-byte slot.
             unsafe { store_u32(p, f.to_bits()) };
         }
         0x52 => {
             if kind != ValueStack::KIND_MARK_DOUBLE {
                 return false;
             }
+            // SAFETY: as above; `Double` is an 8-byte slot.
             unsafe { store_u64(p, val.raw_bits()) };
         }
         0x54 => {
@@ -839,6 +1185,7 @@ pub(super) fn array_store_prim(
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: as above; a 2-byte slot.
             unsafe { store_u16(p, v as u16) };
         }
         _ => return false,
@@ -965,5 +1312,105 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_probe_tests {
+    use super::*;
+    use cratonvm_types::{ArrayElementType, ClassId, ObjectKind};
+
+    /// A `FastFieldSite` for a legacy-body receiver of `(class_id, num_slots)`.
+    fn legacy_site(class_id: u32, num_slots: u32) -> FastFieldSite {
+        FastFieldSite {
+            receiver_class_id: ClassId::new(class_id),
+            num_slots,
+            offset: 0,
+            storage: None,
+            field_index: 0,
+            desc_byte: b'I',
+            is_reference: false,
+        }
+    }
+
+    /// **The test the registry elide needed and did not have.**
+    ///
+    /// `field_ptr_for` must refuse an address the heap does not know, even when
+    /// the bytes at that address are a *perfectly matching header*. That is the
+    /// only case that distinguishes "the probe ran" from "the probe was
+    /// skipped": every other guard in the function — class id, slot count,
+    /// compact flag — passes by construction here.
+    ///
+    /// # Why the header is forged rather than wild
+    ///
+    /// A wild pointer would make the elided build SEGFAULT, which aborts the
+    /// whole test binary and takes every other result with it. A forged header
+    /// in a Rust-owned allocation is readable, satisfies all three comparisons,
+    /// and is not in the heap's registry — so the probe is the *only* thing
+    /// that can refuse it. With the probe: `None`, and this passes. Without it:
+    /// `Some(ptr)`, and this fails as an assertion rather than a crash.
+    ///
+    /// This is the shape any future "the fast path may skip check X" change
+    /// needs: construct the input that only X rejects.
+    #[test]
+    fn field_ptr_for_refuses_a_matching_header_the_heap_does_not_know() {
+        let zgc = ZgcRealHeap::new();
+        let (class_id, num_slots) = (4321u32, 3u32);
+
+        // A header the site would accept, in memory the heap never handed out.
+        let forged = Box::new(ObjectHeader::new(
+            ClassId::new(class_id),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            num_slots,
+        ));
+        let ptr = Box::into_raw(forged);
+        let site = legacy_site(class_id, num_slots);
+
+        // SAFETY: `ptr` is a live `Box` allocation for the length of this test.
+        let header = unsafe { &*ptr };
+        assert_eq!(header.class_id, site.receiver_class_id, "forge is wrong");
+        assert_eq!(header.num_slots(), site.num_slots, "forge is wrong");
+        assert!(
+            !cratonvm_types::is_compact_object(header),
+            "forge is wrong: a legacy site must meet a legacy header"
+        );
+
+        let got = field_ptr_for(&zgc, ptr as u64, &site);
+
+        // SAFETY: reclaim the forged header; nothing retained it.
+        unsafe { drop(Box::from_raw(ptr)) };
+
+        assert!(
+            got.is_none(),
+            "field_ptr_for accepted an address the heap does not know. Every              other guard in it passes for this input by construction, so this              can only mean the `is_object_address` probe was removed. It is              not redundant with the slow path: `op_getfield` and `op_putfield`              both reach `load_and_forward`, whose first act is that same probe."
+        );
+    }
+
+    /// The array arms deliberately do **not** probe, and that asymmetry is
+    /// load-bearing rather than an oversight — so it is pinned here too.
+    ///
+    /// `prim_elem_ptr` is at parity with the handler it replaces:
+    /// `VmHeap::get_array_element` and `VmHeap::array_length` are both reached
+    /// with **no** `load_and_forward` and no membership test between the
+    /// operand-stack pop and the header read. The field path is not at parity,
+    /// because its handlers do reach one. A single switch used to cover both;
+    /// this test records which side is which, so that flipping either one has
+    /// to come here and say why.
+    #[test]
+    fn the_array_arm_is_at_parity_with_its_handler_and_the_field_arm_is_not() {
+        // Not an execution test — a statement of the contract the two arms are
+        // held to, in a place a change to either has to walk past.
+        let field_handler_probes = true; // op_getfield/op_putfield -> load_and_forward
+        let array_handler_probes = false; // get_array_element / array_length
+        assert!(
+            field_handler_probes,
+            "if op_getfield stops calling load_and_forward, field_ptr_for's              probe may be reconsidered — until then it stays"
+        );
+        assert!(
+            !array_handler_probes,
+            "if the array handlers start validating, prim_elem_ptr must too"
+        );
     }
 }

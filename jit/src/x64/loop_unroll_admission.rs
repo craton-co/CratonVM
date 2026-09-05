@@ -1514,6 +1514,71 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
     assert!(out_osr[x.fast_base()] >= 0 && out_osr[x.fast_base()] < fallback_off);
 }
 
+/// `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` really does turn the rule off.
+///
+/// The switch was added 2026-09-05 to close the last open item on the
+/// retired `osr-miscompiles-cachecoherence-20260904` write-up: the rule is
+/// default-on CODEGEN that landed without a failure of its own, and re-opening
+/// the question should not need a rebuild. A declared flag that no test arms
+/// is a flag that might be inert, and every other test in this file would stay
+/// green if it were — so this asserts the difference the flag makes, on the
+/// same fixture and the same five pcs the test above pins as REFUSED.
+///
+/// `MID_EXPRESSION` is respelled rather than shared: the two tests must be
+/// able to disagree. If the list above is edited to match a regression, this
+/// one still names the pcs the rule was written for and fails.
+#[test]
+fn the_empty_stack_rule_has_an_off_switch_and_it_is_not_inert() {
+    // Depth at each pc, from the fixture's own table in the test above:
+    //   5 [i]  6 [i, n]  10 [s]  11 [s, i]  12 [s+i]
+    const MID_EXPRESSION: [usize; 5] = [5, 6, 10, 11, 12];
+
+    let rebuild = || {
+        let _armed = Armed::new();
+        let code = shape_int_accum_loop();
+        let x = plan_bytecode_loop_xform(&code, 21, &[], &HashMap::new(), accum_shape_ok())
+            .expect("versioned unroll");
+        let art = compile_bytes(&x.code, x.code_len).expect("compiles");
+        let out_osr = art
+            .osr_pc_to_native
+            .as_ref()
+            .expect("the artifact publishes OSR entries");
+        x.rebuild_pc_to_native(out_osr, 21)
+    };
+
+    // Default: refused, which is what `a_versioned_artifact_publishes_its_osr_
+    // entries_inside_the_fallback_copy` also asserts. Repeated here so a
+    // failure of this test says which half moved.
+    let on = rebuild();
+    for bci in MID_EXPRESSION {
+        assert_eq!(on[bci], -1, "bci {bci}: refused with the rule ON");
+    }
+
+    // Off: every one of them gets an entry again. Thread-scoped, so this does
+    // not disturb tests running in parallel in the same process — which is
+    // also why `osr_empty_stack_entry_enabled` must not latch in a `OnceLock`.
+    let off = cratonvm_types::flags::with_thread_overrides(
+        &[("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY", Some("1"))],
+        rebuild,
+    );
+    for bci in MID_EXPRESSION {
+        assert!(
+            off[bci] >= 0,
+            "bci {bci}: the rule is off, so this pc must be enterable again — \
+             the flag reached no read site"
+        );
+    }
+
+    // And nothing else moved: the enterable pcs are unaffected either way, so
+    // the difference above is the rule and not a wholesale change of artifact.
+    for bci in [4usize, 9, 13, 16] {
+        assert_eq!(
+            on[bci], off[bci],
+            "bci {bci}: an empty-stack pc is enterable under both settings"
+        );
+    }
+}
+
 /// End to end: with the rewriter armed the emitter really compiles the
 /// rewritten bytes, and the OSR metadata the artifact publishes is back in
 /// INTERPRETER-bci space.
