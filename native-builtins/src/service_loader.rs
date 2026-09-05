@@ -3753,8 +3753,29 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
     // In a synthetic-jdk build nothing changes, ordering included: these still
     // land after `register_p63_service_loader`'s empty-iterator stubs, which
     // live inside `register_synthetic_overrides` and exist only there.
-    #[cfg(feature = "synthetic-jdk")]
-    {
+    //
+    // 2026-09-05: the gate above used to be `#[cfg(feature = "synthetic-jdk")]`,
+    // and that is the wrong question. `drops_real_layout_synthetic`'s own doc
+    // says so in as many words: "the Cargo feature decides what is COMPILED,
+    // the launcher flag decides which CLASS LIBRARY loads". `VmConfig::default`
+    // selects `EMBEDDED_DEFAULT_JDK_MODE` = `JdkMode::Synthetic`, so a DEFAULT
+    // build asked for a plain `Vm::new(VmConfig::new())` -- the documented
+    // embedding path, and what every `vm/tests/*` boots -- runs synthetic mode
+    // with no JDK image at all. There `java/util/ServiceLoader` is never
+    // loaded, so the bytecode this retirement defers to does not exist and
+    // `ServiceLoader.load(Driver.class)` raised `NoSuchMethodError`. The
+    // retirement's premise ("the JDK's own bytecode is what should answer it")
+    // is a statement about the run; ask the run.
+    // `vm/tests/wp1_8_real_jar_serviceloader.rs` is the witness.
+    //
+    // `vm_init` sets the flag before every caller of this registrar: arm A at
+    // the top of its real-JDK `else`, arm B before
+    // `register_essential_natives_with_shims` -- which is what reaches
+    // `jdbc::register_jdbc_service_loader`, the second caller the gate lives
+    // inside this function for. A bare `NativeMethodRegistry::new()` answers
+    // `false`, i.e. synthetic; a test that wants the real-JDK answer says so
+    // with `set_drop_real_layout_synthetic(true)`.
+    if !r.drops_real_layout_synthetic() {
         let sl = "java/util/ServiceLoader";
         r.register(
             sl,
