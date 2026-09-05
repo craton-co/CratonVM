@@ -443,11 +443,15 @@ pub(super) fn getfield_fast_keyed(
     if stack.len() == 0 {
         return false;
     }
+    // Boundary BEFORE the peek: the prologue and the `Acquire` load are the two
+    // candidates for this phase being the largest, and both land above here.
+    let t_wp = ph::now();
+    ph::charge(ph::P_ENTRY, t_entry, t_wp);
     let Some(ptr) = stack.peek_compact().as_object_ptr() else {
         return false;
     };
     let t_gates = ph::now();
-    ph::charge(ph::P_GATES, t_entry, t_gates);
+    ph::charge(ph::P_PEEK, t_wp, t_gates);
     let site = match sites.get(class_id, cp_index) {
         Some(s) => *s,
         None => {

@@ -50,25 +50,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Entry through the JVMTI watchpoint gate, the stack-depth check and the
 /// receiver peek. All of it is per-access work that no site can memoize.
-pub const P_GATES: usize = 0;
+pub const P_ENTRY: usize = 0;
 /// `FastFieldSiteCache::get`: the redefine latch, the two epoch loads and
 /// their compares, the multiply-shift slot index, and the tag comparison
 /// against the entry. The refuted site-count hypothesis was about this phase;
 /// if it reads small, that refutation has a second, independent witness.
-pub const P_SITE: usize = 1;
+pub const P_SITE: usize = 2;
 /// `field_ptr_for`: the object-start registry probe plus the class id, slot
 /// count and compact-flag comparisons against the site.
-pub const P_PTR: usize = 2;
+pub const P_PTR: usize = 3;
 /// The read itself and the operand-stack traffic around it: the storage-kind
 /// match, the load at the field's width, and the `pop_compact` /
 /// `push_compact` pair with their bounds checks and kind writes.
-pub const P_READ: usize = 3;
+pub const P_READ: usize = 4;
 /// CALIBRATION: two back-to-back [`now`] calls measuring nothing.
-pub const P_CALIB: usize = 4;
+pub const P_CALIB: usize = 5;
 
-const N: usize = 5;
+/// The stack half of what used to be one `gates` phase: the length check, the
+/// `peek_compact` (a bounds-checked `Vec` index) and the NaN-tag decode.
+///
+/// Split out because `gates` was the largest phase across three runs (33.0 /
+/// 27.0 / 23.5 corrected) while holding the least obvious work. The two
+/// candidates for that — a compiler barrier at the top of the function, and
+/// the function's own prologue if LLVM declined to inline it — both land in
+/// [`P_ENTRY`], not here. If `P_ENTRY` keeps the bulk, the cost is
+/// entry-shaped; if this one does, it is the operand stack and neither
+/// candidate is right.
+pub const P_PEEK: usize = 1;
+
+const N: usize = 6;
 const NAMES: [&str; N] = [
-    "gates       ",
+    "entry+wpgate",
+    "stack_peek  ",
     "site_lookup ",
     "field_ptr   ",
     "read+stack  ",
