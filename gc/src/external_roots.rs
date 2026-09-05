@@ -10,7 +10,7 @@
 use cratonvm_types::ObjectRef;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 pub type OwnerPredicate<'a> = dyn Fn(usize) -> bool + 'a;
@@ -140,11 +140,71 @@ pub fn register_external_root_provider(provider: ExternalRootProvider) {
         return;
     }
     providers.push(provider);
-    PROVIDER_COUNT.store(providers.len(), Ordering::Relaxed);
+    // Publish the immutable read-side view BEFORE the latch, so a reader that
+    // observes a non-zero count always observes a table that contains that many
+    // entries. `PROVIDER_COUNT` is the cheap "is there anything at all" latch;
+    // `PUBLISHED` is what the iteration actually walks.
+    publish_locked(&providers);
+    PROVIDER_COUNT.store(providers.len(), Ordering::Release);
 }
 
-fn snapshot() -> Vec<ExternalRootProvider> {
-    PROVIDERS.read().clone()
+/// The lock-free read-side view of [`PROVIDERS`], republished on every
+/// registration.
+///
+/// # Why not just read the `RwLock`
+///
+/// [`external_roots_for_owner`] runs **once per marked object**, in every
+/// marker in the tree, from every marking thread. It took
+/// `PROVIDERS.read_recursive()` to do it. An uncontended `parking_lot` read is
+/// a few nanoseconds; the same read taken by N marking threads is one shared
+/// cache line taken exclusive N times per object, and the measurement on this
+/// exact path is on [`PROVIDER_COUNT`]: **four workers cost +153% pause against
+/// zero, monotonic in worker count**, which is a lock rather than a start-up
+/// offset. `PROVIDER_COUNT` removed the cost for the empty registry (every
+/// `--jdk-only` run and every unit test); this removes it for the non-empty one,
+/// which is every real application run.
+///
+/// A `Box::leak` per registration rather than an `Arc` swap: registration is
+/// monotone (nothing unregisters) and happens a handful of times at start-up,
+/// three call sites in the whole tree, so the superseded tables are a bounded
+/// few hundred bytes and the reader needs no reference count — which is the
+/// entire point, since a reference count is the shared-line write this exists
+/// to delete.
+///
+/// Null means "nothing registered yet"; readers treat it as the empty slice.
+static PUBLISHED: AtomicPtr<Vec<ExternalRootProvider>> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Republish [`PUBLISHED`] from the writer-locked `providers`.
+///
+/// Caller must hold the [`PROVIDERS`] write lock, which is what serialises the
+/// leak against a concurrent registration.
+fn publish_locked(providers: &[ExternalRootProvider]) {
+    let leaked: &'static mut Vec<ExternalRootProvider> = Box::leak(Box::new(providers.to_vec()));
+    PUBLISHED.store(leaked as *mut _, Ordering::Release);
+}
+
+/// The registered providers, as a borrowed slice, with no lock and no
+/// allocation.
+///
+/// Carries its own length (a `Vec` behind one pointer), so there is no window
+/// in which a reader can pair a new count with an old table.
+#[inline]
+fn published() -> &'static [ExternalRootProvider] {
+    let p = PUBLISHED.load(Ordering::Acquire);
+    if p.is_null() {
+        return &[];
+    }
+    // SAFETY: `PUBLISHED` only ever holds a pointer produced by `Box::leak` in
+    // `publish_locked`, which is `&'static mut` and therefore valid for the rest
+    // of the process. Superseded tables are leaked rather than freed, so a
+    // pointer read here can never dangle. The referent is never mutated after
+    // publication — `publish_locked` builds a fresh `Vec` and swaps the pointer
+    // — so handing out a shared reference introduces no aliasing conflict.
+    unsafe { &*p }
+}
+
+fn snapshot() -> &'static [ExternalRootProvider] {
+    published()
 }
 
 pub fn scan_external_roots(roots: &mut Vec<ObjectRef>) {
@@ -188,21 +248,85 @@ pub fn external_roots_for_owner(owner_addr: usize, owner_class_id: Option<u32>) 
     // THE LATCH FIRST, then iterate IN PLACE -- see [`PROVIDER_COUNT`]. This is
     // the one function here that runs per marked object, so it is the only one
     // that does not go through `snapshot`.
-    if PROVIDER_COUNT.load(Ordering::Relaxed) == 0 {
-        return Vec::new();
-    }
     let mut roots = Vec::new();
-    // `read_recursive`, not `read`: a provider callback runs while this guard is
-    // held, and `parking_lot`'s plain `read` can deadlock a second read on the
-    // same thread when a writer is queued behind it. Nothing registers a provider
-    // from inside a root callback today, and this is what makes that a
-    // non-question rather than a latent deadlock waiting for the day something
-    // does. `Vec::new()` does not allocate until something is pushed, so the
-    // no-roots case (the overwhelming majority of objects) is allocation-free.
-    for provider in PROVIDERS.read_recursive().iter() {
-        roots.extend((provider.roots_for_owner)(owner_addr, owner_class_id));
-    }
+    external_roots_for_owner_into(owner_addr, owner_class_id, &mut roots);
     roots
+}
+
+/// [`external_roots_for_owner`], appending into a caller-owned buffer.
+///
+/// This is the form a marker should use: it runs once per marked object, so the
+/// `Vec` it returns is a heap allocation per object per provider that has
+/// anything to say. A marker holding one buffer across the whole cycle
+/// allocates once and reuses the capacity, and the provider's own result vector
+/// is the only one left — which is why `roots_for_owner` keeps its signature
+/// (three registration sites, one of them real, and its empty answer already
+/// costs nothing because `Vec::new()` does not allocate).
+///
+/// No lock: see [`PUBLISHED`]. The latch is checked first so the empty registry
+/// — every `--jdk-only` run and every unit test — is one relaxed load.
+pub fn external_roots_for_owner_into(
+    owner_addr: usize,
+    owner_class_id: Option<u32>,
+    out: &mut Vec<ObjectRef>,
+) {
+    if PROVIDER_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    for provider in published() {
+        let owned = (provider.roots_for_owner)(owner_addr, owner_class_id);
+        if !owned.is_empty() {
+            out.extend(owned);
+        }
+    }
+}
+
+thread_local! {
+    /// Per-thread scratch for [`with_external_roots_for_owner`].
+    ///
+    /// One buffer per marking thread for the whole cycle, so the per-object
+    /// path allocates once ever instead of once per owning object. `RefCell`
+    /// rather than a bare `Cell`/`UnsafeCell` so reentrancy is *detected*
+    /// rather than assumed away — see the fallback in the function below.
+    static OWNER_SCRATCH: std::cell::RefCell<Vec<ObjectRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Call `visit` with the roots owned by the object at `owner_addr`.
+///
+/// The allocation-free form of [`external_roots_for_owner`], and the one every
+/// per-object marker should use. The slice handed to `visit` borrows a
+/// thread-local buffer that lives for the whole cycle, so a marker that walks
+/// ten million objects performs at most one allocation between them instead of
+/// one per object that owns anything.
+///
+/// # Reentrancy
+///
+/// If `visit` (or a provider callback) re-enters this function on the same
+/// thread, the scratch is already borrowed and this falls back to a fresh
+/// `Vec` for the inner call. Nothing in the tree does that today; the point is
+/// that if something starts to, it gets a correct answer rather than a panic
+/// or an aliased buffer.
+pub fn with_external_roots_for_owner<R>(
+    owner_addr: usize,
+    owner_class_id: Option<u32>,
+    visit: impl FnOnce(&[ObjectRef]) -> R,
+) -> R {
+    if PROVIDER_COUNT.load(Ordering::Relaxed) == 0 {
+        return visit(&[]);
+    }
+    let borrowed = OWNER_SCRATCH.with(|cell| cell.try_borrow_mut().is_ok());
+    if !borrowed {
+        let mut fresh = Vec::new();
+        external_roots_for_owner_into(owner_addr, owner_class_id, &mut fresh);
+        return visit(&fresh);
+    }
+    OWNER_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        external_roots_for_owner_into(owner_addr, owner_class_id, &mut buf);
+        visit(&buf)
+    })
 }
 
 pub fn external_roots_for_matching_owners(owner_matches: &OwnerPredicate<'_>) -> Vec<ObjectRef> {

@@ -109,6 +109,8 @@ pub mod external_roots;
 pub mod g1;
 pub mod g1_cards;
 pub mod g1_concurrent;
+pub mod heap_bitmap;
+pub mod heap_geometry;
 pub mod heap_reservation;
 pub mod gc;
 /// Card / remembered-set cost counters and the per-cycle collector-decision

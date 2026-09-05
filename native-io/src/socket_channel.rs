@@ -747,7 +747,7 @@ fn alloc_channel_as_impl(
 /// Returns the channel ref, which the caller MUST use from here on: seeding
 /// `interruptor` allocates, and an allocation can move `ch`.
 #[must_use]
-fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
+pub(crate) fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
     // Seed each monitor field with the channel object ITSELF rather than a fresh
     // `new Object()`. The fields only need to be a non-null, stable monitor; the
     // channel is one, and using it avoids the allocation entirely — which matters
@@ -1047,6 +1047,55 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
     {
         Some(Syn::I(i)) => Value::Int(*i),
         _ => Value::Int(0),
+    }
+}
+
+/// Mark a real-JDK channel object CLOSED **where the JDK itself reads it**.
+///
+/// `java.nio.channels.spi.AbstractInterruptibleChannel` keeps one `volatile
+/// boolean closed`, and the whole close protocol is written against it:
+///
+/// ```text
+///   public final boolean isOpen()  { return !closed; }
+///   public final void    close()   { synchronized (closeLock) {
+///                                        if (closed) return; closed = true; }
+///                                    implCloseChannel(); }
+///   protected final void end(boolean completed) { ... if (!completed && !isOpen())
+///                                        throw new AsynchronousCloseException(); }
+/// ```
+///
+/// CratonVM answers `isOpen()` from its own `chan_fields` side table
+/// ([`sc_is_open`]) and `sc_close` drops that row, so the two views agreed for
+/// as long as every reader went through the native. They do not. The JIT
+/// devirtualises `final` methods, so a compiled caller of
+/// `SelectableChannel.isOpen()` runs the JDK's own two-instruction body against
+/// the `closed` field this VM never wrote — and read `true` for the rest of the
+/// process.
+///
+/// That is the whole of
+/// `channeloutboundbuffer-close-ordering-three-classes-20260905`: netty's
+/// `AbstractChannel.close()` calls `doClose0()` and then, in the same `finally`,
+/// `outboundBuffer.close(cause)`, which throws
+/// `IllegalStateException: close() must be invoked after the channel is closed.`
+/// when `channel.isOpen()` is still true. `AbstractNioChannel.isOpen()` is
+/// `return ch.isOpen()` on a `SelectableChannel`-typed field — the exact shape
+/// the devirtualiser takes. The page called it an ordering gap and cleared
+/// `sc_close`, which really does clear its state synchronously; the state it
+/// cleared was simply not the state the reader read.
+///
+/// Writing the JDK's own flag makes both views agree, so it no longer matters
+/// which of them answers. It also restores `close()`'s specified idempotence:
+/// without it, a second `close()` through the real bytecode re-runs
+/// `implCloseChannel()` every time.
+///
+/// Guarded on the slot actually being an `int`-shaped field: `get_field_by_name`
+/// answers `Object(None)` when the name does not resolve, which is what a
+/// synthetic-JDK stub class (no `closed` field at all) gives. Writing blind
+/// would be the `synthetic_file_channel` corruption family in reverse — a
+/// boolean pushed into whatever slot a fabricated class happens to have.
+pub(crate) fn mark_jdk_channel_closed(ctx: &dyn NativeContext, obj: ObjectRef) {
+    if matches!(ctx.get_field_by_name(obj, "closed"), Value::Int(_)) {
+        ctx.set_field_by_name(obj, "closed", Value::Int(1));
     }
 }
 
@@ -2157,6 +2206,12 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // then reads the default Int(0) (== closed/not-connected), and the
         // side-table does not grow across many short-lived connections.
         cf_clear(ctx, this);
+        // ... and the JDK's OWN `closed` flag, which is what every reader that
+        // does not go through `sc_is_open` consults — including any compiled
+        // caller, because the JIT devirtualises `final` methods and
+        // `AbstractInterruptibleChannel.isOpen()` is one. See
+        // `mark_jdk_channel_closed`.
+        mark_jdk_channel_closed(ctx, this);
         // Same for the `ServerSocketChannel.socket()` adaptor row. It holds two
         // GC roots, so leaving it behind would keep a closed listener and its
         // `java.net.ServerSocket` view alive for the life of the process.

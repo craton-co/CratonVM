@@ -22,8 +22,44 @@
 //!
 //! # Why not [`crate::card_table::CardTable`]
 //!
-//! The generational backend already has a card table and it does not fit here,
-//! for two independent reasons:
+//! REASSESSED 2026-09-05, because the first of the two reasons below stopped
+//! being true. `CardTable::mark_dirty_lockfree` is now a bounds check, a shift,
+//! a relaxed load and a conditional release byte-store — byte for byte the rule
+//! the JIT's inline barrier emits — so "its dirty path is a buffered push plus
+//! an eventual mutex-protected fold" no longer describes it.
+//!
+//! The merge is still not worth making, and the honest reason is not either of
+//! the ones below. It is that the SHARED core is about thirty lines — a byte
+//! map, a base-relative index, and one conditional store — while everything
+//! around it is genuinely different work. `CardTable` is a QUEUE: per-thread
+//! buffers, a cross-thread registry, `drain_pending`, `flush_all`, and table-id
+//! scoping so several live instances cannot steal each other's offsets.
+//! `G1CardTable` is a MAP with span queries: `snapshot`, `clean_and_redirty`,
+//! `any_dirty_in`, and a `CardSet`. Neither wants the other's half, and merging
+//! them would mean one type carrying both, on two collectors' hottest barrier
+//! paths, for thirty lines.
+//!
+//! What DID need fixing is the part a comment was holding together: the card
+//! SIZE. There were THREE copies, not two — `CARD_SIZE = 512` here's sibling,
+//! `G1_CARD_SHIFT = 9` in this file, and `emit_shr_r64_imm8(RCX, 9);
+//! // CARD_SIZE = 512` in the x64 emitter — bound by two comments. The third is
+//! the one that matters: it is a shift BAKED INTO MACHINE CODE, so a divergence
+//! would not read as a mismatch between two Rust constants, it would be a
+//! barrier that dirties the wrong card.
+//!
+//! All three now derive from [`cratonvm_types::CARD_SIZE_BYTES`], which is the
+//! only crate the emitter and both card tables can name.
+//!
+//! BOTH JIT PATHS ARE CURRENTLY LATENT, which is why this was a trap rather
+//! than a bug: `inline_card_mark_available()` is a deliberate constant `false`,
+//! so the emitter's sequence is unreachable; and the G1 inline barrier CALLs the
+//! lean helper rather than emitting a card store, so words `[3]` and `[4]` of
+//! `JIT_G1_BARRIER` (`card_table_base`, `card_shift`) are published with no
+//! reader. Whoever wires either path is the one who would have re-derived the
+//! constant by hand, at the moment they were thinking about something else.
+//!
+//! The two original reasons, kept because the first is dated history and the
+//! second is still true:
 //!
 //! * its dirty path is a per-thread `Vec` buffer behind a `Mutex`, drained into
 //!   the authoritative `Mutex<CardCells>` at a safepoint (see its module docs:
@@ -38,8 +74,9 @@
 //!   each other's buffered offsets. G1 has exactly one arena for the collector's
 //!   whole life, so none of that machinery buys anything here.
 //!
-//! What is shared is the CARD SIZE (512 bytes) and the vocabulary, so that a
-//! reader who knows one knows the other.
+//! What is shared is the CARD SIZE and the vocabulary, so that a reader who
+//! knows one knows the other — and since 2026-09-05 the size is shared by
+//! DERIVATION rather than by two constants that happened to agree.
 //!
 //! # A byte per card, not a bit
 //!
@@ -86,12 +123,34 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// log2 of the bytes one card covers. 512 bytes, matching
-/// [`crate::card_table::CARD_SIZE`].
-pub const G1_CARD_SHIFT: u32 = 9;
+/// log2 of the bytes one card covers.
+///
+/// DERIVED from [`crate::card_table::CARD_SIZE`] rather than written down
+/// beside it. This was `= 9` with a doc comment saying "512 bytes, matching
+/// `crate::card_table::CARD_SIZE`" — two independent constants that must agree,
+/// bound by nothing but that sentence.
+///
+/// The agreement is load-bearing in a way a comment cannot hold. The generational
+/// collector and G1 both publish a card-table base to the JIT, and the emitter
+/// BAKES the shift into the inline post-write barrier
+/// (`jit/src/x64/objects.rs`: `[arena_base, arena_len, region_mask,
+/// card_table_base, card_shift]`). A divergence would not be a mismatch between
+/// two Rust constants; it would be compiled into machine code that dirties the
+/// wrong card, and a missed dirty card is a live cross-region edge Phase 2 never
+/// scans, whose referent is not evacuated and whose region is then freed.
+pub const G1_CARD_SHIFT: u32 = cratonvm_types::CARD_SHIFT;
 
 /// Bytes of heap one card covers.
 pub const G1_CARD_BYTES: usize = 1 << G1_CARD_SHIFT;
+
+// The derivation above is only sound for a power of two: `trailing_zeros` of a
+// non-power-of-two silently rounds DOWN, so a `CARD_SIZE` of 768 would yield a
+// 256-byte card here and the two tables would disagree with no diagnostic
+// anywhere. Fail the build instead.
+const _: () = assert!(
+    G1_CARD_BYTES == crate::card_table::CARD_SIZE,
+    "G1_CARD_SHIFT is derived from card_table::CARD_SIZE and must reproduce it      exactly; a CARD_SIZE that is not a power of two breaks the derivation and      the JIT bakes the shift into its inline barrier",
+);
 
 /// No cross-region reference has been stored into this card since the region
 /// was last recycled.
