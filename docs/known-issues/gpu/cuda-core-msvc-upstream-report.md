@@ -87,6 +87,34 @@ these parameters `unsigned int`, so the mismatch is between the generated
 enum constant and the generated parameter type. Exactly the diagnosis in
 #204; only the file list differs.
 
+### The same build on Linux, for comparison
+
+Same crate, same CUDA 13.3 headers, same bindgen, same `libclang` 18.1.1
+-- only the target differs (`x86_64-unknown-linux-gnu`, rustc 1.98.1
+stable, `main` @ `7f60633`):
+
+| | `c_uint` | `c_int` |
+| --- | ---: | ---: |
+| Linux | **111** | 2 |
+| Windows / MSVC | 0 | **113** |
+
+and the two that stay signed on Linux are exactly the two that have a
+NEGATIVE enumerator:
+
+```
+CUshared_carveout_enum_CU_SHAREDMEM_CARVEOUT_DEFAULT            = -1
+CUgraphChildGraphNodeOwnership_enum_..._OWNERSHIP_INVALID        = -1
+```
+
+So the rule is visible operating, and it predicts its own exceptions:
+all-non-negative enums are unsigned on Linux and signed on MSVC, while an
+enum with a negative enumerator is signed on both. That is the whole
+defect.
+
+**Unpatched `cuda-core` builds clean on Linux** (`cargo build -p
+cuda-core`, 0 errors, stable 1.98.1), which is the other half of the same
+statement.
+
 Two of the sites are the *reverse* direction: `DriverError(pub CUresult)`
 is `c_int` here while `CudaContext::error_state` is an `AtomicU32`, so
 `context.rs:758` and `:770` need casts the other way.
@@ -131,10 +159,11 @@ repo root and no `#![feature(...)]` anywhere under `cuda-core/src`. The
 nightly requirement belongs to `cuda-host` and `rustc-codegen-cuda`. The
 build above is stable 1.97.1.
 
-**The host API works below the `sm_80` floor.** With the patch applied, a
-runtime-PTX round trip — `load_module_from_ptx_src` → `load_function` →
-`DeviceBuffer::from_host` → `launch_kernel_on_stream` → `to_host_vec` —
-ran on an **sm_75** RTX 2060:
+**The host API works below the `sm_80` floor.** A runtime-PTX round trip
+— `load_module_from_ptx_src` → `load_function` → `DeviceBuffer::from_host`
+→ `launch_kernel_on_stream` → `to_host_vec` — ran on an **sm_75** RTX
+2060 on both targets: on Windows with the patch applied, and on Linux
+**unpatched**, at `main` @ `7f60633` on stable:
 
 ```
 device = NVIDIA GeForce RTX 2060 (sm_75), driver = 13030

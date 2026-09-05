@@ -2056,6 +2056,60 @@ optimizing tier's loop body cannot be measured on a workload where that body is
 not what runs.** Every zero this section records against those switches was
 taken on one.
 
+#### Taking on the 1.57x: the census says ONE value of four is in a register
+
+With a workload where the optimizing tier finally owns a loop
+(`probes/OsrTierBench.java` through the OSR door), the residency census is
+readable for the first time on the population that matters. Its kernel has four
+live values — `n`, `sum`, `acc`, `i` — and five registers to put them in:
+
+```text
+[ir-ls] peak_live=15 scan_promoted=19 resident=1 (gp=1) splits=12
+[ir-ls] skipped: split_or_spilled=3 const=7 single_use=20 no_alloc=3
+```
+
+**The allocator promotes nineteen values and the residency file accepts one.**
+`split_or_spilled=3` is the whole loop-carried set minus the one that survived.
+
+**Why the scan evicts exactly the wrong values.** `ls_pick_victim` maximises
+`next_use_distance × SCALE / frequency_weight`, which is the classic rule and is
+right when a reload is paid ONCE. A loop-carried value's next use is across the
+back edge, so its distance is large; and it typically has FEWER uses than a
+temporary in the same body, so its weight is smaller. Both terms point the same
+way, and the value whose eviction costs a store and a reload on *every
+iteration* scores as the best victim available.
+
+Loop-depth weighting cannot separate the two, and that is worth stating plainly
+because the weighting is already there: a loop-carried phi and a temporary in
+the same loop body sit at the SAME depth. What distinguishes them is not where
+they are but how long they live — across the back edge, or not.
+
+**The fix, and what it bought.** `LiveModel::carried` marks a value whose range
+spans a back-edge position, and `ls_carry_relief` divides such a value's
+distance before scoring, which keeps the ordering among carried values while
+moving all of them behind the uncarried ones. It works, deterministically:
+`resident` 1 → 2 and `split_or_spilled` 3 → 2, saturating by a relief of 64.
+
+**It is default OFF, because it is not shown to pay.** The timing arm was
+attempted and is not usable: the host was at load 22 on 8 cores, and this file
+has recorded twice already what a contended host does to an arm. A zero taken
+there is not a zero. That measurement is owed.
+
+**And the census names what actually stands in the way.** Two of the four
+carried values are STILL split, and `plan_register_residency` refuses any split
+value outright — the file has no reload machinery, so "one segment, one
+register, whole range" is the admission. With four carried values and five
+registers there is no reason to split any of them; the scan splits them because
+it allocates them in competition with eleven transients under `peak_live=15`.
+
+So the shape of the remaining work is not a better heuristic. It is **reserving
+the carried set** — assigning those values registers before the scan runs and
+letting everything else compete for what is left, which is what the single-pass
+tier does by colouring locals into callee-saved registers and is why it wins by
+1.57x. The heuristic fix above moves one value; reserving moves the set, and
+this section's own conclusion has been "the live set has to move as a group, or
+not at all" since the four zeros.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

@@ -4229,6 +4229,18 @@ pub struct LiveModel {
     pub weight: Vec<u64>,
     /// `loop_depth[b]` = nesting depth of block `b`.
     pub loop_depth: Vec<u32>,
+    /// `carried[id]` = this value's live range spans a BACK EDGE, i.e. it is
+    /// live on entry to an iteration and still live at the end of one.
+    ///
+    /// The distinction the spill heuristic could not otherwise draw. Classic
+    /// linear scan evicts the interval whose next use is FURTHEST away, which
+    /// is right when the reload is paid once — and exactly wrong here, because
+    /// a loop-carried value's "far" next use is across the back edge and
+    /// evicting it costs a store and a reload on EVERY ITERATION. Loop-depth
+    /// weighting cannot separate the two: a loop-carried phi and a temporary in
+    /// the same loop body sit at the same depth, and the phi usually has FEWER
+    /// uses, so it scored as the better victim of the two.
+    pub carried: Vec<bool>,
     /// Maximum number of intervals covering any one position. The floor a
     /// perfect allocation could reach; reported, never sized from.
     pub peak_live: usize,
@@ -4762,6 +4774,27 @@ pub fn build_live_model(graph: &Graph, schedule: &Schedule) -> LiveModel {
         peak_live = peak_live.max(running);
     }
 
+    // Which positions are back edges: the outgoing edge of a block that
+    // branches to itself or to any earlier block. Same test
+    // `MachineModel::for_graph` uses to place its safepoint polls, because it
+    // is the same event — the point an iteration ends.
+    let mut back_edges: Vec<usize> = Vec::new();
+    for (b, block) in schedule.blocks.iter().enumerate() {
+        if block.successors.iter().any(|&s| s <= b) {
+            if let Some(&(_, edge)) = span.get(b) {
+                back_edges.push(edge);
+            }
+        }
+    }
+    let mut carried = vec![false; n];
+    if !back_edges.is_empty() {
+        for (id, r) in range.iter().enumerate() {
+            if let Some(r) = r {
+                carried[id] = back_edges.iter().any(|&e| r.lo <= e && e <= r.hi);
+            }
+        }
+    }
+
     LiveModel {
         pos_of,
         span,
@@ -4775,6 +4808,7 @@ pub fn build_live_model(graph: &Graph, schedule: &Schedule) -> LiveModel {
         uses,
         weight,
         loop_depth,
+        carried,
         peak_live: peak_live.max(0) as usize,
         converged,
     }
@@ -5130,6 +5164,36 @@ impl Allocation {
 /// Scale factor for the eviction score, so integer division by the frequency
 /// weight keeps useful resolution.
 const SPILL_DISTANCE_SCALE: u64 = 1024;
+
+/// How much a LOOP-CARRIED value's next-use distance is discounted when
+/// choosing a spill victim -- **default 0, i.e. OFF**; opt in with
+/// `CRATONVM_JIT_LS_CARRY_RELIEF=64`.
+///
+/// Off by default because it is not shown to PAY, not because it is wrong. It
+/// moves the residency census deterministically (`resident=1` to `2`,
+/// `split_or_spilled=3` to `2` on `probes/OsrTierBench.java`, saturating by
+/// 64), and it changes register allocation on every IR compile — a real
+/// behaviour change that has no measured benefit behind it yet. The timing arm
+/// that would settle it was attempted at host load 22 on 8 cores and is not
+/// usable; see `JIT_OPTIMIZATION.md`.
+///
+/// Not a tuning knob so much as a units correction. The score compares "how
+/// long until this value is needed again", which prices a reload paid ONCE. A
+/// value that crosses the back edge is needed again every iteration, so its
+/// distance overstates its availability by roughly the trip count -- and the
+/// heuristic then evicts precisely the values whose eviction is paid the most
+/// times. Dividing keeps the ordering AMONG carried values intact while moving
+/// all of them behind the uncarried ones.
+fn ls_carry_relief() -> u64 {
+    use std::sync::OnceLock;
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LS_CARRY_RELIEF") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        }
+    })
+}
 
 /// Score handed to a rematerializable value, which is always the first thing
 /// evicted: dropping it costs no store and its reload is an immediate.
@@ -5568,7 +5632,15 @@ fn ls_pick_victim(
             return SPILL_SCORE_REMAT;
         }
         let next = live.next_use_at_or_after(node, from).unwrap_or(end);
-        let dist = next.saturating_sub(from) as u64;
+        let mut dist = next.saturating_sub(from) as u64;
+        // See `ls_carry_relief`: a carried value's distance is measured in the
+        // wrong units for the cost it represents.
+        if live.carried.get(node as usize).copied().unwrap_or(false) {
+            let relief = ls_carry_relief();
+            if relief > 1 {
+                dist /= relief;
+            }
+        }
         let w = live.weight.get(node as usize).copied().unwrap_or(1).max(1);
         dist.saturating_mul(SPILL_DISTANCE_SCALE) / w
     };
@@ -6481,6 +6553,7 @@ mod linear_scan_tests {
                     weight: Vec::new(),
                     loop_depth: vec![0],
                     peak_live: 0,
+                    carried: Vec::new(),
                     converged: true,
                 },
             }

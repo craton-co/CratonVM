@@ -143,6 +143,10 @@ static DECOMMIT_SITE_PTR: [AtomicUsize; RECENT_DECOMMITS] =
     [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
 static DECOMMIT_SITE_LEN: [AtomicUsize; RECENT_DECOMMITS] =
     [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
+/// The ordinal each slot was written with, so a reader can prefer the NEWEST
+/// entry covering an address rather than the first one it happens to scan.
+static DECOMMIT_AT: [AtomicUsize; RECENT_DECOMMITS] =
+    [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
 static DECOMMIT_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// The span was committed again after this give-back, so its address is mapped
@@ -157,14 +161,48 @@ pub fn decommits_total() -> usize {
 
 /// Remember that `[addr, addr + len)` went back to the OS from `site`.
 fn record_decommit(addr: usize, len: usize, site: &'static str) {
-    let i = DECOMMIT_SEQ.fetch_add(1, Ordering::Relaxed) % RECENT_DECOMMITS;
+    let seq = DECOMMIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let i = seq % RECENT_DECOMMITS;
     // Base last, for the reason on the ring's doc.
     DECOMMIT_BASE[i].store(0, Ordering::Relaxed);
     DECOMMIT_LEN[i].store(len, Ordering::Relaxed);
     DECOMMIT_FLAGS[i].store(0, Ordering::Relaxed);
     DECOMMIT_SITE_PTR[i].store(site.as_ptr() as usize, Ordering::Relaxed);
     DECOMMIT_SITE_LEN[i].store(site.len(), Ordering::Relaxed);
+    DECOMMIT_AT[i].store(seq.wrapping_add(1), Ordering::Relaxed);
     DECOMMIT_BASE[i].store(addr, Ordering::Release);
+}
+
+/// Forget every remembered span inside `[addr, addr + len)`.
+///
+/// # An address means nothing once the mapping under it is gone
+///
+/// The ring keeps ABSOLUTE addresses, and a reservation's address space goes
+/// back to the OS when it is dropped. The very next mapping -- another heap, a
+/// `malloc` arena, anything -- can be handed the same addresses, at which point
+/// a surviving entry would make the crash handler report a live, unrelated
+/// mapping as "memory the collector gave away". That is a confident WRONG
+/// answer, which is worse than the silence this ring was built to end.
+///
+/// Found by the Linux workspace run of 2026-09-05: with tests running in
+/// parallel, one reservation's freed addresses were re-issued to another's, and
+/// `recent_decommit_covering` answered with the dead one's span -- a 3-granule
+/// give-back reported for a 2-granule one. It passed on Windows, whose address
+/// reuse happened not to collide.
+fn forget_decommits_in(addr: usize, len: usize) {
+    let end = addr.saturating_add(len);
+    for i in 0..RECENT_DECOMMITS {
+        let base = DECOMMIT_BASE[i].load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let blen = DECOMMIT_LEN[i].load(Ordering::Relaxed);
+        if addr < base.saturating_add(blen) && base < end {
+            // Base first and alone: a reader that sees 0 skips the slot, so
+            // there is no window in which it reads a half-cleared entry.
+            DECOMMIT_BASE[i].store(0, Ordering::Release);
+        }
+    }
 }
 
 /// Flag every remembered span that `[addr, addr + len)` overlaps as re-taken.
@@ -196,6 +234,11 @@ fn note_recommit(addr: usize, len: usize) {
 ///
 /// Async-signal-safe: atomic loads and a `'static` string slice.
 pub fn recent_decommit_covering(addr: usize) -> Option<(usize, usize, &'static str, usize)> {
+    // NEWEST WINS. Scanning in slot order and taking the first hit lets a stale
+    // entry outrank the accurate one for the same address -- the ring is a
+    // circular buffer, so slot order is not time order.
+    let mut best: Option<usize> = None;
+    let mut best_at = 0usize;
     for i in 0..RECENT_DECOMMITS {
         let base = DECOMMIT_BASE[i].load(Ordering::Acquire);
         if base == 0 {
@@ -203,24 +246,33 @@ pub fn recent_decommit_covering(addr: usize) -> Option<(usize, usize, &'static s
         }
         let len = DECOMMIT_LEN[i].load(Ordering::Relaxed);
         if addr >= base && addr < base.saturating_add(len) {
-            let ptr = DECOMMIT_SITE_PTR[i].load(Ordering::Relaxed) as *const u8;
-            let slen = DECOMMIT_SITE_LEN[i].load(Ordering::Relaxed);
-            let site = if ptr.is_null() || slen == 0 || slen > 128 {
-                "?"
-            } else {
-                // SAFETY: written by `record_decommit` from a `&'static str`,
-                // whose bytes are valid UTF-8 and outlive the process.
-                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, slen)) }
-            };
-            return Some((
-                base,
-                len,
-                site,
-                DECOMMIT_FLAGS[i].load(Ordering::Relaxed),
-            ));
+            let at = DECOMMIT_AT[i].load(Ordering::Relaxed);
+            if best.is_none() || at > best_at {
+                best = Some(i);
+                best_at = at;
+            }
         }
     }
-    None
+    // Re-read the winner. A slot cleared between the scan and here reads as
+    // base 0, and answering `None` for a span that has just been forgotten is
+    // the safe direction: it costs a line in a crash report, where the other
+    // direction names memory that now belongs to someone else.
+    let i = best?;
+    let base = DECOMMIT_BASE[i].load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let len = DECOMMIT_LEN[i].load(Ordering::Relaxed);
+    let ptr = DECOMMIT_SITE_PTR[i].load(Ordering::Relaxed) as *const u8;
+    let slen = DECOMMIT_SITE_LEN[i].load(Ordering::Relaxed);
+    let site = if ptr.is_null() || slen == 0 || slen > 128 {
+        "?"
+    } else {
+        // SAFETY: written by `record_decommit` from a `&'static str`, whose
+        // bytes are valid UTF-8 and outlive the process.
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, slen)) }
+    };
+    Some((base, len, site, DECOMMIT_FLAGS[i].load(Ordering::Relaxed)))
 }
 
 /// The heap's backing bytes.
@@ -805,6 +857,10 @@ impl Drop for Reservation {
         if self.committed != 0 {
             COMMITTED_BYTES.fetch_sub(self.committed * GRANULE, Ordering::Relaxed);
         }
+        // BEFORE the addresses go back to the OS, not after: once released they
+        // can be re-issued to anything, and a surviving ring entry would name
+        // the new owner's memory. See `forget_decommits_in`.
+        forget_decommits_in(self.base as usize, self.reserved_len);
         // SAFETY: `base`/`len` are exactly what `platform_reserve` returned and
         // this value owns them uniquely.
         unsafe { platform_release(self.base, self.reserved_len) };
@@ -1131,6 +1187,77 @@ mod tests {
             0,
             "a span committed again must be flagged, so the handler stops \
              calling it a use-after-free"
+        );
+    }
+
+    /// **A DROPPED RESERVATION'S SPANS MUST BE FORGOTTEN**, or the ring names
+    /// memory that now belongs to someone else.
+    ///
+    /// The ring keeps absolute addresses. A reservation's address space goes
+    /// back to the OS when it drops, and the next mapping can be handed the
+    /// same addresses — so an entry that outlived its reservation makes the
+    /// crash handler report a live, unrelated mapping as "memory the collector
+    /// gave away". A confident wrong answer, which is worse than the silence
+    /// the ring exists to end.
+    ///
+    /// This is not hypothetical and it is not Windows-visible. The Linux
+    /// workspace run of 2026-09-05 failed
+    /// `the_decommit_ring_answers_for_a_released_span_and_flags_its_return`
+    /// with `left: 6291456, right: 4194304`: tests run in parallel, one
+    /// reservation's freed addresses were re-issued to another's, and the scan
+    /// answered with the DEAD reservation's 3-granule span for a 2-granule
+    /// give-back. The same code passed on Windows, whose reuse pattern happened
+    /// not to collide — a platform difference standing in for a real defect.
+    #[test]
+    fn a_dropped_reservations_spans_are_forgotten() {
+        let Some(mut res) = Reservation::reserve(4 * GRANULE) else {
+            return;
+        };
+        assert!(res.commit_range(0, 4 * GRANULE));
+        let base = res.base as usize;
+        if res.decommit_range(GRANULE, 2 * GRANULE, "free-list-low") == 0 {
+            return; // platform declined; nothing was recorded to forget
+        }
+        let probe = base + GRANULE + 4096;
+        assert!(
+            recent_decommit_covering(probe).is_some(),
+            "the span must be findable while its reservation is alive"
+        );
+        drop(res);
+        assert!(
+            recent_decommit_covering(probe).is_none(),
+            "a span whose reservation has been released must not be reported:              those addresses can already belong to another mapping"
+        );
+    }
+
+    /// **THE NEWEST ENTRY WINS**, because slot order is not time order.
+    ///
+    /// The ring is circular, so a scan that takes the first covering slot it
+    /// meets can return a stale entry that a newer, accurate one has already
+    /// superseded. Two give-backs at the same address, the second narrower:
+    /// a first-match scan answers with whichever landed in the lower slot.
+    #[test]
+    fn the_ring_answers_with_the_most_recent_span_covering_an_address() {
+        let Some(mut res) = Reservation::reserve(8 * GRANULE) else {
+            return;
+        };
+        assert!(res.commit_range(0, 8 * GRANULE));
+        let base = res.base as usize;
+        if res.decommit_range(GRANULE, 4 * GRANULE, "unbumped-middle") == 0 {
+            return;
+        }
+        // Re-commit and give back a NARROWER span inside the first one, so both
+        // entries cover the probe and only the second is current.
+        assert!(res.commit_range(GRANULE, 4 * GRANULE));
+        if res.decommit_range(2 * GRANULE, GRANULE, "free-list-high") == 0 {
+            return;
+        }
+        let probe = base + 2 * GRANULE + 64;
+        let hit = recent_decommit_covering(probe).expect("covered by both spans");
+        assert_eq!(
+            (hit.1, hit.2),
+            (GRANULE, "free-list-high"),
+            "the ring must answer with the LATEST give-back covering the              address, not with whichever slot the scan reached first"
         );
     }
 
