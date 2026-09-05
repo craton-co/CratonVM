@@ -620,7 +620,7 @@ fn register_datasource_runtime_config(registry: &mut NativeMethodRegistry) {
 /// it meant `start()` returned SUCCESSFULLY having created none of that, so
 /// `main` parked in `waitForExit` with no event loop, no listener, and no
 /// error anywhere -- the failure mode
-/// `keycloak/keycloak-no-vertx-http-runtime-init-20260728.md`
+/// `keycloak-no-vertx-http-runtime-init-20260728.md`
 /// was filed for. A silent, fully-successful-looking non-boot is strictly
 /// worse than a loud one, which is why this shim is retired rather than kept
 /// under the "app-enabling shim" rule.

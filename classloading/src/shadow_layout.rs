@@ -8,7 +8,7 @@
 //! reverse. That is a real signal, but it is only one of the ways a
 //! hand-numbered slot model goes wrong against a real JDK layout, and it is
 //! blind to the other two (see
-//! `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`):
+//! `jdk-only-fabricated-object-layouts-FIXED-20260810.md`):
 //!
 //! * an `Int` written into the *wrong* `Int` slot type-checks and passes; and
 //! * a read of a slot whose real field is a different field entirely returns a
@@ -91,7 +91,7 @@ pub enum SlotVerdict {
     /// this index, so the VM's value is sitting on the JDK's storage.
     ///
     /// This is **kind 3** in
-    /// `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`,
+    /// `jdk-only-fabricated-object-layouts-FIXED-20260810.md`,
     /// and it is the one family a corrected model cannot fix: there is nowhere
     /// right to put the value, so it wants a side table (or an index anchored
     /// past the real field count, which reads back as

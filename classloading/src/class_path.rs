@@ -527,7 +527,7 @@ enum ClassPathEntry {
     /// boot classpath, so that cost 27,962 full deflate passes and ~136 MB of
     /// resident inflated bytes *before the first Java class loaded* — measured
     /// at 15-21 s even with optimised native zlib, and far worse in a debug
-    /// build. See `arch-2026-07-26/boot-classpath-lazy.md`.
+    /// build. See `boot-classpath-lazy.md`.
     ///
     /// The eager cache existed to stop existence probes paying a deflate each
     /// (`find_in_archive(..).is_some()` inflated the entry just to answer a

@@ -28,8 +28,7 @@
 //! `c.getInterfaces(false)` with no null guard — aborting every Mockito
 //! `mock(X509Certificate.class)` with
 //! `NullPointerException: Cannot read field "interfaces" because "rd" is null`
-//! (`fixed-suite-bugs/springboot/`
-//! `sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md`).
+//! (`sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md`).
 //!
 //! The probe reads `getPermittedSubclasses0()` reflectively — the raw native,
 //! before the public wrapper's filter — so a regression shows up as null slots

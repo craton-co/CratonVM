@@ -7,7 +7,7 @@
 //! lookup MUST return the first of those URLs (not null, not a
 //! different URL form).
 //!
-//! Roadmap reference: `history/roadmap-any-java-app.md` Wave 1 Task B.
+//! Roadmap reference: `roadmap-any-java-app.md` Wave 1 Task B.
 //!
 //! Why this is a real-JDK-mode pin (not a `vm.invoke` Rust unit test):
 //!   * The bug shape is "the cl_get_resource native override is never

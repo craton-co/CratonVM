@@ -320,7 +320,7 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("{{size={size}}}"));
         Ok(Some(Value::Object(Some(s))))
     });
-    // SHIM-AUDIT (feature-designs/native-builtins-shim-audit.md, row
+    // SHIM-AUDIT (native-builtins-shim-audit.md, row
     // `java/util/AbstractMap`) — `equals`/`hashCode` are DELIBERATELY NOT
     // registered here. They used to be, as:
     //

@@ -121,7 +121,7 @@ gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cr
 # — i.e. whole dispatch paths, not just a module. Default-off because the
 # backend is not yet at pass-rate parity with `Generational`; see
 # `gc/Cargo.toml`'s note and
-# `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+# `zgc-real-fullsuite-regression-RETIRED-20260807.md`.
 # `cratonvm-cli` has a matching pass-through, so the launcher is built with
 # `cargo build -p cratonvm-cli --features zgc`.
 # SCOPE, as of 2026-08-07: `cratonvm-gc` grew ELEVEN new `src/zgc/` modules that

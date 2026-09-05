@@ -1284,7 +1284,7 @@ impl VirtualThreadManager {
                 // `Thread.sleep` — a correctness regression traded for
                 // nothing. The residual is bounded latency on `parkNanos`,
                 // recorded as a known gap in
-                // `arch-2026-07-26/virtual-threads.md`.
+                // `virtual-threads.md`.
                 vt.unpark_permit = false;
                 vt.state = VirtualThreadState::Started;
                 resubmit = true;
@@ -1403,7 +1403,7 @@ impl VirtualThreadManager {
     ///   test failed and nothing was submitted; the permit it set
     ///   (`unpark_permit`) was read by no live code path, because the
     ///   freeze/thaw `VirtualThread::park` that consumed it is dead code (see
-    ///   `arch-2026-07-26/virtual-threads.md`). An untimed
+    ///   `virtual-threads.md`). An untimed
     ///   `LockSupport.park()` yields with `wake_after_nanos == 0`, so
     ///   `suspend_runtime` schedules no timer either — the virtual thread was
     ///   parked forever. That window is exactly the one every real

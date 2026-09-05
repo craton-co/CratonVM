@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! Regression test for
-//! `fixed-suite-bugs/wildfly/wildfly-jboss-modules-service-provider-leak.md`.
+//! `wildfly-jboss-modules-service-provider-leak.md`.
 //!
 //! Drives the exact call WildFly's boot code uses to discover a module's
 //! `Extension` implementations —

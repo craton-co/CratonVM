@@ -23,7 +23,7 @@ Log: `apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-windows-2026
 
 Two existing docs cover this exact class:
 
-- `fixed-suite-bugs/springboot/files-createsymboliclink-unsupported-FIXED.md`
+- `files-createsymboliclink-unsupported-FIXED.md`
   (FIXED 2026-08-01) fixed `Files.createSymbolicLink` from an unconditional
   `UnsupportedOperationException` to a real implementation, and explicitly documents the
   **expected residual**: "That last one is what Windows reports without Developer Mode or an
@@ -31,7 +31,7 @@ Two existing docs cover this exact class:
   limitation HotSpot reports identically, not a missing feature," backed by a typed
   `FileSystemException(file, other, reason)` (repair #3 in that doc). Its own verification
   table lists `FileWatcherTests`'s 5 remaining (of 14 then-failing) as exactly this residual.
-- `springboot/filewatcher-watchservice-surface-FIXED-20260801.md` (FIXED
+- `filewatcher-watchservice-surface-FIXED-20260801.md` (FIXED
   2026-08-01) fixed the `WatchService` surface itself (9 of the then-14 failures) and
   confirms the same split: "the other five are the separate `Files.createSymbolicLink` gap."
 - `docs/known-issues/repros/nio-symlink/README.md` states the general rule directly:
@@ -71,7 +71,7 @@ same 5 symlink-dependent test names as above:
 started`, `10 tests successful`, `5 tests failed`, same failing test
 identifiers, same bare `=> java.nio.file.FileSystemException` (no message —
 consistent with the `reason`-field-drop finding recorded in
-`fixed-suite-bugs/springboot/configtree-applicationtemp-windows-symlink-privilege-RETIRED-20260809.md`
+`configtree-applicationtemp-windows-symlink-privilege-RETIRED-20260809.md`
 §4). This is the same host-environment gap across all three collectors, not
 a GC-specific defect — expected, since the root cause (host lacks
 `SeCreateSymbolicLinkPrivilege`/Developer Mode) has nothing to do with the

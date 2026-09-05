@@ -37,7 +37,7 @@ impl Compiler {
     /// that copy becomes a reversing copy into itself: with two int arguments
     /// it stored arg0 over arg1 before the marshalling read it, and the callee
     /// got arg0 in BOTH parameter slots — every comparison in it evaluating
-    /// `cmp a, a`. `fixed-suite-bugs/jit-direct-call-arg1-clobbered-by-arg0-FIXED.md`.
+    /// `cmp a, a`. `jit-direct-call-arg1-clobbered-by-arg0-FIXED.md`.
     ///
     /// `args_frame_top` is `next_spill_offset` as it stood BEFORE the pops.
     /// The overlap check afterwards is not redundant with the bump: it is what

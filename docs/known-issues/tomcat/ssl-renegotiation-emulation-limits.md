@@ -13,14 +13,14 @@ Measured on `bin/cratonvm-tls-7b7f66ee5`, Azure Linux, real JDK 25,
 
 **1. "A client certificate is never presented on mutual TLS" — FIXED.**
 A resumed TLS session was cancelling the `CertificateRequest`. Root cause and
-fix in `fixed-suite-bugs/tls-session-resumption-cancels-the-client-certificate-request-FIXED-20260822.md`
+fix in `tls-session-resumption-cancels-the-client-certificate-request-FIXED-20260822.md`
 (plain text — that tree is stripped from public history).
 `TestCustomSslTrustManager` 2 failures → **OK (9 tests)**; `TestClientCert`
 5 failures → 1.
 
 **2. "Client-initiated renegotiation" was never an open defect.** That page
 should not have listed it. There is a 2026-08-02 record —
-`fixed-suite-bugs/tomcat/testssl-client-initiated-renegotiation-FIXED.md` —
+`testssl-client-initiated-renegotiation-FIXED.md` —
 which fixed three genuine defects in that test and documented the fourth as
 permanent: *"that one test remains red by design"*. The reason is in the
 `addHandshakeCompletedListener` registration itself: rustls implements no TLS 1.2
@@ -73,7 +73,7 @@ in `recv` while the collector still counted the thread as a cooperative mutator,
 so a stop-the-world request could never be satisfied and every other thread
 parked behind it. `rc=124` at a 1800 s cap → **OK (20 tests) in 7 s**.
 
-Record: `fixed-suite-bugs/ocsp-trust-check-parked-a-mutator-the-collector-still-counted-FIXED-20260822.md`
+Record: `ocsp-trust-check-parked-a-mutator-the-collector-still-counted-FIXED-20260822.md`
 (plain text — that tree is stripped from public history). The measurement hazard
 below is kept there too, because it outlives the defect.
 

@@ -7,7 +7,7 @@
 > are dated. Added 2026-08-29, when `HANDOFF-20260828-SCOPE.md` §3/§5/§6 moved
 > there so that page could retire without taking the rules out of circulation.
 >
-> **It did retire, on 2026-09-01**, to `jdk-only/HANDOFF-20260828-SCOPE.md` in
+> **It did retire, on 2026-09-01**, to `HANDOFF-20260828-SCOPE.md` in
 > the internal tree, all three of its stated blockers discharged: Phase 2
 > adjudicated, §4's two owned items closed, §5 rehomed. The eight-lane campaign
 > that page scoped is finished; what it measured is a record, and what it taught
@@ -972,7 +972,7 @@ Three of those are worth reading before acting anywhere in this tree:
   record had attributed the same exception to `java/util/ArrayList.iterator` and
   held four retirable triples back on it.
 * **`G60-1`** — **RESOLVED 2026-08-17, moved to
-  `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`.**
+  `G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`.**
   `--jdk-only` counts its own violations and nobody had read the count. 0 classes
   fabricated, 0 synthetic stubs run. Read the resolved record before quoting any
   of its numbers: **the "81 natives that won over real JDK bytecode" was 58.**

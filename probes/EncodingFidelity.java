@@ -1,4 +1,4 @@
-// Residual of `bug-printstream-charset-answers-the-abstract-base-20260825.md`
+// Residual of `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md`
 // §5: "CratonVM answers UTF-8 where HotSpot answers the console encoding
 // (Cp1251 on this host, from `stdout.encoding`)."
 //

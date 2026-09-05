@@ -591,7 +591,7 @@ thread_local! {
     /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
     /// unreachable from a collecting thread and the throwable was therefore
     /// neither scanned nor remapped for the whole stash→drain window (see
-    /// `fixed-bugs/jit-signals-root-gap.md`). Every remaining field is a
+    /// `jit-signals-root-gap.md`). Every remaining field is a
     /// plain scalar the collector has no interest in, which is why they may
     /// stay here and keep the one-TLS-access drain. **Do not add an
     /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
@@ -1059,7 +1059,7 @@ pub fn clear_jit_thread() {
 ///
 /// Scalars only — the pending throwable lives on
 /// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
-/// it (`fixed-bugs/jit-signals-root-gap.md`).
+/// it (`jit-signals-root-gap.md`).
 struct JitSignals {
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
     /// the thread's `jit_pending_exception`, when statically known at
@@ -2240,8 +2240,7 @@ unsafe fn bail_to_interpreter(
 /// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
 /// three failures in every full-class run of `ASTParserLoadingTest`.
 /// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
-/// witness for all four interfaces; `fixed-suite-bugs/hibernate/
-/// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
+/// witness for all four interfaces; `hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
 ///
 /// Kept as one helper rather than repeated at each bail so a third by-name
 /// dispatch path added later inherits the guard instead of re-opening the hole.
@@ -2448,7 +2447,7 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 /// cross-VM hit therefore does not degrade to a slow path — it CALLs another
 /// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
 /// class happens to hold that id in this VM. See
-/// `audits/vm-jit-cache-keying.md`.
+/// `vm-jit-cache-keying.md`.
 ///
 /// `vm_identity` is a monotonically issued counter (`vm_init.rs`
 /// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
@@ -2930,7 +2929,7 @@ fn publish_mic_rust_cached_entry(
 /// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
 /// CPU in `lock_shared_slow` alone, with every workload converging on the same
 /// per-op cost regardless of what it actually did
-/// (fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md).
+/// (23-charsetcache-pathological-slowdown.md).
 ///
 /// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
 /// thread first — that is what makes a hit as fresh as a locked resolution.
@@ -4382,7 +4381,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
 // references stay invisible to the marker. The next mixed evacuation
 // then turns the classic SATB lost-object scenario into a use-after-
-// free (audit: history/round7-gc.md §3).
+// free (audit: round7-gc.md §3).
 //
 // `flush_thread_satb` itself is a cheap inline call when `is_active() ==
 // false`: a single Acquire load and an early return. We invoke it
@@ -5123,8 +5122,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // site needs a `jit_thread_mut()` acquire merely to have a thread to hand
     // it. The memo skips BOTH. `is_class_initialized_via_manager` +
     // `ensure_class_initialized_shared` were 12.2% of a whole-process profile
-    // of an allocation loop -- see `fixed-suite-bugs/netty/`
-    // `osr-door-binds-ctor-and-the-inline-new-lever-is-inert-FIXED-20260817.md`.
+    // of an allocation loop -- see `osr-door-binds-ctor-and-the-inline-new-lever-is-inert-FIXED-20260817.md`.
     if new_class_init_memo_enabled() {
         if !class_init_memo::is_initialized(vm.vm_identity, class_id_raw as u32) {
             if let Some((thread, _guard)) = jit_thread_mut() {
@@ -8041,7 +8039,7 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
 /// This is the fork that decides whether anything further is reachable on ZGC
 /// and G1. Those two collectors publish no region bounds by design — the empty
 /// `JIT_REGION_BOUNDS` is the interlock that keeps inline reference STORES
-/// unreachable there (`audits/g1-audit.md` §8.1) — so containment can only be
+/// unreachable there (`g1-audit.md` §8.1) — so containment can only be
 /// bypassed by a receiver check that does not need it. The IR tier now has one
 /// (`emit_trusted_oop_receiver_check`, primitives only), and the single-pass
 /// arm has always had one.
@@ -8513,7 +8511,7 @@ unsafe fn jit_getfield_impl(
     // that follows it) fell through: every compiled `getfield` either takes its
     // inline branch or lands here, so this count IS the fast path's miss count.
     //
-    // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
+    // every-jit-getfield-takes-the-helper-FIXED-20260820.md
     // asks for exactly this as its step 1 — "a fix priced on anything but that
     // counter is a guess" — because three separate signals (the gates are
     // default-on, 35 sites were emitted, the codegen arm has unit tests) all
@@ -8635,7 +8633,7 @@ unsafe fn jit_getfield_impl(
         // on a plain field read/write being tear-free (e.g.
         // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
         // `firstReaderHoldCount`) -- see
-        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
@@ -9510,7 +9508,7 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// the `OWNER` latch, and every other VM answers `is_initialized == false` and
 /// takes the authoritative `ensure_class_initialized_shared` path forever. That
 /// is a correct-but-slower outcome for VM #2, and no shared mutable state can
-/// give a wrong answer. See `audits/vm-jit-cache-keying.md`.
+/// give a wrong answer. See `vm-jit-cache-keying.md`.
 mod class_init_memo {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -11162,7 +11160,7 @@ pub unsafe extern "C" fn jit_checkcast(
         // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
         // which is also the all-zero header the collector leaves over a
         // reclaimed span; free-list membership tells the two apart.
-        // See audits/old-sweep-liveness.md section 7.
+        // See old-sweep-liveness.md section 7.
         //
         // 2026-08-02: moved into `memory::reclaim_guard` so the three faces of
         // this defect — interpreted `checkcast`, compiled `checkcast`, and an
@@ -11278,7 +11276,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // next would then read through a dangling pointer — observed live as
     // a SIGSEGV inside this function under concurrent executor load
     // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
-    // fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
+    // wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
     // `is_object_address` additionally validates the address falls inside
     // a live heap region (and looks like a real header) before ever
     // dereferencing it, degrading a dangling reference to "not an
@@ -11495,7 +11493,7 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     } else if let Some((thread, _guard)) = jit_thread_mut() {
         // The throwable is stashed on the `JvmThread` so the collector can
         // both keep it alive and relocate it before the interpreter's drain
-        // reads it back (`fixed-bugs/jit-signals-root-gap.md`).
+        // reads it back (`jit-signals-root-gap.md`).
         set_jit_pending_exception_with_bci(
             thread,
             ObjectRef::from_raw(exc_ptr as usize as *mut u8),
@@ -12133,7 +12131,7 @@ static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// removable from a run in one flag.
 ///
 /// See
-/// `fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
+/// `batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -12271,7 +12269,7 @@ pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
 /// JIT and 0 times under `--nojit`, `StreamSupport.stream(spliterator, false)`
 /// handing back the spliterator, `Proxy$Dispatch.invokeProxy` reached with a
 /// null `Method`. See
-/// `fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
+/// `cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
 ///
 /// So `all` is restored. Gating it would cost 836631dcc's win to work around a
 /// defect that no longer exists. **A perf change that makes a latent defect
@@ -12701,7 +12699,7 @@ fn resolve_native_site(
 /// field read, and, through `AbstractByteBuf.ensureAccessible()` ->
 /// `RefCnt.isLiveNonVolatile` -> `VH.get`, made every netty `ByteBuf`
 /// accessor cost ~2.6 µs. See
-/// `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
+/// `varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
 ///
 /// [`vm_exec::invoke_on_class_shared_inner`] already handles the shape, in the
 /// `None` arm of its hierarchy resolution — i.e. exactly where rules 1-3
@@ -22895,7 +22893,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
-    // (audits/vm-jit-cache-keying.md)
+    // (vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     /// Serializes the tests that reset the two process-global, VM-owned
@@ -22911,7 +22909,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The pending JIT exception is thread-resident, not TLS-resident
-    // (fixed-bugs/jit-signals-root-gap.md)
+    // (jit-signals-root-gap.md)
     // -----------------------------------------------------------------------
 
     fn scratch_thread(id: u64) -> JvmThread {
@@ -24474,7 +24472,7 @@ mod tests {
     }
 
     // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
-    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
     // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
     // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
@@ -25385,7 +25383,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `feature-designs/vm-process-global-state.md`.
+/// `vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.
@@ -25711,7 +25709,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // The READ-side sibling. Same six-word shape, DIFFERENT table on
         // purpose: `JIT_REGION_BOUNDS` above is what gates inline reference
         // STORES, and G1/ZGC keep it empty so an inline store can never skip
-        // `post_write_barrier_rset` (`audits/g1-audit.md` 8.1). This one
+        // `post_write_barrier_rset` (`g1-audit.md` 8.1). This one
         // answers only the read question -- is the receiver inside mapped
         // arena memory, so a raw load cannot fault -- and G1 does publish its
         // single contiguous arena span into it. ZGC publishes nothing, which

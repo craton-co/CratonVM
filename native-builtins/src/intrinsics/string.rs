@@ -4,7 +4,7 @@
 //! Interpreter intrinsic handlers for `java/lang/String`.
 //!
 //! See `intrinsic_table_contract.md` and
-//! `gaps/feature_roadmap_interpreter_intrinsic_table.md`.
+//! `feature_roadmap_interpreter_intrinsic_table.md`.
 //!
 //! These handlers are the interpreter fast-path entry points for the hottest
 //! `String` leaf methods. They MUST be behavior-identical to the normal native

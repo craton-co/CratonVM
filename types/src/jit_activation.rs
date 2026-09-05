@@ -17,7 +17,7 @@
 //! `FxHashMap`s (`entry_ptr -> class_id` and `class_id -> count`), and once the
 //! `class_manager` read lock came off the JIT dispatch path it became the
 //! dominant serialization point in the VM
-//! (`fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md`).
+//! (`23-charsetcache-pathological-slowdown.md`).
 //!
 //! Both halves are gone rather than merely made cheaper:
 //!

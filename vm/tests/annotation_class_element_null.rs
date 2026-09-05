@@ -6,7 +6,7 @@
 //!
 //! Three unrelated frameworks dereference these without a null check, and each
 //! one crashed on a CratonVM null (see
-//! `annotation-class-element-resolves-null-cluster-FIXED-20260805.md`):
+//! `annotation-class-element-resolves-null-cluster-RETIRED-20260805.md`):
 //!
 //! | caller | expression that NPEs on a null |
 //! |---|---|

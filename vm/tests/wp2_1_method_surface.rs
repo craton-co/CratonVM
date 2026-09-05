@@ -7,7 +7,7 @@
 
 //! WP2.1 — `java.lang.reflect.Method` surface end-to-end (excluding `invoke`).
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1).
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1).
 //! `Method.invoke` is WP2.2's lane and lives in
 //! `vm/tests/wp2_2_method_invoke_matrix.rs`; this suite intentionally
 //! does not exercise that path.

@@ -12,7 +12,7 @@
 //! `ApplicationContext` per test method) therefore pay a full-heap trace for
 //! every short-lived object they drop, which is the shape that turned 35
 //! passing classes into 300 s timeouts under `-XX:+UseZGC`
-//! (`fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
+//! (`zgc-real-fullsuite-regression-RETIRED-20260807.md`).
 //!
 //! The fix is generational collection, and a **remembered set is its hard
 //! prerequisite**: a young-only collection must find every old→young reference

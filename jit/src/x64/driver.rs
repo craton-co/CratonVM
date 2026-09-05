@@ -2948,7 +2948,7 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     //
     // `moving_young_osr_method_needs_fallback` reports the aggregate as one
     // `map_coverage` counter, and that counter is what
-    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` was left
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` was left
     // holding: it names the field, not the term, and not the method. The four
     // terms fail for completely different reasons (a gate that is off, a slot
     // the prologue did not reserve, an inlined callee, a safepoint that

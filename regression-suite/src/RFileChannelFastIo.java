@@ -21,7 +21,7 @@ import java.nio.file.StandardOpenOption;
  * glue chain, and every observable of that chain has to survive.
  *
  * The open page that asked for the fast path
- * (`performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`) also gave
+ * (`filechannel-heap-read-glue-depth-FIXED-20260823.md`) also gave
  * the reason it had not been taken: a fast path has to reproduce the position
  * advance, the EOF-is-`-1` convention, the read-only and non-readable
  * refusals, and the `beginBlocking`/`endBlocking` pairing — and **getting any

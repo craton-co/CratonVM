@@ -680,7 +680,7 @@ struct Lowerer<'a> {
     /// The READ table, not `JIT_REGION_BOUNDS`: this tier emits no inline
     /// reference STORE, so it asks only "is this address mapped, so a raw load
     /// cannot fault". The store question -- which G1/ZGC answer by leaving
-    /// `JIT_REGION_BOUNDS` empty (`audits/g1-audit.md` 8.1) -- has no site
+    /// `JIT_REGION_BOUNDS` empty (`g1-audit.md` 8.1) -- has no site
     /// here to ask it.
     ///
     /// **Since 2026-09-02 there is such a site** — `emit_gated_ir_ref_putfield`
@@ -935,6 +935,8 @@ struct Lowerer<'a> {
     carries_read: usize,
     carries_refused: usize,
     carry_stores_dropped: usize,
+    /// ENGAGEMENT: constant operands folded into their ALU instruction.
+    alu_imms_folded: usize,
     /// Why an adjacent pair was not carried, per cause, and how many carried
     /// values still had to write their home because a frame state names them.
     carry_skips: [usize; 6],
@@ -1469,6 +1471,7 @@ impl<'a> Lowerer<'a> {
             carries_read: 0,
             carries_refused: 0,
             carry_stores_dropped: 0,
+            alu_imms_folded: 0,
             carry_skips: [0; 6],
             carry_named: 0,
             deopt_nameable: Vec::new(),
@@ -1784,6 +1787,77 @@ impl<'a> Lowerer<'a> {
         if let Some(cell) = self.gp_reg_live.get_mut(id as usize) {
             *cell = true;
         }
+    }
+
+    /// The `imm32` this operand denotes, if it is an integer constant that
+    /// fits one.
+    ///
+    /// A wider `long` constant falls back to the register form, which is
+    /// correct rather than merely conservative: every immediate form below
+    /// SIGN-EXTENDS its `imm32` to 64 bits, so a constant outside `i32` cannot
+    /// be expressed by one.
+    fn alu_imm32(&self, id: NodeId) -> Option<i32> {
+        if !ir_alu_imm_enabled() {
+            return None;
+        }
+        match self.graph.nodes.get(id as usize)?.op {
+            Op::Const(val) => i32::try_from(val).ok(),
+            _ => None,
+        }
+    }
+
+    /// `<op> EAX/RAX, imm32` in the one-byte accumulator form, if `id` is a
+    /// constant. Answers whether it emitted, so the caller skips its
+    /// register-to-register form.
+    ///
+    /// `acc` is the `AL/eAX, imm` opcode: ADD 0x05, OR 0x0D, AND 0x25,
+    /// SUB 0x2D, XOR 0x35 -- the same column of the opcode map, which is why
+    /// one helper covers five arms.
+    fn emit_alu_acc_imm(&mut self, id: NodeId, acc: u8, wide: bool) -> bool {
+        let Some(imm) = self.alu_imm32(id) else {
+            return false;
+        };
+        if wide {
+            self.buf.emit_byte(0x48); // REX.W
+        }
+        self.buf.emit_byte(acc);
+        self.buf.emit(&imm.to_le_bytes());
+        self.alu_imms_folded += 1;
+        true
+    }
+
+    /// `IMUL EAX/RAX, EAX/RAX, imm32` (0x69 /r id), if `id` is a constant.
+    fn emit_imul_imm(&mut self, id: NodeId, wide: bool) -> bool {
+        let Some(imm) = self.alu_imm32(id) else {
+            return false;
+        };
+        if wide {
+            self.buf.emit_byte(0x48);
+        }
+        self.buf.emit(&[0x69, 0xC0]); // dst=rax, src=rax
+        self.buf.emit(&imm.to_le_bytes());
+        self.alu_imms_folded += 1;
+        true
+    }
+
+    /// `<shift> EAX/RAX, imm8` (0xC1 /digit ib), if `id` is a constant.
+    ///
+    /// The count is masked here to the width the JVM specifies -- 5 bits for
+    /// `ishl`/`ishr`/`iushr`, 6 for the `l` forms. x86 masks a shift count the
+    /// same way, which is what makes the existing `CL` form correct without a
+    /// mask; doing it explicitly keeps the immediate form from depending on
+    /// that coincidence.
+    fn emit_shift_imm(&mut self, id: NodeId, digit: u8, wide: bool) -> bool {
+        let Some(imm) = self.alu_imm32(id) else {
+            return false;
+        };
+        let count = (imm as u32) & if wide { 63 } else { 31 };
+        if wide {
+            self.buf.emit_byte(0x48);
+        }
+        self.buf.emit(&[0xC1, digit, count as u8]);
+        self.alu_imms_folded += 1;
+        true
     }
 
     /// Load `id`'s value into `dst`, from its resident register when it has one
@@ -3697,7 +3771,7 @@ impl<'a> Lowerer<'a> {
     /// `plan_object_alloc`, so a class with a perfectly good registered compact
     /// layout is still allocated legacy. An arm that inlines only compact
     /// receivers therefore inlines almost nothing. See
-    /// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+    /// every-jit-getfield-takes-the-helper-FIXED-20260820.md.
     ///
     /// The legacy read is the uniform 16-byte `Value` cell at
     /// `HEADER_SIZE + field_index * SLOT_SIZE`, transcribed from the
@@ -3769,7 +3843,7 @@ impl<'a> Lowerer<'a> {
         //
         // Note what this does NOT do: it does not publish `JIT_REGION_BOUNDS`
         // on a non-publishing collector. That table's emptiness is load-bearing
-        // — per `audits/g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
+        // — per `g1-audit.md` §8.1 (G1-2) it is the interlock that keeps
         // every inline reference-STORE fast path unreachable under G1/ZGC, so a
         // JNI-pinned CSet-excluded region cannot lose its remembered-set edge.
         // Filling it to speed up loads would silently re-enable those stores.
@@ -6561,13 +6635,15 @@ impl<'a> Lowerer<'a> {
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.gp_load_value(RAX, node.inputs[0]);
-                    self.gp_load_value(RCX, node.inputs[1]);
-                    if node.ty == IrType::Int {
-                        // ADD EAX, ECX
-                        self.buf.emit(&[0x01, 0xC8]);
-                    } else {
-                        // ADD RAX, RCX
-                        self.buf.emit(&[0x48, 0x01, 0xC8]);
+                    if !self.emit_alu_acc_imm(node.inputs[1], 0x05, node.ty != IrType::Int) {
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        if node.ty == IrType::Int {
+                            // ADD EAX, ECX
+                            self.buf.emit(&[0x01, 0xC8]);
+                        } else {
+                            // ADD RAX, RCX
+                            self.buf.emit(&[0x48, 0x01, 0xC8]);
+                        }
                     }
                     self.store_rax(slot);
                 }
@@ -6583,13 +6659,15 @@ impl<'a> Lowerer<'a> {
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.gp_load_value(RAX, node.inputs[0]);
-                    self.gp_load_value(RCX, node.inputs[1]);
-                    if node.ty == IrType::Int {
-                        // SUB EAX, ECX
-                        self.buf.emit(&[0x29, 0xC8]);
-                    } else {
-                        // SUB RAX, RCX
-                        self.buf.emit(&[0x48, 0x29, 0xC8]);
+                    if !self.emit_alu_acc_imm(node.inputs[1], 0x2D, node.ty != IrType::Int) {
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        if node.ty == IrType::Int {
+                            // SUB EAX, ECX
+                            self.buf.emit(&[0x29, 0xC8]);
+                        } else {
+                            // SUB RAX, RCX
+                            self.buf.emit(&[0x48, 0x29, 0xC8]);
+                        }
                     }
                     self.store_rax(slot);
                 }
@@ -6605,13 +6683,15 @@ impl<'a> Lowerer<'a> {
                     self.fp_store_value(id, slot, XMM0, is_d);
                 } else {
                     self.gp_load_value(RAX, node.inputs[0]);
-                    self.gp_load_value(RCX, node.inputs[1]);
-                    if node.ty == IrType::Int {
-                        // IMUL EAX, ECX
-                        self.buf.emit(&[0x0F, 0xAF, 0xC1]);
-                    } else {
-                        // IMUL RAX, RCX
-                        self.buf.emit(&[0x48, 0x0F, 0xAF, 0xC1]);
+                    if !self.emit_imul_imm(node.inputs[1], node.ty != IrType::Int) {
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        if node.ty == IrType::Int {
+                            // IMUL EAX, ECX
+                            self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                        } else {
+                            // IMUL RAX, RCX
+                            self.buf.emit(&[0x48, 0x0F, 0xAF, 0xC1]);
+                        }
                     }
                     self.store_rax(slot);
                 }
@@ -6973,63 +7053,75 @@ impl<'a> Lowerer<'a> {
             Op::And => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                // AND RAX, RCX
-                self.buf.emit(&[0x48, 0x21, 0xC8]);
+                if !self.emit_alu_acc_imm(node.inputs[1], 0x25, true) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    // AND RAX, RCX
+                    self.buf.emit(&[0x48, 0x21, 0xC8]);
+                }
                 self.store_rax(slot);
             }
             Op::Or => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                // OR RAX, RCX
-                self.buf.emit(&[0x48, 0x09, 0xC8]);
+                if !self.emit_alu_acc_imm(node.inputs[1], 0x0D, true) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    // OR RAX, RCX
+                    self.buf.emit(&[0x48, 0x09, 0xC8]);
+                }
                 self.store_rax(slot);
             }
             Op::Xor => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                // XOR RAX, RCX
-                self.buf.emit(&[0x48, 0x31, 0xC8]);
+                if !self.emit_alu_acc_imm(node.inputs[1], 0x35, true) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    // XOR RAX, RCX
+                    self.buf.emit(&[0x48, 0x31, 0xC8]);
+                }
                 self.store_rax(slot);
             }
             Op::Shl => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                if node.ty == IrType::Int {
-                    // SHL EAX, CL
-                    self.buf.emit(&[0xD3, 0xE0]);
-                } else {
-                    // SHL RAX, CL
-                    self.buf.emit(&[0x48, 0xD3, 0xE0]);
+                if !self.emit_shift_imm(node.inputs[1], 0xE0, node.ty != IrType::Int) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    if node.ty == IrType::Int {
+                        // SHL EAX, CL
+                        self.buf.emit(&[0xD3, 0xE0]);
+                    } else {
+                        // SHL RAX, CL
+                        self.buf.emit(&[0x48, 0xD3, 0xE0]);
+                    }
                 }
                 self.store_rax(slot);
             }
             Op::Shr => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                if node.ty == IrType::Int {
-                    // SAR EAX, CL
-                    self.buf.emit(&[0xD3, 0xF8]);
-                } else {
-                    // SAR RAX, CL
-                    self.buf.emit(&[0x48, 0xD3, 0xF8]);
+                if !self.emit_shift_imm(node.inputs[1], 0xF8, node.ty != IrType::Int) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    if node.ty == IrType::Int {
+                        // SAR EAX, CL
+                        self.buf.emit(&[0xD3, 0xF8]);
+                    } else {
+                        // SAR RAX, CL
+                        self.buf.emit(&[0x48, 0xD3, 0xF8]);
+                    }
                 }
                 self.store_rax(slot);
             }
             Op::UShr => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]);
-                self.gp_load_value(RCX, node.inputs[1]);
-                if node.ty == IrType::Int {
-                    // SHR EAX, CL
-                    self.buf.emit(&[0xD3, 0xE8]);
-                } else {
-                    // SHR RAX, CL
-                    self.buf.emit(&[0x48, 0xD3, 0xE8]);
+                if !self.emit_shift_imm(node.inputs[1], 0xE8, node.ty != IrType::Int) {
+                    self.gp_load_value(RCX, node.inputs[1]);
+                    if node.ty == IrType::Int {
+                        // SHR EAX, CL
+                        self.buf.emit(&[0xD3, 0xE8]);
+                    } else {
+                        // SHR RAX, CL
+                        self.buf.emit(&[0x48, 0xD3, 0xE8]);
+                    }
                 }
                 self.store_rax(slot);
             }
@@ -7181,7 +7273,7 @@ impl<'a> Lowerer<'a> {
                 // no-op here — but this arm was the ONLY one resolving from a
                 // raw bci, and a raw bci inside a spliced body is the exact
                 // shape that produced
-                // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+                // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
                 // A fence and an asymmetry is one fence away from the bug;
                 // agreeing with the other emitters costs nothing.
                 let bci = self.resume_bci(bci);
@@ -9568,9 +9660,7 @@ impl<'a> Lowerer<'a> {
     /// # One stub per DISTINCT throw-site bci, not one shared stub
     ///
     /// This is the IR half of RBC.6, and it was the gap cov-07's closeout doc
-    /// flagged and did not own (`fixed-suite-bugs/hibernate/
-    /// offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-
-    /// 20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
+    /// flagged and did not own (`offsetdatetimetest-zoneddatetimetest-athrow-ir-sneaky-throw-swallowed-20260804-FIXED.md`). `JitSignals::athrow_bci` is consumed by `execute_jit_call`
     /// as *this* method's throw site and range-tested against `[start_pc,
     /// end_pc)` of every entry in this method's own exception table. Until this
     /// stub stamped it, that field still held whatever the CALLEE's compiled
@@ -11618,6 +11708,38 @@ fn ir_carry_single_use_enabled() -> bool {
 /// into its branch and then emits nothing at all. `Op::Load`, `Op::ArrayLoad`
 /// and `Op::Call` are absent because they read their operands in another order
 /// or through another path.
+/// Fold a constant second operand into the ALU instruction instead of
+/// materialising it into RCX first -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_ALU_IMM=1`.
+///
+/// Every binary arithmetic arm in this file reads its second operand through
+/// `gp_load_value(RCX, ..)` and then works register-to-register. When that
+/// operand is a constant, `ir_const_imm` turns the read into `mov ecx, imm` --
+/// so the emitted loop carries a whole instruction per constant operand that
+/// x86 has an addressing form for:
+///
+/// ```text
+/// mov ecx,1Fh  /  imul eax,ecx        becomes   imul eax,eax,1Fh
+/// mov ecx,1    /  add eax,ecx         becomes   add eax,1
+/// mov ecx,0FFh /  and rax,rcx         becomes   and rax,0FFh
+/// ```
+///
+/// Unlike the rest of the work around it, this is not specific to a loop
+/// shape: it is every `x + 1`, `x & 0xFF` and `x * 31` in every compiled
+/// method. On `OsrTierBench.kernel` it is five of the loop's forty-four
+/// instructions.
+///
+/// Only the SECOND operand is folded, never the first, even for the
+/// commutative ops. `gp_load_value(RAX, node.inputs[0])` being unconditional
+/// is what `op_reads_rax_then_rcx` and the carry's RAX contract rest on, and
+/// buying a few more folds is not worth making that conditional.
+fn ir_alu_imm_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ALU_IMM") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
 fn op_reads_rax_then_rcx(op: &Op) -> bool {
     matches!(
         op,
@@ -13678,7 +13800,7 @@ pub fn last_lower_bail() -> Option<&'static str> {
 /// interpreted forever. A single Spring Boot suite class produced **8072** such
 /// warnings in one run, every one of them from this estimate (the report that
 /// first noticed the flood,
-/// `fixed-suite-bugs/springboot/basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
+/// `basicerrorcontroller-jit-only-failure-20260731-FIXED.md`,
 /// attributed them to the single-pass backend's estimate — that one accounted
 /// for 10).
 ///
@@ -13985,7 +14107,7 @@ pub(crate) fn lower_inner_with_scopes(
     // reference, the cell then holds a primitive under a reference's name, and
     // the fault appears much later in whatever dereferences it — a compiled
     // `arraylength` on `Int(1)`, faulting at `addr=0x5`
-    // (`fixed-suite-bugs/tomcat/punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
+    // (`punned-sqlchar-rawdata-was-a-direct-call-pinned-by-address-FIXED-20260828.md`).
     // Nothing in the report points back here, because a wrong-slot write leaves
     // no trace of having chosen the wrong slot.
     //
@@ -14093,7 +14215,7 @@ pub(crate) fn lower_inner_with_scopes(
         // found no matching deopt point, defaulted the reason to
         // `UnreachedCode`, and refused the replay against a bci nothing
         // could resume at. See
-        // `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+        // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
         spliced_ranges,
         sr_map,
         direct_calls,
@@ -14122,7 +14244,7 @@ pub(crate) fn lower_inner_with_scopes(
     // 300_000. Downstream it silently emptied Spring Boot's property binding,
     // because `BindHandler.onSuccess(name, target, context, result)` is
     // `aload 4; areturn` over five slots — see
-    // `fixed-suite-bugs/springboot/webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
+    // `webflux-defaultpathcontainer-defaultseparator-classcast-FIXED.md`
     // for the trail from there to `BindResult.isBound() == false` for every
     // property.
     //
@@ -14550,6 +14672,7 @@ pub(crate) fn lower_inner_with_scopes(
              already_resident={} consumer_arm={} operand_position={}",
             s[0], s[1], s[2], s[3], s[4], s[5],
         );
+        eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to

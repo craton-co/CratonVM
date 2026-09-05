@@ -7,7 +7,7 @@
 //!
 //! # The measurement this exists for
 //!
-//! `performance/filechannel-heap-read-glue-depth-FIXED-20260823.md`
+//! `filechannel-heap-read-glue-depth-FIXED-20260823.md`
 //! priced `FileChannel.read` into a HEAP buffer at **~8.7x HotSpot**
 //! (`probes/FileChannelHeapReadProbe.java`, 20 000 reads of 24 bytes). The
 //! cause is not an allocation and not the temporary-direct-buffer cache —

@@ -13,7 +13,7 @@ import java.security.Signature;
  * Does a service ABSENT from `provider.getServices()` actually fail to resolve?
  *
  * This exists because it does not, and I asserted otherwise.
- * `jca-provider-population-gap-20260830.md` reasoned from an enumeration gap --
+ * `jca-provider-population-gap-20260830-FIXED.md` reasoned from an enumeration gap --
  * SunJCE lists 103 services here against HotSpot's 194 -- to a functional one:
  * "invisible until a program asks for an algorithm in one of the six missing
  * types and gets NoSuchAlgorithmException". Then a full Diffie-Hellman

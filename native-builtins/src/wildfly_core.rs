@@ -46,7 +46,7 @@
 //!   `Starting → Running` (after boot) and `Running → Stopping` (on
 //!   shutdown).
 //!
-//! See `history/roadmap-100.md` T19.2.a.
+//! See `roadmap-100.md` T19.2.a.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -1469,7 +1469,7 @@ use cratonvm_types::ObjectRef;
 /// behind the `ClassCastException: java.lang.Object cannot be cast to X`
 /// family (X being whatever class the stale address's reused object
 /// happened to report): see
-/// `fixed-suite-bugs/wildfly/wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md`.
+/// `wildfly-remoting-classcastexception-parallel-extension-add-FIXED.md`.
 /// Fixed by rooting each queued Runnable at enqueue time
 /// (`register_var_handle_root`, keyed by identity hash) and re-resolving to
 /// the current address at drain time (`read_var_handle_root`), the same

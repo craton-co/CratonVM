@@ -201,7 +201,7 @@ const REMEDIATION_CAPTURE: &str =
 ///
 /// # The reading this exists to make impossible
 ///
-/// `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
+/// `G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
 /// §1 split one `RJdkReflBox` census into
 /// `58 bridge-ran-over-bytecode` and `21 bridge`, and glossed the second group
 /// as *"registered over bytecode; not observed running"* — then nominated all 21

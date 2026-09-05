@@ -33,7 +33,7 @@ The REAL mechanism behind `TestWeb.testWebApp()`'s empty-body symptom:
 suggesting the closing `'`. Root cause: `org.h2.bnf.Sentence`'s hardcoded
 `MAX_PROCESSING_TIME = 100` (milliseconds) wall-clock budget for the BNF
 grammar-tree walk — **the exact same mechanism already characterized for
-`org.h2.test.unit.TestBnf` in `bug-h2-suite-residual-fail-triage.md`**.
+`org.h2.test.unit.TestBnf` in `bug-h2-suite-residual-fail-triage-FIXED.md`**.
 Confirmed directly: temporarily widening the budget to 30000ms in a scratch
 rebuild makes `getNextTokenList("select 'abc")` correctly return
 `{1#anything=Hello World, 1#'='}` (the expected closing-quote suggestion) —
@@ -315,7 +315,7 @@ cratonvm-classloading --release invoke_cache`); live runs of
 `org.h2.test.unit.TestShell`, and `org.h2.test.db.TestLinkedTable` against
 the fixed binary (all pass cleanly); `org.h2.test.unit.TestUpgrade` fails
 only at its own already-tracked, unrelated `RootReference` residual (see
-`bug-h2-suite-residual-fail-triage.md`). A `cargo test -p cratonvm-vm
+`bug-h2-suite-residual-fail-triage-FIXED.md`). A `cargo test -p cratonvm-vm
 force_native_over_real_jdk_bytecode` run was attempted but got OOM-killed
 by the host's memory pressure before completing — not evaluated, worth
 re-running by whoever picks this up next on a less contended host.

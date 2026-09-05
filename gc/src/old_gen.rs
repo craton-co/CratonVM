@@ -43,7 +43,7 @@ use cratonvm_types::{ObjectRef, Value};
 /// `update_refs_in_object` logs any referent whose `forwarding_ptr` is
 /// non-null but `< 0x1000` — the §6.1 suspect that would write
 /// `Object(Some(0x4))` into a live referrer's field during major-GC
-/// compaction. See gaps/bc-math-ec-gc-0x4-handoff.md §6.1.
+/// compaction. See bc-math-ec-gc-0x4-handoff.md §6.1.
 #[inline]
 fn seedhunt_enabled() -> bool {
     gc_flags().dbg_seedhunt
@@ -131,7 +131,7 @@ pub static BLOCKS_MERGED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// desync read the payload byte as a typed `#[repr(u8)]` enum — instant UB
 /// for a discriminant outside the declared set, which optimized code can
 /// lower to a hardware trap (`HIB-DCAST-LATEPHASE.1`,
-/// `fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md`
+/// `source-debug-jit-conservative-root-invalid-header-tag-sigill.md`
 /// fixed the same class of bug for the conservative-root validators but
 /// never reached this walk). This counter turns that silent-until-it-traps
 /// failure mode into something a regression test or a log can see.
@@ -680,7 +680,7 @@ impl OldGen {
     /// reclaims dead blocks IN PLACE and does not zero them, so the dead
     /// object's bytes stay put and the address keeps passing `contains`. This
     /// is the discriminator a liveness query needs; see
-    /// `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+    /// `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
     ///
     /// O(log n) in the free-block count, over the same offset-sorted view
     /// `walk_objects` already caches.
@@ -873,7 +873,7 @@ impl OldGen {
     ///
     /// Mirrors the fix already applied to the conservative-root validators
     /// in `gen_heap.rs`/`g1.rs` (see
-    /// `fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md`):
+    /// `source-debug-jit-conservative-root-invalid-header-tag-sigill.md`):
     /// read the raw tag bytes and validate them through
     /// `object_kind_from_tag`/`array_element_type_from_tag` *before* ever
     /// forming a `&ObjectHeader` reference and touching the typed field.
@@ -907,7 +907,7 @@ impl OldGen {
                      boundary — the walk has desynced from real object headers; \
                      stopping this scan stripe instead of reading a corrupt header as \
                      a typed enum. See \
-                     fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md."
+                     source-debug-jit-conservative-root-invalid-header-tag-sigill.md."
                 );
                 None
             }
@@ -1048,7 +1048,7 @@ impl OldGen {
                     // is that this header may not be trustworthy to decode as
                     // one, and a `Debug` format on an out-of-range `kind`
                     // walked exactly this wild-pointer bug once already (see
-                    // fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
+                    // gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md).
                     // SAFETY: `ptr` is inside the allocated region between
                     // `start_offset` and `end_offset`, both within `self.data`;
                     // HEADER_SIZE bytes at `ptr` are therefore in-bounds.
@@ -1138,7 +1138,7 @@ impl OldGen {
         // points at that survivor's data instead — exactly the "unrelated
         // object's bytes read back through a stale-but-not-obviously-wrong
         // pointer" shape the residual corruption in
-        // fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md
+        // map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md
         // keeps presenting as (Follow-up 4).
         //
         // `used_bytes` is independently maintained by `alloc`/`free` — it is
@@ -1244,7 +1244,7 @@ impl OldGen {
         // lock in the old generation reset, and every INFLATED word's single
         // strong `Arc<Monitor>` reference dropped on the floor, leaving the slid
         // survivor with no monitor. Snapshot before clobbering, restore after
-        // the copy. See `arch-2026-07-26/header-shrink.md` §4.3.
+        // the copy. See `header-shrink.md` §4.3.
         let mut live_objects: Vec<(*mut u8, usize, *mut u8, u64)> = Vec::new();
 
         for &(obj_ptr, total_size) in &objects {
@@ -1517,7 +1517,7 @@ impl OldGen {
     ///   allocated extents as the gaps between free blocks, so a freed block
     ///   is invisible to it. That is exactly the state the in-place sweep
     ///   leaves behind when the mark under-marks (defect 4 in
-    ///   `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`);
+    ///   `map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`);
     /// * `scan_region` hit a header anomaly and `break`ed out of an allocated
     ///   region, dropping every object after it in that region.
     ///
@@ -2164,7 +2164,7 @@ mod tests {
     /// workload). This corrupts only the raw tag byte of an otherwise
     /// legitimately-allocated object, mirroring the regression style already
     /// used for the conservative-root validators (see
-    /// `fixed-suite-bugs/source-debug-jit-conservative-root-invalid-header-tag-sigill.md`),
+    /// `source-debug-jit-conservative-root-invalid-header-tag-sigill.md`),
     /// and asserts the walk stops at the corrupted header instead of
     /// trusting it.
     #[test]

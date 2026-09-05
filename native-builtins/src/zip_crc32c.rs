@@ -27,7 +27,7 @@
 //! value is the bit-complement of the running state. This matches RFC 3720
 //! (iSCSI) and the JDK's `CRC32C`.
 //!
-//! # CRC field-layout contract (see gaps/crc_layout_contract.md)
+//! # CRC field-layout contract (see crc_layout_contract.md)
 //!
 //! Both `java.util.zip.CRC32` and `java.util.zip.CRC32C` declare exactly one
 //! instance field — `private int crc` — and neither has a synthetic-stub

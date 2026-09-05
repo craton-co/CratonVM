@@ -5746,7 +5746,7 @@ fn execute_frame_from_index(
         }
 
         // T19.H7 diag — opcode counter. Removed; documented findings in
-        // history/roadmap-100.md T19.H7 section. Last localization:
+        // roadmap-100.md T19.H7 section. Last localization:
         // `org/jboss/modules/Main.main` pc=1306 dispatched, then a native
         // call from that opcode never returns (interpreter loop never
         // re-entered).
@@ -6350,7 +6350,7 @@ fn execute_frame_from_index(
                     // dropping the high bits. Copy the raw CompactValue for
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
-                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+                    // bc-ec-mod-mododdinverse-investigation.md.
                     //
                     // Underflow guard: an empty operand stack at a value
                     // return means earlier execution desynced the stack

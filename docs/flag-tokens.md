@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-516 tokens.
+518 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -190,6 +190,7 @@ export inherited from a parent shell.
 | `fbref` | `CRATONVM_DBG_FBREF` |
 | `fc-fast-io-stats` | `CRATONVM_FC_FAST_IO_STATS` |
 | `field-get` | `CRATONVM_DBG_FIELD_GET` |
+| `sc-io-stats` | `CRATONVM_SC_IO_STATS` |
 | `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
@@ -293,6 +294,7 @@ export inherited from a parent shell.
 | `jit-direct-binds` | `CRATONVM_DBG_JIT_DIRECT_BINDS` |
 | `jit-ea` | `CRATONVM_DBG_JIT_EA` |
 | `ir-graph` | `CRATONVM_DBG_IR_GRAPH` |
+| `ir-sink` | `CRATONVM_DBG_IR_SINK` |
 | `zgc-target` | `CRATONVM_DBG_ZGC_TARGET` |
 | `zgc-high` | `CRATONVM_DBG_ZGC_HIGH` |
 | `jit-elide-ctor` | `CRATONVM_DBG_JIT_ELIDE_CTOR` |
@@ -582,7 +584,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-359 tokens.
+366 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -702,6 +704,8 @@ export inherited from a parent shell.
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
 | `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
+| `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
+| `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -873,6 +877,11 @@ export inherited from a parent shell.
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
 | `fc-fast-io` | `CRATONVM_FC_FAST_IO` |
+| `sc-scratch` | `CRATONVM_SC_SCRATCH` |
+| `sc-bb-slots` | `CRATONVM_SC_BB_SLOTS` |
+| `sel-ready-cache` | `CRATONVM_SEL_READY_CACHE` |
+| `sel-fast-keys` | `CRATONVM_SEL_FAST_KEYS` |
+| `sc-preresolved` | `CRATONVM_SC_PRERESOLVED` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |

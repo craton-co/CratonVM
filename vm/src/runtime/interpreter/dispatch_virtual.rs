@@ -343,8 +343,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // (`class_id_of`/`kind_of` used to pick the dispatch target) are
     // exactly the class-resolution step implicated in the TestUpgrade
     // RootReference residual — refresh defensively before trusting it for
-    // dispatch. See fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-suite-residual-fail-triage-FIXED.md.
+    // dispatch. See bug-h2-suite-residual-fail-triage-FIXED.md.
     let receiver_obj = shared.mem.heap.load_and_forward(receiver_obj);
 
     // Arrays go through java/lang/Object — don't dispatch via the
@@ -932,7 +931,7 @@ pub(super) fn execute_invokevirtual_vtable_fast(
     // The prior pop_unchecked()/to_value() dropped the high bits of a
     // category-2 long arg whose NaN-box bit pattern collides with a tagged
     // sub-tag (BC safegcd 0xFFFC_… accumulators). See
-    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+    // bc-ec-mod-mododdinverse-investigation.md.
     // ONE forward scan for the whole descriptor. This closure used to call
     // `nth_param_tag_byte` per argument, and that rescans from `(` each time,
     // so popping N args cost O(N^2) tokenising of a string fixed per call site.
@@ -1745,7 +1744,6 @@ pub(super) fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // fixed-suite-bugs/h2-suite-bugs/
                     // bug-h2-suite-residual-fail-triage-FIXED.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
                     // JVMS §4.4.1: an array type inherits its method table
@@ -1947,7 +1945,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // Decode args bit-exact via parameter descriptors (receiver
                     // = 'L'); pop_unchecked()/to_value() dropped the high bits
                     // of collision-pattern long args. See
-                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+                    // bc-ec-mod-mododdinverse-investigation.md.
                     // ONE forward scan; the per-argument form rescanned from `(` each time.
 
                     let param_tags = ParamTags::for_method(&cached);
@@ -2155,8 +2153,7 @@ pub(super) fn execute_invokevirtual_cached(
                     // doesn't faithfully reproduce, reintroducing the exact
                     // always-null symptom the native override exists to fix, but
                     // ONLY under JIT (this tier-up is JIT-only) and ONLY once
-                    // warm — see fixed-suite-bugs/springboot/
-                    // core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md
+                    // warm — see core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md
                     // Cluster C "Residual 5". Site A3 of
                     // `native-dispatch-memoization.md` §3 Step 2: reusing this
                     // entry's `NativeCallSite` (already warm from the
@@ -2495,7 +2492,6 @@ pub(super) fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // fixed-suite-bugs/h2-suite-bugs/
                     // bug-h2-suite-residual-fail-triage-FIXED.md.
                     let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
                     // JVMS §4.4.1: an array type inherits its method table
@@ -2664,8 +2660,7 @@ pub(super) fn execute_invokevirtual_cached(
                         // Refresh via the same GC-forwarding barrier as
                         // invoke args (`refresh_stale_object_args`) — this
                         // receiver came from a bare `peek_at`, not a `pop`.
-                        // See fixed-suite-bugs/h2-suite-bugs/
-                        // bug-h2-suite-residual-fail-triage-FIXED.md.
+                        // See bug-h2-suite-residual-fail-triage-FIXED.md.
                         let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
                         // JVMS §4.4.1: an array type inherits its method table
                         // from `java.lang.Object`, but an array's header stores
@@ -2797,7 +2792,7 @@ pub(super) fn execute_invokevirtual_cached(
             const MAX_INLINE_ARGS: usize = 16;
             // Decode args bit-exact via parameter descriptors (receiver = 'L');
             // pop_unchecked()/to_value() dropped the high bits of collision-
-            // pattern long args. See gaps/bc-ec-mod-mododdinverse-investigation.md.
+            // pattern long args. See bc-ec-mod-mododdinverse-investigation.md.
             // ONE forward scan; the per-argument form rescanned from `(` each time.
 
             let param_tags = ParamTags::for_method(&cached);

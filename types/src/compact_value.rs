@@ -3841,7 +3841,7 @@ mod tests {
     /// `Frame::scan_local_objects` skips LONG slots -- so the young sweep
     /// reclaimed an object a running frame still held. That is the
     /// `ClassId(0)` / `"result" is null` family in
-    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`; two
+    /// `bug-h2-classid0-stale-address-family-FIXED.md`; two
     /// sites (`Frame::update_object_refs`, `ValueStack::update_object_refs`)
     /// had already been hand-patched with a `ObjectRef::from_raw` round-trip
     /// for exactly this reason, which is the symptom of a missing invariant

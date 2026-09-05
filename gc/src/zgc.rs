@@ -1560,7 +1560,7 @@ pub struct ZgcRealHeap {
     /// 1902 / 18 / 11 on the default collector — **35 classes PASS -> HANG**,
     /// concentrated on `*AutoConfigurationTests`, i.e. `ApplicationContext`
     /// boot/teardown, the most allocation-heavy workload in the suite
-    /// (`fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
+    /// (`zgc-real-fullsuite-regression-RETIRED-20260807.md`).
     ///
     /// That record does not attribute the hangs to this lock and neither does
     /// this field: a global lock on every allocation is the wrong answer at
@@ -5501,7 +5501,7 @@ impl ZgcRealHeap {
             // `hand_out`. A slide does not: it picks `to` arithmetically and
             // memmoves. So the first slide after a give-back wrote into a
             // `PROT_NONE` granule and died inside `memcpy`, which is what
-            // `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+            // `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
             // recorded as "the fault address is always a page boundary, `rdi`
             // equal to it, fault pc inside libc".
             if to != from && !arena.commit_for_relocation(to - base, size) {
