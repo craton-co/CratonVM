@@ -377,6 +377,50 @@ both arms. The quickened arm's worst pass (1944) beats the general path's best
 (2032). This page predicted "around one nanosecond, below what this host
 resolves"; that was wrong by a factor of five, in the conservative direction.
 
+## `getstatic` took a class-manager read lock, on every getstatic
+
+The last outlier on the opening table, and the cause is one line.
+
+`op_getstatic` intercepts `System.out` / `System.err` / `System.in` during
+bootstrap. It decided whether a field was one of them by taking a
+`class_manager` **read lock**, calling `get_class`, and comparing the class's
+name against the literal `"java/lang/System"` — for every `getstatic` in the
+program, to answer a question about three fields of one class.
+`op_putstatic` never had the screen.
+
+The fix is the trade the two lines beside it already make, and their comment
+states it: *"one name comparison on the class-DEFINITION path (cold: at most a
+few thousand times per process) buys ... a one-relaxed-load answer on the
+virtual-invoke path (hot: millions of times per second)."*
+`is_annotation_proxy_class` and `class_is_java_util` are both built that way;
+this screen was written the other way round. `class_is_java_lang_system` is a
+`ClassId` latched at definition plus one integer compare, with `u32::MAX` as
+the not-yet-defined sentinel because `0` is a real `ClassId`.
+
+`probes/StaticBurn.java`, N = 30 M, eight interleaved passes, wall ms,
+min-of-8. `put` and `ctl` are the arms the switch cannot reach.
+
+| | min-of-8 | pairwise |
+|---|---:|---|
+| latched (default) | 2369 ms | — |
+| lock restored | 2533 ms | **8/8** |
+
+**164 ms over 30 M reads ≈ 5.5 ns per `getstatic`**, with `putstatic` flat
+(2451 against 2413) and `ctl` flat (1949 against 1914). Against this probe's
+own control that is **~14 ns per `getstatic`, 8.6x HotSpot's 1.63** — down
+from ~20.6 ns and 12.6x. It is in the band.
+
+**Do not quote the 25x from this page's opening table for `getstatic`.** That
+row is a `getstatic` + `putstatic` PAIR measured over `FieldShape`'s control,
+which carries more per-iteration work; `StaticBurn` is the single-shape
+instrument and its pre-fix figure is 12.6x. Both are right about what they
+measure and they are not the same quantity.
+
+Kill switch: `CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH=1`
+(`CRATONVM_JIT=-system-class-latch`). It was added in a follow-up commit
+because the fix originally shipped without one, and a cross-binary comparison
+is not an A/B.
+
 ## The 10x floor: both structural proposals refuted, by measurement
 
 The audit that opened this page named one structural change as "the only one on
