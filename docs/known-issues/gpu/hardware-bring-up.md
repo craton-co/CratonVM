@@ -1,6 +1,6 @@
 # Bringing up a GPU box: what to build, what to run first, and what is waiting on hardware
 
-[hardware-ci.md](hardware-ci.md) has said "no CUDA machine is currently
+[hardware-ci.md](../../gpu/hardware-ci.md) has said "no CUDA machine is currently
 enrolled" since the workflow was written. This page is the other half of that
 sentence: what someone with a CUDA device in front of them should do, in order,
 and which open questions in this tree only hardware can answer.
@@ -13,7 +13,7 @@ step 5, not step 1 — the value is in the first run, not in the automation.
 | | |
 |---|---|
 | GPU | any CUDA device the driver enumerates; the gates are correctness-and-checksum, not throughput-tiered |
-| CUDA | **12.6** — `cudarc` is pinned `features = ["driver", "cuda-12060"]` in `cuda-bridge/Cargo.toml` |
+| CUDA | **12.6** — `cudarc` is pinned `features = ["driver", "cuda-12060"]` in `../../../cuda-bridge/Cargo.toml` |
 | JDK | a real JDK 21+ (`JDK=…`); HotSpot from the same JDK is the differential oracle |
 | `GPU_JAR` | **the `craton-gpu` annotations jar, which is NOT in this repository.** Several bench scripts open with `GPU_JAR="${GPU_JAR:?set GPU_JAR to the craton-gpu annotations jar}"`. The `craton.gpu` API classes (`GpuExecutor`, `GpuFuture`, …) live in that jar — `find` for `GpuExecutor.java` in this tree returns nothing, which has misled at least one investigation into concluding the API did not exist. |
 
@@ -27,9 +27,9 @@ enable both):
   0.3.1 does not compile on Windows/MSVC: 17 signedness errors inside the crate
   itself, reproduced on 0.3.1 and on upstream `main`. Not our bug. A 13-cast fix
   is prepared in-tree at
-  `docs/known-issues/gpu/0001-cuda-core-msvc-simt-flags.patch` and was verified
+  `0001-cuda-core-msvc-simt-flags.patch` and was verified
   working on real hardware after patching — see
-  `docs/known-issues/gpu/cuda-core-msvc-enum-signedness-20260904.md`. If you are
+  `cuda-core-msvc-enum-signedness-20260904.md`. If you are
   on Windows and want this backend, applying that patch to a vendored `cuda-core`
   (and submitting it upstream) is a real, bounded task.
 
@@ -54,7 +54,7 @@ CV=target/release/cratonvm
 
 `--gpu-info` **always exits 0** — "device found" and "no CUDA driver" are both
 clean early exits. So the exit code proves nothing; what proves it is a line
-matching `^device [0-9]+:`. `bench-gpu/ci-gate.sh`'s gate (a) checks exactly
+matching `^device [0-9]+:`. `../../../bench-gpu/ci-gate.sh`'s gate (a) checks exactly
 that, and for that reason.
 
 ## 2. The highest-value single run: the submission drain
@@ -94,7 +94,7 @@ however correctly written. `GpuAsyncChainBench`, which awaits and releases every
 handle it takes, still reported `released=0 live_at_exit=2001`.
 
 Fixed by `f6061f7b3`; the ownership contract is in
-[async-api.md](async-api.md) under "Submission handles must be released", and
+[async-api.md](../../gpu/async-api.md) under "Submission handles must be released", and
 note its conclusion — closing the executor **cannot** sweep the registry,
 because the map is process-global and a close-time drain-all would free another
 executor's submissions.
@@ -147,9 +147,9 @@ A green run here plus a red gate above puts the fault past the shim boundary.
 
 ## 5. Enrol the runner
 
-`.github/workflows/gpu-selfhosted.yml` is written and waiting for a machine
-with the right label; `bench-gpu/ci-gate.sh` is what it runs. See
-[ci.md](ci.md) for the workflow structure. Do this last — after a manual gate
+`../../../.github/workflows/gpu-selfhosted.yml` is written and waiting for a machine
+with the right label; `../../../bench-gpu/ci-gate.sh` is what it runs. See
+[ci.md](../../gpu/ci.md) for the workflow structure. Do this last — after a manual gate
 run has passed at least once, so a red first CI run means "the runner is
 misconfigured" rather than "something in the tree is broken and we don't know
 which".
@@ -163,16 +163,16 @@ Ranked by what a single session could settle:
 2. **`GATE_REDUCTION`** — off since reduction dispatch "hasn't shipped yet".
    Either it ships and the gate turns on, or the comment is stale. One run says
    which.
-3. **The breakeven/crossover surface** — `arithmetic-intensity-sweep-20260904.md`
-   and `offload-crossover-and-min-work-20260904.md` are active, and
+3. **The breakeven/crossover surface** — `../../gpu/arithmetic-intensity-sweep-20260904.md`
+   and `../../gpu/offload-crossover-and-min-work-20260904.md` are active, and
    `bench/gpu-breakeven-surface-20260905` merged on 2026-09-05. Whoever picks
    this up should read those two first; the sweep scripts are
-   `bench-gpu/intensity-sweep.sh` and `bench-gpu/crossover-n.sh`.
+   `../../../bench-gpu/intensity-sweep.sh` and `../../../bench-gpu/crossover-n.sh`.
 4. **`cuda-core` on Windows** — apply the prepared patch, confirm on device,
    submit upstream. The report to send is already written
    (`cuda-core-msvc-upstream-report.md`).
 5. **Runner enrolment** — the standing operational task
-   ([hardware-ci.md](hardware-ci.md)).
+   ([hardware-ci.md](../../gpu/hardware-ci.md)).
 
 ## Two traps this tree has already paid for
 
