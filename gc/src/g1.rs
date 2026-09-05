@@ -368,6 +368,43 @@ fn use_parallel_evacuator(enabled: bool, in_jit: bool, allowed_in_jit: bool) -> 
 /// reference slot that is inside the heap's address span but is not an object —
 /// which, before the guard, was a SIGSEGV inside `scan_and_evacuate_refs`.
 /// Reported by `G1Collector::print_gc_summary`.
+/// Young collections G1 drove through the PARALLEL evacuator, and through the
+/// serial one.
+///
+/// # Why this did not exist, and why that made a measurement impossible
+///
+/// `EvacPool` is a persistent worker pool with a careful safety argument, and
+/// `use_parallel_evacuator` decides per pause whether to use it — but nothing
+/// anywhere counted the outcome. G1's `[GC-STAT]` line has no `workers=` field,
+/// `evac_pool.rs` has no census, and the dispatcher recorded nothing. So the
+/// question "does adding GC workers still cost more than it saves" could not be
+/// answered on this backend at all: an A/B over `CRATONVM_GC_PAR_THREADS` cannot
+/// be read without knowing whether the lever engaged, and the nearest-looking
+/// counter (`[GC] par_evac`) belongs to the GENERATIONAL evacuator in
+/// `gen_evac.rs` and reads zero under G1 whatever G1 did.
+///
+/// That is how a zero from an instrument armed where it cannot fire gets
+/// mistaken for a finding, which is exactly what nearly happened here.
+///
+/// Both halves, always: `parallel=0` alone cannot distinguish the flag being
+/// off, the in-JIT term declining every pause, and a run that never collected.
+pub static G1_YOUNG_PARALLEL: AtomicUsize = AtomicUsize::new(0);
+pub static G1_YOUNG_SERIAL: AtomicUsize = AtomicUsize::new(0);
+/// Workers the most recent parallel young collection actually asked for.
+///
+/// The count is an ergonomic over `CRATONVM_GC_PAR_THREADS` and the machine,
+/// not the flag value, so reporting the flag would not say what ran.
+pub static G1_EVAC_WORKERS_LAST: AtomicUsize = AtomicUsize::new(0);
+
+/// `(parallel_cycles, serial_cycles, workers_last)` for G1 young evacuation.
+pub fn g1_young_evac_counts() -> (usize, usize, usize) {
+    (
+        G1_YOUNG_PARALLEL.load(Ordering::Relaxed),
+        G1_YOUNG_SERIAL.load(Ordering::Relaxed),
+        G1_EVAC_WORKERS_LAST.load(Ordering::Relaxed),
+    )
+}
+
 pub static EVAC_REF_REJECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`EVAC_REF_REJECTED`].
@@ -4199,6 +4236,24 @@ impl G1Collector {
             arena_base + arena.committed_len(),
         );
 
+        // The capability-free geometry table -- see `heap_geometry`. This is
+        // the one table in the family G1 fills WITHOUT a caveat, because it
+        // grants nothing: `JIT_REGION_BOUNDS` must stay empty here (defect G1-2,
+        // inline reference stores), `JIT_READ_BOUNDS` is bounded by the commit
+        // (a raw load must not reach an unmapped page) and `MOVABLE_BOUNDS`
+        // likewise. None of that constrains "where did this heap reserve its
+        // address space", which is the only thing this one says.
+        //
+        // The RESERVATION, not the committed prefix, and that is the difference
+        // from the two publishes above. A narrow-oop window has to cover every
+        // address the heap can ever produce; deriving it from a prefix that
+        // grows would invalidate every reference already encoded against it.
+        crate::heap_geometry::publish_heap_span(
+            0,
+            arena_base,
+            arena_base + arena.reserved_len(),
+        );
+
         // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
         //
         // A SEPARATE table from `JIT_REGION_BOUNDS`, whose emptiness under G1
@@ -5888,8 +5943,11 @@ impl G1Collector {
             crate::gc_quiescence::is_active(),
             gc_flags().g1_parallel_evac_in_jit,
         ) {
+            G1_YOUNG_PARALLEL.fetch_add(1, Ordering::Relaxed);
+            G1_EVAC_WORKERS_LAST.store(self.parallel_worker_count(), Ordering::Relaxed);
             return self.young_collection_parallel(roots, monitors);
         }
+        G1_YOUNG_SERIAL.fetch_add(1, Ordering::Relaxed);
         self.young_collection_serial(roots, monitors)
     }
 
@@ -14436,6 +14494,15 @@ impl G1Collector {
             "[GC] g1 non_object_roots_skipped={}",
             non_object_roots_skipped(),
         );
+        // Which evacuator actually ran. See `G1_YOUNG_PARALLEL`: without this
+        // pair, an A/B over `CRATONVM_GC_PAR_THREADS` measures an unknown, and
+        // the nearest-looking counter belongs to a different collector.
+        {
+            let (par, ser, workers) = g1_young_evac_counts();
+            eprintln!(
+                "[GC] g1 young evacuation: parallel={par} serial={ser} workers_last={workers}"
+            );
+        }
         eprintln!(
             "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
             evacuation_implausible_class0_copies(),

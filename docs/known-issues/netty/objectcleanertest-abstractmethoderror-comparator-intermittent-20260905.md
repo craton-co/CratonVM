@@ -1,84 +1,240 @@
-# ObjectCleanerTest: an intermittent AbstractMethodError on Comparator.compare, not reproduced live
+# `ObjectCleanerTest`: a live lambda is reclaimed by the young sweep — deterministic under G1 and Generational, never under ZGC
 
 ## Status
 
-**OPEN, unreproduced.** Observed once, in a full 733-class Netty suite run
-under host contention (9 concurrent CratonVM processes: 3 GC arms x 3
-internal shards). Did not reproduce in 16 follow-up isolated/concurrent
-attempts. Recorded as a real but rare, load-sensitive symptom rather than a
-pinned defect.
+**OPEN, and no longer intermittent.** The 2026-09-04 revision of this page
+recorded the symptom as "observed once, in a full 733-class run under 9-way
+contention; not reproduced in 16 follow-up attempts", and hypothesised a
+conservative-scan false positive (Family-A / G30). Both halves of that were
+wrong:
 
-## What was observed
+* it is not rare — it reproduces **5/5 under `-XX:+UseGenerationalGC` and 5/5
+  under `-XX:+UseG1GC`** on a quiet Windows box, in about three seconds a run;
+* the 16 clean follow-ups were all on the **default collector**, which is ZGC —
+  **0/5**. That is the entire reason it read as unreproducible. Same lesson as
+  `a-per-collector-sweep-finds-bugs-the-default-cannot-reach`.
 
-`io.netty.util.internal.ObjectCleanerTest`, one shard of a Generational-GC
-full-suite run (2026-09-04):
+It is **not** a JIT defect (`--nojit` reproduces 4/5) and it is **pre-existing
+on `dev`** (4/4 on a `dev`-tip binary built by another session).
 
-```
-@@RESULT io.netty.util.internal.ObjectCleanerTest found=3 started=3 ok=1 failed=2 aborted=0 skipped=0 ms=1109
-```
-
-2 of the class's 3 test methods (`testCleanup`, `testCleanupContinuesDespiteThrowing`,
-`testCleanerThreadIsDaemon`) failed with:
-
-```
-java.lang.AbstractMethodError: method java/util/Comparator.compare(Ljava/lang/Object;Ljava/lang/Object;)I has no Code attribute
-```
-
-## Why this doesn't look like a real Comparator call
-
-`common/src/test/java/io/netty/util/internal/ObjectCleanerTest.java` has **no
-`Comparator` usage anywhere in its source** — no sorting, no `PriorityQueue`,
-no explicit `compare()` call. The three test methods only: spawn a thread,
-register an `ObjectCleaner` callback, join, and poll `System.gc()` until the
-callback fires; and (`testCleanerThreadIsDaemon`) call
-`Thread.getAllStackTraces()` and check `isDaemon()`.
-
-The error text — "has no Code attribute" on an interface method — matches
-this project's documented conservative-root-scan false-positive family
-(Family-A / G30, see `G30-1-the-silent-reference-slot-coercion-20260817.md`
-and the `is_object_address` "Family-A fix" comment in
-`gc/src/gen_heap.rs`): a conservative scan lands on interior bytes that
-happen to decode as a plausible-looking object header, gets treated as a
-real object, and a method dispatch against its (fake) class lands on an
-abstract/interface method slot that was never meant to be invoked directly.
-`Comparator` is exactly the shape this would produce — a functional
-interface with no concrete implementation body reachable from a
-mis-identified receiver.
-
-This is a hypothesis based on the error's shape and this project's own
-prior-documented defect family, **not confirmed** — no receiver, class, or
-call site was captured for this specific occurrence.
-
-## Reproduction attempts — all clean
-
-16 attempts total, none reproduced:
-
-- 6x isolated (`--Xmx 1g`, no other process running)
-- 4x isolated with a small heap (`--Xmx 64m`, to increase GC frequency/pressure)
-- 6x concurrent (9 simultaneous instances on one host, mimicking the original
-  full-suite contention)
-
-All 16 completed `found=3 ok=3 failed=0` in 660-1350ms.
-
-## What would be needed to pin this down
-
-- Catch a live occurrence and dump the receiver's raw header bytes /
-  `CRATONVM_DBG_LAYOUT=1` output to identify what class the misdecoded
-  object actually belongs to and which caller triggered the scan.
-- Since it did not reproduce under either isolated OR concurrent conditions
-  matching the original run, the trigger may be a specific GC-cycle timing
-  window (e.g. a scan landing mid-collection) rather than raw host load —
-  worth trying with `CRATONVM_DBG_COERCION=1` armed across a large batch of
-  runs to catch one live, per this project's own `[inv=0 lies]` /
-  `[noise floor 1st]` conventions: measure the actual flake rate over many
-  more runs before spending further effort explaining a single occurrence.
-
-## Repro
+## Reproducing
 
 ```bash
 cd apps/netty-suite-runner
-CV_BIN=<binary> JDK=<jdk25 home> ./run-netty-suite.sh \
-  --list <(echo io.netty.util.internal.ObjectCleanerTest) --shards 1 --out /tmp/repro
-# Has not reproduced in isolation; the one known occurrence was under a
-# 733-class, 9-concurrent-process full-suite run (3 GC arms x 3 shards).
+CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_DBG_NOCODE=1 CRATONVM_DBG_SWEEP_ZERO=1 \
+  <cratonvm> --java-home <jdk25> --Xmx 1g -XX:+UseGenerationalGC \
+  @common.args -Dcraton.batch=1 CratonRunner io.netty.util.internal.ObjectCleanerTest
 ```
+
+`rc=1`, `ok=1 failed=2`, and the two diagnostics above print the whole story
+with no further work.
+
+| arm | non-clean runs |
+|---|---|
+| `-XX:+UseGenerationalGC` | **5/5** |
+| `-XX:+UseG1GC` | **5/5** |
+| `-XX:+UseG1GC --nojit` | **4/5** |
+| default (ZGC) | 0/5 |
+| `-XX:+UseZGC` | 0/5 |
+
+Heap size is irrelevant: 2/3 at `--Xmx 256m`, 3/3 at each of 512m, 1g, 2g, 4g.
+
+## What is actually happening
+
+`CRATONVM_DBG_SWEEP_ZERO=1` names the victim at the moment of use:
+
+```
+[sweep-zero] RECLAIMED-LIVE receiver ptr=0x2430055bff0:
+    original class=class_id=2147483768 (kind=0x00),
+    zeroed by non-moving sweep cycle 0; invoked as java/util/Comparator.compare
+[sweep-zero]     at java/util/Collections$ReverseComparator2.compare
+[sweep-zero]     at org/junit/platform/engine/support/store/NamespacedHierarchicalStore.close
+[sweep-zero]     at org/junit/jupiter/engine/descriptor/AbstractExtensionContext.close
+[sweep-zero]     at org/junit/jupiter/engine/descriptor/TestMethodTestDescriptor.cleanUp
+```
+
+* `class_id=2147483768` is `0x80000078`; the high bit marks a **lambda proxy**
+  class.
+* The holder is `java.util.Collections$ReverseComparator2`, whose only field is
+  `final Comparator<T> cmp` and whose `compare` is `return cmp.compare(t2, t1)`.
+* That object is JUnit's
+  `NamespacedHierarchicalStore$EvaluatedValue.REVERSE_INSERT_ORDER`, a
+  `private static final Comparator` built in `<clinit>` as
+  `Comparator.comparing(EvaluatedValue::getOrder).reversed()` — confirmed with
+  `javap -p -c` on `junit-platform-engine-1.14.3.jar`.
+
+So **the holder survives, its `cmp` field survives, and the lambda that field
+points at has been freed and zeroed.** The next `compare` dispatches on an
+all-zero header, `class_id` reads 0, and the interpreter resolves the abstract
+interface declaration:
+
+```
+java.lang.AbstractMethodError: method java/util/Comparator.compare(Ljava/lang/Object;Ljava/lang/Object;)I has no Code attribute
+	at java.util.Collections$ReverseComparator2.compare(Collections.java:5756)
+	at org.junit.platform.engine.support.store.NamespacedHierarchicalStore.close(...:136)
+```
+
+That is exactly the message the earlier revision reported. It was right that no
+`Comparator` appears in the test's own source — the comparator belongs to
+**JUnit's extension-context store**, which this test reaches only because
+`@Timeout(5000)` puts a value in that store for each of its three methods.
+
+**The same run produces two more faces of the one defect**, which is why the
+class reports `found=3 started=2` — the engine dies mid-class:
+
+```
+[DBG_NOCODE] MutableExtensionRegistry$Entry.getExtension()Ljava/util/Optional; has no Code attribute
+             | recv_cid=0 recv_class=java/lang/Object recv_kind=Object recv_is_declaring=false
+NoSuchMethodError  method="java/lang/Object.getTestInstanceLifecycle()Ljava/util/Optional;"
+[DBG_NOCODE] java/util/function/Predicate.test(Ljava/lang/Object;)Z has no Code attribute
+```
+
+`recv_cid=0` with `recv_kind=Object` is the signature: a heap cell whose class
+stamp is gone — not an array, not an unstamped synthetic. The interpreter's own
+tripwire agrees: `Stale pointer detected in invokevirtual receiver (…, all-zero
+header)`.
+
+## The collector's own verdict
+
+`CRATONVM_DBG_SWEEP_EDGES=1` classifies the cycle, and the answer is stable:
+
+```
+[sweep-edges] SUMMARY marked=22458 unmarked=13492
+              | edges: root=11 young-survivor=0 old-gen=0
+              => REACHABLE NODE WILL BE SWEPT — case (b) marking/seeding bug
+```
+
+`root=11` appears in **10 of 10** failing runs and `root=0` in the single run
+that passed under that flag — the tightest correlation measured here. Each of
+the 11 is a root the marker was handed and did not retain:
+
+```
+[sweep-edges] (1) ROOT @0x2675361dc08 -> UNMARKED young obj
+              (class_id=1745 kind=0x00 num_slots=3 array_len=0)
+              — mark filter rejected a live root?
+```
+
+The corruption is confined to the **first** young collection: `cycle=0` carries
+every symptom, `cycle=1` is clean.
+
+**Do not over-read `root=11`.** The `CRATONVM_GC_LATE_RESOLVE_DROPPED` arm below
+shows those candidates resolve to no object base at all, so they are ordinary
+conservative false positives pointing at gap space — which the collector's own
+contract says can only over-retain. The `(1) ROOT -> UNMARKED` line resolves a
+root through a PARTIAL oracle and calls anything it cannot cover a live root, so
+"case (b) marking/seeding bug" is the diagnostic's inference, not a measurement.
+The correlation with failure (10/10 vs the one passing run's 0) is real and
+unexplained, but it is not yet evidence that these eleven are the victims.
+
+## Hypotheses tested and REFUTED
+
+Each was a plausible mechanism; each is now excluded by measurement, so the next
+session need not re-run them.
+
+| hypothesis | how it was tested | result |
+|---|---|---|
+| conservative-scan false positive (this page's original guess) | `recv_kind` / `recv_cid` from `CRATONVM_DBG_NOCODE` | **refuted** — `recv_cid=0`, not a plausible-looking fake header |
+| a JIT defect | `--nojit` | **refuted** — 4/5 |
+| young **relocation** (the `DoHead` Generational family, `CRATONVM_NO_MOVING_YOUNG=1`) | 6-rep arms, both collectors | **refuted** — 5/6 and 6/6 with the lever on |
+| an object-grid **desync** (`arena already corrupt before this sweep`) | 10 runs, desync vs failure | **refuted** — desync in 1 of 10 failing runs |
+| an old→young **card / remembered-set** miss | `CRATONVM_DBG_RSET_AUDIT=1`, which walks every old object and checks every old→young edge against the card bitmap | **not applicable, and read the zero carefully** — the audit prints only when it finds edges, and it printed nothing, i.e. `edges == 0`. That is a VACUOUS "no misses": there were no old→young edges at all in this collection. What it does establish is that the holder is not an old-gen object, because at cycle 0 old gen holds no reference into young |
+| a **live heap object** still pointing at the victim | whole-heap inverted holder scan (below) | **refuted** — 0 references, young and old |
+| a **root** pointing into a freed span | the unconditional `ROOT_IN_DEAD_SPANS` guard, and `CRATONVM_DBG_SWEEP_LIVENESS=1` | **refuted** — neither ever fires |
+| a CratonVM **native** holding the lambda in a Rust local across a GC (the Family-1 stale-`ObjectRef` shape) | `--dump-native-registry` | **refuted** — `java/util/Comparator` has **no** registrations in this build, and `Collections.reverseOrder` none either; the whole path is real bytecode |
+| the anchor oracle **dropping a live root** as free/gap space inside a "proved" span (`mark_young`'s `oracle_dropped` arm — the one decline with no second chance, unlike `oracle_unresolved`) | a new default-off arm, `CRATONVM_GC_LATE_RESOLVE_DROPPED=1`, that runs the dropped candidates through the SAME grid resolver the unresolved ones get and marks whatever resolves | **refuted** — `LATE_RESOLVE_DROPPED_RECOVERED` stays 0 and the arm is 5/5 bad, i.e. every dropped candidate really is gap space and the oracle's proofs hold. The arm is kept: it is over-retention-only, it costs nothing when the proofs are right, and it is the cheapest way for the next session to re-ask this question |
+| any single G1 / Generational tuning lever | 14-arm sweep: `PARALLEL_EVAC`, `PARALLEL_MARK`, `FULL_RSET_SCAN`, `SCRUB_FREE`, `INLINE_BARRIER`, `NARROW_FIXUP`, `EDEN_STRIPES`, `SHARED_ALLOC`, `WORKERS=1`, `LATE_HEADER_WRITE`, `PAR_THREADS=1`, `NO_LIVE_REGION_MEMO`, `PRECISE_ONLY_ROOTS`, `SYNC_YOUNG_WIPE` | **refuted** — none takes the arm to 0 |
+
+Minimal Java reproductions of the *shape* also do **not** reproduce, and that is
+itself a datum — the trigger needs more than this object graph. All clean on
+both affected collectors:
+
+* a `private static final Comparator.comparing(fn).reversed()` used across
+  `System.gc()` — 200 rounds;
+* the same driven by allocation-forced young collections instead of
+  `System.gc()` — 40 rounds;
+* the same used from four `ForkJoinPool` workers while another thread forces GC
+  and short-lived threads die;
+* the same with the `<clinit>` forced onto a worker thread and made to allocate
+  ~48 MB *between* `comparing(...)` and `reverseOrder(...)`, so a young
+  collection lands while the lambda is only on that frame's operand stack;
+* netty's own `ObjectCleanerTest.testCleanup` re-implemented in the default
+  package, with and without `@Timeout`.
+
+## What remains, and the instruments for it
+
+Everything the collector can be asked from outside says the victim was
+unreachable at mark time: no heap holder (young walked as objects, old walked as
+objects), no root, no old→young edge, no native local, and no dropped-candidate
+proof that turns out to be wrong. The heap-side space is exhausted.
+
+What is left is the one root source none of these instruments can see the inside
+of: a **Java frame** — an operand-stack or local slot on some thread — holding
+the lambda between `Comparator.comparing(fn)` producing it and
+`Collections.reverseOrder(cmp)` storing it. The victim is reclaimed in the FIRST
+young collection, which is when JUnit is still loading and initialising classes,
+so `<clinit>` frames are exactly what is on the stacks. Four probes that
+reproduce that shape deliberately (including one that forces the `<clinit>` onto
+a worker thread and allocates 48 MB inside it, between the two halves) are all
+clean, so it is not the shape alone — something about the real frame, thread, or
+class-init state matters.
+
+The next instrument should therefore be on the ROOT-GATHERING side rather than
+the sweep side. Two things are already known about it, and both are traps that
+cost time here:
+
+* **`CRATONVM_DBG_MTROOTS=1` runs, and the thread census is COMPLETE.** With it
+  armed the failing collection reports
+  `GC reason=1 initiator_tid=0 alive=3 blocked=2 frames=72` and
+  `thread-census (3 alive, 2 in_blocked): t0R(177) t2B(9) t1B(17)` — every
+  thread accounted for, the initiator running and the other two parked at the
+  barrier. So "a thread the STW scan never enumerated" is **not** the
+  explanation. It also confirms the collection is a `System.gc()` (reason 1)
+  raised from the test's own loop.
+* **A `[sweep-zero]` record reading `gc reason=unknown initiator_tid=0
+  blocked_threads=0` means only that `CRATONVM_DBG_MTROOTS` was OFF.**
+  `mtroots_set_gc_ctx` is the sole publisher of that context and it is gated on
+  that flag. It is not evidence of a collection taking an unusual path — an
+  earlier revision of this page read it that way.
+* **`CRATONVM_DBG_MARK_WHY_CLASS=<name>` watches the class's LOADER address,
+  not instances of the class** (it is armed in `add_mirror_pin`). Pointing it at
+  `java/util/Collections$ReverseComparator2` to ask "why was this comparator
+  marked" prints nothing and means nothing; it answers a loader-reachability
+  question instead.
+
+So the open question is narrower than "which root source": every thread was
+scanned, and the object is reachable from a `private static final` field of a
+loaded class. What has NOT been checked is whether that STATIC is in the root
+set for this collection, and whether the BFS out of it reaches the
+`ReverseComparator2`'s single `cmp` slot. A per-collection root census that
+names the static-field channel — comparable to G1's
+`CRATONVM_G1_DBG_ROOTCENSUS`, which the Generational path has no equivalent of
+— is the missing instrument.
+
+Two diagnostics were sharpened while chasing this and are now permanent (both
+opt-in, both in `gc/src/gen_heap.rs`):
+
+* **`CRATONVM_DBG_SWEEP_CENSUS=1` now runs an INVERTED holder scan.** The
+  pre-existing per-victim scan is `O(victims x heap)` and so is bounded to six
+  victims — on a 20,000-object cycle that is a 0.03% sample, and the wrong one
+  (the six lowest addresses). The new pass builds the dead spans once, walks
+  young from-space **as objects** and old gen once, and reports only victims
+  that DO have a holder, naming the holder's class and slot offset, with a
+  per-cycle total where `0` is the only clean answer. Walking objects rather
+  than raw words is load-bearing: a flat word scan over the same arena reported
+  **240 phantom "live holders"** that were words in free/gap space; the object
+  walk reports 0.
+* **`CRATONVM_DBG_SWEEP_EDGES=1`'s desync report now names the culprit.** A walk
+  desyncs at the object AFTER the one whose recorded size was wrong, so the
+  offset it printed was always the victim's, never the culprit's. It now prints
+  the offending header's `class_id`/kind/`num_slots`/`array_length`/
+  `element_type`/`gc_flags` and a hex window, plus the PREVIOUS object's
+  identity and size.
+
+## Not to be confused with
+
+The `AbstractMethodError` text is shared with the `Comparator$Native` cluster in
+`native-collections` (see the block comment above its registrations, which
+records the Groovy/ANTLR4 `ParserATNSimulator.STATE_ALT_SORT_COMPARATOR` case).
+That cluster is **not** registered in this build — `--dump-native-registry`
+shows zero `java/util/Comparator` rows — so the two are unrelated here despite
+the identical message.

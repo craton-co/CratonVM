@@ -2590,6 +2590,87 @@ censuses say what a single kernel cannot: the sink fires on 1 optimizing compile
 in 112 across the regression suite. Defaulting these on wants a measurement on a
 real workload, and that is the next thing this file should record.
 
+#### Turning them on, and the two bugs that only appeared when they met
+
+Thirteen switches, every one of them measured on `OsrTierBench.kernel` and
+every one of them shipping OFF:
+
+| switch | what it does |
+|---|---|
+| `CRATONVM_JIT_OSR_OPTIMIZING` | the OSR door reaches the optimizing tier |
+| `CRATONVM_JIT_IR_OSR_ENTRY` | the entry stubs that door needs |
+| `CRATONVM_JIT_IR_DEOPT_REGS` | the register image a deopt frame reads |
+| `CRATONVM_JIT_IR_PHI_COPY_REGS` | edge copies through registers |
+| `CRATONVM_JIT_IR_SKIP_REPUBLISH` | no reload of a live register |
+| `CRATONVM_JIT_IR_PUBLISH_AT_DEF` | publish from RAX at the store |
+| `CRATONVM_JIT_IR_DROP_PHI_HOME` | a phi with no home word |
+| `CRATONVM_JIT_IR_DROP_HOME` | the same for ordinary values |
+| `CRATONVM_JIT_IR_RESERVE_CARRIED` | a register each for the carried set |
+| `CRATONVM_JIT_LS_CARRY_RELIEF` | price a carried value's eviction (0 → 64) |
+| `CRATONVM_JIT_IR_CARRY_SINGLE_USE` | one-instruction live ranges stay in a register |
+| `CRATONVM_JIT_IR_SINK_LATE` | pure work out of loops it is not used in |
+| `CRATONVM_JIT_IR_ALU_IMM` | constant operands folded into the ALU op |
+
+All thirteen are now ON, each keeping `=0` as its kill switch. The three that
+were tested with `runtime_var_os(..).is_some()` now read the VALUE, because
+presence alone cannot express an off word.
+
+**Flipping them found two bugs that no arrangement of them one at a time
+could.** Both were caught by `cargo test -p cratonvm-jit`, and neither was a
+stale expectation:
+
+* **A carried value and a dropped home refused each other.**
+  `lower_data_node_tracked` bailed on any value whose home was dropped and
+  whose lowering published no register — and a carried value never publishes
+  one, because being left in RAX or RCX for its single consumer *is* the
+  contract. The probe this was all built on could not reach it: every
+  intermediate there is named by a frame state, so no carried value's home was
+  ever dropped and the two mechanisms never met. Two hand-built lowering tests
+  with no safepoints at all did meet them, and failed **closed** —
+  `n5's home was dropped but its lowering published no register` — rather than
+  emitting anything wrong.
+* **The level-2 machine list drifted from the arms it is measured against.**
+  `mir_emitted_bytes` already forced residency off for *both* arms of its
+  comparison, with the reason written down: a comparison that left it on for
+  one arm would measure residency rather than the selector. The carry and the
+  folded immediates are two more of exactly that. They also now refuse under a
+  MIR mode outright, and not merely for the lane's convenience — in
+  `MirMode::Emit` a tiled node is emitted by the SELECTOR and its arm never
+  runs, so a mix is genuinely broken rather than different: an arm could start
+  a carry its tiled consumer never reads, or fold an immediate the tiler then
+  re-materialises.
+
+Two tests also had to stop asserting a default and start asserting a property.
+`the_osr_entry_kill_switch_emits_no_stub` and the deopt-region test now reach
+for a force-off, because **a default-on codegen change is only as good as its
+way back**, and the way back is the thing worth pinning.
+
+**Engagement, with nothing set at all** — this is the census on a plain run,
+which is what "default on" has to mean:
+
+```text
+osr optimizing OsrTierBench.kernel pc=7: stub=true entries=[7] sentinel_free=true
+[ir-ls] resident=5 (fp=0 gp=5) scan_promoted=20 peak_live=13
+[ir-ls] carries: planned=4 taken=4 read=4 refused=0 stores_dropped=0 still_deopt_named=4
+[ir-ls] homes: dropped_values=4 stores_skipped=7 read_refusals=0 def_publishes=1
+[ir-ls] alu immediates folded: 5
+[ir-sink] moved=3 reverted_for_safepoints=0
+```
+
+**Verified.** `cargo test -p cratonvm-jit` and `-p cratonvm-vm` in debug, so
+`debug_assert` is live. The regression suite **90/90 with the new defaults and
+90/90 with every kill switch set** — both directions, because a switch nobody
+exercises is not a switch. `AluImmProbe` and `OsrTierBench` agree with HotSpot
+under the defaults, under every kill switch, and under `--nojit`.
+
+**What is still owed, and it has not changed.** Every number in this section
+comes from one six-line kernel. The engagement censuses say what that kernel
+cannot: the sink fires on **1 optimizing compile in 112** across the regression
+suite. These are on now because they are correct, reversible and free where
+they do not fire — not because a real workload has been measured. That
+measurement is the next thing this file should record, and until it does, the
+right reading of the parity result is "on this kernel", not "in general".
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

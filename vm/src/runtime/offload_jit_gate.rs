@@ -357,9 +357,9 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         // dispatcher this gate exists to serve -- calls
         // `analyze_with_pool`, which admits a numeric literal (AUDIT
         // C31). So the two disagreed, silently, about any kernel
-        // containing a float or double constant.
+        // containing a constant-pool constant.
         //
-        // `bench-gpu/GpuFloatDivChain.divChain` is that kernel: its
+        // `bench-gpu/GpuFloatDivChain.divChain` is one such kernel: its
         // `x = x / d + 1.0000001` is an `ldc2_w`, so the gate saw
         // INELIGIBLE while the interpreter saw `Eligible` and offloaded.
         // Its int twin's `+ 12345` is a `sipush` with no pool entry, so
@@ -368,17 +368,62 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         // (which keeps the caller interpreted, where the CP-aware verdict
         // is the one that runs).
         //
+        // NOT an FP-only disagreement, though both symptoms that found it
+        // were. The boundary is the CONSTANT POOL, not the type: an
+        // `int[]` kernel whose constant is above `sipush` range needs an
+        // `ldc` and went dark too, while a `long[]` kernel using only
+        // `lconst_1` never touched the pool and offloaded normally. Both
+        // measured on `test_classes/gpu/GpuLdcSplit.java`, which exists
+        // to break that correlation -- the same defect was independently
+        // scoped as "the compiled caller drops long[] and double[]",
+        // because a `long`/`double` literal has no small-immediate form
+        // and so always trips it. See
+        // docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md.
+        //
         // The disagreement was always wrong, and it became load-bearing
         // when this scan started ARMING the compiled-tier hook rather
         // than merely blocking: a target the gate cannot see is one the
         // compiler binds directly, and the hook is then lost for the life
         // of the process.
-        let jit_cuda::OffloadVerdict::Eligible(sig) = jit_cuda::analyzer::analyze_with_pool(
+        let sig = match jit_cuda::analyzer::analyze_with_pool(
             target_method,
             &target_class.constant_pool,
-        )
-        else {
-            continue;
+        ) {
+            jit_cuda::OffloadVerdict::Eligible(sig) => sig,
+            // Counted, and named. This refusal used to be a bare
+            // `continue`: the two counters below it exist because a
+            // narrowing that shows up only as an ABSENCE cannot be told
+            // from one that never fired, and this one had no counter at
+            // all. That is how the pool-free `analyze` above went
+            // unnoticed -- a run whose kernels had all silently stopped
+            // registering printed a census identical to a healthy one.
+            jit_cuda::OffloadVerdict::Rejected(reason) => {
+                // Split, because a census that folds "never a candidate"
+                // into "refused" is one nobody reads: one run of
+                // `GpuIntensitySweep` walks past ~154 signature-refused
+                // JDK targets, and naming those would bury the handful
+                // that matter.
+                use jit_cuda::analyzer::Reason;
+                let never_a_candidate = matches!(
+                    reason,
+                    Reason::NonStatic
+                        | Reason::Synchronized
+                        | Reason::NativeOrAbstract
+                        | Reason::NoCode
+                        | Reason::BadDescriptor
+                        | Reason::UnsupportedParamType
+                        | Reason::UnsupportedReturnType
+                        | Reason::GpuExcluded
+                );
+                if never_a_candidate {
+                    cratonvm_types::gpu_jit_gate_census::note_target_never_candidate();
+                } else {
+                    cratonvm_types::gpu_jit_gate_census::note_target_body_refused(format!(
+                        "{target_class_name}.{target_method_name}{target_descriptor} — {reason:?}"
+                    ));
+                }
+                continue;
+            }
         };
 
         // ...and then the DISPATCHER's own gates. `Eligible` answers

@@ -3418,8 +3418,8 @@ pub(super) fn route_osr_exception_out_of_artifact(
     }
 }
 
-/// Let the OSR door reach the OPTIMIZING tier -- **default OFF**, opt in with
-/// `CRATONVM_JIT_OSR_OPTIMIZING=1`.
+/// Let the OSR door reach the OPTIMIZING tier -- **default ON** since
+/// 2026-09-05; `CRATONVM_JIT_OSR_OPTIMIZING=0` is the kill switch.
 ///
 /// This door has always reached `x64::compile_with_param_slots` directly, so a
 /// method whose only route to compiled code is a back edge -- one big method
@@ -3432,7 +3432,13 @@ fn osr_optimizing_tier_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_OPTIMIZING").is_some()
+        // 2026-09-05: DEFAULT ON. `=0` is the kill switch — which is why
+        // this reads the VALUE now rather than only asking whether the
+        // variable is present.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -5502,6 +5508,7 @@ pub(super) fn compile_optimizing_artifact(
             // in `invoke::invokevirtual_site_final_owner` — so these three
             // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
+                shared,
                 &cm,
                 class_id,
                 target_class,
@@ -6049,6 +6056,7 @@ pub(super) fn compile_optimizing_artifact(
                 // in `invoke::invokevirtual_site_final_owner` — so these three
                 // per-door copies cannot drift apart on either.
                 return super::invoke::invokevirtual_site_final_owner(
+                    shared,
                     &cm,
                     callee_cid,
                     target_class,
@@ -7765,6 +7773,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // in `invoke::invokevirtual_site_final_owner` — so these three
             // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
+                shared,
                 &cm,
                 cid,
                 target_class,

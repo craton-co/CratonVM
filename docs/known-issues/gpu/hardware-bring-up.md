@@ -10,11 +10,11 @@ step 5, not step 1 — the value is in the first run, not in the automation.
 
 **First full run: 2026-09-05**, RTX 2060 (sm_75), CUDA 13.3, driver 610.88,
 Windows 11, JDK 25.0.3, `cratonvm-cli --features gpu-driver` at `b82da0607`.
-Steps 1-4 all executed. Results are recorded inline below, and the two
-things that run found are
-[the concurrent-dispatch wrong answer](concurrent-dispatch-wrong-answer-20260905.md)
-and a gate that had been switched off for two months on a stale premise
-(step 3, gate e). Enrolment (step 5) is still not done.
+Steps 1-4 all executed. Results are recorded inline below. That run found
+two things: [a concurrent-dispatch wrong answer](concurrent-dispatch-wrong-answer-20260905.md)
+(two races, both fixed the same day) and a gate that had been switched off
+for two months on a stale premise (step 3, gate e).
+Enrolment (step 5) is still not done.
 
 ## 0. What you need
 
@@ -220,24 +220,26 @@ same `CV`/`JDK`/`TG`:
 
 | script | what it covers | 2026-09-05 |
 |---|---|---|
-| `bench-gpu/runtime-stress.sh` | concurrent dispatch, residency coherence, read-only inputs, aliasing, repeat submit, deopt-then-continue, bulk writes | **FAILED — see below** |
+| `bench-gpu/runtime-stress.sh` | concurrent dispatch, residency coherence, read-only inputs, aliasing, repeat submit, deopt-then-continue, bulk writes | **FAILED — two races, both fixed; see below** |
 | `bench-gpu/marshal-stress.sh` | all six element types × zero-copy and staged transfer, with a per-kernel engagement census | PASS (all six offloaded) |
 | `bench-gpu/residency-gc.sh` | residency cache survives relocation, **once per collector** | PASS on ZGC, G1, Generational; `re-keyed > 0` on each, so non-vacuous |
 | `bench-gpu/jit-writer-stale.sh` | a compiled array writer must not leave the residency cache stale | PASS |
 | `cargo test -p cratonvm-cuda-bridge --features cuda --test concurrent_dispatch_it -- --ignored` | bridge-level concurrency | PASS (2) |
 | `cargo test -p cratonvm-cuda-bridge --features cuda --test stream_ordering_it -- --ignored` | cross-stream ordering against the real driver | PASS (3) |
 
-**`runtime-stress.sh`'s `concurrent` scenario returns a wrong answer about
-10% of the time.** Full write-up, rates, controls and the amplifier that
-takes it to 53%:
+**`runtime-stress.sh`'s `concurrent` scenario returned a wrong answer about
+10% of the time.** Two independent races in `input_cache`, both fixed the
+same day: a lost filter bit in `insert` (12/30 → 0/30), and — visible only
+once that was fixed — a compiled-store drain that cleared its `DIRTY`
+flags before performing the eviction they authorised (12/300 → 0/300).
+Full write-up, including the first diagnosis that was wrong and how it was
+refuted:
 [concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md).
-Note what this means for the ordering advice above: the gate battery was
-fully green while a real correctness defect sat one script away. `ci-gate.sh`
-has no concurrent-dispatch shape at all.
 
-It also means the first enrolled CI run will be **red**, and legitimately
-so. Fix or quarantine that scenario before step 5, or the "red means the
-runner is misconfigured" reasoning this page is built on stops holding.
+Note what this meant for the ordering advice above: the gate battery was
+fully green while a real correctness defect sat one script away.
+`ci-gate.sh` has no concurrent-dispatch shape at all. That is the whole
+argument for step 3b.
 
 ## 4. What you can check WITHOUT the device, to isolate a failure
 
@@ -267,10 +269,13 @@ run has passed at least once, so a red first CI run means "the runner is
 misconfigured" rather than "something in the tree is broken and we don't know
 which".
 
-**Still not done as of 2026-09-05**, and it should stay that way until the
-`concurrent` scenario in step 3b is fixed or quarantined: enrolling now
-would produce a red first run caused by a real tree defect, which is the
-one thing the ordering above exists to prevent.
+**Still not done as of 2026-09-05, and nothing in the tree is now blocking
+it.** The blocker that stood here — a red first run caused by the
+`concurrent` scenario — is gone. Both races behind it are fixed
+([concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md)),
+the scenario is 0/300 with the amplifier and 0/100 on each of the three
+collectors, and the whole battery is green on this box. Enrolment is now
+purely the operational task it was always described as.
 
 ## What is actually waiting on hardware
 
@@ -297,11 +302,14 @@ is the useful part of the estimate.
    `../../../bench-gpu/intensity-sweep.sh` and `../../../bench-gpu/crossover-n.sh`.
    `--gpu-min-work` still defaults to 4096, which those pages show is 3-5x
    too eager at ops=1, so the open part is what replaces it, not what it costs.
-4. **The concurrent-dispatch wrong answer** — new on 2026-09-05, and now the
-   highest-value open item on this list:
+4. ~~**The concurrent-dispatch wrong answer.**~~ **Settled** — two races,
+   both fixed on 2026-09-05:
    [concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md).
-   It has a 53% repro recipe, clean controls, a collector split and a ruled-out
-   shortlist; what it does not have is a diagnosis.
+   Worth reading for the method rather than the bugs: the first diagnosis
+   was wrong and was refuted by cheap switch-flipping before any code was
+   read, and the second race was invisible until the first was fixed. Note
+   the sample sizes the second one needed — at a 4% rate, 300 runs an arm,
+   which is not a "one run says which" item.
 5. **`cuda-core` on Windows** — apply the prepared patch, confirm on device,
    submit upstream. The report to send is already written
    (`cuda-core-msvc-upstream-report.md`). Note `docs/cuda-core-linux-verified-20260905`
@@ -309,7 +317,7 @@ is the useful part of the estimate.
 6. **Runner enrolment** — the standing operational task
    ([hardware-ci.md](../../gpu/hardware-ci.md)). Blocked on item 4: see step 5.
 
-## Four traps this tree has already paid for
+## Six traps this tree has already paid for
 
 * **A no-device box passes a badly-written GPU gate.** Every script here has an
   anti-vacuity assertion for that reason (`registered > 0`, the `^device N:`
@@ -328,6 +336,19 @@ is the useful part of the estimate.
   returned wrong answers 10% of the time. `ci-gate.sh` simply has no
   concurrent-dispatch shape. Before concluding the GPU path is healthy,
   check what the scripts you ran actually cover, not just that they passed.
+* **Fixing one race can uncover another.** The `concurrent` scenario had
+  TWO independent bugs in `input_cache`, and the second was invisible
+  while the first was firing at ten times its rate. After landing a fix
+  for an intermittent defect, re-measure at the sample size the *new* rate
+  demands rather than the old one — 0/30 looked like "fixed" when the
+  truth was 4% left.
+* **A racy defect walks through a single-shot gate.** `runtime-stress.sh`
+  ran each scenario once, so a 10% race passed it nine times in ten; the
+  defect above surfaced only because the first run of the day was an
+  unlucky one. Demonstrated after the fact — the pre-fix binary PASSES the
+  single-shot check and fails only the repeat arm added with the fix. If a
+  scenario can race, the gate has to repeat it, and in the configuration
+  that makes it most likely to fail rather than the most comfortable one.
 
 ## Known residual in this page's neighbourhood
 

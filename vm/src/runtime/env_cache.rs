@@ -514,6 +514,50 @@ pub fn jit_final_devirt() -> bool {
     })
 }
 
+/// Screen the `final`-devirtualisation door against the native registry.
+/// Default ON; `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0` restores the
+/// pre-2026-09-05 behaviour, in which a `final` JDK method whose body a
+/// registered native shadows was bound straight to that body in compiled code
+/// while the interpreter kept running the native.
+///
+/// The B arm of an in-binary A/B, and the reason it is a SEPARATE switch from
+/// `CRATONVM_JIT_FINAL_DEVIRT`: turning the whole door off also removes every
+/// devirtualisation the screen would have admitted, so it cannot price the
+/// screen.
+///
+/// **Read the B arm with the sibling fix in mind.** This screen and
+/// `socket_channel::mark_jdk_channel_closed` (plus `native_dc_open`'s field
+/// seeding) were measured to be INDEPENDENTLY sufficient for every face of the
+/// netty defect, so turning only one of them off leaves the other covering it
+/// and the probes read clean. Measured 2026-09-05 on one binary, by reverting
+/// the `native-io` half and rebuilding:
+///
+/// ```text
+///                                          screen ON   screen OFF
+///   ChannelCloseDevirtProbe, datagram         0/4000    3487/4000 (first @512)
+///   ChannelStateAfterCloseCensus, dc.isOpen  0/400000  399999/400000
+/// ```
+///
+/// With BOTH halves in, both arms read zero. That is the shipped state and it
+/// is why a `=0` run is not by itself evidence that this screen does nothing:
+/// the instrument that says what it DID is the engagement counter
+/// [`cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`], and
+/// `CRATONVM_DBG_JITC=1` names each refused site — on the regression fixture
+/// that is exactly `SelectableChannel.isOpen()Z` and `SelectableChannel.close()V`,
+/// both declared on `AbstractInterruptibleChannel`.
+pub fn jit_final_devirt_native_screen() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
 pub fn jit_inline_calls() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

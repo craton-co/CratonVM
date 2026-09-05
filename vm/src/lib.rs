@@ -79,6 +79,14 @@ pub use cratonvm_gc::zgc::report_punned_watch_at_exit;
 /// `--verbose:gc` / `CRATONVM_GC_STATS` and does not depend on `cratonvm-gc`
 /// directly.
 pub use cratonvm_gc::gc_metrics::collector_decision_report;
+/// Bytes the generational young collector has returned to the OS
+/// (`CRATONVM_GEN_UNCOMMIT`). Re-exported for the shutdown census in `vm-cli`,
+/// which does not depend on `cratonvm-gc` directly.
+pub use cratonvm_gc::gen_heap::young_bytes_uncommitted;
+/// `(hits, misses)` for the exact object-start fast path in
+/// `is_object_address` (`CRATONVM_GC_OBJECT_STARTS`). Re-exported for the
+/// shutdown census in `vm-cli`.
+pub use cratonvm_gc::gen_heap::object_start_counts;
 
 // ---------------------------------------------------------------------------
 // T17.E.2 — Windows test-harness teardown shim
