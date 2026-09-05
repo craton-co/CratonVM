@@ -17,6 +17,14 @@
 #   arm B     CRATONVM_JIT_GPU_ARRAY_BARRIER=0     -> array writers blocked
 #   arm C     CRATONVM_GPU_JIT_GATE_DISPATCHABLE=0 -> Math.min callers blocked
 #
+# Arm C toggles the CALLER-blocking half of the gate, so it only says
+# anything while that half is switched on. Since 2026-09-05 the default
+# is `CallerGateMode::CompiledHook`, which turns caller-blocking off
+# outright -- under it arm C blocks nothing, the same as the default, and
+# the comparison is vacuous rather than failing. Both control arms
+# therefore pin `CRATONVM_GPU_JIT_GATE_CALLERS=block`, which is the mode
+# whose breadth this script exists to measure.
+#
 # The assertion is on the CENSUS, not on wall clock: at this fixture's
 # size a desktop timing would be noise, and "which methods were denied
 # compilation" is the fact under test. `GpuJitWriterStale` covers the
@@ -59,15 +67,19 @@ run_arm() {
   grep 'blocked_from_jit' "$TMP/$label.log" | head -1
 }
 
+# The reference arm is `block` too: it is the breadth of the CALLER
+# gate that the two controls vary, and comparing them against a default
+# that has no caller gate at all would credit the narrowings with a
+# difference that mode makes on its own.
 echo "--- default (both narrowings on) ---"
-run_arm default CRATONVM_DUMMY=1
+run_arm default CRATONVM_GPU_JIT_GATE_CALLERS=block
 grep 'gpu jit gate:' "$TMP/default.log" | sed 's/^/  /'
 echo
 echo "--- arm B: CRATONVM_JIT_GPU_ARRAY_BARRIER=0 ---"
-run_arm armB CRATONVM_JIT_GPU_ARRAY_BARRIER=0
+run_arm armB CRATONVM_JIT_GPU_ARRAY_BARRIER=0 CRATONVM_GPU_JIT_GATE_CALLERS=block
 echo
 echo "--- arm C: CRATONVM_GPU_JIT_GATE_DISPATCHABLE=0 ---"
-run_arm armC CRATONVM_GPU_JIT_GATE_DISPATCHABLE=0
+run_arm armC CRATONVM_GPU_JIT_GATE_DISPATCHABLE=0 CRATONVM_GPU_JIT_GATE_CALLERS=block
 echo
 
 blocked() {
