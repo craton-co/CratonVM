@@ -8146,9 +8146,16 @@ pub fn ir_build_bail<T>(site: u32, pc: usize) -> Option<T> {
     //
     // The site/pc pair stays in the debug line above; what the report needs is
     // the method and the category, which is what this adds.
-    attribute_build_bail(crate::bailout::BailoutReason::UnsupportedShape(
-        "IrBuilder::build",
-    ));
+    // The SITE, not just the fact. On a real workload (H2 `TestAlter`) 38 of 50
+    // fall-throughs land here, and with one shared category they were 38
+    // identical rows — "the builder refused", 38 times, naming nothing to fix.
+    // `ir.rs:<line>` is what separates them into the distinct refusals they
+    // actually are, and the line is already the argument this function takes.
+    attribute_build_bail_at(
+        crate::bailout::BailoutReason::UnsupportedShape("IrBuilder::build"),
+        site,
+        pc,
+    );
     None
 }
 
@@ -8158,6 +8165,19 @@ pub fn ir_build_bail<T>(site: u32, pc: usize) -> Option<T> {
 /// counter AND the per-compilation report, the same pair `verify_or_bail` uses.
 fn attribute_build_bail(reason: crate::bailout::BailoutReason) {
     let bailout = crate::bailout::Bailout::new(reason);
+    crate::bailout::record_bailout(&bailout);
+    crate::metrics::note_current_bailout(&bailout, "build");
+}
+
+/// [`attribute_build_bail`] carrying the refusing site.
+///
+/// The category stays one value so the process-wide counters keep their stable
+/// row set; the site rides in the bailout's context, which is what the
+/// per-compilation report prints. That is the difference between "the builder
+/// refused 38 times" and a ranked list of which refusals to go and fix.
+fn attribute_build_bail_at(reason: crate::bailout::BailoutReason, site: u32, pc: usize) {
+    let bailout =
+        crate::bailout::Bailout::with_context(reason, format!("ir.rs:{site} (bytecode pc {pc})"));
     crate::bailout::record_bailout(&bailout);
     crate::metrics::note_current_bailout(&bailout, "build");
 }

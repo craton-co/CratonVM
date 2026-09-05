@@ -37,7 +37,7 @@ CV="${CV:-$ROOT/target-gpu/release/cratonvm.exe}"
 JDK="${JDK:-C:/Program Files/Eclipse Adoptium/jdk-25.0.3.9-hotspot}"
 TG="${TG:-$ROOT/test_classes/gpu}"
 N="${1:-8192}"
-ROUNDS="${2:-2000}"
+ROUNDS="${2:-6000}"
 MINWORK="${MINWORK:-4096}"
 
 if [ ! -f "$TG/GpuJitWriterStale.class" ]; then
@@ -62,6 +62,19 @@ RUST_LOG="cratonvm_vm::runtime::offload=info" CRATONVM_GPU_TRACE_BYTES=1 \
     GpuJitWriterStale "$N" "$ROUNDS" > "$TMP/gpu.out" 2> "$TMP/gpu.log"
 grep '=' "$TMP/gpu.out" | tr -d '\r' > "$TMP/gpu"
 
+# How many times did a COMPILED array store hit a device-resident array?
+#
+# AUDIT 2026-09-04. This arm passed at `ROUNDS=2000` with the barrier
+# firing ZERO times, because `bump*` is called 2000 times for 128
+# iterations each and never gets hot enough to compile. Every store ran
+# interpreted, every interpreted store evicts, and the fixture proved
+# nothing about the compiled tier -- which is the only tier it exists to
+# test. At 6000 rounds all four `bump*` compile and the barrier fires
+# ~5.5k times.
+#
+# So the drain count is checked, not just the checksums: a green run
+# with `drains=0` is a run that tested nothing.
+DRAINS=0
 for f in hs cpu gpu; do
   if [ ! -s "$TMP/$f" ]; then
     echo "FAIL: the '$f' arm produced no output"
@@ -79,9 +92,25 @@ if [ "$host" != "0" ]; then
 fi
 echo "control matches HotSpot"
 
-# Engagement. A run where the kernels never dispatched cannot go stale,
-# so it would pass no matter what the gate did.
+DRAINS=$(grep -o 'compiled-write drains=[0-9]*' "$TMP/gpu.log" | head -1 | cut -d= -f2)
+DRAINS="${DRAINS:-0}"
+RELEASED=$(grep -o 'array-writer-behind-barrier=[0-9]*' "$TMP/gpu.log" | head -1 | cut -d= -f2)
+RELEASED="${RELEASED:-0}"
+
+# Engagement, part 1: did the BARRIER fire? See the note above `DRAINS`.
 echo
+echo "--- engagement census (compiled-tier barrier) ---"
+echo "  array writers admitted behind the barrier: $RELEASED"
+echo "  compiled stores that hit a resident array: $DRAINS"
+if [ "$DRAINS" = "0" ]; then
+  echo "  ZERO -- no compiled store ever hit a cached array, so the"
+  echo "  checksums below cannot distinguish a working barrier from a"
+  echo "  missing one. Raise ROUNDS until the bump* writers compile."
+  FAILS=$((FAILS + 1))
+fi
+echo
+# Engagement, part 2. A run where the kernels never dispatched cannot go
+# stale, so it would pass no matter what the gate or the barrier did.
 echo "--- engagement census (H2D dispatches per kernel) ---"
 for k in scaleI scaleS scaleB; do
   c=$(grep -c "H2D=.*(GpuJitWriterStale\.$k" "$TMP/gpu.log" 2>/dev/null || true)

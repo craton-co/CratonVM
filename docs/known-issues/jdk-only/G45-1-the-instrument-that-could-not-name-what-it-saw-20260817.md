@@ -72,6 +72,44 @@ the three this lane owns. `gc/src/heap.rs` needed **no change at all**; see
 > per-species after-lines are therefore confirmed only in shape. Nothing in
 > §§1-3's MEASURED before-state was re-derived.
 
+> **The remediation-advice residual is FIXED 2026-09-04.** The discharge note
+> above recorded that this record's own warning text — *"Run with
+> `CRATONVM_DBG_LAYOUT=1` to resolve a `class_id` to a name"* — produced nothing:
+> 13,135 lines of output and not one `[layout]` row, so none of the six class ids
+> in that transcript could be resolved.
+>
+> **The cause is a cheap gate standing in front of an informative one.**
+> `ClassRegistry::register_compact_layout_if_enabled` opened with
+>
+> ```rust
+> if !cratonvm_types::compact_ref_fields_enabled() {
+>     return;                      // <- the diagnostic sat past this
+> }
+> ```
+>
+> so with compact reference fields off — the default — `CRATONVM_DBG_LAYOUT=1`
+> printed nothing at all, while **three** separate doc comments told readers to
+> use it for exactly this mapping: `gc/src/autobox.rs`, `gc/src/heap.rs` (this
+> record's own warning), and `types/src/compact_value.rs`. The flag was gated on
+> an unrelated FEATURE, not on what it reports.
+>
+> The class-id-to-name mapping exists in every configuration, so it is now
+> emitted in both: unchanged when compact layouts are on, and as
+> `[layout] <name> cid=<N> (no compact layout: …)` when they are off.
+>
+> **`autobox.rs`'s own comment, two flags earlier, says why this mattered**:
+> that message once advertised `CRATONVM_DBG_TOARRAY=1`, which printed nothing
+> at its site, and *"a diagnostic that names the wrong instrument costs more
+> than no diagnostic, because it is trusted"* — measured by two readers who each
+> followed the advice and got an empty transcript. This was the same failure one
+> flag over, and it was found the same way.
+>
+> **What is NOT fixed.** The four-species coercion counter and its
+> `class_id`/`index` provenance are unchanged — this makes the ids RESOLVABLE,
+> it does not resolve them into the coercion warning itself, so a reader still
+> has to cross-reference two lines of output. The 5,431-event, 63-vector
+> before-state is still not re-measured.
+
 ## 0. The headline
 
 G30 gave this tree a four-species counter for silent field coercions. It

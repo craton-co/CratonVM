@@ -24,10 +24,10 @@ import org.h2.mvstore.MVStore;
  * 11 s and the CratonVM interpreter does not finish in an hour. Every arm that
  * forces interpretation (`--nojit`, `CRATONVM_JIT_DENY=org/h2`) therefore ends
  * as "no failure in T seconds, zero passes", which is not a result: the run may
- * simply be slower than the defect is deep. `known-issues/jit/
- * bug-box-unbox-intrinsic-segv-under-relocation-20260902.md` records exactly
- * that arm being voided, and names the missing progress signal as the thing to
- * build. This is it.
+ * simply be slower than the defect is deep. The box/unbox page (retired as
+ * `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`)
+ * records exactly that arm being voided, and names the missing progress signal
+ * as the thing to build. This is it.
  *
  * The failure is at `seed:0 op:1033`, i.e. inside the FIRST `testOps` call, so
  * one 3000-op loop reproduces the whole of it. Ops per second is printed so a

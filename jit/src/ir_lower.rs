@@ -935,6 +935,12 @@ struct Lowerer<'a> {
     /// How many stores were dropped, and how many `slot_of` reads refused.
     /// A non-zero refusal count names work: the reader wants converting to
     /// `gp_load_value`. `Cell` because `slot_of` takes `&self`.
+    /// `(bci, offset of its entry stub)` for every bci this body can be
+    /// entered at. Empty unless [`ir_osr_entry_enabled`].
+    osr_entries: Vec<(u32, u32, u32)>,
+    /// Why a bci did not get one. A per-CAUSE census, because the four causes
+    /// call for four different next steps and a bare count cannot be acted on.
+    osr_refusals: Vec<(&'static str, usize)>,
     home_stores_dropped: usize,
     home_read_refusals: std::cell::Cell<usize>,
     /// How many frame-state slots were described by a register. Engagement, and
@@ -1406,6 +1412,8 @@ impl<'a> Lowerer<'a> {
             deopt_nameable: Vec::new(),
             deopt_reg_named: std::cell::Cell::new(0),
             home_dropped: Vec::new(),
+            osr_entries: Vec::new(),
+            osr_refusals: Vec::new(),
             home_stores_dropped: 0,
             home_read_refusals: std::cell::Cell::new(0),
             use_count: Vec::new(),
@@ -7140,6 +7148,9 @@ impl<'a> Lowerer<'a> {
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
                     self.emit_array_null_bounds_guards(bci);
                     self.emit_gpr_array_elem_store(*kind);
+                    // RAX still holds the array pointer -- the store above
+                    // addresses through it. See `crate::gpu_barrier`.
+                    self.emit_gpu_input_cache_barrier();
                     return;
                 }
                 let is_d = matches!(kind, MemKind::Double);
@@ -7152,6 +7163,10 @@ impl<'a> Lowerer<'a> {
                 let sib = if is_d { 0xC8 } else { 0x88 };
                 self.buf
                     .emit(&[prefix, 0x0F, 0x11, 0x44, sib, HEADER_SIZE as u8]);
+                // Same contract as the integral arm above: RAX is the array.
+                // The barrier clobbers R10/R11 and the flags only, so an
+                // XMM-resident value elsewhere in the frame is untouched.
+                self.emit_gpu_input_cache_barrier();
             }
             // arraylength (COV-02). inputs = [ctrl, mem, array]. One 32-bit
             // load at a fixed header offset behind the JVMS null check. No
@@ -8734,6 +8749,24 @@ impl<'a> Lowerer<'a> {
     /// `MemKind::Ref` is refused by the caller (no store barrier in this tier)
     /// and the FP kinds take the XMM path. One shared header displacement, for
     /// the reason given on [`Self::emit_gpr_array_elem_load`].
+    /// Emit the GPU input-residency barrier after an inline primitive
+    /// array store, if a `--gpu` run armed it.
+    ///
+    /// Assumes RAX holds the array pointer, which both `ArrayStore` arms
+    /// guarantee. Clobbers R10, R11 and the flags: R10 is already this
+    /// backend's guard scratch, R11 is never register-resident, and this
+    /// backend's linear-scan residency uses only callee-saved GPRs
+    /// (`IR_LOWER_LS_GPRS`), so nothing live is at risk.
+    ///
+    /// Emits nothing at all unless armed -- see [`crate::gpu_barrier`],
+    /// which is also where the reason a compiled store marks a bucket
+    /// instead of calling `input_cache::invalidate` is written down.
+    fn emit_gpu_input_cache_barrier(&mut self) {
+        if let Some(bytes) = crate::gpu_barrier::barrier_bytes() {
+            self.buf.emit(&bytes);
+        }
+    }
+
     fn emit_gpr_array_elem_store(&mut self, kind: MemKind) {
         let d = crate::x64::disp::disp8_const(HEADER_SIZE as i64) as u8;
         match kind {
@@ -8755,6 +8788,260 @@ impl<'a> Lowerer<'a> {
                     format!("{kind:?}"),
                 ));
             }
+        }
+    }
+
+    /// Count one bci that could not be given an OSR entry.
+    fn note_osr_refusal(&mut self, why: &'static str) {
+        match self.osr_refusals.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, n)) => *n += 1,
+            None => self.osr_refusals.push((why, 1)),
+        }
+    }
+
+    /// `MOV RAX, [R11 + disp32]` — read one word of the interpreter's locals
+    /// array. R11 is caller-saved and nothing between its load and the seeding
+    /// loop calls out, which is the whole reason the seeding runs last.
+    fn emit_mov_rax_from_r11_disp(&mut self, disp: i32) {
+        self.buf.emit(&[0x49, 0x8B, 0x83]);
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit an entry stub for each bci this body can be entered at part-way.
+    ///
+    /// ABI: `extern "C" fn(ctx: i64, locals: *const i64) -> i64`, i.e. the
+    /// entry ABI's first two registers. It builds this tier's own frame — which
+    /// is the point. `osr_trampoline` cannot: it takes some twenty layout
+    /// parameters because it builds the SINGLE-PASS frame from outside, and
+    /// that rests on a fixed per-method local→home map. This tier has no such
+    /// map; its locals are SSA values on colour-assigned slots that differ from
+    /// bci to bci. The lowerer, by contrast, knows the layout because it built
+    /// it, and the safepoint snapshot already says where each local lives at
+    /// each bci — the very table `build_deopt_points` reads, used in the
+    /// opposite direction.
+    ///
+    /// **A bci is refused unless every value live on entry is one the
+    /// interpreter can supply.** The snapshot names the locals; anything else
+    /// live across that point — a hoisted invariant, a CSE'd subexpression —
+    /// exists only because earlier compiled code computed it, and no seeding
+    /// can reconstruct it. `live.range` gives that check exactly: a value whose
+    /// range STARTS before the entry position and extends past it is live-in,
+    /// and every such value must be named by the snapshot.
+    fn emit_osr_entry_stubs(&mut self, live: &crate::regalloc::LiveModel) {
+        if !ir_osr_entry_enabled() {
+            return;
+        }
+        if !live.converged {
+            self.note_osr_refusal("liveness did not converge");
+            return;
+        }
+        // Planned first, emitted second: the plan reads `self` immutably and
+        // the emission needs it mutably.
+        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>)> = Vec::new();
+        let mut refusals: Vec<&'static str> = Vec::new();
+        // Keyed by BLOCK, not by bci. Two reasons, and the first is fatal on
+        // its own: `bci_native` anchors DATA nodes, and a loop header's bci is
+        // an `iload` of a phi, which lowers to no node at all — eleven of the
+        // fifteen snapshots in a counted loop had no offset under it. The
+        // second is that a block boundary is the only place entering MEANS
+        // anything: the phi copies run on the predecessors' edges, so at a
+        // header's first instruction the phis are exactly the values a seeding
+        // can supply, and nothing else is half-computed.
+        for bi in 0..self.schedule.blocks.len() {
+            // The block's bci is its CONTROL node's, not its first data node's.
+            // A loop header's `Merge` carries the header bci (4 in a javac
+            // counted loop); its first scheduled data node is whatever the
+            // scheduler put there, which in that same loop is the `iinc` at 13.
+            // Keying on the data node found the bci-13 snapshot, where the
+            // header's `s` phi has already been superseded by the add and so is
+            // live-across-but-unnamed — a refusal for entirely the wrong
+            // reason.
+            let ctrl = self.schedule.blocks[bi].ctrl;
+            let Some(bci) = self
+                .graph
+                .nodes
+                .get(ctrl as usize)
+                .and_then(|n| n.bytecode_pc)
+            else {
+                refusals.push("block control carries no bci");
+                continue;
+            };
+            let Some(sp) = self.graph.safepoints.iter().find(|s| s.bci == bci) else {
+                refusals.push("no safepoint snapshot at this block start");
+                continue;
+            };
+            let native = self.block_offsets[bi];
+            // A javac loop header has an empty operand stack. A bci that does
+            // not is refused rather than reasoned about: the interpreter's
+            // stack would have to be seeded too, and the snapshot's stack slots
+            // are not JVM-local-indexed.
+            if !sp.stack.is_empty() {
+                refusals.push("operand stack not empty at this bci");
+                continue;
+            }
+            // Where this block begins, in the liveness model's own positions.
+            let Some(&(entry_pos, _)) = live.span.get(bi) else {
+                refusals.push("no liveness span for this block");
+                continue;
+            };
+            let named: std::collections::HashSet<NodeId> = sp
+                .locals
+                .iter()
+                .copied()
+                .filter(|v| *v != NO_NODE)
+                .collect();
+            // Live-in, and not something the entered code can produce for
+            // itself. A CONSTANT can: every reader materialises it as an
+            // immediate (`ir_const_imm_enabled`), so its range crossing the
+            // header says nothing about what has to be seeded. Counting it as
+            // unseedable refused every loop in the language.
+            let unseedable = live.range.iter().enumerate().any(|(id, r)| {
+                if matches!(
+                    self.graph.nodes.get(id).map(|n| &n.op),
+                    Some(Op::Const(_)) | Some(Op::ConstF(_))
+                ) {
+                    return false;
+                }
+                r.is_some_and(|r| {
+                    r.lo < entry_pos
+                        && entry_pos <= r.hi
+                        // Cast: an index into the node arena is a `NodeId`.
+                        && !named.contains(&(id as NodeId))
+                })
+            });
+            if unseedable {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
+                    for (id, r) in live.range.iter().enumerate() {
+                        if matches!(
+                            self.graph.nodes.get(id).map(|n| &n.op),
+                            Some(Op::Const(_)) | Some(Op::ConstF(_))
+                        ) {
+                            continue;
+                        }
+                        if r.is_some_and(|r| {
+                            r.lo < entry_pos && entry_pos <= r.hi && !named.contains(&(id as NodeId))
+                        }) {
+                            eprintln!(
+                                "[ir-ls]   osr block {bi} (bci {bci}) refused: n{id} {:?} is live                                  across it and no local names it",
+                                self.graph.nodes.get(id).map(|n| &n.op),
+                            );
+                        }
+                    }
+                }
+                refusals.push("a value live here is named by no local");
+                continue;
+            }
+            let mut seeds: Vec<(usize, NodeId)> = Vec::new();
+            let mut homeless = false;
+            for (i, &v) in sp.locals.iter().enumerate() {
+                if v == NO_NODE {
+                    continue;
+                }
+                let has_slot = self.node_slot.get(v as usize).copied().flatten().is_some()
+                    && !self.home_dropped.get(v as usize).copied().unwrap_or(false);
+                if !has_slot && self.assigned_gpr(v).is_none() {
+                    homeless = true;
+                    break;
+                }
+                seeds.push((i, v));
+            }
+            if homeless {
+                refusals.push("a named local has nowhere to be seeded");
+                continue;
+            }
+            // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
+            plans.push((bci as u32, native, seeds));
+        }
+        for why in refusals {
+            self.note_osr_refusal(why);
+        }
+        for (bci, native, seeds) in plans {
+            // Cast: a JVM local index plus one; `max_locals` is u16.
+            let seeds_hi = seeds.iter().map(|(i, _)| *i as u32 + 1).max().unwrap_or(0);
+            let stub = self.buf.pos();
+            // push rbp ; mov rbp, rsp ; sub rsp, frame_size
+            self.buf.emit_byte(0x55);
+            self.buf.emit(&[0x48, 0x89, 0xE5]);
+            self.buf.emit(&[0x48, 0x81, 0xEC]);
+            self.buf.emit(&self.frame_size.to_le_bytes());
+            // The caller's registers, exactly as `emit_prologue` saves them —
+            // every exit restores them, including the ones this stub's body
+            // reaches.
+            let xmm_saves: Vec<(u8, i32)> = self.saved_xmm_regs().collect();
+            for (reg, off) in xmm_saves {
+                self.emit_xmm_frame_move(reg, off, true);
+            }
+            let gpr_saves: Vec<(u8, i32)> = self.saved_gpr_regs().collect();
+            for (reg, off) in gpr_saves {
+                self.emit_gpr_frame_move(reg, off, true);
+            }
+            // Park the locals pointer before anything can call out.
+            // `emit_frame_record`'s fallback path CALLs, and the second entry
+            // ABI register is caller-saved on both ABIs. The phi-copy scratch
+            // is the right parking space: it is a bookkeeping word no value is
+            // ever coloured onto, and the body only ever WRITES it before
+            // reading it, so a value left here is consumed and gone before the
+            // first parallel copy runs.
+            self.store_abi_reg(ENTRY_ABI_REGS[1], self.phi_copy_scratch_slot_off);
+            if self.needs_context {
+                self.store_abi_reg(ENTRY_ABI_REGS[0], self.context_slot_off);
+            }
+            // A clean frame, on the same terms the prologue establishes it —
+            // and BEFORE the seeding, because `zero_ref_phi_slots` would
+            // otherwise erase a reference this stub had just placed.
+            if !prologue_zero_unset_locals_disabled() {
+                for i in 0..self.num_locals {
+                    // Cast: a JVM local index times 8; `max_locals` is u16.
+                    self.emit_zero_frame_slot(((i as i32) + 1) * 8);
+                }
+            }
+            if self.get_current_thread != 0 && self.shadow_thread_slot_off > 0 {
+                self.emit_zero_frame_slot(self.shadow_thread_slot_off);
+                self.emit_zero_frame_slot(self.shadow_savetop_slot_off);
+                if !prologue_zero_reserved_tail_disabled() && self.shadow_savebase_slot_off > 0 {
+                    self.emit_zero_frame_slot(self.shadow_savebase_slot_off);
+                }
+            }
+            if self.sp_id_slot_off > 0 && Self::zero_sp_id_slot_enabled() {
+                self.emit_zero_frame_slot(self.sp_id_slot_off);
+            }
+            self.emit_frame_record();
+            self.fetch_current_thread();
+            self.zero_ref_phi_slots();
+            // ── Seed, last ───────────────────────────────────────────
+            self.load_reg_from_frame(R11, self.phi_copy_scratch_slot_off);
+            for (i, v) in seeds {
+                // Cast: a JVM local index times 8.
+                self.emit_mov_rax_from_r11_disp((i as i32) * 8);
+                if !self.home_dropped.get(v as usize).copied().unwrap_or(false) {
+                    if let Some(off) = self.node_slot.get(v as usize).copied().flatten() {
+                        self.store_abi_reg(RAX, off.get() as i32);
+                    }
+                }
+                if let Some(dst) = self.assigned_gpr(v) {
+                    self.emit_mov_reg_reg64(dst, RAX);
+                    self.mark_gp_reg_live(v);
+                }
+            }
+            // The scratch held a pointer; leave it as the prologue would.
+            if !prologue_zero_reserved_tail_disabled() && self.phi_copy_scratch_slot_off > 0 {
+                self.emit_zero_frame_slot(self.phi_copy_scratch_slot_off);
+            }
+            // JMP into the body at this bci.
+            self.buf.emit_byte(0xE9);
+            let patch = self.buf.pos();
+            self.buf.emit(&[0, 0, 0, 0]);
+            let rel = native as i32 - (patch as i32 + 4);
+            if !Self::patch_or_bail(&mut self.buf, patch, rel) {
+                return;
+            }
+            // The highest JVM local index this stub reads, plus one. The
+            // caller offers a locals snapshot and must not be asked for more
+            // than the interpreter frame holds — `ir_osr_enter` refuses a short
+            // one rather than reading past its end.
+            let locals_needed = seeds_hi;
+            // Cast: an offset inside a bounded executable buffer.
+            self.osr_entries.push((bci, stub as u32, locals_needed));
         }
     }
 
@@ -10801,6 +11088,54 @@ fn ir_drop_phi_home_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_PHI_HOME") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
+    }
+}
+
+/// Emit an OSR entry stub for every bci this body can safely be entered at --
+/// **default OFF**, opt in with `CRATONVM_JIT_IR_OSR_ENTRY=1`.
+///
+/// Nothing in the VM calls these yet: `compile_osr_artifact` reaches
+/// `x64::compile_with_param_slots` directly and knows nothing about this tier.
+/// The stubs are emitted, counted and TESTED here first, because entering a
+/// compiled body part-way with a hand-seeded frame fails by producing a
+/// plausible wrong number rather than a crash, and that is the half worth
+/// proving before any plumbing exists to reach it.
+fn ir_osr_entry_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = OSR_ENTRY_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_OSR_ENTRY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_osr_entry_enabled`], the same shape as
+    /// `LS_FORCE` and `DEOPT_REGS_FORCE` and for the same reason.
+    static OSR_ENTRY_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_osr_entry_enabled`] on this thread.
+#[cfg(test)]
+struct OsrEntryForce;
+
+#[cfg(test)]
+impl OsrEntryForce {
+    fn on() -> OsrEntryForce {
+        OSR_ENTRY_FORCE.with(|c| c.set(Some(true)));
+        OsrEntryForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for OsrEntryForce {
+    fn drop(&mut self) {
+        OSR_ENTRY_FORCE.with(|c| c.set(None));
     }
 }
 
@@ -13329,7 +13664,31 @@ pub(crate) fn lower_inner_with_scopes(
     // Gap B: emit the shared call-exception bail stub after the body so each
     // dispatch site's sentinel `JE` reaches it.
     lowerer.emit_call_exc_stub();
+    // The optimizing tier's own OSR entry points. After the body, because each
+    // stub ends in a `JMP` to a native offset the body has already produced;
+    // before `patch_branches`, because a stub's own `JMP` is patched here and
+    // must not be mistaken for an in-body branch.
+    //
+    // The liveness model is rebuilt rather than threaded down from
+    // `plan_register_residency`: it is a pure function of the graph and the
+    // schedule, this costs one pass on a path that is off by default, and
+    // threading it would tie the OSR decision to whether register residency
+    // happened to run.
+    if ir_osr_entry_enabled() {
+        let osr_live = crate::regalloc::build_live_model(graph, schedule);
+        lowerer.emit_osr_entry_stubs(&osr_live);
+    }
 
+    let lowerer_osr_entries = std::mem::take(&mut lowerer.osr_entries);
+    if ir_osr_entry_enabled()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
+    {
+        eprintln!(
+            "[ir-ls] osr entries: emitted={} refused={:?}",
+            lowerer_osr_entries.len(),
+            lowerer.osr_refusals,
+        );
+    }
     lowerer.finish_lazy_thread_fetch();
     lowerer.patch_branches();
     // fib44-fix follow-up: patch direct self-recursive calls to the method entry.
@@ -13527,6 +13886,7 @@ pub(crate) fn lower_inner_with_scopes(
     let mut cm = CompiledMethod::new(buf);
     cm.compile_id = compile_id;
     cm.deopt_points = deopt_points;
+    cm.ir_osr_entries = lowerer_osr_entries;
     cm._deopt_point_boxes = deopt_boxes;
 
     // ── Moving-young relocation contract ────────────────────────────────
@@ -13870,6 +14230,13 @@ fn ir_inline_tlab_enabled() -> bool {
 }
 
 #[cfg(test)]
+// x86-64 ONLY. These assert x86-64 encodings and several EXECUTE the code
+// they emit, which on another architecture is an illegal instruction that
+// takes the whole test binary down with it -- `cargo test -p cratonvm-jit`
+// died at `a_previously_declined_large_method_now_compiles` with SIGILL the
+// first time it was ever run on aarch64. Gated at the MODULE, because the
+// property is "this module is about x86-64", not a per-test accident.
+#[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
     use crate::ir::IrBuilder;
@@ -17122,6 +17489,89 @@ mod tests {
     // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
     // header self-loops (the condition is at the bottom). Exercises the
     // if-as-back-edge path + a block whose true edge targets its own head.
+    #[test]
+    /// **The one that matters: enter the loop part-way and finish it.**
+    ///
+    /// `int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }`, whose
+    /// loop header is bci 4. The stub is called the way an OSR trigger would
+    /// call it — with an interpreter locals array, not with the method's
+    /// arguments — carrying a state the method could never have reached from
+    /// its own entry: `n=10, s=100, i=7`. A correct entry finishes the loop
+    /// from there and returns `100 + 7 + 8 + 9 = 124`.
+    ///
+    /// Nothing else proves this. The frame build, the callee-saved saves, the
+    /// clean-frame zeroing, the ORDER of that zeroing against the seeding
+    /// (`zero_ref_phi_slots` would erase a seeded reference), the parked
+    /// locals pointer surviving `emit_frame_record`'s call, the seeding
+    /// itself and the jump are six independent chances to be wrong, and every
+    /// one of them fails by returning a plausible number.
+    #[test]
+    fn an_osr_entry_finishes_a_loop_it_did_not_start() {
+        let _osr = OsrEntryForce::on();
+        //  0: iconst_0  1: istore_1  2: iconst_0  3: istore_2
+        //  4: iload_2   5: iload_0   6: if_icmpge 19
+        //  9: iload_1  10: iload_2  11: iadd  12: istore_1
+        // 13: iinc 2,1 16: goto 4   19: iload_1 20: ireturn
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
+        // The ordinary entry still works, unchanged.
+        assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
+
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
+            // Not every configuration admits the header (the refusal census
+            // says which clause declined). Assert the shape that IS guaranteed:
+            // a refusal is silent and total, never a half-emitted stub.
+            assert!(
+                cm.ir_osr_entries.is_empty(),
+                "an entry for some other bci while the loop header was refused                  means the eligibility test and the emitter disagree",
+            );
+            return;
+        };
+        // The interpreter's locals at bci 4: local 0 = n, 1 = s, 2 = i.
+        let locals: [i64; 3] = [10, 100, 7];
+        // Through the artifact's own entry point, which is what the VM calls:
+        // it re-checks the bci and refuses a locals slice shorter than the stub
+        // reads, so the test exercises the admission as well as the code.
+        //
+        // SAFETY: the stub builds and tears down its own frame, reads exactly
+        // `locals[0..3]`, and returns the method's `int` result in RAX.
+        let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(4, 0, l) };
+        assert_eq!(
+            entered(&locals),
+            Some(124),
+            "entering at the header with s=100 i=7 n=10 must run i=7,8,9 and              return 100+7+8+9",
+        );
+        // A second entry, to catch a stub that works once because it left the
+        // frame or a callee-saved register in a state the next entry inherits.
+        let again: [i64; 3] = [5, 0, 2];
+        assert_eq!(entered(&again), Some(9), "i=2,3,4 from s=0 is 2+3+4");
+        // And the admission: a locals slice shorter than the stub reads is
+        // refused rather than read past.
+        assert_eq!(
+            entered(&again[..1]),
+            None,
+            "a short locals snapshot must be refused, not read past",
+        );
+    }
+
+    /// The stubs are off unless asked for, and an artifact carries none.
+    #[test]
+    fn no_osr_entry_stub_is_emitted_by_default() {
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
+        assert!(
+            cm.ir_osr_entries.is_empty(),
+            "the entry stubs are opt-in; an artifact must carry none by default",
+        );
+        assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
+    }
+
     #[test]
     fn test_lower_do_while_sum() {
         // int f(int n){ int s=0,i=0; do { s+=i; i++; } while(i<n); return s; }

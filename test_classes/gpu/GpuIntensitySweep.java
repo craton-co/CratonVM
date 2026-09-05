@@ -181,8 +181,14 @@ public class GpuIntensitySweep {
             case "D": sink = (long) (dOut[0] + dOut[n - 1]); break;
             case "B": sink = bOut[0] + bOut[n - 1]; break;
         }
+        // `ns_per_call` was added 2026-09-04 for the crossover sweep.
+        // `us_per_call` is integer microseconds, which is fine at n=2^20
+        // (~2000 units) and useless at n=2^10, where a call costs one or
+        // two microseconds and the quotient quantises to 1-2. Both are
+        // printed so existing consumers keep working.
         System.out.println("type=" + type + " n=" + n + " iters=" + iters + " ops=" + ops
-                + " us_per_call=" + (ns / 1000L / iters) + " sink=" + sink);
+                + " us_per_call=" + (ns / 1000L / iters)
+                + " ns_per_call=" + (ns / iters) + " sink=" + sink);
     }
 
     static void run(String type, int ops, int[] iIn, int[] iOut, long[] jIn, long[] jOut,

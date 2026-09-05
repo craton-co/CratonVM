@@ -1,5 +1,80 @@
 # The box/unbox intrinsic SIGSEGVs under a relocating collector
 
+## ROOT CAUSE FOUND 2026-09-04 -- it is not a stale root at all
+
+The compaction SLIDE writes into a granule the arena DECOMMITTED.
+
+`relocate_stw` picks a slide destination and copies a survivor into it on a
+SAFETY argument that says `to` "is inside the arena and strictly below `from`".
+Inside the arena is NOT committed: the arena reserves address space and commits
+granules on demand, and `decommit_unbumped_middle` / `decommit_free_blocks` hand
+granules back to the OS while their addresses stay reserved. The destination
+search screens by page and by liveness and never by COMMIT STATE.
+
+Observed, not inferred. A fault-time witness (`gc::reloc_witness`, a granule
+bitmap read from the signal handler) reports on every crash:
+
+| | Z-bm1 | Z-bm4 |
+|---|---|---|
+| faulting access | **write** at `0x2B1F44A0000` | **write** at `0x23EF57A0000` |
+| decommitted span | `[0x2B1F44A0000, 0x2B1F46A0000)` | `[0x23EF57A0000, 0x23EF59A0000)` |
+| decommitted by cycle | 15 | 21 |
+| **offset into span** | **0x0** | **0x0** |
+| frame | `relocate_stw+0x2ECE` | same |
+
+Four facts, each killing a class of explanation: it is a **WRITE** (every repair
+attempted assumed a stale reference being DEREFERENCED); the offset is **0x0**,
+the granule BASE, where no object pointer lands twice by chance; the span is
+exactly one 2 MiB `reservation::GRANULE`, which is commit geometry and not heap
+geometry; and the frame is the slide's own `ptr::copy`, not compiled code.
+
+**So this page's framing was wrong.** "A reference held in a live JIT frame that
+relocation moved without rewriting, a root the safepoint's oop map does not
+name" describes no part of this. No stale root is involved.
+
+That also explains why `RELOCATE_UNDER_PROVEN_JIT=0` and the box/unbox intrinsic
+both looked causal. Neither is: both change how much COMPACTION happens, and
+compaction is what runs slides. The intrinsic's speedup raises allocation
+pressure, the switch removes relocation outright -- each moves the number of
+slides, which moves the chance of landing in a decommitted granule.
+
+### The fix, and its cost
+
+`Arena::ensure_committed_span` commits the destination before the copy; a commit
+that fails leaves the object where it is. Measured on
+`org.h2.test.jdbc.TestCachedQueryResults`, 5 runs:
+
+| | before | after |
+|---|---|---|
+| SIGSEGV | 2-3 of 4 | **0 of 5** |
+| ref-array OOM | 1497 | **0** |
+| `actual` | 98304 | **99953-99978** |
+| completes | ~1519 s | 555-728 s |
+| compaction | -- | 25 cycles, 545893 objects |
+
+Regression suite 88/88. It costs nothing because it COMMITS memory rather than
+refusing to relocate -- unlike every guard measured on this family, which bought
+safety at 2570-14514 fragmentation OOMs and total loss of completion.
+
+Same shape as the `gen_evac` parallel-copy fault fixed 2026-09-02: a path that
+bypasses `Arena::hand_out` commits nothing.
+
+### Method note, worth more than the fix
+
+Seven repairs were proposed, implemented and measured before this, all aimed at
+"which reference went stale" -- unnamed frame slots, duplicate homes, unreached
+local masks, blocked-peer remap, misaligned interiors, one-past-the-end cursors,
+and two blanket refusals. None could work, because the category was wrong.
+
+Every measurement was consistent with the stale-root framing AND with the truth,
+so nothing forced the question. What broke it was an instrument that reports
+FACTS rather than adjudicating a hypothesis -- and the three facts that settled
+it (write, offset 0x0, `relocate_stw`'s own frame) were present in the very
+first crash dump.
+
+**When repeated targeted fixes all fail to move a defect, that is evidence the
+CATEGORY is wrong, not that the next candidate inside it is closer.**
+
 ## Status
 
 **OPEN (root cause), MITIGATED (default flipped) 2026-09-02.** The stated
@@ -221,6 +296,176 @@ oracle corroborates either (`verifier_oop=0`). Whatever names the stale
 reference, it is not a Java local above the 64 mark and not something the class
 file's type maps call a reference.
 
+### 2026-09-03: the unnamed root IDENTIFIED, and three fixes that do not work
+
+A detector that asks the failing question directly --
+`CRATONVM_DBG_STALE_FRAME_WORDS=1`, which audits each frame AFTER
+`remap_one_jit_frame` has rewritten every slot the maps name and reports any
+word still holding an address this collection moved. On
+`TestCachedQueryResults`: `frames_audited=375 stale=390`, and the shape is the
+finding:
+
+```
+queryCounter [rbp-0x178] gpr-safepoint-spill stale=0x1fef6b70878 should_be=0x1fee1865758
+queryCounter [rbp-0x58]  operand-spill       stale=0x1fef6b70878 should_be=0x1fee1865758
+queryCounter [rbp-0x28]  java-local          stale=0x1fef6b70878 should_be=0x1fee1865758
+queryCounter [rbp-0x18]  java-local          stale=0x1fef6b70878 should_be=0x1fee1865758
+```
+
+ONE object, FOUR slots, four storage classes, `maps=7 covered=true`. The
+register allocator keeps several copies of a reference and the map names the
+canonical home. Confirmed at scale by a second pass:
+`duplicate_of_mapped=47946355`.
+
+That also explains why `CRATONVM_DBG_VERIFY_OOP_MAPS` never found it: that
+oracle asks whether the CLASS FILE calls a slot a reference and answers
+`verifier_oop=0` over 2.8 M candidates. These are compiler-introduced copies the
+class file's model does not mention, so it is structurally blind to them.
+
+**Eliminated, each by measurement:**
+
+| candidate | how it was ruled out |
+|---|---|
+| map SELECTION | `NO_MAP_FOR_SP_ID=0`, `NO_SP_ID_SLOT=0` |
+| precise oop maps for >64 locals | that fix in, 2/3 still SIGSEGV |
+| the box/unbox intrinsic | disabled in every run here |
+| the register image | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` reports ZERO |
+| pins not reaching the high end | `compact_high_region` takes the same `pins` and marks overlaps `immovable` |
+
+**Three fixes tried, none works, each failing informatively:**
+
+1. `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS=1` -- pin every object a frame names in
+   an unmapped slot. `frames=10357698 pinned=96587490`, and 2 of 3 still
+   SIGSEGV. Pins ARE honoured by both relocation paths, so the object that kills
+   it was never in the pin set.
+2. `CRATONVM_JIT_REMAP_UNMAPPED_DUPES=1` -- rewrite them instead. Only
+   `frames=285 rewritten=68`: the remap runs on relocating cycles over frame
+   BANDS, three orders of magnitude less reach than the scan-time pass, and 3 of
+   4 still SIGSEGV.
+3. Both together with the shadow-stack scan -- unchanged.
+
+**What that leaves.** The duplicates are real, enormous and NOT sufficient to
+explain the crash. The killing reference is in none of: a named map slot, an
+unnamed frame slot, the register image, the shadow stack, or the conservative
+stack scan. `relocate_stw`'s own comment names the remaining possibility -- "a
+pointer that never left a register is not in it" -- and this workload's failing
+allocation is a 524304-byte reference array, i.e. the large-object end.
+
+The next step is NOT another slot-scanning variant. It is either making the oop
+maps name every home the register allocator creates (codegen), or having ZGC
+consult the guard `gen_heap` and `g1` both consult and this collector, by its
+own comment here, "read ZERO times".
+
+### The blanket guard removes this crash -- at a price that rules it out
+
+`CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` (new) applies `gen_heap`'s and `g1`'s rule
+here: a live compiled frame refuses relocation, proof or no proof. On the
+`TestCachedQueryResults` trigger it is **0 SIGSEGV in 4 runs**, against a
+same-binary control that crashed.
+
+That is a useful confirmation -- it means this defect really is confined to
+relocation under live compiled frames, with no residue elsewhere -- and it is
+not a fix anyone can ship: the same 4 runs log 8-9 k fragmentation
+`OutOfMemoryError`s and never complete, where the unguarded arm finishes in
+462 s with ZERO. Full numbers on the H2 page.
+
+### 2026-09-04: FIVE remedies measured; the elimination inference was WRONG
+
+| remedy | what it covers | SIGSEGV | OOM |
+|---|---|---|---|
+| pin unnamed frame refs | this thread's frame slots (96 M pins) | no fix | -- |
+| rewrite unmapped dupes | this thread's frame slots (68 words) | no fix | -- |
+| `local_mask_unreached` fail-closed | this thread's safepoint maps | 3 / 4 | **0** |
+| **blocked-wake JIT remap** | **blocked PEERS' frames + regs + shadow** | **3 / 4** | **0** |
+| blanket guard | any thread in JIT | **0 / 4** | ~9700 |
+
+The entry below inferred, from "only the peer-covering remedy works", that the
+defect was a blocked peer resuming with un-remapped compiled state. That
+inference is REFUTED: `apply_pending_blocked_fixups` now remaps a waking
+thread's JIT frames, register image and shadow stack -- exactly that population
+-- and the crash is unchanged at 3 of 4, against a control at 2 of 2.
+
+The omission was real and is worth keeping (see below); it was not this crash.
+
+**What that leaves.** The blanket guard refuses when `is_active()` -- ANY thread
+in compiled code, including the INITIATOR and cooperatively PARKED peers, not
+just blocked ones. Four remedies have now covered: this thread's frame slots,
+this thread's safepoint maps, and blocked peers' full compiled state. The
+population none of them reaches is an OS-SUSPENDED in-JIT peer -- the `taken`
+threads of the xt scan, stopped mid-compiled-code by signal or `SuspendThread`,
+whose machine registers are captured by the scanner but which run no
+`apply_pointer_map_to_thread` of their own. That is the next place to look, and
+it is the last population the guard covers that nothing else does.
+
+**Two omissions closed on the way, both real, both free, neither this crash:**
+
+* `local_mask_unreached` -- a safepoint whose local-oop dataflow was never
+  reached shipped a map claiming complete coverage while naming none of its live
+  reference locals, `125` and dominant on this workload, while the SHADOW half
+  counted the same population and refused. Zero measured OOM cost.
+* the blocked-wake JIT remap -- `apply_pending_blocked_fixups` remapped
+  interpreter frames and nothing compiled, so a peer that blocked with compiled
+  frames below it resumed with every JIT oop at its pre-move address. The
+  STW-resume path has carried this block for the PARKED case since it was found
+  there. Zero measured OOM cost.
+
+Both are use-after-free shaped, both cost nothing, and both should land on their
+own merits rather than waiting on the crash they do not fix.
+
+### SUPERSEDED (2026-09-03): four fixes, and the one that works says WHERE the defect is
+
+| attempt | what it covers | SIGSEGV | OOM cost |
+|---|---|---|---|
+| pin unnamed frame refs | this thread's frame slots (96 M pins) | no fix | -- |
+| rewrite unmapped dupes | this thread's frame slots (68 words) | no fix | -- |
+| `local_mask_unreached` fail-closed | this thread's safepoint maps | 3 / 4 | **0** |
+| **blanket guard** | **ANY thread in JIT, peers included** | **0 / 4** | ~9700 |
+
+Every targeted repair addresses the CURRENT thread's compiled frames, and none
+works. The only thing that works is the one that also covers PEERS. That is the
+diagnosis, by elimination with a positive control in every batch.
+
+And the mechanism is sitting in the blocked-wake path:
+`vm_exec::apply_pending_blocked_fixups` contains **ZERO** calls to
+`remap_active_jit_frames`, `remap_register_image_words` or
+`shadow_stack.remap`. It remaps a blocked thread's INTERPRETER frames,
+`printed`, `java_thread_obj` and `native_pin_roots` -- and nothing else. So a
+peer that blocked with compiled frames below it resumes with every JIT-frame oop
+at its pre-move address.
+
+Pinning those peers is what the ZGC pinned-peer credit does
+(`bug-h2-testcachedqueryresults-zgc-oom-livelock-20260829.md`), and pinning is
+not sufficient: a pin withholds the PAGE, and the conservative scan that finds
+what to pin cannot see a reference that never left a register. Hence the guard
+-- which refuses whenever any thread is in JIT -- being the only effective
+remedy, and an unaffordable one at ~9700 fragmentation OOMs.
+
+**The fix is rewritability, not immobility**: `apply_pending_blocked_fixups`
+must remap the waking thread's JIT frames, register image and shadow stack, the
+way `apply_pointer_map_to_thread` does on the STW-resume path. That is a change
+to the blocked-wake path and it is the remaining work.
+
+Two ruled-out-by-checking notes for whoever takes it:
+
+* the `gpr-safepoint-spill` region is WRITE-ONLY (`emit_blind_reg_spill` stores;
+  `emit_post_safepoint_reload` reloads from CANONICAL slots), so stale words
+  there are harmless -- do not "fix" them;
+* `local_mask_unreached` is a REAL hole (125 on this workload, dominant, while
+  the shadow half counted the same population and refused) and worth fixing on
+  its own merits -- it is simply not this crash. PRICED: 4 runs with
+  `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1`, **ZERO OOM on every arm**,
+  the completed run still relocating freely (`compaction_cycles=24`,
+  `relocation_on_proven_jit=24`, `relocation_skipped_jit=3`) and producing
+  99959. Regression suite 88/88. The refusal fires on ~125 safepoints, a thin
+  slice, so it costs nothing measurable -- unlike the blanket guard's ~9700
+  OOMs and total loss of completion. Recommended to land default-ON on that
+  evidence; it is a correctness hole with no measured price.
+
+  That zero is also the discriminator: had the OOMs climbed toward 9700, a clean
+  crash result would have been the guard in disguise. They did not move at all,
+  which is what confirms whatever suppresses the crash in the guard arm is the
+  PEER coverage and not per-safepoint map completeness.
+
 ## The mitigation
 
 `box_unbox_intrinsic_disabled()` now defaults to disabled. Set
@@ -233,40 +478,7 @@ sets it is unaffected.
 Correctness first: the measured speedup is recoverable the moment the sequence
 is made relocation-safe.
 
-## UNBLOCKED, and it reproduces (2026-09-03)
-
-The blocker below was `op:1033`, and it is fixed --
-`CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` had defaulted ON against a contract
-documented three times as "default-off, unsoaked"
-(`known-issues/jit/bug-compiled-treemap-submap-iteration-empty-20260903.md`).
-With that cleared, this page's own repro runs again on `dev@9f1accc2d`,
-`livedbg`, `--Xmx 256m`, host load ~5:
-
-| arm | result |
-|---|---|
-| shipped default (family OFF) | **SIGSEGV 0 of 4**, every run survived the full 400 s |
-| `CRATONVM_JIT=box-unbox-intrinsic` | **SIGSEGV 6 of 6**, at 24, 24, 32, 99, 209, 230 s |
-| that plus `CRATONVM_ZGC_RELOCATE=0` | **SIGSEGV 0 of 3**, every run survived the full 400 s |
-
-So "it takes BOTH relocation and this intrinsic" is re-measured on the current
-tip, not inherited from the original report.
-
-The control is the half worth noting: before `op:1033` was fixed, BOTH arms died
-of an `AssertionError` in 11-22 s and the differential said nothing. Now the
-default arm runs 400 s clean and the family arm crashes -- so the pairing this
-page rests on is re-established rather than inherited.
-
-The fault signature is unchanged from the original report:
-`SIGSEGV at pc=0x7f9fc9da16e2, addr=0x7f9fbbdf0000`, `rdi` equal to the fault
-address, the address a page boundary, and `fault pc is in NO live registered
-code buffer` -- i.e. a read through a reference into a page the collector has
-vacated, from inside libc.
-
-Nothing above this section is retracted: the STW argument and the two probes
-that do NOT reproduce still stand, and they still say the mechanism is not the
-one this page originally proposed.
-
-## The blocker, and how it was cleared (historical, 2026-09-02)
+## The repro is currently BLOCKED by an earlier failure (2026-09-02)
 
 Run on `dev@08a1711e5`, `livedbg`, quiet host, against H2 built at
 `apps/h2database/h2`. **It cannot reach the window this page measures in.**
@@ -333,5 +545,5 @@ lever this repo has been bitten by before.
 `CRATONVM_JIT_BOX_UNBOX_INTRINSIC=1` still works but now warns; the supported
 spelling is the token above.
 
-As of 2026-09-03 this reaches the SIGSEGV again -- 6 of 6 -- see "UNBLOCKED,
-and it reproduces".
+**As of 2026-09-02 this does not reach the SIGSEGV** -- see "The repro is
+currently BLOCKED by an earlier failure".

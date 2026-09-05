@@ -1,6 +1,40 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
 
+## RESOLVED 2026-09-04 -- two complementary fixes, and the crash was never a GC root
+
+| configuration | SIGSEGV | ref-array OOM | completes | `actual` |
+|---|---|---|---|---|
+| credit, no arena fix | 2-3 of 4 | 0 | when it survives | 99 96x |
+| arena fix, no credit | 0 | **6264** | **no** | -- |
+| **both** | **0 of 5** | **0** | **yes, 555-728 s** | **99953-99978** |
+
+Against this page's opening state: `98304` with **1497** ref-array
+`OutOfMemoryError`s in ~1519 s. Regression suite 88/88. Compaction fully intact
+(25 cycles, 545893 objects relocated).
+
+**Two independent defects, one symptom each.**
+
+1. **The OOM** is what this page is about, and the repair is the ZGC pinned-peer
+   credit plus the blocked-peer shadow-stack scan: a blocked peer's coverage can
+   be discharged by pinning, so relocation is no longer refused on nearly every
+   cycle. `CRATONVM_XT_PINNED_PEER_DEPTH=1` + `CRATONVM_XT_PEER_SHADOW_SCAN=1`.
+
+2. **The SIGSEGV** that discharge exposed is a separate, older collector bug and
+   has nothing to do with JIT roots: `relocate_stw`'s slide writes into a
+   granule the arena DECOMMITTED, because the destination search screens by page
+   and liveness and never by commit state. `Arena::ensure_committed_span` fixes
+   it. Full evidence on
+   `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+
+The credit never corrupted anything. It raises compaction, compaction runs
+slides, and slides are what land in a decommitted granule -- which is why the
+crash tracked the credit so convincingly, and why seven repairs aimed at stale
+references in compiled frames all changed nothing.
+
+**Neither fix alone retires this page.** Without the arena fix the class
+crashes; without the credit it logs 6264 OOMs and never finishes.
+
 ## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
 
 The `--jdk-only` corpus hit this class, so it got the three arms. Both CratonVM
@@ -1201,14 +1235,33 @@ produced -- better than the unsafe `ASSUME_REWRITABLE` bypass (99952 with 48
 NPEs), and obtained by satisfying the obligation rather than skipping it. The
 fragmentation diagnosis is right and the mechanism now demonstrably clears it.
 
-It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting:
+It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting.
 
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
-establishes, with `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow
-switch (0/3), that **relocation under LIVE COMPILED FRAMES moves a reference the
-safepoint's oop map does not name** -- and that root cause is OPEN. That page
-also links it to `bug-h2-testrandommapops-small-heap-corruption-20260829.md`,
-"hunting an unnamed root in a compiled frame for days".
+> **REFUTED, and re-measure this section (2026-09-04).** What follows rests on
+> the box/unbox page's reading of its own switch table, and that reading was
+> wrong. The mechanism was never an unnamed oop-map root: `ZgcRealHeap`'s
+> relocation slides were copying into arena granules
+> `Arena::decommit_free_blocks` had already returned to the OS, and both slides
+> now commit their destination first. See
+> `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+>
+> This section's own evidence points the same way and is worth re-reading with
+> that in hand: the fault signature recorded below is `rdi` page-aligned at the
+> fault, which is a `memmove` running off the end of a mapping, not a read
+> through a stale reference. `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` removed
+> it by removing the slide, not by fixing a root.
+>
+> **The arms below have not been re-run on a tree carrying that fix.** Whoever
+> takes this page next starts there, and the cheapest discriminator is
+> `CRATONVM_GC_RESERVE=0`: if it removes the SIGSEGV on the pre-fix binary, this
+> section's crash is the same defect and closes with it.
+
+The reading this section was written under, kept because the argument it
+supports is still the one to re-test: that page established, with
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow switch (0/3), that
+relocation under LIVE COMPILED FRAMES was implicated, and linked it to
+`bug-h2-testrandommapops-small-heap-corruption-20260829.md`, "hunting an
+unnamed root in a compiled frame for days".
 
 Enabling relocation under live JIT frames is precisely and only what this credit
 does. So it is a powerful EXPOSER of that defect, and no arm on this workload
@@ -1246,6 +1299,51 @@ Third independent binary, same two facts: the credit clears the fragmentation
 published candidate for the unnamed root, and fixing it changes nothing here.
 Ruled out, and recorded on that page too.
 
+### 2026-09-03: the guard PRICED -- it removes the crash by restoring the OOM
+
+`CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` makes a live compiled frame refuse
+relocation on its own, without consulting the coverage proof -- the rule
+`gen_heap` and `g1` both apply and this collector replaced on 2026-08-21.
+`relocate_stw` already computed the term (`compiled_frames_live`); it simply was
+not a refusal.
+
+One binary, the flag the only difference, 1500 s cap:
+
+| arm | exit | ref-array OOM | `actual` |
+|---|---|---|---|
+| guard ON, run 1 | timeout 1501 s | 8344 | — |
+| guard ON, run 2 | timeout 1500 s | 9382 | — |
+| guard ON, run 3 | timeout 1500 s | 10118 | — |
+| guard ON, run 4 | timeout 1500 s | 11004 | — |
+| guard OFF, run 1 | **SIGSEGV** 306 s | 0 | — |
+| guard OFF, run 2 | completed 462 s | **0** | **99966** |
+
+Guard ON: **0 SIGSEGV in 4**, mean **9712** OOMs, NOT ONE RUN COMPLETED. The
+four counts rise monotonically (8344 -> 11004), so they are FLOORS -- what
+accumulated before the cap killed each run, not totals.
+
+The comparison is generous to the guard: its OOMs are what 1500 s produced,
+while the unguarded arm reached zero OOMs and finished in 462 s. There is no
+duration at which the unguarded arm produces one.
+
+So the guard WORKS as a crash fix, and it is not shippable: it trades the
+SIGSEGV for the exact `OutOfMemoryError` this page exists to remove. For scale,
+the same-dev discharge-only control logs 14040 OOMs and also does not complete,
+so the guard is better than having no credit at all and an order of magnitude
+worse than the credit running unguarded.
+
+That prices the trade and closes the question. The three-way choice is now
+explicit:
+
+1. **credit, unguarded** -- 99966-99978, ZERO OOM, completes in ~460 s, and
+   SIGSEGVs about 2 runs in 3 on the open codegen defect;
+2. **credit + guard** -- no crash, ~8-9 k OOMs, never completes;
+3. **neither** -- no crash, 14 k OOMs, never completes.
+
+None ships. (1) is the only one that solves the page, and it is blocked on
+naming every home the register allocator creates -- see the box/unbox page for
+the identification, the three failed repairs, and what remains.
+
 ### Attribution closed 2026-09-03: it is dev's relocation defect, and the oracle does not see it
 
 | arm | SIGSEGV |
@@ -1256,7 +1354,7 @@ Ruled out, and recorded on that page too.
 | discharge only (control) | 0 / 3 |
 
 Relocation is REQUIRED -- the same 0/3 that
-`bug-box-unbox-intrinsic-segv-under-relocation-20260902` measured on that
+`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
 switch. And the fault signature matches that page's: `rdi` page-aligned at the
 fault (`0x232ECD30000`, `0x28DEA7B0000`, `0x1CA01BB0000`), which that page reads
 as "a read through a reference into a page the collector has already vacated".
@@ -1297,7 +1395,7 @@ Two traps this cost, worth not repeating:
 The conclusion below is withdrawn. It is not known to be wrong; it is not
 supported by the evidence that was offered for it.
 
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`
+`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
 landed on dev the same day: the box/unbox intrinsic SIGSEGVs under a relocating
 collector, **11 of 11 runs, 25-183 s**, and it takes BOTH relocation and that
 intrinsic -- neither alone. Dev flipped the intrinsic to opt-in as the
