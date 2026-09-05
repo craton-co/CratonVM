@@ -47,10 +47,18 @@ boundary, branches, or does arithmetic is inside one 7–11x band. Everything th
 allocation — it reads one word out of a header and pushes an int, and it costs
 three and a half straight-line bytecodes' worth of time to do it.
 
-`aaload` is the worst and is not in a fast arm at all: reference arrays keep the
-full barrier-aware `get_array_element`, so an `aaload` costs 47 ns more than an
-`iaload` + `ifne` doing the same work, where HotSpot has the two identical to
-within noise.
+`aaload` is the worst, and the precise statement matters. It **is** in the
+dispatch loop's `0x2e..=0x35` arm — but that arm's quickened half,
+`field_fast::array_load_prim`, declines it: `prim_elem_for_opcode` has no
+reference entry, so every `aaload` falls through to the full barrier-aware
+`VmHeap::get_array_element`. It costs 47 ns more than an `iaload` + `ifne`
+doing the same work, where HotSpot has the two identical to within noise.
+
+The same arm is worth reading for a second reason: it opens with two
+`pop_unchecked()` calls, decoding both operands into the 16-byte `Value` enum
+*before* it can even offer them to the quickened path — and on the non-object
+path it pushes both back, keeping them live across the arm. That is the same
+shape as `arraylength` below, in the opcode family that pays it twice.
 
 ## The item that was taken: the registry probe
 
@@ -188,9 +196,13 @@ worthless and did not look it:
 
 ## What is left, ranked by evidence
 
-1. **`aaload` has no fast arm at all** (+47 ns over the equivalent `iaload`,
-   against HotSpot's −0.8). Reference arrays keep the barrier-aware path. This is
-   the largest item on the page and nothing has been built for it.
+1. **`aaload` never reaches the quickened path** (+47 ns over the equivalent
+   `iaload`, against HotSpot's −0.8). It enters the `0x2e..=0x35` arm and is
+   declined by `array_load_prim`, so it always takes the full
+   `get_array_element`. This is the largest item on the page and nothing has
+   been built for it. A reference element needs the load barrier that
+   `getfield`'s reference arm already performs inline
+   (`load_and_forward` + the autobox latch), which is the shape to copy.
 2. **Seven or eight per-access gate loads to read one field.** Counted through
    `getfield_fast_keyed`: `any_field_watchpoint_active`, `any_class_redefined`,
    `class_definition_epoch` and `resolution_epoch` (the last two inside
