@@ -379,6 +379,27 @@ mod loader_lookup_tests {
                 }
                 index
             }
+            /// The condition `loaded_classes_insert` computes to raise
+            /// `ANY_DUPLICATE_CLASS_NAME`: "some name resolves to more than
+            /// one distinct `ClassId`".
+            fn duplicate_via_index(&self) -> bool {
+                self.index.values().any(|ids| ids.len() > 1)
+            }
+            /// The property that condition is supposed to mean, computed the
+            /// slow way straight off the map: two live entries sharing a name
+            /// but not an id. This is exactly the situation
+            /// `retarget_instance_field_to_receiver` exists to handle, so if
+            /// these two ever disagree the field gate is unsound.
+            fn duplicate_linear(&self) -> bool {
+                for ((_, a_name), &a_id) in self.map.iter() {
+                    for ((_, b_name), &b_id) in self.map.iter() {
+                        if a_name == b_name && a_id != b_id {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             fn check(&self, names: &[&str]) {
                 for name in names {
                     assert_eq!(
@@ -388,6 +409,14 @@ mod loader_lookup_tests {
                     );
                 }
                 assert_eq!(self.index, self.rebuilt(), "incremental index drifted");
+                assert_eq!(
+                    self.duplicate_via_index(),
+                    self.duplicate_linear(),
+                    "the duplicate-name gate condition disagrees with the \
+                     property it stands for; `any_duplicate_class_name` would \
+                     let `retarget_instance_field_to_receiver` skip a receiver \
+                     it must retarget"
+                );
             }
         }
 
@@ -1291,6 +1320,139 @@ static ANY_CLASS_REDEFINED: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn any_class_redefined() -> bool {
     ANY_CLASS_REDEFINED.load(Ordering::Relaxed)
+}
+
+/// Set the first time two *distinct* `ClassId`s are simultaneously loaded
+/// under the same binary name — i.e. the first time a loader split produces a
+/// duplicate-name class.
+///
+/// # Why this exists
+///
+/// `interpreter::field_access::retarget_instance_field_to_receiver` runs on
+/// **every** `getfield`/`putfield` whose receiver class differs from the
+/// resolved field's declaring class — the ordinary case for any *inherited*
+/// field, which is most of them in real OO bytecode. Its whole job is the
+/// loader-split case: it bails immediately unless the receiver class and the
+/// resolved declaring class have the **same name** under **different**
+/// `ClassId`s. Reaching that bail costs a `class_manager` read lock, three
+/// class lookups and a constant-pool walk, and it is paid per field access.
+///
+/// Measured on `probes/FieldShape.java` (`--nojit`, min-of-9, arms
+/// interleaved in both orders): an inherited-field get+put pair cost 54 / 78
+/// / 103 ns more than an own-class pair across three runs, with nothing else
+/// differing between the arms. `CRATONVM_DBG_HOTPATH_COUNTS=1` reported
+/// `retarget_field=3000000` on a run with exactly three million field
+/// accesses — one call per access.
+///
+/// This latch answers "can that situation exist at all in this process" with
+/// one relaxed load. It is maintained precisely rather than heuristically:
+/// `ClassManager::name_definitions` already indexes name -> set of defining
+/// `ClassId`s (two loaders mapping one name to the *same* id still reads as
+/// unique, by design), so the condition is exactly "some name has more than
+/// one distinct id".
+///
+/// # Never reset
+///
+/// Unloading a duplicate can take a name back down to one id, but the latch
+/// stays raised. That direction is the safe one: a raised latch merely
+/// restores the pre-latch behaviour (the full retarget walk runs and answers
+/// correctly), whereas a lowered one could skip a retarget that was still
+/// needed. Same policy, and the same reasoning, as [`any_class_redefined`].
+/// One bit per dense class id: "this class's internal name starts with
+/// `java/util/`". Set once at definition; read lock-free by the interpreter's
+/// virtual-invoke tier-up gate, which used to take a class-manager read lock
+/// and do a string prefix compare on every cache hit to answer the same
+/// question (`receiver_is_java_util`). Ids at or beyond the covered range
+/// (proxies live at `0x8000_0000+`) answer `None`, and the caller keeps the
+/// old locked path for them.
+const JAVA_UTIL_BITMAP_WORDS: usize = 1 << 14; // 1 M class ids, 128 KiB
+#[allow(clippy::declare_interior_mutable_const)]
+const JAVA_UTIL_ZERO: AtomicU64 = AtomicU64::new(0);
+static JAVA_UTIL_CLASS_BITS: [AtomicU64; JAVA_UTIL_BITMAP_WORDS] = [JAVA_UTIL_ZERO; JAVA_UTIL_BITMAP_WORDS];
+
+/// Record that `id` names a `java/util/` class (no-op out of range).
+fn note_java_util_class(id: ClassId) {
+    let i = id.as_u32() as usize;
+    if i >> 6 < JAVA_UTIL_BITMAP_WORDS {
+        JAVA_UTIL_CLASS_BITS[i >> 6].fetch_or(1u64 << (i & 63), Ordering::Relaxed);
+    }
+}
+
+/// Whether class `id` was defined under `java/util/`: `Some(bool)` for ids the
+/// bitmap covers, `None` otherwise. One relaxed load, no lock.
+#[inline]
+pub fn class_is_java_util(id: ClassId) -> Option<bool> {
+    let i = id.as_u32() as usize;
+    if i >> 6 < JAVA_UTIL_BITMAP_WORDS {
+        Some(JAVA_UTIL_CLASS_BITS[i >> 6].load(Ordering::Relaxed) & (1u64 << (i & 63)) != 0)
+    } else {
+        None
+    }
+}
+
+static ANY_DUPLICATE_CLASS_NAME: AtomicBool = AtomicBool::new(false);
+
+/// True once two distinct `ClassId`s have shared a binary name. Single
+/// relaxed load — the fast-path gate for loader-split field retargeting.
+#[inline]
+pub fn any_duplicate_class_name() -> bool {
+    ANY_DUPLICATE_CLASS_NAME.load(Ordering::Relaxed)
+}
+
+/// Set the first time a class named `java/lang/annotation/AnnotationProxy` is
+/// defined anywhere in the process.
+///
+/// # Why a latch, when there is already an epoch-keyed negative
+///
+/// `ClassRealm::is_annotation_proxy_class` gates a correctness decision on
+/// **every** `invokevirtual`/`invokeinterface` that hits the inline cache: an
+/// annotation proxy has no bytecode for the `Annotation` contract, so a cached
+/// virtual target must never serve one. Its own doc says "steady state is one
+/// relaxed load and one `u32` compare" — but that steady state is only reached
+/// once the class *exists*. `AnnotationProxy` is a VM-internal synthetic class
+/// that most programs never mint, so the realm's `annotation_proxy_cid` hint
+/// stays `u32::MAX` for the life of the process and every virtual invoke falls
+/// into the cold resolver.
+///
+/// The cold resolver is `#[cold]` — an out-of-line call — and does two atomic
+/// loads before it can answer, so the advertised "one relaxed load and one
+/// `u32` compare" is not what the common case pays. Its negative cache is
+/// additionally keyed on [`class_definition_epoch`], bumped by **every class
+/// definition**, so while classes are loading the first virtual invoke after
+/// each definition also takes a `class_manager` read lock and probes the name
+/// across the builtin loader delegation chain. (That is O(classes defined),
+/// **not** O(invokes) — the resolver stamps the epoch on its negative. Said
+/// plainly here because the first draft of this note claimed the latter.)
+///
+/// This latch answers the epoch-independent half of the question — *can* the
+/// class exist at all — in one relaxed load. It deliberately does **not**
+/// replace the per-realm `annotation_proxy_cid`: two VMs in one process mint
+/// the class independently and must not share an id. A realm that has not yet
+/// minted one simply performs the same lookup it does today, and only once the
+/// latch is raised.
+///
+/// Never reset, for the same reason as [`ANY_CLASS_REDEFINED`]: a raised latch
+/// restores the pre-latch behaviour exactly, a lowered one could skip a live
+/// annotation proxy.
+static ANY_ANNOTATION_PROXY_DEFINED: AtomicBool = AtomicBool::new(false);
+
+/// True once `java/lang/annotation/AnnotationProxy` has been defined anywhere
+/// in this process. Single relaxed load — the fast-path gate for
+/// `ClassRealm::is_annotation_proxy_class`.
+#[inline]
+pub fn any_annotation_proxy_defined() -> bool {
+    ANY_ANNOTATION_PROXY_DEFINED.load(Ordering::Relaxed)
+}
+
+/// Raise [`ANY_DUPLICATE_CLASS_NAME`]. Called from the two places that can
+/// make a name resolve to a second `ClassId`: the per-insert hook and the
+/// unload path's index rebuild.
+#[inline]
+fn note_duplicate_class_name() {
+    // Relaxed store against a relaxed load: the flag only ever goes
+    // false -> true, and a reader that misses the transition falls back to
+    // the authoritative walk, which is the pre-latch behaviour.
+    ANY_DUPLICATE_CLASS_NAME.store(true, Ordering::Relaxed);
 }
 
 /// Generation of the class-name -> `ClassId` mapping.
@@ -9236,17 +9398,35 @@ impl ClassManager {
             }
         }
         let name = Arc::clone(&key.1);
+        // One name comparison on the class-DEFINITION path (cold: at most a
+        // few thousand times per process) buys `is_annotation_proxy_class` a
+        // one-relaxed-load answer on the virtual-invoke path (hot: millions of
+        // times per second). See `ANY_ANNOTATION_PROXY_DEFINED`.
+        if is_vm_annotation_carrier_name(&name) {
+            ANY_ANNOTATION_PROXY_DEFINED.store(true, Ordering::Relaxed);
+        }
+        if name.starts_with("java/util/") {
+            note_java_util_class(id);
+        }
         let displaced = self.loaded_classes.insert(key, id);
         bump_class_definition_epoch();
         if let Some(old) = displaced {
             release_name_definition(&mut self.name_definitions, &name, old);
         }
-        *self
-            .name_definitions
-            .entry(name)
-            .or_default()
-            .entry(id)
-            .or_insert(0) += 1;
+        // `distinct` is the number of *different* `ClassId`s this name now
+        // resolves to. Two loaders mapping one name to the same id keep it at
+        // 1 (the inner map is keyed by id, refcounted by loader), so this is
+        // exactly the loader-split condition `any_duplicate_class_name`
+        // reports. Reading it here costs nothing: the `entry` walk that
+        // maintains the index is already being done.
+        let distinct = {
+            let per_name = self.name_definitions.entry(name).or_default();
+            *per_name.entry(id).or_insert(0) += 1;
+            per_name.len()
+        };
+        if distinct > 1 {
+            note_duplicate_class_name();
+        }
         displaced
     }
 
@@ -9275,6 +9455,9 @@ impl ClassManager {
                 .or_default()
                 .entry(id)
                 .or_insert(0) += 1;
+        }
+        if index.values().any(|ids| ids.len() > 1) {
+            note_duplicate_class_name();
         }
         self.name_definitions = index;
     }
@@ -9379,6 +9562,62 @@ impl ClassManager {
     /// The number of classes currently loaded.
     pub fn loaded_count(&self) -> usize {
         self.class_store.len()
+    }
+
+    /// Is any currently-loaded class a member of `package_slash` (e.g.
+    /// `"java/sql"`, `""` for the default package)?
+    ///
+    /// This is the DEFINITION question `ClassLoader.getDefinedPackage` asks,
+    /// and it is not the same as the visibility question
+    /// `find_all_resource_urls` answers: a package whose class files sit in the
+    /// boot image but none of whose classes has been loaded is visible and NOT
+    /// defined, exactly as on HotSpot, where a loader defines a package when it
+    /// defines a class in it.
+    ///
+    /// Immediate members only — `java/sql` does not answer for
+    /// `java/sql/rowset/Foo`, matching the JDK's flat package namespace.
+    ///
+    /// O(loaded classes). Called only from the `getDefinedPackage` /
+    /// `getDefinedPackages` family, which is not a hot path; deliberately NOT
+    /// memoised, because classes keep loading and a memo would freeze the
+    /// answer a package had before its first class arrived.
+    /// [`Self::any_loaded_class_in_package`], narrowed to the classes ONE
+    /// loader defined.
+    ///
+    /// `loader_native_id` is `ClassLoaderId::to_native_id()`'s flat value, the
+    /// same numbering `NativeContext::loader_id_of_class` reports and
+    /// `classloader::loader_namespace_id` hands out — so a user-defined
+    /// loader's own id (>= 3) selects exactly the classes IT defined, and
+    /// nothing a parent or the application loader defined.
+    ///
+    /// This is the question `ClassLoader.getDefinedPackage` asks of a CUSTOM
+    /// loader. The unscoped form cannot answer it: `com.example.app` has a
+    /// loaded class in every run, and answering `true` for a loader that
+    /// defined none of them is the "any package I can see" error one arm over.
+    pub fn any_loaded_class_in_package_for_loader(
+        &self,
+        package_slash: &str,
+        loader_native_id: u32,
+    ) -> bool {
+        self.class_store.iter().any(|c| {
+            c.loader_id.to_native_id() == loader_native_id
+                && match c.name.rsplit_once('/') {
+                    Some((pkg, _)) => pkg == package_slash,
+                    None => package_slash.is_empty(),
+                }
+        })
+    }
+
+    pub fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        self.class_store.iter().any(|c| {
+            // Array classes (`[Ljava/lang/String;`) are members of no package
+            // for this purpose; the leading `[` keeps them from matching a
+            // real name anyway.
+            match c.name.rsplit_once('/') {
+                Some((pkg, _)) => pkg == package_slash,
+                None => package_slash.is_empty(),
+            }
+        })
     }
 
     /// Register a class name → id mapping for a given loader.
@@ -9542,7 +9781,36 @@ impl ClassManager {
                 | "java/lang/ProcessHandle"
                 | "java/lang/ProcessHandle$Info"
         );
-        let access_flags = if (name.contains("$") && !is_concrete_dollar_class)
+        let access_flags = if jdk_superclass(name) == "java/lang/Enum" {
+            // ACC_ENUM, derived from the superclass row rather than from a
+            // second list of enum names — one fact, one place. It must be
+            // tested BEFORE the `$`/`able` heuristics: `HttpClient$Version`
+            // contains a `$` and would otherwise be fabricated as an INTERFACE.
+            //
+            // `native-builtins`' `class_is_declared_enum` requires BOTH
+            // `ACC_ENUM` and a `java/lang/Enum` parent, and it gates
+            // `Class.getEnumConstants`, which `EnumSet.allOf` reads through.
+            // Without the flag a synthetic enum publishes its constants and
+            // answers `name()`, `ordinal()` and `values()` correctly while
+            // `X.class.isEnum()` is false and `getEnumConstants()` is null.
+            //
+            // That was true of EVERY synthetic JDK enum, including
+            // `PosixFilePermission`, which has been the model for the others
+            // since it landed — measured 2026-09-02 with
+            // `apps/probes/SyntheticEnumSurface` and `TuDiag`:
+            //
+            //     TimeUnit             isEnum=false getEnumConstants=null allOf=0
+            //     DayOfWeek            isEnum=false getEnumConstants=null allOf=0
+            //     PosixFilePermission  isEnum=false getEnumConstants=null allOf=0
+            //     a user-defined enum  isEnum=true  getEnumConstants=2    allOf=2
+            //
+            // A real enum's class file carries `ACC_ENUM` and `ACC_FINAL`, and
+            // `SUPER` is set on every modern class file.
+            ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::SUPER
+                | ClassAccessFlags::FINAL
+                | ClassAccessFlags::ENUM
+        } else if (name.contains("$") && !is_concrete_dollar_class)
             || name.ends_with("able")
             || is_known_jdk_interface
         {
@@ -10989,6 +11257,30 @@ fn jdk_superclass(name: &str) -> &'static str {
         // java.nio.file.attribute — enum PosixFilePermission extends Enum
         "java/nio/file/attribute/PosixFilePermission" => "java/lang/Enum",
 
+        // The three enums added 2026-09-02 with `enum_constant_fields`. This
+        // row is not decoration: `Enum.name()`/`ordinal()`/`compareTo()` are
+        // registered on `java/lang/Enum`, so a stub without it publishes its
+        // constants correctly and then answers `NoSuchMethodError` the moment
+        // anyone calls `name()` on one — measured for both `HttpClient` enums
+        // before this row existed, with `MONDAY` working beside them.
+        //
+        // It is the same row `posix_publish_constants`' doc calls out as the
+        // thing that made an INVERTED name/ordinal pair merely latent rather
+        // than fatal: "one missing superclass row, or one enum copied from this
+        // model without that row, and every constant is NAMELESS".
+        //
+        // `TimeUnit` is here for the same reason though it long predates them:
+        // it had a full field table, a `<clinit>` and working `name()`/
+        // `ordinal()`/`values()`, and no superclass row — so
+        // `class_is_declared_enum` (which requires ACC_ENUM *and* a
+        // `java/lang/Enum` parent) said false, `Class.getEnumConstants`
+        // returned null, and `EnumSet.allOf(TimeUnit.class)` answered 0 against
+        // HotSpot's 7 while every direct use of the enum was correct.
+        "java/time/DayOfWeek"
+        | "java/net/http/HttpClient$Version"
+        | "java/net/http/HttpClient$Redirect"
+        | "java/util/concurrent/TimeUnit" => "java/lang/Enum",
+
         // Number type hierarchy
         "java/lang/Integer" | "java/lang/Long" | "java/lang/Short" | "java/lang/Byte"
         | "java/lang/Float" | "java/lang/Double" => "java/lang/Number",
@@ -11262,13 +11554,51 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/lang/Boolean" | "java/lang/Character" => {
             &["java/io/Serializable", "java/lang/Comparable"]
         }
+        // The RANDOM-ACCESS lists. `ArrayList`, `Vector` and
+        // `CopyOnWriteArrayList` all declare `implements RandomAccess` on
+        // HotSpot; `LinkedList` deliberately does not, which is why it is no
+        // longer grouped with them.
+        //
+        // `RandomAccess` is a marker with no methods, and grouping the four
+        // cost the three that have it exactly that marker — measured
+        // 2026-09-02 in `--synthetic-jdk`:
+        //
+        //     ArrayList instanceof RandomAccess   HotSpot true   CratonVM false
+        //     Collections.unmodifiableList(list)  HotSpot $UnmodifiableRandomAccessList
+        //                                         CratonVM $UnmodifiableList
+        //
+        // The `Collections` code was right in both: `unmodifiableList` picks
+        // its view class BY that marker. And the marker is not decoration —
+        // `Collections.binarySearch`, `reverse`, `shuffle` and `fill` each
+        // branch on it to choose indexed access over an iterator, so an
+        // `ArrayList` without it silently took the linked-list path in every
+        // one. `W7-63-jca-advertise-vs-serve.md` §8 records that
+        // `--synthetic-jdk` "has never been built by any lane"; it builds, and
+        // this is what the first run of it found.
         "java/util/ArrayList"
-        | "java/util/LinkedList"
         | "java/util/Vector"
         | "java/util/concurrent/CopyOnWriteArrayList" => &[
             "java/util/List",
             "java/util/Collection",
             "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/lang/Cloneable",
+            "java/io/Serializable",
+        ],
+        // `LinkedList` — no `RandomAccess`, matching HotSpot.
+        //
+        // It is also a `Deque` there (and so a `Queue`), and that is NOT added
+        // here on purpose: this VM's `LinkedList` carries most of the deque
+        // surface (`addFirst`/`addLast`/`pollFirst`/`pollLast`/`removeFirst`/
+        // `removeLast`/`descendingIterator`) and not all of it, so declaring
+        // the interface would turn a clean `ClassCastException` into a missing
+        // method at the point of use — a worse divergence than the one it
+        // closes. Left as a named gap rather than a half-kept promise.
+        "java/util/LinkedList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/lang/Cloneable",
             "java/io/Serializable",
         ],
         // A map view is a `Collection`, and deliberately NOT a `List` — that
@@ -11304,22 +11634,49 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/Collection",
             "java/lang/Iterable",
         ],
+        // The SORTED maps, split out for the same reason as the sorted sets
+        // below and the `ArrayList`/`LinkedList` split further down: a group
+        // costs its members the markers that distinguish them. Measured in
+        // `--synthetic-jdk` with `apps/probes/CollectionViewTypes` —
+        // `aTreeMap instanceof SortedMap` was `false`, so `firstKey()`,
+        // `headMap()` and `comparator()` were all unreachable through the
+        // interface and `(SortedMap<?, ?>) aTreeMap` threw.
+        "java/util/TreeMap" | "java/util/concurrent/ConcurrentSkipListMap" => &[
+            "java/util/NavigableMap",
+            "java/util/SortedMap",
+            "java/util/Map",
+            "java/io/Serializable",
+        ],
         "java/util/HashMap"
         | "java/util/LinkedHashMap"
-        | "java/util/TreeMap"
         | "java/util/IdentityHashMap"
         | "java/util/WeakHashMap"
         | "java/util/EnumMap"
-        | "java/util/concurrent/ConcurrentHashMap"
-        | "java/util/concurrent/ConcurrentSkipListMap" => {
+        | "java/util/concurrent/ConcurrentHashMap" => {
             &["java/util/Map", "java/io/Serializable"]
         }
+        // The SORTED sets, split out of the group below for the reason the
+        // `ArrayList`/`LinkedList` split above records: a group costs its
+        // members exactly the markers that distinguish them. `TreeSet` and
+        // `ConcurrentSkipListSet` are `NavigableSet`s (and so `SortedSet`s) on
+        // HotSpot and were neither here — measured with
+        // `apps/probes/CollectionViewTypes` in `--synthetic-jdk`:
+        // `TreeSet instanceof SortedSet` was `false`, so
+        // `(SortedSet<?>) aTreeSet` threw and `first()`/`last()`/`headSet` were
+        // unreachable through the interface. `EnumSet` and
+        // `CopyOnWriteArraySet` are plain `Set`s on HotSpot and stay below.
+        "java/util/TreeSet" | "java/util/concurrent/ConcurrentSkipListSet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
         "java/util/HashSet"
         | "java/util/LinkedHashSet"
-        | "java/util/TreeSet"
         | "java/util/EnumSet"
         | "java/util/concurrent/CopyOnWriteArraySet"
-        | "java/util/concurrent/ConcurrentSkipListSet"
         // `newKeySet()`'s product. Without `Set` here the synthetic stub is not
         // `instanceof Set`, and `AbstractSet.equals`'s "a Set equals only
         // another Set" guard answers false for a set that is plainly equal.
@@ -11397,6 +11754,111 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/io/Serializable",
         ],
         "java/util/Collections$SynchronizedMap" => &["java/util/Map", "java/io/Serializable"],
+        // The UNMODIFIABLE and IMMUTABLE views — `Collections.unmodifiable*`,
+        // `List/Set/Map.of`, `Arrays.asList`.
+        //
+        // None of these names had an arm here, so all of them fell to this
+        // match's `_ => &[]` default and declared NOTHING. That was invisible
+        // because `interpreter::typecheck::synthetic_implements` has a
+        // name-word fallback which reads `List` out of `UnmodifiableList` and
+        // `Set` out of `Set12` — so the coarse questions answered correctly and
+        // only the ones the NAME does not spell got the default. Measured in
+        // `--synthetic-jdk` against HotSpot 25.0.3 with
+        // `apps/probes/CollectionViewTypes` (24 rows x 10 interfaces):
+        //
+        //     unmodifiableList(ArrayList)  Iterable  HotSpot T  CratonVM F
+        //                                  RandomAccess         T          F
+        //     Arrays.asList                RandomAccess         T          F
+        //                                  Serializable         T          F
+        //     List.of(..)                  Iterable             T          F
+        //                                  RandomAccess         T          F
+        //     Set.of(..)                   Iterable             T          F
+        //
+        // A `Collection` that is not an `Iterable` is the worst of those: every
+        // for-each through an erased type is a `checkcast java/lang/Iterable`.
+        //
+        // The sets are FLATTENED, like the `ArrayList` arm above and unlike
+        // HotSpot's own class files, where `$UnmodifiableRandomAccessList`
+        // declares `RandomAccess` alone and inherits the rest. There is no
+        // superclass chain to inherit through here.
+        "java/util/Collections$UnmodifiableRandomAccessList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/io/Serializable",
+        ],
+        // The non-random-access twin. Listed separately and NOT grouped with
+        // the arm above: the whole point of the pair is the one marker that
+        // differs, and grouping four list classes that way is what cost
+        // `ArrayList` its `RandomAccess` until 2026-09-02 (see that arm).
+        "java/util/Collections$UnmodifiableList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableCollection" => &[
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableSet" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableSortedSet" => &[
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableNavigableSet" => &[
+            "java/util/NavigableSet",
+            "java/util/SortedSet",
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/Collections$UnmodifiableMap" => &["java/util/Map", "java/io/Serializable"],
+        "java/util/Collections$UnmodifiableSortedMap" => &[
+            "java/util/SortedMap",
+            "java/util/Map",
+            "java/io/Serializable",
+        ],
+        // `Arrays.asList`'s view. `RandomAccess` and `Serializable` were the
+        // two the name could not spell.
+        "java/util/Arrays$ArrayList" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/io/Serializable",
+        ],
+        // `List.of(..)`. Both size forms, because they are supertype-identical
+        // on HotSpot — `List12` and `ListN` each extend
+        // `ImmutableCollections$AbstractImmutableList`, which is where their
+        // `RandomAccess` comes from, and nothing distinguishes them but size.
+        "java/util/ImmutableCollections$List12" | "java/util/ImmutableCollections$ListN" => &[
+            "java/util/List",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/util/RandomAccess",
+            "java/io/Serializable",
+        ],
+        "java/util/ImmutableCollections$Set12" | "java/util/ImmutableCollections$SetN" => &[
+            "java/util/Set",
+            "java/util/Collection",
+            "java/lang/Iterable",
+            "java/io/Serializable",
+        ],
+        "java/util/ImmutableCollections$Map1" | "java/util/ImmutableCollections$MapN" => {
+            &["java/util/Map", "java/io/Serializable"]
+        }
         "java/util/Collections$SingletonList" | "java/util/Collections$EmptyList" => &[
             "java/util/List",
             "java/util/Collection",
@@ -12231,6 +12693,28 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             })
             .collect()
+    }
+
+    /// The static fields a synthetic JDK enum needs: one per constant, in
+    /// declaration (= ordinal) order, plus the `$VALUES` array its `<clinit>`
+    /// publishes and `EnumSet.allOf` / `Class.getEnumConstants` read.
+    ///
+    /// One builder rather than a hand-written list per enum, for the reason
+    /// `publish_synthetic_enum_constants` gives on the other half of this pair:
+    /// the enum stubs that predate it are the survivors of copies that drifted.
+    fn enum_constant_fields(descriptor: &str, constants: &[&str]) -> Vec<ClassFileField> {
+        let mk = |n: &str, d: &str| ClassFileField {
+            access_flags: FieldAccessFlags::PUBLIC
+                | FieldAccessFlags::STATIC
+                | FieldAccessFlags::FINAL,
+            name: cratonvm_types::intern_arc(n),
+            descriptor: cratonvm_types::intern_arc(d),
+            attributes: vec![],
+        };
+        let mut fields: Vec<ClassFileField> =
+            constants.iter().map(|c| mk(c, descriptor)).collect();
+        fields.push(mk("$VALUES", &format!("[{descriptor}")));
+        fields
     }
 
     fn named_field(name: &str, descriptor: &str) -> ClassFileField {
@@ -13474,6 +13958,21 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                     attributes: vec![],
                 });
             }
+            // `$VALUES`, added 2026-09-02. Its absence was the last row of
+            // `apps/probes/SyntheticEnumSurface`: every direct use of TimeUnit
+            // worked — `MILLISECONDS.name()`, `toNanos`, `values()` — while
+            // `EnumSet.allOf(TimeUnit.class)` answered 0 against HotSpot's 7,
+            // because `Class.getEnumConstants` reads `$VALUES` and
+            // `set_static_field_by_name` is a silent no-op on a static this
+            // table never declared. The clinit's publish is the other half.
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: cratonvm_types::intern_arc("$VALUES"),
+                descriptor: cratonvm_types::intern_arc("[Ljava/util/concurrent/TimeUnit;"),
+                attributes: vec![],
+            });
             fields
         }
         // java.lang.ref: Reference = 2 fields (referent=0, queue=1)
@@ -13733,6 +14232,54 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             instance_fields(2)
         }
 
+        // Three JDK enums the synthetic model did not carry, added 2026-09-02.
+        //
+        // A synthetic JDK enum needs its constants DECLARED as statics here (so
+        // `GETSTATIC` resolves) and POPULATED by a native `<clinit>` (so the
+        // resolved value is not null) — `native-builtins`'
+        // `publish_synthetic_enum_constants` is the second half, and one
+        // without the other is worse than neither: a declared-but-unpopulated
+        // constant turns `NoSuchFieldError` into a NULL enum, which is exactly
+        // the shape two stale tests were asserting when they passed a null
+        // TimeUnit and a null Class.
+        //
+        // Measured absent by `apps/probes/SyntheticEnumSurface`:
+        // `DayOfWeek.MONDAY`, `HttpClient$Version.HTTP_1_1` and
+        // `HttpClient$Redirect.NEVER` were each `NoSuchFieldError` in
+        // `--synthetic-jdk` while `TimeUnit.MILLISECONDS` (which HAS a table
+        // here) worked.
+        //
+        // DECLARATION ORDER IS THE ORDINAL, and it is `javap` order on
+        // 25.0.3+9, not alphabetical: `compareTo`, `EnumMap` and `EnumSet` all
+        // key on it.
+        //
+        // `$VALUES` is declared alongside, unlike the `PosixFilePermission`
+        // block below — whose own doc records that omitting it makes the
+        // `<clinit>`'s `$VALUES` publish a silent no-op, because
+        // `set_static_field_by_name` resolves a DECLARED static and does
+        // nothing otherwise. `EnumSet.allOf` and `Class.getEnumConstants` read
+        // `$VALUES`, so without the declaration they answer empty.
+        "java/time/DayOfWeek" => enum_constant_fields(
+            "Ljava/time/DayOfWeek;",
+            &[
+                "MONDAY",
+                "TUESDAY",
+                "WEDNESDAY",
+                "THURSDAY",
+                "FRIDAY",
+                "SATURDAY",
+                "SUNDAY",
+            ],
+        ),
+        "java/net/http/HttpClient$Version" => enum_constant_fields(
+            "Ljava/net/http/HttpClient$Version;",
+            &["HTTP_1_1", "HTTP_2"],
+        ),
+        "java/net/http/HttpClient$Redirect" => enum_constant_fields(
+            "Ljava/net/http/HttpClient$Redirect;",
+            &["NEVER", "ALWAYS", "NORMAL"],
+        ),
+
         // Spring Boot 3 JarFileArchive.<clinit> reads PosixFilePermission.OWNER_* statics.
         // When the JDK image is unavailable we fall back to a synthetic stub; declare
         // the enum constants so GETSTATIC resolves, and wire values from a native <clinit>
@@ -13748,7 +14295,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 ),
                 attributes: vec![],
             };
-            vec![
+            let mut fields = vec![
                 mk("OWNER_READ"),
                 mk("OWNER_WRITE"),
                 mk("OWNER_EXECUTE"),
@@ -13758,7 +14305,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 mk("OTHERS_READ"),
                 mk("OTHERS_WRITE"),
                 mk("OTHERS_EXECUTE"),
-            ]
+            ];
+            // `$VALUES`, 2026-09-02 — the declaration `posix_publish_constants`
+            // nominated and wrote its publish against: "this table declares the
+            // nine constants for this stub but NOT `$VALUES` … so the `$VALUES`
+            // publish below currently goes nowhere on the synthetic side … the
+            // declaration is nominated; the publish is written now so it starts
+            // working the moment that lands."
+            //
+            // It lands here. Nothing else changes: that `<clinit>` already
+            // writes both spellings, and `values()` reads the nine statics
+            // directly either way. What it fixes is `Class.getEnumConstants`,
+            // which reads `$VALUES` and answered null — invisible until
+            // `create_synthetic_stub` started setting ACC_ENUM in this same
+            // change, because `class_is_declared_enum` refused before it ever
+            // looked for the array.
+            fields.push(ClassFileField {
+                access_flags: FieldAccessFlags::PUBLIC
+                    | FieldAccessFlags::STATIC
+                    | FieldAccessFlags::FINAL,
+                name: cratonvm_types::intern_arc("$VALUES"),
+                descriptor: cratonvm_types::intern_arc(
+                    "[Ljava/nio/file/attribute/PosixFilePermission;",
+                ),
+                attributes: vec![],
+            });
+            fields
         }
 
         // `Files.getOwner` on Windows returns one of these. Field NAMES (not

@@ -55,7 +55,7 @@ impl Compiler {
         if self.next_spill_offset < args_frame_top {
             self.next_spill_offset = args_frame_top;
         }
-        let base = self.reserve_spill_slots(arg_slots.len())?;
+        let base = self.reserve_spill_slots(arg_slots.len(), SpillReason::CallService)?;
         let end = base.checked_add((arg_slots.len() as i32).checked_mul(8)?)?;
         for slot in arg_slots {
             if let StackSlot::Frame(off) = slot {
@@ -155,6 +155,8 @@ impl Compiler {
             spill_hi: self.spill_limit_offset,
             callee_saved_lo: self.callee_saved_base,
             callee_saved_hi,
+            // x86-64 geometry: the save area is the DEEPEST region.
+            callee_saved_shallow: false,
             xmm_saved_lo: self.xmm_saved_base,
             xmm_saved_hi,
             reg_spill_lo: self.reg_spill_base,
@@ -657,7 +659,14 @@ impl Compiler {
             // we are still in the prologue (params already homed), so this is a
             // register-safe place to keep the actual fetch.
             self.shadow_fetch_start = self.buf.pos();
-            self.emit_call_absolute(self.helpers.get_current_thread);
+            // 2026-09-02: one `mov rax, gs:[disp]` through the `JIT_THREAD`
+            // mirror where the VM publishes it; the helper call otherwise.
+            let tls_disp = jit_thread_tls_disp();
+            if tls_disp != 0 {
+                self.emit_mov_rax_tls_disp32(tls_disp as u32);
+            } else {
+                self.emit_call_absolute(self.helpers.get_current_thread);
+            }
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
             // Save the shadow `top` watermark (RAX = thread). The epilogue
             // restores it, unwinding any unbalanced safepoint push this method
@@ -680,6 +689,18 @@ impl Compiler {
             self.jit_thread_slot_off != 0 && self.helpers.get_current_thread != 0;
         let has_floor_cache =
             self.stack_floor_slot_off != 0 && self.helpers.native_stack_floor_fn != 0;
+        // 2026-09-02: where the `JIT_THREAD` mirror is published, the thread
+        // cache is ONE segment-prefixed load on every entry -- cheaper than the
+        // inherit proof below (two imm64 compares and a frame chase), so the
+        // thread slot leaves the inherit path entirely and only the stack
+        // floor still inherits.
+        let tls_disp = jit_thread_tls_disp();
+        let thread_via_tls = has_thread_cache && tls_disp != 0;
+        if thread_via_tls {
+            self.emit_mov_rax_tls_disp32(tls_disp as u32);
+            self.emit_store_local(self.jit_thread_slot_off, RAX);
+        }
+        let has_thread_cache = has_thread_cache && !thread_via_tls;
         let can_inherit = self_cache_inherit_enabled() && (has_thread_cache || has_floor_cache);
         let mut external_entry_patches = Vec::new();
         let mut inherited_done = None;

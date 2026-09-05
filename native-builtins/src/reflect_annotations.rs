@@ -324,6 +324,41 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             );
         }
         ctx.set_field_by_name(*this, "filter", Value::Object(None));
+        // `private final LogManager manager = LogManager.getLogManager();` is
+        // this class's FIRST field initializer, and a native `<init>` skips it
+        // for the same reason it skipped `errorManager` below. MEASURED, both
+        // modes, `probes/JulHandlerLevel.java`:
+        //
+        //   Handler.manager   HotSpot  LogManager
+        //                     --jdk-only  LogManager   (the real ctor runs:
+        //                                               this registration is
+        //                                               a SyntheticStub and
+        //                                               strict refuses it)
+        //                     compatible  null
+        //
+        // So the gap was compatible-mode only, and closing it converges the two
+        // modes rather than inventing anything: the value written is the same
+        // singleton `LogManager.getLogManager()` answers.
+        //
+        // Same two guards as `errorManager`: the field must EXIST (a synthetic
+        // `Handler` has no `manager`, and `get_field_by_name` cannot tell
+        // "absent" from "null"), and it must still be null, so a real
+        // constructor that did run is never clobbered. `this` is re-read
+        // through a pin because building the singleton allocates.
+        let handler_class_for_manager = ctx.class_id_of_object(*this);
+        if ctx
+            .resolve_field_index_by_class_id(handler_class_for_manager, "manager")
+            .is_some()
+            && matches!(ctx.get_field_by_name(*this, "manager"), Value::Object(None))
+        {
+            let this_pin = ctx.pin_native_root(*this);
+            let manager = crate::logmanager::jul_log_manager_singleton(ctx);
+            let this_live = ctx.read_native_pin(this_pin, *this);
+            ctx.unpin_native_roots(this_pin);
+            if let Some(manager) = manager {
+                ctx.set_field_by_name(this_live, "manager", Value::Object(Some(manager)));
+            }
+        }
         // `java.util.logging.Handler`'s third field initializer is
         // `private volatile ErrorManager errorManager = new ErrorManager();`
         // — and a native `<init>` replaces the real constructor wholesale, so
@@ -3252,10 +3287,28 @@ fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// Built-in / null loaders keep the identity-hash namespace.
 pub(crate) fn proxy_loader_namespace(ctx: &mut dyn NativeContext, loader_obj: ObjectRef) -> u32 {
     if crate::classloader::is_user_defined_loader(ctx, loader_obj) {
-        crate::classloader::loader_namespace_id(ctx, loader_obj)
-    } else {
-        ctx.identity_hash_code(loader_obj) as u32
+        return crate::classloader::loader_namespace_id(ctx, loader_obj);
     }
+    // The PLATFORM loader is the one built-in whose identity a proxy can now
+    // arrive with: `Proxy.newProxyInstance(Connection.class.getClassLoader(),
+    // ...)` hands it over since `Class.getClassLoader()` started reporting the
+    // platform loader for platform-module classes. Registering that proxy under
+    // an identity-hash namespace makes `Class.getClassLoader()` unable to find
+    // a loader object for it (`loader_object_for_namespace_id` only knows
+    // user-defined ids) and fall back to the application loader:
+    //
+    //   Proxy over java.sql.Connection, getClass().getClassLoader()
+    //     HotSpot PlatformClassLoader        was AppClassLoader
+    //
+    // `NATIVE_EXTENSION` is the id `loader_namespace_id` already assigns this
+    // loader, and the one `native_class_get_class_loader`'s `loader_type == 1`
+    // arm decodes straight back to the platform singleton. Scoped to the
+    // platform loader on purpose: every other built-in keeps the identity-hash
+    // namespace this function has always given it.
+    if crate::classloader::is_platform_loader_object(ctx, loader_obj) {
+        return cratonvm_types::ClassLoaderId::NATIVE_EXTENSION;
+    }
+    ctx.identity_hash_code(loader_obj) as u32
 }
 
 // ---------------------------------------------------------------------------

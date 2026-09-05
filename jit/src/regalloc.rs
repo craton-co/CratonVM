@@ -182,10 +182,11 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
         // <const>` is 6 bytes (extra 2-byte signed constant). The modified
         // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
-        // form. Currently latent — `jit_scan` rejects `wide`, so no compiled
-        // method contains it — but the length table must stay correct as
-        // defense-in-depth so every PC-stepping consumer stays in lockstep if
-        // `wide` is ever accepted. Keep the x64.rs `bytecode_len_at` twin in
+        // form. NOT latent, whatever this comment used to say: `jit_scan`
+        // accepts the widened load/store and `iinc` forms
+        // (`x64/bytecode_compat.rs`), so compiled methods DO contain `wide` and
+        // every PC-stepping consumer of this table is load-bearing rather than
+        // defensive. Keep the x64.rs `bytecode_len_at` twin in
         // sync.
         0xc4 => {
             if pc + 1 < code.len() && code[pc + 1] == 0x84 {
@@ -1099,13 +1100,13 @@ fn build_interference(
 /// contributes `LOOP_WEIGHT_PER_DEPTH^d`, capped at `MAX_LOOP_DEPTH_WEIGHT` to
 /// keep saturating arithmetic well-behaved and bound the influence of
 /// pathologically deep loops on register-allocation priorities.
-const LOOP_WEIGHT_PER_DEPTH: u32 = 10;
+pub const LOOP_WEIGHT_PER_DEPTH: u32 = 10;
 /// Cap on the loop-depth weight contributed by a single use.
 ///
 /// Corresponds to depth = 6 with `LOOP_WEIGHT_PER_DEPTH = 10` (=> 10^6).
 /// At this cap a deeply-nested use still dominates a non-loop use by 1e6×,
 /// which is more than enough for the graph-coloring spill heuristic.
-const MAX_LOOP_DEPTH_WEIGHT: u32 = 1_000_000;
+pub const MAX_LOOP_DEPTH_WEIGHT: u32 = 1_000_000;
 
 /// Count uses of each local in the bytecode, weighted by loop-nesting depth.
 ///
@@ -3883,6 +3884,46 @@ pub mod xmm_roles {
         }
     }
 
+    /// `ir_lower`'s **general-purpose** linear-scan file — the registers a
+    /// long-lived `int`/`long` value may be promoted into for a whole method.
+    ///
+    /// RBX and R12–R15, and every part of that choice is forced:
+    ///
+    ///   * **Callee-saved on both ABIs.** `ir_lower` emits calls constantly —
+    ///     runtime helpers, inline-cache dispatch, JIT-to-JIT direct calls —
+    ///     and this wiring has no reload machinery, so a value's register must
+    ///     survive a call by the calling convention rather than by analysis.
+    ///     That rules out every caller-saved register, including the otherwise
+    ///     obvious System V candidates RSI/RDI.
+    ///   * **Untouched by this emitter.** The value tier is RAX/RCX/RDX, the
+    ///     safepoint and shadow-stack scratch is R10/R11, and call arguments go
+    ///     in `ENTRY_ABI_REGS`. None of those overlaps this set.
+    ///   * RBP and RSP are excluded for the obvious reason. R13 is *included*:
+    ///     it is only awkward as an addressing BASE (no `mod=00` form), and
+    ///     nothing here uses one of these as a base.
+    ///
+    /// The frame stays authoritative — this is a write-through read cache,
+    /// exactly like [`IR_LINEAR_SCAN`] — so no oop map, deopt frame state or
+    /// phi copy changes. What does change is that the prologue must save these
+    /// and every exit restore them: see [`IR_GP_PROLOGUE_SAVED`].
+    ///
+    /// **`IrType::Ref` is never promoted**, and that is not a tuning choice. A
+    /// GC safepoint walks a frame it did not stop, through RBP, and
+    /// `OopMapEntry` can only name frame slots — so no reference may be
+    /// register-resident at one. The XMM file discharged that obligation
+    /// structurally, by having no register a `Ref` could occupy; a GP file has
+    /// to discharge it by refusing the type, which `plan_register_residency`
+    /// does and which its own test pins.
+    pub const IR_GP_LINEAR_SCAN: [u8; 5] = [3, 12, 13, 14, 15];
+
+    /// The GP registers `ir_lower::emit_prologue` saves and every exit
+    /// restores — all of [`IR_GP_LINEAR_SCAN`], because every one of them is
+    /// callee-saved on both ABIs and that is exactly why they were chosen.
+    ///
+    /// Unlike the XMM list this is not platform-conditional: System V and Win64
+    /// agree that RBX and R12–R15 belong to the caller.
+    pub const IR_GP_PROLOGUE_SAVED: &[u8] = &IR_GP_LINEAR_SCAN;
+
     /// The first register claimed by two of the three authorities, if any.
     ///
     /// The invariant this module exists to make checkable, as a value rather
@@ -4198,12 +4239,33 @@ pub struct LiveModel {
 
 /// Does this op define a value that needs a machine location?
 ///
-/// **Verbatim mirror of `ir_lower::op_defines_result_slot`**, including its
-/// omissions (`I2B`/`I2C`/`I2S`, `ArrayLength`, `NewArray` are absent there and
-/// absent here). The two lists must stay in lockstep: a value this predicate
-/// claims exists but `ir_lower` never allocates for has no home to spill to,
-/// and a value `ir_lower` allocates for but this predicate omits is invisible
-/// to the interference check. If that file's list changes, change this one.
+/// **Verbatim mirror of `ir_lower::op_defines_result_slot`.** The two lists
+/// must stay in lockstep: a value this predicate claims exists but `ir_lower`
+/// never allocates for has no home to spill to, and a value `ir_lower`
+/// allocates for but this predicate omits is invisible to the interference
+/// check.
+///
+/// # The comment that guarded against drift WAS the drift
+///
+/// This paragraph used to read "including its omissions (`I2B`/`I2C`/`I2S`,
+/// `ArrayLength`, `NewArray` are absent there and absent here)". `I2B`/`I2C`/
+/// `I2S` were and are absent from both. **`ArrayLength` and `NewArray` were
+/// present in `ir_lower`'s list the whole time**, so the two disagreed on every
+/// method containing an `arraylength` or a `newarray` — which is every counted
+/// loop written `for (i = 0; i < a.length; i++)`.
+///
+/// The consequence was silent and total: `plan_register_residency`'s agreement
+/// check compares `wants_loc` against `node_color`, and a single disagreement
+/// declines register residency **for the whole method**. With
+/// `CRATONVM_DBG_IR_LINEAR_SCAN=1` that showed as *"refused: liveness and
+/// colourer disagree about which values want a home"* on 5 of 5 array-touching
+/// probe kernels, while `BinTrees.itemCheck` — which touches no array —
+/// promoted 7 values fine. The check did its job; nothing was miscompiled, and
+/// the optimization was simply never available where arrays are.
+///
+/// The lockstep claim is enforced now rather than asserted:
+/// `the_two_value_defining_enumerations_agree` in `ir_lower`'s tests reads both
+/// function bodies out of the source and compares the sets.
 fn ir_op_defines_value(op: &Op) -> bool {
     matches!(
         op,
@@ -4241,7 +4303,12 @@ fn ir_op_defines_value(op: &Op) -> bool {
             | Op::Load(_)
             | Op::ArrayLoad(_)
             | Op::ArrayStore(_)
+            // Both of these are in `op_defines_result_slot` and were missing
+            // here, which is what made every array-touching method decline
+            // register residency. See this function's doc comment.
+            | Op::ArrayLength
             | Op::New { .. }
+            | Op::NewArray { .. }
             | Op::Call { .. }
             // cov-01 — mirrors `ir_lower::op_defines_result_slot`.
             | Op::ConstString { .. }
@@ -4779,6 +4846,31 @@ impl LiveModel {
             }
             self.pinned[id] = false;
             released += 1;
+        }
+        released
+    }
+    /// Release the STRUCTURAL pin on every phi, for a consumer that publishes
+    /// a promoted phi's register itself at every incoming edge (`ir_lower`'s
+    /// `emit_phi_copies` does, behind `CRATONVM_JIT_IR_PHI_RESIDENCY`). The
+    /// pin exists because no definition arm ever writes a phi; a consumer
+    /// that supplies that write at the edges has discharged the reason.
+    ///
+    /// Same caveat as [`Self::release_deopt_pins`]: the home layout must
+    /// still come from a colouring that keeps every phi in its own word,
+    /// which `ir_lower::plan_slots` does. A no-op on an unconverged model.
+    pub fn release_phi_pins(&mut self, graph: &Graph) -> usize {
+        if !self.converged {
+            return 0;
+        }
+        let mut released = 0usize;
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if !matches!(node.op, Op::Phi) {
+                continue;
+            }
+            if self.pinned.get(id).copied().unwrap_or(false) {
+                self.pinned[id] = false;
+                released += 1;
+            }
         }
         released
     }
@@ -6373,6 +6465,7 @@ mod linear_scan_tests {
                     exit: NO_NODE,
                     safepoints: Vec::new(),
                     uses: Default::default(),
+                    receiver_param: None,
                 },
                 live: LiveModel {
                     pos_of: Vec::new(),

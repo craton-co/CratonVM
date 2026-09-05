@@ -6,6 +6,32 @@ verified end to end on HotSpot 25.0.3.9 and on the release binary at
 `C:/craton/CratonVM/target/release/cratonvm.exe` (built 2026-08-12 00:21). The
 `native-builtins` change is a claim about source; it is not rebuilt here.
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** The `native-builtins` half was "a
+> claim about source; it is not rebuilt here". It has now been run, and the
+> instrument this record built did the job it was built for.
+>
+> ```text
+> PROBE-SECTIONS=28
+> PROBE-LEDGER=missing:0,undeclared:0,duplicate:0,multiline:0,unrenderable:0
+> ```
+>
+> Emitted identically by HotSpot 25 and by CratonVM `--real-jdk`, both at 872
+> lines with an EMPTY diff.
+>
+> **The ledger is what makes that empty diff mean something.** `W7-36`'s
+> differential went 43 -> 0 on this run. A zero from a differential is exactly
+> the shape this record exists to distrust — hole 1 was a probe whose two sides
+> were not the same class file, so lost lines read as agreement. `missing:0,
+> undeclared:0, duplicate:0` is the line that separates "agreed on 28 sections"
+> from "stopped early and agreed on nothing", and it is present on both sides.
+>
+> The nine markers §"RE-VERIFIED IN TREE" enumerates are in the restored probe,
+> and `PROBE-LEDGER` / `PROBE-SECTIONS` are the two that fired here.
+>
+> **Not covered:** the `[SUREFIRE-NPE]` forensic gate is still a source claim —
+> this run did not set `surefire_npe_trace_enabled()`, so hole 2's fix is
+> unexercised by it.
+
 Predecessor: W7-40-differential-at-14.md (which reported the two holes as two
 of its fourteen divergences), W7-33-differential-dead-sections.md (whose
 excised scratchpad copy of the probe is hole 1's mechanism),

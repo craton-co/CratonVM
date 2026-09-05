@@ -76,6 +76,72 @@ field count is `javap -p` against the JDK 25.0.3.9 image on the Windows host
 > holds; the ratchet it points at is `BOUND = 28`
 > (`native-api/tests/layout_alias_coverage.rs:947`).
 
+
+> **VERIFIED AGAINST A BINARY 2026-09-03. §9.3's owed run has been done.** That
+> section ended: *"the census is a source-level upper bound until somebody
+> executes `CRATONVM_DBG_LAYOUT_ALIAS=1` over a workload, which nobody has done
+> for this record, W7-66, W7-68, W7-73 or W7-90."* Somebody has now.
+>
+> **The banner's trap was avoided by checking, not by assuming.** It warns that
+> the shipping binary on the Windows host predates `layout_alias.rs` and that a
+> later lane running the flag against it "will get an empty transcript that
+> reads exactly like *the census is clean*". The binary used here was built from
+> this tree on 2026-09-03 and was probed for its own strings first —
+> `CRATONVM_DBG_LAYOUT_ALIAS`, `undeclared` and `explain-jdk-only` are all
+> **present**. The transcript below is not empty, which is itself the proof the
+> instrument is live.
+>
+> **The live census: 51 species, 216 observations**, over
+> `SlotIndexRecensusProbe` and `OverAllocationWidthProbe` — the two probes this
+> record names, recovered from a sibling worktree after `3b2901531` deleted
+> `probes/` from the checkout. The widest divergences, both directions:
+>
+> ```text
+> class                                       req   real   dir      obs   width
+> java/util/Properties                         16     32   under      2    -16
+> java/util/HashSet                             1     16   under     15    -15
+> jdk/internal/loader/…$PlatformClassLoader     7     21   under      2    -14
+> jdk/internal/loader/…$AppClassLoader          7     21   under      2    -14
+> java/lang/Thread                              5     19   under      1    -14
+> java/net/http/HttpClient                      9      0   undeclared 2     +9
+> sun/net/httpserver/HttpServerImpl             6     12   under      1     -6
+> java/util/TreeMap                             3      9   under     12     -6
+> java/util/HashMap$KeyIterator                10      5   over       8     +5
+> sun/nio/ch/EPollSelectorImpl                 23     18   over       1     +5
+> <unresolved:ClassId(0)>                       3      0   undeclared 15    +3
+>
+> over  19 species /  97 observations
+> under 19 species /  81 observations
+> undeclared (real_fields=0) 13 species / 38 observations
+> ```
+>
+> **Three things this measurement says that the source census could not.**
+>
+> * **The `under` side carries the wide divergences and the `over` side does
+>   not.** Every width past 6 is `under`; the widest `over` is +5. That is
+>   direct evidence for W7-66 §1's thesis that `over` is not on its own a defect
+>   predicate — and its mirror, that this record's own subject is where the
+>   width lives.
+> * **13 species allocate against a class the VM declares NO fields for**
+>   (`real_fields=0`) — `java/net/http/HttpClient`, `HttpRequest`, `Path`,
+>   `FileSystem`, `Stream`. A `+9` against an undeclared layout is a different
+>   species from a `+9` against a known one, and it is invisible to a `javap`
+>   oracle because the disagreement is with our own table, not with the JDK's.
+> * **15 observations name no class at all** — `<unresolved:ClassId(0)>`, the
+>   exact string the banner tested the old binary for. The site is live, the
+>   class id is 0, and the census cannot say what was allocated.
+>
+> **What this does NOT verify, and it is the load-bearing limit.** This record's
+> own headline is that **the detector sits on ONE allocation funnel and 511
+> direct allocation call sites in the native crates never reach it**. That is
+> unchanged. Everything above is therefore a **LOWER bound on live aliasing**,
+> not a census — including the claim that the widest LIVE over-allocation's
+> owner bypasses the detector, which by construction this instrument cannot see
+> and which is NOT adjudicated here. The four repaired sites are not
+> individually confirmed either: the instrument reports classes and call-site
+> chains, not the source sites §6 enumerates, so no row above is matched to a
+> row in this record. What is settled is that the run is possible, was done on
+> an instrumented binary, and is not empty.
 ## 1. The repair is real — verified, not taken on trust
 
 `native-builtins/src/util_concurrent_ext.rs`, the condition at the funnel:

@@ -304,6 +304,55 @@ pub fn host_view_i16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
 }
 
 /// Copy a Java `byte[]` into a packed host `Vec<i8>`.
+/// `char[]` -> `Vec<u16>`. Same packed 2-byte layout as `short[]`
+/// (`element_byte_size(ArrayElementType::Char) == 2`), so the same bulk
+/// copy is legal; the difference is only in how the VALUE is interpreted,
+/// and that lives in the PTX (`caload` zero-extends where `saload` sign-
+/// extends), not in the bytes moved here.
+pub fn host_view_u16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<u16> {
+    let header = heap.get_header(obj);
+    assert_eq!(
+        header.kind(),
+        ObjectKind::Array,
+        "host_view_u16: not an array"
+    );
+    assert_eq!(
+        header.element_type(),
+        ArrayElementType::Char,
+        "host_view_u16: not a char[]"
+    );
+    let len = header.array_length() as usize;
+    let mut out = vec![0u16; len];
+    if len != 0 {
+        match heap.array_data_ptr(obj) {
+            Some(src) => {
+                // SAFETY: live `char[]` (kind + element type asserted), so
+                // the payload is `len * 2` contiguous bytes at
+                // `array_data_ptr`; `out` holds `len` u16s; the regions do
+                // not overlap; the GC is paused for the token's lifetime.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 2);
+                }
+            }
+            // G1 humongous char[]: no flat base pointer. The heap accessor
+            // hands back a `Value::Int` holding the ZERO-extended char, so
+            // `as u16` is a plain truncation of a value that already fits.
+            None => {
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let v = heap
+                        .get_array_element(obj, i)
+                        .expect("host_view_u16: in-bounds index returned OOB");
+                    match v {
+                        Value::Int(x) => *slot = x as u16,
+                        other => panic!("host_view_u16: expected Value::Int, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) -> Vec<i8> {
     let header = heap.get_header(obj);
     assert_eq!(
@@ -602,6 +651,46 @@ pub fn write_back_i16(obj: ObjectRef, heap: &VmHeap, src: &[i16], _token: &Safep
 /// - if `obj` is not a `byte[]` on the heap;
 /// - if `src.len()` differs from the array's length. Callers (Part E) are
 ///   expected to enforce length equality before calling.
+/// `Vec<u16>` -> `char[]`. Mirror of [`host_view_u16`].
+pub fn write_back_u16(obj: ObjectRef, heap: &VmHeap, src: &[u16], _token: &SafepointToken<'_>) {
+    let header = heap.get_header(obj);
+    assert_eq!(
+        header.kind(),
+        ObjectKind::Array,
+        "write_back_u16: not an array"
+    );
+    assert_eq!(
+        header.element_type(),
+        ArrayElementType::Char,
+        "write_back_u16: not a char[]"
+    );
+    let len = header.array_length() as usize;
+    assert_eq!(
+        src.len(),
+        len,
+        "write_back_u16: src length {} != array length {}",
+        src.len(),
+        len
+    );
+    if len == 0 {
+        return;
+    }
+    match heap.array_data_ptr(obj) {
+        Some(dst) => {
+            // SAFETY: as `host_view_u16`, in the opposite direction.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst, len * 2);
+            }
+        }
+        None => {
+            for (i, &x) in src.iter().enumerate() {
+                // A char is zero-extended into the int slot.
+                let _ = heap.set_array_element(obj, i, Value::Int(x as i32));
+            }
+        }
+    }
+}
+
 pub fn write_back_i8(obj: ObjectRef, heap: &VmHeap, src: &[i8], _token: &SafepointToken<'_>) {
     let header = heap.get_header(obj);
     assert_eq!(
@@ -687,6 +776,27 @@ where
 
 /// `false` only when `CRATONVM_GPU_NO_ZEROCOPY` is set — an opt-out for A/B
 /// measurement / safety. Cached.
+///
+/// # The invariant the zero-copy path rests on
+///
+/// AUDIT 2026-09-02. When this is on, the device DMAs against the JVM heap
+/// arena itself rather than against a detached host copy — the array body
+/// is never staged. That is sound only because every transfer below is
+/// SYNCHRONOUS: `DeviceBuffer::from_host` host-blocks on the upload stream
+/// and `to_host` on the download stream before returning, so the DMA has
+/// retired while the caller's `SafepointToken` is still held and the
+/// collector cannot have moved anything.
+///
+/// `cuda_bridge::critical`'s module doc used to assert the opposite — that
+/// "the device never holds a JVM heap address" — and concluded from it
+/// that a GPU critical token needs only keep-alive semantics and not
+/// [`cuda_bridge::critical::Relocation::Forbidden`]. The conclusion is
+/// still right; the reason it gave was not.
+///
+/// So: moving this path to an async upload is not a local change. It would
+/// need either the staged copy back for this arm, or a token that forbids
+/// relocation until the transfer event has fired. Nothing in the types
+/// connects the token's lifetime to the copy's, so nothing would complain.
 fn zerocopy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -835,6 +945,18 @@ direct_xfer!(
     host_view_i8,
     write_back_i8,
     "byte[]"
+);
+// char[] joined on 2026-09-03. `u16` satisfies `cuda_bridge::DeviceElem`
+// through its blanket `T: bytemuck::Pod + Send + Sync` impl, and the heap
+// slot is natural-width and packed exactly as `short[]`'s is.
+direct_xfer!(
+    upload_obj_u16,
+    download_obj_u16,
+    u16,
+    ArrayElementType::Char,
+    host_view_u16,
+    write_back_u16,
+    "char[]"
 );
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1285,4 +1407,36 @@ write_back_range!(
     ArrayElementType::Double,
     Value::Double,
     "double[]"
+);
+// short[]/byte[] became offloadable on 2026-09-02 but were left out of the
+// chunked writeback, so any dispatch carrying one gave up copy/compute
+// overlap for the whole dispatch (`take_chunkable_writeback` bails when it
+// sees an array writeback it does not recognise). These close that.
+write_back_range!(
+    write_back_range_i16,
+    i16,
+    ArrayElementType::Short,
+    // The slow per-element arm stores through `Value::Int`, so the
+    // narrow element widens on the way in; `set_array_element` narrows
+    // it back per the array's own element type.
+    |v: i16| Value::Int(v as i32),
+    "short[]"
+);
+write_back_range!(
+    write_back_range_u16,
+    u16,
+    ArrayElementType::Char,
+    // Zero-extended into the int slot, unlike short[]'s sign extension.
+    |v: u16| Value::Int(v as i32),
+    "char[]"
+);
+write_back_range!(
+    write_back_range_i8,
+    i8,
+    ArrayElementType::Byte,
+    // The slow per-element arm stores through `Value::Int`, so the
+    // narrow element widens on the way in; `set_array_element` narrows
+    // it back per the array's own element type.
+    |v: i8| Value::Int(v as i32),
+    "byte[]"
 );

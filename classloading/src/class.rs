@@ -1503,7 +1503,35 @@ impl ClassStore {
     /// compact reference-field layout is enabled. Idempotent (overwrites on
     /// redefine / subclass-layout recompute). Safe no-op when the flag is off.
     pub fn register_compact_layout_if_enabled(&self, id: ClassId) {
-        if !cratonvm_types::compact_ref_fields_enabled() {
+        let compact = cratonvm_types::compact_ref_fields_enabled();
+        // `CRATONVM_DBG_LAYOUT=1`'s FIRST job is the class-id -> NAME mapping,
+        // and that mapping exists in every configuration. It used to sit past
+        // the `compact_ref_fields_enabled()` early return, so with compact
+        // layouts off — the default — the flag printed NOTHING, while three
+        // separate doc comments told readers to use it for exactly this:
+        //
+        //   gc/src/autobox.rs        "run with CRATONVM_DBG_LAYOUT=1, which
+        //                             prints `[layout] <name> cid=<N> ...`"
+        //   gc/src/heap.rs           "Run with CRATONVM_DBG_LAYOUT=1 to resolve
+        //                             a class_id to a name"
+        //   types/src/compact_value.rs  the same sentence again
+        //
+        // MEASURED (`G45-1`): `CRATONVM_DBG_COERCION=1 CRATONVM_DBG_LAYOUT=1`
+        // over `RJdkSecurity` produced 13,135 lines and not one `[layout]` row,
+        // so none of the six class ids in that transcript could be resolved.
+        // A cheap gate for a DIFFERENT feature was standing in front of an
+        // informative one and hiding its zero — and `autobox.rs`'s own comment
+        // says it best about the flag it replaced: "a diagnostic that names the
+        // wrong instrument costs more than no diagnostic, because it is
+        // trusted."
+        if !compact {
+            if loader_flags().dbg_layout {
+                let name = self.get(id).map(|c| c.name.to_string()).unwrap_or_default();
+                eprintln!(
+                    "[layout] {name} cid={} (no compact layout: compact reference                      fields are disabled in this build/configuration)",
+                    id.as_u32()
+                );
+            }
             return;
         }
         let built = self.build_compact_layout(id);
@@ -2580,6 +2608,89 @@ mod tests {
             !proxy_class.is_assignable_to_name("java/lang/Runnable", &store),
             "the fallback must not degrade into 'everything is assignable'",
         );
+    }
+
+    /// The two name-based walks are NOT interchangeable, and the pair of
+    /// asserts below is the whole reason to prefer one at a call site.
+    ///
+    /// `is_subclass_of_by_name` exists for exception `catch_type` matching,
+    /// where the target is never an interface, so it walks only the superclass
+    /// chain. Its name does not say so, and a caller asking about an INTERFACE
+    /// gets a silent, permanent `false` rather than an error — which is
+    /// indistinguishable from a correct negative and so cannot be noticed
+    /// without a test like this one.
+    ///
+    /// It has been read the wrong way twice. The `Path.toString()` branch in
+    /// `vm/src/runtime/invokedynamic.rs` carries the first write-up (that
+    /// version "never actually fires"); the second was
+    /// `interpreter::typecheck::unmod_backing_reaches`, which decides between
+    /// `Collections$UnmodifiableList` and `Collections$UnmodifiableRandomAccessList`
+    /// for the class the `instanceof`/`checkcast` opcodes consult. It asked
+    /// about `java/util/RandomAccess` — an interface — so it answered `false`
+    /// for every list, and `x instanceof RandomAccess` disagreed with both
+    /// `RandomAccess.class.isInstance(x)` and `x.getClass()`.
+    ///
+    /// The hierarchy below is `ArrayList`'s, shortened to the part that
+    /// matters: the marker is reached through `interfaces`, and there is no
+    /// route to it through `superclass` at all.
+    #[test]
+    fn the_supers_only_name_walk_cannot_see_an_interface_the_dag_walk_finds() {
+        let mut store = ClassStore::new();
+
+        let random_access = store.next_id();
+        store.add(make_class(
+            random_access,
+            "java/util/RandomAccess",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let abstract_list = store.next_id();
+        store.add(make_class(
+            abstract_list,
+            "java/util/AbstractList",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let array_list = store.next_id();
+        store.add(make_class(
+            array_list,
+            "java/util/ArrayList",
+            Some(abstract_list),
+            vec![random_access],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        let al = store.get(array_list).expect("ArrayList present");
+
+        // The superclass leg: both walks agree, because a superclass IS on the
+        // supers-only path. Asserted so the negative below reads as "interface"
+        // and not as "this walk is broken".
+        assert!(al.is_subclass_of_by_name("java/util/AbstractList", &store));
+        assert!(al.is_assignable_to_name("java/util/AbstractList", &store));
+
+        // The interface leg: they diverge. This is the trap.
+        assert!(
+            !al.is_subclass_of_by_name("java/util/RandomAccess", &store),
+            "if this starts passing, `is_subclass_of_by_name` grew an interface              walk — which is a behaviour change for every exception-`catch_type`              caller and must be justified there, not discovered here",
+        );
+        assert!(
+            al.is_assignable_to_name("java/util/RandomAccess", &store),
+            "the DAG walk is the one a caller asking about an interface must use",
+        );
+
+        // Still a real check in both directions.
+        assert!(!al.is_assignable_to_name("java/util/Deque", &store));
     }
 
     /// Reordering must not disturb which *index* names which field: the storage

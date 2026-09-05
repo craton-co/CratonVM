@@ -84,6 +84,13 @@ const KEM_MLKEM_512: i32 = 0;
 const KEM_MLKEM_768: i32 = 1;
 const KEM_MLKEM_1024: i32 = 2;
 const KEM_MLKEM: i32 = 3; // umbrella "ML-KEM" — parameter set derived from key
+/// RFC 9180 `DHKEM`, the other `KEM` service SunJCE registers and the one this
+/// table did not have. Nothing about the drive below is ML-KEM-specific — the
+/// SPI is constructed by name and then `engineNewEncapsulator` /
+/// `engineNewDecapsulator` do the work — so serving it is an index, a name and
+/// a class. It is `com.sun.crypto.provider.DHKEM`, driven over an X25519/X448
+/// or EC key pair.
+const KEM_DHKEM: i32 = 4;
 
 // Synthetic-state offsets, relative to `synthetic_base_offset(...)`.
 const KEM_OFF_ALGO: usize = 0;
@@ -114,6 +121,7 @@ fn kem_algo_idx(name: &str) -> i32 {
         "ML-KEM-512" | "2.16.840.1.101.3.4.4.1" => KEM_MLKEM_512,
         "ML-KEM-768" | "2.16.840.1.101.3.4.4.2" => KEM_MLKEM_768,
         "ML-KEM-1024" | "2.16.840.1.101.3.4.4.3" => KEM_MLKEM_1024,
+        "DHKEM" => KEM_DHKEM,
         _ => -1,
     }
 }
@@ -123,6 +131,7 @@ fn kem_algo_name(idx: i32) -> &'static str {
         KEM_MLKEM_512 => "ML-KEM-512",
         KEM_MLKEM_768 => "ML-KEM-768",
         KEM_MLKEM_1024 => "ML-KEM-1024",
+        KEM_DHKEM => "DHKEM",
         _ => "ML-KEM",
     }
 }
@@ -137,6 +146,11 @@ fn mlkem_spi_class(idx: i32) -> Option<&'static str> {
         KEM_MLKEM_768 => Some("com/sun/crypto/provider/ML_KEM_Impls$K3"),
         KEM_MLKEM_1024 => Some("com/sun/crypto/provider/ML_KEM_Impls$K5"),
         KEM_MLKEM => Some("com/sun/crypto/provider/ML_KEM_Impls$K"),
+        // Not an ML_KEM_Impls class, and the function name now understates
+        // what it does — kept as one table because the CALLER only needs "the
+        // SPI class for this index", and splitting it would duplicate the
+        // construct-and-wrap that follows.
+        KEM_DHKEM => Some("com/sun/crypto/provider/DHKEM"),
         _ => None,
     }
 }

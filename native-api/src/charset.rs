@@ -117,7 +117,17 @@ pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
         "UTF32" => "UTF-32",
         "UTF32BE" => "UTF-32BE",
         "UTF32LE" => "UTF-32LE",
-        "USASCII" | "ASCII" => "US-ASCII",
+        // `ANSI_X3.4-1968` is what glibc's `nl_langinfo(CODESET)` answers in
+        // the C/POSIX locale and therefore what HotSpot reports for
+        // `native.encoding` / `stdout.encoding` there (MEASURED, Temurin
+        // 25.0.3+9, `LANG=C`). It reached this table the moment CratonVM
+        // started reporting the host's real encoding instead of a pinned
+        // UTF-8, and an unmapped name here is an `UnsupportedCharsetException`
+        // out of `Charset.forName` at bootstrap. The rest of the row is the
+        // JDK's own alias list for `sun.nio.cs.US_ASCII`.
+        "USASCII" | "ASCII" | "ANSIX3.41968" | "ANSIX3.41986" | "ISO646US"
+        | "ISO646.IRV:1991" | "646" | "CSASCII" | "IBM367" | "CP367"
+        | "ISOIR6" | "US" => "US-ASCII",
         // The JDK also accepts the historic `8859_1` spelling (used by
         // c3p0's resource-path reader) in addition to the ISO-prefixed
         // aliases. Underscores are removed above, yielding `88591`.
@@ -135,6 +145,14 @@ pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
         "GB2312" | "CSGB2312" => "GB2312",
         "GBK" | "CP936" => "GBK",
         "GB18030" => "GB18030",
+        // `ms<cp>` is how the JDK spells a Windows CONSOLE code page in the
+        // 874..=950 band (`cratonvm_native_api::os_encoding`), so these names
+        // now arrive from `stdout.encoding` on a CJK/Thai console. Each maps
+        // to the closest family this engine actually transcodes; the same
+        // approximation `WINDOWS31J -> Shift_JIS` above already makes.
+        "MS932" => "Shift_JIS",
+        "MS949" => "EUC-KR",
+        "MS950" => "Big5",
         "WINDOWS1252" | "CP1252" => "windows-1252",
         "WINDOWS1251" | "CP1251" => "windows-1251",
         "WINDOWS1250" | "CP1250" => "windows-1250",

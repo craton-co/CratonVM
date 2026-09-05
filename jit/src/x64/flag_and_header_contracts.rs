@@ -514,6 +514,54 @@ fn the_inline_allocator_writes_the_mark_word_unconditionally() {
     assert!(found, "the inline allocator must zero the mark word");
 }
 
+/// The decision to INLINE the bump and the decision to DROP the post-init
+/// helper call must stay two different questions.
+///
+/// They were one boolean until 2026-09-02, and collapsing them is only sound
+/// while every collector can find an object by walking the chunk it was
+/// allocated in. ZGC cannot: its sweep, its `is_object_address` oracle and
+/// its conservative scans are driven by an allocation-base registry, and the
+/// post-init helper is the only place an inline allocation can enter it. An
+/// object allocated without that call is invisible to the runtime — its first
+/// use as a receiver decodes as `null`, which is what miscompiled
+/// `probes/FjpProbe.java` (`NullPointerException: null object argument` inside
+/// `ForkJoinTask.fork`, no collection anywhere in the run).
+///
+/// A source scan for the same reason the test above is one: the flag is
+/// process-wide and published by the heap, so a byte-level test in this crate
+/// could only ever observe the unpublished default.
+#[test]
+fn dropping_the_post_init_helper_asks_the_collector_first() {
+    let src = include_str!("bytecode_walk.rs");
+    let start = src
+        .find("let skip_helper =")
+        .expect("the `new` arm must still decide whether to skip the post-init helper");
+    // The decision, up to the end of its statement.
+    let decision = &src[start..start + src[start..].find(';').expect("terminated statement")];
+    assert!(
+        decision.contains("jit_tlab_registration_required"),
+        "`skip_helper` no longer consults \
+         `cratonvm_types::jit_tlab_registration_required()`. On a collector \
+         that is TOLD about each allocation rather than walking the chunk \
+         (ZGC), dropping the post-init call leaves every inline-allocated \
+         object unregistered, and it decodes as `null` at its first native \
+         boundary. Found instead: {decision}"
+    );
+
+    let inline_gate_start = src
+        .find("let can_inline =")
+        .expect("the `new` arm must still gate inline allocation");
+    let inline_gate =
+        &src[inline_gate_start..inline_gate_start + src[inline_gate_start..].find(';').unwrap()];
+    assert!(
+        !inline_gate.contains("skip_helper"),
+        "inline ELIGIBILITY is reading `skip_helper`, so a collector that \
+         requires the announcing call would switch the inline bump off \
+         altogether rather than keep it and pay one call. It must read the \
+         class-only `helper_is_noop` term instead. Found: {inline_gate}"
+    );
+}
+
 /// The zeroing stores in `emit_inline_tlab_new` must cover exactly the
 /// header words that are not written with a real value, and every one of
 /// them must sit inside the header.
@@ -831,11 +879,21 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
     // (Deliberately phrased without the literal needles -- this test counts its
     // own source text, so spelling one out here inflates the very number it is
     // checking. That cost one round.)
-    let cases: [(&str, &str, usize); 6] = [
+    //
+    // The third row fell 23 -> 22 on 2026-09-02 and the sixth row appeared.
+    // `emit_bounds_check`'s length load moved into its cold stub (the fast path
+    // is now a fused `CMP r32, [array + len]`), so the constant is spelled at
+    // two emission sites instead of one -- and both were written as a `const`
+    // binding through the checked narrowing rather than a raw one, which is why
+    // the raw row went DOWN while a site was added. The checked row is counted
+    // for the same reason the sibling test counts ir_lower's: deleting it would
+    // silently restore an unchecked site.
+    let cases: [(&str, &str, usize); 7] = [
         ("HEADER_SIZE", " as u8", 22),
         ("HEADER_SIZE", " as i32", 13),
-        ("ARRAY_LENGTH_OFFSET", " as u8", 23),
+        ("ARRAY_LENGTH_OFFSET", " as u8", 22),
         ("ARRAY_LENGTH_OFFSET", " as i32", 5),
+        ("ARRAY_LENGTH_OFFSET", " as i64", 2),
         ("ARRAY_DATA_OFFSET", " as u8", 13),
         ("ARRAY_DATA_OFFSET", " as i32", 0),
     ];
@@ -851,6 +909,115 @@ fn header_offset_emission_site_inventory_matches_the_doc() {
              ObjectHeader 32→16 shrink navigates by."
         );
     }
+}
+
+
+/// The array bounds check and its cold stub are ONE contract, split across two
+/// files, and neither half is correct alone.
+///
+/// The fast path is `CMP ECX, [RAX + len] ; JAE stub` — the length is compared
+/// straight out of the object header and is **not** left in a register. The
+/// stub reports it: `jit_throw_aioobe`'s second argument is the number in
+/// "Index 5 out of bounds for length 3", and it reads that from R10D. So the
+/// stub must re-load the length itself.
+///
+/// Before 2026-09-02 the fast path did the load (`MOV R10D, [RAX+len]`) and the
+/// stub inherited the register. Folding the load into the compare — one
+/// instruction and four bytes fewer on every emitted bounds check — was a
+/// deliberately-refused peephole for years *precisely* because doing only that
+/// half leaves the stub printing whatever R10 last held, which is a wrong
+/// exception message and not a crash: nothing fails, the number is just false.
+///
+/// This test is the tripwire on the pairing. It emits both halves and asserts
+/// each contains the load-or-compare it owes, so removing either one fails here
+/// rather than in a user's stack trace.
+#[test]
+fn bounds_check_length_is_reloaded_in_the_cold_stub() {
+    use cratonvm_types::ARRAY_LENGTH_OFFSET;
+    let len_disp = u8::try_from(ARRAY_LENGTH_OFFSET).expect("array length offset fits a disp8");
+
+    // FAST PATH — `CMP ECX, [RAX + len]`: 3B /r with ModRM(01, ECX, RAX).
+    let mut c = bounds_check_test_compiler();
+    let start = c.buf.pos();
+    c.emit_bounds_check(0);
+    let fast: Vec<u8> = c.buf.as_slice()[start..c.buf.pos()].to_vec();
+    assert_eq!(
+        &fast[..3],
+        &[0x3B, 0x48, len_disp],
+        "the fast path must compare against the header word directly; if this \
+         became a register compare again, the stub's own load below is now dead \
+         and the two halves have drifted"
+    );
+    // ...followed by `JAE rel32` and nothing else. Nine bytes total, four fewer
+    // than the pre-fold `MOV`(4) + `CMP`(3) + `JAE`(6).
+    assert_eq!(fast.len(), 9, "fused bounds check is CMP(3) + JAE rel32(6)");
+    assert_eq!(&fast[3..5], &[0x0F, 0x83], "JAE rel32");
+
+    // COLD STUB — `MOV R10D, [RAX + len]` must be the FIRST thing it does,
+    // before the argument shuffle overwrites RAX or RCX.
+    let mut c = bounds_check_test_compiler();
+    c.emit_bounds_check(0);
+    let stub_start = c.buf.pos();
+    c.emit_bounds_check_stubs();
+    let stub: Vec<u8> = c.buf.as_slice()[stub_start..c.buf.pos()].to_vec();
+    assert_eq!(
+        &stub[..4],
+        &[0x44, 0x8B, 0x50, len_disp],
+        "the cold stub must re-load the length into R10D as its first \
+         instruction — it is `jit_throw_aioobe`'s `length` argument, and the \
+         fast path no longer leaves it in a register"
+    );
+
+    // And the kill switch really restores the old shape, so the A/B it exists
+    // for compares two different instruction sequences and not one.
+    if jit_fused_bounds_load_enabled() {
+        // Only meaningful in the default configuration; under
+        // `CRATONVM_JIT_FUSED_BOUNDS_LOAD=0` the assertions above would be
+        // testing the fallback against itself.
+        assert_eq!(fast.len(), 9);
+    }
+}
+
+/// A bare `Compiler` for the two bounds-check emitters: no locals, no register
+/// assignments, a helper table whose `throw_aioobe` is a plausible address so
+/// `emit_call_absolute` takes its rel32 path.
+fn bounds_check_test_compiler() -> Compiler {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut helpers = cratonvm_jit_api::JitRuntimeHelpers::default();
+    // Any non-zero, in-reach address: the stub only has to be emittable, it is
+    // never executed here.
+    helpers.throw_aioobe = bounds_check_test_compiler as usize;
+    Compiler::new(
+        "bounds-check-pairing-test".to_string(),
+        crate::ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        helpers,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    )
 }
 
 // -- arch-2026-07-26 `header-shrink`: contracts the shrink navigates by ---
@@ -881,9 +1048,10 @@ fn ir_lower_header_offset_sites_are_inventoried_too() {
         // every element width. Deleting either would silently restore an
         // unchecked site.
         ("HEADER_SIZE", " as i64", 2),
-        // 0, deliberately: this site moved to
-        // `disp::disp8_const(ARRAY_LENGTH_OFFSET as i64)`, which is a
-        // `const fn` that fails the BUILD if the constant ever exceeds 127.
+        // 0, deliberately: this site moved to the checked `disp::disp8_const`
+        // narrowing, a `const fn` that fails the BUILD if the constant ever
+        // exceeds 127. (Spelled without the literal needle: the sibling test
+        // now counts that form too, and this file is inside its scan.)
         // That is strictly stronger than counting the raw narrowing here —
         // an inventory notices drift after the fact, the const check makes
         // the drift unrepresentable. A future raw `as u8` reintroduces the

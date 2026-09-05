@@ -2654,6 +2654,124 @@ fn extract_key_bytes(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Vec<u8>
 /// `GCMParameterSpec` object.  Both real classes hold the IV at
 /// instance field 0 (an Object reference slot), so the layout
 /// matches in either mode.
+/// `(salt, iterationCount, iv)` out of a `javax.crypto.spec.PBEParameterSpec`,
+/// or `None` when `spec` is not one.
+///
+/// Read through the spec's own accessors rather than by slot index: this is a
+/// REAL JDK class whose field order is not this crate's to assume, and
+/// `extract_iv_bytes` reading "field 0" is exactly the mistake this function
+/// exists to correct — field 0 of a `PBEParameterSpec` is the SALT.
+///
+/// The IV is the OPTIONAL nested spec of the three-argument constructor
+/// (`PBEParameterSpec(salt, iterationCount, IvParameterSpec)`), which is how a
+/// caller pins a PBES2 IV instead of letting the cipher draw one. `None` there
+/// is the ordinary two-argument form and yields an empty IV, which the
+/// ENCRYPT path then fills.
+fn pbe_parameter_spec_params(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+) -> Option<(Vec<u8>, u32, Vec<u8>)> {
+    let is_pbe_spec = ctx
+        .class_name_of_id(ctx.class_id_of_object(spec))
+        .is_some_and(|n| n == "javax/crypto/spec/PBEParameterSpec");
+    if !is_pbe_spec {
+        return None;
+    }
+    let pin = ctx.pin_native_root(spec);
+    let salt = match ctx.invoke_virtual(spec, "getSalt", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => read_bytes(ctx, arr),
+        _ => Vec::new(),
+    };
+    let spec = ctx.read_native_pin(pin, spec);
+    let iters = match ctx.invoke_virtual(spec, "getIterationCount", "()I", &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(0).max(0) as u32,
+        _ => 0,
+    };
+    let spec = ctx.read_native_pin(pin, spec);
+    let iv = match ctx.invoke_virtual(
+        spec,
+        "getParameterSpec",
+        "()Ljava/security/spec/AlgorithmParameterSpec;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(nested)))) => extract_iv_bytes(ctx, nested),
+        _ => Vec::new(),
+    };
+    ctx.unpin_native_roots(pin);
+    if salt.is_empty() {
+        return None;
+    }
+    Some((salt, iters, iv))
+}
+
+/// `Cipher.init(mode, key, PBEParameterSpec)` for a PBES2 transformation — the
+/// ORDINARY way to use one, and the overload that had no PBES2 arm at all.
+///
+/// Every other route to a PBES2 cipher was wired: `init(mode, key,
+/// AlgorithmParameters)` has `cipher_init_record_pbes2`, and PKCS12KeyStore
+/// takes that one. The spec overload fell through to the generic IV read, which
+/// asks the spec for "field 0" — the SALT on a `PBEParameterSpec` — recorded
+/// eight salt bytes as the IV, and left the KEY as the raw password with no
+/// PBKDF2 derivation at all. The AES path then refused the eight-byte "IV":
+///
+/// ```text
+/// Cipher.getInstance("PBEWithHmacSHA256AndAES_256")
+///       .init(ENCRYPT_MODE, pbeKey, new PBEParameterSpec(salt, iters, iv))
+///   CratonVM -> InvalidAlgorithmParameterException:
+///               Wrong IV length: must be 16 bytes long
+///   HotSpot  -> encrypts
+/// ```
+///
+/// measured 2026-09-02 by `apps/probes/JcaCipherVectors`, whose PBES2 CONTROL
+/// row this was — the eight delegated PRFs beside it all matched HotSpot byte
+/// for byte, and the natively-computed one did not run.
+///
+/// Returns `true` when it handled the init.
+fn cipher_init_pbes2_from_spec(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    mode: i32,
+    key: ObjectRef,
+    spec: Option<ObjectRef>,
+) -> Option<()> {
+    let spec = spec?;
+    let algo = cipher_algorithm_of(ctx, this);
+    let (prf, keylen) = pbes2_aes_params(&algo)?;
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = ctx.pin_native_root(key);
+    let params = pbe_parameter_spec_params(ctx, spec);
+    let this = ctx.read_native_pin(this_pin, this);
+    let key = ctx.read_native_pin(key_pin, key);
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(key_pin);
+    let (salt, iters, mut iv) = params?;
+    // Same rule as the `AlgorithmParameters` arm: an ENCRYPT with no pinned IV
+    // draws one, and `Cipher.getParameters()` hands it back.
+    if iv.is_empty() && mode == 1 {
+        let mut generated = vec![0u8; 16];
+        if crate::securerandom::os_random_bytes(&mut generated) {
+            iv = generated;
+        }
+    }
+    let password_bytes = extract_key_bytes(ctx, key);
+    let aes_key = crate::phases_early::pbkdf2_derive_for(prf, &password_bytes, &salt, iters, keylen);
+    let tkey = obj_key(ctx, this);
+    with_table_write(|t| {
+        let s = t.entry(tkey).or_default();
+        s.mode = mode;
+        s.key_bytes = aes_key;
+        s.iv_bytes = iv;
+        s.rsa_n = Vec::new();
+        s.rsa_exp = Vec::new();
+        s.rsa_key_id = None;
+        s.pbe_salt = salt;
+        s.pbe_iterations = iters;
+        s.accumulated.clear();
+        s.aad.clear();
+    });
+    Some(())
+}
+
 fn extract_iv_bytes(ctx: &mut dyn NativeContext, spec: ObjectRef) -> Vec<u8> {
     match ctx.get_field(spec, 0) {
         Value::Object(Some(arr)) => read_bytes(ctx, arr),
@@ -4782,6 +4900,12 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                     None,
                 );
             }
+            // PBES2 needs the spec's SALT and iteration count to derive the
+            // key at all, and its field 0 is that salt — so it is resolved
+            // before the generic IV read, for the same reason ChaCha20 is.
+            if cipher_init_pbes2_from_spec(ctx, this, mode, key, spec).is_some() {
+                return Ok(None);
+            }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
             let algo = cipher_algorithm_of(ctx, this);
@@ -4818,6 +4942,12 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                     CipherInitParams::Spec,
                     obj_at(args, 4),
                 );
+            }
+            // PBES2 needs the spec's SALT and iteration count to derive the
+            // key at all, and its field 0 is that salt — so it is resolved
+            // before the generic IV read, for the same reason ChaCha20 is.
+            if cipher_init_pbes2_from_spec(ctx, this, mode, key, spec).is_some() {
+                return Ok(None);
             }
             // ChaCha20 needs the spec's TYPE and its counter, not just its
             // field 0, so it is resolved before the generic IV read.
@@ -5904,7 +6034,32 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
     });
 
     let sks = "javax/crypto/spec/SecretKeySpec";
-    r.register(sks, "<clinit>", "()V", clinit_noop);
+    // `<clinit>` is NOT a no-op here, and stubbing it cost fourteen MACs.
+    //
+    // The real one (JDK 25 `src.zip`) is one statement:
+    //
+    //     static { SharedSecrets.setJavaxCryptoSpecAccess(SecretKeySpec::clear); }
+    //
+    // That is the ONLY writer of `jdk.internal.access.SharedSecrets`'
+    // `JavaxCryptoSpecAccess` slot, and JDK code inside `java.base` reads it to
+    // scrub key material. Replacing the static block with a no-op left the slot
+    // null for the life of the process, so every reader NPEs — measured
+    // 2026-09-02 on all fourteen PKCS#12 / PBMAC1 `Mac` services:
+    //
+    //     Mac.getInstance("HmacPBESHA256").init(pbeKey, params)
+    //       NullPointerException: Cannot invoke
+    //       "jdk.internal.access.JavaxCryptoSpecAccess.clearSecretKeySpec(...)"
+    //       because the return value of
+    //       "jdk.internal.access.SharedSecrets.getJavaxCryptoSpecAccess()" is null
+    //
+    // and `getInstance` resolved for all fourteen, which is why a gap census
+    // that scores on `getInstance` could not see it
+    // (`jca-provider-population-gap-20260830.md`; `apps/probes/JcaMacVectors`
+    // is what does).
+    //
+    // The `<init>` shim below stays: it is the copy-the-array fix, and it is
+    // independent of the static block.
+    let _ = clinit_noop;
     // `SecretKeySpec.<init>` is `this.key = key.clone()` in the real class
     // (`java.base/javax/crypto/spec/SecretKeySpec.java`, JDK 25 `src.zip`), and
     // the javadoc states why: "The contents of the array are copied to protect

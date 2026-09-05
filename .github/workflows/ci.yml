@@ -226,10 +226,54 @@ jobs:
       # Forbid reintroduction of bring-up eprintln!/println! markers
       # ([WP*], [DIAG*], [TRACE*], ...) in landed code.
       # Bash-only script, so gate to the Linux leg.
+      - name: Clippy
+        # `[workspace.lints]` in Cargo.toml already silences the noise lints
+        # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
+        # empty_loop / while_let_loop), so this check measures the repository's
+        # configured lint policy rather than the full default lint set.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # THE CORRECTNESS GATES RUN FIRST, and the policy ratchets below them.
+      #
+      # `Clippy --workspace --all-targets` is the only thing in this file that
+      # compiles TEST targets, and `Test` is the only thing that runs them.
+      # GitHub Actions skips every later step of a job once one fails, so any
+      # check standing in front of those two can switch them off -- silently,
+      # because the job's annotation names only the step that failed.
+      #
+      # That has now happened twice. The `fmt` job's header records the first:
+      # a whole-tree `cargo fmt --all --check` failed on every push and took the
+      # compile gate with it for weeks, which is how `084098bce` landed five
+      # `#[test]` functions applying `?` to a `Result` while declaring `-> ()`.
+      # Splitting `fmt` into its own job fixed that instance and left the shape
+      # intact: four policy steps still stood in front, and on 2026-09-04 the
+      # flag-surface guard went red -- a bench reading `SWEEP_BENCH_ROUNDS`
+      # through `std::env::var` -- and masked the gate again, in the same window
+      # an `OopMapEntry` field left two test files unable to compile on `dev`.
+      #
+      # Ordering is the fix rather than more jobs: the ratchets below need the
+      # same `Build` this job already paid for, and a separate job would pay for
+      # it twice. They still run, and still fail the build; they simply no
+      # longer stand in front of "does it compile" and "do the tests pass".
       - name: Forbid debug-trace prints
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: bash scripts/check-no-diag-prints.sh
+
+      # Forbid an UNSCREENED `Value` decode of a heap cell.
+      # `read_value_atomic` transmutes 16 bytes into an enum without checking
+      # the discriminant; a later `match` on the result is a jump table indexed
+      # by the tag with no bounds check. That instruction, in
+      # `gc::heap::coerce_field_value_for_slot`, is the decoded faulting
+      # instruction of the eight hibernate-orm JSON/XML SIGSEGVs.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Forbid unscreened Value-cell decodes
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-value-cell-reads.sh
 
       # The CRATONVM_* surface reached 692 identifiers by growing roughly one
       # per fixed bug with no retirement path. It is now ten grouped variables
@@ -248,15 +292,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python tools/check_markdown_links.py
 
-      - name: Clippy
-        # `[workspace.lints]` in Cargo.toml already silences the noise lints
-        # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
-        # empty_loop / while_let_loop), so this check measures the repository's
-        # configured lint policy rather than the full default lint set.
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
 
       # THE PRODUCER FOR CRATONVM_REQUIRE_E2E. Until this step existed, nothing
       # under .github/workflows/ mentioned the variable at all.
@@ -430,6 +465,29 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: CV=target/debug/cratonvm TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+
+      # A `--jdk-only` refusal is only a RETIREMENT when nothing already owns
+      # the triple. `register` is last-write-wins and its JdkOnly arm returns
+      # WITHOUT inserting, so when an earlier registration owns the slot the
+      # older native survives as the winner, the retirement silently does not
+      # happen, and the two modes run different code.
+      #
+      # HERE rather than only in the advisory `jdk-only` job, for the reason the
+      # two steps above state: that job is `continue-on-error` at the JOB level.
+      #
+      # It is a RATCHET over a committed set, not a demand for zero: the nine
+      # measured winner-differences are triaged (four are deliberate per-mode
+      # branching in `lang_system.rs`; the rest are this shape and behaviourally
+      # equal today), and it fails when that set GROWS. The script refuses with
+      # exit 2 rather than looking green when the report is empty or unparsable
+      # — a run with zero refusals is a broken measurement, not a clean gate.
+      #
+      # Prerequisites are the same ones the step above already relies on: `Set
+      # up JDK 25` exports JAVA_HOME and `Build` leaves target/debug/cratonvm.
+      - name: JDK-only refusal survivors (a refusal that did not retire)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: CV=target/debug/cratonvm bash scripts/jdk-only-refusal-survivors.sh
 
       # ARCH-2026-08-04 A7. A `pub` item referenced only by its own tests is
       # invisible to `dead_code`; `lockfree_resolve.rs` kept 389 lines of an

@@ -37,7 +37,41 @@ which this change does not own; they are written out verbatim in §8.
 | **G1-8** | The remembered set is *additive* and its only pruning is `cleanup`'s Free-source pass. A source region recycled into a live type is re-walked **wholesale**, resurrecting its dead objects' referents. | Medium (over-retention, not unsoundness) | **Fixed** (G1AUD-5) — an rset entry is now `(source_index, generation)` rather than a bare source index. `G1Region::recycled_in_generation` records when a region was last reset, `rset_cache_epoch` doubles as the monotone reclassification clock, and an entry is dead exactly when `stamp < source.recycled_in_generation`. Both the scan side (`live_rset_sources`) and `cleanup` (`retain_sources_in_generation`) now ask that sharper question instead of "is the source Free *right now*". Entries recorded without a generation get `RSET_GENERATION_PINNED` (`u64::MAX`) and are never aged out — over-retain rather than under-scan. The staleness test is a strict `<`, so an edge recorded in the same generation that later resets the source survives one extra cycle, again in the fail-safe direction. |
 | **G1-9** | The parallel young evacuator's object scan ignored compact field layouts, so a compact object's reference fields were never visited: its referents were not evacuated and its slots were not rewritten, and Phase 5 then freed the region they pointed into. | **Critical** (live-object loss / UAF under `CRATONVM_GC=g1-parallel-evac`) | **Fixed** 2026-08-13. `SharedEvac::process_object` and `seed_source_region` strode `HEADER_SIZE + slot_idx * SLOT_SIZE` over `num_slots()`, i.e. assumed the legacy uniform 16-byte cell body for every object, while every other reference walk in `g1.rs` — the serial evacuator, the Phase-4 remap, the mark scan, this audit's own V7b verifier — goes through `for_each_flat_object_reference`, which dispatches on `is_compact_object` and walks the registered `CompactLayout::field_offsets`. Both scans now do the same. Two corrections to this row's previous wording, both load-bearing for anyone re-reading the history: the defect was **not non-deterministic** (10/10 runs, and identical at `CRATONVM_G1_WORKERS=1`) and it was **not a race** — chasing it as a CAS race is why it stayed open. `num_slots()` is the hierarchy-wide field count, so the old stride also addressed 320 bytes of a 19-field compact object that occupies 152, reading and — on a decode that happened to look like `Value::Object` — writing past it. The G1AUD-6 source-set divergence recorded below was real and is still fixed, but it was **not** this. Regression: `parallel_evacuation_scans_compact_object_reference_fields`, which registers a `CompactLayout` with references at packed offsets and fails on the pre-fix scan — the coverage gap that hid this, since every other gc unit test allocates with no layout registered and is therefore legacy-layout, for which the old stride was accidentally correct. |
 | **G1-10** | Humongous spans were reclaimed by `cleanup` and nothing else, so humongous garbage survived until a concurrent mark cycle happened to fire. On a heap sized for the live set, IHOP may never be crossed and the answer is "never". | Medium (over-retention, not unsoundness) | **Fixed** 2026-08-13 — `eager_reclaim_humongous_locked` runs after Phase 5 of every young/mixed pause and frees any span neither a root nor the Phase-4 reference walk reaches. See §4 for the gates and for the ordering trap (asking the *remembered set* here frees a live span, because the pause has just recycled the Eden region its only entry names). `CRATONVM_G1_EAGER_HUMONGOUS=0` restores the old behaviour. |
-| **G1-11** | Under `-XX:+UseG1GC` with the **JIT warm** and a heap tight enough to force sustained collection, the VM takes `EXCEPTION_ACCESS_VIOLATION` reading one page past a heap arena boundary (`read at address 0x…010000`), then reports "thread 'main-vm' has overflowed its stack". | **Critical** (memory unsafety under `-XX:+UseG1GC`) | **OPEN — not this branch's.** Found by finally running §9 item 8 (below). Reproduces with every G1 flag this branch added turned off (`CRATONVM_G1_EAGER_HUMONGOUS=0 CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_RSET_SOURCE_CAP=0`), so it is not attributable to the parallel evacuator, the worker pool, the eager humongous reclaim or the rset bound — though it was NOT bisected against a `dev` build, so "pre-existing" is an inference from the flag arms, not a measurement. Repro and the four discriminating arms are in item 8. |
+| **G1-11** | Under `-XX:+UseG1GC` with the **JIT warm** and a heap tight enough to force sustained collection, the VM takes `EXCEPTION_ACCESS_VIOLATION` reading one page past a heap arena boundary (`read at address 0x…010000`), then reports "thread 'main-vm' has overflowed its stack". | **Critical** (memory unsafety under `-XX:+UseG1GC`) | **OPEN — not this branch's.** Found by finally running §9 item 8 (below). Reproduces with every G1 flag this branch added turned off (`CRATONVM_G1_EAGER_HUMONGOUS=0 CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_RSET_SOURCE_CAP=0`), so it is not attributable to the parallel evacuator, the worker pool, the eager humongous reclaim or the rset bound — though it was NOT bisected against a `dev` build, so "pre-existing" is an inference from the flag arms, not a measurement. Repro and the four discriminating arms are in item 8. **BISECTED 2026-09-02** — see below. |
+
+**G1-11, the dev bisect this row asked for (2026-09-02).** The row says
+"pre-existing" was an inference from the flag arms rather than a measurement.
+It is a measurement now. A plain `origin/dev` binary was built in its own
+worktree and run interleaved against the nineteen-findings branch on
+`StringNativeAllocationChurn` under `-XX:+UseG1GC -Xmx256m`, three load
+conditions, same JDK, exit codes read directly (not through a pipeline, whose
+status is the last command's):
+
+| condition | branch | plain dev |
+|---|---|---|
+| idle host | 0/10 | **1/10** |
+| four CPU spinners | 0/12 | 0/12 |
+| during a release build | 0/10 | 0/10 |
+
+0/32 against 1/32. The one failure is on PLAIN DEV, so the crash class is not
+introduced by that branch — which is what this row wanted to know and could not
+say.
+
+Two cautions on reading it further. The rate is far too low for 32 reps to
+distinguish anything beyond that, and CPU load — the variable the tree's own
+notes say surfaces this kind of defect — did not raise it here, so whatever the
+trigger is, four spinners are not it.
+
+And the observation that started this bisect was not G1-11 at all. An earlier
+run of the same workload failed 2/10 on the branch, and both failures were
+downstream of a `debug_assert!` that branch had added too strongly (F-06's
+cleanup cross-check asserted equality between two counts that are keyed
+differently). The VM catches a native panic and continues, so an assertion that
+aborts a collection mid-pause leaves a half-collected heap for the next
+dereference to find. Correcting the assertion took the same workload to 0/32.
+That is worth recording as its own lesson: a debug assertion that fires inside a
+GC pause does not merely report a problem, it manufactures one that looks like a
+different problem.
 
 Nothing in G1's SATB **pre**-write barrier was found missing on the paths this
 crate owns, and — contrary to the hypothesis this audit started from — the JIT
@@ -538,7 +572,22 @@ Ordered. Each item is a precondition for the next being meaningful.
    the coarsening bound above is confirmed as insurance for the O(regions²)
    ceiling rather than as relief from present pressure.
 
-   Getting a reading took a purpose-built probe (`apps/g1_probe/RsetChurn.java`, committed so the number stays
+   **The probe named below was NOT in the tree, and could not have been.** This
+   item says it was "committed so the number stays reproducible"; the commit
+   that wrote that sentence touched no `.java` file at all. The cause is
+   mechanical rather than careless — `apps/` is in `.gitignore` (line 12), so
+   `git add apps/g1_probe/RsetChurn.java` silently added nothing and the commit
+   went out claiming a file it did not carry. From that day until 2026-09-02 the
+   number could not be reproduced by anyone.
+
+   The probe is reconstructed from this paragraph's own description of it and
+   now lives at `probes/RsetChurn.java`, which is tracked. That matters because
+   F-05 revisits the conclusion drawn here: `rset_bytes_per_live_byte` answers
+   the SPACE question, and it was read as also answering the TIME one — what it
+   costs to ACT on an entry, which for a region-granular set is a linear walk of
+   the whole source region.
+
+   Getting a reading took a purpose-built probe (`probes/RsetChurn.java`, committed so the number stays
    reproducible: four retained
    depth-12 trees whose leaves are re-pointed at fresh young arrays every
    round, so the edges are old→young and load-bearing) and three corrections
@@ -567,6 +616,43 @@ Ordered. Each item is a precondition for the next being meaningful.
    the reading item 2's `cset_verify_truncated` counter exists to make possible,
    and it means `dangling=0` here is "nothing found in 995,328 objects
    sampled", not "the heap was exhaustively clean at any instant".
+
+   **F-05 (2026-09-02) — the SPACE reading above answered the wrong question,
+   and a card table shipped for the other one.** `rset_bytes_per_live_byte =
+   0.000034` says the remembered set is cheap to STORE. It says nothing about
+   what it costs to USE, and that is where the cost was: an entry names a source
+   REGION, so acting on one remembered edge meant `scan_source_region_for_cset_refs`
+   walking the whole source — every header validated, every reference slot read,
+   an `evacuation_candidate_is_an_object` check and a `region_for_ptr` binary
+   search per candidate — i.e. a cost proportional to BYTES IN THE SOURCE rather
+   than to the number of edges. A single edge into a 1 MiB Old region cost a
+   megabyte walk, and a COARSENED rset makes every live region a nominal source.
+   `gc/src/g1_cards.rs` adds a per-arena byte-per-512-bytes card table maintained
+   by the same three producers that maintain the rset, and Phase 2 now skips a
+   source with no dirty card outright and steps over any object that touches no
+   dirty card. `CRATONVM_G1_CARD_RSET=0` restores the whole-region walk.
+   Measured on the unit fixture (one holder among hundreds of fillers in a 1 MiB
+   source): `scanned=512 skipped=1048064` — 99.95% of the source walk removed.
+   The region-index rset is unchanged and still decides WHICH regions a pause
+   looks at; the cards decide WHERE INSIDE one. Residual: no block-start table,
+   so the walk still steps object-by-object (see the long comment at the
+   per-object screen for why `bump_alloc` cannot maintain one across a TLAB
+   carve), and a card is cleaned only at `G1Region::reset`, so a long-lived Old
+   region's cards saturate.
+
+   **END-TO-END, 2026-09-02.** `G1CardChurn 11 200` (four retained depth-11
+   trees whose leaves are re-pointed at fresh young `int[]` every round, so the
+   edges are old->young and the checksum is computed from data reachable ONLY
+   through them) at `-Xmx24m -XX:InitiatingHeapOccupancyPercent=15 --nojit`:
+   42 pauses, young and mixed, `checksum=82273920000` — byte-identical to
+   HotSpot and to the same binary under `CRATONVM_G1_CARD_RSET=0`. Engagement
+   on the mixed pauses reads `rset_scanned=2406256 rset_skipped=86240`, i.e.
+   about 3.5% of the source walk removed. That number is small and it is the
+   honest one for this probe: it re-points EVERY leaf every round, so nearly
+   every card in the holder regions is dirty by construction. It is the
+   worst case for a card screen, not the case it is for. The 99.95% figure
+   above is the other end of the same distribution (one holder among hundreds
+   of clean fillers), and a real application sits between them.
 6. ~~**Decide the JNI-pinned-source policy explicitly.**~~ **DONE.** Stated in
    `a_jni_pinned_region_is_an_ordinary_rset_source_not_a_wholesale_one`, which
    pins both halves: a JNI-pinned region is held out of the CSet but is an
@@ -658,3 +744,1535 @@ routes to the helper, so the disable is fail-safe. Re-enabling it — with
 end-to-end coverage for every compiled store form and the card-table lifecycle —
 is what would give G1 back an inline post barrier, for old and fresh receivers
 alike.
+
+### F-08 (2026-09-02) — G1 got an inline post barrier of its own, and it is NOT the card mark
+
+The paragraph above is right that the generational inline card mark is the way
+to give the GENERATIONAL collector its inline barrier back, and it stays
+disabled: `inline_card_mark_available()` is still a constant `false` and this
+change does not touch it. What it got wrong is treating that as G1's only
+recovery path. G1's post barrier is a different mechanism with different inputs,
+and it does not need the card mark, the `GC_FLAG_OLD_GEN` bit, or the
+`JIT_REGION_BOUNDS` table whose emptiness closes G1-2:
+
+```
+if dst == null                              -> nothing to remember
+if (src - base) >> shift == (dst - base) >> shift  -> nothing to remember
+otherwise                                   -> record the edge
+```
+
+Both elided cases are exactly the cases `post_write_barrier_rset` returns from
+without touching anything, so the inline filter removes calls whose callee
+would have returned and never a call that would have recorded. Everything else
+— an address outside the arena, a Free destination region, an edge this thread
+already recorded — is left to the callee.
+
+Shipped as `jit/src/x64/objects.rs::emit_g1_barrier_filter` plus a lean
+`jit_g1_post_write_barrier` helper, against a **fourth** process-global table
+(`gc/src/gen_heap.rs::JIT_G1_BARRIER`: arena base, arena length, region mask,
+and F-05's card table base and shift). A fourth table rather than a fourth use
+of an existing one, for the third time and the same reason: `JIT_REGION_BOUNDS`
+must stay empty under G1 or G1-2 re-opens, and `publishing_the_g1_barrier_table_does_not_make_region_bounds_live`
+is the test that says so.
+
+Two things it deliberately does NOT do. It does not dirty the F-05 card inline,
+because the remembered-set ENTRY still has to be recorded and that is a hash-map
+insert keyed on a (source, target) region pair with no inline form — dirtying
+inline and calling anyway is duplicated work, and the callee dirties on the way
+through. Making the barrier fully inline would additionally require Phase 2 to
+take its source set from the card table rather than from the region-index
+remembered set, which is a collector policy change and not an emitter one; the
+table carries the card base and shift so that work starts from the numbers
+rather than from a table migration. And it does not use the trusted-oop
+receiver check, whose premise ("with bounds live the backend is Generational")
+is precisely what this arm falsifies.
+
+`CRATONVM_G1_INLINE_BARRIER`, **default OFF**. The soundness argument above is a
+proof about which calls are elided rather than a claim about behaviour, and the
+executable unit test pins the four cases the filter separates — including the
+one that only exists because G1's arena is malloc-aligned rather than
+region-aligned, where a base-free `(obj ^ val) & mask` would call two addresses
+either side of a real region boundary "same region" and lose the edge. It still
+ships off, because this is a code-generation change on an experimental
+collector and because the last inline barrier this JIT had was disabled by a
+production audit rather than by a review. The flag is how it gets measured
+before it becomes a default; §10's own advice ("it should be measured under the
+reliability gate rather than assumed small") applies to the recovery as much as
+to the cost.
+
+**END-TO-END, 2026-09-02.** `G1CardChurn 11 60` at `-Xmx24m` with the JIT WARM
+(no `--nojit`), which is the arm every earlier G1 result in this document was
+missing: `checksum=7616601600` with `CRATONVM_G1_INLINE_BARRIER=1`, identical to
+the same binary with it off and to HotSpot. The arm was verified to have been
+TAKEN rather than merely enabled — `emit_g1_barrier_filter` logs
+`jit: G1 inline post-write barrier ACTIVE` once per process at `info`, present
+in the flag-on run and absent in the flag-off control. A checksum from a gated
+path nobody confirmed was entered is the "a subsystem kill switch passing 6/6 is
+not a diagnosis" failure, and this file has been on the receiving end of it
+before.
+
+## 11. The ten findings (2026-09-02)
+
+*Written against `perf/g1-ten-findings-20260902`, branched from `origin/dev`
+at `5a6247661` — the first tip that carried the nineteen-findings merge
+(`001acd84f`). A full read of the collector after that merge produced ten more
+findings, each of which is now landed with a unit test. Where a finding changed
+pause complexity it is listed first; the allocation-path items follow.*
+
+| # | Finding | Fix | Kill switch | Test |
+|---|---|---|---|---|
+| 1 | Any humongous span made every young pause walk the whole old generation: the eager-reclaim census was "a whole-heap question" and `phase4_regions_to_walk` refused to narrow while one was wanted. | Liveness comes from the spans' REMEMBERED SETS. The Phase-4 rebuild records humongous targets as rset edges (card included), and `humongous_spans_referenced_by_rset` walks a span's live sources, card-screened, to see whether a reference is still there; more than `EAGER_RECLAIM_MAX_SOURCES` (8) sources retains the span until cleanup. A wide walk still takes the exact census. | `CRATONVM_G1_NARROW_FIXUP=0` (wide walk, census path) | `a_humongous_span_held_by_an_untouched_old_object_survives_a_narrow_pause` |
+| 2 | Mixed pauses were always whole-heap, and up to eight of them ran per mark cycle whether or not any old region was selected. | The mixed fix-up is narrowed by the young rule (both mixed paths); `collect_garbage` ends the mixed phase at the first pause with no candidate (`mixed_phase_has_work`, `end_mixed_phase`). | `CRATONVM_G1_NARROW_FIXUP=0` | `a_narrow_mixed_pause_still_records_the_edges_a_later_young_pause_needs`, `the_mixed_phase_ends_early_when_no_old_region_is_worth_collecting` |
+| 3 | Old-region selection had no live threshold and no waste bound: a 98%-live region was evacuated at nearly a full copy for 2% reclaim. | `mixed_gc_live_threshold_percent` (85) and `heap_waste_percent` (5) on `G1CollectorConfig`; `-XX:G1MixedGCLiveThresholdPercent`, `-XX:G1HeapWastePercent`. | the knobs | `the_mixed_phase_respects_the_live_threshold_and_the_waste_floor` |
+| 4 | The evacuation scans validated the referent's HEADER before testing CSet membership — one cold line per old->old slot in every source walk. | Region index and bitset test first; the plausibility screen runs only for a CSet resident. The dead "already forwarded" branch for non-CSet slots is gone (the pointer map only ever names CSet residents). | — (pure reorder) | the existing evacuation suite |
+| 5 | `G1Region` was ~3 KiB: two inline 32-entry diagnostic rings, streamed by every linear pass over the table. | The rings are `Vec`s that stay empty until `CRATONVM_G1_DBG_REACH=1` records into them. | — | `a_region_table_entry_stays_small` (≤ 512 bytes) |
+| 6 | Two full region-table scans per Eden region claimed, under the exclusive lock (`refill_tlab`'s reserve check and `note_region_consumed_locked`). | The Free/young counters are maintained at the claim funnel (`note_free_regions_claimed`); the pause-end census is the backstop. | — | `the_free_region_count_tracks_claims_without_a_rescan` |
+| 7 | TLAB carves and humongous spans were zeroed under the exclusive guard, stalling every other allocator for the memset. | The fresh-Eden refill downgrades to the shared guard before carving; a humongous claim types its regions with the start cursor at 0 and publishes the cursor only after zeroing under the shared guard. | — | `a_reused_humongous_span_is_zeroed_before_it_is_handed_out` |
+| 8 | Eden regions and humongous spans were both first-fit from index 0, so Eden claims fragmented the contiguous runs humongous allocation needs. | Young claims come from the TOP of the committed prefix (`claim_free_region_young`), Old and humongous from the bottom — HotSpot's head/tail split. Lazy commit is preserved: the prefix grows only when it holds no Free region. | — | `young_regions_claim_from_the_top_and_humongous_from_the_bottom`, `young_claims_do_not_grow_the_committed_prefix_while_it_has_room` |
+| 9 | The concurrent marker scanned a whole reference array under one hold of the region guard, and parked workers polled every 5 ms. | Arrays are marked in 4096-element chunks (a gray entry carries a chunk index in its top 16 bits); the collector wakes parked workers on a SATB spill, a keep-alive push and remark seeding, with the poll a 250 ms fallback. | — | `a_long_reference_array_is_marked_in_chunks`, `a_seed_wakes_a_parked_marker_without_waiting_for_the_poll` |
+| 10 | The pause-time goal was opt-in, and the mixed copy budget priced only the copying. | `CRATONVM_G1_YOUNG_PAUSE_TARGET` is default-on; the mixed budget is the goal minus a decaying estimate of the fix-up walk (`old_cset_copy_budget_ns`). | `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` | `the_mixed_copy_budget_is_charged_for_the_fix_up_walk` |
+
+### 11.1 Why item 1 is sound without the census
+
+The census was exact because Phase 4 walked every non-CSet region. The
+replacement rests on one claim: **every reference into a humongous span from
+outside it is recorded in the span's remembered set, and every recording path
+dirties the holder's card.** The producers are the same three §2.1 lists —
+the mutator post-write barrier (`post_write_barrier_rset` records to any
+non-Free target and dirties `src_addr`), the Phase-4 rebuild for the regions
+it walks (which now pushes `(span, holder)` for a humongous target and dirties
+the holder), and the evacuation-failure fix-up (`record_outgoing_rset_edges`,
+same). A GC-created edge — an evacuated copy holding a reference to a span —
+lives in a to-space region, which is in the narrow set because its cursor
+changed, so the rebuild records it in the same pause. A dead young holder's
+entry goes stale the moment Phase 5 resets its region (`recycled_in_generation`
+advances past the entry's generation), which is before eager reclaim runs.
+JIT-pinned regions are walked wholesale, unscreened, for the reason Phase 2
+walks them wholesale. What the rset cannot prove it does not claim: a
+coarsened set, more than eight live sources, or a source walk that breaks on an
+unsizeable header all RETAIN the span, and `debug_assert_no_reference_into_spans`
+still re-derives the verdict over every non-Free region in debug builds.
+
+### 11.2 Why item 2 is sound without the wide walk
+
+F-04 kept the mixed fix-up wide because the old members' rsets are "maintained
+by this very walk's rebuild half". The young CSet's rsets are maintained by the
+same three producers and the young walk has been narrow since G1AUD-11; what
+makes either sound is that every slot needing a rewrite lives in a region that
+is a recorded source of some CSet member or a region the pause wrote into. The
+rebuild only ever ADDS edges for the regions it walks, which a narrow walk also
+does, and a region it does not walk keeps the entries it had. It has never been
+what makes THIS pause sound (§2.1: a missing barrier entry is a UAF in this
+pause and a repair for the next); it still repairs for later pauses.
+`a_narrow_mixed_pause_still_records_the_edges_a_later_young_pause_needs` drives
+the case that would break first — the copy of an object reachable only through
+an Old holder, collected by a rootless young pause immediately after.
+
+### 11.3 END-TO-END, release, interleaved against the branch point
+
+The shape items 1 and 2 are about needs three things at once, and the first two
+probes written for this did not have them: `HumongousHold` ran on a heap small
+enough that a wide walk and a narrow one covered the same regions, and
+`HumongousWide`'s inner churn was dead on arrival, so the JIT removed it and the
+run took three pauses. `probes/HumongousChurn.java` (tracked, unlike the
+`apps/` probe F-05 lost to `.gitignore`) has all three: a 48 MiB retained old
+generation, ONE humongous span held by it, and a young churn that escapes into a
+rotating window so the collector genuinely runs.
+
+**Release binaries, `-Xmx160m -XX:+UseG1GC`, `HumongousChurn 48 20000 512`, six
+ABBA-interleaved reps, A = a binary built at this branch's point on `dev`
+(`5a6247661`), B = this branch. Medians:**
+
+| | A (branch point) | B (ten findings) | |
+|---|---:|---:|---|
+| fix-up walk, total per run | 581.1 ms | 142.0 ms | **-75.6%** |
+| young pause p50 | 63.1 ms | 23.1 ms | **-63.4%** |
+| total pause time | 5410 ms | 4186 ms | -22.6% |
+| wall | 7562 ms | 6028 ms | -20.3% |
+| widest fix-up walk (regions) | 94-99 | 82-85 | |
+| pauses | 17-18 | 16 | |
+
+`checksum=262316478568` on all twelve runs, identical to HotSpot JDK 25's on
+the same probe. The fix-up column is the one this measures directly: a
+humongous span no longer forces the whole-heap walk, so the walk costs a
+quarter of what it did, and the median pause follows it down.
+
+Two honest limits on that table. The p99 column is not in it because it is one
+pause — the first, which is paid in full before any adaptive term can react,
+and which swings by 3x between reps on this host. And the "widest fix-up walk"
+rows are close together because at this heap size the CSet is a small part of
+the heap either way; the number that moved is the TIME, which is the sum over
+pauses, not the width of the widest one.
+
+**The other arms, same binaries** (`e2e-debug2` in the run log): `G1CardChurn
+11 60` at `-Xmx24m` and `G1ChurnPauseProbe 24 200` at `-Xmx256m` both produce
+HotSpot-identical checksums on the default arm and under
+`CRATONVM_G1_NARROW_FIXUP=0`, `CRATONVM_G1_YOUNG_PAUSE_TARGET=0`,
+`CRATONVM_G1_EAGER_HUMONGOUS=0` and `CRATONVM_G1_CARD_RSET=0` — the kill
+switches change the cost, not the answer. The regression suite is 85/85 on the
+branch's own binary.
+
+**One tight-heap arm still OOMs, on both arms.** `G1CardChurn 11 60` at
+`-Xmx24m` reports evacuation failure on most pauses and then
+`OutOfMemoryError` on 2 of 6 control runs and 1 of 6 branch runs — the same
+shape, at the same rate, on a binary built before any of this. It is recorded
+here because a reader running that arm will see it, not as a residual of this
+work.
+
+## 12. Card cleaning, and what measuring it said about the card table (2026-09-02)
+
+*`perf/g1-card-clean-bot-20260902`, branched from `dev` at `120bb7c37`. Opened
+to close the residual F-05 states in its own module docs — "a card is cleaned
+only at `G1Region::reset`, so a long-lived Old region's cards saturate" — and
+to add the block-start table the same note names. It landed the first, refused
+the second on the measurement, and found that neither was the reason the card
+screen looked inert.*
+
+### 12.1 The hypothesis and the number that started it
+
+§11's A/B run left a byte skip-rate for the card screen:
+`scanned=92007064 skipped=223968` — **0.2%**. F-05's own fixture reports
+99.95% on a fresh region, so something was eating the difference, and the
+module docs already named a candidate: the table only ever GAINS bits, because
+`G1Region::reset` is the only thing that clears one. A long-lived Old region
+would then accumulate dirty cards until the screen answers "scan it" for
+everything.
+
+### 12.2 What shipped
+
+`CRATONVM_G1_CARD_CLEAN`, **opt-in**. Both source walkers — the serial
+`scan_source_region_for_cset_refs` and the parallel evacuator's
+`seed_source_region`, which is the default path — now take a `CardSet`
+snapshot of the region's dirty cards, decide what to scan from THAT, and
+rewrite the table once at the end: every card covering the bytes they examined
+is cleaned, then the start card of each object that still references another
+region is put back.
+
+Three properties, three tests:
+
+* `a_card_whose_edge_is_gone_is_cleaned_by_the_pause_that_walks_it`;
+* `a_card_whose_edge_survives_is_left_dirty_by_the_walk` — the soundness half;
+* `cleaning_is_bounded_by_what_the_walk_examined` — a walk that broke early
+  must not clean past the break, or it drops edges nothing looked at.
+
+The snapshot is not incidental. A walk that read the live table while cleaning
+it would answer its own next question wrongly: cards are 512 bytes and objects
+are smaller, so scanning object A, cleaning its card, and then asking whether
+B's card is dirty reports CLEAN for a B nobody examined.
+
+### 12.3 It does not pay, and one run nearly said it did
+
+Four ABBA-interleaved release reps, `HumongousChurn 48 6000 512` at
+`-Xmx160m --nojit` — the `--nojit` arm because it is where the screen is
+actually consulted (§12.4). Medians:
+
+| | cleaning off | cleaning on |
+|---|---:|---:|
+| wall | 7740 ms | 8392 ms |
+| total pause | 3054 ms | 3680 ms |
+| byte skip-rate | 28.7% | 23.4% |
+
+Slower, and the skip-rate did not reliably rise. `checksum=249707433568` on
+all eight runs.
+
+**A single earlier run showed 82.44% against 45.49%** and would have made a
+much better story. It was noise: the per-run skip-rate on this workload ranges
+17%–52% on the SAME arm. Four reps is what it took to see that, and the first
+number is recorded here because a reader who reruns this will get one like it
+and should know it means nothing on its own.
+
+Why it does not pay is not mysterious once the numbers exist: the cost is real
+(a snapshot plus a rewrite pass per region walk) and the benefit is not, because
+most objects in a retained linked structure hold a cross-region reference and
+their cards are kept dirty anyway. Cleaning removes STALE cards, and this shape
+does not make many.
+
+So it ships off. It is sound, it is tested, and it is the mechanism a card
+table needs the moment §12.4 is fixed — but nothing measured licenses turning
+it on.
+
+### 12.4 The 0.2% is not saturation — the screen is bypassed
+
+The same runs answer the original question, and the answer is not the card
+table's contents:
+
+| arm | byte skip-rate |
+|---|---:|
+| JIT warm | 0.79% |
+| `--nojit` | 20%–50% |
+
+The table is the same in both. What differs is how many source regions reach
+the per-object screen at all: `scan_source_region_for_cset_refs` takes a
+`card_screen: bool`, and every caller passes
+`!jit_pinned_regions.contains(&src_idx)` — a JIT-pinned source is walked
+**wholesale**, screen bypassed, by the design §5 sets out (a compiled store
+there is not assumed to have taken the barrier). With the JIT warm, that is
+most of them.
+
+That is where the next measurement goes, and it is a bigger lever than
+anything in §12.2: the screen is not weak, it is switched off for the regions
+that matter. The two ways out are the two §11.1 already names for root
+coverage — precise shadow-stack coverage, which removes JIT pinning
+altogether — or an argument that a JIT-pinned region's cards ARE complete,
+which the F-08 inline barrier would supply since it dirties the card from
+compiled code.
+
+**A diagnostic gap this exposed, now closed.** The `[g1][PINS]` line that
+reports the pin set printed only from `young_collection_serial`. The parallel
+evacuator is the default path, so an investigation into exactly this question
+could not see the pin set on the arm that runs. `young_collection_parallel`
+prints it too now.
+
+### 12.5 The block-start table: not built, and why
+
+F-05's residual asks for a BOT so a dirty-card scan can start at the card
+instead of walking the region from offset 0. It is not here, deliberately.
+
+A BOT's value is proportional to the fraction of objects the screen SKIPS —
+it removes the header read and `object_total_size` for the ones stepped over.
+At the measured engagement (0.79% of bytes skipped on the arm that matters)
+there is nothing for it to remove, and building it against §12.4 would be
+optimising the part of the walk that is not the cost.
+
+The design that would work here, when the engagement is fixed, is worth
+recording because F-05's note rules out the obvious one for a good reason
+(`bump_alloc` sees a whole TLAB carve, not the objects the mutator later writes
+into it): build the table **during a walk** rather than at allocation. Every
+full region walk already steps object-by-object from 0, so it can record each
+card's first object start as it goes and stamp the region with the cursor the
+table is valid up to. A later walk uses it below that mark and walks forward
+above it. Old regions stop growing once they fill, so the table would be valid
+for essentially all of one.
+
+## 13. The card screen was switched off for the regions that matter (2026-09-02)
+
+*`perf/g1-card-screen-jit-pinned-20260902`, branched from `dev` at `86889860a`.
+§12.4 measured the card screen skipping 0.79% of source-walk bytes with the JIT
+warm against 20-50% without it, and named the cause: a JIT-pinned source region
+is walked WHOLESALE. This is that carve-out removed.*
+
+### 13.1 What the carve-out was, and the premise under it
+
+`young_collection`/`mixed_collection` add every JIT-pinned region to the source
+list on top of the remembered set's own, and pass `card_screen = false` for
+them. The reason, from the call site: "JIT-compiled code may have installed
+those references through stores the collector cannot assume went through
+`post_write_barrier_rset`". A card screen is derived from that same assumption,
+so applying it there would trust the belt the wholesale walk exists to double.
+
+The premise is about what compiled code can do behind the collector's back. It
+is worth re-deriving rather than inheriting, because it has changed.
+
+### 13.2 The enumeration
+
+Every path by which compiled code can write a reference into a G1 heap now
+reaches `post_write_barrier_rset`, which records the remembered-set entry AND
+dirties the holder's card:
+
+| path | what forces the barrier |
+|---|---|
+| `putfield` (ref), every inline arm, both tiers | G1-2 gates each arm on `region_bounds_are_live(...)`; G1 publishes nothing into `JIT_REGION_BOUNDS`, and `publishing_the_g1_barrier_table_does_not_make_region_bounds_live` pins that. Every arm takes `jit_putfield_object`. |
+| `putfield` under `CRATONVM_G1_INLINE_BARRIER` (F-08) | The inline filter elides only a null value and a same-region store — the two cases whose callee returns without recording. Everything else calls `jit_g1_post_write_barrier`. |
+| `aastore`, single-pass tier | Stores inline, then calls `helpers.write_barrier` → `jit_write_barrier` → `VmHeap::write_barrier`. The inline card-mark shortcut beside it is generational-only (`inline_card_mark_available()` is a constant `false`). |
+| `aastore`, IR tier | Refused outright: `ir_lower` latches a bailout rather than emit a barrier-less reference store. |
+| statics, natives, reflection, `Unsafe`, `VarHandle`, `arraycopy` | All funnel through the barriered accessors; none is compiled inline. |
+
+There is a second, weaker argument that holds independently and covers the
+default configuration: with `CRATONVM_G1_CARD_CLEAN` off (§12), a card is
+cleared only by `G1Region::reset`. A clean card therefore means "no store into
+this region's contents has EVER been recorded since it was recycled", and
+skipping such an object cannot skip one a store has touched.
+
+### 13.3 Measured
+
+`CRATONVM_G1_CARD_SCREEN_JIT_PINNED`, default-on with a `=0` opt-out.
+Release, `HumongousChurn 48 20000 512` at `-Xmx160m`, JIT warm:
+
+| | screen off (old behaviour) | screen on |
+|---|---:|---:|
+| source-walk bytes scanned | 90.1 MB | 1.70 MB |
+| bytes skipped | 0.21 MB | 88.6 MB |
+| **skip-rate** | **0.23%** | **98.11%** |
+
+Four ABBA-interleaved reps for time, medians: wall 7670 → 6960 ms (**-9.3%**),
+total pause 5639 → 4901 ms (**-13.1%**). The tail moves more than the median:
+the off arm ranges 6190-10469 ms and the on arm 6103-7226 ms, because the walk
+no longer scales with how much of the old generation a warm JIT happens to pin.
+
+### 13.4 Correctness evidence
+
+This is a use-after-free class of change — a lost edge frees a live object — so
+it is worth listing what was actually run rather than what was reasoned:
+
+* `dangling=0` from `verify_no_dangling_into_cset` over 21.4M objects across 16
+  pauses, on both arms, parallel evacuator;
+* `missing=0` from `dbg_verify_rset_completeness` across 6 checks on the serial
+  arm (`CRATONVM_G1_PARALLEL_EVAC=0 CRATONVM_G1_DBG_RSET=1`), both arms;
+* HotSpot-identical checksums on every probe and every kill-switch arm:
+  `G1CardChurn 11 60` (7616601600) with the flag on and off,
+  `G1ChurnPauseProbe 24 200` (111889612800), `HumongousHold 300` (266925450),
+  and `HumongousChurn` (249707433568) under `CRATONVM_G1_CARD_RSET=0`,
+  `CRATONVM_G1_CARD_CLEAN=1` and `--nojit`;
+* `a_jit_pinned_source_is_screened_or_walked_wholesale_by_the_flag` pins both
+  directions — 4096 bytes skipped with the flag on, 0 with it off, and the
+  referent reachable only through the pinned holder survives either way.
+
+The wholesale walk is still the `=0` behaviour, and it is the first thing to
+try for a lost-edge defect dated after this.
+
+### 13.5 What this does NOT change
+
+The JIT-pinned regions are still added to the source set unconditionally, and
+they are still excluded from every collection set. This changes only how much
+of such a region Phase 2 reads. Region pinning itself goes away when precise
+shadow-stack coverage lands (§11.1), which is a different and larger piece of
+work.
+
+## 14. Precise root coverage: G1's proof was vacuous, and G1 was the only relocating collector not answering (2026-09-02)
+
+*`perf/g1-precise-root-coverage-20260902`, branched from `dev` at `038e4e1e3`.
+§11.1 and §13.5 both end at the same place — "region pinning goes away when
+precise shadow-stack coverage lands" — and every G1 pause reporting
+`root coverage: incomplete` made that look far away. It was one unpublished
+table.*
+
+### 14.1 The finding
+
+`conservative_roots`'s frame-band verifier decides "does this compiled frame's
+spill band hold a heap address the shadow stack never published?" by
+classifying each band word with `gen_heap::addr_is_movable` — the union of
+`JIT_REGION_BOUNDS` and `MOVABLE_BOUNDS`. Two tables, because filling the first
+to fix the verifier would silently re-enable the inline reference-store fast
+path defect G1-2 closed; the second exists precisely so a collector can answer
+the movability question without that.
+
+**ZGC has published its envelope there since 2026-08-21. G1 published neither.**
+So `movable_bounds_are_live()` was false under G1, the verifier failed closed on
+`YOUNG_BOUNDS_UNPUBLISHED` before inspecting a single frame, and the verdict was
+`incomplete` on **100.00%** of pauses — a constant, carrying no information.
+
+That constant is also what made `CRATONVM_G1_COVERAGE_PIN` useless: a lever that
+refuses to evacuate whenever coverage is incomplete refuses every evacuation
+when coverage is always incomplete.
+
+### 14.2 The fix
+
+`G1Collector::new` publishes its whole arena reservation into `MOVABLE_BOUNDS`,
+and `Drop` clears it owner-checked, mirroring ZGC exactly. The whole
+reservation rather than the committed prefix or the young set: a superset is the
+safe direction — an address wrongly called movable costs a declined
+suppression, an address wrongly called immovable is a frame reported clean that
+was never inspected — and the envelope is the one thing about the arena that
+never changes.
+
+`g1_publishes_its_movable_envelope_without_making_region_bounds_live` pins both
+halves, and the second half is the one that must never regress: the STORE-side
+table stays empty, so this cannot re-open G1-2.
+
+Measured: `root coverage: incomplete` **100.00% → 0.00%** on every probe.
+
+### 14.3 What the earned proof unlocks, measured
+
+With the proof real, the precise-only branch does what §2.4 always said it
+would. Three arms, `HumongousChurn 48 6000 512` at `-Xmx160m`:
+
+| arm | coverage | pauses pinning | `pin_addrs` | dangling |
+|---|---|---:|---:|---:|
+| default (both switches off) | 0% incomplete | 2 | 21 | 0 |
+| `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` only | 0% incomplete | 2 | 21 | 0 |
+| **both switches on** | 0% incomplete | **0** | **0** | 0 |
+
+`checksum=249707433568` in all three. With both on, `G1CardChurn 11 60`,
+`G1ChurnPauseProbe 24 200` and `HumongousHold 300` also run with `pin_addrs=0`,
+`dangling=0` and HotSpot-identical checksums.
+
+**G1 pins nothing.** That is the whole of what region pinning costs — the
+hottest, most garbage-dense Eden region kept out of every collection set (§2.3)
+— removed.
+
+**A vacuous arm on the way, recorded because the next reader will hit it.** The
+first A/B set only `CRATONVM_G1_PRECISE_ONLY_ROOTS=1` and reported both arms
+identical. The master switch `CRATONVM_GC_PRECISE_ONLY_ROOTS` gates it, so
+`moving_young_precise_only` was false in both arms and the experiment measured
+nothing. The G1 switch alone does nothing at all.
+
+### 14.4 Why the defaults do NOT move here
+
+The publish lands on. Both suppression switches stay opt-in, and the reason is
+no longer G1's:
+
+* `dbg_precise_only_roots`'s own doc records that the suppression rests on
+  `CompiledMethod::fully_oop_covered`, a **presence** test — every GC-capable
+  safepoint recorded *an* oop map — not a completeness one, and that the
+  runtime oracle which would settle it (`CRATONVM_DBG_VERIFY_OOP_MAPS`) runs
+  inside the very scan the branch skips
+  (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`). That is
+  a JIT-wide question, not a collector one.
+* One workload over a handful of pauses is not a soak for a use-after-free
+  class of change, and the G1 instance of exactly this failure
+  (`bug-g1-evacuates-live-jit-reference-20260819.md`) is a year-fresh record of
+  what it looks like when the proof is wrong.
+
+The stale half of the record is corrected in passing: the doc on
+`CRATONVM_G1_PRECISE_ONLY_ROOTS` said the branch "is unsound under G1" because
+the pin set comes from the scan. That describes the mechanism correctly but
+names the wrong cause — the defect was the vacuous proof, which is what this
+change fixes. The doc now says so, and says what a soak must answer instead.
+
+## 15. The precise-only soak: not clean, and the gate could not have said so (2026-09-02)
+
+*`perf/g1-precise-only-soak-20260902`, branched from `dev` at `221a383f2`.
+§14.4 said the defaults could not move until a soak answered the
+`fully_oop_covered` question. This is that soak. **The answer is no**, twice
+over, and one of the two refutations was invisible to the gate that decides
+whether to suppress.*
+
+### 15.1 How it was run
+
+144 release runs: 6 workloads × 2 collectors (G1 and Generational) × 4 reps ×
+2 modes, all with `CRATONVM_GC_PRECISE_ONLY_ROOTS=1
+CRATONVM_G1_PRECISE_ONLY_ROOTS=1`.
+
+The two modes answer different questions and neither answers both:
+
+* **ORACLE** adds `CRATONVM_DBG_VERIFY_OOP_MAPS=1`. In this mode
+  `verify_active_coverage_into` runs the FULL conservative scan anyway and only
+  asks whether the precise maps missed anything, so the suppression never
+  fires. It is a pure correctness experiment.
+* **LIVE** omits the oracle, so the suppression really happens and G1's pin set
+  really goes empty. It checks checksum, dangling references and exit code.
+
+**Every LIVE run passed** — right checksum, `dangling=0`, no crash marker. That
+is exactly why the ORACLE arm exists: a stranded oop only becomes a wrong answer
+if the object is also evacuated AND dereferenced, so a checksum soak of this
+change is a coin-flip dressed as evidence.
+
+### 15.2 What the oracle found
+
+`while_covered` is `NEVER_MAPPED_WHILE_COVERED` — the counter the code itself
+calls "the number that says whether the codegen's coverage bit is sound".
+`wrong_map` is an in-band live oop named by SOME map of the method but not by
+the one its safepoint id selects. Both numbers below are per run, and the two
+values per cell are the two collectors; all four reps agreed to within noise.
+
+| workload | `while_covered` | `wrong_map` |
+|---|---:|---:|
+| `G1CardChurn` | — (no claiming frames) | — |
+| `G1ChurnPauseProbe` | 36 / 128 | 12 / 64 |
+| `HumongousChurn 48 6000` | 16 / 32 | 22 / 34 |
+| `HumongousChurn 48 20000` | 52 / 102 | 58 / 104 |
+| **`HumongousHold`** | **0 / 0** | **160 / 139** |
+| `HumongousWide` | 6 / 23 | 12 / 45 |
+
+Two independent refutations:
+
+1. **The coverage bit is refuted directly** on 4 of 6 workloads —
+   live references in slots no map of the frame mentions. That is precisely what
+   `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`
+   predicted, now measured rather than reasoned.
+2. **The map-SELECTION gap** on 5 of 6. `scan_active_oop_map_at_rbp` resolves
+   ONE map through `find_oop_map_for_safepoint_id` and iterates only its
+   `slot_offsets`, so a `wrong_map` word is invisible to the precise walk and
+   the suppression strands it exactly as an unmapped one.
+
+**Neither is G1-specific** — both collectors show both, at the same order of
+magnitude. §14.4 guessed this was a JIT-wide question; it is.
+
+### 15.3 The gate was blind to half of it
+
+Read the `HumongousHold` row again: `while_covered = 0`, `wrong_map = 160`.
+
+`verify_active_coverage_into` — the "verify first, then suppress" gate — used to
+return its verdict from `NEVER_MAPPED_WHILE_COVERED` and
+`NEVER_MAPPED_WHILE_SHADOW_COVERED` alone. On that workload both are zero, so
+the gate would have reported **"proof holds"** over frames it had just been
+shown hold 160 oops the precise scan cannot reach, and suppressed the backstop
+that was finding them.
+
+The gate now also consults `WRONG_MAP`. This has no production effect — both
+suppression switches remain opt-in and off — but it means the experiment fails
+closed instead of silently succeeding.
+`the_refutation_gate_reads_the_map_selection_counter` pins it.
+
+### 15.4 Verdict
+
+**The defaults do not move.** Not `CRATONVM_GC_PRECISE_ONLY_ROOTS`, not
+`CRATONVM_G1_PRECISE_ONLY_ROOTS`. §14's finding stands — G1's coverage proof is
+earned now rather than vacuous, and with the switches on G1 pins nothing — but
+"the proof is real" and "the maps are complete" are different claims, and this
+soak refutes the second.
+
+What would have to change before this is asked again, in order:
+
+1. **The map-selection gap** is the cheaper of the two and is a JIT fix, not a
+   collector one: either the precise scan unions every map that can be live at
+   the safepoint, or the emitter stops producing slots that only a
+   non-selected map names. `wrong_map` is the number to drive to zero.
+2. **The coverage gap** is the harder one and is what the 2026-08-20 bug page
+   is about. `while_covered` is the number, and it is non-zero on ordinary
+   workloads.
+
+Only when both read zero across a soak of this shape does the question become
+"should the defaults move", and even then the answer is a longer soak, not this
+one.
+
+## 16. §15 was wrong: there is no map-selection gap, and there was no coverage gap either (2026-09-03)
+
+*`fix/jit-oop-map-selection-20260902`. §15 read two raw counters as refutations
+of the precise-only suppression. The class file's own type maps say both
+populations are dead storage. This section corrects the record and fixes the
+instrument that produced it.*
+
+### 16.1 The correction
+
+`NEVER_MAPPED` and `WRONG_MAP` count in-band words **that look like heap
+addresses**. Looking like one is not being one: an old pointer left in a
+reusable local or spill slot after its value died still passes
+`heap.is_object_address`, and the precise map is *right* to omit it — that is
+the whole advantage a precise map has over a conservative scan, which keeps
+such garbage alive.
+
+The tree already had the independent answer and `NEVER_MAPPED` was already
+split by it: `verifier_local_verdict` asks the CLASS FILE's own type maps
+whether that local holds a reference at that bci. Read with that column, §15's
+table says the opposite of what §15 concluded:
+
+| workload | `never_mapped` | `verifier_oop` | `verifier_not_oop` | `wrong_map` | `wrong_map` `verifier_oop` |
+|---|---:|---:|---:|---:|---:|
+| `HumongousChurn 48 6000` | 16 | **0** | 16 | 22 | **0** |
+| `HumongousChurn 48 20000` | 52 | **0** | 52 | 58 | **0** |
+| `HumongousWide 64 400` | 6 | **0** | 6 | 12 | **0** |
+
+`verifier_unknown=0` throughout, so the oracle answered rather than declined.
+**Every flagged word in both populations is dead storage.** There is no
+map-selection gap on these workloads, and no coverage gap either.
+
+The stale-after-remap evidence §15.2 leaned on falls the same way. Under the
+suppression `HumongousChurn` leaves 15 `region=java-local verifiable=true`
+words stale against 0 without it — but a *dead* slot left stale is harmless,
+and what that experiment actually measured is the conservative scan needlessly
+retaining and rewriting dead values. It is a cost of the backstop, not a
+hazard of removing it.
+
+### 16.2 What that made the gate do
+
+§15 landed a change making `verify_active_coverage_into` refute on any
+`WRONG_MAP` increment. On this evidence that gate would have refused the
+suppression **forever**, on every workload, over words the class file says are
+not references. A gate keyed to a counter that cannot tell a live oop from dead
+storage is not a safety property; it is an off switch with a justification
+attached.
+
+`WRONG_MAP` is now split — `WRONG_MAP_VERIFIER_OOP` and
+`WRONG_MAP_VERIFIER_OTHER`, the same oracle `NEVER_MAPPED` has always used —
+and the gate reads the confirmed subset. The raw counters remain, reported
+beside their split, because the *ratio* is the interesting number: a large
+`wrong_map` with a zero `verifier_oop` is precisely the measurement of how much
+dead storage the conservative backstop is retaining.
+
+### 16.3 Where this leaves the defaults
+
+Still opt-in, but the reason has changed and is weaker than §15's.
+
+§15 said "the soak refutes the suppression". It does not; that reading was an
+artefact of an instrument that could not subtract dead slots. What can honestly
+be said now is only that **no refutation was found** on six probes covering 14
+compiled frames — a sample far too small to license a default, and much smaller
+than the `CRATONVM_GC_STRESS` populations the master switch's own doc cites.
+
+So the open question is no longer "is the coverage bit sound" — nothing here
+impugns it — but "has it been exercised over enough compiled code to trust",
+which is a soak of a different size than this one, on real applications rather
+than probes. `WRONG_MAP_VERIFIER_OOP` and the `while_covered` verifier column
+are the two numbers that soak should read, and neither should be read without
+the other.
+
+### 16.4 The lesson, since it cost two sections
+
+A counter that flags a *possible* defect is not evidence of one, and this file
+now has an instance in each direction: §12.3 recorded a single run that looked
+like a 82%-vs-45% win and was noise, and §15 recorded a counter that looked like
+a refutation and was dead storage. Both were caught by asking for a second,
+independent reading — reps in the first case, the verifier's own type maps in
+the second. The instruments that can answer were already in the tree both times.
+
+## 17. The real-application soak: a false-positive latch, and the obligation that is actually blocking (2026-09-03)
+
+*`fix/g1-coverage-reason-census-20260903`. §16.3 said the open question was
+sample size and that a real soak needs applications rather than probes. This is
+that soak, on H2 and its own test suite. It found two things the probes could
+not, and the second one only became visible after the first was fixed.*
+
+### 17.1 §16 holds at scale
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, oracle armed — **612
+compiled frames and 14 798 in-band words**, against 14 frames on the probes:
+
+| counter | raw | verifier-confirmed |
+|---|---:|---:|
+| `never_mapped` | 400 | **0** (`not_oop=302`, `unknown=98`) |
+| `wrong_map` | 1 874 | **0** |
+
+Forty-four times the frame sample and still not one confirmed refutation. §16's
+conclusion — the raw counters measure dead pointers in reusable slots, which a
+precise map is right to omit — is not a small-sample artefact.
+
+### 17.2 A latch that fired on shape, on every real workload
+
+With the precise-only switches and the oracle on, H2 reported
+`root coverage: incomplete` on **100.00%** of pauses. The same class with the
+switches off reports **0.00%**. Enabling the suppression was *causing* the
+incompleteness.
+
+The cause is one ungated latch. At the audit site two refutation latches sit
+side by side:
+
+* the `fully_shadow_covered` one is gated on `verdict == Oop`, and its comment
+  gives the reason — "latching on the raw counter would have suppressed every
+  collection on every workload measured, since 5-6% of in-band words trip it";
+* the `fully_oop_covered` one, three lines above, was **not gated**. It latched
+  on the raw counter.
+
+`note_coverage_oracle_refutation` is process-wide, so 400 raw hits on H2 — all
+`verifier_oop=0` — latched the refutation for the rest of the run and every
+subsequent pause reported incomplete. The argument the tree had already written
+for the second latch applies verbatim to the first; it now has it.
+
+### 17.3 The reason was computed and thrown away
+
+`root_coverage_incomplete_reason()` returns WHICH obligation failed, and
+`record_g1_pause_coverage` was handed only `is_some()`. So a reader of
+`incomplete=58 (100.00%)` could not tell an unregistered JIT frame from an
+unpublished bounds table from an OSR shadow — which is why §14 read 0% on
+probes and §17 read 100% on H2 with no way to see that the two were different
+obligations.
+
+The `[GC] g1 root coverage:` line now carries the per-reason census, appended
+rather than on its own line so the rate cannot be read without it.
+
+### 17.4 What is actually blocking, named
+
+With the latch fixed, the same H2 run says:
+
+```
+g1 root coverage: pauses=243 incomplete=197 (81.07%)
+                  reasons: compiled-frame-oop-not-published=197
+```
+
+`UNPUBLISHED_FRAME_OOP`: a live compiled frame's own spill band holds a
+young-heap address the shadow stack never published, so nothing can rewrite
+that slot after a relocation. Not the coverage bit, not map selection, not the
+bounds table — a *shadow-stack publication* gap, and the one obligation
+`arch-2026-07-26/moving-young-corruption-rootcause.md` is named after.
+
+The pause count rising 33 → 243 in the same wall time is the other half of the
+same story: the old latch was refusing evacuation, so the run made less
+progress per pause.
+
+That is where precise root coverage actually stands on real code, and it is a
+more specific answer than §14, §15 or §16 could give. The defaults stay
+opt-in; `compiled-frame-oop-not-published` at 81% is the number the next
+attempt should drive down, and it is a shadow-stack question rather than a
+codegen or collector one.
+
+### 17.5 Two instruments, both of which had to be fixed to see this
+
+Neither result was visible before this section: the latch made every real
+workload report the same wrong reason, and the discarded reason code made the
+report unreadable even when it was right. §16.4 said a counter that flags a
+possible defect is not evidence of one; §17 adds the converse — an instrument
+that reports a real obligation under a wrong label hides the one finding worth
+having.
+
+## 18. The shadow-stack gap was mostly my own envelope (2026-09-03)
+
+*`fix/moving-young-band-object-screen-20260903`. §17.4 named
+`compiled-frame-oop-not-published` at 81% as what is actually blocking precise
+root coverage on real code. Most of it was an artefact of the change §14 made.*
+
+### 18.1 The detector has no object screen, and could not have one
+
+`band_has_unpublished_word_with_map` decides a stack word is an unpublished oop
+on one test:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) { return true; }
+```
+
+`is_relocatable` is `gen_heap::addr_is_movable` — an **address-range check**.
+No `is_object_address`, no header validation, unlike every sibling instrument
+in this file, all of which require `heap.is_object_address(qword).is_some()`
+before believing a word.
+
+It cannot simply be given one: there is no heap handle in
+`refresh_moving_young_coverage_for_current_thread`, and — the harder half —
+the range it tests covered G1's whole **reservation**, where reading a header
+faults on pages that were never committed.
+
+§14 published that reservation, on the argument that a superset is the safe
+direction. It is, for this classification. But it is also the reason this test
+lit up for G1 at all: every reserved-but-uncommitted byte is address space that
+cannot hold an object and can only turn coincidental stack words into
+"unpublished oops".
+
+### 18.2 The fix, and what it is worth
+
+G1 now publishes the **committed prefix** into `MOVABLE_BOUNDS`, republished as
+the prefix grows — exactly as `publish_jit_read_bounds` beside it already does.
+Still a superset of what can hold an object, so §14's safety argument is intact,
+and now tight enough that a header screen would be safe to add later.
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, precise-only switches and the
+oracle on, six reps each:
+
+| | incomplete rate per rep | median |
+|---|---|---:|
+| reservation (§14) | 2.94, 3.85, 16.95, 40.38, 72.41, 83.62 % | **28.7 %** |
+| committed prefix | 2.78, 2.78, 3.39, 4.08, 4.27, 21.43 % | **3.7 %** |
+
+The absolute counts fall the same way: 1–97 incomplete pauses become 1–5.
+
+**Read those spreads before the medians.** This workload is extremely unstable —
+the same binary and configuration produced 34 and 243 pauses on consecutive
+runs, and rates from 2.9% to 83.6% on the unchanged arm. Six reps are enough to
+say the arms differ by roughly an order of magnitude and not enough to put a
+figure on it. §12.3's lesson applies here too, and the instability is itself the
+finding that blocks a real soak of this metric: nobody can drive
+`compiled-frame-oop-not-published` down until the measurement is stable enough
+to tell progress from variance.
+
+### 18.3 What is left, honestly
+
+A residue survives the fix — 1 to 5 pauses per run still report
+`compiled-frame-oop-not-published`, and a second reason,
+`innermost-rbp-belongs-to-unguarded-callee`, appears alongside it. Those are
+the ones that may be real, and the object screen §18.1 describes is what would
+tell: with the range now bounded by the commit, a header check is safe to add,
+and it is the next step rather than a further narrowing of the bounds.
+
+**One segfault**, on the fixed arm, during the spread runs above. It did not
+reproduce: 0 crashes in 14 subsequent reps on that arm (8 without the oracle, 6
+with) and 0 in 14 on the unchanged arm. It is recorded rather than explained,
+and it matches the rare tight-heap crash class G1-11 already documents at
+roughly 1-in-32 on plain `dev`.
+
+## 19. The band test's object screen — and what it did NOT find (2026-09-03)
+
+*`fix/band-test-object-screen-20260903`. §18.3 named the object screen as the
+next step, once the envelope was bounded by the commit and a header read was
+safe. It is in. It does not move the number, and that is the result.*
+
+### 19.1 What was added
+
+`cratonvm_types::plausible_object_header_at` — the heap-free half of
+`G1Collector::is_object_address`. That function is a range check followed by
+exactly these header tests (kind tag decodes, element-type tag decodes, not a
+filler, plausible `num_slots`/`array_length`), and only the range half needs a
+collector. `band_word_is_an_object` applies it in
+`band_has_unpublished_word_with_map`, so the band test now asks "is there an
+unpublished OBJECT here" rather than "is there a word whose value lands in the
+heap's range" — the question every sibling instrument in that file already asks.
+
+Safe only because §18 bounded `MOVABLE_BOUNDS` to the committed prefix; under
+the previous reservation-wide envelope this dereference could touch a page that
+was never mapped.
+
+`CRATONVM_MOVING_YOUNG_NO_BAND_OBJECT_SCREEN=1` restores the range-only test,
+and that is the fail-OPEN direction — more words flagged, more cycles refusing
+to move — so it is the safe lever if a missed root is ever suspected here.
+
+**It is a filter, not a proof, and its test says so.** The kind and
+element-type tags are a few bits each, so some arbitrary words decode to a
+valid pair by chance; `the_object_header_screen_separates_headers_from_numbers`
+asserts a rejection RATE over a spread rather than a verdict on one hand-picked
+word, which would have been a coin toss dressed as a property.
+
+### 19.2 The measurement, which is a null result
+
+`org.h2.test.store.TestMVStoreTool` at `-Xmx64m`, precise-only switches and
+oracle on, four reps each:
+
+| screen | incomplete rate per rep | median |
+|---|---|---:|
+| off (range only) | 5.41, 3.80, 2.25, 25.00 % | 4.6 % |
+| on | 3.45, 45.83, 3.57, 2.50 % | 3.5 % |
+
+Both arms carry one outlier and the medians are inside the noise. **The screen
+does not reduce the residue.**
+
+That is worth having. After §18 the residual `compiled-frame-oop-not-published`
+reports are NOT non-header junk — they are words that pass a header screen. So
+the residue is either genuine unpublished roots, or dead slots still pointing at
+real objects, and telling those apart needs a liveness question rather than a
+shape one. The screen is landed because it makes the instrument ask the right
+question for whoever asks it next, not because it improved today's number.
+
+### 19.3 Where this leaves the shadow-stack question
+
+Four sections in, the honest state:
+
+* §14 — the coverage proof was vacuous under G1 (no movable envelope). Fixed.
+* §17 — a refutation latch fired on shape, reporting 100% incomplete on every
+  real workload for the wrong reason. Fixed; the reason census now names the
+  obligation.
+* §18 — most of the named obligation was the reservation-wide envelope that
+  §14 itself published. Fixed; median 28.7% → 3.7%.
+* §19 — the remaining few percent survive an object screen, so they are not
+  shape artefacts.
+
+What has NOT been established at any point is that the residue is a real
+missed root. Every instrument aimed at it so far has answered a question about
+shape, and every time the shape answer has turned out to be dominated by
+artefacts. The next step is the liveness question — the verifier type maps, as
+§16 used for `never_mapped` — applied to the band words, and it needs a
+workload whose coverage rate is stable enough to measure against, which
+`TestMVStoreTool` is not (§18.2).
+
+## 20. The liveness screen — and the crash §19 shipped (2026-09-03)
+
+*`fix/band-test-liveness-screen-20260903`. §19.3 named the liveness question as
+the next step. Adding it surfaced a defect §19 had already merged.*
+
+### 20.1 First: §19 shipped a segfault, and this is how
+
+§19's object screen dereferences a band word to read its header:
+
+```rust
+if is_relocatable(w) && !published.contains(&w) && band_word_is_an_object(w) {
+```
+
+Its safety comment argued the word is inside the published movable range, which
+§18 bounds by the committed prefix. **That argument holds for one of the two
+callers.** `band_has_unpublished_word_with_map` takes
+`is_relocatable: impl Fn(usize) -> bool` as a PARAMETER; production passes
+`gen_heap::addr_is_movable`, but the map-less wrapper takes whatever the caller
+supplies, and every unit test in this file supplies a closure over synthetic
+values like `0xbeef_0000`. Reading a header from one of those is a segfault, and
+`frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published`
+duly crashed the whole `cratonvm-vm` test binary.
+
+**How it reached `dev`**: §19 was gated on the types and gc suites and
+`cargo check --workspace --all-targets`. A `check` compiles tests without
+running them, and the crashing test lives in `cratonvm-vm`, whose test suite was
+not run. The lesson is narrow and worth stating: a change to a function in
+`vm/src/` is not gated by the gc suite, and `check` is not `test`.
+
+The fix is a `readable: bool` parameter — only the caller knows whether the
+words its predicate accepts may be dereferenced. `true` for the
+`addr_is_movable` caller, `false` for the generic one, which reverts to §18's
+behaviour there. The four band tests pass again and the full 2613-test
+`cratonvm-vm` suite is green.
+
+### 20.2 The liveness screen
+
+§19 established the survivors of the object screen are header-shaped, so shape
+cannot separate a real missed root from a dead slot still pointing at a live
+object. The class file's own type maps can, for the java-locals band —
+`verifier_local_verdict`, the same oracle §16 used.
+
+**One direction only, and that is the whole safety argument.** Reporting an
+unpublished oop makes the cycle refuse to move, so DISCARDING a report is the
+direction that permits movement. A word is discarded only on a positive
+`NotOop` — the verifier saying this local definitely holds no reference at this
+bci. `Unknown` (an inlined frame, a slot outside the locals band, no type maps
+for the method) KEEPS the report, because "could not ask" must never read as
+"answered no".
+
+That is §16's asymmetry pointed the other way, and deliberately so: there the
+consequence of being wrong was a missed refutation, here it is a missed root.
+
+### 20.3 Status
+
+The screen is in and sound by construction; it is not yet measured. §18.2's
+finding stands in the way — `TestMVStoreTool`'s coverage rate swings from 2.9%
+to 83.6% on an unchanged arm, so a residue of a few percent cannot be shown to
+move against it. Whoever measures this needs a workload with a stable rate
+first; that is now the blocking item for the whole §14-§20 line of work, ahead
+of any further screening.
+
+## 21. A workload whose coverage rate can actually be measured (2026-09-03)
+
+*`perf/g1-coverage-stable-probe-20260903`. §20.3 made this the blocking item
+for the whole §14-§20 line: the screens are sound by construction but
+unmeasurable, because the only workload exercising enough compiled frames swung
+its coverage rate by 80 points between identical runs.*
+
+### 21.1 What was wrong with both ends
+
+| | frames | rate spread, identical runs | reliable? |
+|---|---:|---|---|
+| `HumongousChurn` &co. | ~14 | n/a — reports 0% | yes |
+| `TestMVStoreTool` (H2) | 612 | **2.9% - 83.6%** | no (`rc=1`) |
+
+The probes are stable and have no obligation to report; H2 has plenty and
+cannot be measured. Neither is a surface for a few-percent effect.
+
+### 21.2 `probes/CoverageBench.java`
+
+The shape follows from what the metric needs, and each part is there for one
+reason:
+
+* **Ten distinct hot methods**, each holding three or more REFERENCE LOCALS
+  live across an allocating call. That is what puts oops in a compiled frame's
+  spill band at a safepoint, which is the thing the coverage verifier has an
+  opinion about — one method with a deep loop gives one frame, ten called in
+  rotation give ten.
+* **Determinism**: no clock, no IO, no identity hashing, no threads. The
+  retained set is walked BY INDEX rather than by chasing `next`, so the access
+  pattern does not depend on where the collector put anything.
+* **A constant live set**, so pause boundaries do not drift as the run
+  proceeds, and escaping garbage through a rotating window so the allocation is
+  real.
+
+### 21.3 It is stable, and the run has to be long
+
+Four to six identical runs per configuration, `-Xmx32m`, precise-only switches
+and oracle on:
+
+| rounds | frames | pauses | incomplete rate | spread |
+|---:|---:|---:|---|---:|
+| 4 000 | 6 | 2 | 50.00 x6 | 0 (too small to mean anything) |
+| 40 000 | 302-659 | 64-137 | 87.50, 90.62, 92.31, 92.70, 98.44, 98.53 % | 11 pts |
+| **150 000** | **1283-2207** | 260-456 | **96.92, 97.48, 97.59, 97.80 %** | **0.88 pts** |
+
+`checksum` is identical across every run of a configuration and `rc=0`
+throughout — neither is true of the H2 class.
+
+**The pause COUNT still varies about twofold**, because when the JIT compiles
+each method shifts the allocation rate. The RATE does not, once the run is long
+enough for the compiled steady state to dominate the early pauses. That is the
+distinction that makes this measurable: the metric is a ratio, and the ratio
+converges even though its denominator does not.
+
+At 150 000 rounds this gives 1283-2207 compiled frames — two to three times the
+H2 sample — with a spread under one point, against H2's eighty. A change worth
+one or two points is now visible; against `TestMVStoreTool` it never was.
+
+### 21.4 What it says, and the work it unblocks
+
+`incomplete = 97.5%`, reason `compiled-frame-oop-not-published`, stably. So the
+obligation §17.4 named is not an artefact of H2 — a deterministic workload with
+no IO and a constant live set reproduces it at the same rate every time.
+
+That is the number for the §20.2 liveness screen to be measured against, and
+for whatever follows it. The recommended invocation:
+
+```
+CRATONVM_GC_PRECISE_ONLY_ROOTS=1 CRATONVM_G1_PRECISE_ONLY_ROOTS=1 \
+CRATONVM_DBG_VERIFY_OOP_MAPS=1 \
+cratonvm -Xmx32m -XX:+UseG1GC --verbose:gc -cp probes CoverageBench 20000 150000 512
+```
+
+Four reps, compare medians, and treat anything under a point as noise.
+
+## 22. The liveness screen, measured — a null result that explains itself (2026-09-03)
+
+*`perf/band-liveness-screen-measured-20260903`. §21 built the stable workload
+so §20.2's screen could finally be measured. It was, and it does nothing —
+but the debug dump says why, and the reason is more useful than the screen.*
+
+### 22.1 The measurement
+
+The screen had no kill switch, so it could not be A/B'd in one binary — every
+other screen in this file has one and this now does too
+(`CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN`, fail-OPEN like the object
+screen's).
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| screen | incomplete rate per rep | median |
+|---|---|---:|
+| off | 98.29, 96.92, 98.69, 99.60 % | **98.49 %** |
+| on | 97.31, 99.60, 100.00, 96.67 % | **98.46 %** |
+
+`checksum=262248526` and `rc=0` on all eight. The medians differ by 0.03
+points inside a ~3-point spread: **the screen changes nothing.**
+
+(The spread is wider than §21.3's 0.88 points because these runs alternate arms
+on a busier host. It is still a usable surface — H2's was eighty.)
+
+### 22.2 Why, and it is not what the screen was built for
+
+`CRATONVM_MOVING_YOUNG_BAND_DBG=1` on the same workload dumps every word the
+band test reports. Of 93:
+
+| region | count | `in_map` |
+|---|---:|---|
+| `java-local` | 67 | **true** |
+| `reserved-locals-tail` | 26 | false |
+
+Two things follow.
+
+The screen cannot fire on the majority: they are java locals, which is exactly
+the population `verifier_local_verdict` CAN answer for — and it answers `Oop`
+or `Unknown`, not `NotOop`, because they really are references. The screen
+keeps them, correctly. It was built on §19's finding that the residue is
+header-shaped; it turns out the residue is not just header-shaped but genuinely
+live.
+
+And the more interesting half: **`in_map=true`**. The active oop map already
+names those 67 slots. So `scan_active_oop_map_at_rbp` visits them and
+`remap_active_jit_frames` rewrites them — the precise mechanism covers them.
+The band test reports them anyway, because its question is whether the SHADOW
+STACK published the word, and it asks that of slots the oop map has already
+accounted for.
+
+### 22.3 The next hypothesis, stated but not acted on
+
+A word the ACTIVE OOP MAP names may not need shadow-stack publication to be
+rewritable, because the oop-map path rewrites it. If that holds,
+`band_has_unpublished_word_with_map` should not report an `in_map` word at all,
+and 67 of 93 reports on this workload would go away.
+
+It is written here rather than implemented because it is one dump on one
+workload, and this document now records two changes landed on that much
+evidence and withdrawn (§15 → §16, and the §19 screen whose crash §20 fixed).
+The test is cheap and specific: suppress `in_map` words, run §21's four reps,
+and see whether the rate falls by roughly the two-thirds the dump predicts. If
+it does not, the dump was not representative and nothing was lost.
+
+### 22.4 The screen stays
+
+Landed despite the null result, for the reason §19's object screen was: it
+makes the instrument ask a sound question, and it is the only thing standing
+between a future `NotOop` word and a spurious refusal to move. It costs a
+verifier lookup on a diagnostic path that only runs under the precise-only
+switches, and `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN=1` removes it.
+
+## 23. The in-map suppression test — a real effect, a wrong prediction, and new variance (2026-09-04)
+
+*`perf/band-in-map-suppression-test-20260904`. §22.3 named this test and
+declined to run it on one dump's evidence. Run now, behind
+`CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` (opt-in, default off).*
+
+### 23.1 The result
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches and oracle
+on, four interleaved reps:
+
+| skip in-map | incomplete rate per rep | median | spread |
+|---|---|---:|---:|
+| off | 98.05, 98.25, 97.30, 98.22 % | **98.14 %** | 0.95 pts |
+| on | 84.15, 46.39, 92.50, 89.05 % | **86.60 %** | **46 pts** |
+
+`checksum=262248526` and `rc=0` on all eight.
+
+The effect is real — about **11.5 points** — and it is nothing like the
+prediction.
+
+### 23.2 The prediction was wrong in kind, not just in size
+
+§22.3 said "expect roughly a two-thirds fall", reasoning from the dump's 67 of
+93 WORDS being `in_map`. That inference does not hold: the rate is per PAUSE,
+and a pause is incomplete if ANY of its words is unpublished. Removing
+two-thirds of the words removes a pause from the count only when it removes
+ALL of that pause's words. A per-word proportion cannot be read as a per-pause
+one, and the 11.5 points measured against 65 predicted is the size of that
+mistake.
+
+Worth stating plainly because the surrounding sections are about instruments
+that answer a different question from the one asked of them, and this is the
+same error committed in the reasoning rather than in the code.
+
+### 23.3 The variance is the more interesting half
+
+The OFF arm spans 0.95 points — §21's stability holds. The ON arm spans 46,
+and its pause counts jump too (526-1013 against 259-462).
+
+That is not measurement noise; it is the suppression changing what the
+collector does. Fewer reported words means more cycles permitted to move,
+which changes the pause pattern, which changes the workload's behaviour — so
+the ON arm is not the same experiment run twice. §21's workload is stable for
+observing a metric, not for a change that alters the collector's decisions,
+and this is the first change in this line that does.
+
+Anything built on this needs its own stability answer first. A rate quoted from
+the ON arm today means nothing narrower than "between 46 and 93%".
+
+### 23.4 What it does not settle
+
+The claim §22.3 rests on — that a slot the active oop map names is rewritten by
+`remap_active_jit_frames` and so needs no shadow-stack publication — is neither
+confirmed nor refuted by an 11.5-point drop in a self-reported metric. What
+would confirm it is the stale-after-remap detector: with the suppression on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` should show no NEW stale word in an
+`in_map` slot. That is the next test, it is cheap, and it is a soundness
+question rather than a rate one — which is the right order after §22 showed
+four rate-screens in a row moved almost nothing.
+
+The flag ships opt-in and stays that way until that question is answered.
+
+## 24. The in-map hypothesis is refuted (2026-09-04)
+
+*`fix/band-in-map-suppression-refuted-20260904`. §23.4 named the soundness test
+and said it was the right order after four rate-screens moved almost nothing.
+Run now, and it kills the hypothesis outright.*
+
+### 24.1 The test and the answer
+
+`CoverageBench 20000 150000 512` at `-Xmx32m`, precise-only switches on,
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1`, three reps per arm:
+
+| skip in-map | stale words after remap | of those, `region=java-local` |
+|---|---:|---:|
+| off | 2, 8, 18 | 0, 4, 10 |
+| **on** | **260, 545, 319** | **54, 140, 70** |
+
+Twenty to forty times as many stale words, and java-local stale words going
+from single digits to 54-140. The other regions move with them
+(`safepoint-gpr-spill-image` 161, `operand-spill` 143, `callee-saved-gpr-image`
+97 in one run).
+
+**The claim §22.3 rested on is false.** A slot the active oop map names is NOT
+thereby rewritten after a move: suppressing those words leaves hundreds of
+references the collector moved and nothing updated. Whatever `in_map`
+guarantees, it is not "the precise path covers this slot", and the
+shadow-publication requirement the band test enforces is not redundant for
+them.
+
+The flag stays — it is the lever that produced this answer and would re-test it
+if the mechanism changes — now documented as refuted, and it is fail-OPEN, so
+off is safe.
+
+### 24.2 The checksums were right the whole time
+
+`checksum=262248526` on every completed run in BOTH arms, including the one
+carrying 545 stale references. A stale reference is only a wrong answer if
+something dereferences it, and this workload did not.
+
+That is §15's lesson arriving a second time, and it is worth the repetition:
+had this experiment been judged on output correctness — the obvious way to
+check "did suppressing this break anything" — it would have passed three times
+out of three and the hypothesis would have been confirmed. The detector is the
+only thing that saw it.
+
+(One `off` run exited `rc=127` and is excluded; the other two agree.)
+
+### 24.3 Where the §14-§24 line stands
+
+Ten sections, and the honest ledger:
+
+* **Fixed and measured**: the vacuous coverage proof (§14), a refutation latch
+  firing on shape (§17), the reservation-wide envelope (§18, median 28.7% →
+  3.7%).
+* **Landed, sound, no measurable effect**: the object screen (§19) and the
+  liveness screen (§20/§22).
+* **Refuted**: the map-selection gap (§16), and now the in-map hypothesis
+  (§24).
+* **Built**: a stable workload (§21) and a per-reason census (§17.3), without
+  which none of the above could have been told apart.
+
+`compiled-frame-oop-not-published` at ~98% remains, and after §24 it is no
+longer safe to assume it is instrument error: the one hypothesis that would
+have explained most of it away has been tested and is wrong. The next question
+is why those slots are not published — a shadow-stack question in the JIT's
+publication path, not another screen in the collector's verifier.
+
+## 25. Why those slots are not published — four dead ends and one structural fact (2026-09-04)
+
+*`docs/shadow-publication-investigation-20260904`. §24.3 left the question as
+"why are those slots not published", a JIT publication question rather than a
+collector one. This is the investigation. It does not answer it, but it
+eliminates four candidate answers with evidence and narrows the remainder to
+one testable question — which is worth writing down so nobody walks the same
+four.*
+
+### 25.1 What was ruled out
+
+**The `published` set is not per-frame.** `moving_young_unpublished_frame_oop_present`
+computes `published` once, from the innermost frame, and reuses it for every
+parent in the RBP-chain walk — which looks like the bug until you read
+`shadow_window_from_frame`: the window is `[BASE, TOP)` of the whole thread
+`ShadowStack`, not a slice belonging to one frame. Every frame's entries are in
+it.
+
+**There is no compile-time/scan-time gate skew.** The shadow push publishes
+locals only under `complete = moving_young_enabled()`, which reads as a
+compile-time decision baked into each method — but
+`conservative_roots::moving_young_enabled` is a `OnceLock` that also publishes
+its value to `gc_quiescence`, so codegen and the collector cannot disagree
+within a process.
+
+**The frame slot is not a stale copy of a register-homed local.**
+`emit_pre_safepoint_spill_impl` flushes every register-resident local to its
+canonical frame slot before the safepoint, unconditionally:
+
+```rust
+for idx in 0..self.local_assignments.len() {
+    if let Some(reg) = self.local_assignments[idx] { ... emit_store_local(off, reg) }
+}
+```
+
+so the slot the band verifier reads holds the value that was current at the
+safepoint.
+
+**The shadow stack does not overflow.** `DEFAULT_SHADOW_SLOTS` is 256 Ki and an
+overflow prints `[JIT] shadow-stack overflow: N push(es) bailed`. It appears in
+none of the captured runs.
+
+### 25.2 The structural fact
+
+`emit_shadow_push` runs in `emit_pre_safepoint_spill_impl`, **before the call**.
+`emit_shadow_reload` runs in `emit_oop_map_for_safepoint`, **right after the
+call returns**, and it POPS.
+
+So a frame's oops are on the shadow stack **only for the duration of a call**.
+That is coherent for a frame suspended inside a call — every parent in the
+chain, and an innermost frame that entered the runtime through an allocation or
+poll helper. It is not coherent for a frame stopped at a safepoint that is not
+a call.
+
+### 25.3 The question that is left, and how to answer it
+
+The contradiction §22.2 measured is that 67 of 93 reported words are
+`in_map=true`: the active oop map, resolved through the frame's own `sp_id`
+slot, names them. The map and the shadow push are driven by the SAME
+enumeration (`for_each_oop_local_at_current_pc`) at the same pc, so a slot in
+one should be in the other — unless the frame is at a safepoint whose push
+never ran or has already been popped.
+
+The next probe is therefore about the safepoint KIND, not about more screening:
+for each reporting frame, record whether its resolved `sp_id` belongs to a
+call-shaped safepoint (push live) or a poll-shaped one (push absent or already
+reloaded). If the reports concentrate on poll-shaped safepoints, the answer is
+that shadow publication is call-scoped while the band verifier's obligation is
+not, and the fix is in that pairing rather than in either side alone.
+
+That probe is a few lines in `report_unpublished_band_words`, which already has
+`cm` and the resolved `sp_id` in hand.
+
+### 25.4 Why this is written up unanswered
+
+Four sections of this document (§16, §19, §22, §24) record hypotheses that
+looked obvious and were wrong, two of them after being implemented. The cost of
+the fifth is one more build; the cost of writing down four eliminated
+candidates and the one fact that survived them is a paragraph. On this
+question's track record the paragraph is the better trade.
+
+## 26. The safepoint-kind probe refutes §25, and finds the real cause (2026-09-04)
+
+§25 ended by proposing a probe: for each reporting frame, record whether the
+resolved `sp_id` belongs to a call-shaped safepoint (shadow push live) or a
+poll-shaped one (push absent or already reloaded). If the reports concentrated
+on poll-shaped safepoints, the answer would be that shadow publication is
+call-scoped while the band verifier's obligation is not.
+
+It does not. The probe added `OopMapEntry::shadow_pushed`, captured in
+`emit_oop_map_for_safepoint` **before** `emit_shadow_reload` takes
+`pending_shadow` — after that call the count is zero by construction, which is
+the one way this probe could have lied. On `CoverageBench 20000 150000 512` at
+`-Xmx32m`, 288 reports over 266 pauses:
+
+| method | `sp_id` | `in_map` | `shadow_pushed` | n |
+| --- | --- | --- | --- | --- |
+| `alloc` | 2 | false | 0/0 | 233 |
+| `m06` | 12 | true | 2/3 | 24 |
+| `main` | 217 | true | 3/3 | 30 |
+
+Nothing reports `0/N`. The `in_map=true` safepoints are call-shaped and the
+push did publish — three of three mapped slots for `main`. §25's hypothesis is
+refuted.
+
+### 26.1 What the same line said instead
+
+Every one of the 288 reports carried `published=0`. That was read for two
+sessions as a publication fact — the shadow push declined these oops, so look
+at `collect_live_oop_homes`. It is not a publication fact.
+`published_shadow_values(None)` returns an empty set, so `published=0` means
+either "the window resolved and held nothing" or "the window did not resolve at
+all", and those point at opposite repairs. `Option` had folded ten distinct
+refusals and a genuinely empty stack into one indistinguishable `None` — the
+UNKNOWN-vs-ZERO conflation, this time inside the instrument rather than the
+subject.
+
+`shadow_window_from_frame_why` now names the refusal and
+`shadow_window_from_frame` is its only reason-discarding caller, so the
+diagnostic cannot drift from the path actually taken. Re-run:
+
+```
+211 alloc win=unresolved(thread-null-or-misaligned) push=0/0
+ 30 main  win=unresolved(?)                         push=3/3
+  6 m06   win=unresolved(?)                         push=2/3
+```
+
+`(?)` is `.err().unwrap_or(...)` on an `Ok` — recomputed against their own
+frames, `main` and `m06` resolve the window fine. They were being verified
+against a window that failed to resolve somewhere else.
+
+### 26.2 The cause
+
+`ir_lower::finish_lazy_thread_fetch` erases the thread-pointer fetch whenever a
+method publishes nothing (`!shadow_pushed_any`), so a leaf with no oops to push
+leaves `[rbp - shadow_thread_slot_off]` zero **by design**. That is a correct
+optimisation. The band verifier's use of it was not: it resolved the thread's
+shadow window from the **innermost** frame alone, and when that frame was such
+a leaf — `CoverageBench.alloc`, whose map names nothing — the window came back
+`None`, and every oop in every outer frame read as unpublished.
+
+228 of 229 pauses declined relocation on that basis, while `main` had in fact
+pushed three of its three mapped slots.
+
+The three reporting groups are one mechanism, not three: `alloc` is the frame
+that loses the window, `main` and `m06` are the frames billed for it.
+
+### 26.3 The repair, and what it is worth
+
+The shadow stack is per-**thread**; the frame slot was only ever a cache, and
+`shadow_window_from_frame_why` already refused any cached pointer that was not
+`current_jit_thread_ptr()`. So when a thread is installed, ask it directly.
+Both paths now end in one shared `shadow_window_at`, so a window reached either
+way is held to identical `ShadowStack` invariants. The frame path remains for
+the no-installed-thread case (unit tests, threads that never entered JIT code).
+
+Kill switch `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW`, so this is one
+binary's A/B and not two builds. ABBA-interleaved, `CoverageBench` at
+`-Xmx32m`, `incomplete` rate:
+
+| configuration | fix off | fix on |
+| --- | --- | --- |
+| default | 99.5 – 100 % | 18.1 – 26.8 % |
+| precise-only roots | 97.8 – 100 % | 18.0 – 28.4 % |
+
+Checksum identical in every completed run of every arm.
+
+### 26.4 The cost, stated plainly
+
+Making the proof succeed makes G1 actually relocate, and at the tightest heap
+that reaches a pre-existing degradation this workload never used to arrive at:
+
+```
+degraded=evacuation-failure-self-forwarded,evacuation-failure-drain-wedged
+```
+
+`EVACUATION_FAILURE_UNRESOLVED` is documented in `gc_metrics.rs` as "the one G1
+state that silently converts most of the heap into kept, mostly-garbage
+regions" — which at `-Xmx32m` is an `OutOfMemoryError`. Fatal-OOM rates:
+
+| configuration | heap | fix off | fix on |
+| --- | --- | --- | --- |
+| precise-only roots | 32 m | 0/40 | 5/40 |
+| precise-only roots | 48 m | 0/10 | 0/10 |
+| precise-only roots | 64 m | 0/10 | 0/10 |
+| default | 32 m | 0/20 | 0/20 |
+
+So the regression is confined to the **opt-in** precise-only mode at the
+tightest heap, where the suppression really fires and G1's pin set really goes
+empty. The shipping configuration takes the coverage gain and shows no failure
+in 20 runs per arm. The rate is also load-dependent — an earlier sample on a
+busier host read 4/16 where a later one read 1/24 — so treat the 5/40 as an
+order of magnitude, not a measurement.
+
+This is the "a crash under YOUR feature may be a known dev defect your feature
+merely ENABLES" shape: the wedge is pre-existing, instrumented, and named in
+dev; the fix's contribution is arriving at it. The next question for the
+precise-only default belongs to `retry_after_evacuation_failure`, not here.
+
+### 26.5 The residual this leaves
+
+`m06` reports `2/3` — its map names three slots and only two homes were
+collected. That is an independent per-slot gap in `collect_live_oop_homes`,
+untouched by the window repair and now the only remaining lead from §25's
+question. It accounts for 6 to 24 reports per run against `alloc`'s 211, so it
+is worth pursuing only after the ~20 % residual incomplete rate is attributed.
+
+## 27. The residual, closed — and §26.5 was wrong about where it was (2026-09-04)
+
+### 27.1 There is no `m06` gap
+
+§26.5 named `m06`'s `shadow_pushed=2/3` as "an independent per-slot gap in
+`collect_live_oop_homes`". It is not a gap, on two counts.
+
+It is not measurable: with the §26 window repair in place, `m06` reports **zero**
+unpublished band words across six runs (386 reports, every one of them
+`CoverageBench.alloc`). The `2/3` was recorded while the window was still
+unresolved, when `published` was empty and therefore EVERY movable word in every
+frame reported. `m06` was one of the frames being billed for `alloc`'s lost
+window, not a second defect beside it.
+
+And it would not have been evidence even if it had persisted: `shadow_pushed`
+counts HOMES — `ShadowHome::Reg` and `ShadowHome::Frame` alike — while the
+denominator counts only the map's `frame_slot_offsets`. A register-resident
+local is one home and one mapped frame slot, and `collect_live_oop_homes`
+deduplicates besides, so the two numbers partition different sets and need not
+be equal. Reading `2/3` as "one slot was missed" was reading a ratio between
+incomparable counts.
+
+Both errors have the same root: a number recorded under one condition was
+carried into a paragraph written under another.
+
+### 27.2 What the residual actually was
+
+Every remaining report was `CoverageBench.alloc` at offsets 16, 48 and 64, all
+`in_map=false` — the active map does not name them, correctly, because the
+dataflow does not consider them live. Decoding the reserved tail from the
+`sp_id_off=32` the report already printed:
+
+| offset | slot |
+| --- | --- |
+| 16 | java local 1 — `long[] a`, before its first assignment |
+| 48 | `shadow_savebase_slot_off` |
+| 64 | `phi_copy_scratch_slot_off` |
+
+All three are **uninitialised frame words**. The prologue zeroes
+`shadow_thread` and `shadow_savetop` and stops there, so `shadow_savebase`
+(written only by a shadow push) and `phi_copy_scratch` (written only by a
+cycle-breaking parallel copy) hold whatever the previous frame at that address
+left — and in an allocation-heavy workload that is a stale object pointer. The
+Java local is the same story from the other direction: definite assignment means
+nothing reads it before it is written, so nothing writes it either.
+
+The band verifier is right about all three. A movable-resident word that no map
+names and no push published is exactly what it exists to refuse.
+
+### 27.3 The repair
+
+Two prologue changes, each behind its own switch so they stay attributable:
+
+* `CRATONVM_JIT_NO_ZERO_RESERVED_TAIL` — also zero `shadow_savebase` and
+  `phi_copy_scratch`, inside the block that already establishes "the reserved
+  tail must read 0, not uninitialised stack".
+* `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` — zero local slots `num_params
+  ..num_locals`. Safe only because this tier publishes no `osr_pc_to_native`,
+  so `osr_enter` refuses and this prologue is the sole entry; an OSR trampoline
+  would jump past it into a frame whose locals the interpreter had already
+  filled. The edit that wires OSR into this tier must revisit this block, for
+  the same reason it must revisit the callee-saved save area.
+
+`CoverageBench` at `-Xmx32m`, ABBA-interleaved, incomplete rate:
+
+| arm | rate | offsets still reporting |
+| --- | --- | --- |
+| both off | 17.7 – 20.1 % | 16, 32, 48, 64 |
+| reserved tail only | 7.6 – 9.6 % | 16, 32 |
+| both on | **0.00 %** | none |
+
+Zero at `-Xmx32m`, `64m` and `256m`, and zero under the precise-only-roots arm.
+Checksum identical in every arm of every run. Taken with §26, the rate on this
+workload went 99.6 % → ~20 % → 0 %.
+
+### 27.4 Cost
+
+Extra prologue stores, so it has to be priced. `CoverageBench 20000 400000 512`,
+ABBA-interleaved, 20 runs per heap:
+
+| heap | on | off |
+| --- | --- | --- |
+| 256 m | 9989 ms | 10794 ms |
+| 48 m | 11907 ms | 12622 ms |
+
+Both medians favour ON, but an earlier 6-run sample at 256 m put ON 3.7 %
+SLOWER, and the per-run spread is 8.8 – 16.7 s. Two samples that disagree in
+sign mean the effect is below this host's noise floor. The honest claim is "no
+measurable cost", not the 5.7 – 7.5 % the medians would otherwise support.
+
+The first attempt at this measurement was worse than useless: every arm exited
+`rc=1` and I read the wall-clock anyway. `CoverageBench`'s `r * 7919` overflows
+`int` past ~271k rounds, so 400k rounds threw
+`ArrayIndexOutOfBoundsException` — the probe's own arithmetic, reported as if it
+were the VM's. Fixed in the probe with a `long` widening; the published
+checksum at 150k rounds is unchanged, so every earlier number still holds.
+
+### 27.5 Gates
+
+`cratonvm-jit` 2230 passed, `cratonvm-vm` 201 passed, regression suite 90 of 90.

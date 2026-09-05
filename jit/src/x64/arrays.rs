@@ -209,6 +209,26 @@ impl Compiler {
         self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
+    /// Emit the GPU input-residency barrier after an inline primitive
+    /// array store, if it is armed.
+    ///
+    /// Assumes **RAX still holds the array pointer**, which it does at
+    /// every one of the seven store arms: the store itself is
+    /// `[RAX + RCX*n + ARRAY_DATA_OFFSET]`, and nothing between the
+    /// bounds check and here touches RAX.
+    ///
+    /// Nothing is emitted unless a `--gpu` run armed the barrier, so a
+    /// CPU-only build and a `gpu-offload` build without `--gpu` both get
+    /// byte-identical code to before it existed. See
+    /// [`crate::gpu_barrier`] for the sequence, the register contract
+    /// and why the compiled tier marks a bucket rather than calling
+    /// `input_cache::invalidate`.
+    pub(super) fn emit_gpu_input_cache_barrier(&mut self) {
+        if let Some(bytes) = crate::gpu_barrier::barrier_bytes() {
+            self.buf.emit(&bytes);
+        }
+    }
+
     /// Inline arraylength. Assumes RAX=array ptr. Result in RAX.
     pub(super) fn emit_arraylength_regs(&mut self) {
         // Assumes RAX = array ptr. MOV EAX, DWORD [RAX + ARRAY_LENGTH_OFFSET]
@@ -229,14 +249,21 @@ impl Compiler {
     /// The previous `process::abort()` in `vm/src/jit/helpers.rs`
     /// jit_iastore/bastore/aastore was a comment-level "fail loudly"
     /// theater because the helpers were never reached on the inline path.
-    fn emit_null_check_array_store(&mut self, action: u8) {
+    ///
+    /// `trap_key` is the id `x64::inlining::record_npe_trap_site` issued for
+    /// this site, or `0` when the site is not described. It travels with the
+    /// action code so [`emit_null_check_store_stubs`] can give a described site
+    /// its own cold trampoline; the two bytes of fast path emitted here are the
+    /// same either way.
+    fn emit_null_check_array_store(&mut self, action: u8, trap_key: u32) {
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
-        // JZ rel32 → null-store stub (patched later)
+        // JZ rel32 -> null-store stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.null_check_store_stubs.push((action, patch_offset));
+        self.null_check_store_stubs
+            .push((action, patch_offset, trap_key));
     }
 
     /// Null check for `putfield` inside a protected range whose handler needs
@@ -246,7 +273,8 @@ impl Compiler {
     pub(super) fn emit_precise_null_check_field_store(&mut self) {
         let bci = self.dbg_last_pc;
         if !self.precise_exception_frames || !self.pc_is_protected(bci) {
-            self.emit_null_check_array_store(npe_action::NONE);
+            let key = crate::x64::inlining::record_npe_trap_site(bci);
+            self.emit_null_check_array_store(npe_action::NONE, key);
             return;
         }
         if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
@@ -286,7 +314,8 @@ impl Compiler {
         }
         // JEP 358: the trapping opcode IS at `code[bc_pc]` (the array-store
         // arm passes its own pc), so derive the per-element-type action.
-        self.emit_null_check_array_store(array_opcode_npe_action(code, bc_pc));
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        self.emit_null_check_array_store(array_opcode_npe_action(code, bc_pc), key);
     }
 
     /// Round-9 HIGH fix (asymmetric coverage): emit an inline null check
@@ -304,14 +333,16 @@ impl Compiler {
     /// run the epilogue. We therefore reuse the SAME shared stub by
     /// pushing the JZ patch offset into the same `null_check_store_stubs`
     /// vector; both loads and stores branch to it.
-    pub(super) fn emit_null_check_array_load(&mut self, action: u8) {
+    /// `trap_key`: see [`Self::emit_null_check_array_store`].
+    pub(super) fn emit_null_check_array_load(&mut self, action: u8, trap_key: u32) {
         // TEST RAX, RAX  (48 85 C0)
         self.buf.emit(&[0x48, 0x85, 0xC0]);
-        // JZ rel32 → shared null-check stub (patched later)
+        // JZ rel32 -> shared null-check stub (patched later)
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.null_check_store_stubs.push((action, patch_offset));
+        self.null_check_store_stubs
+            .push((action, patch_offset, trap_key));
     }
 
     /// Round-11 HIGH-2 (mirrors `emit_null_check_array_store_at`):
@@ -326,7 +357,8 @@ impl Compiler {
             }
         }
         // JEP 358: derive the per-element-type action from the trapping opcode.
-        self.emit_null_check_array_load(array_opcode_npe_action(code, bc_pc));
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        self.emit_null_check_array_load(array_opcode_npe_action(code, bc_pc), key);
     }
 
     /// Emit an inline null check on the `arraylength` receiver (assumed
@@ -336,6 +368,25 @@ impl Compiler {
     /// handler re-raises rather than throwing NPE). This reuses the
     /// shared null-check stub (sets `JIT_PENDING_NPE`, deopts out) that
     /// array loads/stores already branch to.
+    ///
+    /// **This check used to be the one that survives in a counted
+    /// `for (int i = 0; i < a.length; i++)` loop, at a `TEST`/`JZ` per
+    /// iteration.** The bound's own `arraylength` sits AT the loop header, and
+    /// the null-check dataflow (`crate::null_check_elim`) meets over paths with
+    /// a bitwise AND: the back edge arrives having just dereferenced the array,
+    /// the pre-header does not, so the intersection at the header drops the
+    /// fact and this helper emitted. The elision was not wrong — the first
+    /// iteration genuinely has no proof — but the second and every later one
+    /// paid for it.
+    ///
+    /// Closed 2026-09-02 by moving the whole sequence instead of proving it
+    /// away: `ArrayLenHoist` (`x64/licm.rs`) computes the invariant
+    /// `arraylength` once in the pre-header and the body reads a frame slot, so
+    /// this null check goes with it and the header no longer emits one at all.
+    /// The dataflow reasoning above still describes what happens at a header
+    /// the hoist declines (a variant receiver, a bypassable header, a site
+    /// outside the header's straight-line prefix), which is why it is kept.
+    /// Sized in array-element-load-baseline-codegen-20260901.
     ///
     /// Unlike the load/store `_at` helpers, the dataflow elision keys on
     /// the directly-preceding `aload`/`aload_<n>` of the array receiver:
@@ -364,16 +415,48 @@ impl Compiler {
         }
         // Reuse the shared null-check stub machinery; the action is the
         // `arraylength` JEP-358 code ("Cannot read the array length").
-        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH);
+        let key = crate::x64::inlining::record_npe_trap_site(bc_pc);
+        self.emit_null_check_array_load(npe_action::ARRAY_LENGTH, key);
     }
 
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
     ///
-    /// Loads array length from header offset 12, compares index (unsigned) against length.
-    /// If index >= length (unsigned comparison catches negatives too), jumps to an
-    /// out-of-line stub that calls `jit_throw_aioobe`.
+    /// Loads the array length from the object header, compares the index
+    /// (unsigned, so the compare catches negatives too) against it, and on
+    /// `index >= length` jumps to an out-of-line stub that calls
+    /// `jit_throw_aioobe`. The stub is emitted later by
+    /// `emit_bounds_check_stubs()` after the main code.
     ///
-    /// The stub is emitted later by `emit_bounds_check_stubs()` after the main code.
+    /// The displacement is the named constant, whose value is **4**. The
+    /// "header offset 12" this comment used to state has been wrong since the
+    /// header shrank to 16 bytes and `shape` moved up into `identity_hash_code`'s
+    /// place (2026-08-07); the emitted bytes always took the constant, so only
+    /// the prose was stale. Note that the constant's own comment in
+    /// `types/src/heap_types.rs` says "8, not 12" above a value of 4 — that one
+    /// is still wrong and is not this file's to fix.
+    ///
+    /// **The length is loaded by the COLD STUB, not by this sequence.** This
+    /// used to be `MOV R10D, [RAX+len] ; CMP ECX, R10D ; JAE stub` — seven
+    /// bytes and three instructions — because `emit_bounds_check_stubs`
+    /// (`x64/deopt_stubs.rs`) reads R10D as `jit_throw_aioobe`'s `length`
+    /// argument: the number in "Index 5 out of bounds for length 3". Folding
+    /// the load into the compare on its own would have left that stub
+    /// reporting whatever R10 last held, which is why it stood as a
+    /// deliberately-refused peephole with the reason written down.
+    ///
+    /// It is correct **together with** the same load added to the cold stub,
+    /// where RAX still holds the array pointer and nothing is timing-critical.
+    /// That is the pairing now in force, and the two halves must move
+    /// together: if this compare ever stops dereferencing `[RAX+len]`, or the
+    /// stub stops re-loading it, the exception message goes wrong silently.
+    /// `bounds_check_length_is_reloaded_in_the_cold_stub` in
+    /// `x64/flag_and_header_contracts.rs` is the tripwire on that pairing.
+    ///
+    /// The fast path is now `CMP ECX, [RAX+len] ; JAE stub` — three bytes and
+    /// four saved, on **every** emitted bounds check, i.e. everywhere BCE does
+    /// not fire. Faulting behaviour is unchanged: the compare still
+    /// dereferences the same header word the load did, so a null array still
+    /// traps at the same instruction boundary rather than reaching the stub.
     pub(super) fn emit_bounds_check(&mut self, bc_pc: usize) {
         // Skip if loop analysis proved this access is safe.
         //
@@ -397,15 +480,28 @@ impl Compiler {
             return;
         }
 
-        // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET]  — load array_length from ObjectHeader
-        // Encoding: 44 8B 50 xx (REX.R + MOV r32, r/m32 + ModRM(01, R10, RAX) + disp8)
-        self.buf
-            .emit(&[0x44, 0x8B, 0x50, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
-
-        // CMP ECX, R10D  — unsigned compare index vs length
-        // If index >= length (unsigned), JAE to failure stub
-        // Encoding: 41 3B CA (REX.B + CMP r32, r/m32 + ModRM(11, ECX, R10))
-        self.buf.emit(&[0x41, 0x3B, 0xCA]);
+        // CMP ECX, DWORD [RAX + ARRAY_LENGTH_OFFSET]  — unsigned compare of the
+        // index against array_length read straight out of the ObjectHeader.
+        // If index >= length (unsigned, so a negative index compares as huge),
+        // JAE to the failure stub, which re-loads the length for the message.
+        // Encoding: 3B 48 xx (CMP r32, r/m32 + ModRM(01, ECX, RAX) + disp8).
+        // The disp8 is const-asserted to fit in `types/src/heap_types.rs`.
+        // A `const` item, not an inline call: `disp8_const` only rejects an
+        // over-127 layout constant at BUILD time when it is evaluated in a
+        // const context. Inline it would be an ordinary runtime panic, and
+        // codegen must never panic.
+        const LEN_DISP: u8 = crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8;
+        if jit_fused_bounds_load_enabled() {
+            self.buf.emit(&[0x3B, 0x48, LEN_DISP]);
+        } else {
+            // `CRATONVM_JIT_FUSED_BOUNDS_LOAD=0`: the pre-2026-09-02 pair.
+            // MOV R10D, DWORD [RAX + len]  (44 8B 50 xx), then
+            // CMP ECX, R10D               (41 3B CA).
+            // The cold stub re-loads the length either way, so this arm is a
+            // pure instruction-count difference on the fast path.
+            self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]);
+            self.buf.emit(&[0x41, 0x3B, 0xCA]);
+        }
 
         // JAE rel32 — jump if above-or-equal (unsigned >= means out of bounds)
         // The rel32 will be patched to point to the out-of-line stub

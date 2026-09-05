@@ -4198,7 +4198,9 @@ fn t10_shared_resolution_read_hit_round_trip() {
         is_synchronized: false,
         is_static: false,
         force_native_cache: std::sync::OnceLock::new(),
+        descriptor_facts_cache: std::sync::OnceLock::new(),
         intercept_shape_cache: std::sync::OnceLock::new(),
+        interp_invocations: std::sync::atomic::AtomicU32::new(0),
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -5042,7 +5044,17 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
     let ptr = storage.as_mut_ptr() as *mut u8;
 
     // Path 1: the TLAB fast path no longer mints a hash at allocation.
-    super::init_object_header(ptr, ClassId::new(0), 0);
+    // `body_size` 0 and `gc_flags` 0: this test is about the TLAB fast path not
+    // minting a hash, and it asserts `class_id` and `num_slots` only. The two
+    // parameters added since carry the COMPACT body shape, which a zero-slot
+    // object does not have -- giving them anything else would be asserting a
+    // layout the test does not check.
+    //
+    // Both trailing arguments were added to `init_object_header` without
+    // updating this call, so `cargo test -p cratonvm-vm` did not compile
+    // at all for a time -- the library still built, so only a test run
+    // showed it.
+    super::init_object_header(ptr, ClassId::new(0), 0, 0, 0);
 
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`.
     let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };
@@ -5241,8 +5253,35 @@ fn ldc_converter_passes_through_unrelated_errors() {
 /// Used by both source-scanning gates below: a test-only submodule must not
 /// be scanned as production code, and must not be counted towards the
 /// production surface B3 requires.
+///
+/// # The WHOLE attribute run, not the line above
+///
+/// A declaration may carry more than one attribute, and `#[cfg(test)]` is not
+/// obliged to be the last of them. `jit/src/x64.rs` writes
+///
+/// ```text
+/// #[cfg(test)]
+/// // x86-64 ONLY. These EXECUTE the code they emit ...
+/// #[cfg(target_arch = "x86_64")]
+/// mod tests;
+/// ```
+///
+/// because the module is BOTH test-only and x86-64-only. Remembering only the
+/// previous non-comment line saw `#[cfg(target_arch = ...)]`, answered "not a
+/// test module", and handed 17 278 lines of assertions to the panic gate as
+/// production code -- 578 sites against a budget of 0. The gate was red on dev
+/// from the moment the aarch64 work added that second attribute, and it read
+/// as a JIT defect rather than as a classifier one, which is the expensive
+/// kind of false positive: it accuses the wrong lane.
+///
+/// So the run of attributes immediately above the declaration is scanned as a
+/// unit. Comments inside the run are skipped, as they already were; anything
+/// that is not an attribute ENDS the run, so an attribute belonging to a
+/// previous item cannot leak onto this one.
 fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
-    let mut prev_was_cfg_test = false;
+    // Set by any `#[cfg(test)]` in the current attribute run, cleared by the
+    // first line that is neither an attribute nor a comment.
+    let mut run_has_cfg_test = false;
     for line in parent_src.lines() {
         let t = line.trim_start();
         if t.is_empty() || t.starts_with("//") || t.starts_with('*') {
@@ -5253,11 +5292,69 @@ fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
             .trim_start_matches("pub(super) ")
             .trim_start_matches("pub ");
         if decl == format!("mod {stem};") {
-            return prev_was_cfg_test;
+            return run_has_cfg_test;
         }
-        prev_was_cfg_test = t.starts_with("#[cfg(test)]");
+        if t.starts_with("#[") {
+            run_has_cfg_test |= t.starts_with("#[cfg(test)]");
+        } else {
+            run_has_cfg_test = false;
+        }
     }
     false
+}
+
+/// **THE CLASSIFIER MUST READ THE WHOLE ATTRIBUTE RUN.**
+///
+/// Every one of these is a shape that appears in the tree or that a reviewer
+/// would write without a second thought, and the pre-2026-09-04 form -- which
+/// remembered one line -- got the second one wrong, silently, in the direction
+/// of scanning 17 278 lines of test assertions as production code.
+///
+/// The last two are the other direction and matter just as much: a classifier
+/// loosened until the real case passes can start calling PRODUCTION modules
+/// test-only, and this gate going quiet is indistinguishable from it passing.
+#[test]
+fn the_cfg_test_classifier_reads_the_whole_attribute_run() {
+    // The plain form.
+    assert!(declared_cfg_test("#[cfg(test)]
+mod tests;
+", "tests"));
+    // The form `jit/src/x64.rs` actually uses: test-only AND x86-64-only, with
+    // the reason for the second attribute written between them.
+    assert!(declared_cfg_test(
+        "#[cfg(test)]
+// x86-64 ONLY -- these EXECUTE what they emit.
+         #[cfg(target_arch = \"x86_64\")]
+mod tests;
+",
+        "tests"
+    ));
+    // Order must not matter either.
+    assert!(declared_cfg_test(
+        "#[cfg(target_arch = \"x86_64\")]
+#[cfg(test)]
+mod tests;
+",
+        "tests"
+    ));
+    // A production module is still production.
+    assert!(!declared_cfg_test("mod isel;
+", "isel"));
+    assert!(!declared_cfg_test(
+        "#[cfg(target_arch = \"x86_64\")]
+mod simd;
+",
+        "simd"
+    ));
+    // AND AN ATTRIBUTE MAY NOT LEAK ACROSS AN ITEM. The `#[cfg(test)]` here
+    // belongs to `helpers`; `objects` is production and must read as such.
+    assert!(!declared_cfg_test(
+        "#[cfg(test)]
+mod helpers;
+mod objects;
+",
+        "objects"
+    ));
 }
 
 /// Meta-test for B3: prove `scan_production_section` covers the real

@@ -11,6 +11,40 @@ still not been run.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-04. §4's owed acceptance measurement has
+> been run and it passes.** Status was *"FIXED IN SOURCE, NOT YET VERIFIED BY AN
+> ARM"* — a page reconstructed by lane H0 from module documentation after lane
+> H20 died to an infrastructure fault, with *"the probe the lane was about to
+> run"* still unrun.
+>
+> §4 states the acceptance in one sentence: *"the 298,000 figure must go to zero
+> under `--jdk-only` and stay unchanged under `--real-jdk`."*
+>
+> ```text
+> CRATONVM_INTRINSIC_STATS=1 <vm> --jdk-only  -cp <dir> OsrDoor    0        (was 298,000)
+> CRATONVM_INTRINSIC_STATS=1 <vm> --real-jdk  -cp <dir> OsrDoor    298,000  (unchanged)
+> ```
+>
+> Both halves, to the digit, on three runs each (0/0/0 and
+> 298,000/298,000/298,000). `probes/OsrDoor.java` is the probe the two records
+> describe, transcribed and now kept in the tree.
+>
+> **§2's hazard is the thing that did NOT happen, and that is the result.** This
+> record exists because the brief's approach — filtering the direct-call plan
+> downstream — *"would have traded an open door for a wild jump"*. The counters
+> show the trade was avoided: `OSR 1` is still reported under `--jdk-only`, so
+> the method is still OSR-compiled and only the `bridge` bind is refused. A fix
+> that had closed the door by breaking the compile would show `OSR 0`, and a fix
+> that had filtered downstream would not show a clean zero here.
+>
+> **What this does NOT verify — and §5 is right that the list is long.** This
+> page is a RECONSTRUCTION: *"No claim here was re-measured by H0."* One
+> acceptance measurement passing does not re-derive the ~950 lines across four
+> files that lane H20 wrote, nor the reasoning §§1-3 attribute to its module
+> documentation. Nothing here witnesses a wrong value or a wild jump — the
+> hazard is argued, and the argument is not tested by this counter. §6's
+> nominations are untouched.
+
 ## 1. What it was asked to do, and what it found instead
 
 The brief proposed transplanting `compile_gate.rs`'s type-level

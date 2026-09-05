@@ -24,14 +24,35 @@
 //! That is the relocatable case — the answer is known, so leaving it dead is a
 //! choice rather than an open question.
 //!
-//! Deliberately *not* failures, because this guard cannot answer them and a
+//! Deliberately *not* a failure, because this guard cannot answer it and a
 //! guard that guesses is worse than none:
 //!
 //! * a basename that matches several pages (`README.md`, `roadmap.md`) — the
-//!   right target needs a human who knows which one the comment meant;
-//! * a basename that matches nothing — the page was deleted, or the citation
-//!   is a placeholder (`docs/internal/x.md`) or a glob (`…/ES-HANG-*`). Whether
-//!   the comment should be rewritten or dropped is an editorial call.
+//!   right target needs a human who knows which one the comment meant.
+//!
+//! # The second rule: a basename that matches nothing
+//!
+//! [`no_new_citation_names_a_page_that_exists_nowhere`] owns the other half.
+//! A citation whose basename appears nowhere under `docs/` names a page that
+//! was deleted, or was never written — and the reader who follows it learns
+//! nothing at all, which is the same failure this file exists to prevent.
+//!
+//! It was left unchecked because whether to rewrite the comment or drop the
+//! link is an editorial call, and there are **56** of them in this tree: too
+//! many to decide in one pass, in files spread across every crate. So it is a
+//! RATCHET rather than a verdict. `types/tests/dead-citation-baseline.txt`
+//! lists the ones that exist today; a citation not on that list fails, and a
+//! list entry that has become resolvable ALSO fails, so the list can only
+//! shrink. The debt stays countable instead of invisible, and no new dead link
+//! can land while it is paid down.
+//!
+//! Regenerate with `CRATONVM_REGEN_DEAD_CITATION_BASELINE=1`, which rewrites
+//! the file and then fails anyway: a run that regenerates has not verified
+//! anything, and a CI job that exported the variable would otherwise pass
+//! while checking nothing.
+//!
+//! Globs (`…/ES-HANG-*.md`) need no special case: [`is_path_byte`] stops at
+//! `*`, so the extractor never produces a `.md` path for one.
 //!
 //! # Basename matching, and the `-FIXED` rename
 //!
@@ -419,14 +440,13 @@ fn resolve_relative(dir: &str, target: &str) -> String {
 ///
 /// Nothing else belongs here. A citation that is merely awkward to reword is
 /// still a citation.
-const NOT_A_CITATION: &[(&str, &str, &str)] = &[(
-    "vm/tests/jck_conformance.rs",
-    "format!(\"{manifest_dir}/../docs/internal/gaps/jdk-regression-baseline.md\"),",
-    "`baseline_document()`'s FIRST candidate path, probed with `read_to_string` \
-     and falling back to the repo-root `gaps/` copy. It is what keeps the gate \
-     working while `docs/internal/` is removed from history, so the literal is \
-     a path being tolerated, not a link being offered.",
-)];
+const NOT_A_CITATION: &[(&str, &str, &str)] = &[
+    (
+        "vm/tests/jck_conformance.rs",
+        "format!(\"{manifest_dir}/../docs/internal/gaps/jdk-regression-baseline.md\"),",
+        "`baseline_document()`'s FIRST candidate path, probed with `read_to_string` and falling back to the repo-root `gaps/` copy. It is what keeps the gate working while `docs/internal/` is removed from history, so the literal is a path being tolerated, not a link being offered.",
+    ),
+];
 
 /// A `NOT_A_CITATION` row whose line is gone is permission nobody needs — the
 /// same defect the resolve-bypass allowlist's dead-row test names.
@@ -695,3 +715,172 @@ fn every_relocatable_doc_citation_points_at_the_page() {
         dead.join("\n\n")
     );
 }
+
+/// Where the ratchet's baseline lives, relative to the workspace root.
+const DEAD_CITATION_BASELINE: &str = "types/tests/dead-citation-baseline.txt";
+
+/// A citation whose page exists NOWHERE under `docs/` — ratcheted against a
+/// checked-in baseline.
+///
+/// See the module docs for why this is a ratchet and not a verdict. The rule
+/// here is narrow on purpose: it fires only when the cited path is missing AND
+/// its basename matches no page at all, exactly or after the `-FIXED` /
+/// `-YYYYMMDD` normalisation. A basename that matches several pages is the
+/// ambiguous case the sibling test documents and neither test judges.
+#[test]
+fn no_new_citation_names_a_page_that_exists_nowhere() {
+    use std::collections::BTreeSet;
+
+    let root = workspace_root();
+
+    let mut pages = Vec::new();
+    doc_pages(&root.join("docs"), &root, &mut pages);
+    assert!(
+        pages.len() > 1000,
+        "only found {} pages under {}/docs — the walk is not reaching the \
+         documentation, so every citation would look dead",
+        pages.len(),
+        root.display()
+    );
+
+    let mut exact: BTreeSet<String> = BTreeSet::new();
+    let mut loose: BTreeSet<String> = BTreeSet::new();
+    for page in &pages {
+        exact.insert(basename(page).to_string());
+        loose.insert(normalized_stem(basename(page)));
+    }
+
+    let mut sources = Vec::new();
+    rust_sources(&root, &mut sources);
+    assert!(
+        sources.len() > 500,
+        "only found {} Rust sources under {} — the walk is not reaching the \
+         workspace, so a clean result would mean nothing",
+        sources.len(),
+        root.display()
+    );
+
+    let this_file = Path::new(file!()).file_name().expect("test file name");
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    let mut live = 0usize;
+    for path in &sources {
+        // This file's module docs spell out example citations, including
+        // deliberately dead ones.
+        if path.file_name() == Some(this_file) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !text.contains(".md") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (cited, _line) in md_paths(&text) {
+            if !cited.starts_with("docs/") {
+                continue;
+            }
+            if root.join(&cited).is_file() {
+                live += 1;
+                continue;
+            }
+            let base = basename(&cited);
+            // Relocatable or ambiguous: some page answers to this name, so the
+            // sibling test owns it (or deliberately declines to).
+            if exact.contains(base) || loose.contains(&normalized_stem(base)) {
+                continue;
+            }
+            // Line numbers are deliberately NOT part of the key: they churn on
+            // every edit above the citation, and a baseline that churns is one
+            // nobody maintains.
+            found.insert(format!("{rel} {cited}"));
+        }
+    }
+    assert!(
+        live > 400,
+        "only {live} citations resolved to a real page — the scanner is not \
+         matching citations any more, so this guard proves nothing"
+    );
+
+    let baseline_path = root.join(DEAD_CITATION_BASELINE);
+    if std::env::var_os("CRATONVM_REGEN_DEAD_CITATION_BASELINE").is_some() {
+        let mut out = String::from(BASELINE_HEADER);
+        for row in &found {
+            out.push_str(row);
+            out.push('\n');
+        }
+        std::fs::write(&baseline_path, out).expect("baseline is writable");
+        panic!(
+            "regenerated {} with {} entries. A regenerating run verifies \
+             nothing, so it fails on purpose — re-run without \
+             CRATONVM_REGEN_DEAD_CITATION_BASELINE.",
+            baseline_path.display(),
+            found.len()
+        );
+    }
+
+    let baseline_text = std::fs::read_to_string(&baseline_path).unwrap_or_default();
+    let baseline: BTreeSet<String> = baseline_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !baseline.is_empty(),
+        "{} is empty or missing — without it every existing dead citation \
+         reads as new and this guard cannot be run at all",
+        baseline_path.display()
+    );
+
+    let fresh: Vec<&String> = found.difference(&baseline).collect();
+    let stale: Vec<&String> = baseline.difference(&found).collect();
+
+    assert!(
+        fresh.is_empty(),
+        "{} comment(s) cite a documentation page that does not exist anywhere \
+         under docs/. Write the page, or cite one that is there, or drop the \
+         link — a reader who follows it finds nothing and concludes the code \
+         the comment explains is unexplained.\n\n{}\n",
+        fresh.len(),
+        fresh
+            .iter()
+            .map(|r| format!("    {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "{} baseline entr(y/ies) in {} no longer name a missing page — the \
+         citation was fixed or removed. Delete the line(s): the list is a \
+         ratchet and may only shrink.\n\n{}\n",
+        stale.len(),
+        DEAD_CITATION_BASELINE,
+        stale
+            .iter()
+            .map(|r| format!("    {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Written at the top of a regenerated baseline so the file explains itself to
+/// whoever opens it next.
+const BASELINE_HEADER: &str = "\
+# Citations to documentation pages that do not exist anywhere under docs/.
+#
+# A RATCHET, not a permission slip: `no_new_citation_names_a_page_that_exists_
+# nowhere` fails on any citation missing from this list, and ALSO fails when a
+# line here has become resolvable. The list can only shrink.
+#
+# To pay one down: write the page it names, repoint the comment at a page that
+# exists, or delete the link — then delete the line.
+#
+# Format: <rust source, workspace-relative> <cited path>
+# Regenerate: CRATONVM_REGEN_DEAD_CITATION_BASELINE=1 cargo test -p cratonvm-types
+#             --test doc_citation_paths   (regenerating always fails; re-run after)
+";

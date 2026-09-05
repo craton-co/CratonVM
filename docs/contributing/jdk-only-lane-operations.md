@@ -7,11 +7,13 @@
 | **Companions** | [`../jdk-only-migration.md`](../jdk-only-migration.md) · [`../jdk-only-native-review.md`](../jdk-only-native-review.md) · [`../known-issues/jdk-only/INDEX.md`](../known-issues/jdk-only/INDEX.md) |
 
 **Why this page exists separately from any handoff.** The eight-lane campaign of
-2026-08-28/29 ran from `known-issues/jdk-only/HANDOFF-20260828-SCOPE.md`, whose
-§3 and §5 were the operating rules every lane worked from. Those rules outlived
-the campaign, and leaving them in a handoff meant the handoff could not retire
-without taking them out of circulation. Everything below is durable; the dated
-campaign material stays where it was.
+2026-08-28/29 ran from `HANDOFF-20260828-SCOPE.md`, whose §3 and §5 were the
+operating rules every lane worked from. Those rules outlived the campaign, and
+leaving them in a handoff meant the handoff could not retire without taking them
+out of circulation. Rehoming them here was the last of that page's three stated
+retirement blockers; **it retired on 2026-09-01** to
+`jdk-only/HANDOFF-20260828-SCOPE.md` in the internal tree, as a campaign record.
+Everything below is durable.
 
 Each rule here was learned by getting it wrong once. The cost is recorded with
 the rule, because that is the part that makes it stick.
@@ -254,15 +256,42 @@ cargo test -p cratonvm-native-builtins --features synthetic-jdk --test stub_ratc
 
 That is a controlled experiment rather than an argument, and it is much cheaper
 than a second worktree. It was worth doing: a `synthetic-jdk` stub ratchet red
-survived the substitution unchanged at 1591 against a baseline of 1582 — so it
-was `dev`'s, and the two intuitions that pointed at my own change (a new
-keystore SPI class, seventeen new registrations) were both wrong. All seventeen
-classified as `Bridge`, not `SyntheticStub`.
+survived the substitution unchanged at 1591 against a baseline of 1582, which
+proved it was **not mine** — and the two intuitions that pointed at my own
+change (a new keystore SPI class, seventeen new registrations) were both wrong.
+All seventeen classified as `Bridge`, not `SyntheticStub`.
+
+**"Not mine" is where substitution stops, and I read it as "therefore `dev`'s"
+twice in a report.** It was neither. That arm had **no baseline of its own**:
+`BASELINE_SYNTHETIC_STUBS` branched on `feature = "management"` and nothing
+else, so a third configuration — which compiles registrars the other two do not
+— was being adjudicated against the first one's number, from the day the arm
+entered §5. Nine rows of "drift" that nobody had introduced.
+
+**So when a gate is red in one arm only, check whether that arm has a baseline
+before you look for a culprit.** A `cfg` with two branches and three callers is
+a silent mis-scoring, and it had also defeated the label meant to catch it —
+the failure line printed `no-management` and named the DEFAULT constant as the
+one to paste into, so re-freezing from that run would have admitted the whole
+gap to the default arm silently. Fixed 2026-08-30 by
+`BASELINE_SYNTHETIC_STUBS_SYNTHETIC_JDK` plus three-way `cfg` on the baseline,
+the label, and the constant name.
 
 **Run the feature arms, not just the default one.** That red is reachable only
 under `--features synthetic-jdk`; the default and `management` arms were green
 on the same tree, because the third arm compiles registrars the other two do
-not. A baseline re-freeze taken from the default arm alone leaves it behind.
+not.
+
+**Read a gate run correctly before attributing it at all.** `cargo test` stops
+at the first failing test BINARY, so without `--no-fail-fast` a run showing one
+failure is showing you where it stopped, not what is broken. And do not pipe it
+through `head`: `cratonvm-vm` emits 40+ `test result:` lines and a cap hides the
+tail. Grep for failure lines only, so an empty result is the green.
+
+**A control is only a control for what it can run.** A test that needs the
+release binary SKIPS when there is none and reports `ok`. A pristine control
+worktree has no binary, so targets that fail on a built tree "pass" there — and
+a clean control run is then evidence about the build, not about the code.
 
 **A red that moves with load is not automatically a flake.** A TLS vector looked
 exactly like one — green, red, green across three solo runs, and failing on the
@@ -271,9 +300,9 @@ client loop discarding the reply it asserts on, because `unwrap()` consumes one
 TLS record per call and three arrive in a single read under load. **Read the
 page the vector is documented on before writing a diagnosis of it.**
 
-The current known-red list is dated material and lives with the campaign that
-measured it, in `known-issues/jdk-only/`. Re-derive rather than trust a list
-older than a day.
+The known-red list of that campaign is dated material and retired with it, in
+`jdk-only/HANDOFF-20260828-SCOPE.md` §5. **Re-derive rather than trust a list
+older than a day** — that is why it is not on this page.
 
 ---
 
@@ -294,3 +323,52 @@ or because it was measured WRONG once and the native is the fix — `StrictMath`
 69 rows adjudicated KEEP for exactly that reason, and the 0-diff was evidence
 the family *works*. Read the registrar's history and count invocations **in the
 same run as the probe** before proposing a retirement.
+
+### Retiring a shadow: the four preconditions, and why the corpus is not one
+
+Two drivers implement this, so the method is runnable rather than described:
+[`../../scripts/jdk-only-phase2-sweep.sh`](../../scripts/jdk-only-phase2-sweep.sh)
+arms one receiver at a time and produces CANDIDATES with the three verdicts, and
+[`../../scripts/jdk-only-phase2-battery.sh`](../../scripts/jdk-only-phase2-battery.sh)
+runs the whole probe tree in three columns and reports the signed distance from
+HotSpot. Both print the vacuity checks beside every row, because that is the
+half a green forgets to mention.
+
+Phase 2 armed all 270 classes of the shadow surface one at a time and the dial
+called 236 of them retire-safe. **Arming those 236 together fails 54 of 118
+corpus vectors and breaks 35 of 78 probe families.** So a sweep produces
+candidates, never verdicts. Each candidate earns its row against all four of:
+
+1. **The dial was ASKED** — `enforcement_dial.reached > 0` for that scope in
+   `--jdk-only-report`, not a passing vector. 146 of those 236 fail this: the
+   smoke set never dispatched anything on the class, so arming it changed
+   nothing and read as the best possible result.
+2. **The WHOLE probe tree, armed on that class alone, gets no worse anywhere** —
+   not just the family's own probe, which is the narrowest instrument in the
+   building. `ConcurrentHashMap`'s own probe is 0-diff over 39 357 yields;
+   `MapViewsShadowSweep` dies at row 261 of 302, because `java.util.Properties`
+   delegates to an internal `ConcurrentHashMap` and every `Properties` view
+   empties out. **A retirement's blast radius is its class's USERS.**
+3. **The image target carries `Code`** to yield to — `image_declaring_method`,
+   declared or inherited and not abstract. Without it the retirement trades a
+   shadow for an `UnsatisfiedLinkError`. That field is `null` unless you pass
+   **`--explain-jdk-only`** alongside `--dump-native-registry`, and a filter
+   over the null reads as "no candidate anywhere has bytecode".
+4. **A dispatch observed by the instrument that produced the improvement**,
+   per TRIPLE, read as `invocations > 0` in that instrument's own run.
+
+**Read the direction, not the movement.** Armed-vs-unarmed says a row moved and
+cannot say which way. Use `d(hs,armed) − d(hs,base)`: negative means the
+retirement moves the VM toward the oracle — `ArrayDeque` armed starts throwing
+`ConcurrentModificationException`, which is what HotSpot does and what the
+native never did. Only positive is a reason not to retire.
+
+**And the dial is not the retirement.** It DECLINES at dispatch and it arms a
+PREFIX; `retired_shadow.rs` re-tags at REGISTRATION and is per-TRIPLE. Treating
+a dial result as the table's result cost a full build: `sun/nio/ch/FileChannelImpl`
+armed took a probe from 4 diffs to 0, so the one triple on it the CORPUS had
+dispatched was retired — and nothing moved, because the probe exercises
+`truncate(J)` (`invocations: 2`) and never touches `open` (`invocations: 0`).
+Convert a dial result into a table entry only via a registry dump **from a run
+of the very probe whose improvement you are citing**, then rebuild and
+re-measure on two binaries.

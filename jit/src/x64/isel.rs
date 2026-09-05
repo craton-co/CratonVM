@@ -5024,6 +5024,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
                 alloc,
                 false,
                 cratonvm_jit_api::JitRuntimeHelpers::default(),
@@ -6525,6 +6526,7 @@ mod tests {
             exit: NO_NODE,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         }
     }
 

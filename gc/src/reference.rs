@@ -162,11 +162,24 @@ impl ReferenceQueue {
             // Evict oldest to make room rather than silently dropping
             self.pending.pop_front();
             self.overflow_count += 1;
-            tracing::debug!(
-                "ReferenceQueue 0x{:x} overflow: evicted oldest entry (total overflows: {})",
-                self.queue_addr,
-                self.overflow_count
-            );
+            // This is data loss: a Reference the application enqueued is
+            // discarded, and the only other record is `overflow_count()`,
+            // whose sole callers are this file's own tests. As `debug!`
+            // it could not print in a release build at all
+            // (`release_max_level_info`), so a program losing references
+            // had no way to find out.
+            //
+            // Rate-limited to the first and then each doubling: once a
+            // queue is full every subsequent enqueue overflows, and an
+            // unconditional warn would turn data loss into a log flood.
+            if self.overflow_count == 1 || self.overflow_count.is_power_of_two() {
+                tracing::warn!(
+                    "ReferenceQueue 0x{:x} overflow: evicted oldest entry (total overflows: {}). \
+                     The application will never observe the dropped reference(s).",
+                    self.queue_addr,
+                    self.overflow_count
+                );
+            }
         }
         self.pending.push_back(reference_obj);
         true
@@ -372,7 +385,7 @@ impl ReferenceProcessor {
             pending_queues: FxHashMap::default(),
             finalization_queue: std::collections::VecDeque::new(),
             soft_ref_lru_index: BTreeMap::new(),
-            soft_ref_addr_index: FxHashMap::default(),
+            soft_ref_addr_index: cratonvm_types::PointerMap::default(),
             last_observed_clock_ms: 0,
             identity_stamps: FxHashMap::default(),
             referent_class_stamps: FxHashMap::default(),

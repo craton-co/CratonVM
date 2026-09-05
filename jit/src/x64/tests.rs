@@ -153,6 +153,7 @@ fn pop_does_not_reclaim_a_slot_a_buried_entry_still_owns() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         alloc_result,
         false,
         test_helpers(),
@@ -254,6 +255,7 @@ fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         alloc_result,
         false,
         test_helpers(),
@@ -326,6 +328,7 @@ fn push_stack_refuses_to_cross_spill_limit() {
         0,
         1,
         false,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -677,6 +680,21 @@ fn test_helpers() -> JitRuntimeHelpers {
         // accessor site in these tests keeps its ordinary native dispatch.
         ffm_segment_get: 0,
         ffm_segment_set: 0,
+        // 0 = no collector published a reference-store barrier plan, so every
+        // ref-store site in these tests keeps the full-helper path. That is
+        // what makes the gated sequence additive: a hand-built table gets the
+        // pre-existing emission, byte for byte.
+        ref_store_pre_gate: 0,
+        ref_store_post_gate: 0,
+        ref_store_post_young_floor: 0,
+        // F-08: 0 = not wired. `g1_inline_barrier_available` requires BOTH a
+        // published `JIT_G1_BARRIER` table and this helper, so these tests emit
+        // no inline G1 barrier and every reference store keeps the
+        // `putfield_object` call it has always emitted here. The dedicated F-08
+        // tests below build their own table and wire their own helper.
+        g1_barrier_addr: 0,
+        g1_post_write_barrier: 0,
+        ref_store_post_skip_mask: 0,
     }
 }
 
@@ -1341,6 +1359,76 @@ fn test_compile_branch() {
     assert_eq!(
         unsafe { compiled.try_call(&[5]).expect("test JIT call") },
         6
+    );
+}
+
+/// The spill census must be WIRED, not merely defined.
+///
+/// Every column here was a `pub fn` away from being another counter nobody
+/// calls — the exact defect the census exists to fix one level up. This drives
+/// a real compile and asserts the columns move, so losing a `note_spill_*` call
+/// site fails a test instead of silently reporting zeros forever.
+///
+/// It asserts DIRECTION, not magnitude: the numbers are global across every
+/// compile the test binary has done, so an exact value would be an assertion
+/// about test ordering.
+#[test]
+fn the_spill_census_is_wired_to_the_cursor() {
+    let before = crate::spill_cursor_counts();
+
+    // Any body with an operand stack will do; `push_stack` is on the path of
+    // essentially every opcode that produces a value.
+    let code: Vec<u8> = vec![
+        0x1a, // 0: iload_0
+        0x1b, // 1: iload_1
+        0x60, // 2: iadd
+        0xac, // 3: ireturn
+        0, 0,
+    ];
+    let compiled = compile_array_test(&code, 4, 2, 2);
+    // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+    let got = unsafe { compiled.try_call(&[20, 22]).expect("test JIT call") };
+    assert_eq!(got, 42, "the compiled body must still compute the sum");
+
+    let after = crate::spill_cursor_counts();
+    assert!(
+        after[crate::SPILL_RES_TOTAL] > before[crate::SPILL_RES_TOTAL],
+        "res-total did not move across a compile that pushes operands: the          census is defined but not wired ({} -> {})",
+        before[crate::SPILL_RES_TOTAL],
+        after[crate::SPILL_RES_TOTAL]
+    );
+    assert!(
+        after[crate::SPILL_RES_PUSH] > before[crate::SPILL_RES_PUSH],
+        "res-push did not move, so `push_stack` no longer reports"
+    );
+    assert!(
+        after[crate::SPILL_RES_TOTAL] >= after[crate::SPILL_RES_PUSH],
+        "res-total must bound the columns attributed out of it"
+    );
+    assert!(
+        after[crate::SPILL_MIN_HEADROOM] < u64::MAX,
+        "min-headroom is still its unset sentinel after a successful          reservation, so nothing is recording it"
+    );
+    // `res-total` is DERIVED from the reason columns, so the partition needs no
+    // assertion -- it cannot be false. What can still break is a reservation
+    // reaching the cursor through a column nobody reads, which is what the
+    // `res-push` check above catches, and a stale name table, which this does.
+    assert_eq!(
+        crate::SPILL_RES_REASON_COLUMNS.len(),
+        7,
+        "a `SpillReason` variant was added or removed without updating the          columns that partition `res-total`"
+    );
+    for &c in crate::SPILL_RES_REASON_COLUMNS.iter() {
+        assert!(
+            c < crate::SPILL_CURSOR_SLOT_NAMES.len(),
+            "reason column {c} has no name in SPILL_CURSOR_SLOT_NAMES"
+        );
+    }
+
+    assert_eq!(
+        after[crate::SPILL_FLUSH_CANONICAL],
+        0,
+        "flush-canonical is a retired column and must stay zero; if this fires,          someone revived the canonical-home flush without revisiting the          measurement that withdrew it (see `Compiler::flush_home`)"
     );
 }
 
@@ -4867,6 +4955,459 @@ fn fake_object_ref_cell(o: &[u64; 8]) -> usize {
 /// is the address of a process-global static and is therefore always
 /// non-zero, so the `!= 0` test the emitters used to key on is a constant
 /// true and not a backend gate at all.
+// -----------------------------------------------------------------------
+// F-08 — the inline G1 post-write barrier
+// -----------------------------------------------------------------------
+
+/// The barrier table is read by CONTENT, never by address — the same lesson
+/// `region_bounds_are_live_reads_the_table_not_its_address` pins one table
+/// over, and the reason that test exists is that the `!= 0` form had shipped.
+///
+/// A published table with a zero base or a zero region mask must read as NOT
+/// live: those are the two words the emitted sequence subtracts and masks with,
+/// and a zero mask would make every pair of addresses look like the same region
+/// — i.e. it would silently disable the barrier rather than fail loudly.
+#[test]
+fn the_g1_barrier_table_is_read_by_content_not_by_address() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TABLE: [AtomicUsize; 5] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    let addr = TABLE.as_ptr() as usize;
+
+    assert_ne!(addr, 0, "a static's address is never zero");
+    assert!(
+        !g1_barrier_table_live(addr),
+        "an all-zero table is the no-G1-collector shape and must not read as live"
+    );
+    assert!(!g1_barrier_table_live(0), "an unwired field is not live");
+
+    // arena_len alone is not enough: the base and the mask are what the
+    // sequence computes with.
+    TABLE[1].store(0x10000, Ordering::Release);
+    assert!(!g1_barrier_table_live(addr), "no base, no mask");
+    TABLE[0].store(0x4000_0000, Ordering::Release);
+    assert!(!g1_barrier_table_live(addr), "no mask");
+    TABLE[2].store(!(0x100000usize - 1), Ordering::Release);
+    assert!(g1_barrier_table_live(addr), "a fully published table is live");
+
+    // `G1Collector::drop` clears the length first.
+    TABLE[1].store(0, Ordering::Release);
+    assert!(
+        !g1_barrier_table_live(addr),
+        "a torn-down collector must read as not-live again"
+    );
+    for w in TABLE.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
+/// The inline barrier's two-instruction filter, EXECUTED.
+///
+/// This is the test that matters. `emit_g1_barrier_filter` introduces three
+/// instruction encodings this backend had no other user for (`SUB r64, m64`,
+/// `AND r64, m64`, `XOR r64, r64`) and an address-arithmetic argument that is
+/// wrong in a silent, use-after-free direction if it is wrong at all. Reading
+/// the emitted bytes would only re-assert the encoding I believe I wrote; this
+/// runs them on a real CPU and asks what the flags did.
+///
+/// The shape under test:
+///
+/// ```text
+///   mov  rax, arg0            ; obj
+///   mov  rdx, arg1            ; val
+///   <filter>                  ; jumps to `nothing` when there is nothing to do
+///   mov  eax, 1 ; ret         ; "would have called the barrier"
+/// nothing:
+///   xor  eax, eax ; ret
+/// ```
+///
+/// The four cases are exactly the four the filter claims to separate, and the
+/// last two are the ones that would be indistinguishable if the arena base
+/// were not subtracted: G1's arena is only malloc-aligned, so an aligned
+/// `region_size` block of the address space is NOT a region, and a raw
+/// `(obj ^ val) & mask` would call two addresses straddling the real region
+/// boundary "same region", skip the barrier and lose the edge.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn the_inline_g1_barrier_filter_separates_the_four_cases_when_executed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A synthetic arena at an UNALIGNED base, which is the real shape: G1's
+    // arena is a `Vec<u8>`, so its base is malloc-aligned and nothing more.
+    const REGION_SIZE: usize = 0x10_0000; // 1 MiB, as G1's default is
+    const ARENA_BASE: usize = 0x4000_0000 + 0x30; // deliberately not region-aligned
+    const ARENA_LEN: usize = 8 * REGION_SIZE;
+
+    static TABLE: [AtomicUsize; 5] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    TABLE[0].store(ARENA_BASE, Ordering::Release);
+    TABLE[2].store(!(REGION_SIZE - 1), Ordering::Release);
+    TABLE[1].store(ARENA_LEN, Ordering::Release);
+
+    let mut helpers = test_helpers();
+    helpers.g1_barrier_addr = TABLE.as_ptr() as usize;
+
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "g1-barrier-filter-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+                // dev added `array_len_hoist_info` as argument 13 while this branch
+        // was open; these tests hoist no array length.
+        Vec::new(),
+alloc_result,
+        false,
+        helpers,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // `Compiler::new` has already emitted a method prologue into the buffer;
+    // this snippet is a self-contained leaf that must be entered AFTER it, so
+    // record where it starts and call there rather than at the buffer base.
+    // (Entering at the base runs a prologue whose epilogue this snippet's `ret`
+    // never reaches — an access violation, which is how this was found.)
+    let entry_off = compiler.buf.pos();
+    // Move the two C arguments into the registers the filter operates on. No
+    // prologue of its own: the sequence touches only RAX/RDX/RCX and returns.
+    compiler.emit_mov_r64_r64(RAX, ARG_REGS[0]);
+    compiler.emit_mov_r64_r64(RDX, ARG_REGS[1]);
+    let nothing = compiler.emit_g1_barrier_filter(RAX, RDX, RCX);
+    compiler.emit_mov_imm64(RAX, 1);
+    compiler.emit_ret();
+    for patch in nothing {
+        compiler.patch_rel32_to_here(patch);
+    }
+    compiler.emit_xor_reg_self(RAX);
+    compiler.emit_ret();
+
+    assert!(!compiler.buf.overflowed(), "the test buffer must hold the snippet");
+    // W^X: `ExecutableBuffer::new` maps RW, and the compile driver flips the
+    // page to RX when it finalises a method. This snippet bypasses the driver,
+    // so it has to do the flip itself or the first instruction faults.
+    crate::platform::make_executable(compiler.buf.as_ptr() as *mut u8, compiler.buf.capacity())
+        .expect("the test buffer must be flippable to RX");
+    // SAFETY: `entry_off` is a byte offset inside the same allocation.
+    let entry = unsafe { compiler.buf.as_ptr().add(entry_off) };
+    // SAFETY: the emitted code takes two i64 arguments in the platform's first
+    // two argument registers, clobbers only RAX/RCX/RDX (all caller-saved on
+    // both the SysV and Win64 ABIs), dereferences nothing but `TABLE`, and
+    // returns an i64 in RAX. The buffer is RWX for its whole lifetime, which
+    // outlives this call because `compiler` is still alive.
+    let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(entry) };
+
+    let r0 = ARENA_BASE + 8; // region 0
+    let r0_high = ARENA_BASE + REGION_SIZE - 8; // still region 0
+    let r1 = ARENA_BASE + REGION_SIZE + 8; // region 1
+
+    assert_eq!(
+        f(r0 as i64, 0),
+        0,
+        "a null store records nothing — post_write_barrier_rset returns on it"
+    );
+    assert_eq!(
+        f(r0 as i64, (r0 + 64) as i64),
+        0,
+        "a same-region store records nothing"
+    );
+    assert_eq!(
+        f(r0 as i64, r1 as i64),
+        1,
+        "a cross-region store must reach the collector's barrier"
+    );
+
+    let _ = r0_high;
+
+    // The two ALIGNMENT cases, which exist only because G1's arena base is not
+    // a multiple of the region size. Region 0 is
+    // `[ARENA_BASE, ARENA_BASE + REGION_SIZE)`, and the aligned 1 MiB block
+    // boundary at `0x4010_0000` falls INSIDE it.
+    //
+    // (a) Same region, different aligned blocks. A filter that masked the raw
+    //     addresses would call this cross-region: a redundant call, harmless.
+    let same_region_lo = ARENA_BASE + REGION_SIZE - 0x38;
+    let same_region_hi = same_region_lo + 0x10;
+    assert_eq!(
+        (same_region_lo - ARENA_BASE) / REGION_SIZE,
+        (same_region_hi - ARENA_BASE) / REGION_SIZE,
+        "test setup: both addresses are in one region"
+    );
+    assert_ne!(
+        same_region_lo >> 20,
+        same_region_hi >> 20,
+        "test setup: they are in DIFFERENT aligned 1 MiB blocks"
+    );
+    assert_eq!(
+        f(same_region_lo as i64, same_region_hi as i64),
+        0,
+        "both are in region 0, so there is nothing to remember"
+    );
+
+    // (b) Different regions, SAME aligned block. This is the pair a base-free
+    //     `(obj ^ val) & mask` silently dismisses, and dismissing it loses a
+    //     live cross-region edge -- the use-after-free the subtraction prevents.
+    let last_of_r0 = ARENA_BASE + REGION_SIZE - 8;
+    let first_of_r1 = ARENA_BASE + REGION_SIZE + 8;
+    assert_ne!(
+        (last_of_r0 - ARENA_BASE) / REGION_SIZE,
+        (first_of_r1 - ARENA_BASE) / REGION_SIZE,
+        "test setup: the pair really is cross-region"
+    );
+    assert_eq!(
+        last_of_r0 >> 20,
+        first_of_r1 >> 20,
+        "test setup: and it shares one aligned 1 MiB block"
+    );
+    assert_eq!(
+        f(last_of_r0 as i64, first_of_r1 as i64),
+        1,
+        "a cross-region pair inside one aligned block must still reach the barrier"
+    );
+
+    for w in TABLE.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
+/// Availability is the conjunction of three independent facts, and none of the
+/// three is redundant: the flag (default OFF), a published table, and a wired
+/// helper. Dropping any one of them either emits a barrier nobody asked for,
+/// loads through a null table, or CALLs address zero.
+#[test]
+fn the_inline_g1_barrier_needs_the_flag_the_table_and_the_helper() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TABLE: [AtomicUsize; 5] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    TABLE[0].store(0x4000_0000, Ordering::Release);
+    TABLE[2].store(!(0x10_0000usize - 1), Ordering::Release);
+    TABLE[1].store(0x80_0000, Ordering::Release);
+
+    let build = |barrier_addr: usize, helper: usize| {
+        let mut helpers = test_helpers();
+        helpers.g1_barrier_addr = barrier_addr;
+        helpers.g1_post_write_barrier = helper;
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        Compiler::new(
+            "g1-barrier-availability-test".to_string(),
+            ExecutableBuffer::new(256).expect("test executable buffer"),
+            0,
+            0,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+                        // dev added `array_len_hoist_info` as argument 13 while this branch
+            // was open; these tests hoist no array length.
+            Vec::new(),
+alloc_result,
+            false,
+            helpers,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+    };
+
+    let table = TABLE.as_ptr() as usize;
+    let helper = 0x1234_5678usize;
+
+    // `CRATONVM_G1_INLINE_BARRIER=0` still suppresses the arm outright. This
+    // used to read "the flag is OFF by default, so even a fully wired backend
+    // emits nothing"; the default flipped on 2026-09-04, and the assertion that
+    // survives the flip is the one about the OFF setting, not about the
+    // default.
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(Some(false)));
+    assert!(
+        !build(table, helper).g1_inline_barrier_available(),
+        "`=0` must suppress the inline arm even on a fully wired backend — it is \
+         the revert lever for a barrier whose failure mode is a lost \
+         remembered-set edge"
+    );
+
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(Some(true)));
+    assert!(
+        build(table, helper).g1_inline_barrier_available(),
+        "flag + table + helper is the combination that emits"
+    );
+    assert!(
+        !build(0, helper).g1_inline_barrier_available(),
+        "no table address: the sequence would load through null"
+    );
+    assert!(
+        !build(table, 0).g1_inline_barrier_available(),
+        "no helper: the slow arm would CALL address zero"
+    );
+
+    // And with the override OUT of the way, the wired backend emits — which is
+    // what "default ON" means and is the half a forced-on assertion cannot show.
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(None));
+    assert!(
+        build(table, helper).g1_inline_barrier_available(),
+        "the arm is default ON since 2026-09-04: a wired backend emits it with no \
+         flag set at all"
+    );
+
+    for w in TABLE.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
+/// Defect G1-2's gate is untouched by F-08.
+///
+/// The G1 arm reads a DIFFERENT table, and `region_bounds_are_live` — the
+/// predicate that decides whether a barrier-free inline store is legal — must
+/// still answer NO for a backend that publishes only the G1 barrier table.
+/// If this ever passes, a G1 receiver has become eligible for the generational
+/// arm's barrier-free store, which is the use-after-free G1-2 named.
+#[test]
+fn publishing_the_g1_barrier_table_does_not_make_region_bounds_live() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static G1_TABLE: [AtomicUsize; 5] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    static STORE_BOUNDS: [AtomicUsize; 6] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    G1_TABLE[0].store(0x4000_0000, Ordering::Release);
+    G1_TABLE[2].store(!(0x10_0000usize - 1), Ordering::Release);
+    G1_TABLE[1].store(0x80_0000, Ordering::Release);
+
+    assert!(g1_barrier_table_live(G1_TABLE.as_ptr() as usize));
+    assert!(
+        !region_bounds_are_live(STORE_BOUNDS.as_ptr() as usize),
+        "G1 publishes no store-side region bounds, and closing G1-2 depends on it"
+    );
+    for w in G1_TABLE.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
+/// The generational inline card mark stays disabled. F-08 is a different
+/// mechanism against a different table and must not be read as re-enabling it:
+/// `inline_card_mark_available` is a constant `false` because a WildFly boot
+/// audit found an old `org/jboss/modules/Module` reference to a young child
+/// left on a CLEAN card, and nothing here addresses that.
+#[test]
+fn the_generational_inline_card_mark_stays_disabled_under_f08() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TABLE: [AtomicUsize; 5] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    TABLE[0].store(0x4000_0000, Ordering::Release);
+    TABLE[2].store(!(0x10_0000usize - 1), Ordering::Release);
+    TABLE[1].store(0x80_0000, Ordering::Release);
+
+    let mut helpers = test_helpers();
+    helpers.g1_barrier_addr = TABLE.as_ptr() as usize;
+    helpers.g1_post_write_barrier = 0x1234_5678;
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let compiler = Compiler::new(
+        "g1-card-mark-separation-test".to_string(),
+        ExecutableBuffer::new(256).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+                // dev added `array_len_hoist_info` as argument 13 while this branch
+        // was open; these tests hoist no array length.
+        Vec::new(),
+alloc_result,
+        false,
+        helpers,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(Some(true)));
+    assert!(compiler.g1_inline_barrier_available());
+    assert!(
+        !compiler.inline_card_mark_available(),
+        "F-08 must not re-enable the generational inline card mark"
+    );
+    crate::x64::licm::G1_INLINE_BARRIER_FORCED.with(|c| c.set(None));
+    for w in TABLE.iter() {
+        w.store(0, Ordering::Release);
+    }
+}
+
 #[test]
 fn region_bounds_are_live_reads_the_table_not_its_address() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6554,6 +7095,213 @@ fn test_find_modified_locals() {
     assert!(modified & (1 << 2) != 0); // local 2 modified by istore_2
     assert!(modified & (1 << 0) == 0); // local 0 NOT modified
     assert!(modified & (1 << 3) == 0); // local 3 NOT modified
+}
+
+/// `for (i = 0; i < a.length; i++) if (a[i] == 'a') c++;` — the exact inner
+/// loop of `probes/CharAtCostCurve.java::scanArr`, taken from `javap -c -p -l`.
+///
+/// This is the shape the whole hoist exists for. javac re-evaluates `a.length`
+/// at the top of every iteration, and the single-pass emitter took that
+/// literally: a receiver move, a `TEST`/`JZ` null check that the loop's own
+/// previous iteration had already discharged, and a header dereference — four
+/// instructions of a 21-instruction body whose useful work is one `MOVZX`.
+///
+/// Locals: 0=a (char[]), 2=c, 4=i.
+#[test]
+fn find_array_len_hoists_matches_the_canonical_counted_loop() {
+    let code: Vec<u8> = vec![
+        0x03, // 0:  iconst_0
+        0x3d, // 1:  istore_2        (c = 0)
+        0x03, // 2:  iconst_0
+        0x36, 0x04, // 3:  istore 4        (i = 0)
+        0x00, 0x00, 0x00, 0x00, 0x00, // 5..9: nop padding to bci 10
+        0x00, 0x00, // 10..11: nop
+        0x15, 0x04, // 12: iload 4         (header)
+        0x2a, // 14: aload_0
+        0xbe, // 15: arraylength
+        0xa2, 0x00, 0x16, // 16: if_icmpge +22 -> 38
+        0x2a, // 19: aload_0
+        0x15, 0x04, // 20: iload 4
+        0x34, // 22: caload
+        0x10, 0x61, // 23: bipush 97
+        0xa0, 0x00, 0x06, // 25: if_icmpne +6 -> 31
+        0x84, 0x02, 0x01, // 28: iinc 2, 1
+        0x84, 0x04, 0x01, // 31: iinc 4, 1
+        0xa7, 0xff, 0xea, // 34: goto -22 -> 12
+        0x1c, // 37: iload_2
+        0xac, // 38: ireturn
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    assert_eq!(loops[0], (12, 34), "back edge 34 -> header 12, got {loops:?}");
+
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert_eq!(hoists.len(), 1, "one invariant arraylength, got {hoists:?}");
+    assert_eq!(hoists[0].loop_header, 12);
+    assert_eq!(hoists[0].array_local, 0);
+    assert_eq!(hoists[0].loop_end, 37, "one past the 3-byte goto at 34");
+    assert_eq!(
+        hoists[0].sites,
+        vec![(14, 16)],
+        "the aload_0 at 14 through the arraylength at 15"
+    );
+}
+
+/// Two reads of the same length in one body share ONE slot and ONE pre-header
+/// computation — the pre-header must not grow a load per site.
+#[test]
+fn find_array_len_hoists_shares_one_slot_across_sites() {
+    // Locals: 0=a, 1=i.
+    //  0: iload_1 ; 1: aload_0 ; 2: arraylength ; 3: if_icmpge -> 16 (header at 0)
+    //  6: aload_0 ; 7: arraylength ; 8: pop
+    //  9: iinc 1,1 ; 12: goto -> 0 ; 15: return
+    let code: Vec<u8> = vec![
+        0x1b, // 0:  iload_1 (header)
+        0x2a, // 1:  aload_0
+        0xbe, // 2:  arraylength
+        0xa2, 0x00, 0x0c, // 3:  if_icmpge +12 -> 15
+        0x2a, // 6:  aload_0
+        0xbe, // 7:  arraylength
+        0x57, // 8:  pop
+        0x84, 0x01, 0x01, // 9:  iinc 1, 1
+        0xa7, 0xff, 0xf4, // 12: goto -12 -> 0
+        0xb1, // 15: return
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert_eq!(hoists.len(), 1, "one record, not one per site");
+    assert_eq!(hoists[0].sites, vec![(1, 3), (6, 8)]);
+}
+
+/// An array local reassigned inside the body is not invariant, and its length
+/// may genuinely differ per iteration. Caching it would make the loop read a
+/// stale bound — and, where BCE trusted that bound, an unchecked access.
+#[test]
+fn find_array_len_hoists_refuses_a_reassigned_array_local() {
+    // Locals: 0=a, 1=i, 2=other.
+    //  0: iload_1 ; 1: aload_0 ; 2: arraylength ; 3: if_icmpge -> 16
+    //  6: aload_2 ; 7: astore_0        <- a = other, inside the body
+    //  8: iinc 1,1 ; 11: goto -> 0 ; 14: return
+    let code: Vec<u8> = vec![
+        0x1b, // 0:  iload_1 (header)
+        0x2a, // 1:  aload_0
+        0xbe, // 2:  arraylength
+        0xa2, 0x00, 0x0b, // 3:  if_icmpge +11 -> 14
+        0x2c, // 6:  aload_2
+        0x4b, // 7:  astore_0
+        0x84, 0x01, 0x01, // 8:  iinc 1, 1
+        0xa7, 0xff, 0xf5, // 11: goto -11 -> 0
+        0xb1, // 14: return
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert!(
+        hoists.is_empty(),
+        "astore_0 in the body makes local 0 variant, got {hoists:?}"
+    );
+}
+
+/// `find_modified_locals` cannot decode a `wide`-prefixed store: it falls into
+/// the catch-all arm and records nothing, so a `wide astore 0` would leave
+/// local 0 looking invariant. The body scan refuses any body containing the
+/// prefix at all rather than trusting a mask that cannot see it.
+#[test]
+fn find_array_len_hoists_refuses_a_wide_prefixed_body() {
+    // Same as the refusal above, but the store is `wide astore 0`
+    // (c4 3a 00 00) — four bytes, which `find_modified_locals` skips whole.
+    let code: Vec<u8> = vec![
+        0x1b, // 0:  iload_1 (header)
+        0x2a, // 1:  aload_0
+        0xbe, // 2:  arraylength
+        0xa2, 0x00, 0x0e, // 3:  if_icmpge +14 -> 17
+        0x2c, // 6:  aload_2
+        0xc4, 0x3a, 0x00, 0x00, // 7:  wide astore 0
+        0x84, 0x01, 0x01, // 11: iinc 1, 1
+        0xa7, 0xff, 0xf2, // 14: goto -14 -> 0
+        0xb1, // 17: return
+    ];
+    let code_len = code.len();
+    let loops = detect_loops(&code, code_len);
+    let hoists = find_array_len_hoists(&code, code_len, &loops);
+    assert!(
+        hoists.is_empty(),
+        "a wide prefix in the body is not modelled, got {hoists:?}"
+    );
+}
+
+/// The cooperative safepoint poll is one RIP-relative instruction, and the
+/// displacement it bakes must resolve to the flag byte itself.
+///
+/// A displacement measured from the wrong reference point reads a byte NEAR
+/// the flag. That is not a fault and not a crash: the poll simply stops seeing
+/// stop-the-world requests, or sees phantom ones, on the back edge of every
+/// compiled loop in the VM. Nothing else in the suite would notice, so decode
+/// the bytes and check the arithmetic.
+#[test]
+fn rip_relative_safepoint_poll_addresses_the_flag_byte() {
+    static FLAG: u8 = 0;
+
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut helpers = test_helpers();
+    let flag_addr = &FLAG as *const u8 as usize;
+    helpers.safepoint_flag_addr = flag_addr;
+    let mut c = Compiler::new(
+        "rip-poll-test".to_string(),
+        ExecutableBuffer::new(4096).expect("test executable buffer"),
+        0,
+        0,
+        8,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        helpers,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    let start = c.buf.pos();
+    let emitted = c.emit_test_mem8_abs_imm8(flag_addr, 0xFF);
+    if !emitted {
+        // The buffer landed more than 2GB from this test binary's data
+        // segment. The fallback is the pre-2026-09-02 sequence and is checked
+        // by the executing poll tests; nothing to decode here.
+        assert_eq!(c.buf.pos(), start, "a refused encoding emits nothing");
+        return;
+    }
+    let bytes: Vec<u8> = c.buf.as_slice()[start..c.buf.pos()].to_vec();
+    assert_eq!(bytes.len(), 7, "F6 05 <disp32> <imm8>");
+    assert_eq!(&bytes[..2], &[0xF6, 0x05], "TEST r/m8, imm8 via [rip+d32]");
+    assert_eq!(bytes[6], 0xFF, "the imm8 tests every bit of the flag byte");
+
+    let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+    // RIP is the address of the NEXT instruction — past the imm8, not past the
+    // displacement. `+ 7`, not `+ 6`: the whole point of the test.
+    let insn_end = c.buf.as_ptr() as usize + start + 7;
+    let resolved = (insn_end as i64).wrapping_add(disp as i64) as usize;
+    assert_eq!(
+        resolved, flag_addr,
+        "the RIP-relative displacement must land exactly on the flag byte"
+    );
 }
 
 #[test]
@@ -8800,6 +9548,12 @@ fn callee_saved_gpr_local_homes_are_default_on_with_precise_maps() {
 }
 
 #[test]
+// x86-64 only: `CompiledMethod::osr_enter` is itself
+// `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not merely
+// fail -- it does not COMPILE, and took the whole crate's test binary with
+// it. Found by actually building for aarch64 in an emulated container; a
+// cfg-gated API needs cfg-gated tests.
+#[cfg(target_arch = "x86_64")]
 fn test_osr_simple_loop() {
     // Test OSR entry: compile a simple sum loop and enter at the loop header
     // Same bytecode as above: sum(n) = 0 + 1 + ... + (n-1)
@@ -8870,6 +9624,12 @@ fn test_osr_simple_loop() {
 }
 
 #[test]
+// x86-64 only: `CompiledMethod::osr_enter` is itself
+// `#[cfg(target_arch = "x86_64")]`, so on aarch64 this test does not merely
+// fail -- it does not COMPILE, and took the whole crate's test binary with
+// it. Found by actually building for aarch64 in an emulated container; a
+// cfg-gated API needs cfg-gated tests.
+#[cfg(target_arch = "x86_64")]
 fn test_osr_long_loop() {
     // long addOnly(long n) { long s=0; for(long i=0;i<n;i++) s+=i; return s; }
     // Locals: 0-1=n(long), 2-3=s(long), 4-5=i(long)
@@ -12353,6 +13113,7 @@ fn make_inline_site(
         ldc2w_info: Vec::new(),
         needs_heap: false,
         class_name: "Test".to_string(),
+        class_id: 0,
         method_name: "inlined".to_string(),
         descriptor,
         elided_invoke_pcs: Vec::new(),
@@ -14138,9 +14899,16 @@ thread_local! {
     /// stub fires.
     static TEST_NPE_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// JEP 358 — the action code the firing null-check stub passed to
-    /// `jit_npe_with_action`. `-1` = no stub fired. Lets the null-NPE tests
-    /// assert the per-opcode action is threaded correctly.
+    /// `jit_npe_with_action`, DECODED out of the packed word. `-1` = no stub
+    /// fired. Lets the null-NPE tests assert the per-opcode action is threaded
+    /// correctly.
     static TEST_NPE_ACTION: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+    /// The trap-site key from the same packed word: the id
+    /// `inlining::record_npe_trap_site` issued for THIS null check, which is
+    /// what lets the stack walk recover the bci of the frame that trapped.
+    /// `-1` = no stub fired, `0` = the site was not recorded (which is what
+    /// `CRATONVM_JIT_NO_NPE_TRAP_LINES=1` produces).
+    static TEST_NPE_TRAP_KEY: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
 }
 
 /// Test stand-in for `jit_throw_aioobe`: records the failure payload
@@ -14160,15 +14928,24 @@ unsafe extern "C" fn flagging_throw_aioobe(
 }
 
 /// Test stand-in for `jit_npe_with_action`: each inline null-check deopt
-/// stub calls `helpers.jit_npe_with_action(code)` to flag a pending NPE
-/// with its JEP-358 action code. Records the hit AND the code; the stub
-/// itself loads the `i64::MIN` sentinel.
+/// stub calls `helpers.jit_npe_with_action(packed)` to flag a pending NPE.
+/// Records the hit AND both halves of the packed word; the stub itself loads
+/// the `i64::MIN` sentinel.
+///
+/// The argument is NOT the bare action code. Since the trap-site side channel
+/// landed, each described null check gets its own ten-byte trampoline that
+/// passes `action | (trap_key << 8)`, so the walk that builds the trace can
+/// ask which check fired and recover the bci of the frame that trapped. A test
+/// that asserts on the raw word is asserting on the low byte AND the site id
+/// at once, and would move every time a new check is emitted ahead of it —
+/// so split it here, once, rather than in each test.
 ///
 /// SAFETY: plain `extern "C"` callback invoked by JIT code with one `i64`
 /// argument; touches only thread-locals.
-unsafe extern "C" fn flagging_npe_with_action(code: i64) {
+unsafe extern "C" fn flagging_npe_with_action(packed: i64) {
     TEST_NPE_HIT.with(|c| c.set(true));
-    TEST_NPE_ACTION.with(|c| c.set(code));
+    TEST_NPE_ACTION.with(|c| c.set(packed & 0xff));
+    TEST_NPE_TRAP_KEY.with(|c| c.set((packed >> 8) & 0x00ff_ffff));
 }
 
 /// `test_helpers()` with the `throw_aioobe` and `jit_npe_with_action`
@@ -14526,6 +15303,7 @@ fn test_inline_arraylength_null_throws_npe() {
 
     TEST_NPE_HIT.with(|c| c.set(false));
     TEST_NPE_ACTION.with(|c| c.set(-1));
+    TEST_NPE_TRAP_KEY.with(|c| c.set(-1));
     // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
     let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
     assert_eq!(
@@ -14544,6 +15322,16 @@ fn test_inline_arraylength_null_throws_npe() {
         npe_action::ARRAY_LENGTH as i64,
         "null arraylength must report the ARRAY_LENGTH action"
     );
+    // The other half of the same word: the trap-site id. A zero here means the
+    // stub fired but named no site, which is exactly what the trace shows as
+    // `Method:-1` — the frame survives and its line does not.
+    if super::inlining::npe_trap_lines_enabled() {
+        assert!(
+            TEST_NPE_TRAP_KEY.with(|c| c.get()) > 0,
+            "the null-check trampoline must carry a recorded trap-site id              beside the action; got {}",
+            TEST_NPE_TRAP_KEY.with(|c| c.get())
+        );
+    }
 }
 
 #[test]
@@ -14560,6 +15348,7 @@ fn test_inline_iaload_null_throws_npe() {
 
     TEST_NPE_HIT.with(|c| c.set(false));
     TEST_NPE_ACTION.with(|c| c.set(-1));
+    TEST_NPE_TRAP_KEY.with(|c| c.set(-1));
     // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
     let result = unsafe { compiled.try_call(&[0, 0]).expect("test JIT call") }; // null array
     assert_eq!(result, i64::MIN, "null iaload must deopt with sentinel");
@@ -14596,6 +15385,7 @@ fn test_inline_castore_null_threads_char_action() {
 
     TEST_NPE_HIT.with(|c| c.set(false));
     TEST_NPE_ACTION.with(|c| c.set(-1));
+    TEST_NPE_TRAP_KEY.with(|c| c.set(-1));
     // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
     let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
     assert_eq!(result, i64::MIN, "null castore must deopt with sentinel");
@@ -16007,6 +16797,7 @@ fn the_method_entry_poll_knows_its_own_live_oop_locals() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         alloc_result,
         false,
         test_helpers(),
@@ -16081,6 +16872,10 @@ fn the_method_entry_poll_knows_its_own_live_oop_locals() {
 fn s31_inline_reservations_count_nested_bodies() {
     use crate::x64::driver::{spliced_bytecode_len, spliced_stack_reserve};
 
+    // Named, not spelled 4: if `MAX_INLINE_MERGE_DEPTH` moves this test must
+    // move with it rather than becoming a silently disagreeing second copy.
+    const MERGE: usize = crate::x64::MAX_INLINE_MERGE_DEPTH;
+
     // Leaf: 3 bytes of bytecode, 2 locals, static ()I -> param_span 0.
     let leaf = make_inline_site(&[0x12, 0x05, 0xac], 2, 0, true, b'I');
     assert_eq!(
@@ -16090,8 +16885,8 @@ fn s31_inline_reservations_count_nested_bodies() {
     );
     assert_eq!(
         spliced_stack_reserve(&leaf),
-        2 + 3,
-        "a leaf site keeps the exact pre-existing per-site formula: \
+        2 + 3 + MERGE,
+        "a leaf site is locals/params + code_len + the branch-merge area, added 2026-09-02: \
          max(callee_max_locals, param_span) + callee_code_len"
     );
 
@@ -16119,11 +16914,12 @@ fn s31_inline_reservations_count_nested_bodies() {
         5 + 7 + 3,
         "the buffer estimate must count nested bodies transitively"
     );
-    // (6+5) + (4+7) + (2+3). A one-level walk would say 22.
+    // Each level plus its own merge area: every level of a chain is live at
+    // once and each reserves `MAX_INLINE_MERGE_DEPTH` words of its own.
     assert_eq!(
         spliced_stack_reserve(&outer),
-        (6 + 5) + (4 + 7) + (2 + 3),
-        "a nested body gets its own locals and operand stack on top of the \
+        (6 + 5 + MERGE) + (4 + 7 + MERGE) + (2 + 3 + MERGE),
+        "a nested body gets its own locals, operand stack AND merge area on top of the \
          body that splices it, so the reserves add transitively"
     );
 
@@ -16131,4 +16927,352 @@ fn s31_inline_reservations_count_nested_bodies() {
     // the old root-only formula would have reserved for its root.
     assert!(spliced_bytecode_len(&outer) > spliced_bytecode_len(&leaf));
     assert!(spliced_stack_reserve(&outer) > spliced_stack_reserve(&leaf));
+}
+
+/// `emit_cmp_r64_mem_disp` picks the narrowest legal encoding, and the widths
+/// it declines to narrow are declined for a reason, not by omission.
+///
+/// The six containment compares in `emit_guarded_getfield_receiver_check` read
+/// table words at displacements 0..40 through RDX. Every one fits a `disp8`;
+/// before this encoder existed each paid the disp32 form, three wasted bytes
+/// apiece on a guard that runs before every unproven-receiver field access.
+///
+/// The two x86 base-register special cases are pinned here as well, because
+/// both are silent mis-encodings rather than assembler errors: RBP/R13 have no
+/// `mod=00` form (that bit pattern is RIP-relative), and RSP/R12 need a SIB
+/// byte this emitter does not produce.
+#[test]
+fn the_containment_compare_narrows_its_displacement_and_knows_the_two_base_cases() {
+    let mk = || {
+        let alloc_result = crate::regalloc::RegAllocResult {
+            assignments: Vec::new(),
+            xmm_assignments: Vec::new(),
+            used_callee_saved: Vec::new(),
+            used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
+        };
+        Compiler::new(
+            "cmp-disp-width-test".to_string(),
+            ExecutableBuffer::new(4096).expect("test executable buffer"),
+            0,
+            0,
+            8,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            alloc_result,
+            false,
+            test_helpers(),
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Vec::new(),
+        )
+    };
+    let bytes = |f: &dyn Fn(&mut Compiler)| -> Vec<u8> {
+        let mut c = mk();
+        let at = c.buf.pos();
+        f(&mut c);
+        c.buf.as_slice()[at..].to_vec()
+    };
+
+    // RDX base, displacement 0: mod=00, no displacement byte at all.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RDX, 0)),
+        vec![0x48, 0x3B, 0x02],
+    );
+    // RDX base, the five remaining table words: mod=01 + one byte.
+    for disp in [8i32, 16, 24, 32, 40] {
+        assert_eq!(
+            bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RDX, disp)),
+            vec![0x48, 0x3B, 0x42, disp as u8],
+            "displacement {disp} did not take the disp8 form",
+        );
+    }
+    // Past a signed byte: back to mod=10 + disp32, byte-identical to the
+    // encoder this one delegates to.
+    let wide = bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RDX, 4096));
+    assert_eq!(wide, bytes(&|c| c.emit_cmp_r64_mem_disp32(RAX, RDX, 4096)));
+
+    // RBP has no mod=00 form: a zero displacement still emits an explicit
+    // disp8 of 0, never the three-byte shape RDX gets.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RBP, 0)),
+        vec![0x48, 0x3B, 0x45, 0x00],
+    );
+    // RSP needs a SIB byte neither form emits, so it is handed to the disp32
+    // encoder unchanged rather than narrowed into a wrong operand here.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, RSP, 8)),
+        bytes(&|c| c.emit_cmp_r64_mem_disp32(RAX, RSP, 8)),
+    );
+    // An extended base keeps its REX.B, and R13 inherits RBP's rule.
+    assert_eq!(
+        bytes(&|c| c.emit_cmp_r64_mem_disp(RAX, R13, 0)),
+        vec![0x49, 0x3B, 0x45, 0x00],
+    );
+}
+
+/// The gated reference store writes the RIGHT CELL for a legacy receiver, and
+/// takes no helper call to do it.
+///
+/// Executed, not inspected: the compiled body runs against a fake object and
+/// the assertions read the bytes it wrote.
+///
+/// This arm used to send every non-compact receiver to `jit_putfield_object`,
+/// which made it an arm that essentially never fired — `init_object_header`,
+/// the TLAB fast path serving nearly every allocation, writes a LEGACY header
+/// unconditionally whatever layout the class has registered. A run-time path
+/// census on `RefStoreLoopProbe` measured `inline=0` out of 16,380,000, all of
+/// them bailing at the compactness test, while the compile-time census said
+/// `gated=2 declined=0` and looked healthy.
+///
+/// Both halves are asserted. A test that only checked the legacy receiver
+/// would pass on an arm that had simply swapped one dead shape for another.
+#[test]
+fn the_gated_ref_store_writes_both_cell_shapes_without_a_helper_call() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    static HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    /// Records the full-barrier path and deliberately does NOT store, so an
+    /// inline store and a helper store are trivially distinguishable.
+    unsafe extern "C" fn marker_putfield_object(_vm: i64, _obj: i64, _idx: i64, _val: i64) {
+        HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn marker_write_barrier(_heap: i64, _obj: i64, _val: i64) {
+        BARRIER_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // The published plan: SATB disarmed, old objects present, and the
+    // generational MASK shape. `post_active` is deliberately 1 so the mask is
+    // what rules the barrier out and not a global "nothing is old" shortcut.
+    static PRE_GATE: AtomicU64 = AtomicU64::new(0);
+    static POST_GATE: AtomicU64 = AtomicU64::new(1);
+    static READ_BOUNDS: [AtomicUsize; 6] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+
+    // void setRef(Object this, Object v) { this.f = v; }
+    let code: Vec<u8> = vec![0x2a, 0x2b, 0xb5, 0x00, 0x01, 0xb1, 0, 0];
+    let field_info = vec![(2usize, 0usize, b'L')];
+    let mut helpers = test_helpers();
+    helpers.putfield_object = marker_putfield_object as *const () as usize; // Cast: fn → slot
+    helpers.write_barrier = marker_write_barrier as *const () as usize; // Cast: fn → slot
+    helpers.read_bounds_addr = READ_BOUNDS.as_ptr() as usize; // Cast: static address
+    helpers.ref_store_pre_gate = std::ptr::addr_of!(PRE_GATE) as usize; // Cast: static address
+    helpers.ref_store_post_gate = std::ptr::addr_of!(POST_GATE) as usize; // Cast: static address
+    helpers.ref_store_post_young_floor = 0;
+    helpers.ref_store_post_skip_mask = cratonvm_types::GC_FLAG_OLD_GEN as usize;
+
+    set_pending_compact_field_info(vec![(2, 0, true)]);
+    let compiled = compile(
+        &code,
+        6,
+        2,
+        2,
+        true, // needs_heap — the barrier helper takes it
+        Vec::new(),
+        field_info,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &helpers,
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("reference putfield must compile");
+
+    let val = Box::new([0u64; 8]);
+    let val_addr = val.as_ptr() as usize; // Cast: stored reference
+
+    // ---- LEGACY receiver: no GC_FLAG_COMPACT, the 16-byte `Value` cell ----
+    let mut obj = Box::new([0u64; 8]);
+    // SAFETY: `obj` is 64 bytes and 8-byte aligned; both writes land inside it.
+    unsafe {
+        let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = 0; // young, LEGACY
+        std::ptr::write_unaligned(
+            p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
+            4u32,
+        );
+    }
+    let obj_addr = obj.as_mut_ptr() as usize; // Cast: receiver address
+    let page = obj_addr & !0xFFF;
+    READ_BOUNDS[0].store(page, Ordering::Release);
+    READ_BOUNDS[1].store(page + 0x10000, Ordering::Release);
+
+    HELPER_CALLS.store(0, Ordering::SeqCst);
+    BARRIER_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: JIT-compiled code from valid bytecode in an executable mmap; the
+    // receiver is a live 64-byte buffer shaped like an object header and
+    // neither marker helper stores anything.
+    unsafe {
+        compiled.call_with_heap(0, &[obj_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        (
+            HELPER_CALLS.load(Ordering::SeqCst),
+            BARRIER_CALLS.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "a young LEGACY receiver must store inline and call NOTHING — before \
+         the two-shape store it took the helper on every single execution"
+    );
+    let word = cratonvm_types::HEADER_SIZE / 8;
+    assert_eq!(
+        obj[word] as u32,
+        cratonvm_types::FIELD_CELL_TAG_OBJECT,
+        "the legacy shape must write the cell's TAG; a payload written without \
+         it leaves a discriminant saying whatever the field held before, and \
+         the reader believes the discriminant"
+    );
+    assert_eq!(
+        obj[word + 1] as usize, // Cast: raw stored pointer word
+        val_addr,
+        "the legacy shape must write the 64-bit pointer payload"
+    );
+
+    // ---- COMPACT receiver: the bare 8-byte pointer at the cell base ----
+    let mut c_obj = fake_compact_young_object();
+    let c_addr = c_obj.as_mut_ptr() as usize; // Cast: receiver address
+    let c_page = c_addr & !0xFFF;
+    READ_BOUNDS[0].store(c_page, Ordering::Release);
+    READ_BOUNDS[1].store(c_page + 0x10000, Ordering::Release);
+    HELPER_CALLS.store(0, Ordering::SeqCst);
+    BARRIER_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[c_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        (
+            HELPER_CALLS.load(Ordering::SeqCst),
+            BARRIER_CALLS.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "a young COMPACT receiver must still store inline and call nothing"
+    );
+    assert_eq!(
+        fake_object_ref_cell(&c_obj),
+        val_addr,
+        "the compact shape must survive the addition of the legacy one — the \
+         receiver's own header decides, and a genuinely compact object stores \
+         the bare pointer"
+    );
+
+    // ---- an OLD receiver still reaches the collector's write barrier ----
+    // SAFETY: `c_obj` is the buffer built above; this sets its flags byte.
+    unsafe {
+        let p = c_obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) =
+            cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_OLD_GEN;
+    }
+    BARRIER_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe {
+        compiled.call_with_heap(0, &[c_addr as i64, val_addr as i64]); // Cast: JIT ABI
+    }
+    assert_eq!(
+        BARRIER_CALLS.load(Ordering::SeqCst),
+        1,
+        "an OLD receiver is the case the mask exists to catch: the store is \
+         still inline, but the collector's own write barrier must run"
+    );
+}
+
+/// The two post-barrier gate shapes are mutually exclusive, and a plan that
+/// supplies neither (or both) is declined.
+///
+/// The mask shape exists because the age FLOOR cannot express the generational
+/// collector's question. Its `write_barrier` cards a store only when the
+/// receiver is in the old generation, which is `GC_FLAG_OLD_GEN` — a bit in the
+/// flags nibble of the same byte the floor compares. The two do not order: an
+/// object allocated straight into old gen has `gc_age == 0`, so its flags byte
+/// is `0x01`, BELOW the age-zero floor `0x10`, while a young object that has
+/// survived three collections is `0x30`, above it. A single unsigned threshold
+/// would therefore have told compiled code to skip the card on exactly the
+/// receivers that need one — so publishing both shapes at once is refused
+/// rather than silently preferring one.
+#[test]
+fn a_ref_store_plan_publishes_exactly_one_post_barrier_shape() {
+    let mut helpers = test_helpers();
+    helpers.ref_store_pre_gate = 0x1000;
+    helpers.ref_store_post_gate = 0x1008;
+
+    let gates = |h: &JitRuntimeHelpers| {
+        (
+            super::objects::ref_store_gates_of(h).is_some(),
+            super::objects::ref_store_post_skip_mask_of(h),
+        )
+    };
+
+    // Neither shape: nothing can rule the post barrier out.
+    helpers.ref_store_post_young_floor = 0;
+    helpers.ref_store_post_skip_mask = 0;
+    assert_eq!(gates(&helpers), (false, None), "neither shape");
+
+    // Floor only — ZGC's shape.
+    helpers.ref_store_post_young_floor = 0x1010;
+    helpers.ref_store_post_skip_mask = 0;
+    assert_eq!(gates(&helpers), (true, None), "floor only");
+
+    // Mask only — the generational collector's shape.
+    helpers.ref_store_post_young_floor = 0;
+    helpers.ref_store_post_skip_mask = usize::from(cratonvm_types::GC_FLAG_OLD_GEN);
+    assert_eq!(
+        gates(&helpers),
+        (true, Some(cratonvm_types::GC_FLAG_OLD_GEN)),
+        "mask only",
+    );
+
+    // Both: refused. Two independent skips for one question, and for a mask
+    // publisher the floor is not merely redundant but wrong.
+    helpers.ref_store_post_young_floor = 0x1010;
+    helpers.ref_store_post_skip_mask = usize::from(cratonvm_types::GC_FLAG_OLD_GEN);
+    assert_eq!(gates(&helpers).0, false, "both shapes");
+}
+
+/// The exact numbers behind that refusal, as a statement about the flags byte
+/// rather than about the emitter: an old-gen receiver can sit BELOW the
+/// age-zero floor, so no unsigned threshold separates old from young.
+#[test]
+fn no_age_floor_can_separate_an_old_gen_receiver_from_a_young_one() {
+    let flags_byte = |age: u8, flags: u8| (age << 4) | flags;
+    // Allocated straight into old gen: age 0, and it NEEDS a card.
+    let old_new = flags_byte(0, cratonvm_types::GC_FLAG_OLD_GEN);
+    // Survived three collections, still young: it needs none.
+    let young_old = flags_byte(3, 0);
+    assert!(
+        old_new < young_old,
+        "the receiver that needs a card ({old_new:#04x}) sorts BELOW one that \
+         does not ({young_old:#04x}) — which is why the floor shape cannot be \
+         used here, and the mask can",
+    );
+    // The mask answers both correctly.
+    assert_ne!(old_new & cratonvm_types::GC_FLAG_OLD_GEN, 0);
+    assert_eq!(young_old & cratonvm_types::GC_FLAG_OLD_GEN, 0);
 }

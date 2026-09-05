@@ -4587,13 +4587,13 @@ fn http_object_links(
 }
 
 const HTTP_LINK_EXECUTOR: u8 = 0;
-const HTTP_LINK_CONTEXT_SERVER: u8 = 1;
+pub(crate) const HTTP_LINK_CONTEXT_SERVER: u8 = 1;
 /// Per-`HttpExchange` attribute map (`get/setAttribute`).
 const HTTP_LINK_EXCHANGE_ATTRS: u8 = 2;
 /// Per-`HttpContext` attribute map (`getAttributes`).
 const HTTP_LINK_CONTEXT_ATTRS: u8 = 3;
 
-fn http_link_set(
+pub(crate) fn http_link_set(
     ctx: &mut dyn NativeContext,
     kind: u8,
     owner: ObjectRef,
@@ -4731,7 +4731,17 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // 72 runs after Phase E and would otherwise shadow them again with the old
     // behaviour.
     let hs = "com/sun/net/httpserver/HttpServer";
-    let hs_simple = "com/sun/net/httpserver/HttpServerImpl";
+    // `sun/...`, NOT `com/sun/...`. The JDK's implementation class is
+    // `sun.net.httpserver.HttpServerImpl`, which is what
+    // `net_phase_e::HS_IMPL_CLASS` spells and what both factories mint. This
+    // read `com/sun/net/httpserver/HttpServerImpl` -- a class that exists in no
+    // JDK and that nothing in this VM allocates -- so every row registered on
+    // it below was unreachable from the day it was written. `class_manager.rs`
+    // found the same typo in the field-count table and fixed it there by
+    // listing BOTH spellings; the REGISTRATION half was left behind, which is
+    // why a `--dump-native-registry` census reports zero rows for either
+    // spelling of the impl class.
+    let hs_simple = "sun/net/httpserver/HttpServerImpl";
 
     // HttpServerImpl alias — Phase E registers HttpServer; route the impl class
     // to the same field layout so that invocations via `HttpServerImpl.create`
@@ -4748,7 +4758,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         // `HttpServer`-keyed natives registered in this file (which Phase E's
         // `alias_class` snapshot cannot see) still dispatch on it.
         |ctx, args| {
-            crate::net_phase_e::re10_create_server(ctx, args, "com/sun/net/httpserver/HttpServer")
+            // Mint the IMPL class, like phase E's own factory. This passed the
+            // PUBLIC name so that the `HttpServer`-keyed rows registered later
+            // in this file would still dispatch on the receiver -- but those
+            // rows are now registered on the impl class too (see `hs_simple`
+            // above, whose spelling was wrong until 2026-09-02), so the
+            // receiver reaches them either way. Minting the public name handed
+            // the application an instance of an ABSTRACT class.
+            crate::net_phase_e::re10_create_server(ctx, args, "sun/net/httpserver/HttpServerImpl")
         },
     );
 
@@ -4867,94 +4884,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         // never written.
     }
 
-    // HttpContext = 2-field (path=0, handler=1)
-    let hctx = "com/sun/net/httpserver/HttpContext";
-    r.register(hctx, "getPath", "()Ljava/lang/String;", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
-    });
-    r.register(
-        hctx,
-        "getHandler",
-        "()Lcom/sun/net/httpserver/HttpHandler;",
-        |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1))),
-    );
-    // `setAuthenticator` is a real mutator: dropping the argument silently
-    // disables authentication on the context, which is a security failure
-    // rather than a missing convenience. The JDK signature RETURNS the
-    // authenticator it replaced — javac emits that descriptor at every real
-    // call site, so the void spelling below could never have matched one; it
-    // is kept (now storing too) for in-tree callers that use it.
-    r.register(
-        hctx,
-        "setAuthenticator",
-        "(Lcom/sun/net/httpserver/Authenticator;)Lcom/sun/net/httpserver/Authenticator;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let auth = match args.get(1).copied() {
-                Some(Value::Object(o)) => o,
-                _ => None,
-            };
-            let previous = http_context_set_authenticator(ctx, this, auth);
-            Ok(Some(Value::Object(previous)))
-        },
-    );
-    r.register(
-        hctx,
-        "setAuthenticator",
-        "(Lcom/sun/net/httpserver/Authenticator;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let auth = match args.get(1).copied() {
-                Some(Value::Object(o)) => o,
-                _ => None,
-            };
-            let _ = http_context_set_authenticator(ctx, this, auth);
-            Ok(None)
-        },
-    );
-    r.register(
-        hctx,
-        "getAuthenticator",
-        "()Lcom/sun/net/httpserver/Authenticator;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Object(http_context_authenticator(ctx, this))))
-        },
-    );
-    // getServer() — the constant null broke the documented
-    // `context.getServer().getExecutor()` idiom (and any handler that walks
-    // back to its server) with an NPE. `createContext` above now records the
-    // owning server, so hand that back.
-    r.register(
-        hctx,
-        "getServer",
-        "()Lcom/sun/net/httpserver/HttpServer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Object(http_link_get(
-                ctx,
-                HTTP_LINK_CONTEXT_SERVER,
-                this,
-            ))))
-        },
-    );
-    // getAttributes() is documented to return "a mutable Map" whose contents
-    // persist for the life of the context — handlers use it to share state.
-    // Minting a fresh empty HashMap per call meant every `put` was written to
-    // a map nobody could read back. Bind ONE map per context.
-    r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let m = http_attribute_map(ctx, HTTP_LINK_CONTEXT_ATTRS, this)?;
-        Ok(Some(Value::Object(Some(m))))
-    });
+    // The HttpContext surface is shared with phase E so it exists in every
+    // mode; see `register_http_context_surface`. Registered again here
+    // because phase 72 runs last under --synthetic-jdk and would
+    // otherwise leave phase E's rows owning the slots -- same bodies, so
+    // the winner does not matter, but the ownership stays where the
+    // surrounding comments say it is.
+    register_http_context_surface(r);
 
-    // HttpExchange method registrations (getRequestMethod, getRequestURI,
-    // getRequestHeaders, getResponseHeaders, getRequestBody, getResponseBody,
-    // sendResponseHeaders, close) are owned by `net_phase_e::register_re10_http_server`,
-    // which routes them through the live HTTP/1.1 dispatch loop. Phase 72 used
-    // to override those keys with naked field accessors that returned null
-    // OutputStreams and never wrote a response — that broke real-server probes.
-    // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
     // MOVED to `net_phase_e::register_re10_http_server`, which is the
     // real-JDK-live registrar and the one that MINTS the exchange
@@ -5958,4 +5895,130 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
     });
     r.set_category(__prev_cat);
     ()
+}
+
+/// Both class names a `createContext` result can carry.
+///
+/// `com.sun.net.httpserver.HttpContext` is the ABSTRACT public type and is what
+/// this VM has always minted; `sun.net.httpserver.HttpContextImpl` is what
+/// HotSpot returns. Rows go on both so the carrier keeps working whichever name
+/// it is minted under.
+pub(crate) const HTTP_CONTEXT_CARRIERS: [&str; 2] = [
+    "com/sun/net/httpserver/HttpContext",
+    "sun/net/httpserver/HttpContextImpl",
+];
+
+/// The `HttpContext` accessor surface, registered in EVERY mode.
+///
+/// This block used to live inside `register_p72_http_server`, which is reached
+/// only from `register_synthetic_overrides` -- so it existed under
+/// `--synthetic-jdk` and NOWHERE ELSE. Meanwhile `createContext` mints the
+/// carrier in every mode, and native dispatch is what gives an abstract carrier
+/// its behaviour: with no rows registered, every accessor resolved to the
+/// abstract declaration instead. Measured on 2026-09-02, compatible AND
+/// `--jdk-only`:
+///
+/// ```text
+/// getPath ! java.lang.AbstractMethodError:
+///     method com/sun/net/httpserver/HttpContext.getPath()Ljava/lang/String;
+///     has no Code attribute
+/// ```
+///
+/// ...and the same for `getServer`, `getHandler`, `getAttributes`. HotSpot
+/// answers all four. So `HttpServer.createContext(path, handler)` returned an
+/// object on which every documented method threw, in the two arms that ship.
+///
+/// Called from `register_p72_http_server` (unchanged behaviour under synthetic
+/// mode, which registers last and wins) and from
+/// `net_phase_e::register_re10_http_server`, which runs in all modes.
+pub(crate) fn register_http_context_surface(r: &mut NativeMethodRegistry) {
+    // HttpContext = 2-field (path=0, handler=1)
+    for hctx in HTTP_CONTEXT_CARRIERS {
+        r.register(hctx, "getPath", "()Ljava/lang/String;", |ctx, args| {
+            Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
+        });
+        r.register(
+            hctx,
+            "getHandler",
+            "()Lcom/sun/net/httpserver/HttpHandler;",
+            |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1))),
+        );
+        // `setAuthenticator` is a real mutator: dropping the argument silently
+        // disables authentication on the context, which is a security failure
+        // rather than a missing convenience. The JDK signature RETURNS the
+        // authenticator it replaced — javac emits that descriptor at every real
+        // call site, so the void spelling below could never have matched one; it
+        // is kept (now storing too) for in-tree callers that use it.
+        r.register(
+            hctx,
+            "setAuthenticator",
+            "(Lcom/sun/net/httpserver/Authenticator;)Lcom/sun/net/httpserver/Authenticator;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let auth = match args.get(1).copied() {
+                    Some(Value::Object(o)) => o,
+                    _ => None,
+                };
+                let previous = http_context_set_authenticator(ctx, this, auth);
+                Ok(Some(Value::Object(previous)))
+            },
+        );
+        r.register(
+            hctx,
+            "setAuthenticator",
+            "(Lcom/sun/net/httpserver/Authenticator;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let auth = match args.get(1).copied() {
+                    Some(Value::Object(o)) => o,
+                    _ => None,
+                };
+                let _ = http_context_set_authenticator(ctx, this, auth);
+                Ok(None)
+            },
+        );
+        r.register(
+            hctx,
+            "getAuthenticator",
+            "()Lcom/sun/net/httpserver/Authenticator;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(Value::Object(http_context_authenticator(ctx, this))))
+            },
+        );
+        // getServer() — the constant null broke the documented
+        // `context.getServer().getExecutor()` idiom (and any handler that walks
+        // back to its server) with an NPE. `createContext` above now records the
+        // owning server, so hand that back.
+        r.register(
+            hctx,
+            "getServer",
+            "()Lcom/sun/net/httpserver/HttpServer;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(Value::Object(http_link_get(
+                    ctx,
+                    HTTP_LINK_CONTEXT_SERVER,
+                    this,
+                ))))
+            },
+        );
+        // getAttributes() is documented to return "a mutable Map" whose contents
+        // persist for the life of the context — handlers use it to share state.
+        // Minting a fresh empty HashMap per call meant every `put` was written to
+        // a map nobody could read back. Bind ONE map per context.
+        r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let m = http_attribute_map(ctx, HTTP_LINK_CONTEXT_ATTRS, this)?;
+            Ok(Some(Value::Object(Some(m))))
+        });
+
+        // HttpExchange method registrations (getRequestMethod, getRequestURI,
+        // getRequestHeaders, getResponseHeaders, getRequestBody, getResponseBody,
+        // sendResponseHeaders, close) are owned by `net_phase_e::register_re10_http_server`,
+        // which routes them through the live HTTP/1.1 dispatch loop. Phase 72 used
+        // to override those keys with naked field accessors that returned null
+        // OutputStreams and never wrote a response — that broke real-server probes.
+        // We keep only the ancillary getters Phase E does not register.
+    }
 }

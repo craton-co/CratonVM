@@ -937,15 +937,104 @@ fn loop_headers(graph: &Graph) -> Vec<(NodeId, NodeId, Vec<NodeId>)> {
                 entry_preds.push(c);
             }
         }
-        // Reducible single-entry loop: one pre-header, ≥1 back-edge. A nested
-        // inner header whose entry is itself control-reachable (both inputs in
-        // `reach`) yields zero pre-headers and is skipped — safe, just not
-        // optimized (same limitation as the unroll pass).
+        // Reducible single-entry loop: one pre-header, >=1 back-edge.
         if entry_preds.len() == 1 && !back_ctrls.is_empty() {
             out.push((id, entry_preds[0], back_ctrls));
+            continue;
+        }
+        // Zero pre-headers is the NESTED INNER LOOP case, and it used to end
+        // here as "safe, just not optimized". It is not a corner: the walk
+        // forward from an inner header leaves through the inner exit, goes
+        // round the OUTER back edge and arrives at the inner loop's own
+        // pre-header, so every input reads as a back edge. Every `for (r…)
+        // for (i…)` in the tree — which is every rep-counted probe and most
+        // real scan loops — offered LICM only its outer header, never the loop
+        // doing the work.
+        //
+        // Dominance answers what reachability cannot; see
+        // `entry_preds_by_dominance`. Applied ONLY here, so a loop the test
+        // above already classifies keeps exactly the answer it had and this
+        // can only ADD loops the pass previously declined.
+        if entry_preds.is_empty() {
+            let (dom_entries, dom_backs) = entry_preds_by_dominance(graph, &users, id);
+            if dom_entries.len() == 1 && !dom_backs.is_empty() {
+                out.push((id, dom_entries[0], dom_backs));
+            }
         }
     }
     out
+}
+
+/// Control nodes `header` does **not** dominate: everything reachable from the
+/// graph entry with `header` deleted.
+///
+/// One reachability walk, no dominator tree. It is the definition of dominance
+/// read directly — `header` dominates `n` exactly when every path from the
+/// entry to `n` goes through `header`, i.e. when deleting `header` makes `n`
+/// unreachable — and it is what tells a NESTED INNER loop's back edge from its
+/// pre-header, and its body from the enclosing method.
+fn control_not_dominated_by(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    header: NodeId,
+) -> FxHashSet<NodeId> {
+    let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+    if (graph.entry as usize) >= graph.nodes.len() {
+        return seen;
+    }
+    seen.insert(graph.entry);
+    let mut work = vec![graph.entry];
+    while let Some(cur) = work.pop() {
+        for &u in &users[cur as usize] {
+            if u == header || seen.contains(&u) || !graph.nodes[u as usize].op.is_control() {
+                continue;
+            }
+            seen.insert(u);
+            work.push(u);
+        }
+    }
+    seen
+}
+
+/// Which of `header`'s control inputs are loop ENTRIES, decided by dominance
+/// rather than by reachability.
+///
+/// A control node is reachable from the graph entry *without passing through
+/// `header`* exactly when `header` does not dominate it — which is the textbook
+/// definition of "not a back edge". Reachability-from-the-header, which
+/// [`loop_headers`] uses first, cannot answer this for a **nested inner loop**:
+/// the walk forward from the inner header leaves through the inner loop's exit,
+/// goes round the OUTER back edge, and arrives at the inner loop's own
+/// pre-header — so every input looks like a back edge, no pre-header is found,
+/// and the inner loop is skipped entirely.
+///
+/// That skip is the documented limitation in `loop_headers`, and it is not a
+/// corner: an inner loop is where the iterations are. Measured on
+/// `probes/ArrayElemLoadCost.java`, whose `for (r…) for (i…)` shape is the same
+/// one every rep-counted probe and most real scan loops have, LICM reported
+/// exactly `1 candidate loop header` per method — the OUTER one — and never saw
+/// the loop doing the work.
+///
+/// Returns `(entry_preds, back_ctrls)`.
+fn entry_preds_by_dominance(
+    graph: &Graph,
+    users: &[Vec<NodeId>],
+    header: NodeId,
+) -> (Vec<NodeId>, Vec<NodeId>) {
+    let seen = control_not_dominated_by(graph, users, header);
+    let mut entries = Vec::new();
+    let mut backs = Vec::new();
+    for &c in graph.nodes[header as usize].inputs.iter() {
+        if c == NO_NODE {
+            continue;
+        }
+        if seen.contains(&c) {
+            entries.push(c);
+        } else {
+            backs.push(c);
+        }
+    }
+    (entries, backs)
 }
 
 /// Compute the set of nodes that belong to the loop whose header is `region`.
@@ -1156,6 +1245,53 @@ fn is_loop_invariant_d(
     }
 }
 
+/// The memory state flowing INTO a loop, as seen at its header.
+///
+/// When the header carries a memory phi, that phi's input for the loop-entry
+/// predecessor is the memory the pre-header ends with; when it does not, memory
+/// is loop-invariant already and the caller's own invariance test answers
+/// first. Used only to re-anchor a node whose alias class conflicts with no
+/// store, so this is an ORDERING choice and never a claim that some other
+/// memory state is equivalent.
+fn loop_entry_memory(graph: &Graph, region: NodeId, entry_pred: NodeId) -> Option<NodeId> {
+    let slot = graph.nodes[region as usize]
+        .inputs
+        .iter()
+        .position(|&p| p == entry_pred)?;
+    graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.op == Op::Phi
+                && node.ty == IrType::Memory
+                && node.inputs.first() == Some(&region)
+        })
+        // Phi inputs are `[region, v_for_pred0, v_for_pred1, …]`, aligned with
+        // the region's own predecessor list.
+        .and_then(|phi| phi.inputs.get(1 + slot).copied())
+}
+
+/// Can any node anchored at this control token raise an exception?
+///
+/// The question a pre-header hoist has to answer: moving a potentially-throwing
+/// node into that block is only invisible if nothing already there could throw
+/// first. Same classification `loop_has_hard_barrier` uses — not pure, not
+/// control, not `Load`/`Store`/`Phi`/`Dead` — applied to one block instead of a
+/// loop body.
+///
+/// Conservative in both directions that matter: a node this cannot see (one
+/// scheduled into the block by `find_best_block` rather than pinned by its
+/// control input) is a PURE node, which cannot throw; and a node it does see
+/// and cannot classify counts as trapping.
+fn preheader_may_trap(graph: &Graph, preheader: NodeId) -> bool {
+    graph.nodes.iter().any(|node| {
+        node.inputs.first() == Some(&preheader)
+            && !node.op.is_pure()
+            && !node.op.is_control()
+            && !matches!(node.op, Op::Load(_) | Op::Store(_) | Op::Phi | Op::Dead)
+    })
+}
+
 /// True if the loop body contains a *hard* memory barrier — a `Call`,
 /// allocation (`New`/`NewArray`, which run constructor side effects), guard,
 /// monitor, or any other non-pure node that is not a `Store`/`Load`/`Phi`/
@@ -1173,6 +1309,64 @@ fn loop_has_hard_barrier(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
             && !op.is_control()
             && !matches!(op, Op::Load(_) | Op::Store(_) | Op::Phi | Op::Dead)
     })
+}
+
+/// The same question asked about WRITES only, plus stores.
+///
+/// [`loop_has_hard_barrier`] disqualifies a loop from every hoist when its
+/// body holds any impure non-control node outside a small allow-list. Three
+/// of the nodes it therefore rejects write no memory at all:
+///
+/// * `Op::ArrayLoad` and `Op::ArrayLength` are **reads**. A read cannot
+///   clobber the location a hoisted load reads, so it cannot make a hoist
+///   value-unsafe. Each is impure only because it raises NPE on a null base
+///   — a TRAP-ordering fact, not an aliasing one.
+/// * `Op::Guard` carries no memory edge at all (`ir_schedule`: "its ordering
+///   against a store is positional"). It transfers control to a deopt; it
+///   writes nothing.
+///
+/// `Op::Store` is NOT exempt here, unlike in the strict predicate: the
+/// restricted hoist this feeds does no alias analysis, so it wants a body
+/// that writes nothing whatsoever rather than one whose writes it would have
+/// to reason about. Everything else — `Op::ArrayStore`, `Op::Call`,
+/// `Op::New`, `Op::NewArray`, `Op::LoadStatic`, the monitors — stays a
+/// barrier for the same reason it always was.
+///
+/// # What this is for
+///
+/// The IR String-access expansion (`ir.rs::try_string_access_intrinsic`)
+/// emits four `Op::Guard`s, two `Op::ArrayLoad`s and one `Op::ArrayLength`
+/// into the very loop it wants its `String.value` / `String.coder` loads
+/// hoisted OUT of — so it disqualified its own LICM, and `CRATONVM_DBG=licm`
+/// reported `hard_barrier=true` with 0 hoisted on every candidate header of
+/// `probes/CharAtCostCurve.java`. The same shape belongs to any counted loop
+/// carrying a bounds-checked array read.
+fn loop_writes_memory(graph: &Graph, body: &FxHashSet<NodeId>) -> bool {
+    body.iter().any(|&id| {
+        let op = &graph.nodes[id as usize].op;
+        !op.is_pure()
+            && !op.is_control()
+            && !matches!(
+                op,
+                Op::Load(_)
+                    | Op::Phi
+                    | Op::Dead
+                    | Op::Guard { .. }
+                    | Op::ArrayLoad(_)
+                    | Op::ArrayLength
+            )
+    })
+}
+
+/// `CRATONVM_JIT_NO_LICM_READ_HOIST=1` — turn off the restricted invariant-
+/// load hoist for a loop that only its own reads and guards disqualify.
+///
+/// Default ON. The B arm of an in-binary A/B: with this set,
+/// `probes/CharAtCostCurve.java` with the String-intrinsic pin off returns to
+/// re-reading `String.value` and `String.coder` per character, and every
+/// other arm is unchanged.
+fn licm_read_hoist_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LICM_READ_HOIST").is_none()
 }
 
 /// Points-to summary of a reference node, used by the LICM alias oracle to
@@ -1345,18 +1539,254 @@ fn licm(graph: &mut Graph) -> bool {
                 .filter(|&&id| matches!(graph.nodes[id as usize].op, Op::Load(_)))
                 .count();
             eprintln!(
-                "[DBG_LICM] header {region}: body {} node(s), {} load(s), hard_barrier={}",
+                "[DBG_LICM] header {region}: body {} node(s), {} load(s), \
+                 hard_barrier={} writes_memory={}",
                 body.len(),
                 nloads,
-                loop_has_hard_barrier(graph, &body)
+                loop_has_hard_barrier(graph, &body),
+                loop_writes_memory(graph, &body)
             );
         }
         // The pre-header is the classified loop-entry predecessor — NOT
         // necessarily input slot 0, since a `Merge` header may carry the
         // back-edge at either slot.
         let preheader = entry_pred;
+        // ── Loop-invariant `Op::ArrayLength` ────────────────────────────────
+        //
+        // Run BEFORE the pre-header guard and the hard-barrier bail below, and
+        // deliberately so on both counts. Taking the barrier first: an
+        // in-loop `ArrayLength` IS one of those barriers (it is not pure, and
+        // it is not a `Load`/`Store`/`Phi`), so a javac counted loop —
+        // `for (i = 0; i < a.length; i++)` — disqualified its own LICM by the
+        // very node this hoists. Measured on `probes/ArrayElemLoadCost.java`
+        // with `CRATONVM_DBG_LICM=1`: every candidate header reported
+        // `hard_barrier=true, 0 load(s)`, so the pass did nothing at all on the
+        // one loop shape it most needed to.
+        //
+        // What makes this hoistable when the general load hoist below is
+        // blocked:
+        //
+        // * **The value cannot change.** Nothing writes an array's length, so
+        //   `AliasClass::ArrayLength` conflicts with no store (see the alias
+        //   oracle's own note in `ir.rs`). The memory token is therefore pure
+        //   ordering for this node, and re-anchoring it to the loop's ENTRY
+        //   memory is value-preserving rather than a claim about aliasing.
+        //   Without re-anchoring the memory the hoist would be inert:
+        //   `ir_schedule::find_best_block` places a data node in the deepest
+        //   block dominated by ALL its input blocks, so a node still reading
+        //   the loop's memory phi stays in the loop no matter where its control
+        //   points.
+        //
+        // * **The throw point does not move.** `ArrayLength` raises NPE on a
+        //   null receiver, which is why it is impure. It is only taken when its
+        //   control input IS the loop header region — i.e. it executes on every
+        //   entry to the header, so in particular on the first — and the
+        //   pre-header runs immediately before that first execution with
+        //   nothing observable in between. `preheader_may_trap` refuses the
+        //   remaining case, a pre-header block that can itself throw, where
+        //   hoisting could report the NPE ahead of an exception that came first.
+        let al_ids: Vec<NodeId> = body
+            .iter()
+            .copied()
+            .filter(|&id| matches!(graph.nodes[id as usize].op, Op::ArrayLength))
+            .collect();
+        if !al_ids.is_empty() && !preheader_may_trap(graph, preheader) {
+            let entry_mem = loop_entry_memory(graph, region, entry_pred);
+            for al in al_ids {
+                let inputs = graph.nodes[al as usize].inputs.clone();
+                // Only the full `[ctrl, mem, array]` form has a control slot to
+                // repoint; the compact EA-bridge form is already schedulable by
+                // invariance alone.
+                if inputs.len() < 3 {
+                    continue;
+                }
+                if inputs[0] != region {
+                    if dbg {
+                        eprintln!(
+                            "[DBG_LICM] arraylength {al}: skip — control {} is not the header {region}",
+                            inputs[0]
+                        );
+                    }
+                    continue;
+                }
+                let array = inputs[2];
+                if !is_loop_invariant(graph, array, region, &body) {
+                    if dbg {
+                        eprintln!("[DBG_LICM] arraylength {al}: skip — array {array} variant");
+                    }
+                    continue;
+                }
+                let new_mem = if is_loop_invariant(graph, inputs[1], region, &body) {
+                    inputs[1]
+                } else {
+                    match entry_mem {
+                        Some(m) => m,
+                        None => {
+                            if dbg {
+                                eprintln!(
+                                    "[DBG_LICM] arraylength {al}: skip — no loop-entry memory"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                };
+                if dbg {
+                    eprintln!(
+                        "[DBG_LICM] arraylength {al} (inputs {inputs:?}): HOIST to preheader \
+                         {preheader}, mem {} -> {new_mem}",
+                        inputs[1]
+                    );
+                }
+                graph.nodes[al as usize].inputs[0] = preheader;
+                graph.nodes[al as usize].inputs[1] = new_mem;
+                changed = true;
+                hoisted += 1;
+            }
+        }
+
+        // ── Restricted invariant `Op::Load` hoist ───────────────────────────
+        //
+        // For a loop the STRICT rule refuses and `loop_writes_memory` clears:
+        // its body reads and guards, and writes nothing. Placed here, beside
+        // the `Op::ArrayLength` arm and above the pre-header guard below, for
+        // the same reason that arm is: for a nested INNER loop `body`
+        // over-approximates and drags the enclosing loop's pre-header in with
+        // it, and `loop_headers` has already established structurally that
+        // `entry_pred` is outside the natural loop. Over-approximation is the
+        // safe direction for every test below — a bigger `body` makes
+        // `is_loop_invariant` stricter and `header_derefs` smaller, so it can
+        // only refuse a hoist, never admit a wrong one.
+        //
+        // Three obligations, the same three the `ArrayLength` arm discharges:
+        //
+        // 1. **The value cannot change.** Nothing in the body writes memory
+        //    (`loop_writes_memory`), and the base is loop-invariant. So the
+        //    load reads the same location and the same value on every
+        //    iteration, and computing it once at the pre-header is
+        //    value-preserving rather than a claim about aliasing.
+        //
+        // 2. **The throw point does not move.** An `Op::Load` deopts (it does
+        //    not fault) on a null base, and a deopt raised from the pre-header
+        //    would rebuild an interpreter frame at a bci the loop never
+        //    reached. So the base must already be dereferenced on entry to the
+        //    header — either because this load IS control-anchored there (the
+        //    `ArrayLength` arm's own condition) or because some other
+        //    header-anchored load/`arraylength` reads the same base.
+        //    `preheader_may_trap` refuses the remaining case, a pre-header
+        //    that can itself throw.
+        //
+        //    For the shape this exists for that condition is exactly met: a
+        //    counted `for (i = 0; i < s.length(); i++)` expands `s.length()`
+        //    at the header, off the same receiver `s.charAt(i)` uses.
+        //
+        // 3. **The memory token is re-anchored.** Without it the hoist is
+        //    INERT whenever the body threads memory through a read:
+        //    `ir_schedule::find_best_block` places a data node in the deepest
+        //    block dominated by all its inputs, so a load still reading the
+        //    loop's memory phi stays in the loop however its control points.
+        if licm_read_hoist_enabled()
+            && preheader != NO_NODE
+            && loop_has_hard_barrier(graph, &body)
+            && !loop_writes_memory(graph, &body)
+            && !preheader_may_trap(graph, preheader)
+        {
+            let header_derefs: FxHashSet<NodeId> = body
+                .iter()
+                .copied()
+                .filter_map(|id| {
+                    let n = &graph.nodes[id as usize];
+                    if !matches!(n.op, Op::Load(_) | Op::ArrayLength) {
+                        return None;
+                    }
+                    if n.inputs.len() < 3 || n.inputs[0] != region {
+                        return None;
+                    }
+                    Some(n.inputs[2])
+                })
+                .collect();
+            let entry_mem = loop_entry_memory(graph, region, entry_pred);
+            let read_load_ids: Vec<NodeId> = body
+                .iter()
+                .copied()
+                .filter(|&id| matches!(graph.nodes[id as usize].op, Op::Load(_)))
+                .collect();
+            for load in read_load_ids {
+                let inputs = graph.nodes[load as usize].inputs.clone();
+                // Full `[ctrl, mem, base, offset?]` form only: the compact
+                // EA-bridge shapes carry no control or memory slot to move,
+                // and this arm's whole content is moving those two.
+                if inputs.len() < 3 {
+                    continue;
+                }
+                let base = inputs[2];
+                let addr = if inputs.len() >= 4 { inputs[3] } else { NO_NODE };
+                if !is_loop_invariant(graph, base, region, &body) {
+                    if dbg {
+                        eprintln!("[DBG_LICM] read-hoist load {load}: skip — base {base} variant");
+                    }
+                    continue;
+                }
+                if addr != NO_NODE && !is_loop_invariant(graph, addr, region, &body) {
+                    if dbg {
+                        eprintln!("[DBG_LICM] read-hoist load {load}: skip — addr {addr} variant");
+                    }
+                    continue;
+                }
+                if inputs[0] != region && !header_derefs.contains(&base) {
+                    if dbg {
+                        eprintln!(
+                            "[DBG_LICM] read-hoist load {load}: skip — base {base} is not \
+                             dereferenced at the header"
+                        );
+                    }
+                    continue;
+                }
+                let new_mem = if is_loop_invariant(graph, inputs[1], region, &body) {
+                    inputs[1]
+                } else {
+                    match entry_mem {
+                        Some(m) => m,
+                        None => {
+                            if dbg {
+                                eprintln!(
+                                    "[DBG_LICM] read-hoist load {load}: skip — no loop-entry memory"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                };
+                if inputs[0] == preheader && inputs[1] == new_mem {
+                    continue;
+                }
+                if dbg {
+                    eprintln!(
+                        "[DBG_LICM] read-hoist load {load} (inputs {inputs:?}): HOIST to \
+                         preheader {preheader}, mem {} -> {new_mem}",
+                        inputs[1]
+                    );
+                }
+                graph.nodes[load as usize].inputs[0] = preheader;
+                graph.nodes[load as usize].inputs[1] = new_mem;
+                changed = true;
+                hoisted += 1;
+            }
+        }
+
         if preheader == NO_NODE || body.contains(&preheader) {
             // No identifiable pre-header outside the loop → cannot hoist.
+            //
+            // Runs AFTER the `ArrayLength` hoist above, and deliberately: for a
+            // nested inner loop `body` over-approximates badly (the sweep drags
+            // the whole enclosing loop in behind the inner exit, pre-header
+            // included), and `loop_headers` has ALREADY established that
+            // `entry_pred` is outside the natural loop — by reachability, or by
+            // dominance for the inner-loop case it added. This guard is a
+            // belt-and-braces check against that over-approximation, not the
+            // structural claim, so the arm above does not owe it. The general
+            // load hoist below still does: it reasons about aliasing against a
+            // body it must not under-read.
             continue;
         }
 
@@ -3425,6 +3855,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Void, vec![], None);
         g.entry = start;
@@ -4210,6 +4641,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
@@ -4246,6 +4678,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;
@@ -4490,6 +4923,191 @@ mod tests {
         );
     }
 
+    /// `for (r…) { for (i…) { … } }` — and the inner header is the one the
+    /// iterations are in.
+    ///
+    /// `loop_headers` classified a header's control inputs by asking which are
+    /// reachable *forward from the header*. For an inner header that question
+    /// has no useful answer: the walk leaves through the inner exit, goes round
+    /// the OUTER back edge, and arrives back at the inner loop's own
+    /// pre-header — so both inputs read as back edges, the loop yields zero
+    /// pre-headers, and it was dropped. Every nested loop in the tree offered
+    /// LICM only its outer header.
+    #[test]
+    fn test_loop_headers_finds_the_inner_header_of_a_nested_loop() {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+
+        // Outer header; its back edge is wired below.
+        let outer = g.add(Op::Merge, IrType::Control, vec![c0], None);
+        let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let r = g.add(Op::Phi, IrType::Int, vec![outer, zero], None);
+        let ten = g.add(Op::Const(10), IrType::Int, vec![], None);
+        let ocond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![r, ten], None);
+        let oif = g.add(Op::If, IrType::Control, vec![outer, ocond], None);
+        let obody = g.add(Op::Proj(0), IrType::Control, vec![oif], None); // inner pre-header
+        let oexit = g.add(Op::Proj(1), IrType::Control, vec![oif], None);
+
+        // Inner header, entered from the outer body.
+        let inner = g.add(Op::Merge, IrType::Control, vec![obody], None);
+        let i = g.add(Op::Phi, IrType::Int, vec![inner, zero], None);
+        let icond = g.add(Op::Cmp(CmpOp::Lt), IrType::Int, vec![i, ten], None);
+        let iif = g.add(Op::If, IrType::Control, vec![inner, icond], None);
+        let ibody = g.add(Op::Proj(0), IrType::Control, vec![iif], None);
+        let iexit = g.add(Op::Proj(1), IrType::Control, vec![iif], None);
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let inext = g.add(Op::Add, IrType::Int, vec![i, one], None);
+        g.nodes[i as usize].inputs.push(inext);
+        g.nodes[inner as usize].inputs.push(ibody); // inner back edge
+
+        // Inner exit closes the outer back edge.
+        let rnext = g.add(Op::Add, IrType::Int, vec![r, one], None);
+        g.nodes[r as usize].inputs.push(rnext);
+        g.nodes[outer as usize].inputs.push(iexit); // outer back edge
+        let ret = g.add(Op::Return, IrType::Void, vec![oexit, r], None);
+        g.exit = ret;
+
+        let headers = loop_headers(&g);
+        let inner_entry = headers
+            .iter()
+            .find(|&&(h, _, _)| h == inner)
+            .map(|&(_, e, _)| e);
+        assert_eq!(
+            inner_entry,
+            Some(obody),
+            "the inner header's pre-header is the outer body's projection, got \
+             headers {:?}",
+            headers.iter().map(|&(h, e, _)| (h, e)).collect::<Vec<_>>()
+        );
+        let outer_entry = headers
+            .iter()
+            .find(|&&(h, _, _)| h == outer)
+            .map(|&(_, e, _)| e);
+        assert_eq!(
+            outer_entry,
+            Some(c0),
+            "the outer header's classification must be unchanged"
+        );
+    }
+
+    /// javac's counted loop — `for (i = 0; i < a.length; i++)` — re-evaluates
+    /// `a.length` at the top of every iteration, and the resulting in-loop
+    /// `Op::ArrayLength` is itself one of the hard barriers that disqualified
+    /// this pass from hoisting anything at all. Measured on
+    /// `probes/ArrayElemLoadCost.java` before the fix: every candidate header
+    /// reported `hard_barrier=true, 0 load(s)`.
+    ///
+    /// Both edges have to move. Re-anchoring only the control leaves the node
+    /// reading the loop's memory phi, and `ir_schedule::find_best_block` places
+    /// a data node in the deepest block dominated by ALL its input blocks — so
+    /// the "hoisted" node would schedule straight back into the loop. This test
+    /// pins both.
+    #[test]
+    fn test_licm_hoists_invariant_arraylength() {
+        let (mut g, region, preheader, _iv) = loop_probe_header(Op::Merge);
+        let entry_mem = 2; // the Start's memory projection
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        // The loop's memory phi, exactly as the builder emits it:
+        // [region, entry_memory, back_edge_memory]. Its own back edge is
+        // itself here — nothing in this probe writes memory.
+        let mem_phi = g.add(Op::Phi, IrType::Memory, vec![region, entry_mem], None);
+        g.nodes[mem_phi as usize].inputs.push(mem_phi);
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![region, mem_phi, arr],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, len], None);
+        g.exit = ret;
+
+        let changed = licm(&mut g);
+
+        assert!(changed, "an invariant arraylength must hoist");
+        assert_eq!(
+            g.nodes[len as usize].inputs[0], preheader,
+            "control must be re-anchored to the pre-header"
+        );
+        assert_eq!(
+            g.nodes[len as usize].inputs[1], entry_mem,
+            "the memory token must be re-anchored to the loop's ENTRY memory — \
+             leaving it on the loop's memory phi schedules the node back into \
+             the loop and the hoist is inert"
+        );
+    }
+
+    /// The receiver decides. An `arraylength` of something the loop itself
+    /// produces is not invariant, and hoisting it would read the length of a
+    /// different array (or of nothing yet).
+    #[test]
+    fn test_licm_does_not_hoist_variant_arraylength() {
+        let (mut g, region, _preheader, iv) = loop_probe_header(Op::Merge);
+        let entry_mem = 2;
+        let mem_phi = g.add(Op::Phi, IrType::Memory, vec![region, entry_mem], None);
+        g.nodes[mem_phi as usize].inputs.push(mem_phi);
+        // A "receiver" that varies with the induction variable.
+        let variant_ref = g.add(Op::Phi, IrType::Ref, vec![region, iv], None);
+        g.nodes[variant_ref as usize].inputs.push(variant_ref);
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![region, mem_phi, variant_ref],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![region, len], None);
+        g.exit = ret;
+
+        licm(&mut g);
+
+        assert_eq!(
+            g.nodes[len as usize].inputs[0], region,
+            "a variant receiver's arraylength must stay in the loop"
+        );
+    }
+
+    /// The hoist moves a node that can raise NPE, so it is only taken when the
+    /// `arraylength` runs on EVERY entry to the header — i.e. its control input
+    /// is the header itself. One behind a conditional inside the body may never
+    /// run at all in the original program, and moving it into the pre-header
+    /// would raise an exception the program never raised.
+    #[test]
+    fn test_licm_does_not_hoist_conditional_arraylength() {
+        let (mut g, region, _preheader, iv) = loop_probe_header(Op::Merge);
+        let entry_mem = 2;
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![g.entry], None);
+        let mem_phi = g.add(Op::Phi, IrType::Memory, vec![region, entry_mem], None);
+        g.nodes[mem_phi as usize].inputs.push(mem_phi);
+        // An in-body branch, with the arraylength on one arm only.
+        let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+        let cond = g.add(Op::Cmp(CmpOp::Ne), IrType::Int, vec![iv, zero], None);
+        let inner_if = g.add(Op::If, IrType::Control, vec![region, cond], None);
+        let taken = g.add(Op::Proj(0), IrType::Control, vec![inner_if], None);
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![taken, mem_phi, arr],
+            None,
+        );
+        let ret = g.add(Op::Return, IrType::Void, vec![taken, len], None);
+        g.exit = ret;
+
+        licm(&mut g);
+
+        assert_eq!(
+            g.nodes[len as usize].inputs[0], taken,
+            "a conditionally-executed arraylength must stay where it is"
+        );
+    }
+
     #[test]
     fn test_licm_hoists_invariant_load_merge_header() {
         // The production bytecode→IR builder emits javac loops with an
@@ -4531,6 +5149,7 @@ mod tests {
             exit: 0,
             safepoints: Vec::new(),
             uses: Default::default(),
+            receiver_param: None,
         };
         let start = g.add(Op::Start, IrType::Control, vec![], None);
         g.entry = start;

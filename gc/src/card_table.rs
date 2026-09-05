@@ -261,6 +261,33 @@ pub struct CardTable {
     base_addr: usize,
     /// Total size of the covered region in bytes (immutable).
     region_size: usize,
+    /// Address of `cells.cards`' backing buffer, and its length.
+    ///
+    /// # Why the map is reachable without the mutex (gc-genpause F5.2)
+    ///
+    /// The JIT's inline post barrier has always written this array directly
+    /// through [`Self::jit_cards_addr`] -- a single release byte-store, no
+    /// lock. The Rust-side barrier could not, because the only handle it had
+    /// was behind `cells`, so it went the long way round: a TLS lookup, an
+    /// `Arc` deref, a `parking_lot::Mutex`, a linear scan of a table-id
+    /// vec-map and a `Vec::push` that may reallocate -- per reference store,
+    /// with no deduplication, so a hot field pushed the same offset thousands
+    /// of times for `drain_pending` to CAS-loop over later.
+    ///
+    /// Caching the address here lets the two barriers be ONE implementation:
+    /// a bounds check, a shift, a load and a conditional byte store. That
+    /// equivalence is also the precondition for ever re-enabling
+    /// `inline_card_mark_available`, which is off today because a WildFly
+    /// audit found a case the emitter did not cover -- an audit that is much
+    /// easier to do against one card-marking rule than against two.
+    ///
+    /// Stable for the table's lifetime: `cards` is allocated once in
+    /// [`Self::new`] and never pushed to, resized or reallocated (only its
+    /// elements are stored to), and moving the `Vec` -- as `new` does when it
+    /// hands ownership to `CardCells` -- does not move its heap buffer. The
+    /// same reasoning `jit_cards_addr` has always relied on.
+    cards_addr: usize,
+    num_cards: usize,
     /// Exclusive bitmap state — touched only by collector-side methods.
     cells: Mutex<CardCells>,
     /// T5.5.2 — pending byte offsets submitted by thread-local buffers
@@ -274,6 +301,11 @@ impl CardTable {
     /// with the given `region_size` in bytes.
     pub fn new(base_addr: usize, region_size: usize) -> Self {
         let num_cards = region_size.div_ceil(CARD_SIZE);
+        // Allocate the byte map first so its buffer address can be cached
+        // outside the mutex (see `cards_addr`). Moving the `Vec` into
+        // `CardCells` below does not move the buffer this points at.
+        let cards: Vec<AtomicU8> = (0..num_cards).map(|_| AtomicU8::new(CARD_CLEAN)).collect();
+        let cards_addr = cards.as_ptr() as usize; // Cast: stable buffer base
         Self {
             // SECURITY FIX (V6): assign a process-unique id so buffered
             // offsets can be drained table-scoped (Relaxed is sufficient: we
@@ -281,8 +313,10 @@ impl CardTable {
             id: NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed),
             base_addr,
             region_size,
+            cards_addr,
+            num_cards,
             cells: Mutex::new(CardCells {
-                cards: (0..num_cards).map(|_| AtomicU8::new(CARD_CLEAN)).collect(),
+                cards,
                 dirty_cards: Vec::new(),
             }),
             pending_offsets: Mutex::new(Vec::new()),
@@ -313,6 +347,67 @@ impl CardTable {
                 .is_ok()
         {
             cells.dirty_cards.push(index);
+        }
+    }
+
+    /// gc-genpause F5.2 -- THE mutator write-barrier fast path: mark the card
+    /// containing `addr` dirty with no lock and no allocation.
+    ///
+    /// A bounds check, a shift, a relaxed load and, only if the card is not
+    /// already dirty, one release byte-store. This is byte-for-byte the same
+    /// rule the JIT's inline post barrier emits
+    /// (`Compiler::emit_inline_card_mark_regs`), which is the point: the
+    /// interpreter, the natives and compiled code now dirty a card the same
+    /// way, so there is one card-marking rule in this VM instead of two.
+    ///
+    /// # What it replaces
+    ///
+    /// [`Self::thread_local_dirty_addr`], which buffered the offset through a
+    /// TLS lookup, an `Arc`, a `parking_lot::Mutex`, a linear table-id lookup
+    /// and a growable `Vec`, for [`Self::drain_pending`] to fold into this
+    /// same byte map at the next safepoint. That pipeline exists because the
+    /// map was only reachable under `cells`; it is not needed now that
+    /// `cards_addr` is cached, and it never deduplicated -- a field written in
+    /// a loop buffered one entry per store, all of them for the same card.
+    /// `duplicate_card_marks` was the counter that measured exactly that.
+    ///
+    /// # The conditional store is not just an optimisation
+    ///
+    /// Re-storing `CARD_DIRTY` over an already-dirty byte is a write to a line
+    /// that every other storing mutator may hold, so an unconditional mark
+    /// ping-pongs the card line between cores on exactly the workload -- many
+    /// threads mutating one region -- where the barrier is hottest. Reading
+    /// first keeps a steady-state hot card read-shared.
+    ///
+    /// # Ordering
+    ///
+    /// The store is `Release` and pairs with the `Acquire` load in
+    /// [`Self::take_dirty_cards`], which is the same pairing the JIT's inline
+    /// store already documents. The pre-read is `Relaxed`: a stale `clean`
+    /// only costs a redundant store, and a stale `dirty` cannot happen -- a
+    /// card is only cleared at STW, when no mutator is running this.
+    ///
+    /// # Why it does not touch `dirty_cards`
+    ///
+    /// It cannot -- that list lives under the mutex this path exists to avoid.
+    /// It does not need to: `take_dirty_cards` scans the whole byte map and
+    /// merges it with the list precisely because the JIT's direct stores were
+    /// already invisible to it. Marks made here are found the same way.
+    #[inline]
+    pub fn mark_dirty_lockfree(&self, addr: usize) {
+        if addr < self.base_addr || addr >= self.base_addr + self.region_size {
+            return;
+        }
+        let index = (addr - self.base_addr) / CARD_SIZE;
+        if index >= self.num_cards {
+            return;
+        }
+        // SAFETY: `cards_addr` is the base of a `[AtomicU8; num_cards]` that
+        // lives as long as `self` and is never reallocated (see the field's
+        // doc comment), and `index < num_cards` was just checked.
+        let card = unsafe { &*(self.cards_addr as *const AtomicU8).add(index) };
+        if card.load(Ordering::Relaxed) != CARD_DIRTY {
+            card.store(CARD_DIRTY, Ordering::Release);
         }
     }
 
@@ -359,10 +454,37 @@ impl CardTable {
     /// thread-local offsets that have been flushed into the shared
     /// queue — they would be applied to a now-clean bitmap and
     /// represent stale work from before the clear.
+    ///
+    /// # PERF (gc-genpause F3): read first, write only what is dirty
+    ///
+    /// This used to store `CARD_CLEAN` over EVERY card byte -- one release
+    /// store per [`CARD_SIZE`] bytes of old gen, on every moving young cycle,
+    /// paired with [`Self::take_dirty_cards`]'s own full pass in the SAME
+    /// cycle. So a minor collection made two complete linear passes over the
+    /// card map regardless of how many cards were actually dirty. Measured at
+    /// 8-9 ns/card that is ~9 ms per cycle at a 512 MiB old gen and ~70 ms at
+    /// 4 GiB -- a cost that grows with OLD-gen size inside a pause that is
+    /// supposed to grow with the YOUNG live set.
+    ///
+    /// A steady-state card map is overwhelmingly clean, so an acquire load
+    /// first and a store only on the bytes that are genuinely dirty replaces
+    /// almost every write with a read. The loads still stream the whole map --
+    /// the flat byte map stays the single source of truth, and the JIT's
+    /// direct card store (`jit_cards_addr`) is deliberately not required to
+    /// maintain any summary structure beside it -- but a plain load is far
+    /// cheaper than the store it replaces.
+    ///
+    /// The conditional store is also strictly SAFER than the unconditional one
+    /// under a hypothetical concurrent writer: a card dirtied between our load
+    /// and our store SURVIVES here, where the old code wiped it. Both are only
+    /// ever called at STW; this one fails in the retaining direction if that
+    /// ever stops being true.
     pub fn clear_all(&self) {
         let mut cells = self.cells.lock();
         for card in &cells.cards {
-            card.store(CARD_CLEAN, Ordering::Release);
+            if card.load(Ordering::Acquire) != CARD_CLEAN {
+                card.store(CARD_CLEAN, Ordering::Release);
+            }
         }
         cells.dirty_cards.clear();
         drop(cells);
@@ -409,11 +531,44 @@ impl CardTable {
     /// restores the bitmap↔list invariant so the re-dirty genuinely re-registers
     /// the card. The moving path is unaffected: its `clear_all` wipes the whole
     /// bitmap anyway, so the early per-card clear is redundant, never harmful.
+    ///
+    /// # PERF (gc-genpause F3): an acquire LOAD, not an acquire RMW
+    ///
+    /// The scan used to be `swap(AcqRel)` on every card byte -- a locked
+    /// read-modify-write per [`CARD_SIZE`] bytes of old generation, executed
+    /// whether or not the byte was dirty. Held-workload measurement, scaling
+    /// only the card map (`refinement_ms / passes` from `[GC] cards:`, with
+    /// `dirty_scanned=0` in every arm, so the whole cost IS the scan):
+    ///
+    /// ```text
+    ///   old gen    cards      ms/pass   ns/card
+    ///    48 MiB     98,304      0.83       8.4
+    ///    96 MiB    196,608      1.83       9.3
+    ///   192 MiB    393,216      3.20       8.1
+    ///   512 MiB  1,048,576      8.26       7.9
+    /// ```
+    ///
+    /// Linear, ~8.3 ns/card, finding nothing. The RMW is what costs that: an
+    /// `Acquire` LOAD is a plain `mov` on x86-64 and an `LDAR` on aarch64,
+    /// where `swap(AcqRel)` is a `LOCK XCHG` / `LDAXRB-STLXRB` pair.
+    ///
+    /// The documented pairing is PRESERVED exactly. The JIT's inline post
+    /// barrier performs a release byte-store of `CARD_DIRTY`; what has to
+    /// happen-after it is an ACQUIRE READ of that byte, which is what the load
+    /// below is. The clear then only needs to be a release store, and only on
+    /// the bytes that were actually dirty -- which is what the old `swap` did
+    /// on those bytes anyway. A clean byte is now read and left alone instead
+    /// of being pointlessly rewritten with the value it already holds.
+    ///
+    /// The bitmap-to-list invariant the bt18 note below depends on is
+    /// unchanged: every byte this returns an index for is left `CARD_CLEAN`.
     pub fn take_dirty_cards(&self) -> Vec<usize> {
         let mut cells = self.cells.lock();
         let mut taken = std::mem::take(&mut cells.dirty_cards);
         for (index, card) in cells.cards.iter().enumerate() {
-            if card.swap(CARD_CLEAN, Ordering::AcqRel) == CARD_DIRTY {
+            // Acquire load pairs with the JIT's release store of CARD_DIRTY.
+            if card.load(Ordering::Acquire) == CARD_DIRTY {
+                card.store(CARD_CLEAN, Ordering::Release);
                 taken.push(index);
             }
         }
@@ -455,7 +610,7 @@ impl CardTable {
 
     /// The number of cards in this table.
     pub fn num_cards(&self) -> usize {
-        self.cells.lock().cards.len()
+        self.num_cards
     }
 
     /// The base address of the covered region.
@@ -474,7 +629,10 @@ impl CardTable {
     /// never resized. A generated release byte-store of `CARD_DIRTY` is paired
     /// with the acquire scan in [`Self::take_dirty_cards`].
     pub fn jit_cards_addr(&self) -> usize {
-        self.cells.lock().cards.as_ptr() as usize
+        // gc-genpause F5.2: cached at construction, so this no longer takes
+        // the collector's mutex to hand out an address that has been constant
+        // since `new`.
+        self.cards_addr
     }
 
     // -----------------------------------------------------------------
@@ -762,6 +920,97 @@ impl std::fmt::Debug for CardTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gc-genpause F5.2: the lock-free barrier and the buffered pipeline it
+    /// replaces must dirty exactly the same cards.
+    ///
+    /// This is the equivalence the change rests on. The two paths reach the
+    /// byte map by completely different routes -- one stores into it directly,
+    /// the other queues a byte offset through a per-thread buffer for
+    /// `drain_pending` to fold in at a safepoint -- so "same card set" is a
+    /// claim about the address arithmetic in both, not something the types
+    /// enforce.
+    #[test]
+    fn the_lockfree_barrier_dirties_the_same_cards_as_the_buffered_path() {
+        const BASE: usize = 0x10_0000;
+        const SIZE: usize = CARD_SIZE * 64;
+        // Addresses spanning card boundaries, exact starts, interiors, the
+        // last byte of the region, and two that share a card.
+        let addrs = [
+            BASE,
+            BASE + 1,
+            BASE + CARD_SIZE - 1,
+            BASE + CARD_SIZE,
+            BASE + CARD_SIZE * 7 + 13,
+            BASE + CARD_SIZE * 7 + 14,
+            BASE + CARD_SIZE * 63,
+            BASE + SIZE - 1,
+            // Out of range in both directions: neither path may record these.
+            BASE - 1,
+            BASE + SIZE,
+            BASE + SIZE + CARD_SIZE * 4,
+        ];
+
+        let buffered = CardTable::new(BASE, SIZE);
+        for &a in &addrs {
+            buffered.thread_local_dirty_addr(a);
+        }
+        buffered.flush_all();
+        buffered.drain_pending();
+        let via_buffer = buffered.take_dirty_cards();
+
+        let direct = CardTable::new(BASE, SIZE);
+        for &a in &addrs {
+            direct.mark_dirty_lockfree(a);
+        }
+        let via_direct = direct.take_dirty_cards();
+
+        assert_eq!(
+            via_direct, via_buffer,
+            "the lock-free barrier must dirty exactly the cards the buffered              path did"
+        );
+        assert!(!via_direct.is_empty(), "the fixture must dirty something");
+        // And specifically: the two addresses sharing card 7 produce ONE card.
+        assert_eq!(
+            via_direct.iter().filter(|&&c| c == 7).count(),
+            1,
+            "two stores into one card are one dirty card"
+        );
+    }
+
+    /// The conditional store in `mark_dirty_lockfree` must not turn a repeat
+    /// mark into a no-op that loses the card -- an already-dirty card stays
+    /// dirty, and is still reported once.
+    #[test]
+    fn repeated_lockfree_marks_of_one_card_stay_dirty() {
+        let ct = CardTable::new(0x1000, CARD_SIZE * 4);
+        for _ in 0..1000 {
+            ct.mark_dirty_lockfree(0x1000 + CARD_SIZE * 2 + 8);
+        }
+        assert!(ct.is_dirty(2));
+        assert_eq!(ct.take_dirty_cards(), vec![2]);
+        // Consumed: the byte is clean again, so a re-mark genuinely
+        // re-registers it (the bt18 bitmap-to-list invariant).
+        assert!(!ct.is_dirty(2));
+        ct.mark_dirty_lockfree(0x1000 + CARD_SIZE * 2 + 8);
+        assert_eq!(ct.take_dirty_cards(), vec![2]);
+    }
+
+    /// gc-genpause F3: `clear_all` writes only the dirty bytes now, so prove
+    /// it still leaves every card clean -- including one dirtied by the
+    /// lock-free barrier, which never touches the tracking list.
+    #[test]
+    fn conditional_clear_all_still_clears_every_card() {
+        let ct = CardTable::new(0x1000, CARD_SIZE * 8);
+        ct.mark_dirty_lockfree(0x1000 + CARD_SIZE * 3);
+        ct.mark_dirty(0x1000 + CARD_SIZE * 5);
+        assert!(ct.is_dirty(3) && ct.is_dirty(5));
+        ct.clear_all();
+        for i in 0..ct.num_cards() {
+            assert!(!ct.is_dirty(i), "card {i} survived clear_all");
+        }
+        assert!(ct.take_dirty_cards().is_empty());
+    }
 
     #[test]
     fn direct_jit_atomic_mark_is_visible_to_stw_consumer() {

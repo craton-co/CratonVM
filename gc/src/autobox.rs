@@ -97,7 +97,7 @@ static WRAPPER_CREATED: AtomicBool = AtomicBool::new(false);
 ///
 /// The read-side fast-path screen. See the module note on cost.
 #[inline(always)]
-pub(crate) fn wrapper_exists() -> bool {
+pub fn wrapper_exists() -> bool {
     WRAPPER_CREATED.load(Ordering::Relaxed)
 }
 
@@ -108,6 +108,129 @@ pub(crate) fn note_wrapper_created() {
     // Store, not swap: a redundant store to an already-`true` flag is cheaper
     // than an RMW, and this is on an allocating path either way.
     WRAPPER_CREATED.store(true, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// The expected-overlay scope
+// ---------------------------------------------------------------------------
+//
+// Two populations reach [`observe_primitive_into_reference_field`] and they are
+// not the same news:
+//
+//   * the VM's OWN class-mirror populator, which type-puns a `ClassId` (and
+//     `Int(-1)` for primitive mirrors) into slot 0 of an object stamped
+//     `java/lang/Class` -- deliberate, self-inflicted, and load-bearing;
+//   * a genuine third-party store of a primitive into a slot the class declares
+//     as a reference -- precisely what this guard exists to catch.
+//
+// Until 2026-09-01 the guard could not tell them apart, and the first
+// population is large enough to hide the second: a stock `cratonvm Hello` mints
+// ~33 mirrors, which the `n < 8 || n.is_power_of_two()` limiter turns into ~12
+// WARN lines, and by the time a real third-party store arrives the budget is
+// spent. Measured, with the corroboration across five other programs, in
+// `.agent-requests/A12-gc-guard.txt` and at both write sites in
+// `vm/src/vm/vm_object.rs`.
+//
+// So the ONE known producer marks its own stores expected, at the call site,
+// and the guard stays fully armed for everybody else. A scope and not a flag,
+// and emphatically not a filter on `class_id == 12 && index == 0`: a class-id
+// filter would also swallow a THIRD-PARTY store into that same slot, which is
+// the single most interesting store this guard could ever see.
+
+/// Nesting depth of [`expect_primitive_into_reference`] scopes on **this
+/// thread**.
+///
+/// Thread-local rather than a process-global flag, and the difference is the
+/// whole point. The store and the guard run on the same thread one frame apart,
+/// so a thread-local is sufficient; a global would additionally mute a
+/// concurrent third-party store happening on another thread while the mirror
+/// populator runs -- and the boot is exactly when other threads are starting.
+/// A guard that goes blind under concurrency is worse than a noisy one.
+///
+/// A `u32` depth rather than a `bool` so nesting is safe by construction: an
+/// inner `bool` scope would clear the outer one when it dropped.
+///
+/// `const`-initialised and holding a non-`Drop` `Cell<u32>`, so this
+/// thread-local has neither a destructor nor a lazy-init flag -- `with`
+/// therefore cannot observe a destroyed slot and cannot panic. That matters
+/// because the reader below sits on a heap store path that can run on a thread
+/// already tearing down.
+thread_local! {
+    static EXPECTED_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Boxing stores made inside an expected scope.
+///
+/// Counted, never printed per event. The bar this change had to clear is that a
+/// quiet boot means "nothing unexpected happened" and never "we stopped
+/// looking", so the expected population has to stay *measurable* -- otherwise
+/// silencing it is indistinguishable from deleting the guard. Read it with
+/// [`expected_primitive_into_reference_count`]; it also rides along as the
+/// `expected_overlay` field on every WARN the guard does emit, which is the
+/// moment the number is most worth having, because it says how much known
+/// traffic ran before this unknown store.
+static EXPECTED_STORES: AtomicU64 = AtomicU64::new(0);
+
+/// A store made while this guard is alive is a KNOWN VM-internal overlay: it is
+/// counted into [`expected_primitive_into_reference_count`] and not warned
+/// about.
+///
+/// The one caller is `vm/src/vm/vm_object.rs`'s class-mirror populator
+/// (`get_or_create_class_mirror` and `get_or_create_primitive_mirror`), which
+/// deliberately writes a `ClassId` / `Int(-1)` into slot 0 of a
+/// `java/lang/Class` object whose real JDK 25 slot 0 is
+/// `Constructor<T> cachedConstructor`. It cannot stop, and the three
+/// cheaper-looking answers are all unsound: skipping the store was MEASURED to
+/// fail `RJdkHello` at `System.out instanceof PrintStream`; hand-boxing there
+/// would hand `mirror_class_id`'s slot-0 fallback the WRAPPER instead of the
+/// `Int`, because [`unbox_reference_slot`] is gated on the `WRAPPER_CREATED`
+/// latch that only [`box_for_reference_slot`] arms; and
+/// `set_field_as(.., b'L')` coerces `Int(_)` to `Value::Object(None)` and loses
+/// the tag entirely. The long form of all three, with the dates, is at the
+/// write site.
+///
+/// **Hold it across as little as possible.** The scope is a suppression, so
+/// every instruction inside it is an instruction the guard is not watching.
+/// Both call sites `drop` it explicitly on the line after the store rather than
+/// letting it live to the end of the function: `set_field`'s boxing closure
+/// allocates, an allocation can collect, and a collection's own field writes
+/// must not inherit the scope.
+///
+/// RAII rather than a `set`/`clear` pair so the expectation cannot leak past a
+/// `?` or a panic -- and the allocation just named is exactly a thing that can
+/// unwind.
+#[must_use]
+pub struct ExpectedPrimitiveIntoReference(());
+
+impl Drop for ExpectedPrimitiveIntoReference {
+    fn drop(&mut self) {
+        // `saturating_sub`: a depth that somehow reached 0 early must not wrap
+        // to `u32::MAX` and mute this thread's guard for the rest of the run.
+        // Failing towards "the guard is armed" is the only acceptable direction
+        // for a bug inside a suppression.
+        EXPECTED_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Open an expected-overlay scope on this thread. See
+/// [`ExpectedPrimitiveIntoReference`] for what belongs inside one, and why the
+/// scope has to be kept to a single statement.
+#[must_use]
+pub fn expect_primitive_into_reference() -> ExpectedPrimitiveIntoReference {
+    EXPECTED_DEPTH.with(|d| d.set(d.get() + 1));
+    ExpectedPrimitiveIntoReference(())
+}
+
+/// How many boxing stores this process made inside an expected scope.
+///
+/// Process-wide and monotone. The intended long-term reader is the shutdown
+/// census line that already prints the sibling counters (see
+/// `.agent-requests/A12-gc-guard.txt` item 4, which is owned by another file);
+/// until it is wired there the number is reachable from any test or debugger,
+/// and from the guard's own WARN as `expected_overlay`.
+#[must_use]
+pub fn expected_primitive_into_reference_count() -> u64 {
+    EXPECTED_STORES.load(Ordering::Relaxed)
 }
 
 /// Does `value` need boxing before it can occupy a REFERENCE slot?
@@ -162,6 +285,16 @@ pub(crate) fn needs_reference_box(value: Value) -> bool {
 /// and adding a name would need four files or `cargo test -p cratonvm-types`
 /// goes red (W7-77 §5.5).
 ///
+/// **Not every store reaches the message.** A store made inside an
+/// [`ExpectedPrimitiveIntoReference`] scope is a declared VM-internal overlay:
+/// it is counted into [`expected_primitive_into_reference_count`] and returns
+/// BEFORE the rate limiter, so it neither prints nor spends budget. Exactly one
+/// producer opens such a scope — `vm/src/vm/vm_object.rs`'s class-mirror
+/// populator, which G30 §1 established was every single warning a default run
+/// emitted. The screen is thread-local and lasts one statement; every other
+/// producer, on this thread or any other, still gets the full message below
+/// with the same escalating dedup.
+///
 /// This is ADDITIVE to the two detectors that already cover this species —
 /// `vm_exec.rs`'s `overlay_access_is_cross_type` (the interpreter/native
 /// boundary) and `native-api`'s read-side alias census. Neither is quietened by
@@ -172,6 +305,20 @@ pub(crate) fn observe_primitive_into_reference_field(
     index: usize,
     value: Value,
 ) {
+    // The expected-overlay screen, and it is deliberately the FIRST statement
+    // rather than a condition on the `warn!` below. If an expected store fell
+    // through to `SEEN.fetch_add` it would still consume the
+    // `n < 8 || n.is_power_of_two()` budget, so the boot's ~33 known mirror
+    // stores would push the first genuine third-party store past occurrence 33
+    // -- where the next printable occurrence is 64 -- and it would never be
+    // printed at all. Quietening the known producer WITHOUT also giving it back
+    // its budget would have left the guard strictly worse than the noise it
+    // replaced. See `ExpectedPrimitiveIntoReference`.
+    if EXPECTED_DEPTH.with(|d| d.get()) > 0 {
+        EXPECTED_STORES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n.is_power_of_two() {
@@ -181,13 +328,19 @@ pub(crate) fn observe_primitive_into_reference_field(
             index,
             value = ?value,
             occurrence = n,
+            expected_overlay = EXPECTED_STORES.load(Ordering::Relaxed),
             "a non-reference value was stored into a slot the class declares as \
              a REFERENCE — boxing it into an AUTOBOX_CLASS_ID wrapper so the \
              value survives and every collector agrees (W7-84). The store is a \
-             type-punning one; it is NOT necessarily a native — on the boot \
-             path it is the VM's own class-mirror populator writing a ClassId \
-             over java.lang.Class.cachedConstructor (vm/src/vm/vm_object.rs). \
-             Run with CRATONVM_DBG_LAYOUT=1 to resolve class_id to a name.",
+             type-punning one and it is NOT necessarily a native. Since \
+             2026-09-01 it is also NOT the VM's own class-mirror populator: \
+             that producer (a ClassId, or Int(-1), written over \
+             java.lang.Class.cachedConstructor by vm/src/vm/vm_object.rs) \
+             declares its two stores expected and is tallied into \
+             expected_overlay instead of being reported here — it used to be \
+             every single one of these records, so a reader who chases it now \
+             is chasing the wrong file. Run with CRATONVM_DBG_LAYOUT=1 to \
+             resolve class_id to a name.",
         );
     }
 }

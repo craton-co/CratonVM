@@ -93,7 +93,9 @@ pub use class_manager::synthetic_stub_field_model;
 // because `native-builtins` must register natives for exactly this list —
 // the stub's method table and the registry cannot be allowed to disagree.
 pub use class_manager::{
+    any_annotation_proxy_defined,
     any_class_redefined,
+    any_duplicate_class_name, class_is_java_util,
     bump_jit_supersede_epoch,
     class_definition_epoch,
     drain_pending_class_hooks,
@@ -149,7 +151,7 @@ pub use class_path::{ClassPath, ManifestInfo};
 // can dedupe their per-call hierarchy walk. Invalidated in lockstep
 // with `ResolutionCache::invalidate_class` from the JVMTI
 // `RedefineClasses` path.
-pub use resolution::{LinkResolver, ResolvedMember};
+pub use resolution::{epoch_stale_evictions, LinkResolver, ResolvedMember};
 // Verification-derived per-method oop maps (see `type_maps`). Produced by the
 // same walk that verifies, on the default build path — no feature gate, no
 // env var. Re-exported here because the eventual consumers (GC root scan,

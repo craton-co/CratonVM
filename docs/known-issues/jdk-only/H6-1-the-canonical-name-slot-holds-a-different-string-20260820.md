@@ -452,6 +452,40 @@ One bean/decision per commit, per `H0-1` N2's rule.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §7.1's oracle probe — "Run this
+> against CratonVM too; it is the differential that decides §7.3" — has been run.
+> It is transcribed verbatim into `probes/ONProbe.java`. **The differential is
+> ZERO**, on both arms:
+>
+> ```text
+> A getCanonicalName         = java.lang:name=G1 Young Generation,type=GarbageCollector
+> A getKeyPropertyListString = type=GarbageCollector,name=G1 Young Generation
+> A toString                 = java.lang:type=GarbageCollector,name=G1 Young Generation
+> A getCanonicalKeyPropList  = name=G1 Young Generation,type=GarbageCollector
+> B getCanonicalName         = d:a=1,b=2,c=3
+> B getKeyPropertyListString = b=2,a=1,c=3
+> B toString                 = d:b=2,a=1,c=3
+>
+> HotSpot vs CratonVM compatible   IDENTICAL
+> HotSpot vs CratonVM --jdk-only   IDENTICAL
+> ```
+>
+> The three-way distinction this record is about is exactly what the B rows pin,
+> and all three are right: `getCanonicalName` SORTS the keys (`a=1,b=2,c=3`),
+> `getKeyPropertyListString` preserves INSERTION order (`b=2,a=1,c=3`), and
+> `toString` preserves the ORIGINAL spelling. A slot holding the wrong one of
+> those three would show here, and none does.
+>
+> **§7.2's prediction also holds, by a route it did not anticipate.** It predicts
+> `RJdkJmx` "stays green and moves nothing". `RJdkJmx` passes when run alone in
+> both modes. It DOES appear in the failure list of a full `SUITE=all` run — but
+> that is one of six vectors shown to fail only inside a full-suite run and to
+> pass alone in either mode, which is the harness rather than the mode or the
+> vector. See
+> [`the-suite-ab-that-was-the-harness-20260902.md`](the-suite-ab-that-was-the-harness-20260902.md).
+> Taken from the full-suite list alone, `RJdkJmx` would have read as this
+> record's prediction failing.
+
 ## 7. VERIFICATION PLAN
 
 ### 7.1 The oracle probe, so it can be re-run

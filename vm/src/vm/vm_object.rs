@@ -159,8 +159,13 @@ pub fn create_java_string_uninterned_gc_safe_threaded(
         && text.is_ascii()
     {
         let (class_id, fields) = java_string_allocation_layout(shared);
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-        let object_size = HEADER_SIZE + fields.saturating_mul(SLOT_SIZE);
+        // The shape planner, not a bare legacy size -- see
+        // `plan_tlab_object_shape`.
+        let (object_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+            class_id,
+            fields,
+            crate::runtime::interpreter::tlab_site::STRING,
+        );
         let str_obj = crate::runtime::interpreter::tlab_alloc_object(
             thread,
             shared,
@@ -1337,10 +1342,70 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     //      already made it fail. **Do not "modernise" this to
     //      `set_field_as`.** `the_class_mirror_id_is_written_without_a_field_descriptor`
     //      is the tripwire.
+    // 2026-09-01 — THIS STORE IS THE WHOLE OF THE W7-84 GUARD'S DEFAULT-RUN
+    // OUTPUT, AND THAT IS NOW A MEASURED COST RATHER THAN A CURIOSITY.
+    //
+    // A stock `cratonvm Hello` — a one-line hello-world — printed 28 lines of
+    // internal diagnostics to stderr where HotSpot prints zero, and about a
+    // dozen of them are `cratonvm::gc::guard` warnings from this line and its
+    // primitive-mirror twin: the boot mints ~33 mirrors, the guard's
+    // `n < 8 || n.is_power_of_two()` sample turns that into occurrences
+    // 0..=7, 8, 16, 32. Corroborated in G30 §1 above, which established that
+    // EVERY such warning in a run is `class_id=ClassId(12) index=0`.
+    //
+    // So the guard spends its entire default-run budget reporting the VM to
+    // itself, and a genuine third-party primitive-into-reference store — the
+    // thing it exists to catch — arrives after the rate limiter has already
+    // been spent on 33 copies of a known, deliberate overlay.
+    //
+    // The fix is NOT to quieten the guard and NOT to raise its threshold: it
+    // stays fully armed, and it must, because it is the only detector that
+    // sees this species at the store. The fix is to mark THIS producer as
+    // expected, so the guard goes quiet for it alone.
+    //
+    // Three cheaper-looking answers were considered and are all unsound:
+    //   * boxing by hand here (allocate the `AUTOBOX_CLASS_ID` wrapper and
+    //     store a reference, so `needs_reference_box` is false) does not work:
+    //     `autobox`'s read-side unbox is gated on a process-global
+    //     `WRAPPER_CREATED` latch that only the boxing path arms, so
+    //     `Heap::get_field` would hand `mirror_class_id`'s fallback the
+    //     WRAPPER instead of the `Int` — the same failure the 2026-08-12 gate
+    //     produced, by a different route;
+    //   * `set_field_as` is refused by the G30 note directly above;
+    //   * skipping the store is the 2026-08-12 gate, falsified by measurement.
+    //
+    // LANDED 2026-09-01. `gc::autobox::expect_primitive_into_reference` is a
+    // thread-local, RAII, depth-counted scope; a boxing store made inside one
+    // is counted into `autobox::expected_primitive_into_reference_count()` and
+    // returns from the guard BEFORE `SEEN.fetch_add`, so it spends no
+    // rate-limit budget either. That second half is the load-bearing one: a
+    // suppression that still consumed the budget would push the first genuine
+    // third-party store past occurrence 33, where the next printable
+    // occurrence is 64, and it would never be printed at all.
+    //
+    // Three properties of the scope are deliberate and a future edit must keep
+    // them:
+    //   * THREAD-LOCAL, not a global flag. A global would also mute a
+    //     concurrent third-party store on another thread while this populator
+    //     runs, and the boot is exactly when other threads start.
+    //   * SCOPED TO THE ONE STATEMENT. `drop(_expected)` is explicit rather
+    //     than end-of-function: the `slots.name` write immediately below
+    //     allocates a String and stores a reference, and the store this scope
+    //     exists for allocates a wrapper, which can collect — nothing beyond
+    //     the single `set_field` should inherit the expectation. What IS
+    //     inside it is one `VmHeap::set_field`: the SATB pre-barrier, the
+    //     backend `set_field`, and `autobox::box_for_reference_slot`, whose
+    //     `observe_…` call happens BEFORE `alloc_wrapper`, so the count is
+    //     taken before any collection can start.
+    //   * NOT A `class_id == 12 && index == 0` FILTER. That would swallow a
+    //     third-party store into this same slot, which is the single most
+    //     interesting store the guard could ever see.
+    let _expected = cratonvm_gc::autobox::expect_primitive_into_reference();
     shared
         .mem
         .heap
         .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
+    drop(_expected);
 
     // name → class name String.
     if let Some(idx) = slots.name {
@@ -1555,7 +1620,18 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // disagreeing about whether slot 0 is written at all — which is a worse
     // state than either consistent choice and exactly the kind of half-applied
     // repair this campaign kept finding.
+    // Counted into the same W7-84 expected-overlay census as the class-mirror
+    // store, by the same mechanism and for the same reason — read the
+    // 2026-09-01 note at that site for the measurement, for the three unsound
+    // alternatives (hand-boxing, `set_field_as`, skipping), and for why the
+    // `drop` below is explicit rather than end-of-scope.
+    //
+    // The scope must not reach the `slots.name` write a few lines down: that
+    // one allocates a String and stores a genuine reference, and a suppression
+    // covering it would hide a real defect if the value ever stopped being one.
+    let _expected = cratonvm_gc::autobox::expect_primitive_into_reference();
     shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
+    drop(_expected);
 
     // name → primitive type name as String.
     if let Some(idx) = slots.name {
@@ -2117,6 +2193,9 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
 }
 
 /// Scan a single class for its ACC_NATIVE methods.
+// Test-only: every caller is a #[test] in `vm_init.rs`. Revealed when the
+// region splitter stopped closing a test region early on a string brace.
+#[cfg(test)]
 pub fn scan_class_natives(shared: &SharedVm, class_name: &str) -> Vec<NativeMethodInfo> {
     let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {

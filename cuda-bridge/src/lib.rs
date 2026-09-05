@@ -118,6 +118,23 @@ pub fn probe_device(device_ordinal: u32) -> Result<DeviceCaps> {
     backend::probe_device(device_ordinal)
 }
 
+/// The installed driver's CUDA version, as `1000 * major + 10 * minor`
+/// (e.g. `12080` for CUDA 12.8).
+///
+/// This is the ceiling on the PTX ISA version the driver's JIT can
+/// parse. A module whose `.version` exceeds it is rejected exactly as a
+/// module naming an unknown `.target` is — so the lowering has to know
+/// it before it picks either directive. See `jit_cuda::target` for what
+/// the caller does with the answer.
+///
+/// `Err(DeviceError::NoDriver)` when there is no driver, or when the
+/// crate was built without the `cuda` feature. The caller reads that as
+/// "do not clamp", which leaves the target exactly where the device
+/// probe put it.
+pub fn driver_cuda_version() -> Result<u32> {
+    backend::driver_cuda_version()
+}
+
 /// A CUDA context bound to one device. Cheap to clone; the underlying
 /// driver handle is shared via Arc.
 #[derive(Clone)]
@@ -180,23 +197,13 @@ impl DeviceContext {
         &self.0
     }
 
-    /// AUDIT 2026-05-29 (H10b fix): crate-internal constructor wrapping
-    /// an existing backend context. Used by `backend_cuda`'s
-    /// `launch_raw_inner` to build a transient `Event` (which needs a
-    /// `&DeviceContext`) without re-attaching the driver context — the
-    /// backend `DeviceContextInner` is `Clone` (an Arc bump).
-    #[allow(dead_code)]
-    pub(crate) fn from_inner(inner: backend::DeviceContextInner) -> Self {
-        Self(inner)
-    }
-
     /// Stub-only test constructor: build a synthetic `DeviceContext`
     /// without going through the driver. Used by the in-crate stub-mode
     /// event-ordering integration tests in `launch.rs`; exposed to the
     /// rest of the crate so sibling test modules can drive
     /// `from_host_async` / `launch_on_stream` / `to_host_async` against
     /// the stub op log without depending on a real `probe()`.
-    #[cfg(all(test, not(feature = "cuda")))]
+    #[cfg(all(test, not(feature = "gpu-driver")))]
     pub(crate) fn for_test() -> Self {
         // Stub `DeviceContextInner` is a unit struct — costs nothing
         // to construct.
@@ -209,14 +216,12 @@ impl DeviceContext {
 /// of kernel identifiers (tens to low hundreds), so this bound is far
 /// above any legitimate need while capping the worst case at a fixed,
 /// bounded amount of leaked memory (≈ this many short boxed strings).
-#[cfg(feature = "cuda")]
 const MAX_INTERNED_KERNEL_NAMES: usize = 4096;
 
 /// `'static` sentinel returned once the interner is saturated. It is a
 /// deliberately invalid kernel name: any `get_func` lookup against it
 /// fails with [`DeviceError::KernelNotFound`] (a clean, surfaced error)
 /// rather than silently growing the process heap without bound.
-#[cfg(feature = "cuda")]
 const INTERN_OVERFLOW_SENTINEL: &str = "__cratonvm_kernel_name_intern_overflow__";
 
 /// Process-wide kernel-name interner.
@@ -239,7 +244,6 @@ const INTERN_OVERFLOW_SENTINEL: &str = "__cratonvm_kernel_name_intern_overflow__
 /// instead of leaking further; the subsequent kernel lookup fails
 /// cleanly with `KernelNotFound` rather than corrupting state or growing
 /// the heap. The cap is far above any legitimate kernel-name count.
-#[cfg(feature = "cuda")]
 fn intern_kernel_name(name: &str) -> &'static str {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -305,6 +309,31 @@ impl DeviceModule {
     /// monotonic counter ([`next_module_name`]); the backend retains it in
     /// `DeviceModuleInner::module_name` so subsequent `get_func` lookups
     /// stay consistent and multiple modules coexist.
+    /// # A cubin cache here would duplicate the driver's own
+    ///
+    /// AUDIT 2026-09-02. This hands PTX text to the driver's JIT, which
+    /// was recorded as an opportunity: cache the compiled cubin on disk
+    /// and skip the compile on later starts. Measured first, on an RTX
+    /// 2060 with a 64-instruction kernel, median of nine:
+    ///
+    /// ```text
+    ///   distinct PTX, driver cache on      0.63 ms
+    ///   distinct PTX, CUDA_CACHE_DISABLE=1  12.05 ms
+    /// ```
+    ///
+    /// The 19x is the NVIDIA driver's own persistent compute cache, and
+    /// it survives process restarts: text that cost 28 ms to compile in
+    /// one process loads in 0.6 ms in the next. A cache in this crate
+    /// would reimplement that, with its own invalidation problem, to
+    /// save the first run of a never-before-seen kernel on a given
+    /// machine.
+    ///
+    /// Worth knowing rather than acting on: a deployment that sets
+    /// `CUDA_CACHE_DISABLE=1`, or one with a read-only or absent cache
+    /// directory, pays ~12 ms per kernel per start. That is the case a
+    /// cubin cache would be for.
+    ///
+    /// `cuda-bridge/tests/transfer_bandwidth_it.rs` is the measurement.
     pub fn from_ptx(ctx: &DeviceContext, ptx: &str, kernel_names: &[&str]) -> Result<Self> {
         let module_name = next_module_name();
         // cudarc 0.13's `CudaDevice::load_ptx` keeps the kernel-name
@@ -321,30 +350,18 @@ impl DeviceModule {
         // name is interned through a process-wide dedup cache so a given
         // distinct name is leaked at most once; repeat loads of the same
         // kernel name reuse the existing `'static` slot.
-        #[cfg(feature = "cuda")]
-        {
-            let static_names: Vec<&'static str> =
-                kernel_names.iter().map(|n| intern_kernel_name(n)).collect();
-            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, &static_names).map(Self)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, kernel_names).map(Self)
-        }
-    }
-
-    /// Launch a kernel by name with raw argument bytes. The argument
-    /// layout must match the kernel's PTX parameter declarations
-    /// exactly — the bridge does no type checking; the
-    /// [`KernelArgs`] helper builds correct buffers from Rust types.
-    pub fn launch_raw(
-        &self,
-        ctx: &DeviceContext,
-        kernel: &str,
-        cfg: &LaunchConfig,
-        args: KernelArgs,
-    ) -> Result<()> {
-        self.0.launch_raw(&ctx.0, kernel, cfg, args)
+        //
+        // AUDIT 2026-09-04: this used to be two cfg-gated bodies -- the
+        // CUDA one interning, the stub one passing the borrowed slice
+        // straight through, because `backend_stub::from_ptx` took
+        // `&[&str]` where `backend_cuda`'s took `&[&'static str]`. That
+        // divergence was invisible (only one module compiles per build)
+        // and meant the stub accepted strictly more than the real
+        // backend. `backend_api::DeviceModuleApi` now fixes the stricter
+        // signature for every backend, so there is one body.
+        let static_names: Vec<&'static str> =
+            kernel_names.iter().map(|n| intern_kernel_name(n)).collect();
+        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, &module_name, &static_names).map(Self)
     }
 
     /// Build a 1-D elementwise [`LaunchConfig`] for `kernel` sized to
@@ -365,12 +382,12 @@ impl DeviceModule {
         kernel: &str,
         n: u32,
     ) -> LaunchConfig {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu-driver")]
         let block = self
             .0
             .optimal_block_size(&ctx.0, kernel)
             .unwrap_or(DEFAULT_ELEMENTWISE_BLOCK);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu-driver"))]
         let block = {
             // Stub mode: no driver to query, so the autotune degenerates
             // to the default block size. `ctx` / `kernel` are unused here
@@ -384,7 +401,7 @@ impl DeviceModule {
     /// Stub-only test constructor — see [`DeviceContext::for_test`].
     /// Builds a synthetic `DeviceModule` whose `launch_on_stream` only
     /// records OpLog ops (no driver call).
-    #[cfg(all(test, not(feature = "cuda")))]
+    #[cfg(all(test, not(feature = "gpu-driver")))]
     pub(crate) fn for_test() -> Self {
         Self(backend::DeviceModuleInner)
     }
@@ -452,7 +469,7 @@ impl KernelArgs {
         // subsequent `to_host_async` / re-launch calls wait on the
         // kernel rather than the upload.
         let last_write = buf.last_write.clone();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu-driver")]
         {
             let (addr, keep_alive) = buf.inner.device_ptr_arg();
             self.raw.push(KernelArg::DevicePtr {
@@ -461,7 +478,7 @@ impl KernelArgs {
                 last_write,
             });
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu-driver"))]
         {
             self.raw.push(KernelArg::DevicePtr {
                 addr: buf.inner.device_ptr_arg(),
@@ -510,7 +527,7 @@ impl KernelArgs {
 // `u64` since there is no real allocation to guard.
 #[derive(Clone)]
 pub(crate) enum KernelArg {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     DevicePtr {
         addr: u64,
         /// Keep-alive only; not read. See the variant comment above.
@@ -523,7 +540,7 @@ pub(crate) enum KernelArg {
         /// after the launch.
         last_write: LastWriteSlot,
     },
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     DevicePtr {
         // Never read in stub mode — the stub `launch_raw` returns
         // `NoDriver` without inspecting args. We still carry the field
@@ -579,6 +596,34 @@ pub(crate) enum KernelArg {
 /// Allocation is one `cuMemAllocHost` and the buffer is reused across
 /// dispatches, so the cost is paid once per size class rather than per
 /// call. In stub mode this is a plain heap `Vec` and nothing is pinned.
+///
+/// # Do NOT extend this to the upload path
+///
+/// AUDIT 2026-09-02. The 12.95-against-3.98 figure above is a D2H
+/// measurement of an ASYNC copy, and it does not transfer to H2D, which
+/// is synchronous — there the driver stages through its own pinned
+/// buffer and is already fast. Measured on the same RTX 2060, median of
+/// nine, release build, staging cost included because it is what a
+/// caller would wait for:
+///
+/// ```text
+///   MiB    pageable-sync    pinned-staged     ratio
+///     1       4.27 GiB/s       3.33 GiB/s     0.78x
+///     8       6.11 GiB/s       5.50 GiB/s     0.90x
+///    32       5.75 GiB/s       5.15 GiB/s     0.90x
+///   128       6.74 GiB/s       5.20 GiB/s     0.77x
+/// ```
+///
+/// Staging is 10-23% SLOWER at every size: the host memcpy into the
+/// pinned buffer costs more than the faster DMA saves. The obvious
+/// optimisation is a pessimisation here, and the number it would have
+/// had to beat had never been taken.
+///
+/// It stays right for the CHUNKED WRITEBACK it was built for, where the
+/// point is not raw bandwidth but that an async D2H can overlap with a
+/// kernel at all — which requires a page-locked destination.
+///
+/// `cuda-bridge/tests/transfer_bandwidth_it.rs` is the measurement.
 pub struct PinnedHostBuffer<T: Copy> {
     inner: backend::PinnedHostInner<T>,
 }
@@ -626,6 +671,28 @@ pub(crate) type LastWriteSlot = std::sync::Arc<std::sync::Mutex<Option<std::sync
 /// Allocate a fresh empty [`LastWriteSlot`].
 pub(crate) fn new_last_write_slot() -> LastWriteSlot {
     std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+/// A [`LastWriteSlot`] already holding an event recorded on the stream
+/// the allocator's zeroing memset was issued to.
+///
+/// AUDIT 2026-09-02. `DeviceBuffer::zeros` used to hand back an EMPTY
+/// slot, which reads as "nothing has written this buffer yet" — true of
+/// the allocation and false of the memset still in flight. A consumer on
+/// a user stream then had nothing to wait on, and the zeroing could
+/// overwrite the kernel's output. Four threads sharing one context
+/// produced `got 0` in 4 of 4 runs at 4 MiB, and passed 5 of 5 at 1 MiB,
+/// because the window is the length of the memset.
+///
+/// A failure to create the event fails the allocation rather than
+/// silently returning an unordered buffer: the unordered buffer IS the
+/// bug, and a `zeros` that cannot promise its own contents is not one.
+fn alloc_last_write_slot(ctx: &DeviceContext) -> Result<LastWriteSlot> {
+    let event = Event::new(ctx)?;
+    ctx.0.record_alloc_event(&event)?;
+    Ok(std::sync::Arc::new(std::sync::Mutex::new(Some(
+        std::sync::Arc::new(event),
+    ))))
 }
 
 // ── Device-element bound ─────────────────────────────────────────────
@@ -729,7 +796,57 @@ unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 // driver streams/events, so Sync follows exactly when `T: Sync`.
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
+/// Hand the allocation back to the context's pool when the device is
+/// already done with it.
+///
+/// The buffer's `last_write` event names the last launch or copy that
+/// touched the memory. If it has fired (or was never recorded), nothing
+/// on the device can still be reading or writing the block and the next
+/// allocation of that size may have it with no stream ordering at all.
+///
+/// # This must never WAIT
+///
+/// AUDIT 2026-09-02, second pass. The first version called
+/// `ev.synchronize()` when the query said "not yet", to widen the pool's
+/// admission. That is a host block on the dropping thread, and the
+/// thread that drops a per-dispatch buffer is the thread submitting the
+/// next dispatch — so a chain of launches serialised on it, which is the
+/// same defect as the per-launch host callback one file over. Measured
+/// on an RTX 2060 (`GpuAsyncChainBench`, 400 launches): 99 us/launch
+/// with the wait, 52 without.
+///
+/// A block whose event has not fired simply takes the ordinary path:
+/// `CudaSlice::drop` calls `cuMemFree`, which the driver documents as
+/// synchronizing with respect to the device, so it is safe against a
+/// running kernel — it is only RECYCLING the block behind a live kernel
+/// that would corrupt, and that is exactly what the query rules out.
+///
+/// Gated on the pool's own switch so `CRATONVM_GPU_DEVICE_POOL=0`
+/// removes the whole change, query included, rather than half of it.
+///
+/// See `backend_cuda::AllocPool` for the pool and its kill switch.
 #[cfg(feature = "cuda")]
+impl<T> Drop for DeviceBuffer<T> {
+    fn drop(&mut self) {
+        if !backend::device_pool_enabled() {
+            return;
+        }
+        let last = self
+            .last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let idle = match last {
+            None => true,
+            Some(ev) => matches!(ev.query(), Ok(true)),
+        };
+        if idle {
+            self.inner.set_retire_to_pool();
+        }
+    }
+}
+
+#[cfg(feature = "gpu-driver")]
 impl<T: DeviceElem> DeviceBuffer<T> {
     // Reject zero-sized types: a `DeviceBuffer<T>` with `size_of::<T>()
     // == 0` would compute a zero-byte allocation and zero-length copies,
@@ -751,11 +868,18 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 
     /// Allocate `len` elements, zero-initialised.
+    ///
+    /// The zeroing is asynchronous, so the buffer comes back carrying a
+    /// `last_write` marker for it — exactly as an uploaded buffer does.
+    /// Without that marker a following `launch_on_stream` had nothing to
+    /// wait on and the memset could land AFTER the kernel's stores; see
+    /// `record_alloc_event` in the cuda backend for the measurement.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+        let inner = backend::DeviceBufferInner::zeros(&ctx.0, len)?;
+        Ok(Self {
             inner,
-            last_write: new_last_write_slot(),
+            last_write: alloc_last_write_slot(ctx)?,
             _host_uploads: Vec::new(),
         })
     }
@@ -1054,7 +1178,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 impl<T: DeviceElem> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
@@ -1066,10 +1190,17 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 
     /// Allocate `len` elements, zero-initialised.
+    ///
+    /// The zeroing is asynchronous, so the buffer comes back carrying a
+    /// `last_write` marker for it — exactly as an uploaded buffer does.
+    /// Without that marker a following `launch_on_stream` had nothing to
+    /// wait on and the memset could land AFTER the kernel's stores; see
+    /// `record_alloc_event` in the cuda backend for the measurement.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+        let inner = backend::DeviceBufferInner::zeros(&ctx.0, len)?;
+        Ok(Self {
             inner,
-            last_write: new_last_write_slot(),
+            last_write: alloc_last_write_slot(ctx)?,
             _host_uploads: Vec::new(),
         })
     }
@@ -1258,7 +1389,7 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     }
 }
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 impl<T: DeviceElem> DeviceBuffer<T> {
     /// Stub-only test constructor: build a `DeviceBuffer<T>` without
     /// going through the driver. Mirrors the `for_test` constructors on
@@ -1282,15 +1413,45 @@ impl<T: DeviceElem> DeviceBuffer<T> {
 
 // ── Backend selection ────────────────────────────────────────────────
 
+/// The contract every backend satisfies. See `backend_api.rs` for what
+/// is on it, what is deliberately off it, and the drift it already
+/// caught between the cudarc and stub backends.
+pub(crate) mod backend_api;
+
+// Two real backends and a stub. `cuda` selects cudarc; `cuda-oxide`
+// selects NVlabs' `cuda-core` (the host runtime cuda-oxide is built on);
+// neither selects the no-driver stub. Both real backends define the same
+// module surface, so exactly one may be compiled in.
+#[cfg(all(feature = "cuda", feature = "cuda-oxide"))]
+compile_error!(
+    "features `cuda` and `cuda-oxide` are mutually exclusive: both provide the `backend` module. Pick one driver backend."
+);
+
 #[cfg(feature = "cuda")]
 mod backend_cuda;
 #[cfg(feature = "cuda")]
 use backend_cuda as backend;
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "cuda-oxide")]
+mod backend_oxide;
+#[cfg(feature = "cuda-oxide")]
+use backend_oxide as backend;
+
+#[cfg(not(feature = "gpu-driver"))]
 mod backend_stub;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 use backend_stub as backend;
+
+// Raw CUDA driver handles (`CUevent`, `CUstream`, `CUdeviceptr`,
+// `CUgraph`, ...) under one name, whichever backend is compiled in.
+// These are the SAME driver types in both cases -- cudarc and
+// `cuda-bindings` each generate them from the vendor's `cuda.h` -- but
+// they are distinct Rust paths, so `stream.rs`, `event.rs` and
+// `graph.rs` name them through this alias rather than a vendor path.
+#[cfg(feature = "cuda")]
+pub(crate) use cudarc::driver::sys as drvsys;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) use backend_oxide::sys as drvsys;
 
 pub mod critical;
 pub mod event;
@@ -1305,7 +1466,7 @@ pub use bytemuck;
 pub use event::Event;
 pub use stream::{Stream, StreamOp};
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 mod stub_tests {
     //! Verification of Part A's no-driver contract.
     //!

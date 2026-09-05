@@ -13636,6 +13636,34 @@ fn re5_ssl_parameter_ciphers(
 
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
+/// `CompletableFuture.failedFuture(t)` — the future `sendAsync` hands back when
+/// the request failed.
+///
+/// MEASURED: `failedFuture` behaves identically to HotSpot on this VM
+/// (`probes/CfFailedProbe.java`) — `isCompletedExceptionally()` is `true` and
+/// `join()` raises `CompletionException` with the original cause — so the
+/// failure reaches the caller through the same channel it does on HotSpot.
+fn re5_failed_future(
+    ctx: &mut dyn NativeContext,
+    thrown: cratonvm_types::ObjectRef,
+) -> MethodCallResult {
+    let failed = ctx.invoke(
+        "java/util/concurrent/CompletableFuture",
+        "failedFuture",
+        "(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;",
+        &[Value::Object(Some(thrown))],
+    );
+    match failed {
+        // If `failedFuture` itself cannot be reached, handing back the original
+        // throwable is better than inventing a successful future over no
+        // response — the caller at least still sees the failure.
+        Err(_) => Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            thrown,
+        )),
+        ok => ok,
+    }
+}
+
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let client = obj_arg(args, 0)?;
     let req = obj_arg(args, 1)?;
@@ -14047,13 +14075,87 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // request synchronously and hand back an already-completed real
     // CompletableFuture so the caller's `.get()` returns immediately.
     let send_async: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
-        let resp = re5_do_request(ctx, args)?.unwrap_or(Value::Object(None));
-        ctx.invoke(
-            "java/util/concurrent/CompletableFuture",
-            "completedFuture",
-            "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
-            &[resp],
-        )
+        // A FAILURE COMPLETES THE FUTURE; it does not come out of the call.
+        //
+        // `CompletableFuture<HttpResponse<T>> sendAsync(...)` declares no
+        // checked exception, so an `IOException` escaping it is a throwable no
+        // Java implementation of this method could ever produce, and no caller
+        // can catch without `catch (Throwable)`. `re5_do_request(...)?` did
+        // exactly that: this VM performs the request synchronously, and the
+        // `?` handed the synchronous failure to a caller expecting a future.
+        //
+        // MEASURED (`probes/ResidualProbe.java`), request to a refused port:
+        //   HotSpot 25   sendAsync returns jdk.internal.net.http.common.MinimalFuture
+        //   CratonVM     sendAsync threw java.io.IOException
+        //
+        // The failure now lands where the contract puts it — in the returned
+        // future — so `.get()`/`.join()` raise `ExecutionException`/
+        // `CompletionException` as they do on HotSpot, and a caller that only
+        // holds the future is no longer skipped past.
+        //
+        // NOT fixed here, and named rather than hidden: the request is still
+        // performed SYNCHRONOUSLY, so the future is already complete when it is
+        // handed back (`isDone()` is `true` where HotSpot's is `false`) and its
+        // class is `CompletableFuture` where HotSpot's is `MinimalFuture`. A
+        // caller that chains on it sees the continuation run on the calling
+        // thread. Making the send genuinely asynchronous is a different change.
+        match re5_do_request(ctx, args) {
+            Ok(resp) => ctx.invoke(
+                "java/util/concurrent/CompletableFuture",
+                "completedFuture",
+                "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+                &[resp.unwrap_or(Value::Object(None))],
+            ),
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) => {
+                re5_failed_future(ctx, thrown)
+            }
+            // The common shape here is NOT an already-materialised throwable:
+            // `re5_do_request` reports its failures as `RuntimeError`s, which
+            // reach this point as `InternalError(VmError::Runtime(..))` and are
+            // turned into Java objects later, at the interpreter's own throw
+            // site. Completing a future needs the object NOW, so build it from
+            // the same table that site uses — `RuntimeError::as_java_throwable`
+            // — exactly as `lang_class.rs` does when it has to wrap a callee's
+            // failure in an `InvocationTargetException`. Reading the variant
+            // wrong is why the first version of this fix changed nothing: the
+            // `ExceptionThrown` arm above never matched.
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
+            )) => {
+                let Some((class_name, message)) = re.as_java_throwable() else {
+                    // Not a Java exception at all (a VM gap). Keep propagating.
+                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(re),
+                    ));
+                };
+                // Own the message so `re` is free again for the failure path.
+                let message = message.map(|m| m.into_owned());
+                let built = match &message {
+                    Some(m) => {
+                        let msg_obj = ctx.create_string(m);
+                        ctx.new_object_initialized(
+                            class_name,
+                            "(Ljava/lang/String;)V",
+                            &[Value::Object(Some(msg_obj))],
+                        )
+                    }
+                    // `None` means "no detail message": the no-arg ctor, so
+                    // `getMessage()` is null rather than "".
+                    None => ctx.new_object_initialized(class_name, "()V", &[]),
+                };
+                match built {
+                    Ok(Some(Value::Object(Some(thrown)))) => re5_failed_future(ctx, thrown),
+                    // Could not build the throwable — propagate the original
+                    // rather than invent a successful future over no response.
+                    _ => Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(re),
+                    )),
+                }
+            }
+            // Not a Java throwable, so it cannot complete a future. It is a VM
+            // fault and keeps propagating as one.
+            Err(internal) => Err(internal),
+        }
     };
     r.register(
         hc,
@@ -20796,13 +20898,28 @@ pub(crate) fn re10_create_server(
 
 /// `HttpServer.create()` — a server that is deliberately NOT bound yet.
 ///
-/// Minted under the PUBLIC class name rather than `HS_IMPL_CLASS`: the
-/// `alias_class` snapshot taken at the end of `register_re10_http_server`
-/// cannot see the phase-72 natives registered afterwards, and this factory's
-/// callers (`createContext(String)`, `getAttributes()`, `getServer()`) are
-/// exactly those. See [`re10_create_server`].
+/// Minted under `HS_IMPL_CLASS`, exactly like the two-arg factory above.
+///
+/// It used to mint under the PUBLIC name `com/sun/net/httpserver/HttpServer`,
+/// to reach phase-72 natives registered on that key AFTER the `alias_class`
+/// snapshot at the end of `register_re10_http_server` — `createContext(String)`,
+/// `getAttributes()`, `getServer()`. **Those rows are not in the registry.** A
+/// `--dump-native-registry` census over a boot in compatible mode reports all
+/// eleven `com/sun/net/httpserver/HttpServer` rows as
+/// `registered_by = net_phase_e.rs` with `overwrote = null`, and phase 72 runs
+/// AFTER phase E — had it registered these keys it would own the slots. The
+/// alias therefore copies the complete surface (eleven rows on each class, the
+/// same eleven method keys), and nothing is lost by minting the impl class.
+///
+/// What WAS lost by minting the public name: `com.sun.net.httpserver.HttpServer`
+/// is ABSTRACT. `create()` handed the application an instance of an abstract
+/// class, so `getClass().getName()` answered a class no JDK can instantiate,
+/// where HotSpot answers `sun.net.httpserver.HttpServerImpl`. That is observable
+/// from ordinary code, it survived `--jdk-only`, and an `instanceof` or cast
+/// against the impl type could not match. See
+/// `docs/known-issues/jdk-only/the-abstract-httpserver-instance-20260902.md`.
 pub(crate) fn re10_create_unbound_server(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let srv = re10_alloc_server(ctx, "com/sun/net/httpserver/HttpServer", None);
+    let srv = re10_alloc_server(ctx, HS_IMPL_CLASS, None);
     Ok(Some(Value::Object(Some(srv?))))
 }
 
@@ -21143,6 +21260,20 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
                     });
                 }
             }
+            // Record the owning server so `HttpContext.getServer()` can answer
+            // it: the 2-slot context layout has no room for a back-pointer, so
+            // the link table carries it. Phase 72's ONE-arg `createContext` has
+            // always done this; this TWO-arg one -- the overload javac emits for
+            // `createContext(path, handler)`, and the only one registered in a
+            // real-JDK build -- never did, so the documented
+            // `context.getServer().getExecutor()` idiom saw a null server in
+            // every mode.
+            crate::phases_late::net_channels::http_link_set(
+                ctx,
+                crate::phases_late::net_channels::HTTP_LINK_CONTEXT_SERVER,
+                hctx,
+                Some(this),
+            );
             // Releases the whole batch (handler + context).
             ctx.unpin_native_roots(h_pin);
             Ok(Some(Value::Object(Some(hctx))))
@@ -21483,6 +21614,13 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     // Native dispatch is keyed by the receiver class rather than Java
     // inheritance. Mirror the complete public HttpServer bridge surface onto
     // the concrete class returned by the factory, including set/getExecutor.
+    // The HttpContext accessors, in EVERY mode. They lived only in phase 72
+    // (reachable solely from `register_synthetic_overrides`) while
+    // `createContext` minted the carrier in every mode, so on the shipping
+    // arms `getPath`/`getServer`/`getHandler`/`getAttributes` all resolved to
+    // the abstract declaration and threw AbstractMethodError.
+    crate::phases_late::net_channels::register_http_context_surface(r);
+
     r.alias_class(hs, HS_IMPL_CLASS);
     ()
 }

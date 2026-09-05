@@ -1115,6 +1115,19 @@ pub fn bg_compile() -> bool {
 // the interpreter hot loop and all codegen are byte-for-byte unchanged unless
 // opted in. See `docs/feature-designs/wire-tiered-manager.md` (Step 4).
 cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
+/// Receiver-type and call-site recording in the interpreter -- **default ON**
+/// since 2026-09-02, opt out with `CRATONVM_TIER_PGO_RECEIVERS=0`. The two
+/// profile maps every speculative-inlining decision reads
+/// (`classify_receiver_shape`, `CallSiteEvidence`) are recorded at invoke
+/// sites only, which is cheap enough to leave on; branch and back-edge
+/// recording stays behind `CRATONVM_TIER_PGO`.
+pub fn tier_pgo_receivers() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_TIER_PGO_RECEIVERS")
+            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
+}
 // Invocation-count tier-up for INSTANCE methods (invokevirtual/invokeinterface).
 //
 // DEFAULT-ON. It was turned off wholesale in `c28bdd687` because the
@@ -1148,6 +1161,148 @@ pub fn jit_virtual_tierup() -> bool {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         }
+    })
+}
+
+/// `CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS` — nomination is not promotion.
+///
+/// **DEFAULT-OFF, `=1` opts in, and the default is the measurement's.** With
+/// it on, `HibfixComposeProbe2` tracks 19 methods instead of 8 and compiles 12
+/// at C2 instead of 3 — and costs **0.994x** (8 interleaved reps, quiet host,
+/// user CPU, ranges 15.80-16.60 against 15.86-16.45). It buys nothing here
+/// because the site that does the counting is still the site that may not
+/// PROMOTE: `getNow` is compiled and is still entered interpreted 40 000 times
+/// in 40 000 chains. Nominating more methods is not what composition was short
+/// of — that is the finding, and it is why the lever ships off rather than
+/// being deleted: it is the instrument that establishes it, and the arm anyone
+/// re-opening the promotion question has to run first.
+///
+/// `execute_invokevirtual_cached`'s tier-up chain
+/// used to gate the invocation COUNTER on the same two conditions that gate
+/// the SITE's promotion to a direct compiled entry — a `java/util/` receiver
+/// and a callee that declares an exception table. Those two are promotion
+/// hazards; neither is a reason to stop counting a callee's invocations.
+///
+/// The cost of conflating them is measured, not argued.
+/// `CRATONVM_DBG_TIERUP_DECLINE=1` on `HibfixComposeProbe2` reports 46 364
+/// declines over 40 000 chains and **every** meaningful row is
+/// `receiver_is_java_util` — `java/util/concurrent/` is inside the prefix, so
+/// the whole of `CompletableFuture` is refused. `CompletableFuture.getNow`
+/// takes 39 998 of them and is still interpreted on call 40 000; it is 1.00
+/// interpreted frame per chain in the `CRATONVM_DBG_INTERP_FRAMES` census.
+/// This is the mechanism behind
+/// `known-issues/perf/completablefuture-composition-is-20x-and-5-percent-compiled-20260901.md`
+/// finding #2: lowering `CRATONVM_JIT_THRESHOLD` 25x bought 6 more tracked
+/// methods and no time, because the methods that matter never reach the
+/// counter at all.
+///
+/// The 2026-08-05 measurement that refused to narrow the `java/util/` prefix
+/// (`retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3, a
+/// `ReentrantLock` loop 30 % SLOWER with tier-up admitted) priced ADMITTING
+/// THE PROMOTION. This gate does not admit it: `promotion_barred` still
+/// suppresses the `jit_cache` probe and the inline upgrade for exactly the
+/// same set. Only the counter and the tiered nomination are hoisted, so a
+/// nominated java.util callee becomes reachable through the doors that carry
+/// their own exception-table guards (`mic_callee_has_exception_table`,
+/// `osr_callee_bars_direct_call`) and never through this one.
+#[inline]
+pub fn jit_virtual_nominate_always() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        // Explicit opt-IN: `1` / `true` enable, unset or anything else leaves
+        // the chain exactly as it was before 2026-09-02.
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_NOMINATE_ALWAYS") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_HOT_LOOKUP_CACHE` — default-ON, `=0` opts out.
+///
+/// The kill switch for the three per-call lookups this change removed from
+/// paths the composition workload runs several times per chain: the two
+/// uncached declared-flag reads ([`dbg_shadow`], [`needs_exact_trace`]) and
+/// the un-range-guarded `lambda_proxies` probe in
+/// `NativeContextImpl::invoke_virtual`. They are grouped under one switch
+/// because they are one finding — a lookup on a hot path whose answer never
+/// changes — and because none of them is separately interesting.
+///
+/// A declared-flag read is not cheap: `runtime_var_os` converts the `OsStr`,
+/// FxHashes the ~20-byte name against the declared-flag SET, and then hashes
+/// it AGAIN against the legacy-value MAP. `CRATONVM_DBG_FLAGREADS=1` on
+/// `HibfixComposeProbe2` counted 400 000 of these in 80 000 chains, 98 % of
+/// them the two names above.
+#[inline]
+pub fn hot_lookup_cache() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_HOT_LOOKUP_CACHE") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL` — default-OFF, `=1` opts in.
+///
+/// Admits a `java/util/` receiver to the cached-virtual PROMOTION, i.e. lets
+/// `execute_invokevirtual_cached` enter a compiled body directly at a site the
+/// `receiver_is_java_util` exclusion has always barred. The exception-table
+/// half of `promotion_barred` is NOT relaxed by this: that one is a
+/// correctness hazard (a handler-bearing callee entered by a direct compiled
+/// call has no interpreter boundary at which its own handler can be resumed),
+/// where the prefix is a performance policy.
+///
+/// It exists because the policy has never been priced on its own.
+/// `retired/aqs-thread-handoff-latency-RETIRED-20260805.md` item 3 measured
+/// `ReentrantLock` against a user subclass `MyLock extends ReentrantLock` and
+/// found the subclass 0.77x — but those are two receiver classes in two loop
+/// methods, so the comparison carries "different class, different call site,
+/// different inlining" along with the tier-up. With this switch the SAME
+/// receiver in ONE binary is the A/B.
+///
+/// Pair it with [`jit_virtual_nominate_always`]: with nomination barred there
+/// is usually no compiled body to promote to, so a promotion arm measured
+/// alone re-measures the conflated thing from the other side.
+#[inline]
+pub fn jit_virtual_promote_java_util() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_PROMOTE_JAVA_UTIL") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        }
+    })
+}
+
+/// `CRATONVM_DBG_SHADOW` — one-shot shadow-stack trace in `set_jit_thread`.
+///
+/// Cached because it is read on EVERY interpreter->JIT boundary crossing.
+/// `CRATONVM_DBG_FLAGREADS=1` on `HibfixComposeProbe2` put it at 250 135 of
+/// 400 000 flag reads (3.1 per composition chain), each one an `OsStr`
+/// conversion, an FxHash of the name and a probe of the declared-flag set —
+/// which is what the `HashMap<&str, ()>::contains_key` and part of the
+/// `__memcmp_evex_movbe` line in that page's profile actually are. The read
+/// sat IN FRONT of the `ONCE` swap that makes the trace one-shot, so it kept
+/// paying long after the trace could ever fire again.
+#[inline]
+pub fn dbg_shadow() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+    })
+}
+
+/// `CRATONVM_NEEDS_EXACT_TRACE` — the sibling of [`dbg_shadow`], 141 112 reads
+/// (1.76 per chain) in the same census. Its call site is
+/// `NativeContextImpl::invoke_virtual`, i.e. every native that calls back into
+/// Java by name; the trace it guards fires for ONE hard-coded method name.
+#[inline]
+pub fn needs_exact_trace() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
     })
 }
 
@@ -1702,6 +1857,94 @@ cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
 /// of wall-clock timing (robust to host contention noise). See
 /// `interpreter::hotpath_counts`.
 cached_is_set!(dbg_hotpath_counts, "CRATONVM_DBG_HOTPATH_COUNTS");
+/// `CRATONVM_JIT_NO_BACKEDGE_POLL_GATE` -- restore the unconditional
+/// `safepoint_check` call on every interpreted backward branch.
+///
+/// The gate it disables lives in `execute_frame_from_index`: a back edge now
+/// tests `stw_requested` plus the hoisted async-exception slot (two relaxed
+/// loads) before paying for the call, because the only work in that call not
+/// repeated by the loop-top poll thirty lines later was an async-exception
+/// drain costing three locked read-modify-writes. Measured at 33-37 ns per
+/// back edge against HotSpot's 4.9 ns, so the two arms have to be comparable
+/// inside one binary.
+cached_is_set!(no_backedge_poll_gate, "CRATONVM_JIT_NO_BACKEDGE_POLL_GATE");
+
+/// `CRATONVM_JIT_NO_FIELD_FAST_PATH` -- disable the quickened `getfield` /
+/// `putfield` arms in the interpreter (per-site receiver-class + offset
+/// memo, raw compact-layout load/store). Off restores the full
+/// `op_getfield` / `op_putfield` handler on every instance field access.
+/// Token: `CRATONVM_JIT=-field-fast-path`.
+cached_is_set!(no_field_fast_path, "CRATONVM_JIT_NO_FIELD_FAST_PATH");
+
+/// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
+/// backward branch instead of only once `Frame::backward_count` has reached
+/// the smallest threshold the call could accept. Token:
+/// `CRATONVM_JIT=-osr-inline-gate`.
+cached_is_set!(no_osr_inline_gate, "CRATONVM_JIT_NO_OSR_INLINE_GATE");
+
+/// `CRATONVM_JIT_NO_INVOKE_FAST_DOOR` -- disable the monomorphic
+/// `invokevirtual` / `invokeinterface` fast door (borrowed cache entry,
+/// compact argument transfer, per-method invocation counter). Off routes
+/// every cache hit through `execute_invokevirtual_cached`. Token:
+/// `CRATONVM_JIT=-invoke-fast-door`.
+cached_is_set!(no_invoke_fast_door, "CRATONVM_JIT_NO_INVOKE_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD=1` -- stop the monomorphic invoke
+/// fast door recording its receiver into `profile_store`, i.e. restore the
+/// behaviour that made it return wrong answers.
+///
+/// This exists so the fix has an A/B lever inside ONE binary. Set, the door
+/// serves warm monomorphic hits and records nothing, so the receiver profile is
+/// sampled only from the calls the door DECLINED -- and
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` goes back to
+/// `AssertionError: (1810, null)` in 12-23 s. Clear, it records like the
+/// general path and the workload is clean.
+cached_is_set!(no_door_receiver_record, "CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD");
+
+/// `CRATONVM_JIT_NO_DOOR_RECV_MEMO=1` -- make the door's receiver recording do
+/// the full `ProfileStore` lookup on EVERY call instead of reusing a memoized
+/// handle. Same records either way; only the cost differs.
+///
+/// Exists so "the memo made the recording cheaper" is a single-binary A/B
+/// rather than a comparison across two builds on a host whose load moves.
+cached_is_set!(no_door_recv_memo, "CRATONVM_JIT_NO_DOOR_RECV_MEMO");
+
+/// `CRATONVM_JIT_INVOKE_FAST_DOOR` -- OPT IN to the monomorphic invoke fast
+/// door, which is default-OFF since 2026-09-03 because it returns wrong
+/// answers.
+///
+/// `org.h2.test.store.TestRandomMapOps --Xmx 256m` fails in 12-23 s, every
+/// run, at a fixed seed and a fixed op, with a map `get` returning `null`
+/// where a value was stored (`AssertionError: (1810, null)`). Disabling this
+/// one door -- and nothing else -- runs it clean to a 200 s cap. It is not the
+/// collector: the same failure reproduces with `CRATONVM_ZGC_RELOCATE=0`.
+///
+/// The line-level defect is NOT yet identified, which is why this is a default
+/// flip and not a repair. See
+/// `fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`.
+cached_is_set!(invoke_fast_door_opt_in, "CRATONVM_JIT_INVOKE_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` -- disable the monomorphic
+/// `invokestatic` / `invokespecial` fast doors (borrowed cache entry,
+/// verbatim `CompactValue` argument transfer, and for `invokestatic` a
+/// per-method invocation counter in place of the sharded profile-store
+/// lock). Off routes every cache hit through the general dispatcher.
+/// Token: `CRATONVM_JIT=-nonvirtual-fast-door`.
+cached_is_set!(no_nonvirtual_fast_door, "CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR");
+
+/// `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` -- return a frame's buffers to the
+/// thread pools on every return and build the next callee's frame from
+/// them, instead of retiring the frame in place and rebuilding the next
+/// call in the buffers it left behind. Token:
+/// `CRATONVM_JIT=-frame-slot-reuse`.
+cached_is_set!(no_frame_slot_reuse, "CRATONVM_JIT_NO_FRAME_SLOT_REUSE");
+
+/// `CRATONVM_JIT_NO_FRAME_EMPLACE` -- build the callee's `Frame` on the Rust
+/// stack and move it into the frame stack, instead of constructing it in the
+/// slot. Only reachable when no slot is retired: the first call at a depth,
+/// and every call under `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`. Token:
+/// `CRATONVM_JIT=-frame-emplace`.
+cached_is_set!(no_frame_emplace, "CRATONVM_JIT_NO_FRAME_EMPLACE");
 /// `CRATONVM_DBG_BYTECODE_DUMP` -- temporary raw-bytecode + mnemonic
 /// disassembly dump (2026-07-15, JRubyScriptTemplateTests round 3): see
 /// `push_frame_and_fire_entry`'s own doc comment for the full story --
@@ -2040,6 +2283,28 @@ pub fn jit_eager_callee_chain() -> bool {
     })
 }
 
+/// Skip the C1→C2 supersede-epoch bump when the publish cannot have
+/// invalidated anything. OFF by default, because it was measured to buy
+/// nothing.
+///
+/// The bump invalidates every `Jit` invoke-cache entry in every thread, which
+/// sounds expensive and is not: instrumenting the eviction it causes
+/// (`epoch_stale_evictions`) over CratonBench measured **9** evictions for the
+/// whole run, and over the regex workload **0** — each call site evicts once
+/// and refills. Two of the three publish outcomes provably cannot invalidate
+/// anything (`SupersedeOutcome`, `jit_bridge`), so skipping them is safe, but
+/// safe and worthless is not a reason to change a default. Set
+/// `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS=1` to skip them anyway; the
+/// engagement census under `CRATONVM_DBG=jitc` reports what was skipped.
+#[inline]
+pub fn supersede_epoch_skip_useless() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS")
+            .map_or(false, |v| v != "0" && v != "false")
+    })
+}
+
 pub fn c2_supersede() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
@@ -2089,11 +2354,35 @@ pub fn jit_ir_call_virtual() -> bool {
 /// `"false"` value) opts in. See
 /// `docs/feature-designs/profile-guided-inlining.md`.
 #[inline]
+/// Guarded monomorphic virtual/interface inlining. **DEFAULT OFF**; opt in with
+/// `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE=1`.
+///
+/// It defaulted ON from `f697d618e`, a commit whose own subject calls it
+/// "wip(pgo-02): plumbing ... (checkpoint, no codegen yet)", while THREE places
+/// in `jit/src/lib.rs` describe this same flag as "default-off, unsoaked" and
+/// reason about correctness on that basis -- one of them explicitly relies on
+/// the speculation being "behavior-preserving when off". The documented
+/// contract and the code disagreed, and the code was the one nobody read.
+///
+/// It produces wrong answers. `probes/TreeTailIterProbe.java`: a compiled
+/// `for (e : treeMap.tailMap(k).entrySet())` iterates ZERO entries while
+/// `entrySet().size()` on the same object says 6, deterministically from
+/// iteration ~502. Handing the same iterator to another method drains nothing
+/// either, so the iterator really is empty -- the speculated `iterator()` body
+/// is spliced against a receiver whose `root` mirror it then reads as null.
+/// That is `org.h2.test.store.TestRandomMapOps` op:1033, which has been failing
+/// H2 in 11-22 s and blocking
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`,
+/// whose SIGSEGV needs 25-183 s to appear.
+///
+/// Turning the default off restores exactly the state the surrounding code is
+/// written for. Re-enabling it needs the splice's receiver handling fixed
+/// first, and `probes/TreeTailIterProbe.java` is the check.
 pub fn jit_guarded_virtual_inline() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_GUARDED_VIRTUAL_INLINE")
-            .is_ok_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 

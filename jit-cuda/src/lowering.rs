@@ -170,21 +170,29 @@ fn lower_method_with_pool_impl(
             // `t + K`, so `bound` threads always cover the loop (`K` of
             // them redundantly, and `K` is 0 for every loop but the
             // constant-start form).
+            // What the bound IS decides both the guard's form and what
+            // it proves — see `Emitter::emit_loop_guard`. An array length
+            // and a non-negative literal are provably `>= 0`, so one
+            // unsigned compare retires an out-of-range thread AND
+            // establishes `tid >= 0` for the body. An `int` parameter is
+            // not: `for (i = 0; i < n; i++)` with a negative `n` runs
+            // zero times, and reading that bound as unsigned would run
+            // the body instead.
             match bound {
                 BoundSource::ParamLen(idx) => {
                     work_bound = crate::emitter::WorkBound::ParamLen(idx as u32);
                     let bound_reg = emitter.materialise_param_len(idx);
-                    emitter.emit_loop_guard(&bound_reg, &li);
+                    emitter.emit_loop_guard(&bound_reg, &li, Some(idx), true);
                 }
                 BoundSource::Literal(v) => {
                     work_bound = crate::emitter::WorkBound::Literal(v);
                     let bound_reg = emitter.materialise_literal_s32(v);
-                    emitter.emit_loop_guard(&bound_reg, &li);
+                    emitter.emit_loop_guard(&bound_reg, &li, None, v >= 0);
                 }
                 BoundSource::ParamScalar(idx) => {
                     work_bound = crate::emitter::WorkBound::ParamScalar(idx);
                     let bound_reg = emitter.materialise_param_scalar(idx as usize);
-                    emitter.emit_loop_guard(&bound_reg, &li);
+                    emitter.emit_loop_guard(&bound_reg, &li, None, false);
                 }
             }
             // Body — lower its forward CFG once.  The canonical back-edge
@@ -460,11 +468,25 @@ impl<'a> Emitter<'a> {
         self.hit_back_branch = false;
     }
 
-    /// Materialise `pN_len` into a fresh s32 register.
+    /// The register holding `pN_len`.
+    ///
+    /// AUDIT 2026-09-02: this used to issue its own `ld.param.s32`,
+    /// which was the second load of the same kernel parameter —
+    /// `bind_param_locals` already hoisted one for the bounds checks.
+    /// Reusing it also makes the loop bound and the bounds-check length
+    /// literally the same register, which is what lets
+    /// `Emitter::prove_index_within_param` recognise
+    /// `for (i = 0; i < a.length; i++) a[i]` as needing no check at all.
     pub(crate) fn materialise_param_len(&mut self, idx: usize) -> emit::Reg {
+        if let Some(r) = self.param_len_reg.get(idx).and_then(|r| r.clone()) {
+            return r;
+        }
         let r = self.regs.fresh_reg(RegKind::S32);
         use std::fmt::Write;
         writeln!(self.body, "    ld.param.s32 {}, [p{idx}_len];", r.name).unwrap();
+        if let Some(slot) = self.param_len_reg.get_mut(idx) {
+            *slot = Some(r.clone());
+        }
         r
     }
 
@@ -488,7 +510,29 @@ impl<'a> Emitter<'a> {
         r
     }
 
-    pub(crate) fn into_body(self) -> String {
+    /// The finished kernel body, with any per-array bounds precondition
+    /// moved back to a dominating position.
+    ///
+    /// The preconditions [`Emitter::prove_index_within_param`] emits are
+    /// discovered while walking the body — that is when it becomes known
+    /// which arrays are indexed by the induction variable — but they have
+    /// to EXECUTE before it. `prologue_splice_at` is the byte offset the
+    /// dispatch guard recorded, so they land immediately after it and
+    /// immediately before the first thing that depends on them.
+    ///
+    /// Splicing text rather than building an instruction list is what
+    /// this emitter does everywhere (see `try_emit_if_converted`, which
+    /// speculates by swapping the body `String` out and back). It is the
+    /// same trade, and the same reason: there is no IR to insert into.
+    pub(crate) fn into_body(mut self) -> String {
+        if self.bounds_prologue.is_empty() {
+            return self.body;
+        }
+        let at = self.prologue_splice_at.expect(
+            "a bounds precondition was emitted without a dispatch guard to \n             splice it after; only a guarded shape can prove an index, so \n             this is unreachable unless `prove_index_within_param` grew a \n             new caller",
+        );
+        let prologue = std::mem::take(&mut self.bounds_prologue);
+        self.body.insert_str(at, &prologue);
         self.body
     }
 
@@ -1064,7 +1108,7 @@ mod tests {
         let (method, cp) = crate::analyzer::load_method_with_pool(class, method_name, descriptor);
         let annotations = crate::annotations::MethodAnnotations {
             gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
-                admit: hint,
+                admit: hint.into(),
                 ..crate::annotations::GpuKernelAttrs::default()
             }),
             gpu_exclude: None,
@@ -1076,6 +1120,355 @@ mod tests {
             };
         lower_method_with_pool(class, &method, &cp, &sig, 7, 5)
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
+    }
+
+    /// The regression test for the `.version 7.5` literal — the one
+    /// that would have caught it without a Hopper card.
+    ///
+    /// A real fixture lowered for each modern architecture, asserting
+    /// that the header the module renders is one that architecture's
+    /// own ISA admits. Before 2026-09-02 every row here rendered
+    /// `.version 7.5` beside a target that ISA has never heard of, and
+    /// `cuModuleLoadData` refused the module — invisibly, because the
+    /// only real-hardware gate runs on an RTX 2060 (`sm_75`), the one
+    /// architecture where that literal is correct.
+    #[test]
+    fn every_modern_target_renders_a_loadable_header() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture not eligible: {v:?}"),
+        };
+        // (target, the `.version` its ISA floor requires)
+        let cases = [
+            ((7, 5), "7.5"),  // Turing — the measured card, must not move
+            ((8, 0), "7.5"),  // Ampere GA100
+            ((8, 6), "7.5"),  // Ampere GA10x
+            ((8, 9), "7.8"),  // Ada
+            ((9, 0), "7.8"),  // Hopper
+            ((10, 0), "8.7"), // Blackwell datacenter
+            ((12, 0), "8.7"), // Blackwell RTX
+        ];
+        for ((maj, min), want_version) in cases {
+            let m = lower_method("EligibleVectorAdd", &method, &sig, maj, min)
+                .unwrap_or_else(|e| panic!("lowering failed for sm_{maj}{min}: {e}"));
+            let text = m.render();
+            assert!(
+                text.contains(&format!(".version {want_version}
+")),
+                "sm_{maj}{min} must render `.version {want_version}`, got:
+{}",
+                text.lines().take(3).collect::<Vec<_>>().join("
+")
+            );
+            assert!(
+                text.contains(&format!(".target sm_{maj}{min}
+")),
+                "sm_{maj}{min} must render its own target"
+            );
+        }
+    }
+
+    /// The element-wise loop body must contain no bounds check and no
+    /// multi-instruction address arithmetic.
+    ///
+    /// AUDIT 2026-09-02. `out[i] = a[i] + b[i]` used to lower to 31
+    /// instructions between the dispatch guard and the back edge, of
+    /// which 27 were overhead: six per access for a bounds check the
+    /// guard had already decided, and three per access to widen, scale
+    /// and offset an index. It is 7 now, plus four one-time
+    /// preconditions before the body starts.
+    ///
+    /// Asserted as an exact count rather than a bound, because both
+    /// directions are regressions worth catching: more means an
+    /// optimisation came undone, and fewer means something the kernel
+    /// needs went missing.
+    #[test]
+    fn elementwise_body_has_no_per_access_bounds_check_or_address_chain() {
+        let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let text = m.render();
+
+        // ── the address chain is one instruction ───────────────────────
+        assert_eq!(
+            text.matches("mad.wide.s32").count(),
+            3,
+            "one folded address per array access, three accesses\n{text}"
+        );
+        for gone in ["cvt.s64.s32", "mul.lo.s64", "add.u64"] {
+            assert!(
+                !text.contains(gone),
+                "`{gone}` is the old three-instruction address chain; \
+                 `mad.wide.s32` replaced it\n{text}"
+            );
+        }
+
+        // ── the length is loaded once per array, in the prologue ───────
+        for i in 0..3 {
+            assert_eq!(
+                text.matches(&format!("ld.param.s32 %r{i}, [p{i}_len]")).count(),
+                1,
+                "p{i}_len must be loaded exactly once, in the prologue\n{text}"
+            );
+        }
+        assert_eq!(
+            text.matches("_len]").count(),
+            3,
+            "three arrays, three length loads, no per-access reloads\n{text}"
+        );
+
+        // ── no per-access check survives ───────────────────────────────
+        assert!(
+            !text.contains("mov.s32 %r6, 0;") || !text.contains("setp.lt.s32 %r6"),
+            "the per-access zero constant should be gone\n{text}"
+        );
+        assert_eq!(
+            text.matches("setp.ge.u32").count(),
+            1,
+            "exactly one unsigned compare — the dispatch guard. A second \
+             would mean an access re-checked what the guard proved\n{text}"
+        );
+
+        // ── the guard's bound IS p0_len, so p0 needs no precondition ───
+        // and p1/p2 get exactly one apiece.
+        assert_eq!(
+            text.matches("bra L_bounds_fail").count(),
+            2,
+            "one precondition per array the guard says nothing about \
+             (p1, p2); p0 IS the bound and needs none\n{text}"
+        );
+        assert_eq!(
+            text.matches("setp.lt.s32").count(),
+            2,
+            "the preconditions are `pN_len < bound`, one per array\n{text}"
+        );
+
+        // ── and the whole body is 7 instructions ───────────────────────
+        let body: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .skip_while(|l| !l.starts_with("@%p0 bra L_done"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("bra L_done"))
+            .filter(|l| !l.is_empty())
+            .collect();
+        // The four leading lines are the one-time preconditions.
+        let per_element: Vec<&&str> = body
+            .iter()
+            .filter(|l| !l.contains("L_bounds_fail") && !l.starts_with("setp.lt.s32"))
+            .collect();
+        assert_eq!(
+            per_element.len(),
+            7,
+            "expected 7 per-element instructions (3 addresses, 2 loads, \
+             1 add, 1 store), got {}:\n{:#?}\nfull kernel:\n{text}",
+            per_element.len(),
+            per_element
+        );
+    }
+
+    /// The bounds check is retired, not deleted: an array the guard says
+    /// nothing about still gets checked, once, before the body runs.
+    ///
+    /// This is the safety half of the optimisation above. Removing a
+    /// per-access check is only sound because something else proves the
+    /// same thing, and if that precondition ever stopped being emitted
+    /// the kernel would write past the end of a short array instead of
+    /// raising the failure flag. The test that counts instructions would
+    /// still pass — it would simply count fewer.
+    #[test]
+    fn a_shorter_secondary_array_still_reaches_the_failure_flag() {
+        let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let text = m.render();
+        let bound_reg = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("setp.ge.u32"))
+            .and_then(|l| l.split(',').nth(2))
+            .map(|r| r.trim().trim_end_matches(';').to_string())
+            .unwrap_or_else(|| panic!("no dispatch guard to read the bound from:\n{text}"));
+        // Both non-bound arrays are compared against that same register,
+        // and both jump to the deopt block.
+        let preconditions: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("setp.lt.s32") && l.ends_with(&format!("{bound_reg};")))
+            .collect();
+        assert_eq!(
+            preconditions.len(),
+            2,
+            "each array whose length the guard does not name must be \
+             proved at least as long as the bound:\n{text}"
+        );
+        assert!(
+            text.contains("L_bounds_fail:"),
+            "the failure block must still exist — the preconditions branch \
+             to it\n{text}"
+        );
+        assert!(
+            text.contains("st.global.u32 [") && text.contains("failure_flag"),
+            "the failure block must still raise the flag the host deopts \
+             on\n{text}"
+        );
+    }
+
+    /// An access behind a branch keeps its own check; one in front of
+    /// every branch does not.
+    ///
+    /// `onlyNegatives` is `for (i < in.length) if (in[i] < 0) out[i] =
+    /// -in[i];`, which has one of each:
+    ///
+    /// * `in[i]` is reached by every thread that passed the dispatch
+    ///   guard, and `in.length` IS the guard's bound — so there is
+    ///   nothing to check and nothing to hoist. Both reads of it lower
+    ///   to a bare address-and-load.
+    /// * `out[i]` sits inside the `if`. Its length is unrelated to the
+    ///   bound, so it needs a check — and that check must stay WHERE THE
+    ///   ACCESS IS. Hoisting `out.length >= bound` into the prologue
+    ///   would be sound in the "no wrong answers" sense and wrong in
+    ///   every other: a launch where `out` is short but no element is
+    ///   negative would deopt to the CPU on every call, having thrown
+    ///   nothing in Java. That is a silent performance cliff, and
+    ///   `Emitter::unconditional_since_guard` exists to prevent it.
+    ///
+    /// The conditional access is still cheaper than it was — one
+    /// unsigned compare rather than a materialised zero and two signed
+    /// ones — so the gate costs coverage, not the whole optimisation.
+    #[test]
+    fn a_conditional_access_keeps_its_check_instead_of_hoisting_a_precondition() {
+        let text = lower_fixture("EligibleBranchingLoop", "onlyNegatives", "([I[I)V").render();
+
+        // The guard, and exactly one more compare: `out[i]`'s own.
+        assert_eq!(
+            text.matches("setp.ge.u32").count(),
+            2,
+            "expected the dispatch guard plus one per-access check for the \
+             conditional store, and nothing else\n{text}"
+        );
+
+        // Nothing was hoisted: the prologue holds no `pN_len < bound`.
+        assert!(
+            !text.contains("setp.lt.s32"),
+            "a precondition was hoisted out of a conditional access — a \
+             launch that never takes the branch would now deopt\n{text}"
+        );
+
+        // The check that remains is in the branch's block, not before it.
+        let guard_line = text
+            .lines()
+            .position(|l| l.trim().starts_with("@%p0 bra L_done"))
+            .expect("no dispatch guard");
+        let branch_line = text
+            .lines()
+            .position(|l| l.trim().starts_with("@%p1 bra L_body_"))
+            .expect("no conditional branch");
+        let check_line = text
+            .lines()
+            .position(|l| l.trim().starts_with("@%p2 bra L_bounds_fail"))
+            .expect("the conditional store lost its bounds check");
+        assert!(
+            guard_line < branch_line && branch_line < check_line,
+            "the surviving check must sit after the branch that guards it, \
+             not between the dispatch guard and the branch\n{text}"
+        );
+
+        // The unconditional reads of the bound array kept nothing at all.
+        assert_eq!(
+            text.matches("mad.wide.s32").count(),
+            3,
+            "two reads of `in` and one write to `out`\n{text}"
+        );
+    }
+
+    /// Every float→integer conversion carries the NaN→0 guard JLS
+    /// §5.1.3 requires.
+    ///
+    /// AUDIT 2026-09-02. `cvt.rzi` alone returned the destination type's
+    /// MIN_VALUE for a NaN source on an RTX 2060 — `(int) NaN` was
+    /// `-2147483648`, `(long) NaN` was `Long.MIN_VALUE` — against the
+    /// zero Java specifies. Found by differential test, not by reading:
+    /// the PTX ISA is silent on the NaN case for these conversions,
+    /// which is precisely why three of the four diverged and the fourth
+    /// did not.
+    ///
+    /// Asserted per opcode rather than as "some `setp.nan` exists",
+    /// because the failure that matters is one conversion losing the
+    /// guard while its neighbours keep it — which is the shape the bug
+    /// arrived in.
+    #[test]
+    fn every_float_to_int_conversion_guards_nan() {
+        // (fixture method, descriptor, the cvt this must sit on)
+        let cases = [
+            ("f2iKernel", "([F[I)V", "cvt.rzi.s32.f32", "f32", "s32"),
+            ("f2lKernel", "([F[J)V", "cvt.rzi.s64.f32", "f32", "s64"),
+            ("d2iKernel", "([D[I)V", "cvt.rzi.s32.f64", "f64", "s32"),
+            ("d2lKernel", "([D[J)V", "cvt.rzi.s64.f64", "f64", "s64"),
+        ];
+        for (m, d, cvt, src, dst) in cases {
+            let (method, cp) = crate::analyzer::load_method_with_pool("GpuArithProbe", m, d);
+            let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+                OffloadVerdict::Eligible(s) => s,
+                v => panic!("{m} not eligible: {v:?}"),
+            };
+            let text = lower_method_with_pool("GpuArithProbe", &method, &cp, &sig, 7, 5)
+                .unwrap_or_else(|e| panic!("{m} failed to lower: {e}"))
+                .render();
+            assert!(
+                text.contains(cvt),
+                "{m} should lower through `{cvt}`\n{text}"
+            );
+            assert!(
+                text.contains(&format!("setp.nan.{src}")),
+                "{m} must test its SOURCE for NaN — the converted result is an \
+                 ordinary integer and carries no evidence of where it came \
+                 from\n{text}"
+            );
+            assert!(
+                text.contains(&format!("selp.{dst}")),
+                "{m} must select 0 on the NaN path (JLS 5.1.3)\n{text}"
+            );
+            // The select's true-arm is the literal zero, not some
+            // register that happens to hold zero at this point.
+            let selp_line = text
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&format!("selp.{dst}")))
+                .unwrap_or_else(|| panic!("{m}: no selp line\n{text}"));
+            assert!(
+                selp_line.contains(", 0, "),
+                "{m}: the NaN arm must be a literal 0, got `{selp_line}`"
+            );
+        }
+    }
+
+    /// The conversions that do NOT get the guard, and why.
+    ///
+    /// `i2f`/`l2f`/`i2d`/`l2d` widen an integer, which has no NaN to
+    /// find; `f2d`/`d2f` are float→float, where a NaN source must stay a
+    /// NaN rather than become zero. Emitting the guard on any of these
+    /// would turn a NaN into 0 and be a new bug of the same family.
+    #[test]
+    fn conversions_without_a_nan_source_do_not_get_the_guard() {
+        for (m, d) in [
+            ("i2fKernel", "([I[F)V"),
+            ("l2fKernel", "([J[F)V"),
+            ("f2dKernel", "([F[D)V"),
+            ("d2fKernel", "([D[F)V"),
+        ] {
+            let (method, cp) =
+                crate::analyzer::load_method_with_pool("GpuArithDifferential", m, d);
+            let sig = match crate::analyzer::analyze_with_pool(&method, &cp) {
+                OffloadVerdict::Eligible(s) => s,
+                v => panic!("{m} not eligible: {v:?}"),
+            };
+            let text = lower_method_with_pool("GpuArithDifferential", &method, &cp, &sig, 7, 5)
+                .unwrap_or_else(|e| panic!("{m} failed to lower: {e}"))
+                .render();
+            assert!(
+                !text.contains("setp.nan"),
+                "{m} has no NaN source to guard, or must preserve one — a \
+                 guard here would convert a NaN result to zero\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -1091,8 +1484,11 @@ mod tests {
         assert!(text.contains("%ntid.x"));
         assert!(text.contains("%tid.x"));
         assert!(text.contains("mad.lo.u32"));
-        // Loop guard
-        assert!(text.contains("setp.ge.s32"));
+        // Loop guard. Unsigned since the bound is an array length: one
+        // compare retires an over-large index AND a negative one, which
+        // is what lets the per-access checks go. See
+        // `Emitter::emit_loop_guard`.
+        assert!(text.contains("setp.ge.u32"), "missing dispatch guard\n{text}");
         assert!(text.contains("L_done"));
         // Two int loads, one int store, one int add, all in global mem.
         let n_int_loads = text.matches("ld.global.s32").count();
@@ -1286,6 +1682,82 @@ mod tests {
         assert!(text.contains("[ret_ptr]"));
     }
 
+    /// A reduction folds each warp with shuffles and issues ONE atomic
+    /// per warp, from lane 0, and every thread the guard retires joins
+    /// the tree carrying zero instead of returning.
+    ///
+    /// AUDIT 2026-09-02. Until this date every thread issued its own
+    /// `red.global.add` into the single accumulator: 2^24 atomics to one
+    /// line for a 2^24-element dot product. Asserted as exact counts,
+    /// because the failure that matters is one step of the tree going
+    /// missing (a wrong sum, not a slow one), and because a second
+    /// `red` would mean a thread found a way around the tree.
+    ///
+    /// # A per-BLOCK fold was tried and is not here
+    ///
+    /// Folding the per-warp partials through shared memory would cut the
+    /// atomics by another 8x at a 256-thread block. It was implemented
+    /// and measured on an RTX 2060 the same day: it LOST. On a
+    /// minimum-arithmetic reduction over 2^26 ints (`BlockReduceBench`,
+    /// where the atomics are as large a share as the shape allows) the
+    /// block fold ran 2.74-2.90 ms against 2.25-2.62 without it, losing
+    /// all four interleaved rounds; on the compute-bound `GpuDotBench`
+    /// at the same size it won one round of three and lost two.
+    ///
+    /// The `bar.sync` is why. `red.global.add` returns nothing, so a
+    /// warp issues it and retires; a barrier makes every warp in the
+    /// block wait for the slowest, at the end of the kernel, and that
+    /// costs more than the seven atomics it saves. It also forced the
+    /// bounds-check deopt to stop returning from the middle of the
+    /// kernel, since a thread leaving while its block waits at the
+    /// barrier is a hang rather than a wrong answer.
+    ///
+    /// See `docs/gpu/reductions.md`.
+    #[test]
+    fn reduction_folds_each_warp_before_the_one_atomic() {
+        let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
+        let text = m.render();
+        // A `long` accumulator travels as two 32-bit halves, five steps
+        // each: 16, 8, 4, 2, 1.
+        assert_eq!(
+            text.matches("shfl.sync.down.b32").count(),
+            10,
+            "five tree steps of two halves each\n{text}"
+        );
+        for offset in [16, 8, 4, 2, 1] {
+            assert!(
+                text.contains(&format!(", {offset}, 0x1f, 0xffffffff;")),
+                "tree step with offset {offset} missing\n{text}"
+            );
+        }
+        assert_eq!(
+            text.matches("red.global.add.u64").count(),
+            1,
+            "exactly one atomic, from lane 0\n{text}"
+        );
+        assert!(text.contains("%laneid"), "lane 0 is chosen by %laneid\n{text}");
+        // The retired-thread path: the guard branches to the zero label,
+        // never straight to `L_done`, and that label feeds the tree.
+        assert!(
+            text.contains("bra L_reduce_zero;"),
+            "the dispatch guard must send a retired thread into the tree with a zero\n{text}"
+        );
+        assert!(
+            !text.contains("bra L_done;\n") || text.matches("bra L_done;").count() == 0,
+            "a reduction kernel has no path that skips the warp tree\n{text}"
+        );
+        assert!(text.contains("L_reduce_zero:\n    mov.s64"), "zero contribution\n{text}");
+        assert!(text.contains("L_reduce:"), "join label\n{text}");
+
+        // No barrier, and therefore no rule about where a thread may
+        // exit. The per-block fold that would have needed one was
+        // measured and rejected; see this test's doc comment.
+        assert!(
+            !text.contains("bar.sync"),
+            "the reduction epilogue must not synchronize the block\n{text}"
+        );
+    }
+
     #[test]
     #[ignore = "diagnostic — prints PTX to stdout; run with --nocapture"]
     fn dump_vector_add_ptx() {
@@ -1337,14 +1809,29 @@ mod tests {
     /// `CUDA_ERROR_INVALID_PTX` at module load (silent CPU fallback via
     /// blacklist) precisely because only vector_add was ever assembled.
     fn ptxas_round_trip(text: &str, stem: &str) {
+        ptxas_round_trip_at(text, stem, "sm_75");
+    }
+
+    /// Assemble `text` for one named architecture, failing with the
+    /// assembler's own diagnostic.
+    ///
+    /// AUDIT 2026-09-02: every caller of `ptxas_round_trip` renders PTX
+    /// for `sm_75` and this harness assembled it for `sm_75`. That is a
+    /// closed loop — the whole suite could pass on a machine with a full
+    /// CUDA toolkit while the header this crate emits for a Hopper card
+    /// was unassemblable, which is exactly what was true while `render`
+    /// wrote a literal `.version 7.5` beside a probed `.target`. Naming
+    /// the architecture is what lets
+    /// `ptxas_round_trip_every_modern_target` close it.
+    fn ptxas_round_trip_at(text: &str, stem: &str, arch: &str) {
         let tmpdir = std::env::temp_dir();
-        let stem = format!("cratonvm_jit_cuda_{stem}_{}", std::process::id());
+        let stem = format!("cratonvm_jit_cuda_{stem}_{arch}_{}", std::process::id());
         let src_path = tmpdir.join(format!("{stem}.ptx"));
         let out_path = tmpdir.join(format!("{stem}.cubin"));
         std::fs::write(&src_path, text).expect("write ptx");
         let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
         let out = std::process::Command::new(&ptxas)
-            .arg("-arch=sm_75")
+            .arg(format!("-arch={arch}"))
             .arg("-o")
             .arg(&out_path)
             .arg(&src_path)
@@ -1352,10 +1839,92 @@ mod tests {
             .expect("invoke ptxas");
         assert!(
             out.status.success(),
-            "ptxas rejected the PTX:\nstdout: {}\nstderr: {}\nPTX:\n{}",
+            "ptxas rejected the PTX for {arch}:\nstdout: {}\nstderr: {}\nPTX:\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
             text,
+        );
+    }
+
+    /// Whether the installed `ptxas` knows `arch` at all.
+    ///
+    /// A CUDA 12 toolkit cannot assemble for Blackwell and a CUDA 13 one
+    /// has dropped everything below `sm_75`. Asking first is what lets
+    /// the multi-architecture round trip skip what the toolkit does not
+    /// know instead of reporting the toolkit's age as a defect in our
+    /// PTX.
+    fn ptxas_knows_arch(ptxas: &str, arch: &str) -> bool {
+        // An empty module is the cheapest possible probe: it exercises
+        // the `-arch` parse and nothing else, so a failure is
+        // unambiguously "unknown architecture".
+        let tmpdir = std::env::temp_dir();
+        let probe = tmpdir.join(format!(
+            "cratonvm_jit_cuda_archprobe_{arch}_{}.ptx",
+            std::process::id()
+        ));
+        let text = format!(".version 6.3\n.target {arch}\n.address_size 64\n");
+        if std::fs::write(&probe, text).is_err() {
+            return false;
+        }
+        std::process::Command::new(ptxas)
+            .arg(format!("-arch={arch}"))
+            .arg("-o")
+            .arg(tmpdir.join(format!(
+                "cratonvm_jit_cuda_archprobe_{arch}_{}.cubin",
+                std::process::id()
+            )))
+            .arg(&probe)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The toolkit-side gate for the `.version` regression.
+    ///
+    /// `every_modern_target_renders_a_loadable_header` proves the two
+    /// header directives agree with each other; this proves they agree
+    /// with NVIDIA's assembler, which is the only authority that counts.
+    /// It needs a CUDA toolkit and no GPU at all, so it runs anywhere
+    /// `ptxas` is installed — including the public runners the
+    /// self-hosted hardware gate cannot use, and which are the reason the
+    /// original bug survived: the only real GPU in CI is an RTX 2060.
+    ///
+    /// Architectures the installed toolkit does not know are skipped and
+    /// reported, never failed, so an old toolkit degrades coverage
+    /// visibly instead of turning red for the wrong reason.
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-it"),
+        ignore = "requires NVIDIA CUDA toolkit (`ptxas`); enable feature `gpu-it` to run"
+    )]
+    fn ptxas_round_trip_every_modern_target() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("fixture not eligible: {v:?}"),
+        };
+        let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
+        let mut assembled: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for (maj, min) in [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)] {
+            let arch = format!("sm_{maj}{min}");
+            if !ptxas_knows_arch(&ptxas, &arch) {
+                skipped.push(arch);
+                continue;
+            }
+            let m = lower_method("EligibleVectorAdd", &method, &sig, maj, min)
+                .unwrap_or_else(|e| panic!("lowering failed for {arch}: {e}"));
+            ptxas_round_trip_at(&m.render(), "vector_add_multi_arch", &arch);
+            assembled.push(arch);
+        }
+        assert!(
+            !assembled.is_empty(),
+            "no architecture was assembled, which makes this test vacuous. \
+             `ptxas` knows none of the targets this crate emits for. \
+             Skipped: {skipped:?}"
+        );
+        eprintln!(
+            "ptxas_round_trip_every_modern_target: assembled {assembled:?}, skipped {skipped:?}"
         );
     }
 
@@ -1693,7 +2262,8 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
+                (l.starts_with("setp.ge.u32") || l.starts_with("setp.ge.s32"))
+                    && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -1706,8 +2276,9 @@ mod tests {
         let m = lower_fixture("NonCanonicalLoops", "canonical", "([I[I[I)V");
         let text = m.render();
         assert!(text.contains(".visible .entry NonCanonicalLoops__canonical_"));
-        // Canonical guard: `tid >= bound` early-out.
-        assert!(text.contains("setp.ge.s32"));
+        // Canonical guard: `tid >= bound` early-out, unsigned so it
+        // also rejects a negative index (see `Emitter::emit_loop_guard`).
+        assert!(text.contains("setp.ge.u32"));
         // Two int loads + one int store + one add — the body lowered.
         assert!(text.matches("ld.global.s32").count() >= 2);
         assert!(text.contains("st.global.s32"));
@@ -2335,7 +2906,7 @@ mod tests {
                 crate::analyzer::load_method_with_pool("EligibleLlamaKernels", name, descriptor);
             let annotations = crate::annotations::MethodAnnotations {
                 gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
-                    admit: hint,
+                    admit: hint.into(),
                     ..crate::annotations::GpuKernelAttrs::default()
                 }),
                 ..crate::annotations::MethodAnnotations::default()
@@ -2465,7 +3036,8 @@ mod tests {
         assert!(
             text.lines().any(|l| {
                 let l = l.trim_start();
-                l.starts_with("setp.ge.s32") && l.contains(&format!("{folded},"))
+                (l.starts_with("setp.ge.u32") || l.starts_with("setp.ge.s32"))
+                    && l.contains(&format!("{folded},"))
             }),
             "expected the loop guard to compare the folded tid+K register:\n{text}"
         );
@@ -3229,7 +3801,7 @@ mod tests {
         );
         let annotations = crate::annotations::MethodAnnotations {
             gpu_kernel: Some(crate::annotations::GpuKernelAttrs {
-                admit: crate::annotations::AdmissionHint::AllowIntrinsicCalls,
+                admit: crate::annotations::AdmissionHint::AllowIntrinsicCalls.into(),
                 ..crate::annotations::GpuKernelAttrs::default()
             }),
             gpu_exclude: None,

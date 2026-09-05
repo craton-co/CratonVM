@@ -721,6 +721,58 @@ pub struct GcFlags {
     /// `CRATONVM_CARD_TABLE_ONLY` — restrict old→young discovery to the card
     /// table.
     pub card_table_only: bool,
+    /// `CRATONVM_GC_FULL_RSET_SCAN` -- restore the whole-old-generation
+    /// old->young walk on every young collection.
+    ///
+    /// **Default OFF since 2026-09-02** (gc-genpause F2); it was the DEFAULT
+    /// behaviour before that, reached by the absence of
+    /// [`Self::card_table_only`].
+    ///
+    /// What it turns back on is `scan_all_old_to_young` -- a full
+    /// `OldGen::walk_objects()` (which materialises a `Vec` of every tenured
+    /// object) scanning every reference slot of every one of them, AFTER the
+    /// dirty-card scan has already answered the same question. It made young
+    /// pause time grow permanently with old-generation size: measured at
+    /// 41-61 ms of a ~229 ms steady-state pause on a heap whose old generation
+    /// held no old->young edges at all.
+    ///
+    /// It was a standing insurance premium against a missed write barrier, and
+    /// what replaces it is [`Self::verify_rset`] -- the same insurance as a
+    /// verifier you can run, rather than a tax every collection pays. This
+    /// flag is the revert lever: set it if a premature-reclamation defect is
+    /// suspected and you want the old belt-and-braces seeding back.
+    pub full_rset_scan: bool,
+    /// `CRATONVM_GC_VERIFY_RSET` -- after each young collection's old->young
+    /// seeding, walk the whole old generation and report every edge the card
+    /// table did NOT deliver, as `[rset-verify] edges=N missing=M`.
+    ///
+    /// The generational twin of G1's `CRATONVM_G1_DBG_RSET`, and for the same
+    /// reason: a remembered set that is trusted needs a way to be checked, and
+    /// a checker whose output cannot distinguish "nothing missing" from "never
+    /// looked" is worthless -- so it prints the edge count it verified beside
+    /// the misses, and a run that seeded no edges says so.
+    ///
+    /// Costs a full old-gen walk per young collection, which is exactly the
+    /// cost [`Self::full_rset_scan`] used to pay unconditionally. That is the
+    /// trade: pay it while you are auditing, not forever.
+    pub verify_rset: bool,
+    /// `CRATONVM_GC_SYNC_YOUNG_WIPE` — zero the evacuated young semi-space
+    /// INSIDE the pause, as every moving cycle did before 2026-09-02, instead
+    /// of on a helper thread after it. The revert lever for the off-pause
+    /// wipe; the first thing to set if a conservative root ever names the
+    /// inactive semi-space.
+    pub gc_sync_young_wipe: bool,
+    /// `CRATONVM_GC_JIT_REF_STORE_GATES` — let the GENERATIONAL collector
+    /// publish the compiled-reference-store barrier plan, so a compiled
+    /// reference store gates its barriers inline instead of always calling
+    /// `jit_putfield_object`. Default **ON** opt-out
+    /// ([`parse::on_unless_zero`]).
+    ///
+    /// `=0` withholds the plan and every compiled reference store takes the
+    /// full helper path exactly as it did before 2026-09-02 — the A/B lever,
+    /// and the first thing to set if a compiled store is ever suspected of
+    /// missing a card or an SATB entry.
+    pub gc_jit_ref_store_gates: bool,
     /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
     /// non-moving sweep. [`parse::on_unless_zero`].
     pub old_sweep_jit: bool,
@@ -736,6 +788,32 @@ pub struct GcFlags {
     /// any suspected parallel-evacuation regression, and a cycle record still
     /// names which evacuator ran.
     pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
+    /// pauses taken while a thread is inside compiled code. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the serial fallback.
+    ///
+    /// Until F-01 the young driver fell back to the serial evacuator whenever
+    /// `gc_quiescence::is_active()`, on the stated ground that "only the serial
+    /// path implements conservative-JIT-root region pinning". That ground was
+    /// stale: `young_collection_parallel` computes the identical exclusion via
+    /// `pinned_region_set_including_non_object_roots`, and its own comment says
+    /// it does so deliberately "even if that gate is ever loosened". Pinning is
+    /// a collection-set FILTER applied before evacuation begins; nothing in it
+    /// requires the evacuation loop to be single-threaded.
+    ///
+    /// The gate mattered because on a JIT-warm application it is true for
+    /// nearly every pause — the audit's own instrumentation recorded 330,263 of
+    /// 330,264 pauses with a live compiled frame — so in production G1 copied
+    /// on one thread and the persistent worker pool never ran.
+    ///
+    /// `=0` is the bisection lever, and the FIRST thing to try for any G1
+    /// crash or corruption seen only with the JIT warm: under it, JIT-warm
+    /// pauses take exactly the evacuator every G1 result before this flag was
+    /// produced under. Defect G1-11 (an access violation under
+    /// `-XX:+UseG1GC -Xmx32m` with the JIT warm) is open at the time of
+    /// writing and lives in this path; reproduce it in both arms before
+    /// attributing a change in its frequency to anything else.
+    pub g1_parallel_evac_in_jit: bool,
     /// `CRATONVM_G1_EAGER_HUMONGOUS` — reclaim provably-dead humongous spans
     /// during evacuation pauses instead of waiting for a concurrent-mark
     /// cleanup. Default **ON** ([`parse::on_unless_zero`]); set `=0` to restore
@@ -806,10 +884,19 @@ pub struct GcFlags {
     /// has already overrun, so the first (largest) pause is always paid in
     /// full and it is the one p99 reports. The flag delivers a real median
     /// improvement and a real throughput cost, which is a trade a specific
-    /// latency-sensitive workload may well want — but it is not a default, and
-    /// nothing measured here says it should be one.
+    /// latency-sensitive workload may well want — which is why, on that
+    /// measurement, it shipped opt-in.
     ///
-    /// Turn it on and measure YOUR pause distribution before keeping it.
+    /// # Default ON since 2026-09-02 (ten-findings item 10)
+    ///
+    /// What made the goal unhonourable was not this sizing but the pause it
+    /// was sizing against: every young pause walked the whole old generation
+    /// in its fix-up phase (and any humongous span made that unconditional),
+    /// and the mixed CSet's copy budget priced only the copying. With the
+    /// fix-up narrow on every pause and the mixed budget charged for the
+    /// walk's measured cost, the target is the only piece of `MaxGCPauseMillis`
+    /// that was still off. `CRATONVM_G1_YOUNG_PAUSE_TARGET=0` restores the
+    /// free-pool-only trigger.
     pub g1_young_pause_target: bool,
     /// `CRATONVM_G1_SCRUB_FREE` — zero a region's bytes when a collection
     /// frees it. **Opt-in** ([`parse::present`]); off means the allocator's own
@@ -849,6 +936,356 @@ pub struct GcFlags {
     /// collector re-walks the whole heap every pause, which is the behaviour
     /// every G1 result before 2026-08-18 was produced under.
     pub g1_narrow_fixup: bool,
+    /// `CRATONVM_G1_CLEANUP_WALK` — make the concurrent-cycle cleanup pause
+    /// recompute per-region liveness by WALKING every object of every non-Free
+    /// region, instead of reading the per-region byte accumulator the marker
+    /// maintains. Opt-in ([`parse::present`]).
+    ///
+    /// The walk was cleanup's only implementation until F-06: an O(heap)
+    /// stop-the-world pass at the end of every concurrent cycle, growing with
+    /// the old generation. Real G1 does not have it, because it accumulates the
+    /// same number during marking; `G1Region::try_mark_and_account` now does.
+    ///
+    /// `=1` restores the walk as the authority. It is the single-binary A/B for
+    /// the change and the FIRST thing to try if a G1 cycle is suspected of
+    /// freeing a live Old region in place — an accumulated liveness is only as
+    /// good as the claim that every mark site goes through the accumulator, and
+    /// an UNDER-count is exactly what makes a live region look wholly dead. A
+    /// debug build runs both and asserts they agree, so the claim is checked
+    /// rather than asserted in prose.
+    pub g1_cleanup_walk: bool,
+    /// `CRATONVM_G1_ADAPTIVE_IHOP` — set the concurrent-marking threshold from
+    /// the measured old-generation ALLOCATION RATE and mark duration, instead
+    /// of from young-pause time. Default **ON** ([`parse::on_unless_zero`]);
+    /// `=0` restores the pause-time model.
+    ///
+    /// IHOP answers one question: did the concurrent cycle start early enough
+    /// that marking finished before the heap filled? The inputs to that are how
+    /// fast the old generation grows and how long marking takes. The previous
+    /// model fed it young-pause time, which is a property of the young live set
+    /// and has no causal relationship to the question — a workload with fast
+    /// young pauses and a fast-filling old generation got its threshold RAISED,
+    /// which is exactly backwards. The code's own comment records that failure
+    /// mode reaching production (61k young collections, no mark cycle, OOM with
+    /// >80% of Old dead) and being fixed by clamping the ceiling rather than by
+    /// changing the signal.
+    ///
+    /// `=0` is the bisection lever and the single-binary A/B. Both arms keep
+    /// the same static ceiling (`-XX:InitiatingHeapOccupancyPercent`) and the
+    /// same floor, so the difference between them is only which evidence moves
+    /// the threshold between the two.
+    pub g1_adaptive_ihop: bool,
+    /// `CRATONVM_G1_ADAPTIVE_TENURING` — re-derive the tenuring threshold after
+    /// every evacuation pause from an age histogram of surviving bytes, instead
+    /// of always promoting at the configured `promotion_age`. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the fixed threshold.
+    ///
+    /// The fixed threshold defaults to 15, so every surviving object was copied
+    /// fifteen times before promotion regardless of how full survivor space
+    /// was. That is right for a workload whose medium-lived objects are few and
+    /// straightforwardly wasteful for one where they are not — a burst that
+    /// lives a dozen pauses is copied a dozen times, and the copying is the
+    /// expensive half of an evacuation pause.
+    ///
+    /// The adaptive rule is HotSpot's: the smallest age whose cumulative
+    /// surviving bytes exceed the survivor target. It may only tenure EARLIER
+    /// than configured, never later, so `-XX:MaxTenuringThreshold`-style intent
+    /// is preserved as a ceiling.
+    ///
+    /// `=0` is the bisection lever for a suspected premature-promotion
+    /// regression: under it the collector tenures exactly where every G1 result
+    /// before this flag did.
+    pub g1_adaptive_tenuring: bool,
+    /// `CRATONVM_G1_RESERVE_HEAP` — RESERVE `-Xmx` as address space and COMMIT
+    /// only what the collector has actually claimed, instead of allocating and
+    /// zeroing the whole heap in the constructor. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` commits every byte up front.
+    ///
+    /// Before F-16 there was no `-Xms` (the flag was parsed and discarded), no
+    /// expansion and no uncommit, so `-Xmx16g` charged 16 GiB against the
+    /// process at startup whether or not a byte of it was used — on Windows,
+    /// 16 GiB of commit charge against the page file immediately.
+    ///
+    /// The committed set is a PREFIX, not an arbitrary subset, because
+    /// `gen_heap::publish_jit_read_bounds` asserts "a raw load anywhere in this
+    /// range cannot fault" and that claim is only expressible as a range.
+    ///
+    /// `=0` is the bisection lever, and the first thing to try for any G1 fault
+    /// at a heap address that looks mapped: under it the whole reservation is
+    /// backed from the start, which is where every G1 result before this flag
+    /// was produced. Note that a platform without a reservation implementation
+    /// takes that path anyway — `G1Collector::heap_is_reserved` says which.
+    pub g1_reserve_heap: bool,
+    /// `CRATONVM_G1_UNCOMMIT` — return the pages of a trailing run of Free
+    /// regions to the OS at the end of a concurrent-mark cleanup. **Opt-in**
+    /// ([`parse::present`]); requires `CRATONVM_G1_RESERVE_HEAP` (the default).
+    ///
+    /// The other half of F-16. Growth on demand is what stops a large `-Xmx`
+    /// costing memory it does not use; this is what lets a process that has
+    /// finished a burst give the memory back instead of holding its high-water
+    /// mark for its whole life.
+    ///
+    /// Opt-in because the two halves have different failure modes. Getting
+    /// growth wrong is a missed optimisation. Getting the shrink wrong — in
+    /// particular, unmapping pages the published JIT read bounds still describe
+    /// as loadable — is a fault in compiled code, so it ships behind its own
+    /// switch even though the ordering that makes it safe is written down and
+    /// tested.
+    pub g1_uncommit: bool,
+    /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
+    /// source walks against a per-arena CARD TABLE, instead of walking every
+    /// byte of every named source region. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the whole-region walk.
+    ///
+    /// A remembered-set entry names a source REGION, so acting on one edge cost
+    /// a walk of the whole region — every object header validated, every
+    /// reference slot visited, a region lookup per slot — i.e. a cost
+    /// proportional to BYTES IN THE SOURCE rather than to the number of edges.
+    /// The card table records, per 512 bytes, whether a cross-region reference
+    /// store ever landed there, so a source with no dirty card is skipped
+    /// outright and an object touching no dirty card is stepped over without
+    /// any per-slot work. See `gc/src/g1_cards.rs`.
+    ///
+    /// `=0` is the bisection lever and the FIRST thing to try for a suspected
+    /// G1 lost-edge or dangling-reference defect that appears after 2026-09-02:
+    /// under it Phase 2 reads no card and walks each source exactly as it did
+    /// before. The card table is still MAINTAINED under `=0` (the barrier's
+    /// store is unconditional), so the flag isolates the READ side — which is
+    /// the side that can lose an edge — rather than half-disabling both.
+    pub g1_card_rset: bool,
+    /// `CRATONVM_G1_CARD_CLEAN` — clean a card once its objects have been
+    /// scanned, instead of leaving it dirty until its region is recycled.
+    /// **Opt-in** ([`parse::present`]), and the measurement below is why.
+    ///
+    /// # The hypothesis, and what measuring it did to it
+    ///
+    /// F-05 added the card table and cleared a card in exactly one place:
+    /// `G1Region::reset`. So the table only ever GAINS bits, and the obvious
+    /// reading of the 0.2% byte skip-rate measured on
+    /// `probes/HumongousChurn.java` at `-Xmx160m` was saturation: a long-lived
+    /// Old region accumulating dirty cards until the screen answers "scan it"
+    /// for everything.
+    ///
+    /// Cleaning is the fix for that, and it works — the unit tests pin all
+    /// three directions (a card whose edge is gone is cleaned, a card whose
+    /// edge survives is kept, and nothing past the walked extent is touched).
+    /// It does not, however, pay for itself on the workload that motivated it.
+    /// Four ABBA-interleaved release reps, `HumongousChurn 48 6000 512` at
+    /// `-Xmx160m --nojit` (the arm where the screen is actually consulted),
+    /// medians:
+    ///
+    /// | | cleaning off | cleaning on |
+    /// |---|---:|---:|
+    /// | wall | 7740 ms | 8392 ms |
+    /// | total pause | 3054 ms | 3680 ms |
+    /// | byte skip-rate | 28.7% | 23.4% |
+    ///
+    /// Slower, and the skip-rate did not reliably rise. A single earlier run
+    /// showed 82% against 45% and would have made a much better story; it was
+    /// noise, and four reps is what it took to see that. The cost is real (a
+    /// per-region-walk snapshot and a rewrite pass) and the benefit on this
+    /// shape is not, because most objects in a retained linked structure hold a
+    /// cross-region reference and their cards are kept dirty anyway.
+    ///
+    /// So the 0.2% is NOT explained by saturation, and this flag is not the
+    /// answer to it. What the same runs do show is that the JIT-warm arm skips
+    /// 0.79% where the `--nojit` arm skips 20-50% — and the difference is not
+    /// the table's contents but how many source regions reach the per-object
+    /// screen at all, since a JIT-pinned source is walked WHOLESALE by design
+    /// (`card_screen: bool` at `scan_source_region_for_cset_refs`). That is
+    /// where the next measurement should go.
+    ///
+    /// Kept, off, because it is sound, tested, and the mechanism a card table
+    /// needs the moment the screen's engagement problem is fixed.
+    pub g1_card_clean: bool,
+    /// `CRATONVM_G1_CARD_SCREEN_JIT_PINNED` — let Phase 2 apply the card screen
+    /// to a JIT-PINNED source region too, instead of walking it wholesale.
+    /// Default-on with a `=0` opt-out ([`parse::on_unless_zero`]).
+    ///
+    /// # The carve-out this removes, and why it was there
+    ///
+    /// `young_collection`/`mixed_collection` add every JIT-pinned region to the
+    /// remembered set's own source list and pass `card_screen = false` for
+    /// them, so they are walked end to end. The stated reason is that
+    /// "JIT-compiled code may have installed those references through stores
+    /// the collector cannot assume went through `post_write_barrier_rset`" — a
+    /// card screen is derived from that same assumption, so applying it there
+    /// would trust the belt it exists to double.
+    ///
+    /// # Why the assumption no longer holds under G1
+    ///
+    /// Every path by which compiled code can write a reference into the heap
+    /// now reaches `post_write_barrier_rset`, which records the remembered-set
+    /// entry AND dirties the holder's card:
+    ///
+    /// * **`putfield` (reference), every inline arm, both tiers.** G1-2's fix
+    ///   gates each arm on `region_bounds_are_live(...)`, and G1 publishes
+    ///   nothing into `JIT_REGION_BOUNDS` — the emptiness is load-bearing and
+    ///   `publishing_the_g1_barrier_table_does_not_make_region_bounds_live`
+    ///   pins it. So under G1 every arm takes `jit_putfield_object`, which goes
+    ///   through `VmHeap::set_field`.
+    /// * **`putfield` under `CRATONVM_G1_INLINE_BARRIER` (F-08).** The inline
+    ///   filter elides only the two cases whose callee returns without
+    ///   recording (a null value, and a same-region store); everything else
+    ///   still calls `jit_g1_post_write_barrier`.
+    /// * **`aastore`, single-pass tier.** Stores inline, then calls
+    ///   `helpers.write_barrier` (`jit_write_barrier` → `VmHeap::write_barrier`
+    ///   → `post_write_barrier_rset`). The inline card-mark shortcut beside it
+    ///   is generational-only and `inline_card_mark_available()` is a constant
+    ///   `false`.
+    /// * **`aastore`, IR tier.** Refused outright — `ir_lower` latches a
+    ///   bailout rather than emit a barrier-less reference store.
+    /// * **Statics, natives, reflection, `Unsafe`, `VarHandle`, `arraycopy`.**
+    ///   All funnel through the barriered accessors; none is compiled inline.
+    ///
+    /// # What is still true, and why this is safe by construction today
+    ///
+    /// With `CRATONVM_G1_CARD_CLEAN` off (its default), a card is cleared in
+    /// exactly one place — `G1Region::reset`, i.e. when the region is recycled.
+    /// So a dirty card means "some store ever named an object here" and a CLEAN
+    /// card means "no store into this region's contents was ever recorded".
+    /// Skipping an object with a clean card can therefore only skip one that no
+    /// compiled or interpreted store has touched since the region was recycled.
+    ///
+    /// `=0` restores the wholesale walk, and is the first thing to try for a
+    /// lost-edge or dangling-reference defect that appears after 2026-09-02.
+    /// The checkers that would catch one are already wired into every pause:
+    /// `verify_no_dangling_into_cset` (budgeted in release) and
+    /// `dbg_verify_rset_completeness` (`CRATONVM_G1_DBG_RSET=1`).
+    pub g1_card_screen_jit_pinned: bool,
+    /// `CRATONVM_G1_INLINE_BARRIER` — F-08: let the JIT emit G1's post-write
+    /// barrier inline instead of routing every compiled reference store to the
+    /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
+    ///
+    /// Closing defect G1-2 (`audits/g1-audit.md` §8.1, §10) made every
+    /// JIT-compiled reference store an out-of-line call, because the inline
+    /// fast paths are gated on the `JIT_REGION_BOUNDS` table, which G1
+    /// deliberately never publishes. §10 measured the cost as falling on the
+    /// `n.left = newChild` shape that dominates allocation-heavy code. This
+    /// emits a real G1 post-barrier — same-region test, null test, then the
+    /// out-of-line remembered-set call — against a SEPARATE published table, so
+    /// the G1-2 gate is untouched.
+    ///
+    /// **Default ON since 2026-09-04**, opt out with
+    /// `CRATONVM_G1_INLINE_BARRIER=0` ([`parse::on_unless_zero`]).
+    ///
+    /// It was default OFF on the reasoning that this is a code-generation
+    /// change on an experimental collector, and because the last inline
+    /// barrier this JIT had (`Compiler::inline_card_mark_available`, a
+    /// different mechanism against a different table) was disabled after a
+    /// WildFly boot audit found a missed dirty card — with the note that "`=1`
+    /// is how it gets measured before it becomes a default". It was then never
+    /// measured, and its only engagement signal was one `tracing::info!` line
+    /// saying the arm had been emitted at least once.
+    ///
+    /// What it was measured at, once a census existed
+    /// (`g1-inline-post-write-barrier-measured-20260903.md`):
+    ///
+    /// * `bt16` under G1, one binary, order alternated: **0.82 s against
+    ///   2.22 s, 8 of 8 rounds**, ~2.7x, identical tree checksum in all
+    ///   sixteen runs.
+    /// * Run-time census: `skipped=29,961,707 called=2,785` — the filter's two
+    ///   tests answer "nothing to remember" 99.99% of the time, which is what a
+    ///   generational-shaped allocation pattern looks like to G1.
+    /// * A 228-program differential soak under G1, and the
+    ///   HotSpot-differential regression suite, both with the barrier on.
+    /// * `CRATONVM_GC_VERIFY_RSET` clean — the audit that would catch the
+    ///   failure mode the WildFly card miss was.
+    ///
+    /// Why the filter is sound rather than merely fast: both its tests are
+    /// transcriptions of `post_write_barrier_rset`'s own first two early-outs
+    /// (a null referent, and `src_region == dst_region`), so a skipped call is
+    /// a call that would have returned having done nothing, and everything else
+    /// reaches the collector's real barrier. The G1-2 gate is untouched: this
+    /// reads a SEPARATE published table and `JIT_REGION_BOUNDS` stays empty.
+    pub g1_inline_barrier: bool,
+    /// `CRATONVM_G1_MARK_LOCK_YIELD` — F-10. Make G1's concurrent marker
+    /// release and re-take the regions lock every few objects instead of
+    /// holding it for a whole mark step. Default **ON**
+    /// ([`parse::on_unless_zero`]); `=0` restores the one-acquisition-per-step
+    /// behaviour.
+    ///
+    /// `ConcurrentMarkController`'s worker calls `concurrent_mark_step(256)` in
+    /// a loop, and that call used to take the regions lock once and hold it
+    /// until all 256 objects had been scanned. Everything else that touches the
+    /// region table — every allocation, every write-barrier slow path, and the
+    /// entire stop-the-world pause — waited behind it. "Concurrent" marking was
+    /// therefore taking turns with the mutators rather than racing them, at the
+    /// exact point in the cycle where the heap fills fastest.
+    ///
+    /// With `=1` (the default) the marker holds a READ guard for a short batch
+    /// of objects and drops it between batches. `parking_lot`'s `RwLock` is
+    /// task-fair, so a waiting writer — an STW pause, or a region claim — is
+    /// admitted at the next batch boundary instead of at the end of the step.
+    ///
+    /// `=0` is the bisection lever for any suspected marking-soundness
+    /// regression that appeared with F-10: under it the marker's view of the
+    /// region table is once again atomic for a whole step, which is the
+    /// behaviour every G1 mark cycle before 2026-09-02 ran under.
+    pub g1_mark_lock_yield: bool,
+    /// `CRATONVM_G1_SHARED_ALLOC` — F-11. Let G1 serve an object allocation or
+    /// a TLAB refill out of the current Eden region under a SHARED regions
+    /// guard, claiming space with an atomic compare-exchange on the region's
+    /// bump cursor. Default **ON** ([`parse::on_unless_zero`]); `=0` sends
+    /// every allocation down the exclusive path instead.
+    ///
+    /// `G1Region::cursor` was a plain `usize`, so bumping it needed
+    /// `&mut G1Region`, so every allocation took the collector's one exclusive
+    /// lock — the same lock the whole stop-the-world pause and (before F-10)
+    /// the concurrent marker held. At the 256 KiB default TLAB against 1 MiB
+    /// regions four refills exhaust a region, so this was not a rare path: it
+    /// was every thread, continuously, at exactly the moment the heap fills.
+    ///
+    /// `=0` is the bisection lever. It does not select a different algorithm —
+    /// it skips the shared probe and enters the identical slow path, which
+    /// re-probes the current Eden under the exclusive guard — so a regression
+    /// that survives `=0` is not about the lock. Try it first for any suspected
+    /// G1 allocation-corruption or lost-TLAB-zeroing defect: under it the
+    /// cursor moves only under exclusion, which is the behaviour every G1 run
+    /// before 2026-09-02 was produced under.
+    pub g1_shared_alloc: bool,
+    /// `CRATONVM_G1_EDEN_STRIPES=<n>` — F-11. How many Eden regions G1 keeps
+    /// open for mutator allocation at once. Unset means the machine-derived
+    /// default (hardware parallelism, capped at an eighth of the heap's
+    /// regions); `=1` is the single global Eden the collector had before F-11.
+    ///
+    /// Removing the exclusive lock from allocation (`CRATONVM_G1_SHARED_ALLOC`)
+    /// only moves the bottleneck if the threads then bump DIFFERENT cursors.
+    /// Measured at four threads, shared-guard allocation into one Eden region
+    /// was about 1.9x slower per object than the exclusive lock it replaced:
+    /// the threads compare-exchange the same word and, because objects are tens
+    /// of bytes, write each other's cache lines on the way out, while the
+    /// exclusive arm's barging mutex lets one thread run a long cache-hot
+    /// burst. Striping is what makes the shared guard pay.
+    ///
+    /// The knob is a `usize` rather than a boolean because it is also the
+    /// fragmentation dial: each stripe holds a partially-filled region that no
+    /// pause has reclaimed yet, so `n` regions of Eden are in flight. `=1` is
+    /// the bisection lever; a larger `n` than the default is a deliberate
+    /// trade of footprint for allocation parallelism.
+    pub g1_eden_stripes: Option<usize>,
+    /// `CRATONVM_G1_PARALLEL_MARK` — F-12. Run G1's concurrent mark phase on
+    /// several workers with per-worker gray deques and work stealing. Default
+    /// **ON** ([`parse::on_unless_zero`]); `=0` pins it to the single worker
+    /// `ConcurrentMarkController::spawn` used to start unconditionally.
+    ///
+    /// Marking was one thread draining one `Mutex<Vec<usize>>` gray set, so
+    /// even a second worker would have contended on every push and pop. Mark
+    /// duration is not only a CPU cost: it sets how much headroom the IHOP
+    /// heuristic has to leave before starting a cycle, so a slow marker is paid
+    /// for in heap.
+    ///
+    /// The worker count is a quarter of the evacuation worker count, rounded up
+    /// — HotSpot's `ConcGCThreads` ergonomic, and deliberately not the pause's
+    /// width, because these workers run BESIDE the application rather than
+    /// inside a pause where every core is idle. `CRATONVM_G1_WORKERS=N` still
+    /// reaches it through the evacuation count.
+    ///
+    /// `=0` is the bisection lever: the marking algorithm is identical at one
+    /// worker (the deque is the worklist, no steal can succeed, the termination
+    /// counter can only be this thread), so a defect that survives `=0` is not
+    /// a parallel-marking race.
+    pub g1_parallel_mark: bool,
     /// `CRATONVM_G1_DBG_RSET` — after every G1 evacuation pause, verify that
     /// every cross-region reference into a COLLECTABLE region is named in that
     /// region's remembered set. Opt-in diagnostic; whole-heap and O(live
@@ -934,6 +1371,22 @@ pub struct GcFlags {
     /// `CRATONVM_GC_PAR_MIN_BYTES` — young-gen size below which parallelism
     /// never pays for itself; default 16 MiB.
     pub gc_par_min_bytes: usize,
+    /// `CRATONVM_GC_PAR_EVAC` — run the generational young collector's MOVING
+    /// (Cheney) copy phase on the same worker set its mark phase already uses.
+    /// Default **ON** ([`parse::on_unless_zero`]); set `=0` to force the
+    /// single-threaded evacuator.
+    ///
+    /// On by default because it cannot engage on its own: the copy phase only
+    /// goes parallel when [`Self::gc_par_threads`] policy already asked for
+    /// two or more workers (which needs a young gen past
+    /// [`Self::gc_par_min_bytes`], or an explicit request) AND the cycle is a
+    /// moving one AND to-space has the per-worker-buffer slack. Defaulting it
+    /// off would leave the parallel copy inert on every workload that has the
+    /// heap for it, which is the state a gated feature dies in.
+    ///
+    /// `=0` is the bisection lever: the serial and parallel evacuators produce
+    /// the same forwarding map, so a suspected regression is one run apart.
+    pub gc_par_evac: bool,
     /// `CRATONVM_DBG_GC_STRESS`, falling back to `CRATONVM_GC_STRESS` — force
     /// a GC every N bytes allocated. Values `<= 0` and unparseable values are
     /// treated as unset. Despite the `DBG_` name this changes GC scheduling,
@@ -1114,12 +1567,33 @@ impl GcFlags {
             sp_no_coalesce: present(src, "CRATONVM_SP_NO_COALESCE"),
             no_defrag_promote: present(src, "CRATONVM_NO_DEFRAG_PROMOTE"),
             card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
+            full_rset_scan: present(src, "CRATONVM_GC_FULL_RSET_SCAN"),
+            verify_rset: present(src, "CRATONVM_GC_VERIFY_RSET"),
+            gc_sync_young_wipe: present(src, "CRATONVM_GC_SYNC_YOUNG_WIPE"),
+            gc_jit_ref_store_gates: on_unless_zero(src, "CRATONVM_GC_JIT_REF_STORE_GATES"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
-            g1_young_pause_target: present(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
+            g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),
+            g1_adaptive_ihop: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_IHOP"),
+            g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
+            g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
+            g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
+            g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
+            g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
+            g1_card_screen_jit_pinned: on_unless_zero(
+                src,
+                "CRATONVM_G1_CARD_SCREEN_JIT_PINNED",
+            ),
+            g1_inline_barrier: on_unless_zero(src, "CRATONVM_G1_INLINE_BARRIER"),
+            g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
+            g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
+            g1_eden_stripes: usize_min1(src, "CRATONVM_G1_EDEN_STRIPES"),
+            g1_parallel_mark: on_unless_zero(src, "CRATONVM_G1_PARALLEL_MARK"),
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
@@ -1132,6 +1606,7 @@ impl GcFlags {
             gc_par_threads: usize_opt(src, "CRATONVM_GC_PAR_THREADS"),
             gc_par_min_bytes: usize_opt(src, "CRATONVM_GC_PAR_MIN_BYTES")
                 .unwrap_or(16 * 1024 * 1024),
+            gc_par_evac: on_unless_zero(src, "CRATONVM_GC_PAR_EVAC"),
             gc_stress_bytes: utf8(src, "CRATONVM_DBG_GC_STRESS")
                 .or_else(|| utf8(src, "CRATONVM_GC_STRESS"))
                 .and_then(|v| v.trim().parse::<usize>().ok())

@@ -2086,13 +2086,24 @@ fn builtin_future_get_error_message(
 /// `Native.releaseFuture(long futureHandle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_future(
-    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.futures.remove(&handle);
     });
+    // AUDIT 2026-09-02: the line above drops THIS crate's record of the
+    // future. The offload runtime keeps a second, independent table --
+    // `offload::SUBMISSIONS` -- keyed by the same handle, and until now
+    // nothing removed from it: one insert, one remove, and the remove had
+    // no production caller. `GpuExecutor.releaseSubmission(h)` compiles
+    // to `Native.releaseFuture(h)`, so a program doing exactly what the
+    // registry's own overflow warning tells it to do still leaked every
+    // submission. Measured before this line: GpuAsyncChainBench, which
+    // awaits and releases all 2000 of its handles, still tripped the
+    // "1024 submissions are alive" warning.
+    ctx.gpu_release_submission(handle);
     Ok(None)
 }
 
@@ -3162,10 +3173,14 @@ mod tests {
 
         // A second release of the same (already-released) handle must
         // not panic and must leave the array absent, matching
-        // `ResidencyTracker::release`'s documented idempotency
-        // (`vm/src/runtime/gpu_residency.rs`) and `releaseFuture`'s
-        // remove-is-a-no-op-on-missing-key shape used elsewhere in this
-        // file.
+        // `releaseFuture`'s remove-is-a-no-op-on-missing-key shape used
+        // elsewhere in this file.
+        //
+        // (This used to cite `ResidencyTracker::release` in
+        // `vm/src/runtime/gpu_residency.rs` as the convention being
+        // matched. That module was dead code -- nothing outside its own
+        // tests ever constructed one -- and was removed 2026-09-02. The
+        // resident store in this file is the only implementation.)
         builtin_release_array(&mut ctx, &[Value::Long(handle)]).unwrap();
         assert_eq!(
             builtin_array_is_resident(&mut ctx, &[Value::Long(handle)]).unwrap(),
@@ -3232,15 +3247,45 @@ pub mod dispatch_timing {
     }
 
     pub fn report() {
+        // The bridge's own engagement census, BEFORE the `calls == 0` gate:
+        // both lines are self-gating (silent for a run with no GPU work) and
+        // both count the `--gpu` auto-offload path, which never goes through
+        // `submitMethod` and so never moves `CALLS`. Until 2026-09-02 they sat
+        // behind the gate, so a transfer-floor or dot-product soak under
+        // `--gpu` printed no census at all -- a run whose pool served nothing
+        // read as a clean run.
+        cratonvm_types::gpu_event_census::exit_summary();
+        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
+        // What the residency cache did across collections. Self-gating
+        // (silent unless the cache saw a GC) and, like the two above, it
+        // reports a path `CALLS` cannot see. See `gpu_residency_census`.
+        cratonvm_types::gpu_residency_census::exit_summary();
+        // Whether the submission registry drained. `live_at_exit` should
+        // be 0 for a program that releases what it takes.
+        cratonvm_types::gpu_submission_census::exit_summary();
+        // Whether the overlapped writeback path engaged. Silent unless
+        // something was chunkable at all.
+        cratonvm_types::gpu_chunk_census::exit_summary();
+        // The transparent (`--gpu`) door's phase table, for the same
+        // reason: it is self-gating and it counts the path `CALLS` cannot
+        // see. See `gpu_offload_phase_census`.
+        cratonvm_types::gpu_offload_phase_census::exit_summary();
+        // The other half of the transparent door: the dispatches that
+        // REFUSED, which the table above cannot see. See
+        // `gpu_refusal_census`.
+        cratonvm_types::gpu_refusal_census::exit_summary();
+        // How much of the program `--gpu` moved off the JIT. See
+        // `vm::runtime::offload_jit_gate`.
+        cratonvm_types::gpu_jit_gate_census::exit_summary();
+        cratonvm_types::gpu_compiled_offload_census::exit_summary();
+        // The OSR side of the same question: the gate census counts
+        // `caller_blocks_jit` verdicts, this counts refusals actually taken
+        // at an OSR admission gate. They disagreed, which is the point.
+        cratonvm_types::osr_refusal_census::exit_summary();
         let calls = CALLS.load(Ordering::Relaxed);
         if calls == 0 {
             return;
         }
-        // The bridge's own engagement census, printed first because it is
-        // what says whether the two per-launch driver-call savings below
-        // are being served at all.
-        cratonvm_types::gpu_event_census::exit_summary();
-        cratonvm_types::gpu_dispatch_memo_census::exit_summary();
         let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
         eprintln!(
             "[cratonvm] gpu dispatch: calls={calls} accounted={:.1} us/call",

@@ -1,10 +1,35 @@
 # Build guard for the `cuda-bridge` crate.
 #
-# `cuda-bridge` ships two backends:
+# `cuda-bridge` ships three backends:
 #   * `backend_stub.rs`  — the default (`default = []`), compiled by every
 #                          normal build and the bulk of CI.
 #   * `backend_cuda.rs`  — the real cudarc-backed driver bridge, only
 #                          compiled behind the `cuda` Cargo feature.
+#   * `backend_oxide.rs` — NVlabs `cuda-core`, behind `cuda-oxide`.
+#
+# WHY `cuda-oxide` IS NOT CHECKED HERE (2026-09-04)
+#
+# It cannot be built on any runner this repo currently has, and adding a
+# job that fails is worse than saying so:
+#   * `ubuntu-latest` — `cuda-core` pulls `cuda-bindings`, whose build
+#     script runs `bindgen` over the vendor's `cuda.h`. That needs a CUDA
+#     **13+** toolkit (its floor is `MIN_CUDA_VERSION = 13000`, so
+#     `apt install nvidia-cuda-toolkit` is too old) plus `libclang`.
+#     Neither is on a public runner, and installing a CUDA toolkit per run
+#     is not proportionate for an opt-in backend.
+#   * `[self-hosted, gpu]` — Windows, and `cuda-core` 0.3.1 does not
+#     compile on MSVC. See
+#     docs/known-issues/gpu/cuda-core-msvc-enum-signedness-20260904.md.
+#
+# So it is guarded by review and by local runs, not by this workflow. On
+# a Linux box with a CUDA 13 toolkit and libclang the check is:
+#
+#     cargo check -p cratonvm-cuda-bridge --features cuda-oxide
+#     cargo test  -p cratonvm-cuda-bridge --features cuda-oxide -- --ignored
+#
+# Wire a job in here the moment a Linux GPU runner exists; the device
+# tests it would run are already backend-neutral (`cfg(feature =
+# "gpu-driver")`), so both backends execute the same suite.
 #
 # Because the real backend is not part of the default feature set, an
 # ordinary `cargo build` / `cargo check` never touches it — so it can
@@ -18,16 +43,46 @@
 
 name: cuda-bridge
 
+# WHAT BELONGS IN THE PATH FILTER
+#
+# `cargo check --features cuda` is the only thing standing between
+# `backend_cuda.rs` and silent rot, and it used to run only on changes
+# under `cuda-bridge/`. That misses the two ways it is most likely to
+# break: a `cudarc` bump landing in `Cargo.lock`, and the callers in
+# `vm/src/runtime/offload*.rs` / `gpu_marshal.rs` changing against a
+# backend the default build never compiles. Neither touches this crate's
+# own directory, and both would have reached `main` unbuilt.
+#
+# The consumers are listed rather than the filter dropped, so the job
+# still skips the overwhelming majority of pushes — which is the point of
+# having one. The lists are duplicated rather than shared through a YAML
+# anchor because GitHub Actions' workflow parser does not expand them.
 on:
   push:
     branches: [main]
     paths:
       - 'cuda-bridge/**'
+      - 'jit-cuda/**'
+      - 'craton-gpu/**'
+      - 'vm/src/runtime/offload.rs'
+      - 'vm/src/runtime/offload_jit_gate.rs'
+      - 'vm/src/runtime/gpu_marshal.rs'
+      - 'vm/src/runtime/gpu_residency.rs'
+      - 'vm/src/runtime/kernels/**'
+      - 'Cargo.lock'
       - '.github/workflows/cuda-bridge.yml'
   pull_request:
     branches: [main]
     paths:
       - 'cuda-bridge/**'
+      - 'jit-cuda/**'
+      - 'craton-gpu/**'
+      - 'vm/src/runtime/offload.rs'
+      - 'vm/src/runtime/offload_jit_gate.rs'
+      - 'vm/src/runtime/gpu_marshal.rs'
+      - 'vm/src/runtime/gpu_residency.rs'
+      - 'vm/src/runtime/kernels/**'
+      - 'Cargo.lock'
       - '.github/workflows/cuda-bridge.yml'
   workflow_dispatch:
 
@@ -56,3 +111,23 @@ jobs:
       # rotting against cudarc API changes.
       - name: Check cuda backend
         run: cargo check -p cratonvm-cuda-bridge --features cuda
+
+      # The VM-side consumers, which the path filter now also watches.
+      # `gpu-offload` links the stub backend, so this needs no CUDA
+      # install; it is what catches an offload.rs change that compiles
+      # against the default build and not against this one.
+      - name: Check the VM GPU offload path
+        run: cargo check -p cratonvm-vm --features gpu-offload
+
+      # The lowering tests, which need neither a GPU nor a toolkit.
+      #
+      # `every_modern_target_renders_a_loadable_header` lives here: it
+      # pins that the `.version` a kernel declares admits the `.target`
+      # beside it, for every architecture the VM can probe. That
+      # pairing was wrong for Ada, Hopper and Blackwell for as long as
+      # the crate existed, and the only gate that could have seen it —
+      # the self-hosted GPU job — runs an RTX 2060, the one card where
+      # the old hardcoded version was correct. A public runner can
+      # answer it, so it should.
+      - name: Test the bytecode → PTX lowering
+        run: cargo test -p cratonvm-jit-cuda

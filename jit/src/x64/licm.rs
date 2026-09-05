@@ -31,6 +31,320 @@ pub(super) struct LoopHoist {
     pub(super) index_local: usize,
 }
 
+/// A loop-invariant `aload A ; arraylength` that can be computed once in the
+/// loop pre-header and read from a frame slot in the body.
+///
+/// This is the cheapest LICM in the backend and the one with the largest
+/// reach, because it is the only invariant load in an ordinary
+/// `for (i = 0; i < a.length; i++)` — javac re-evaluates `a.length` at the top
+/// of every iteration and the single-pass emitter took that literally:
+/// `MOV RAX, Ra ; TEST RAX,RAX ; JZ npe ; MOV EAX,[RAX+len]`, four
+/// instructions and a dependent load, on the hot path of every counted loop
+/// over an array in the VM. See
+/// `array-element-load-baseline-codegen-20260901`, where it is the largest
+/// single row of a 21-instruction body whose useful work is one `MOVZX`.
+///
+/// **The cached value is a primitive, and that is why this hoist is tractable
+/// where the general `getfield`/`getstatic` one (`loop_analysis::
+/// find_invariant_loads`, still inert) is not.** An `int` in a frame slot is
+/// invisible to the GC, needs no oop map, survives every safepoint unchanged,
+/// and cannot be invalidated by relocation — an array's length does not change
+/// and no bytecode can write it. [`LoopHoist`] caches a *pointer* and owes all
+/// of that; this owes none of it.
+///
+/// The soundness obligations that DO remain are the pre-header's:
+///
+/// * The pre-header runs **unconditionally**, including for a zero-trip loop,
+///   so an `arraylength` moved into it must be one the original program was
+///   always going to perform at that same moment. [`LoopHoist`] buys that with
+///   a guard and a deopt; this buys it with a **dominance restriction** in the
+///   matcher instead — only a site in the header's straight-line prefix,
+///   reachable through nothing but local and constant pushes, is taken (see
+///   [`straight_line_prefix_of_header`]). Such a site is evaluated on the first
+///   pass through the header no matter what, so a null `A` may simply throw
+///   NPE in the pre-header: same exception, same JEP-358 action, same instant.
+///   Routing it to a deopt stub instead would work too, and was the first
+///   shape of this code — but a deopt snapshot bakes a `Box` ADDRESS into the
+///   emitted instruction stream, so two compiles of one method produce
+///   different bytes and `corpus_is_deterministic_within_a_process` fails.
+///   The restriction is worth more than the generality it costs: it is
+///   exactly javac's counted-loop shape.
+/// * An OSR entry landing strictly INSIDE the body would read a cold slot —
+///   here a garbage *length*, which a `bounds_safe_pcs` access would then trust
+///   — so those pcs are published OSR-ineligible. The header itself stays
+///   eligible: `osr_entry_native[header]` points BEFORE the pre-header, so a
+///   cold entry there runs the initialisation.
+/// * A header that can be entered bypassing its pre-header at all (an
+///   exception handler landing inside the loop) is vetoed wholesale by
+///   `find_bypassable_loop_headers`, the same filter the other speculating
+///   transforms take.
+///
+/// Attached to the **innermost** loop containing the site, unlike
+/// [`LoopHoist`], which walks outermost-first. Hoisting further out would save
+/// nothing measurable — the pre-header already runs once per entry to a loop
+/// whose body runs it every iteration — and it would cost the inner header its
+/// OSR eligibility, which for a hot inner loop is the entry the tier-up
+/// trigger actually fires on.
+#[derive(Debug)]
+pub(super) struct ArrayLenHoist {
+    /// Bytecode PC of the loop header (back-edge target).
+    pub(super) loop_header: usize,
+    /// First PC strictly after the back-edge instruction. Mirrors
+    /// [`LoopHoist::loop_end`]; see that doc for the OSR contract it serves.
+    pub(super) loop_end: usize,
+    /// Local variable index of the array reference.
+    pub(super) array_local: usize,
+    /// Every `aload A ; arraylength` site in this loop body, as
+    /// `(seq_start, seq_end)` — `seq_start` is the `aload`, `seq_end` is one
+    /// past the `arraylength`. All sites of one `(header, local)` pair share a
+    /// single frame slot and a single pre-header computation; the alternative
+    /// (one hoist record per site) would recompute the same length once per
+    /// site in the pre-header for no gain.
+    pub(super) sites: Vec<(usize, usize)>,
+}
+
+/// Match `aload A ; arraylength` at `pc`, returning `(A, seq_end)`.
+///
+/// Accepts both `aload_0..aload_3` (single-byte) and `aload <u8>` (two-byte).
+/// The wide form (`wide aload <u16>`) is not accepted: `find_modified_locals`
+/// does not decode `wide`-prefixed stores either, so a body containing one
+/// could hide the very store that makes `A` variant. Callers reject such
+/// bodies outright rather than relying on this.
+fn match_invariant_arraylength(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, usize)> {
+    let (local, after_load) = match *code.get(pc)? {
+        // aload_0..aload_3
+        op @ 0x2a..=0x2d => ((op - 0x2a) as usize, pc + 1), // Widening: u8 -> usize (opcode-relative local index)
+        // aload <u8>
+        0x19 => (*code.get(pc + 1)? as usize, pc + 2), // Widening: u8 -> usize (operand byte)
+        _ => return None,
+    };
+    if after_load >= code_len || *code.get(after_load)? != 0xbe {
+        return None;
+    }
+    Some((local, after_load + 1))
+}
+
+/// Find every hoistable loop-invariant `arraylength`, innermost loop first.
+///
+/// A site qualifies when, for the innermost loop containing it:
+/// * the array local is not stored anywhere in the body (`find_modified_locals`
+///   — the same invariance test [`find_loop_hoists`] uses), and
+/// * the local index is below the bitmask's saturation bit, so "not modified"
+///   is a fact about THIS local and not about "some local at or above 63", and
+/// * the site sits in the header's straight-line prefix
+///   ([`straight_line_prefix_of_header`]), so the pre-header may evaluate it
+///   eagerly, and
+/// * the `arraylength` is not itself a branch target, so the two-instruction
+///   sequence cannot be entered halfway, and
+/// * the body contains no `wide` prefix (0xc4) and no `jsr`/`ret`
+///   (0xa8/0xc9/0xa9) — the first because `find_modified_locals` cannot decode
+///   a `wide` store and would report a modified local as invariant, the second
+///   because `detect_loops` does not model subroutine control flow, so "the
+///   body" would not be the set of PCs that can run.
+pub(super) fn find_array_len_hoists(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> Vec<ArrayLenHoist> {
+    if loops.is_empty() {
+        return Vec::new();
+    }
+
+    // Innermost first: the smallest span that contains a site claims it. See
+    // the `ArrayLenHoist` doc for why that is the right end to start from.
+    let mut sorted_loops = loops.to_vec();
+    sorted_loops.sort_by_key(|&(h, b)| b.saturating_sub(h));
+
+    let mut hoists: Vec<ArrayLenHoist> = Vec::new();
+    let mut claimed_pcs: Vec<usize> = Vec::new();
+
+    for &(header, back_edge) in &sorted_loops {
+        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        if loop_end > code_len || header >= loop_end {
+            continue;
+        }
+
+        // Control-flow shapes this analysis does not model. Checked over the
+        // whole body before any site is taken, so one `wide` store late in the
+        // body cannot validate a hoist matched early in it.
+        let mut unmodelled = false;
+        let mut scan = header;
+        while scan < loop_end {
+            if matches!(code[scan], 0xc4 | 0xa8 | 0xa9 | 0xc9) {
+                unmodelled = true;
+                break;
+            }
+            let l = bytecode_len_at(code, scan);
+            if l == 0 {
+                unmodelled = true;
+                break;
+            }
+            scan += l;
+        }
+        if unmodelled {
+            continue;
+        }
+
+        let modified = find_modified_locals(code, header, loop_end);
+        let targets = branch_target_pcs(code, header, loop_end);
+
+        let mut pc = header;
+        while pc < loop_end && pc < code_len {
+            if claimed_pcs.contains(&pc) {
+                pc += bytecode_len_at(code, pc);
+                continue;
+            }
+            let Some((array_local, seq_end)) = match_invariant_arraylength(code, pc, code_len)
+            else {
+                pc += bytecode_len_at(code, pc);
+                continue;
+            };
+            // `find_modified_locals` saturates every local index at bit 63, so
+            // bit 63 means "some local at or above 63 was stored" and proves
+            // nothing about local 63 itself.
+            let invariant = array_local < 63 && (modified & (1u64 << array_local)) == 0;
+            let interior_entered = targets.contains(&(seq_end - 1));
+            let existing_idx = hoists
+                .iter()
+                .position(|h| h.loop_header == header && h.array_local == array_local);
+            // Dominance is a condition on OPENING a record, not on joining one.
+            // It licenses the pre-header's eager evaluation; once some site has
+            // licensed it, the slot holds this array's true length for the whole
+            // body, and any other invariant read of the same length -- including
+            // one behind a conditional -- may take it. Such a site's own null
+            // check goes with it, which is sound because the pre-header already
+            // proved the receiver non-null on this path.
+            let admissible = invariant
+                && !interior_entered
+                && seq_end <= loop_end
+                && (existing_idx.is_some()
+                    || straight_line_prefix_of_header(code, header, pc, &targets));
+            if admissible {
+                claimed_pcs.push(pc);
+                match existing_idx {
+                    Some(i) => hoists[i].sites.push((pc, seq_end)),
+                    None => hoists.push(ArrayLenHoist {
+                        loop_header: header,
+                        loop_end,
+                        array_local,
+                        sites: vec![(pc, seq_end)],
+                    }),
+                }
+                pc = seq_end;
+            } else {
+                pc += bytecode_len_at(code, pc);
+            }
+        }
+    }
+
+    hoists
+}
+
+/// Is `site` reached from `header` by a run of instructions that cannot
+/// branch, cannot throw, and cannot be entered from anywhere else?
+///
+/// If so, control that reaches the loop header at all reaches `site`, so the
+/// pre-header may evaluate the `arraylength` there eagerly and let a null
+/// receiver throw exactly the NPE the body would have thrown, at the same
+/// point in the execution. That is what lets this hoist skip the deopt
+/// machinery [`LoopHoist`] needs.
+///
+/// The admitted prefix is deliberately tiny: local loads and constant pushes
+/// only. `ldc` is excluded (a class-literal or condy resolution can throw),
+/// every arithmetic opcode is excluded (`idiv` throws), and any branch ends
+/// the run. In practice this admits one shape and it is the one that matters —
+/// javac's `iload i ; aload a ; arraylength ; if_icmpge` loop header, where the
+/// run from the header to the `aload` is a single `iload`.
+fn straight_line_prefix_of_header(
+    code: &[u8],
+    header: usize,
+    site: usize,
+    targets: &[usize],
+) -> bool {
+    let mut pc = header;
+    while pc < site {
+        // A branch landing INSIDE the prefix reaches `site` without having
+        // come through the header, so "the header was entered" would no longer
+        // imply "this instruction runs".
+        if pc != header && targets.contains(&pc) {
+            return false;
+        }
+        let pure_push = matches!(code[pc],
+            // nop
+            0x00
+            // aconst_null .. dconst_1
+            | 0x01..=0x0f
+            // bipush / sipush
+            | 0x10 | 0x11
+            // iload / lload / fload / dload / aload (operand-byte forms)
+            | 0x15..=0x19
+            // iload_0 .. aload_3
+            | 0x1a..=0x2d);
+        if !pure_push {
+            return false;
+        }
+        let l = bytecode_len_at(code, pc);
+        if l == 0 {
+            return false;
+        }
+        pc += l;
+    }
+    pc == site
+}
+
+/// Every branch target inside `[start, end)`, including the `switch` tables.
+///
+/// Used to reject a two-instruction sequence whose second instruction can be
+/// jumped to directly: replacing the pair with one slot load would delete the
+/// landing pad.
+fn branch_target_pcs(code: &[u8], start: usize, end: usize) -> Vec<usize> {
+    let mut targets = Vec::new();
+    let mut pc = start;
+    while pc < end {
+        let op = code[pc];
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            break;
+        }
+        match op {
+            // goto and every two-byte-offset conditional branch.
+            0xa7 | 0x99..=0xa6 | 0xc6 | 0xc7 => {
+                if pc + 2 < code.len() {
+                    let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
+                    if let Some(t) = pc.checked_add_signed(off as isize) {
+                        // Cast: address arithmetic
+                        targets.push(t);
+                    }
+                }
+            }
+            // goto_w
+            0xc8 => {
+                if pc + 4 < code.len() {
+                    let off =
+                        i32::from_be_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                    if let Some(t) = pc.checked_add_signed(off as isize) {
+                        // Cast: address arithmetic
+                        targets.push(t);
+                    }
+                }
+            }
+            // tableswitch / lookupswitch: every target is a branch target, and
+            // decoding their variable-length payloads here would duplicate
+            // `bytecode_len_at`. Treat the whole span as entered rather than
+            // half-decode them -- a switch in the body is rare and losing the
+            // hoist there costs nothing anyone can measure.
+            0xaa | 0xab => {
+                for t in pc..end {
+                    targets.push(t);
+                }
+            }
+            _ => {}
+        }
+        pc += len;
+    }
+    targets
+}
+
 /// Information about a loop-invariant FP load that can be hoisted.
 /// Pattern: dload/fload of a local that is not modified within the loop body.
 #[derive(Debug)]
@@ -124,10 +438,11 @@ pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         // is 4 bytes for the load/store/ret family, and `wide iinc <index>
         // <const>` is 6 bytes (extra 2-byte signed constant). The modified
         // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
-        // form. Currently latent — `jit_scan` rejects `wide`, so no compiled
-        // method contains it — but the length table must stay correct as
-        // defense-in-depth so every PC-stepping consumer stays in lockstep if
-        // `wide` is ever accepted. Keep the regalloc.rs `bc_len` twin in sync.
+        // form. NOT latent, whatever this comment used to say: `jit_scan`
+        // accepts the widened load/store and `iinc` forms
+        // (`x64/bytecode_compat.rs`), so compiled methods DO contain `wide` and
+        // every PC-stepping consumer of this table is load-bearing rather than
+        // defensive. Keep the regalloc.rs `bc_len` twin in sync.
         0xc4 => {
             if pc + 1 < code.len() && code[pc + 1] == 0x84 {
                 6 // wide iinc
@@ -530,6 +845,93 @@ pub fn region_bounds_are_live(bounds_addr: usize) -> bool {
         let end = words[i * 2 + 1].load(Ordering::Acquire);
         base != 0 && end > base
     })
+}
+
+/// F-08 — is a G1 collector's geometry published, so an inline G1 post-write
+/// barrier can be emitted at all?
+///
+/// The THIRD bounds-shaped predicate in this file, and it must not be confused
+/// with either of the other two. [`region_bounds_are_live`] answers "may an
+/// inline reference store skip the collector's barrier", and under G1 the
+/// answer is permanently NO — that is defect G1-2's closure and this function
+/// does not touch it. This one answers a question that only arises AFTER that
+/// no: "if the emitter is going to run a real G1 barrier inline, does it have
+/// the numbers?"
+///
+/// The numbers live in `gc/src/gen_heap.rs::JIT_G1_BARRIER`, published once by
+/// `G1Collector::new` and cleared (owner-checked) on its `Drop`. `arena_len`
+/// (word 1) is the liveness flag and is stored last with `Release`, so a
+/// non-zero length implies the other four words are visible.
+///
+/// Fail-safe in both race directions, exactly as its sibling is: a compile that
+/// observes the table before the first publish, or after a collector is
+/// dropped, reports "not live" and the caller emits the `jit_putfield_object`
+/// helper call it emits today. A `0` address (the JIT unit-test helper tables,
+/// and any embedding that never wired the field) is likewise not live, which is
+/// what stops a caller baking a `MOV r64, 0` + `SUB r64, [r64]` that would
+/// fault.
+pub fn g1_barrier_table_live(g1_barrier_addr: usize) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if g1_barrier_addr == 0 {
+        return false;
+    }
+    // SAFETY: `g1_barrier_addr` is non-zero here and is only ever set from
+    // `cratonvm_gc::jit_g1_barrier_addr()` — the address of the `'static`
+    // `JIT_G1_BARRIER: JitG1BarrierTable`, whose sole field is
+    // `[AtomicUsize; 5]` and which lives for the whole process — or, in this
+    // crate's tests, from a `static [AtomicUsize; 5]`. Both are valid, aligned
+    // and initialised for the loads below, which pair race-freely with the
+    // collector's `Release` store of word 1.
+    let words = unsafe { &*(g1_barrier_addr as *const [AtomicUsize; 5]) };
+    let arena_len = words[1].load(Ordering::Acquire);
+    if arena_len == 0 {
+        return false;
+    }
+    // A published table with a zero base or a zero region mask would make the
+    // emitted sequence wrong rather than merely useless, so treat it as not
+    // live rather than trusting the publisher. `region_mask` is
+    // `!(region_size - 1)` and can never legitimately be zero.
+    words[0].load(Ordering::Relaxed) != 0 && words[2].load(Ordering::Relaxed) != 0
+}
+
+/// F-08 — `CRATONVM_G1_INLINE_BARRIER`. Opt-in, default OFF.
+///
+/// See the flag's doc on `cratonvm_types::GcFlags` for why it ships off: this
+/// is a code-generation change on an experimental collector, and the last
+/// inline barrier this JIT had (`Compiler::inline_card_mark_available`, a
+/// DIFFERENT mechanism against a DIFFERENT table) was disabled after a WildFly
+/// boot audit found an old object left on a clean card. That one is not
+/// re-enabled by this and stays a constant `false`.
+pub fn g1_inline_barrier_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = G1_INLINE_BARRIER_FORCED.with(|c| c.get()) {
+        return forced;
+    }
+    cratonvm_types::flags().gc.g1_inline_barrier
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`g1_inline_barrier_enabled`].
+    ///
+    /// THREAD-local, not a process-global, and that is the whole point. The
+    /// real switch is a `cratonvm_types::flags()` field latched once per
+    /// process from the environment, so a test cannot vary it without
+    /// publishing the change to every other test in the binary — the exact
+    /// hazard that produced this workspace's narrow-oop-geometry flake, and the
+    /// reason `RememberedSet::add_reference_in_generation_within` exists on the
+    /// GC side. A thread-local override is visible only to the test that set
+    /// it, and `cargo test` gives each test its own thread.
+    ///
+    /// TRI-STATE since 2026-09-04: `Some(true)` forces the arm on, `Some(false)`
+    /// forces it off, `None` defers to the real flag. It used to be a bare
+    /// `bool` where `false` meant "defer", which was adequate only while the
+    /// real flag was opt-in — once the default flipped, "defer" and "off"
+    /// stopped being the same state and the off case became untestable. The
+    /// contract test needs both directions, because "no table" and "no helper"
+    /// are not the only ways this arm must decline.
+    pub(crate) static G1_INLINE_BARRIER_FORCED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Inline TLAB `new` — bump allocation emitted directly in compiled code.
@@ -980,6 +1382,199 @@ pub fn inline_rbp_tls_disp() -> usize {
 /// This is shared with the OSR trampoline emitter in `lib.rs`; keeping the
 /// platform byte in one place prevents that independently emitted prologue
 /// from silently retaining the Windows `gs:` prefix on Linux.
+// ── JIT thread-pointer mirror ────────────────────────────────────────
+//
+// `jit_get_current_thread` is a helper CALL: `mov rax, imm64; call rax`, a
+// `note_jit_boundary` bump, a `thread_local!` access, `ret`. Both prologues
+// paid it -- the single-pass tier once per invocation for the shadow-stack
+// thread slot (plus a ten-instruction "inherit from the caller frame"
+// sequence for the TLAB thread cache), the optimizing tier once per
+// invocation unconditionally -- and `fib` paid it 1.4 billion times.
+//
+// The RBP mirror above already shows the cheaper shape: the VM keeps a raw
+// TLS word in lockstep with a Rust `thread_local!`, and compiled code reads
+// it with one segment-prefixed `mov`. This is the same shape for the thread
+// pointer. The VM publishes through `publish_jit_thread_mirror` at exactly
+// the sites that set `JIT_THREAD` (`set_jit_thread`, `restore_jit_thread`,
+// `clear_jit_thread`), so the mirror equals `JIT_THREAD` whenever compiled
+// code can run. Off (`CRATONVM_JIT_TLS_THREAD_FETCH=0`, or a failed probe)
+// every site falls back to the helper call byte for byte.
+
+/// Kill switch for the thread-pointer mirror: `CRATONVM_JIT_TLS_THREAD_FETCH=0`.
+fn tls_thread_fetch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_TLS_THREAD_FETCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// TLS displacement of the `JIT_THREAD` mirror (`gs:` on Windows, `fs:` on
+/// Linux), or 0 when unavailable. Process-cached, thread-invariant.
+#[cfg(windows)]
+pub fn jit_thread_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !tls_thread_fetch_enabled() {
+            return 0;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TlsAlloc() -> u32;
+            fn TlsSetValue(idx: u32, val: *mut core::ffi::c_void) -> i32;
+        }
+        const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+        const TEB_TLS_SLOTS_OFF: usize = 0x1480;
+        unsafe {
+            let slot = TlsAlloc();
+            if slot == TLS_OUT_OF_INDEXES {
+                return 0;
+            }
+            let sentinel: usize = 0x4A54_5448_5244_0000 | (slot as usize & 0xFFFF);
+            if TlsSetValue(slot, sentinel as *mut core::ffi::c_void) == 0 {
+                return 0;
+            }
+            let candidate = TEB_TLS_SLOTS_OFF + (slot as usize) * 8;
+            let found = if read_gs_qword(candidate) == sentinel {
+                candidate
+            } else {
+                let mut d = TEB_TLS_SLOTS_OFF;
+                let end = TEB_TLS_SLOTS_OFF + 64 * 8;
+                let mut hit = 0;
+                while d < end {
+                    if read_gs_qword(d) == sentinel {
+                        hit = d;
+                        break;
+                    }
+                    d += 8;
+                }
+                hit
+            };
+            TlsSetValue(slot, core::ptr::null_mut());
+            found
+        }
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+thread_local! {
+    pub(super) static LINUX_JIT_THREAD_MIRROR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn jit_thread_tls_disp() -> usize {
+    use std::sync::OnceLock;
+    static DISP: OnceLock<usize> = OnceLock::new();
+    *DISP.get_or_init(|| {
+        if !tls_thread_fetch_enabled() {
+            return 0;
+        }
+        LINUX_JIT_THREAD_MIRROR.with(|cell| {
+            let fs_base = unsafe { read_fs_qword(0) };
+            let cell_addr = cell as *const std::cell::Cell<usize> as usize;
+            let delta = (cell_addr as i128) - (fs_base as i128);
+            let Ok(delta32) = i32::try_from(delta) else {
+                return 0;
+            };
+            if delta32 == 0 {
+                return 0;
+            }
+            let old = cell.replace(0x4A54_5448_5244_4C58);
+            let probed = unsafe { read_fs_qword(delta32 as isize) };
+            cell.set(old);
+            if probed == 0x4A54_5448_5244_4C58 {
+                (delta32 as u32) as usize
+            } else {
+                0
+            }
+        })
+    })
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn jit_thread_tls_disp() -> usize {
+    0
+}
+
+/// VM side: keep the mirror equal to `JIT_THREAD`. A no-op when the mirror is
+/// unavailable, so the three callers need no gate of their own.
+pub fn publish_jit_thread_mirror(ptr: usize) {
+    #[cfg(windows)]
+    {
+        let disp = jit_thread_tls_disp();
+        if disp != 0 {
+            unsafe { write_gs_qword(disp, ptr) };
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if jit_thread_tls_disp() != 0 {
+            LINUX_JIT_THREAD_MIRROR.with(|c| c.set(ptr));
+        }
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// What compiled code would read right now; `None` when the mirror is off.
+pub fn jit_thread_mirror_read() -> Option<usize> {
+    let disp = jit_thread_tls_disp();
+    if disp == 0 {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        Some(unsafe { read_gs_qword(disp) })
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some(unsafe { read_fs_qword(disp as u32 as i32 as isize) })
+    }
+    #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+pub(super) unsafe fn write_gs_qword(disp: usize, val: usize) {
+    core::arch::asm!(
+        "mov qword ptr gs:[{addr}], {val}",
+        addr = in(reg) disp,
+        val = in(reg) val,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// One post-call sentinel compare instead of two -- **default ON**, opt out
+/// with `CRATONVM_JIT_MERGED_CALL_SENTINEL=0`.
+///
+/// Every compiled call used to be followed by the callee-deopt check and the
+/// exception check, each materialising `i64::MIN` (a 10-byte `mov r, imm64`)
+/// and comparing RAX against it. Both ask the same question of the same
+/// register; the merged shape asks it once on the hot path and leaves the two
+/// original checks on the cold side, where they run only when the callee
+/// actually returned the sentinel. Off restores the previous two-check
+/// emission byte for byte, so the arms are A/B-able in one binary.
+pub fn merged_call_sentinel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGED_CALL_SENTINEL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub(crate) const fn inline_rbp_tls_segment_prefix() -> u8 {
     #[cfg(windows)]
     {
@@ -1757,6 +2352,52 @@ pub(super) fn shadow_no_savebase() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_RIP_SAFEPOINT_POLL=0` — emit the safepoint poll as
+/// `MOV R11, imm64 ; TEST BYTE [R11], 0xFF` again instead of the one-instruction
+/// `TEST BYTE [rip+disp32], 0xFF`.
+///
+/// Default ON. The two forms read the same byte and branch the same way, so
+/// this is a bisect lever rather than a safety valve — but the poll is on the
+/// back edge of every compiled loop in the VM, which is the largest blast
+/// radius any single instruction change in this backend has, and the RIP form
+/// is the first RIP-relative operand the single-pass emitter has ever
+/// produced. A wrong displacement here reads a byte NEAR the flag and is a
+/// silent liveness bug, not a fault, so it needs a lever that reaches the
+/// emission and not just the analysis.
+///
+/// Reaching for the out-of-reach fallback is NOT what this switch is for: that
+/// path is chosen per site by `emit_test_mem8_abs_imm8`'s own ±2GB test.
+pub(super) fn jit_rip_safepoint_poll_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RIP_SAFEPOINT_POLL")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
+/// `CRATONVM_JIT_FUSED_BOUNDS_LOAD=0` — emit the array bounds check as
+/// `MOV R10D, [RAX+len] ; CMP ECX, R10D ; JAE stub` again instead of the fused
+/// `CMP ECX, [RAX+len] ; JAE stub`.
+///
+/// Default ON. Both forms compare the same two numbers against the same
+/// header word and take the same branch; what differs is whether R10D is live
+/// at the stub, and the stub re-loads the length unconditionally so it is
+/// correct under either. The switch exists because the fused form is one
+/// instruction on EVERY bounds check the VM emits — every array access outside
+/// a proved counted loop — so if an array-heavy workload regresses, this is
+/// the arm that separates "the fold" from everything else in the same build.
+pub(super) fn jit_fused_bounds_load_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FUSED_BOUNDS_LOAD")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
+}
+
 /// Cooperative JIT safepoint polling — whether the backend emits an inline
 /// poll of `helpers.safepoint_flag_addr` (the GC barrier's
 /// `stw_requested` flag byte) at method entry and loop back-edges. Polling is
@@ -1995,6 +2636,160 @@ pub(super) fn direct_call_arg_maps_enabled() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALL_ARG_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Name a SELF-RECURSIVE call's reference arguments in its safepoint map
+/// (`CRATONVM_JIT_SELF_CALL_ARG_MAPS`, **default-ON; `=0` restores the pre-fix
+/// arrangement**).
+///
+/// The sibling of [`direct_call_arg_maps_enabled`], for the one invoke arm that
+/// change did not reach. The 0xb8 self-recursive site pops its arguments and,
+/// if any of them is a reference, raises `pending_staged_args_unmapped` — which
+/// makes `map_incomplete` true at the next safepoint, takes that safepoint's
+/// `moving_young_coverage_complete` false through
+/// `relocation_coverage_complete`, and so takes `fully_shadow_covered` false
+/// for the WHOLE method.
+///
+/// It did not have to. The arguments this arm stages are still in ordinary
+/// frame slots at the safepoint that consumes the flag: the non-tail form emits
+/// its stack-guard safepoint (and then the recursive `CALL`) only AFTER
+/// `pop_invoke_args`, and `emit_stack_arg_setup` — the step that moves them
+/// into the un-nameable outgoing-ABI area — runs later still. A frame slot is
+/// exactly what `pending_staged_arg_oops` exists to name, so the honest answer
+/// at that safepoint is the slot, not a refusal.
+///
+/// MEASURED on `probes/OopMapSelfCall.java`: the two self-recursive methods are
+/// the ONLY two methods in the whole run whose coverage claim is false
+/// (`shadow=false shadow_missing_pcs=[45]` / `[23]`, both the self-call bci),
+/// and every one of the eight `scauses` reads zero — the refusal arrives
+/// through `map_incomplete`, whose own census names it `staged_unmappable`.
+///
+/// An argument whose home is NOT a frame slot still fails the safepoint closed:
+/// a register- or xmm-resident value is precisely what a frame-slot map cannot
+/// describe, and that is the case the flag was right about.
+/// May a REVIVED merge block claim its reconstructed operand-stack oop marks
+/// are exact (`CRATONVM_JIT_MERGE_MARKS_EXACT`, **default-ON; `=0` restores the
+/// pre-fix flag**)?
+///
+/// When the walk arrives at a branch target dead (the block before it ended in
+/// a `goto`/`return`/`athrow`), the operand stack is reconstructed from
+/// `branch_target_stack_depth` and the marks from
+/// `branch_target_stack_oop_marks`. The marks half was fixed once already: a
+/// blanket `vec![false; depth]` there permanently mis-marked any reference
+/// carried across the branch from before it.
+///
+/// The EXACTNESS flag was not fixed with it. It kept reading
+/// `expected_depth == 0` -- the honest answer for the blanket fallback, and the
+/// wrong one once the real marks are in hand. `record_oop_map` seeds
+/// `map_incomplete` from that flag, so every safepoint in the revived block
+/// lost its relocation claim, and `fully_shadow_covered` ANDs it over the
+/// method.
+///
+/// MEASURED: on `RTreeRangeGc` and `RPriorityQueueGc` it was the ONLY remaining
+/// cause after the self-call repair -- `checkMap` 6, `checkSet` 9,
+/// `singleThreaded` 3 -- and every failing pc is an arm or the merge of one
+/// `?:` feeding a string concat.
+///
+/// Sound for the same reason the recorded marks are usable at all: JVMS 4.10.1
+/// admits no merge of a reference with a primitive, so a merge point's
+/// predecessors must agree about which slots hold references and whichever one
+/// was captured first speaks for all of them. The fallback -- no recorded marks,
+/// or a length that does not match the depth -- still fails closed, because
+/// there it genuinely did guess.
+/// May a method containing an INLINE SPLICE claim `fully_oop_covered`
+/// (`CRATONVM_JIT_INLINE_OOP_COVERAGE`, **default-ON; `=0` restores the
+/// previous predicate verbatim**)?
+///
+/// On: the term is `incomplete_oop_maps == 0` -- no safepoint of this
+/// compilation published a short map. Off: the historical
+/// `inline_sites.is_empty()` -- no splice at all, whatever the maps say.
+///
+/// The two changes are one change. Retiring the blanket term is only sound
+/// because the count replacing it is unmaskable, and the count is only worth
+/// having because the blanket term was what incidentally covered the mask. See
+/// `Compiler::incomplete_oop_maps` and the comment at the assignment.
+pub(super) fn inline_oop_coverage_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_OOP_COVERAGE") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Does a method whose locals the oop dataflow cannot describe AT ALL fail its
+/// safepoints closed (`CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED`, **default-ON;
+/// `=0` restores the silent claim**)?
+///
+/// `compute_local_oop_masks` returns empty vectors above its supported local
+/// count. Stage 2 is wrapped in `if !self.local_oop_masks.is_empty()`, so such
+/// a method contributed no slots, bumped no cause and left `map_incomplete`
+/// alone -- publishing a map that named none of its reference locals while
+/// `fully_oop_covered` read TRUE. See
+/// `map_incomplete_cause::LOCAL_MASK_UNSUPPORTED` for the measurement.
+/// `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1` -- a safepoint whose
+/// local-oop dataflow was never REACHED must not ship a map claiming complete
+/// frame-slot coverage.
+///
+/// Sibling of [`local_mask_fail_closed_enabled`], which covers the case where
+/// the dataflow never ran for the METHOD. This one covers a pc inside a method
+/// it did run on. Default OFF (that one defaults ON) because this population is
+/// larger and its refusal cost is still being priced -- see the call site in
+/// `x64::safepoint` for the measurement that motivated it.
+pub(super) fn local_mask_unreached_fail_closed_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED")
+            .is_some()
+    })
+}
+
+pub(super) fn local_mask_fail_closed_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn merge_marks_exact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_MERGE_MARKS_EXACT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+pub(super) fn self_call_arg_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_SELF_CALL_ARG_MAPS") {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
@@ -2626,19 +3421,34 @@ pub(super) fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -
 /// definitely-oop; primitive stores (`istore`/`lstore`/`fstore`/`dstore`/
 /// `iinc`) make it definitely-non-oop; long/double stores also clear the
 /// category-2 high half. All other opcodes leave the local types unchanged.
-pub(super) fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -> u64 {
+pub(super) fn oop_dataflow_transfer(
+    code: &[u8],
+    pc: usize,
+    mask: u64,
+    max_locals: usize,
+    base: usize,
+) -> u64 {
+    // `base` is the first JVM local slot this 64-bit word describes, so bit `b`
+    // means local `base + b`. These two closures are the ONLY places a local
+    // index becomes a bit position -- which is why widening the analysis past
+    // 64 locals leaves all twenty opcode arms below untouched. `base == 0`
+    // reproduces the pre-window behaviour exactly.
     let set_oop = |m: u64, k: usize| -> u64 {
-        if k < 64 && k < max_locals {
-            m | (1u64 << k)
-        } else {
-            m
+        if k >= max_locals {
+            return m;
+        }
+        match k.checked_sub(base) {
+            Some(b) if b < 64 => m | (1u64 << b),
+            _ => m,
         }
     };
     let clr = |m: u64, k: usize, span: usize| -> u64 {
         let mut m = m;
         for j in k..k + span {
-            if j < 64 {
-                m &= !(1u64 << j);
+            if let Some(b) = j.checked_sub(base) {
+                if b < 64 {
+                    m &= !(1u64 << b);
+                }
             }
         }
         m
@@ -2711,13 +3521,129 @@ pub(super) fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_local
 /// last false-negative that blocked fully-covered status for reference-param
 /// methods. The caller passes `0` when the precise gate is off, so the default
 /// path is byte-identical (entry state empty, exactly as before).
-pub(super) fn compute_local_oop_masks(
+/// The most JVM local slots the windowed analysis will describe: four words.
+///
+/// The JVMS allows 65535. A method past this stays on the conservative path and
+/// now SAYS so (`map_incomplete_cause::LOCAL_MASK_UNSUPPORTED`) instead of
+/// publishing a map that names none of its locals.
+pub(super) const MAX_WINDOWED_LOCALS: usize = 256;
+
+/// Widen the "must be oop" local dataflow past 64 locals
+/// (`CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS`, **default-ON; `=0` restores the 64-slot
+/// cliff**).
+///
+/// Above 64 locals the analysis returned EMPTY vectors, so such a method had no
+/// precise local coverage at all -- the oop map named none of its reference
+/// locals and every safepoint fell back to the conservative sweep. Measured on
+/// `probes/OopMapWideLocals.java` (83 locals, 80 of them live references across
+/// allocations that collect): 409 of 409 safepoints, none of them naming a
+/// local. `BOBYQAOptimizer.trsbox` (90+ locals) is the shape it was first
+/// noticed on.
+///
+/// The analysis itself is unchanged. It is run once per 64-local window, with
+/// `oop_dataflow_transfer`'s `base` selecting which slots a word describes. A
+/// slot outside the window simply has no bit; the same worklist runs over the
+/// same CFG each time, so this is a wider answer, not a weaker one.
+///
+/// THE DEOPT SNAPSHOT IS THE COUPLING TO KNOW ABOUT.
+/// `build_and_record_deopt_point`'s `is_oop` reads bits `< 64`, so a >64-local
+/// method now has a SECOND source where `classify_local_kinds` was the only one
+/// -- the same refinement already shipped below the cliff, and strictly more
+/// precise, since a set bit means "astore'd on every reaching path".
+pub(super) fn wide_local_oop_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    })
+}
+
+/// How many 64-local windows a method needs, or `None` when it is past what the
+/// analysis will describe. One window is the historical case.
+pub(super) fn local_oop_window_count(max_locals: usize) -> Option<usize> {
+    if max_locals == 0 {
+        return None;
+    }
+    if !wide_local_oop_maps_enabled() {
+        return if max_locals <= 64 { Some(1) } else { None };
+    }
+    if max_locals > MAX_WINDOWED_LOCALS {
+        return None;
+    }
+    Some(max_locals.div_ceil(64))
+}
+
+/// The windowed form: `masks[w * code_len + pc]` describes locals
+/// `w*64 .. w*64+64` at `pc`. An empty result is a REFUSAL.
+pub(super) fn compute_local_oop_masks_windowed(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+    param_oop_mask: u64,
+) -> (Vec<u64>, Vec<bool>, usize) {
+    let Some(windows) = local_oop_window_count(max_locals) else {
+        return (Vec::new(), Vec::new(), 0);
+    };
+    if code_len == 0 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let mut all: Vec<u64> = Vec::with_capacity(windows * code_len);
+    let mut reached_all: Vec<bool> = Vec::new();
+    for w in 0..windows {
+        // `param_oop_mask` describes slots 0..63, so only the first window is
+        // seeded from it. A reference parameter above slot 63 needs 64 slots of
+        // parameters ahead of it; it seeds conservatively (not-oop) and its
+        // first `astore` corrects it.
+        let seed = if w == 0 { param_oop_mask } else { 0 };
+        let (m, r) = compute_local_oop_masks_window(code, code_len, max_locals, seed, w * 64);
+        if m.is_empty() {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        // The CFG walk is identical across windows, so `reached` is too.
+        if w == 0 {
+            reached_all = r;
+        }
+        all.extend_from_slice(&m);
+    }
+    (all, reached_all, windows)
+}
+
+/// The historical entry point: window 0 only, empty above 64 locals.
+///
+/// Kept for the INLINE-SPLICE path, whose `InlineOopScope` is a single `u64` by
+/// construction -- a spliced callee above 64 locals still fails its safepoints
+/// closed through `mask_at_cur() == None`, which is what that type documents.
+// Visible to the whole crate, not just `x64`: this is a BYTECODE dataflow with
+// nothing architecture-specific in it, and the aarch64 backend needs the same
+// answer to name its reference locals at a safepoint. It lives here because x64
+// was the first caller, not because it belongs to x64 (`x64::stack_kinds` is
+// already shared the same way).
+pub(crate) fn compute_local_oop_masks(
     code: &[u8],
     code_len: usize,
     max_locals: usize,
     param_oop_mask: u64,
 ) -> (Vec<u64>, Vec<bool>) {
     if max_locals == 0 || max_locals > 64 || code_len == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    compute_local_oop_masks_window(code, code_len, max_locals, param_oop_mask, 0)
+}
+
+fn compute_local_oop_masks_window(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+    param_oop_mask: u64,
+    base: usize,
+) -> (Vec<u64>, Vec<bool>) {
+    if max_locals == 0 || code_len == 0 || base >= max_locals {
         return (Vec::new(), Vec::new());
     }
     const TOP: u64 = u64::MAX;
@@ -2739,7 +3665,7 @@ pub(super) fn compute_local_oop_masks(
         if guard == 0 {
             break;
         }
-        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals);
+        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals, base);
         for succ in oop_dataflow_successors(code, code_len, pc) {
             if succ >= code_len {
                 continue;
@@ -2759,10 +3685,12 @@ pub(super) fn compute_local_oop_masks(
     }
     // Mask off bits beyond max_locals (TOP-init residue on any unreached PC is
     // irrelevant — callers gate on `reached`).
-    let valid_bits = if max_locals >= 64 {
+    // Bits past this window's share of `max_locals` are TOP-init residue.
+    let in_window = max_locals.saturating_sub(base);
+    let valid_bits = if in_window >= 64 {
         u64::MAX
     } else {
-        (1u64 << max_locals) - 1
+        (1u64 << in_window) - 1
     };
     for m in in_mask.iter_mut() {
         *m &= valid_bits;
@@ -7385,4 +8313,160 @@ mod loop_xform_tests {
             "the capability `zgc_relocation_permitted` trusts rests on exactly              the property asserted above"
         );
     }
+}
+
+/// Gated inline reference stores — **default ON**, opt out with
+/// `CRATONVM_JIT_GATED_REF_STORE=0`.
+///
+/// The switch exists so the change can be A/B'd in ONE binary, which the
+/// feature it replaces could not be: `CRATONVM_NO_JIT_INLINE_PUTFIELD` measured
+/// exactly zero on the default collector, because the path it disabled was
+/// already unreachable there (`region_bounds_are_live` is false under G1 and
+/// ZGC, so every receiver fell through six containment compares into the
+/// helper). A kill switch that cannot change a number is not a lever.
+///
+/// Turning this off restores that behaviour exactly — the store takes
+/// `jit_putfield_object`, with its full SATB pre-barrier and the collector's
+/// own post barrier — so the off arm is a supported configuration, not a
+/// broken one.
+pub fn gated_ref_store_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_GATED_REF_STORE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// The gated inline reference store on the **optimizing (IR) tier** — default
+/// ON, opt out with `CRATONVM_JIT_IR_REF_STORE=0`.
+///
+/// A separate switch from [`gated_ref_store_enabled`] above, and it has to be:
+/// the two tiers emit different code from the same barrier plan, so one lever
+/// covering both could not tell "the plan is wrong" from "the new emitter is
+/// wrong". The single-pass switch stays the lever for the plan itself; this one
+/// is the lever for THIS emitter.
+///
+/// Why the optimizing tier needed its own arm at all: it lowered every
+/// reference store to `jit_putfield_object` unconditionally, so the barrier
+/// plan published on 2026-09-02 was inert exactly where hot loops are compiled.
+/// A probe of nothing but reference stores in a counted loop reported
+/// `gated=0 declined=0` — not "declined", but never asked, because this tier
+/// had no arm to ask with.
+///
+/// Off ⇒ the unconditional helper call this tier emitted before, which is a
+/// supported configuration and the first thing to set if a compiled reference
+/// store is suspected of losing a card or an SATB entry.
+/// `CRATONVM_DBG_IR_REF_STORE_TRACE=1` — count, at RUN time, how many gated
+/// reference stores took the inline path and how many fell through to the
+/// helper. Default off.
+///
+/// The compile-time `gated=N` census cannot answer this, and the difference
+/// matters: a sequence emitted at two sites whose compactness gate never passes
+/// is five extra instructions in front of the same helper call it always made.
+/// Costs a `LOCK INC` per store, so it is a diagnostic arm, never a timed one.
+/// `CRATONVM_DBG_SP_REF_STORE_TRACE=1` — the SINGLE-PASS twin of
+/// [`ir_ref_store_trace_enabled`]. Default off; costs a `LOCK INC` per store,
+/// so it is a diagnostic arm and never a timed one.
+pub fn sp_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SP_REF_STORE_TRACE").is_some()
+    })
+}
+
+pub fn ir_ref_store_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_REF_STORE_TRACE").is_some()
+    })
+}
+
+pub fn ir_gated_ref_store_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REF_STORE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// The deferred operand-stack register cache for **every** method rather than
+/// only for call-free pure kernels — `CRATONVM_JIT_OPERAND_CACHE=1`, default
+/// **OFF**, and this comment is mostly about why.
+///
+/// # What the veto costs today
+///
+/// `push_from_rax` parks a pushed value in a scratch register instead of
+/// storing it to the frame, so a value consumed by the next bytecode never
+/// makes the memory round trip. It is gated on `pure_kernel`: no invokes, no
+/// MIC/PIC or indy sites, no field or static-field ops, no allocation, no array
+/// allocation, no typechecks, no inline sites, no speculative BCE guards. One
+/// `getfield` anywhere in a method turns it off for the whole method, so it
+/// never engages on application code — every operand-stack push is a frame
+/// store and every pop a frame load.
+///
+/// # Why the obvious widening is WRONG, stated exactly
+///
+/// The comment at that gate blamed "the broad R8/R9 experiment regressed
+/// call-heavy methods because each call flushed live scratch values". That
+/// reads as a cost argument and is not one: a flush emits the store the frame
+/// push would have emitted anyway, only later.
+///
+/// The real blocker is a register collision. `SCRATCH_REGS` is `[R8, R9]` and
+/// `ARG_REGS` is `[RCX, RDX, R8, R9]` on Win64, `[RDI, RSI, RDX, RCX, R8, R9]`
+/// on System V — **R8 and R9 are argument registers on both**. Every helper
+/// call marshalling three arguments writes R8; four writes R9. Only sites that
+/// call `flush_scratch_registers` first are safe, and the emitter has far more
+/// `emit_call_absolute` sites than flush sites: the checked getfield helper,
+/// `jit_putfield_object`, the TLAB post-init, the write barrier and the
+/// inline-cache slow path all marshal into ARG_REGS without one. Under
+/// `pure_kernel` none of them is reachable, which is why the collision has
+/// never mattered.
+///
+/// Turning this on without that audit produces wrong code, measurably: with it
+/// default-on, `test_compile_fib` returned 20 for `fib(10)` and
+/// `test_getfield_putfield_roundtrip` returned garbage.
+///
+/// # What it would take
+///
+/// Either an audit that puts a flush in front of every ARG_REGS write, or a
+/// scratch pair that is not an argument register. There is no free caller-saved
+/// GPR pair on either ABI — RAX is the accumulator, R10 belongs to bounds
+/// checks and SIMD, R11 stages call targets — so the second route means
+/// callee-saved registers, which are already `LOCAL_REGS` and would need
+/// prologue save/restore and a GC-map story of their own. Neither is a flag
+/// flip, and this flag exists so that whoever does the work can measure the
+/// two arms in one binary.
+///
+/// **The frame-growth defect this was blamed for does not reproduce**, and
+/// this comment claimed the opposite between 2026-09-01 and 2026-09-02.
+/// Carrying the home word on `StackSlot::Scratch` and reserving it at PUSH time
+/// made `push_from_rax` advance the spill cursor; the OSR entry's local homes
+/// come off the same layout, so an OSR transition loaded the wrong words. That
+/// shipped a nondeterministic heap corruption and was reverted the same day,
+/// leaving a note that the growth itself was still open.
+///
+/// It is not. The spill census (`crate::spill_cursor_counts`) shows flush
+/// reservations are a small constant that does not move even when the budget is
+/// cut hard enough to refuse 177 compiles, and that peak usage tracks
+/// `max_stack` rather than the number of calls a method makes;
+/// `Compiler::flush_home` carries the inequality that explains why reserving is
+/// already optimal. Nothing here is a prerequisite for widening this flag any
+/// more — the register collision above is, and it still is.
+pub fn operand_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OPERAND_CACHE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
 }

@@ -1,6 +1,40 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
 
+## RESOLVED 2026-09-04 -- two complementary fixes, and the crash was never a GC root
+
+| configuration | SIGSEGV | ref-array OOM | completes | `actual` |
+|---|---|---|---|---|
+| credit, no arena fix | 2-3 of 4 | 0 | when it survives | 99 96x |
+| arena fix, no credit | 0 | **6264** | **no** | -- |
+| **both** | **0 of 5** | **0** | **yes, 555-728 s** | **99953-99978** |
+
+Against this page's opening state: `98304` with **1497** ref-array
+`OutOfMemoryError`s in ~1519 s. Regression suite 88/88. Compaction fully intact
+(25 cycles, 545893 objects relocated).
+
+**Two independent defects, one symptom each.**
+
+1. **The OOM** is what this page is about, and the repair is the ZGC pinned-peer
+   credit plus the blocked-peer shadow-stack scan: a blocked peer's coverage can
+   be discharged by pinning, so relocation is no longer refused on nearly every
+   cycle. `CRATONVM_XT_PINNED_PEER_DEPTH=1` + `CRATONVM_XT_PEER_SHADOW_SCAN=1`.
+
+2. **The SIGSEGV** that discharge exposed is a separate, older collector bug and
+   has nothing to do with JIT roots: `relocate_stw`'s slide writes into a
+   granule the arena DECOMMITTED, because the destination search screens by page
+   and liveness and never by commit state. `Arena::ensure_committed_span` fixes
+   it. Full evidence on
+   `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+
+The credit never corrupted anything. It raises compaction, compaction runs
+slides, and slides are what land in a decommitted granule -- which is why the
+crash tracked the credit so convincingly, and why seven repairs aimed at stale
+references in compiled frames all changed nothing.
+
+**Neither fix alone retires this page.** Without the arena fix the class
+crashes; without the credit it logs 6264 OOMs and never finishes.
+
 ## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
 
 The `--jdk-only` corpus hit this class, so it got the three arms. Both CratonVM
@@ -192,13 +226,616 @@ fails, in 641 s instead of 1078 s.
    a 96 %-free heap, and `zgc-high-compaction: cycles=0 declined=0
    objects_relocated=0` says the targeted compactor engaged **zero** times. Ask
    what those 13 runs are and why nothing is asked to move them.
-2. **Then the helper window**, 219 of 227 refusals. A peer inside a JIT helper
-   has provable compiled frames and an unrewritable Rust frame above them.
+2. ~~**Then the helper window**, 219 of 227 refusals.~~ **DONE 2026-09-01** --
+   discharged by pinning the peer's conservative roots rather than refusing the
+   cycle; see the 2026-09-01 addendum. Whether it makes THIS class compact is
+   still unmeasured (it needs a quiet host).
 3. `compiled-frame-oop-not-published` (5) and `unregistered-jit-frame-on-stack`
    (3) are not worth attacking until 1 and 2 are answered.
 4. `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` settles "is the handshake the gate?" in
    one run. It is unsafe; read `relocation_on_proven_jit` before believing
    anything it produces.
+
+## ADDENDUM 2026-09-01: the dominant refusal is NOT discharged -- read the correction below before the claim above
+
+The 2026-08-30 (b) census named `xt-helper-window-conservative-scan` as **219 of
+227** refusals. It is now gone, and the repair is not a proof at all -- it is a
+root set that had nowhere to go.
+
+### What a helper window actually is
+
+A peer thread whose `Rip` is OUTSIDE compiled code but which has JIT frames on
+its native stack: it is inside a **Rust helper called from compiled code** when
+the collector's signal reaches it. `classify_slot_helper_window` freezes it,
+reads its published register file and every readable word of its stack from
+`rsp` up, and recovers a conservative root set. Those roots kept the objects
+alive and the cycle then refused to relocate anything at all.
+
+### Why it refused, and why that was avoidable
+
+ZGC has consumed `pinned_jit_roots_snapshot()` since 2026-08-13: conservative
+JIT roots pin their page, the objects stay still, and everything else may move.
+That mechanism was already right there. The helper-window peer simply had no
+way to use it:
+
+**`PINNED_JIT_ROOTS_BY_THREAD` is published BY EACH THREAD**, at its own
+safepoint arrival or blocking-region entry. A helper-window peer is exactly the
+thread that reached NEITHER -- a signal interrupted it mid-helper. And the scan
+that recovers its roots runs on the COLLECTOR's thread, so it cannot publish
+under the peer's `ThreadId` either. So the roots existed, the pin machinery
+existed, and nothing connected them; the cycle refused instead.
+
+The connection is a per-CYCLE pin set (`XT_CYCLE_PINNED_JIT_ROOTS`), unioned
+into `pinned_jit_roots_snapshot()` and cleared where the coverage verdict it
+used to be expressed as is cleared.
+
+**Soundness rests on COMPLETENESS, not on trust.** The Linux classifier reads
+the register file AND the whole readable stack band, so no address that peer can
+reach is missing -- which is exactly the property that lets pinning substitute
+for refusing. Pinned objects do not move; their FIELDS are still rewritten
+through the pointer map, as for any other pinned root. `classify_slot_helper_window`
+now returns `(has_jit, complete)`, and its two early returns -- `rsp` unusable,
+no readable region -- report `complete = false`. A partial scan is NOT pinned
+and keeps refusing, because pinning what you found does not help when what you
+missed is unrewritable too. The Windows arm keeps refusing outright: its
+completeness is not measurable here.
+
+### MEASURED, one binary, `org.h2.test.db.TestMultiThread`, both arms `rc=0`
+
+| arm | `helper_windows` | `hw_pinned` | `hw_refused` | `relocation_skipped_jit` |
+|---|---:|---:|---:|---:|
+| `CRATONVM_XT_HELPER_WINDOW_PIN=1` | 62 | **62** | **0** | 8 |
+| `=0` | 44 | 0 | 44 | 14 |
+
+and the coverage census, which is the readable half:
+
+```text
+PIN=0   xt-helper-window-conservative-scan=13   compiled-frame-oop-not-published=1
+PIN=1   (absent)                                compiled-frame-oop-not-published=5
+```
+
+The reason does not merely get rarer -- it leaves the census. `hw_pinned` and
+`hw_refused` ride on the `[GC] xt_peer_scan` line so neither has to be inferred
+from the other, and `CRATONVM_XT_HELPER_WINDOW_PIN=0` restores the refusal on
+the same binary.
+
+### What this does NOT yet establish
+
+`TestMultiThread` compacts either way (`objects_relocated` 64841 vs 66624), so
+it proves the refusal is discharged and NOT that this class now compacts. The
+run that would say so is `TestCachedQueryResults` itself, and the host it must
+run on has to be quiet: at load 26 the class does not finish inside 1800 s,
+`timeout` kills it, and **a killed run prints no `[GC]` summary at all** -- which
+is how one earlier attempt produced an empty gate census and a different failure
+(`Timeout trying to lock table "COUNTER"`) that says nothing about the heap.
+Read `relocation_on_proven_jit` before believing any arm of it.
+
+### 2026-09-01 (correction): the helper-window pin does NOT discharge the refusal
+
+**The claim in the section above is wrong and is corrected here.** Pinning a
+frozen peer's conservative roots removes the LABEL
+`xt-helper-window-conservative-scan` from the coverage census; it does not make
+the cycle relocatable, and the refusal has been restored.
+
+Two things were missed.
+
+**1. There is a SECOND refusal site, and it is unlabelled.**
+`interpreter::gc_and_alloc`'s root gather ends with
+
+```rust
+if taken.count() > 0 || helper_windows > 0 {
+    mark_moving_young_coverage_incomplete();      // no reason code
+    mark_unrewritable_peer_state();
+}
+```
+
+so a helper window marks the cycle incomplete a second time, with no reason
+attached. That is why the `PIN=1` arm of the `TestMultiThread` A/B still reports
+`coverage-proof-incomplete=8` with `none=2` among the reasons: the labelled
+refusal moved into the unlabelled bucket. `relocation_on_proven_jit` was 1 with
+the pin and 2 without — i.e. **engagement did not improve**, which the label's
+disappearance had made look like progress.
+
+**2. The pin set cannot be complete, because the scan probes with the wrong
+predicate.** `helper_window_pass` is called with
+`|a| shared.mem.heap.is_object_address(a)`, and ZGC's `is_object_address` is
+`registry.contains(addr)` — **exact object bases only**. A frozen peer holding a
+DERIVED pointer (a compiled loop's pointer into an array body is the ordinary
+case) contributes no candidate, so its base is never pinned and relocating it
+strands the peer. The second site's own comment says precisely this: *"a frozen
+peer's registers can hold only a derived/interior pointer whose base would
+otherwise be evacuated from under it, then zeroed and re-served"*.
+
+### What that leaves, and it is a smaller, sharper question than before
+
+The refusal IS dischargeable — the obstacle is one predicate, and it is no
+longer expensive. `is_heap_addr` resolves an interior pointer to its base in one
+backwards bit scan plus one header dereference (`nearest_base_at_or_below`), not
+the O(live) registry iteration it used to be, and `vm_heap.rs` already feeds it
+per-slot conservative scanning. So the remaining work is:
+
+1. probe the helper window with `is_heap_addr` instead of `is_object_address`,
+   so derived pointers resolve to the base that must be pinned;
+2. price the resulting WIDER conservative root set — every `long` that lands
+   inside a live object's extent becomes a root — which is the trade that has
+   not been measured and is the reason this is not simply switched;
+3. then, and only then, discharge BOTH sites together.
+
+The pins are still published (`CRATONVM_XT_HELPER_WINDOW_PIN`, default on)
+because they are strictly additive — a pin can only keep a page out of one CSet
+— and because `hw_pinned`/`hw_refused` on the `[GC] xt_peer_scan` line are what
+size the work above: **62 of 62 windows** on `TestMultiThread`.
+
+### 2026-09-02: the widening is MEASURED, and it is cheap -- the discharge is now justified
+
+The correction above left one thing unpriced: adopting `is_heap_addr` for the
+helper-window probe widens the conservative root set, and "every `long` that
+lands inside a live object's extent becomes a root" sounds like it could be an
+order of magnitude. It is not.
+
+`CRATONVM_XT_HELPER_WINDOW_INTERIOR=1` swaps the predicate and changes nothing
+else -- both refusal sites still fire -- so the two arms differ only in which
+words the helper-window scan admits. `org.h2.test.db.TestMultiThread`, one
+binary, `CRATONVM_DBG_XT_JIT_ROOT_SCAN=1` summing the pass's own root counts:
+
+| predicate | windows | conservative roots | per window |
+|---|---:|---:|---:|
+| `is_object_address` (exact bases) | 64 | 7 134 | 111 |
+| `is_heap_addr` (resolves derived) | 60 | 8 365 | **139** |
+
+**+25 % per window.** Read per WINDOW, not per run: the two arms ran at load
+5.6 and 17.7 and therefore took different numbers of passes (16 and 17), so the
+totals are not directly comparable and the ratio is.
+
+That is a small price for the property that makes pinning sound at all -- a
+derived pointer resolving to the base that must not move. So the remaining work
+is no longer blocked on an unknown:
+
+1. probe the helper window with `is_heap_addr`;
+2. pin the resolved bases (the machinery is already there and already publishes
+   -- `hw_pinned` is 62 of 62 / 64 of 64 / 60 of 60 across every run measured);
+3. discharge BOTH refusal sites together -- the labelled one in `xt_root_scan`
+   and the unlabelled `mark_moving_young_coverage_incomplete()` +
+   `mark_unrewritable_peer_state()` in `interpreter::gc_and_alloc`, which is the
+   one the first attempt missed;
+4. and only then read `relocation_on_proven_jit` on this class, which is the
+   number the whole page turns on.
+
+Step 3 is the one to be careful with: discharging only the labelled site is what
+made the first attempt look like progress while engagement did not move at all.
+
+### 2026-09-02 (decisive): compaction relieves the OOM -- but see the 32-core correction below before reading this as a fix
+
+`CRATONVM_ZGC_ASSUME_REWRITABLE=1` forces the whole relocation gate. One binary,
+`--Xmx 1g`, 3000 s cap:
+
+| arm | `arena allocation failed` | 65536-slot ref-array OOM |
+|---|---:|---:|
+| `CRATONVM_ZGC_ASSUME_REWRITABLE=1` | **0** | **0** |
+| off | 14 | **13 999** |
+
+**The failing allocation disappears completely.** Not fewer, not slower --
+absent. So every framing question this page has carried is now settled:
+
+* the OOM framing is RIGHT: it is fragmentation of the low end, and relocation
+  relieves it;
+* `98304` really is where `ConcurrentHashMap` needs its 65536-slot table, and
+  that table really is the request that cannot be served;
+* the four JIT safepoint defects fixed on 2026-08-30 are real repairs to the
+  COVERAGE PROOF, and none of them could ever have fixed this class on their
+  own, because the proof is a conjunction and they each closed one term;
+* and the helper-window work is likewise a term, not the answer.
+
+**Both arms still hit the cap** with `Timeout trying to lock table "COUNTER"`,
+which is the load artefact described above and not a heap result -- the runs
+were at load 13-48. The heap evidence is per-cycle and survives that; the
+pass/fail does not, and is still owed on a quiet host.
+
+### What this makes the work
+
+The question is no longer "which obligation" but "how many". Discharging one at
+a time provably does not move `relocation_on_proven_jit` -- three attempts, each
+removing a different term, each leaving engagement where it was. The remaining
+terms measured on `TestMultiThread` after the helper window is discharged are:
+
+```text
+zgc-relocation-coverage-reason: compiled-frame-oop-not-published=8
+zgc-relocation-coverage-reason: cross-thread-jit-peer=5
+```
+
+so the next work is those two, together, with `relocation_on_proven_jit` as the
+only acceptance test -- and `CRATONVM_ZGC_ASSUME_REWRITABLE=1` as the upper
+bound that says what winning looks like.
+
+
+
+### 2026-09-02 (32-core box, legitimate discharge): `relocation_on_proven_jit` moves OFF ZERO with NO corruption
+
+The Windows helper-window arm had none of the pin/discharge work -- it was
+written for Linux -- and on this box that is where the refusals are:
+
+```text
+zgc-relocation-coverage-reason: xt-helper-window-conservative-scan=1468   (95% of 1539)
+                                compiled-frame-oop-not-published=59
+                                active-safepoint-map-incomplete=8
+                                unregistered-jit-frame-on-stack=3
+                                parent-frame-map-incomplete=1
+helper_windows=9087  hw_pinned=0  hw_refused=0      <- none of the code ran
+```
+
+With the Windows arm implemented (a counted window there is complete by
+construction: `snapshot_peer` returning `Some` means the whole GPR range and the
+whole `[rsp, committed_region_end)` band were captured), one binary,
+`org.h2.test.db.TestMultiThread`, both arms `rc=0`:
+
+| arm | `hw_pinned` | `skipped_jit` | `on_proven_jit` | coverage reasons | **NPE** |
+|---|---:|---:|---:|---|---:|
+| base | 71 | 18 | **0** | `helper-window=12`, `oop-not-published=6` | 0 |
+| `HELPER_WINDOW_DISCHARGE=1` | 69 | **7** | **2** | *(helper-window absent)*, `xt-peer=3`, `oop-not-published=3`, `unregistered=1` | **0** |
+
+**This is the first change in this investigation that moves
+`relocation_on_proven_jit` off zero without bypassing the proof, and it does so
+with zero NPEs** -- against the 48 that `ASSUME_REWRITABLE` produces on the same
+box. So pinning a frozen peer's conservative roots, with the interior-resolving
+probe so a derived pointer resolves to the base that must stay still, is SOUND
+where bypassing the proof is not.
+
+**It is not sufficient on its own.** `TestCachedQueryResults` with the discharge
+alone still capped at 2400 s with 6 354 reference-array OOMs. That is the
+conjunction again: removing 1 468 of 1 539 refusals still leaves
+`oop-not-published=59`, `active-safepoint-map-incomplete=8` and
+`unregistered=3`, and ONE of those per cycle refuses that cycle -- while this
+class needs MOST cycles to relocate to keep the arena from shattering.
+
+So the next term is `compiled-frame-oop-not-published`, and the acceptance test
+is unchanged: `relocation_on_proven_jit > 0` with 0 OOM and 0 NPE together.
+
+
+#### And on the class itself: 98 304 -> 99 100, OOMs halved, no corruption
+
+Same binary, `TestCachedQueryResults`, discharge on:
+
+| arm | secs | `actual` | ref-array OOM | COUNTER | **NPE** | `on_proven_jit` |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 1519 | 98 304 | 1 497 | 199 | 0 | 1 |
+| `HELPER_WINDOW_DISCHARGE=1` | **997** | **99 100** | **834** | 66 | **0** | 2 |
+
+**+796 entries recovered, reference-array OOMs almost halved, 34 % faster, and
+zero NPEs** -- all 5 111 helper windows pinned, none refused. This is the first
+arm to move the class's own assertion without corrupting anything.
+
+And it re-sorts what is left. The reason census is FIRST-WINS, so removing the
+helper window exposes the terms behind it -- `unregistered-jit-frame-on-stack`
+goes from 3 to 360 not because anything got worse but because 1 468 cycles that
+used to stop earlier now reach it:
+
+```text
+cross-thread-jit-peer             448   (51 % of 877)
+unregistered-jit-frame-on-stack   360   (41 %)
+compiled-frame-oop-not-published   68   ( 8 %)
+active-safepoint-map-incomplete     1
+```
+
+So the next term is `cross-thread-jit-peer`, and there is a specific reason to
+think it is now WRONG rather than merely unsatisfied: the peers it refuses for
+are blocked threads that never reach `publish_peer_jit_coverage_for_stw`, and
+those are exactly the threads whose helper windows this change now PINS. A
+pinned peer's frames cannot move, so it does not need to prove them rewritable
+-- but `peer_coverage_accounted` still counts its JIT entries in `peer_depth`
+and finds no deposit against them.
+
+Fixing that means excluding the pinned-blocked population from `peer_depth`
+(e.g. a process-wide blocked-JIT-depth counter maintained at blocked-region
+enter/leave), and it is the same accounting that produced a false positive
+earlier on this page -- so it must be measured on `relocation_on_proven_jit`,
+not on whether the label disappears.
+
+### 2026-09-02 (32-core local box): the baseline reproduces EXACTLY, and forcing relocation CORRUPTS
+
+Moved off the shared Azure host, which spent the day between load 1 and 477 and
+twice had H2's `target/` deleted underneath a run. This box is 32 cores /
+64 GB, uncontended, with the corpus pinned locally. Release binary, `--Xmx 1g`,
+`TestCachedQueryResults`:
+
+| arm | secs | `actual` | ref-array OOM | arena | COUNTER | **NPE** | relocation |
+|---|---:|---:|---:|---:|---:|---:|---|
+| baseline | 1519 | **98 304** | 1 497 | 11 | 199 | **0** | skipped 1539, proven 1 |
+| `ASSUME_REWRITABLE=1` | **629** | 99 952 | **0** | **0** | **0** | **48** | skipped 0, proven 24 |
+
+**The baseline reproduces this page's number to the digit** -- `actual: 98304` --
+so the local box is a faithful reproduction and every earlier arm can be
+re-read against it.
+
+**And the forced arm CORRUPTS.** Its 48 missing entries are not OOM and not lock
+timeouts; they are
+
+```text
+General error: "java.lang.NullPointerException"; SQL statement:
+SELECT counter FROM Counter WHERE id = 1 FOR UPDATE WAIT 0.5
+```
+
+**48 in the forced arm against 0 in the baseline**, same binary, same corpus,
+one flag apart. That is what `CRATONVM_ZGC_ASSUME_REWRITABLE`'s own doc
+promises -- *"it relocates under frames nobody proved rewritable; expect
+corruption if the answer is no"* -- and this is the first run where the
+corruption is visible rather than theoretical. The Azure arms did not show it
+(their residual was exactly their COUNTER count); 32 cores and a 2.4x faster
+run expose the race that 8 contended cores hid.
+
+### What that corrects, and it is a correction to this page's own 2026-09-02 entry
+
+The earlier entry said compaction "fixes" the class and called the forced arm an
+upper bound on what winning looks like. Half of that stands and half does not:
+
+* **Stands:** compaction eliminates the OOM. 1 497 reference-array failures and
+  11 arena failures go to ZERO, and the wall clock more than halves. The
+  fragmentation diagnosis is right and relocation is the relief.
+* **Does NOT stand:** the forced arm is not a preview of a correct fix. A
+  correct fix must have **zero NPEs as well as zero OOMs**, and this arm trades
+  one for the other.
+
+So the coverage conjunction is **load-bearing, not over-conservative**. The
+obligations cannot be bypassed to buy compaction; they have to be SATISFIED so
+that the frames really are rewritable. That makes the remaining work narrower
+and strictly harder than the previous entry implied:
+
+1. discharge `compiled-frame-oop-not-published` and `cross-thread-jit-peer` by
+   making the frames genuinely provable -- not by skipping the proof;
+2. the acceptance test is `relocation_on_proven_jit > 0` **with 0 NPE and 0
+   OOM**, which no arm has yet produced together;
+3. `ASSUME_REWRITABLE` remains useful for exactly one thing: showing that the
+   OOM is relievable at all. It is not a target.
+
+### 2026-09-02 (idle host): the OOM is gone and the RESIDUAL IS PAUSE DURATION, not the heap
+
+Three release-profile arms, `--Xmx 1g`, on a box that was briefly idle. The
+accounting is exact in every one -- **missing == COUNTER timeouts, OOM == 0**:
+
+| arm | load | `actual` | missing | COUNTER | OOM | conc cycles |
+|---|---:|---:|---:|---:|---:|---|
+| `ASSUME_REWRITABLE` | 8.92 | 99 988 | 12 | 12 | **0** | 0 of 26 |
+| `ASSUME_REWRITABLE` | 3.29 | 99 984 | 16 | 16 | **0** | 0 of 27 |
+| `ASSUME` + `CONC_START=60` | 8.48 | **99 990** | **10** | **10** | **0** | 4 of 26 |
+| `XT_HELPER_WINDOW_DISCHARGE` alone | 1.4 | *(capped)* | -- | 28 | **4 587** | -- |
+
+Two conclusions, and the second is new.
+
+**The helper-window discharge alone does not fix the class.** 4 587 reference-array
+OOMs, capped at 1800 s. That is the conjunction result reproduced on the class
+itself rather than on `TestMultiThread`, and it is why no single obligation is
+worth repairing on its own.
+
+**The residual failures are GC PAUSE DURATION, not host load.** The arm at load
+3.29 lost 16 and the arm at load 8.48 lost 10 -- fewer losses at HIGHER load, so
+contention cannot be the driver. What changed is that four of its cycles marked
+concurrently. And the mechanism is documented in the flag's own measurements
+(`Z_CONC_START_PERCENT_DEFAULT`):
+
+| arm | mean pause |
+|---|---:|
+| 8 mutator threads, stop-the-world | **609 ms** |
+| 8 mutator threads, concurrent, 2 workers | **253 ms** |
+
+**609 ms is above H2's `FOR UPDATE WAIT 0.5`.** So every STW compaction cycle
+that lands inside a lock wait costs one entry, and `CRATONVM_ZGC_CONC_START`
+(default `0`, i.e. every cycle stop-the-world) is what decides how many do.
+`zgc-real` reports `occupancy=64503936/1073741824` -- the heap is 6 % occupied
+once compaction runs, so the 60 % trigger rarely opens and only 4 of 26 cycles
+were concurrent. A lower `CONC_START` should open it on nearly all of them.
+
+So the path to a PASS is now fully specified and has nothing left in it that is
+mysterious:
+
+1. discharge the coverage conjunction so relocation runs without the unsafe
+   instrument (`compiled-frame-oop-not-published` + `cross-thread-jit-peer`
+   together);
+2. keep the compaction pause under 500 ms -- `CRATONVM_ZGC_CONC_START` low
+   enough that most cycles mark concurrently;
+3. measure on a box with headroom. This one spent the session between load 1 and
+   155, and at 155 with 1 GB free the OOM killer takes the JVM (`rc=137`).
+
+### 2026-09-02 (RELEASE + forced relocation): the shortfall goes 1696 -> 12, and NONE of the 12 is an OOM
+
+The livedbg arm above could not produce a pass/fail because its `opt-level=1`
+slowness tripped H2's `FOR UPDATE WAIT 0.5`. This is the same experiment on a
+`--profile release` binary, load 8.92:
+
+```text
+CRATONVM_ZGC_ASSUME_REWRITABLE=1     rc=1   1018 s
+    Expected: 100000 actual: 99988
+    Timeout trying to lock table "COUNTER"   12
+    java.lang.OutOfMemoryError                0
+    native reference array of length 65536    0
+    arena allocation failed                   0
+    LOST UPDATE                               0
+    relocation_skipped_jit 0   relocation_on_proven_jit 26
+    compaction_cycles 26       objects_relocated 536508
+```
+
+Apply this page's OWN accounting method -- the one the L7 addendum used to
+show that 1696 = 1691 OOM + 5 SQLException:
+
+```text
+100000 - 99988                                 = 12
+OutOfMemoryError raised in tasks                  0
+SQLException (COUNTER lock timeout) caught       12
+                                                ---
+                                                 12
+```
+
+**The OOM population is gone. All twelve survivors are H2's own half-second
+lock timeout**, which the callable catches as `SQLException` and prints -- the
+same class of loss the original accounting attributed 5 of 1696 to.
+
+So the defect this page is about is FULLY explained and FULLY relieved by
+relocation:
+
+| arm | actual | OOM | SQLException |
+|---|---:|---:|---:|
+| as this page found it | 98 304 | 1 691 | 5 |
+| relocation forced (release) | **99 988** | **0** | 12 |
+
+The residual 12 are a shared-host artefact, not a VM defect: `WAIT 0.5` is half
+a second, the host was at load 8.9 on 8 cores, and 26 compaction pauses moving
+536 508 objects sit inside that window. HotSpot passes this class in 9 s on the
+same box. An idle host is what would turn 12 into 0, and that run is the only
+thing between this page and a PASS.
+
+**What this makes the remaining work.** The coverage conjunction is no longer a
+theory about what might help -- it is the only thing standing between the
+measured state above and a passing class. The terms left after the helper-window
+discharge are `compiled-frame-oop-not-published` and `cross-thread-jit-peer`,
+they must be closed together, and `relocation_on_proven_jit > 0` is the
+acceptance test.
+
+#### The paired control, and why it did not finish
+
+Same binary, same host window, flag off:
+
+| arm | ref-array OOM | arena failures | outcome |
+|---|---:|---:|---|
+| `CRATONVM_ZGC_ASSUME_REWRITABLE=1` | **0** | **0** | reached the assertion, `actual: 99988` |
+| control (flag off) | **6 617** | **13** | `rc=137` (SIGKILL) at 2 489 s, 131 COUNTER timeouts |
+
+`rc=137` is the Linux OOM killer, not the VM: the host was at load 138 with
+**1 GB of 31 GB available** while other tenants built. The control therefore
+never reached its assertion, and its numbers are a lower bound on a truncated
+run rather than a matched endpoint. What it does establish is the only thing it
+is used for here -- that the same binary in the same window produces thousands
+of the exact failure the treatment arm produces none of.
+
+**Host-condition note for anyone rerunning this.** Every arm of this page is
+sensitive to the box in three separate ways, and all three have now bitten:
+
+1. `FOR UPDATE WAIT 0.5` turns CPU contention into `SQLException`s that look
+   like data loss (12 of them even in the good arm);
+2. a run killed by `timeout` prints no `[GC]` summary, so the counters the
+   question turns on vanish;
+3. at load 130+ with memory exhausted the OOM killer takes the JVM (`rc=137`)
+   or `rustc` during a fat-LTO link, and a `cargo build && cp` then copies a
+   STALE binary while printing success.
+
+Record `/proc/loadavg` and `free -g` beside every arm.
+
+### 2026-09-02 (quiet host): ZERO OOMs, 24 compaction cycles, and the gate never refuses
+
+The 3000 s arms above both capped under contention. This one ran on a quiet host
+(load 7.64 / 6.02 / 5.79) and **exited cleanly**, so it carries the `[GC]`
+summary the capped runs could not:
+
+```text
+CRATONVM_ZGC_ASSUME_REWRITABLE=1     rc=1   3575 s
+    arena allocation failed          0
+    native reference array OOM       0
+    java.lang.OutOfMemoryError       0
+    relocation_skipped_jit           0
+    relocation_on_proven_jit         24
+    compaction_cycles                24     objects_relocated=641125
+    zgc-relocation-skip-reason:      (none)
+```
+
+**Zero OutOfMemoryError of any kind, and the relocation gate refuses nothing.**
+Against the same binary with the flag off, which produced an 11.6 MB error log
+of exactly the OOM this page is about. So the heap defect is not merely reduced
+by compaction; under compaction it does not exist.
+
+**The class still fails, and the reason is now the INSTRUMENT, not the heap.**
+`rc=1` here is `Timeout trying to lock table "COUNTER"` again -- but this arm ran
+at load 7.6, so contention is no longer a sufficient explanation. The likelier
+cause is that this binary is built `--profile livedbg` (`opt-level = 1`,
+`lto = false`), chosen because the fat-LTO release link was being OOM-killed by
+other tenants at load 130+. An `opt-level=1` VM is several times slower than
+release, which is enough on its own to trip H2's `FOR UPDATE WAIT 0.5`. The
+release build reaches the ASSERTION (`Expected: 100000 actual: 98304`) in 641 s;
+this one never gets that far.
+
+So the pass/fail verdict needs `--profile release` **and** the flag, and until
+that run exists this page should claim exactly what is measured: compaction
+removes the OOM, and the class's remaining failure under the instrument is not
+attributable to the heap.
+
+### 2026-09-02 (later): the discharge WORKS and changes nothing -- `coverage-proof-incomplete` is a conjunction
+
+`CRATONVM_XT_HELPER_WINDOW_DISCHARGE=1` gates BOTH refusal sites off one
+per-cycle condition and forces the interior-resolving probe, so the helper
+window is genuinely discharged this time -- not just relabelled. One binary,
+`org.h2.test.db.TestMultiThread`:
+
+| discharge | helper windows | coverage reasons | `skipped_jit` | `on_proven_jit` | compaction |
+|---|---:|---|---:|---:|---:|
+| off | 49 | **`xt-helper-window=12`**, `oop-not-published=3` | 15 | 1 | 1 cycle / 2 220 |
+| on | 37 | *(absent)*, `cross-thread-jit-peer=5`, `oop-not-published=8` | 13 | **0** | **0** |
+
+The reason leaves the census. **Engagement does not improve** -- it goes to
+zero, and `coverage-proof-incomplete` barely moves (15 -> 13). The refusals
+simply redistribute to the next obligations in line.
+
+**That is the third time the same lesson has arrived, and it should be the
+page's headline.** `coverage-proof-incomplete` is a CONJUNCTION over many
+obligations, and discharging them one at a time can never move
+`relocation_on_proven_jit`:
+
+* `CRATONVM_XT_JIT_COVERAGE_ASSUME` took the handshake to
+  `accepted=1731 refused=0` -> the class failed identically;
+* `CRATONVM_XT_HELPER_WINDOW_PIN` removed the label only -> engagement 1 vs 2;
+* `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` removed the obligation outright ->
+  engagement 1 -> 0.
+
+So the next measurement is not another repair. It is
+`CRATONVM_ZGC_ASSUME_REWRITABLE=1`, which forces the WHOLE term and is
+unsafe by construction, and it answers the only question worth asking before
+any further work: **if every compiled frame were rewritable, would compaction
+fix this class at all?** If it would not, the page's OOM framing is wrong at the
+root and every coverage repair above it is beside the point.
+
+### 2026-09-01 (later): two reproduction attempts that FAILED, and what each eliminates
+
+`probes/ZgcRefArrayFragProbe.java` is checked in because it does NOT reproduce.
+Both shapes were run at `--Xmx 1g` against a HotSpot control:
+
+| probe shape | HotSpot | CratonVM | arena failures |
+|---|---|---|---:|
+| `Object[65536]` in a loop + churn | `served=254483 failed=0` | `served=185964 failed=0` | 0 |
+| `ConcurrentHashMap` keySet to 100000 + churn | `size=100000 missing=0 oom=0` | `size=100000 missing=0 oom=0` | 0 |
+
+**`ConcurrentHashMap` growth to 100000 is not sufficient**, even with four churn
+threads shattering the arena underneath it. That settles a question this page
+has answered twice in opposite directions: the number 98304 IS the CHM resize
+threshold and the failing allocation IS that 65536-slot table (so the
+2026-08-30 un-retraction stands), AND the resize alone does not fail (so
+`ChmKeySetGrowth` was not wrong either). What fails it is the ARENA STATE H2
+builds -- `spans=219425 largest_span=246704` -- which takes sustained
+mixed-lifetime allocation over hundreds of seconds, not a burst.
+
+**And `helper_windows=0` in every probe run.** A pure-Java allocation workload
+never puts a peer inside a Rust helper at collection time; H2 does, through file
+I/O, MVStore chunk compression and the JDBC path. So the helper-window repair
+cannot be A/B'd on a probe like this -- an instrument armed where it cannot fire
+-- which is why `org.h2.test.db.TestMultiThread` is the class used for it above.
+
+The second shape also showed relocation ENGAGING on CratonVM
+(`relocation_on_proven_jit=118`, `compaction_cycles=116`, `objects_relocated=101058`)
+with zero arena failures. A heap that compacts does not reach this failure,
+which is consistent with everything else on this page and is the reason the
+class's `relocation_on_proven_jit=0` is the number that matters.
+
+### A measurement trap this class carries, and it is not the heap
+
+`TestCachedQueryResults` cannot be measured on a loaded host, for a reason that
+has nothing to do with GC. Its inner statement is
+
+```sql
+SELECT counter FROM Counter WHERE id = 1 FOR UPDATE WAIT 0.5
+```
+
+so under contention it fails with `Timeout trying to lock table "COUNTER"` --
+a starved half-second SQL lock. Two capped runs on a host at load 20-60
+produced exactly that and nothing else. Worse, both were killed by `timeout`
+(`rc=124`), and **a run killed by `timeout` prints no `[GC]` summary at all**,
+so `relocation_on_proven_jit`, the gate census and the frag windows are simply
+absent from it. Record `/proc/loadavg` beside every arm, give the run a cap it
+can finish inside, and treat a `COUNTER` timeout as "no measurement", not as a
+result.
 
 ## Status
 
@@ -513,6 +1150,371 @@ CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
 CRATONVM_GC_STATS=1 timeout 900 <cratonvm-bin> --java-home /data/toolchain/jdk-25 \
     --Xmx 1g -c "$CP" org.h2.test.jdbc.TestCachedQueryResults
 ```
+
+## 2026-09-02 — `cross-thread-jit-peer` cannot be discharged by pinning
+
+`cross-thread-jit-peer` was 448 of the 877 relocation refusals left after the
+helper-window discharge, and it looked WRONG rather than merely unsatisfied: it
+refuses for blocked peers that never reach `publish_peer_jit_coverage_for_stw`,
+and those are exactly the peers the discharge now PINS. A pinned peer's objects
+cannot move, so — the argument went — its frames need no rewritability proof.
+
+That argument is false, and the class says so in the least ambiguous way
+available.
+
+### The measurement
+
+One binary, `CRATONVM_XT_PINNED_PEER_DEPTH` the only difference, no debug I/O:
+
+| arm | outcome |
+|---|---|
+| credit ON, 4 runs | **SIGSEGV at 138 s, 218 s, 95 s**; one reached the 600 s cap |
+| credit OFF, 3 runs | no crash — 3600 s, 601 s, 600 s |
+
+All three crashes at the SAME pc, inside compiled code. `accounted=true` on 10
+of 35 cycles, so relocation ran where it used to refuse and a compiled frame
+then used a pointer that had moved. On `TestMultiThread` the same credit is
+clean and moves `relocation_on_proven_jit` 3 → 5 — a smoke test is not a
+verdict here.
+
+### Why: a JIT frame's oops are not on the stack the pin covers
+
+`helper_window_pass` scans a frozen peer's register file and
+`[rsp, stack_base)`. It contained no mention of the shadow stack — and the
+shadow stack is where a JIT frame publishes its oops. It is a per-thread heap
+`Box<[usize]>`, a separate allocation.
+
+| peer state | shadow stack scanned | remapped |
+|---|---|---|
+| initiator | yes (`collect_roots`) | n/a |
+| cooperatively parked | yes (`root_snapshot`) | yes, on resume |
+| **blocked** | **no** | **no** — `apply_pending_blocked_fixups` never calls `shadow_stack.remap` |
+
+So a blocked peer's shadow-stack oops were unpinned, unremapped and possibly
+unmarked. `ShadowStack`'s own safety comment states the collector reads another
+thread's "only after that thread has **parked**"; a blocked peer never parks.
+
+### This qualifies the 2026-09-02 discharge entry above
+
+That entry reports the helper-window discharge as sound on the strength of
+`0 NPE`. The measurement was real; the conclusion was too broad. The discharge
+was safe **in conjunction with** `cross-thread-jit-peer` still refusing, which
+held `relocation_on_proven_jit` at 2 for a whole class run — the pin was barely
+exercised. Remove the backstop and it is exercised properly, and it fails. A
+near-zero relocation count is weak evidence for a safety claim, not vindication
+of one.
+
+### Two defects found in the credit itself
+
+Both real, both fixed, neither shown to BE the crash:
+
+- a recycled OS tid inherited a dead thread's published depth (the entry
+  outlives its owner and a recycled thread that never enters JIT never
+  overwrites it) — slots are now dropped by a TLS guard at thread exit and
+  reset on re-registration;
+- `publish_self_jit_depth` used `with`, which PANICS on a destroyed
+  thread-local, and `pop_jit_entry` can run during teardown — now `try_with`.
+
+### 2026-09-03 -- IT WORKS, and it is blocked on an open dev defect
+
+On merged dev (box/unbox intrinsic now default-OFF), credit + shadow scan,
+1500 s cap, 3 runs, against 2 discharge-only controls on the SAME binary:
+
+| | credit + shadow scan | discharge only (control) |
+|---|---|---|
+| best run | **`actual: 99978`** | did not complete |
+| ref-array OOM | **0** | **20000** |
+| NPE | 0 | 0 |
+| `relocation_skipped_jit` | **3** (was 877) | — |
+| `relocation_on_proven_jit` | **22** (was 2) | — |
+| compaction | 22 cycles, **519932 objects relocated** | — |
+| outcome | 1 completed, 2 SIGSEGV (185 s, 100 s) | 2 x rc=124 at the cap |
+
+99978 of 100000 with **zero** OutOfMemoryError is the best result this class has
+produced -- better than the unsafe `ASSUME_REWRITABLE` bypass (99952 with 48
+NPEs), and obtained by satisfying the obligation rather than skipping it. The
+fragmentation diagnosis is right and the mechanism now demonstrably clears it.
+
+It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting.
+
+> **REFUTED, and re-measure this section (2026-09-04).** What follows rests on
+> the box/unbox page's reading of its own switch table, and that reading was
+> wrong. The mechanism was never an unnamed oop-map root: `ZgcRealHeap`'s
+> relocation slides were copying into arena granules
+> `Arena::decommit_free_blocks` had already returned to the OS, and both slides
+> now commit their destination first. See
+> `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+>
+> This section's own evidence points the same way and is worth re-reading with
+> that in hand: the fault signature recorded below is `rdi` page-aligned at the
+> fault, which is a `memmove` running off the end of a mapping, not a read
+> through a stale reference. `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` removed
+> it by removing the slide, not by fixing a root.
+>
+> **The arms below have not been re-run on a tree carrying that fix.** Whoever
+> takes this page next starts there, and the cheapest discriminator is
+> `CRATONVM_GC_RESERVE=0`: if it removes the SIGSEGV on the pre-fix binary, this
+> section's crash is the same defect and closes with it.
+
+The reading this section was written under, kept because the argument it
+supports is still the one to re-test: that page established, with
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` as the narrow switch (0/3), that
+relocation under LIVE COMPILED FRAMES was implicated, and linked it to
+`bug-h2-testrandommapops-small-heap-corruption-20260829.md`, "hunting an
+unnamed root in a compiled frame for days".
+
+Enabling relocation under live JIT frames is precisely and only what this credit
+does. So it is a powerful EXPOSER of that defect, and no arm on this workload
+can separate the two: every switch that removes the crash (`PUBLISH_ONLY`,
+credit-off, `RELOCATE_UNDER_PROVEN_JIT=0`) also removes relocation-under-JIT.
+
+**New fact for that page: the box/unbox intrinsic is not required.** Every run
+above had it DISABLED (merged-dev default; the enable flag appears nowhere in
+the logs). That page's crash needed both relocation and the intrinsic; this one
+needs only relocation under live JIT frames. So there is a second, independent
+trigger of the same shape -- which supports "an unnamed root in a compiled
+frame" over any account that makes the box/unbox sequence itself the mechanism.
+
+**Status: this work is BLOCKED on that defect, not refuted by it.** When the
+unnamed root is found and fixed, re-run these arms; if the SIGSEGVs go, the
+credit ships and takes the class from 98304 to ~99978 with no OOMs.
+
+### 2026-09-03 (later): reproduced on a THIRD binary; the wide-locals fix does not help
+
+Rebuilt on dev with `fix/jit-precise-oop-maps-wide-locals-20260903` included
+(`2632fb2c1` confirmed an ancestor):
+
+| | credit + shadow scan | discharge-only control |
+|---|---|---|
+| best run | **`actual: 99977`**, 0 OOM, 0 NPE | did not complete in 1500 s, 14040 OOM |
+| `relocation_on_proven_jit` | 24 | — |
+| shadow scan | 104 windows, 4309 roots, 0 untrusted | — |
+| SIGSEGV | 2 / 3 (103 s, 119 s) | 0 |
+
+Third independent binary, same two facts: the credit clears the fragmentation
+-- 99977-99978 with ZERO OutOfMemoryError against a control that cannot finish
+-- and it still trips the open relocation defect on 2 runs in 3.
+
+"Methods above 64 locals had no precise oop maps at all" was the closest
+published candidate for the unnamed root, and fixing it changes nothing here.
+Ruled out, and recorded on that page too.
+
+### 2026-09-03: the guard PRICED -- it removes the crash by restoring the OOM
+
+`CRATONVM_ZGC_JIT_BLANKET_REFUSAL=1` makes a live compiled frame refuse
+relocation on its own, without consulting the coverage proof -- the rule
+`gen_heap` and `g1` both apply and this collector replaced on 2026-08-21.
+`relocate_stw` already computed the term (`compiled_frames_live`); it simply was
+not a refusal.
+
+One binary, the flag the only difference, 1500 s cap:
+
+| arm | exit | ref-array OOM | `actual` |
+|---|---|---|---|
+| guard ON, run 1 | timeout 1501 s | 8344 | — |
+| guard ON, run 2 | timeout 1500 s | 9382 | — |
+| guard ON, run 3 | timeout 1500 s | 10118 | — |
+| guard ON, run 4 | timeout 1500 s | 11004 | — |
+| guard OFF, run 1 | **SIGSEGV** 306 s | 0 | — |
+| guard OFF, run 2 | completed 462 s | **0** | **99966** |
+
+Guard ON: **0 SIGSEGV in 4**, mean **9712** OOMs, NOT ONE RUN COMPLETED. The
+four counts rise monotonically (8344 -> 11004), so they are FLOORS -- what
+accumulated before the cap killed each run, not totals.
+
+The comparison is generous to the guard: its OOMs are what 1500 s produced,
+while the unguarded arm reached zero OOMs and finished in 462 s. There is no
+duration at which the unguarded arm produces one.
+
+So the guard WORKS as a crash fix, and it is not shippable: it trades the
+SIGSEGV for the exact `OutOfMemoryError` this page exists to remove. For scale,
+the same-dev discharge-only control logs 14040 OOMs and also does not complete,
+so the guard is better than having no credit at all and an order of magnitude
+worse than the credit running unguarded.
+
+That prices the trade and closes the question. The three-way choice is now
+explicit:
+
+1. **credit, unguarded** -- 99966-99978, ZERO OOM, completes in ~460 s, and
+   SIGSEGVs about 2 runs in 3 on the open codegen defect;
+2. **credit + guard** -- no crash, ~8-9 k OOMs, never completes;
+3. **neither** -- no crash, 14 k OOMs, never completes.
+
+None ships. (1) is the only one that solves the page, and it is blocked on
+naming every home the register allocator creates -- see the box/unbox page for
+the identification, the three failed repairs, and what remains.
+
+### Attribution closed 2026-09-03: it is dev's relocation defect, and the oracle does not see it
+
+| arm | SIGSEGV |
+|---|---|
+| credit + shadow scan | 2 / 3 (185 s, 100 s) |
+| credit + shadow scan + `CRATONVM_ZGC_RELOCATE=0` | **0 / 3** |
+| `PUBLISH_ONLY` (plumbing, no credit) | 0 / 3 |
+| discharge only (control) | 0 / 3 |
+
+Relocation is REQUIRED -- the same 0/3 that
+`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
+switch. And the fault signature matches that page's: `rdi` page-aligned at the
+fault (`0x232ECD30000`, `0x28DEA7B0000`, `0x1CA01BB0000`), which that page reads
+as "a read through a reference into a page the collector has already vacated".
+
+So this is that defect, reached by a second route. The credit is an exposer.
+
+**A negative worth recording for the root-cause hunt.** The obvious instrument
+does not find it. `CRATONVM_DBG_VERIFY_OOP_MAPS=1` REFUTES the codegen's
+`fully_oop_covered` bit within the first two log lines on both this class and
+`TestMultiThread` -- but its own corroborating verdict is empty:
+
+```
+oop-map audit: frames=2712711 words=47361242 never_mapped=2804541
+               (while_covered=2153089 of 2630854 claiming;
+                while_shadow_covered=1511211 of 2085086 claiming)
+oop-map audit: verifier_oop=0 verifier_not_oop=1222475 verifier_unknown=1582066
+               name_index=(1237 names, 0 collisions)
+```
+
+`verifier_oop=0` with a POPULATED name index (1237 names): the class files say
+not one of 2.8 M never-mapped words is a reference. The raw never-mapped count
+is the documented false positive -- primitives whose bits land on a live object
+header -- and the audit's own comment says only `verifier_oop` is a lead.
+
+Two traps this cost, worth not repeating:
+
+* the per-hit `[VERIFY-OOP-MAPS]` lines are capped at `STEP3_LOG_CAP` (64), so a
+  slot-class breakdown taken from the log is a sample of the first 64, NOT a
+  distribution over the 2.8 M. Read the audit summary for the population.
+* both audit lines print only at NORMAL exit, so a run that SIGSEGVs (`rc=139`)
+  or is killed at the cap (`rc=124`) yields no verdict at all. To get one on a
+  crashing arm the workload has to be made to exit -- or the verdict has to move
+  into the per-hit line.
+
+### Superseded: the retraction that preceded this measurement
+### Superseded: the retraction that preceded this measurement
+
+The conclusion below is withdrawn. It is not known to be wrong; it is not
+supported by the evidence that was offered for it.
+
+`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+landed on dev the same day: the box/unbox intrinsic SIGSEGVs under a relocating
+collector, **11 of 11 runs, 25-183 s**, and it takes BOTH relocation and that
+intrinsic -- neither alone. Dev flipped the intrinsic to opt-in as the
+mitigation.
+
+Every binary crashed on this page was built before that flip, so it carried the
+intrinsic default-ON. And the ONLY effect of the pinned-peer credit is to let
+relocation happen on cycles that previously refused. So "relocation crashes this
+workload" was already true on dev, independently of the credit, and the
+`PUBLISH_ONLY` control cannot separate the two: suppressing the decision
+suppresses relocation, which suppresses the known defect too. Same for
+`CRATONVM_ZGC_RELOCATE=0`.
+
+What survives the retraction:
+
+* the relocation DECISION is what crashes -- still true, and still what the
+  arms show;
+* the plumbing is innocent (`PUBLISH_ONLY` 0/3, scan-only 0/2);
+* the shadow stack is a genuinely uncovered channel, 2090 refs on a 216 s run
+  -- an independent measurement that owes nothing to the crash;
+* the three implementation defects found by auditing the scan.
+
+What does not survive: any claim about whether a blocked peer CAN be discharged
+by pinning. Re-running on merged dev with the intrinsic default-off.
+
+The lesson is the cheap one: before concluding that a crash under your feature
+indicts your feature, ask what else on dev crashes under exactly the condition
+your feature creates. `git log origin/dev -- docs/known-issues/` would have
+found it in seconds.
+
+### SUPERSEDED CONCLUSION (read the retraction above first)
+
+Settled by measurement. Every arm below is the same binary with flags as the
+only difference.
+
+| arm | crashes |
+|---|---|
+| credit ON, no shadow scan | 3/4, then 3/3, then 2/2 across two binaries |
+| credit ON, shadow scan ON (engaged, 2090 roots recovered) | 3/3 |
+| credit ON but `PUBLISH_ONLY` -- all plumbing, no decision | **0/3** |
+| shadow scan only, no credit | **0/2** |
+| plain control (discharge only) | 0/3, including one 3600 s run |
+
+The plumbing is innocent: the TLS `Arc`, the per-tid registry, the deposits and
+the shadow scan all run clean for 600 s when the DECISION is suppressed. What
+crashes is crediting a pinned blocked peer and letting relocation proceed.
+
+Three channels are now covered -- register file, `[rsp, stack_base)`, and the
+shadow stack -- and it still crashes. There is at least a fourth
+(`apply_pending_blocked_fixups` also skips `remap_register_image_words` and
+`remap_active_jit_frames`), but the pattern is the point: the architecture makes
+a peer's JIT state consistent BY THE PEER ITSELF -- park, publish, remap on
+resume -- and a blocked peer sits outside that by design. Retrofitting
+immobility means enumerating every channel the design never required anyone else
+to know about, and being wrong once is a SIGSEGV.
+
+**So `cross-thread-jit-peer` stays.** Discharging it needs REWRITABILITY, not
+immobility: make a blocked peer remap its own JIT frames, register image and
+shadow stack when it wakes, which is a substantial change to the blocked-wake
+path and should be scoped as its own piece of work.
+
+### Independent finding: a blocked peer's shadow stack is never scanned for ROOTS
+
+Worth separating from the failed credit. `helper_window_pass` contributes a
+blocked peer's registers and stack to the root set on every cycle it runs, but
+never its shadow stack -- and `collect_roots` scans only the initiator's while a
+parked peer publishes its own. On a 216 s `TestMultiThread` run the new scan
+found `sh_windows=61 sh_slots=2376 sh_roots=2090`: 2090 heap references in
+blocked peers' shadow stacks that nothing else was scanning.
+
+Whether any of those 2090 is reachable ONLY through the shadow stack is NOT
+established here -- the same values usually also sit in a stack slot or
+register. But precise publication exists precisely because they sometimes do
+not, so this is a real hole to close on its own merits.
+`CRATONVM_XT_PEER_SHADOW_SCAN=1` closes it and measured clean (0/2 crashes,
+0 NPE, 0 OOM on `TestMultiThread`). It stays default-OFF pending a run that
+either demonstrates the loss or rules it out.
+
+### The route that was tried and rejected
+
+`CRATONVM_XT_PEER_SHADOW_SCAN=1` gives the owner-published route to the missing
+coverage: each thread publishes its own `ShadowStack` ADDRESS (authoritative,
+no frame→`CompiledMethod` attribution, stable for the thread's lifetime) and the
+initiator reads `base`/`top` from it while the peer is blocked and therefore
+stable. Every field is validated before dereference, and an untrusted window
+REFUSES the pin rather than claiming coverage — that direction costs compaction,
+not correctness.
+
+The initiator cannot instead recover the window from the peer's frames:
+`shadow_window_from_frame` trusts a frame only when its cached `JvmThread` is
+the current thread's, and mis-attributing a `CompiledMethod` to a conservatively
+found frame is what SIGSEGV'd the band verifier on a `base` of
+`0x5555_0000_0004`.
+
+If that does not close it, pinning is the wrong instrument for blocked peers and
+the remaining route is to make a blocked peer remap its own JIT state on wake —
+rewritability rather than immobility — which is a much larger change to the
+blocked-wake path.
+
+### Acceptance test, unchanged
+
+`relocation_on_proven_jit > 0` with 0 OOM **and** 0 NPE **and** no crash,
+together. Not whether the `cross-thread-jit-peer` label disappears: the census is
+first-wins, so discharging one term merely exposes the next, and this is the same
+style of depth accounting that produced a false positive earlier on this page.
+
+### Bisect levers
+
+- `CRATONVM_XT_PINNED_PEER_DEPTH=1` — the credit (default OFF).
+- `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1` — publish and deposit but credit
+  nothing; separates the publisher from the decision, which one flag otherwise
+  conflates.
+- `CRATONVM_XT_PEER_SHADOW_SCAN=1` — the candidate fix (default OFF).
+- `CRATONVM_DBG_XT_COVERAGE=1` prints `peer_depth= proven= pinned= accounted=`.
+  It is an ENGAGEMENT counter: `pinned=0` throughout means the credit never
+  engaged and everything downstream is vacuous. Do NOT leave it on while
+  measuring outcomes — 25113 lines of stderr pushed a 997 s control to the
+  3600 s cap and inflated its ref-array OOMs from 834 to 48132, because this
+  class's `FOR UPDATE WAIT 0.5` turns added latency into failures.
 
 ## Related
 

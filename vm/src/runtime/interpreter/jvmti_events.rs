@@ -15,6 +15,7 @@
 //! surface unattributed while looking complete. Delivery sites are now
 //! countable by opening one file.
 
+use super::site_cache::site_stats;
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -225,16 +226,190 @@ pub(super) fn fire_jvmti_single_step(
 /// be derived from `thread` or `frame` — see the VM-scoping note at the top of
 /// this helper block.
 #[inline]
-pub(crate) fn push_frame_and_fire_entry(vm: usize, thread: &mut JvmThread, frame: Frame) {
-    thread.frames.push(frame);
+/// Fire `MethodEntry` for the frame on top of the stack.
+///
+/// Split out of [`push_frame_and_fire_entry`] for the fast doors, which
+/// install a callee by rebuilding a retired `FrameStack` slot in place and so
+/// never hand a `Frame` to that function. Only the JVMTI event is shared: the
+/// Spring trace and the bytecode dump beside it are diagnostics of the
+/// by-value push and stay there.
+#[inline]
+pub(crate) fn fire_method_entry_after_push(vm: usize, thread: &mut JvmThread) {
     if crate::runtime::jvmti::any_method_entry_listener_active() {
-        // Safe: we just pushed.
         let last = thread.frames.len() - 1;
         let frame_ref = &thread.frames[last];
         let method_id = synth_method_id(frame_ref);
         let tid = thread.thread_id.0;
         crate::runtime::jvmti::fire_method_entry_for_vm(vm, tid, method_id);
     }
+}
+
+pub(crate) fn push_frame_and_fire_entry(vm: usize, thread: &mut JvmThread, frame: Frame) {
+    // A retired slot at this depth is about to be overwritten by the frame
+    // just built. Harvest its buffers into the thread pools first, so the
+    // pooled constructors keep the recycling they have always relied on —
+    // without this, a workload whose calls do not go through a fast door
+    // would free a set of buffers and allocate a fresh one every call.
+    thread.harvest_retired_slot();
+    thread.frames.push(frame);
+    fire_entry_and_diagnostics_after_push(vm, thread);
+}
+
+/// Install a frame for a cached bytecode callee on top of `thread`'s stack.
+///
+/// The general dispatchers' counterpart to the fast doors'
+/// `invoke_fast::push_frame_verbatim`, and the same three-way ladder:
+///
+/// 1. **Rebuild the retired slot** at this depth. A return retires its frame
+///    in place, so the four buffers are already here and none of them has to
+///    travel through the thread's pools.
+/// 2. **Emplace** into the next slot when none is retired — the first call at
+///    a depth. Only the three buffer handles travel; the ~220-byte `Frame`
+///    is written where it belongs instead of being built and moved.
+/// 3. **By value**, which is what every general dispatcher did before this and
+///    what `CRATONVM_JIT_NO_FRAME_EMPLACE` restores.
+///
+/// The one thing the doors do that this cannot is the verbatim `(slot, tag)`
+/// argument transfer: a general dispatcher has already decoded its arguments
+/// to `Value`s by the time it knows which callee shape it has.
+///
+/// `monitor_obj` is installed *after* the frame is, because two of the three
+/// paths never hold a `Frame` to set it on. That is not a reordering of the
+/// monitor **enter** — every caller still does that before calling this, and
+/// must, since a synchronized callee's monitor has to be held before its frame
+/// can run. `trace_tag` reports the caller's depth, as it did when the trace
+/// ran before the push.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_cached_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: Arc<CachedBytecodeMethod>,
+    args: &[Value],
+    monitor_obj: Option<ObjectRef>,
+    trace_tag: Option<&str>,
+    charge_phases: bool,
+) {
+    use crate::runtime::interpreter::invoke_phases;
+    // Only `execute_invokestatic_cached` charges the phase accounting, and
+    // `now()` is a relaxed load even when the instrument is off. The other
+    // four call sites should not pay for an instrument they do not feed.
+    let ph_t0 = if charge_phases { invoke_phases::now() } else { 0 };
+    let depth_before = thread.frames.len();
+
+    if crate::runtime::env_cache::no_frame_emplace() {
+        // The control arm: build the frame somewhere else and move it in.
+        let mut frame = Frame::new_pooled_cached(
+            cached,
+            args,
+            &mut thread.locals_pool,
+            &mut thread.stacks_pool,
+        );
+        frame.monitor_on_exit = monitor_obj;
+        trace_frame_push(trace_tag, depth_before, &frame);
+        let ph_t1 = if charge_phases { invoke_phases::now() } else { 0 };
+        // `push_frame_and_fire_entry` harvests the retired slot, so this arm
+        // also turns slot reuse off for the general dispatchers — which is
+        // exactly the state they were in before this change.
+        push_frame_and_fire_entry(shared.vm_identity, thread, frame);
+        site_stats::bump(site_stats::INSTALL_BYVALUE);
+        charge_install(charge_phases, ph_t0, ph_t1);
+        return;
+    }
+
+    if !crate::runtime::env_cache::no_frame_slot_reuse()
+        && thread.frames.has_retired_slot()
+        && thread
+            .frames
+            .push_cached_value_reusing(Arc::clone(&cached), args)
+    {
+        let ph_t1 = if charge_phases { invoke_phases::now() } else { 0 };
+        install_tail(shared, thread, monitor_obj, trace_tag, depth_before);
+        site_stats::bump(site_stats::INSTALL_REUSE);
+        charge_install(charge_phases, ph_t0, ph_t1);
+        return;
+    }
+
+    // No slot to rebuild: harvest anything retired above us so its buffers
+    // reach the pools the parts build is about to draw from, then write the
+    // frame straight into the slot.
+    thread.harvest_retired_slot();
+    let (locals, kinds, stack, eff_max_locals) = crate::runtime::frame::take_cached_value_parts(
+        &cached,
+        args,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    thread
+        .frames
+        .emplace_cached_compact(cached, locals, kinds, stack, eff_max_locals);
+    let ph_t1 = if charge_phases { invoke_phases::now() } else { 0 };
+    install_tail(shared, thread, monitor_obj, trace_tag, depth_before);
+    site_stats::bump(site_stats::INSTALL_EMPLACE);
+    charge_install(charge_phases, ph_t0, ph_t1);
+}
+
+/// `P_FRAME_BUILD` for the install, `P_PUSH` for the tail after it.
+#[inline]
+fn charge_install(charge_phases: bool, start: u64, tail_start: u64) {
+    if !charge_phases {
+        return;
+    }
+    use crate::runtime::interpreter::invoke_phases;
+    invoke_phases::charge(invoke_phases::P_FRAME_BUILD, start, tail_start);
+    invoke_phases::charge(invoke_phases::P_PUSH, tail_start, invoke_phases::now());
+}
+
+/// What both in-place install paths do once the frame is live: the monitor the
+/// caller already entered, the frame trace, the JVMTI entry event and the
+/// push-time diagnostics.
+#[inline]
+fn install_tail(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    monitor_obj: Option<ObjectRef>,
+    trace_tag: Option<&str>,
+    depth_before: usize,
+) {
+    if monitor_obj.is_some() {
+        if let Some(top) = thread.frames.last_mut() {
+            top.monitor_on_exit = monitor_obj;
+        }
+    }
+    if trace_tag.is_some() {
+        let top = thread.frames.len() - 1;
+        let frame = &thread.frames[top];
+        trace_frame_push(trace_tag, depth_before, frame);
+    }
+    fire_entry_and_diagnostics_after_push(shared.vm_identity, thread);
+}
+
+/// `CRATONVM_DBG_FRAME_TRACE=1` — one line per frame push, at the depth the
+/// caller was at.
+#[inline]
+fn trace_frame_push(tag: Option<&str>, depth: usize, frame: &Frame) {
+    let Some(tag) = tag else { return };
+    if !crate::runtime::env_cache::frame_trace() {
+        return;
+    }
+    eprintln!(
+        "[FRAME_PUSH/{}] depth={} {}.{}{}",
+        tag,
+        depth,
+        frame.class_name(),
+        frame.method_name(),
+        frame.method_descriptor()
+    );
+}
+
+/// The JVMTI `MethodEntry` event plus every push-time diagnostic that reads
+/// the frame just installed.
+///
+/// Split out of [`push_frame_and_fire_entry`] so that
+/// [`install_cached_frame`]'s in-place paths, which never hand a `Frame` to
+/// that function, still run all of them — an `SBF-TRACE` that goes dark for
+/// the calls that happen to take a cheaper install is worse than no trace.
+pub(crate) fn fire_entry_and_diagnostics_after_push(vm: usize, thread: &mut JvmThread) {
+    fire_method_entry_after_push(vm, thread);
     if crate::runtime::env_cache::trace_sb_filter() {
         let last = thread.frames.len() - 1;
         let frame_ref = &thread.frames[last];

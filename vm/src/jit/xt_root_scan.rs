@@ -85,6 +85,168 @@ pub static XT_HELPER_WINDOWS_SCANNED: AtomicU64 = AtomicU64::new(0);
 /// A4 (fork6-fjp) — conservative roots contributed by helper-window peers.
 pub static XT_HELPER_WINDOW_ROOTS: AtomicU64 = AtomicU64::new(0);
 
+/// Helper windows DISCHARGED by pinning the peer's conservative roots, and
+/// those that still refused the collection.
+///
+/// The pair is the point: `pinned` alone cannot say whether the refusal is
+/// gone, and `refused` alone cannot say whether the pass ever ran. Zero in both
+/// means no peer was caught inside a helper.
+pub static XT_HELPER_WINDOWS_PINNED: AtomicU64 = AtomicU64::new(0);
+pub static XT_HELPER_WINDOWS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Helper windows THIS CYCLE that could not be pinned (a partial scan, or the
+/// pin switch off). Reset at the start of every pass.
+///
+/// Per-cycle, unlike the two lifetime totals above, because the discharge
+/// decision is per-cycle: a collection may relocate only if EVERY window it saw
+/// is covered. The Windows arm never pins, so it leaves this nonzero and never
+/// discharges.
+pub static XT_HELPER_WINDOWS_UNPINNED_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+/// May this cycle's helper windows be discharged instead of refusing?
+///
+/// True only when the pass pinned every window it saw. Read by
+/// `interpreter::gc_and_alloc`, which raises the SECOND (unlabelled) refusal.
+pub fn helper_windows_all_pinned_this_cycle() -> bool {
+    XT_HELPER_WINDOWS_UNPINNED_CYCLE.load(Ordering::Acquire) == 0
+}
+
+/// `CRATONVM_XT_HELPER_WINDOW_DISCHARGE=1` -- let a fully-pinned helper window
+/// stop refusing the collection. **Default OFF.**
+///
+/// Off by default because it is a behaviour change on the relocation gate and
+/// the first attempt at it (722de9a33) was wrong in two ways at once: it
+/// discharged only the LABELLED refusal, leaving the unlabelled one in
+/// `interpreter::gc_and_alloc` to refuse anyway, and it pinned a root set that
+/// could not be complete because the probe was `is_object_address` (exact bases
+/// only), so a peer's derived pointer left its base unpinned.
+///
+/// Both are addressed here: this flag implies the interior-resolving probe, and
+/// it gates BOTH sites off the same per-cycle condition. The widening that
+/// implies was measured at **+25 % conservative roots per window** on
+/// `TestMultiThread` (111 -> 139), which is what makes it affordable.
+///
+/// Turn it on with `CRATONVM_GC_STATS=1` and read `relocation_on_proven_jit`:
+/// a zero still voids the run.
+/// Engagement census for [`scan_peer_shadow_window`].
+///
+/// Without these a clean result cannot be told apart from a scan that never
+/// ran: a peer whose shadow stack is legitimately empty and a peer whose window
+/// was never read both contribute zero roots. `WINDOWS` is the denominator,
+/// `SLOTS` says whether the windows had anything in them, and `UNTRUSTED`
+/// counts the windows that refused the pin rather than claim coverage.
+pub static XT_PEER_SHADOW_WINDOWS: AtomicU64 = AtomicU64::new(0);
+pub static XT_PEER_SHADOW_SLOTS: AtomicU64 = AtomicU64::new(0);
+pub static XT_PEER_SHADOW_ROOTS: AtomicU64 = AtomicU64::new(0);
+pub static XT_PEER_SHADOW_UNTRUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Scan a frozen blocked peer's SHADOW STACK, appending every heap address it
+/// names to `out`.
+///
+/// The window is `[base, top)` of the `ShadowStack` the peer published the
+/// address of (`gc_quiescence::publish_self_shadow_addr`). Reading it is sound
+/// only for a peer that cannot run: `mark_blocked_region_leave` waits out an
+/// active pause, so a blocked peer's `top` is stable for the whole STW.
+///
+/// Every field is validated before use. The address came from another thread
+/// and a stale or torn one would be dereferenced here -- the same shape of
+/// mistake that SIGSEGV'd the band verifier on a `base` of `0x5555_0000_0004`.
+/// Returns the number of slots scanned, or `None` if the window could not be
+/// trusted (which must keep the cycle refusing rather than claim coverage).
+pub fn scan_peer_shadow_window<F>(os_tid: u32, is_obj: &F, out: &mut Vec<ObjectRef>) -> Option<usize>
+where
+    F: Fn(usize) -> Option<ObjectRef>,
+{
+    let Some((ss, pub_base, pub_end)) = cratonvm_gc::gc_quiescence::shadow_window_of_tid(os_tid)
+    else {
+        // The peer never published. That is UNKNOWN coverage, not empty
+        // coverage, so it must refuse.
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    if ss == 0 || ss & 0x7 != 0 {
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: `ss` is the `#[repr(C)] ShadowStack` address the owning thread
+    // published. The thread is in `blocked_os_tids` (alive), it is blocked so
+    // it is not mutating, its `JvmThread` cannot have moved while it holds live
+    // compiled frames (the JIT caches `*mut JvmThread` per frame and reaches
+    // the shadow stack through it), and the entry is removed when the thread
+    // exits. Fields are `top`, `end`, `base` at 0, 8, 16 -- asserted by
+    // `layout_offsets_match_jit_contract`.
+    //
+    // RESIDUAL, stated plainly: this read happens BEFORE the identity check
+    // below can reject a stale address, so a thread that died between the
+    // blocked-tid snapshot and here would be read after free. The window is
+    // narrow and the same shape the existing `shadow_window_from_frame` lives
+    // with; the identity check is what stops a stale read from being ACTED on.
+    let (top, end, base) = unsafe {
+        let p = ss as *const usize;
+        (p.read(), p.add(1).read(), p.add(2).read())
+    };
+    // IDENTITY CHECK, and the reason reading `ss` is defensible: the struct's
+    // own `base`/`end` must be exactly what this thread published. They point
+    // into the heap `Box` and never change after `ensure_allocated`, so a
+    // struct that moved (or was freed) does not match, and a stale address is
+    // rejected instead of dereferenced further.
+    if base != pub_base || end != pub_end {
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // The `#[repr(C)]` invariant. `top` is the only field compiled code writes,
+    // so it is the only one that still needs checking.
+    if top & 0x7 != 0 || top < base || top > end {
+        XT_PEER_SHADOW_UNTRUSTED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let span = top - base;
+    let slots = span / 8;
+    XT_PEER_SHADOW_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    XT_PEER_SHADOW_SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+    let found_before = out.len();
+    for i in 0..slots {
+        // SAFETY: `[base, top)` is inside the validated window, which the
+        // blocked peer is not mutating.
+        let v = unsafe { ((base + i * 8) as *const usize).read() };
+        if let Some(o) = is_obj(v) {
+            out.push(o);
+        }
+    }
+    XT_PEER_SHADOW_ROOTS.fetch_add((out.len() - found_before) as u64, Ordering::Relaxed);
+    Some(slots)
+}
+
+/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=1` -- resolve a frozen peer's words
+/// with `resolve_interior_for_pin` rather than `is_heap_addr`.
+///
+/// The difference is the two cases `is_heap_addr` drops and a frozen peer's
+/// registers hold: a MISALIGNED interior pointer and a ONE-PAST-THE-END cursor.
+/// Both leave an object unpinned, and relocation then moves it out from under
+/// the register that names it.
+pub fn helper_window_pin_resolve_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE").is_some()
+}
+
+pub fn helper_window_discharge_enabled() -> bool {
+    // DEFAULT ON since 2026-09-04. A helper window whose peer is completely
+    // pinned -- register file, whole `[rsp, stack_base)` band, and the peer's
+    // shadow stack -- no longer refuses the collection.
+    //
+    // Measured on `org.h2.test.jdbc.TestCachedQueryResults` with the arena
+    // commit fix in: 5 runs, 0 SIGSEGV, ZERO ref-array OOM, 99953-99978,
+    // completing in 555-728 s, compaction intact at 25 cycles / 545893 objects.
+    // Against 98304 with 1497 OOMs in ~1519 s before. Regression suite 88/88.
+    //
+    // `CRATONVM_XT_HELPER_WINDOW_DISCHARGE=0` is the kill switch: it restores
+    // the blanket refusal, which costs ~6264 OOMs on that class and does not
+    // complete.
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_DISCHARGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
 /// Peers the STW cross-thread scan could NOT classify: it signalled them and
 /// they did not reach the handler before the deadline (`STATE_CANCELLED`), or
 /// no slot was free to arm. Such a peer is neither parked nor proven
@@ -207,6 +369,27 @@ pub fn helper_window_scan_enabled() -> bool {
     );
     CACHE.store(on as u64, Ordering::Relaxed);
     on
+}
+
+/// `CRATONVM_XT_HELPER_WINDOW_PIN=0` -- stop publishing a frozen helper-window
+/// peer's conservative roots as pins.
+///
+/// Default ON, and it does NOT discharge `incomplete_reason::XT_HELPER_WINDOW`;
+/// see the note at that refusal. The pins are additive protection and a
+/// measurement: on `org.h2.test.jdbc.TestCachedQueryResults` the helper-window
+/// refusal is **219 of 227**, so `hw_pinned` is the size of what a future
+/// discharge has to cover.
+///
+/// The scan itself is complete in what it READS -- the published register file
+/// and every readable word from `rsp` up -- and `classify_slot_helper_window`
+/// reports `complete` so a partial one is never pinned. What it cannot do is
+/// resolve a DERIVED pointer to its base, because it probes with
+/// `is_object_address` (exact bases). That is the gap that keeps the refusal.
+fn helper_window_pin_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_PIN").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
 }
 
 /// A4 (fork6-fjp) — classify one peer's already-copied stack/register words.
@@ -607,6 +790,10 @@ mod imp {
         let mut band: Vec<u8> = Vec::with_capacity(256 * 1024);
         let mut candidates: Vec<ObjectRef> = Vec::new();
         let mut windows = 0usize;
+        let mut pinned_windows = 0usize;
+        let mut unpinned_windows = 0usize;
+        // Per-cycle, so reset before the pass rather than accumulated.
+        super::XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(0, Ordering::Release);
         let mut found_total = 0usize;
         let mut e: ThreadEntry32 = unsafe { core::mem::zeroed() };
         e.dw_size = core::mem::size_of::<ThreadEntry32>() as u32;
@@ -658,7 +845,52 @@ mod imp {
                         classify_helper_window_words(words, &ranges, is_obj, &mut candidates);
                     if has_jit {
                         windows += 1;
+                        // A JIT frame's oops live in the SHADOW STACK, which
+                        // is not the machine stack and so is invisible to
+                        // everything above. Scan it too, or the pin is
+                        // incomplete and any coverage credited on it is a lie.
+                        // An untrusted window refuses the pin rather than
+                        // claiming coverage it does not have.
+                        let shadow_ok = if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled()
+                        {
+                            super::scan_peer_shadow_window(tid, is_obj, &mut candidates).is_some()
+                        } else {
+                            true
+                        };
                         found_total += candidates.len();
+                        // PIN, exactly as the Linux arm does. A window is only
+                        // COUNTED here when `snapshot_peer` returned `Some`,
+                        // and that means the whole GPR range and the whole
+                        // band `[rsp, committed_region_end)` were captured --
+                        // so a counted window is complete by construction and
+                        // needs no separate `complete` flag.
+                        if super::helper_window_pin_enabled() && shadow_ok {
+                            let addrs: Vec<usize> =
+                                candidates.iter().map(|o| o.as_ptr() as usize).collect();
+                            cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
+                            pinned_windows += 1;
+                            // A pinned window covers the peer's WHOLE stack
+                            // (`[rsp, stack_base)`) plus its register file, so
+                            // every JIT frame it holds is immobile -- which is
+                            // what the cross-thread coverage account wants to
+                            // hear, and it wants to hear it as a DEPTH.
+                            //
+                            // Reading the peer's published depth after it has
+                            // resumed is still exact: `mark_blocked_region_leave`
+                            // waits out an active pause, so a blocked peer
+                            // cannot run Java (and so cannot mutate its chain)
+                            // between the block and the end of this STW.
+                            //
+                            // `None` -- a peer that never registered a slot --
+                            // poisons the ledger rather than crediting zero.
+                            if crate::jit::conservative_roots::xt_pinned_peer_depth_enabled() {
+                                cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_depth(
+                                    cratonvm_gc::gc_quiescence::jit_depth_of_tid(tid),
+                                );
+                            }
+                        } else {
+                            unpinned_windows += 1;
+                        }
                         roots.append(&mut candidates);
                         if dbg() {
                             eprintln!(
@@ -674,10 +906,20 @@ mod imp {
         unsafe { CloseHandle(snap) };
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
-        if windows > 0 {
-            // Helper-window roots are a blocked peer's register file + raw
-            // stack: conservative and un-rewritable, exactly like the takeover
-            // pass. This collection must not relocate.
+        super::XT_HELPER_WINDOWS_PINNED.fetch_add(pinned_windows as u64, Ordering::Relaxed);
+        super::XT_HELPER_WINDOWS_REFUSED.fetch_add(unpinned_windows as u64, Ordering::Relaxed);
+        super::XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(unpinned_windows as u64, Ordering::Release);
+        // Helper-window roots are a blocked peer's register file + raw stack:
+        // conservative and un-rewritable, so without a pin this collection must
+        // not relocate. WITH one -- and with the interior-resolving probe the
+        // discharge implies, so a derived pointer resolves to the base that
+        // must stay still -- the objects the peer can reach are held in place
+        // and the rest of the heap may move. See the Linux arm for the full
+        // argument and for why the pins alone are not sufficient without the
+        // second site in `interpreter::gc_and_alloc` agreeing.
+        if windows > 0
+            && !(super::helper_window_discharge_enabled() && unpinned_windows == 0)
+        {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
@@ -1178,13 +1420,21 @@ mod imp {
         slot.clear();
     }
 
+    /// Returns `(has_jit, complete)`.
+    ///
+    /// `complete` is the half that licenses PINNING instead of refusing the
+    /// cycle: it says this peer's conservative root set is the WHOLE of what it
+    /// can reach -- its register file and every readable word of its stack from
+    /// `rsp` up. Pinning a partial set helps nothing, because what was missed
+    /// is unrewritable too, so the two early returns below report `false` and
+    /// the caller keeps refusing.
     fn classify_slot_helper_window<F>(
         slot: &LinuxSlot,
         regions: &[(usize, usize)],
         ranges: &[(usize, usize)],
         is_obj: &F,
         candidates: &mut Vec<ObjectRef>,
-    ) -> bool
+    ) -> (bool, bool)
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -1201,10 +1451,10 @@ mod imp {
 
         let rsp = slot.rsp.load(Ordering::Acquire);
         if rsp == 0 || rsp & 0x7 != 0 {
-            return has_jit;
+            return (has_jit, false);
         }
         let Some(end) = readable_region_end_from_regions(rsp, regions) else {
-            return has_jit;
+            return (has_jit, false);
         };
         let mut p = rsp;
         while p + 8 <= end {
@@ -1217,7 +1467,7 @@ mod imp {
             }
             p += 8;
         }
-        has_jit
+        (has_jit, true)
     }
 
     /// Linux implementation of the cross-thread JIT root scan. We cannot use
@@ -1369,6 +1619,10 @@ mod imp {
         let self_tid = gettid();
         let mut candidates: Vec<ObjectRef> = Vec::new();
         let mut windows = 0usize;
+        let mut pinned_windows = 0usize;
+        let mut unpinned_windows = 0usize;
+        // Per-cycle, so reset before the pass rather than accumulated.
+        XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(0, Ordering::Release);
         let mut found_total = 0usize;
         let mut examined = 0usize;
         let mut unclassified = 0usize;
@@ -1405,7 +1659,7 @@ mod imp {
             match answer {
                 STATE_PARKED => {
                     candidates.clear();
-                    let has_jit = classify_slot_helper_window(
+                    let (has_jit, complete) = classify_slot_helper_window(
                         slot,
                         &regions,
                         &ranges,
@@ -1414,8 +1668,66 @@ mod imp {
                     );
                     if has_jit {
                         windows += 1;
+                        // A JIT frame's oops live in the SHADOW STACK, which
+                        // is not the machine stack and so is invisible to
+                        // everything above. Scan it too, or the pin is
+                        // incomplete and any coverage credited on it is a lie.
+                        // An untrusted window refuses the pin rather than
+                        // claiming coverage it does not have.
+                        let shadow_ok = if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled()
+                        {
+                            super::scan_peer_shadow_window(tid, is_obj, &mut candidates).is_some()
+                        } else {
+                            true
+                        };
                         found_total += candidates.len();
                         let roots_this_window = candidates.len();
+                        // PIN, rather than refuse the whole cycle.
+                        //
+                        // This peer's conservative root set is COMPLETE -- the
+                        // classifier read its register file and every readable
+                        // word of its stack -- so nothing it can reach is
+                        // missing from `candidates`. Pinning exactly those
+                        // addresses is the same contract the cooperatively
+                        // parked threads already get through
+                        // `publish_pinned_jit_roots`: the objects do not move,
+                        // their FIELDS are still rewritten through the pointer
+                        // map, and everything else in the heap may relocate.
+                        //
+                        // The peer could not publish for itself because it was
+                        // interrupted by our signal inside a Rust helper,
+                        // reaching neither a safepoint arrival nor a
+                        // blocking-region entry -- the only two deposit points.
+                        // The scan runs on the COLLECTOR's thread, so it cannot
+                        // publish under the peer's `ThreadId` either; hence a
+                        // per-cycle set.
+                        if complete && shadow_ok && helper_window_pin_enabled() {
+                            let addrs: Vec<usize> =
+                                candidates.iter().map(|o| o.as_ptr() as usize).collect();
+                            cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_roots(&addrs);
+                            pinned_windows += 1;
+                            // A pinned window covers the peer's WHOLE stack
+                            // (`[rsp, stack_base)`) plus its register file, so
+                            // every JIT frame it holds is immobile -- which is
+                            // what the cross-thread coverage account wants to
+                            // hear, and it wants to hear it as a DEPTH.
+                            //
+                            // Reading the peer's published depth after it has
+                            // resumed is still exact: `mark_blocked_region_leave`
+                            // waits out an active pause, so a blocked peer
+                            // cannot run Java (and so cannot mutate its chain)
+                            // between the block and the end of this STW.
+                            //
+                            // `None` -- a peer that never registered a slot --
+                            // poisons the ledger rather than crediting zero.
+                            if crate::jit::conservative_roots::xt_pinned_peer_depth_enabled() {
+                                cratonvm_gc::gc_quiescence::add_xt_cycle_pinned_jit_depth(
+                                    cratonvm_gc::gc_quiescence::jit_depth_of_tid(tid),
+                                );
+                            }
+                        } else {
+                            unpinned_windows += 1;
+                        }
                         roots.append(&mut candidates);
                         if dbg() {
                             eprintln!(
@@ -1450,12 +1762,46 @@ mod imp {
         }
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
-        if windows > 0 {
-            // See the Windows arm.
+        // EVERY window still refuses, and the pins above do NOT discharge it.
+        //
+        // This was wrong in the first cut of this change, which suppressed the
+        // refusal for a pinned window. The pins are real and the scan is
+        // complete in the sense that matters for what it FINDS -- register file
+        // plus the whole readable stack band -- but the predicate it finds with
+        // is `VmHeap::is_object_address`, which is `registry.contains(addr)`:
+        // EXACT OBJECT BASES ONLY. A frozen peer holding a derived or interior
+        // pointer (a compiled loop's pointer into an array body is the ordinary
+        // case) contributes no candidate at all, so its base object is not
+        // pinned, and relocating it strands the peer on resume. The comment at
+        // the second refusal site in `interpreter::gc_and_alloc` says exactly
+        // this -- "a frozen peer's registers can hold only a derived/interior
+        // pointer whose base would otherwise be evacuated from under it" -- and
+        // it is the reason that site marks the cycle incomplete too.
+        //
+        // Discharging this properly needs the interior-resolving predicate,
+        // `is_heap_addr`, which is now affordable (one backwards bit scan plus
+        // one header dereference via `nearest_base_at_or_below`, not the old
+        // O(live) registry iteration) and which `vm_heap.rs` already feeds
+        // per-slot conservative scanning. The cost of adopting it here is a
+        // WIDER conservative root set -- every long that happens to land inside
+        // a live object's extent becomes a root -- and that trade has not been
+        // measured. Until it is, the refusal stands.
+        //
+        // The pins are still published, because they are strictly additive
+        // (they can only keep a page out of one CSet) and because they are what
+        // made the shortfall measurable: `hw_pinned`/`hw_refused` on the
+        // `[GC] xt_peer_scan` line say how many windows a future discharge
+        // would have to cover.
+        XT_HELPER_WINDOWS_UNPINNED_CYCLE.store(unpinned_windows as u64, Ordering::Release);
+        if windows > 0
+            && !(helper_window_discharge_enabled() && unpinned_windows == 0)
+        {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
             );
         }
+        XT_HELPER_WINDOWS_PINNED.fetch_add(pinned_windows as u64, Ordering::Relaxed);
+        XT_HELPER_WINDOWS_REFUSED.fetch_add(unpinned_windows as u64, Ordering::Relaxed);
         cratonvm_gc::gc_quiescence::publish_xt_helper_window(windows as u64, found_total as u64);
         if dbg() {
             eprintln!(

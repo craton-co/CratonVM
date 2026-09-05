@@ -19,6 +19,38 @@ Probes: `scratchpad/probe/{P1,P2,P3,P4,P5}.java` (session scratchpad).
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03. The blocker is GONE, and §0's "after"
+> prediction is superseded rather than wrong.**
+>
+> ```text
+> HotSpot 25            PASS RJdkBridge1 (483 checks)
+> CratonVM --jdk-only   PASS RJdkBridge1 (483 checks)     diff: EMPTY
+> ```
+>
+> §0 measured CratonVM dying at check **197**, on `negp.getPort() == -1`, having
+> completed 196 of the oracle's 394 — and predicted "**still dies at check 197**,
+> the blocking fix is in `net_phase_e.rs`, which this lane may not edit". It does
+> not die. It completes every check the oracle does, with byte-identical output.
+> Somebody made that one-line change in the file this lane did not own; the
+> prediction was correct about the blocker and correct that it could not fix it,
+> and has simply been overtaken.
+>
+> **The check count is the vector's own, not a line count.** The last two lines
+> are `CK RJdkBridge1 checks=483` and `PASS RJdkBridge1 (483 checks)`; the output
+> is 182 lines. Counting lines here would have given 182 against §0's 394 and
+> read as a vector that still stops early — the same trap `RSslNullSession`
+> sets, where the suite reports `1 passed` for a vector that died after one check
+> of ninety-one. Where a vector self-reports its checks, that number is the
+> measurement.
+>
+> 483, not §0's 394: the vector grew. The `uri` section's tripwire
+> (`sectionEnd("uri", 50)`) that §0 records as never reached is reached now,
+> since the run completes and the diff against the oracle is empty.
+>
+> **Scope.** This says the vector passes; it does not re-measure §0's 51 rows of
+> URI surface individually. Those were MEASURED before and are unchanged by this
+> note.
+
 ## 0. The headline
 
 | vector | before (MEASURED) | after (PREDICTED) |

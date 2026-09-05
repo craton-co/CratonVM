@@ -87,8 +87,29 @@ impl ConcurrentGcState {
     }
 
     /// Set the GC phase (called by the GC coordinator).
+    ///
+    /// This is the ONE writer of the phase, and therefore the one place that
+    /// can keep the JIT's SATB pre-barrier gate honest. Compiled reference
+    /// stores skip their pre-barrier call when that gate reads clear, so the
+    /// gate must be armed for a superset of the interval in which
+    /// [`Self::is_marking_active`] is true — never a subset. Hence the
+    /// asymmetry below: arm BEFORE the phase becomes observable, disarm AFTER
+    /// it stops being. `arm`/`disarm` count markers rather than setting a
+    /// boolean, because this type is shared by the generational collector and
+    /// G1 and a process can hold several heaps at once.
     pub fn set_phase(&self, phase: ConcurrentGcPhase) {
+        let was = self.is_marking_active();
+        let will = matches!(
+            phase,
+            ConcurrentGcPhase::ConcurrentMark | ConcurrentGcPhase::Remark
+        );
+        if will && !was {
+            crate::gen_heap::arm_jit_ref_store_marker();
+        }
         self.phase.store(phase as u8, Ordering::Release);
+        if was && !will {
+            crate::gen_heap::disarm_jit_ref_store_marker();
+        }
     }
 
     /// Whether concurrent marking is active (SATB barrier should log).
@@ -757,7 +778,12 @@ impl ConcurrentMarker {
         // being collected now.
         if snapshot_epoch != Some(old_gen.reclaim_epoch()) {
             SWEEP_EPOCH_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(
+            // `info!`: a whole concurrent sweep's work is being thrown
+            // away, at most once per cycle. `SWEEP_EPOCH_ABORTS` is read
+            // only by this file's tests, and as `debug!` this line could
+            // not print in a release build, so the abandonment was
+            // unobservable outside a debug run.
+            tracing::info!(
                 snapshot_epoch = ?snapshot_epoch,
                 current_epoch = old_gen.reclaim_epoch(),
                 eligible = eligible.len(),
@@ -972,7 +998,7 @@ impl ConcurrentMarker {
             // slots past the extent `old_gen.contains` approved — which is the
             // "can a reader visit slot n of an object whose real slot count is
             // below n" question that
-            // `known-issues/hibernate/hib-orm-json-xml-function-tests-segfault-g1-zgc-20260820.md`
+            // `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md`
             // §0.5 item 2 asks of exactly this code.
             //
             // Deriving the count from `total_size` closes the window by

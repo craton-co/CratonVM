@@ -2181,21 +2181,53 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // buffer at a sane chunk size to bound memory), so loop until `n`
     // bytes have been skipped or EOF is reached. Return the actual
     // number of bytes skipped, matching `java.io.FileInputStream.skip`.
-    // NOT REPAIRED HERE, AND THE REGISTRY SAYS WHY. HotSpot's `skip` past end
-    // of file answers the requested count (its `skip0` is one `lseek`), and
-    // this body answers 0. A seek was added here and MEASURED INERT: under
-    // `--jdk-only` the `skip(J)J` triple is not registered at all, and in the
-    // default mode it is registered with `invocations: 0`. So is `skip0(J)J`,
-    // in both. What actually answers is `java.io.InputStream.skip`'s
-    // read-and-discard default — the invocation counts prove it
-    // (`readBytes` +4 for two skips over a 2-byte file, `skip0` +0).
+    // NOT REPAIRED HERE, AND THE REASON HAS BEEN RE-MEASURED (2026-08-30).
+    // The conclusion below stands; both pieces of evidence the previous note
+    // gave for it were wrong, which is why they are replaced rather than kept.
     //
-    // That is a RESOLUTION finding, not a body one: `FileInputStream.skip`
-    // resolves to its superclass's method, so no change to either native here
-    // can move the answer. Recorded as a nomination rather than fixed with an
-    // edit that cannot fire. The answer is contract-legal in the meantime —
-    // `InputStream.skip` is specified to "skip over some smaller number of
-    // bytes, possibly zero".
+    // THE DEFECT IS THREE ROWS, NOT ONE. `FileInputStream.skip` is not
+    // `InputStream.skip`: its javadoc says it "may skip more bytes than what
+    // are remaining in the backing file ... the number of bytes skipped may
+    // include some number of bytes that were beyond the EOF", because HotSpot's
+    // `skip0` is one `lseek`. Read-and-discard can only answer what is there:
+    //
+    //   4-byte file at EOF   skip(4)    HotSpot 4     this VM 0
+    //   4-byte file, 1 left  skip(100)  HotSpot 100   this VM 1
+    //   at position 0        skip(-1)   HotSpot IOException   this VM 0
+    //
+    // WRONG EVIDENCE #1 — "the `skip(J)J` triple is not registered at all under
+    // `--jdk-only`, and `skip0(J)J` has `invocations: 0` in both". The registry
+    // now reads `skip 0 / skip0 5` for a five-`skip` program. That number is
+    // real and it is not entry: an `eprintln!` placed in THIS body printed
+    // nothing, in `--jdk-only` AND in the default mode. The counter counts a
+    // dispatch ATTEMPT; the body was never reached. (Same family as
+    // `a-zero-invocation-count-is-evidence-about-a-counter`, from the other
+    // side: a NON-zero count is evidence about a counter too.)
+    //
+    // WRONG EVIDENCE #2 — "`FileInputStream.skip` resolves to its superclass's
+    // method". It does not. Measured through reflection, identical to HotSpot:
+    //
+    //   FileInputStream.class.getMethod("skip", long.class).getDeclaringClass()
+    //     HotSpot   java.io.FileInputStream
+    //     this VM   java.io.FileInputStream
+    //
+    // and `getDeclaredMethods` lists `skip` AND `skip0` on the class, exactly
+    // as HotSpot does. RESOLUTION is correct; what differs is the body
+    // `invokevirtual` actually enters. The three answers above are precisely
+    // `InputStream.skip`'s read-and-discard default, so that is the bytecode
+    // running.
+    //
+    // So this is a DISPATCH finding — the superclass body is entered for a
+    // method the subclass declares and overrides — and no edit to either native
+    // in this file can move it. A seek-based body was written and measured
+    // inert twice, most recently on 2026-08-30; it is not carried here, because
+    // code that cannot run is worse than the absence of it. Nominated out of
+    // this lane.
+    //
+    // Contract-legal in the meantime only in the weak sense: `InputStream.skip`
+    // may "skip over some smaller number of bytes, possibly zero", but
+    // `FileInputStream` overrides that contract, and it is the override a
+    // caller holding a `FileInputStream` is entitled to.
     const CHUNK: usize = 8192;
     let mut remaining = n as u64;
     let mut total_skipped: u64 = 0;
@@ -8494,6 +8526,25 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // an unregistered triple. The count stays 37 and the reason is a test outside
 // this crate, not a dispatch requirement. Long note at the foot of this
 // function.
+/// Whether the real `java.util.Scanner` should run instead of this crate's
+/// tokenizer, on a real JDK.
+///
+/// The same shape as `jdk_random_enabled` in `native-collections`: a
+/// registration-time gate, so the family is not registered at all rather than
+/// refused at dispatch. `CRATONVM_ENFORCE_NATIVE_SHADOW` cannot serve here --
+/// it is a `--jdk-only` instrument and `NativeKind::allowed_in` is
+/// unconditionally true for `Compatible`, so the dial moves compatible mode by
+/// zero (measured: 50 diff lines with it and without it).
+fn jdk_scanner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JDK_SCANNER").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
+    })
+}
+
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     // RETAG ATTEMPTED 2026-08-19 AND REVERTED — the classification above is
@@ -8509,10 +8560,109 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     //
     //   RJdkIntrinsics3: findWithinHorizon(String, 0) expected "42", got null
     //
-    // So a correct classification does NOT imply the registrar can be retagged.
-    // That needs the state to move first (G88-1 §5) — retiring the Rust
-    // tokenizer, which is wave-2 work.
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // MEASURED 2026-08-30 (lane L3), and the paragraph above is WRONG about the
+    // blocker. `apps/probes/ScannerShadowSweep` is the first differential
+    // coverage this class has ever had -- 94 rows, 43 owning registrations, and
+    // it found 25 wrong rows IDENTICAL in both modes:
+    //
+    //   * `new Scanner("a").locale()` is NULL, where HotSpot answers the
+    //     default -- an NPE in any caller that compares it;
+    //   * `nextBigInteger()`, `hasNextBigInteger()`, `hasNextShort()` and
+    //     `hasNextByte()` reach the parse path with RADIX 0
+    //     (`IllegalArgumentException: radix:0`);
+    //   * `nextBigDecimal()`, `nextBigInteger(radix)`, `skip(String)` and
+    //     `findAll(String)` NPE on `this.matcher` / `this.patternCache`, real
+    //     fields our `<init>` never populates;
+    //   * `new Scanner("a,b,,c").useDelimiter(",")` walks `[a][b]` where HotSpot
+    //     walks `[a][b][][c]` -- it drops the empty token AND everything after
+    //     it;
+    //   * `1,234` does not parse as a grouped int in any locale;
+    //   * nine rows carry invented exception messages ("no more elements",
+    //     "token mismatch") where HotSpot's are null or carry the
+    //     `NumberFormatException` text.
+    //
+    // AND REFUSING THE FAMILY FIXES 24 OF THEM. Run under
+    // `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/Scanner`, the probe goes from 25
+    // wrong rows to 12. The recorded objection -- "the real bytecode runs
+    // against a Scanner whose real fields were never populated" -- described a
+    // refusal that left `<init>` shadowed. Refuse the WHOLE family and the real
+    // constructor runs, so the state is the JDK's and there is nothing left to
+    // populate.
+    //
+    // The 11 rows that broke under the dial were not a missing capability
+    // either. Scanner native invocations fell 186 -> 17 under it, and the 17
+    // that SURVIVED are exactly the `findWithinHorizon` and `match` rows below:
+    // the dial refuses `Bridge` and does not refuse `Intrinsic`. So real
+    // `nextLine`/`findInLine` bytecode was calling a still-shadowed
+    // `findWithinHorizon` that did not understand the real Scanner's state.
+    // Both candidate capabilities were ruled out by measurement rather than
+    // argument: `apps/probes/MatcherRegionProbe` is 39 of 40 rows clean on the
+    // region-bounded `Matcher` API `findPatternInBuffer` runs on -- `region`,
+    // `usePattern`, transparent and anchoring bounds, `hitEnd`, a `CharBuffer`
+    // input and Scanner's own line pattern -- and `apps/probes/ReadableProbe` is
+    // 0-diff on all 15 rows of `Readable.read(CharBuffer)`, the loop it drives.
+    //
+    // `SyntheticStub`, therefore, and the three `Intrinsic` rows below go with
+    // it -- a family that is refused in part is the configuration that produced
+    // the false blocker. `--jdk-only` now drops all 43 and runs java.base's own
+    // `Scanner`. COMPATIBLE MODE IS UNCHANGED: `NativeKind::allowed_in` returns
+    // an unconditional `true` there, so this moves the default mode by zero and
+    // the 25 rows stay open in it, against the day the Rust tokenizer is retired
+    // outright.
+    // The compatible-mode half of the same retirement. `SyntheticStub` already
+    // drops this family under `--jdk-only`; on a real JDK with the flag on it is
+    // not registered in EITHER mode and `java.util.Scanner`'s own bytecode runs,
+    // which is what would close the 25 rows listed above in the default mode.
+    //
+    // THE DEFAULT IS OFF, AND IT IS CHOSEN BY MEASUREMENT, exactly as the
+    // sibling gate `jdk_random_enabled` is.
+    //
+    // Correctness says turn it ON. `apps/probes/ScannerShadowSweep`, 94 rows:
+    //
+    // ```text
+    //             flag OFF        flag ON
+    //   compat    50 diff lines   0
+    //   jdk-only  0               0
+    // ```
+    //
+    // -- the flag closes all 25 wrong rows in the DEFAULT mode, which
+    // `SyntheticStub` alone cannot do (`NativeKind::allowed_in` is
+    // unconditionally true for `Compatible`).
+    //
+    // AND IT COSTS NOTHING ELSE. The whole `java.util` corpus was re-run in
+    // compatible mode with the flag ON -- UtilCoverage, UtilCoverage4,
+    // UtilTail2, UtilTail, Collections, MapViews, Properties, ViewIdentity,
+    // Base64 and UtilUnshadowed, 1631 rows -- and every one is byte-identical
+    // to its flag-OFF run. Only `ScannerShadowSweep` moves, 50 diff lines to 0.
+    // A retirement that closes 25 rows is worth little if it opens others
+    // somewhere the probe for THIS class cannot see, so the corpus is the
+    // check, not the class's own probe.
+    //
+    // Throughput says leave it off. `apps/probes/ScannerBench`, A/B/B/A
+    // interleaved so load drift cannot be mistaken for the effect, ns per scan
+    // of a 40-item source:
+    //
+    // ```text
+    //                       shadowed          retired
+    //   next (tokens)       623985, 672046    5118757, 4769729
+    //   nextInt             518312, 435840    5181001, 5303971
+    //   nextLine            380821, 323801    4712739, 6249495
+    // ```
+    //
+    // 8x on tokens, 11x on typed reads, 15x on lines, and the A pair and the B
+    // pair each agree with themselves. The real `Scanner` drives a `Matcher`
+    // over a `CharBuffer` and re-reads its source through `findPatternInBuffer`
+    // where this crate's tokenizer walks an `Arc<str>` with a Rust regex, so the
+    // gap is structural.
+    //
+    // So the two modes get what each is for: `--jdk-only` already has the
+    // correctness, because the family is `SyntheticStub` and is dropped there,
+    // and compatible mode keeps the tokenizer and its 25 recorded rows. Turning
+    // this on is a throughput decision and the numbers above are its price.
+    if registry.real_jdk() && jdk_scanner_enabled() {
+        return;
+    }
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/Scanner";
 
     // Constructors
@@ -8664,23 +8814,24 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
     // it, which is the category the implementation in `phases_early.rs` used
     // before it moved here.
     //
-    // The other 35 registrations in this function are still `Bridge` by
-    // inheritance and still wrong for the same reason — see the
-    // JDK-ONLY-CLASSIFY note above. Re-tagging them moves the ratchet in the
-    // GOOD direction and belongs with whoever re-freezes it.
+    // The other 35 registrations in this function are `SyntheticStub` by
+    // inheritance as of 2026-08-30, and these three now match them. Leaving
+    // them `Intrinsic` is what made a partial refusal look like a missing
+    // capability: under the enforce dial these were the only Scanner natives
+    // still running, and real `nextLine` bytecode called them.
     registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/lang/String;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_string,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     registry.register_with_kind(
         c,
         "findWithinHorizon",
         "(Ljava/util/regex/Pattern;I)Ljava/lang/String;",
         native_scanner_find_within_horizon_pattern,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     // `match()` is Intrinsic for the same reason as `findWithinHorizon` above:
     // `java.util.Scanner` declares no ACC_NATIVE method, so contract §1.5's
@@ -8691,7 +8842,7 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "match",
         "()Ljava/util/regex/MatchResult;",
         native_scanner_match,
-        cratonvm_native_api::NativeKind::Intrinsic,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // Interface dispatch: Iterator
@@ -18325,7 +18476,7 @@ fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -18396,10 +18547,37 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             "([BII)V",
             &[Value::Object(Some(buf)), Value::Int(0), Value::Int(count)],
         );
-        let this = ctx.read_native_pin(this_pin, this);
+        this = ctx.read_native_pin(this_pin, this);
         ctx.unpin_native_roots(this_pin);
         write_result?;
         ctx.set_field(this, count_slot, Value::Int(0));
+    }
+    // `BufferedOutputStream.implFlush()` is `flushBuffer(); out.flush();` — the
+    // inner flush is UNCONDITIONAL, and it was missing here. Emptying our own
+    // buffer into `out` is not a flush of `out`: if the inner stream buffers
+    // too, its bytes stayed where they were, and any failure it would have
+    // raised was never raised at all.
+    //
+    // The tell was inside this same function: [`bos_side_flush`], the arm taken
+    // when the receiver has no real buffer slots, has always done
+    // `invoke_virtual(inner, "flush")` under its `flush_inner` flag. The two
+    // halves of one flush disagreed, and the half with the shorter path was
+    // the one that ran for a real `BufferedOutputStream`.
+    //
+    // MEASURED — `probes/CloseFlushSwallowProbe.java`'s
+    // `filterOutFlushFailureWins`: a sink whose `flush()` throws must let that
+    // failure out of `close()`. It answered `none`, because `flush()` was never
+    // called on it. `W7-57` swept 51 delegated-failure sites and this one
+    // survived the sweep, since the failure is not swallowed here — it is never
+    // produced. Same pin discipline as the write above: `flush()` is arbitrary
+    // overridable bytecode and can move `this`.
+    if let Some(inner) = bos_inner(ctx, this, out_slot) {
+        let this_pin = ctx.pin_native_root(this);
+        let flush_result = ctx.invoke_virtual(inner, "flush", "()V", &[]);
+        this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        let _ = this;
+        flush_result?;
     }
     Ok(None)
 }
@@ -18429,25 +18607,48 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this_pin = ctx.pin_native_root(this);
     let flush_result = native_bos_flush(ctx, args);
     let mut this = ctx.read_native_pin(this_pin, this);
-    if let Err(error) = flush_result {
-        ctx.unpin_native_roots(this_pin);
-        return Err(error);
-    }
-    // 2) Close the inner stream (matches the JDK
-    //    `try (out) {}` block in BufferedOutputStream.close).
+    // 2) Close the inner stream — from the equivalent of the JDK's `finally`,
+    //    so it happens EVEN WHEN THE FLUSH FAILED.
+    //
+    //    `FilterOutputStream.close()` is
+    //
+    //        try { flush(); } catch (Throwable e) { flushException = e; throw e; }
+    //        finally {
+    //            if (flushException == null) { out.close(); }
+    //            else { try { out.close(); } catch (Throwable ce) { … throw ce; } }
+    //        }
+    //
+    //    so a failing flush does not cost the caller its file descriptor. This
+    //    code used to `return Err(error)` on the flush failure and never reach
+    //    the close at all, which leaks the inner stream on exactly the path
+    //    where the caller most needs it released. It was invisible while
+    //    `native_bos_flush` could not produce a failure in the first place;
+    //    fixing that flush is what made this reachable.
+    //    MEASURED — `CloseFlushSwallowProbe`'s
+    //    `filterOutCloseAttemptedAfterFailedFlush`.
     let (out_slot, _, _) = bos_slots(ctx);
-    if let Some(inner) = bos_inner(ctx, this, out_slot) {
-        let close_result =
+    let close_result = if let Some(inner) = bos_inner(ctx, this, out_slot) {
+        let result =
             ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[]);
         this = ctx.read_native_pin(this_pin, this);
-        if let Err(error) = close_result {
-            ctx.unpin_native_roots(this_pin);
-            return Err(error);
-        }
-    }
+        result
+    } else {
+        Ok(None)
+    };
     bos_side_buffers().lock().remove(&bos_side_key(ctx, this));
     ctx.unpin_native_roots(this_pin);
-    Ok(None)
+    // Precedence is the JDK's: a close failure wins over a flush failure
+    // (the JDK suppresses the flush one INTO it), and a flush failure wins
+    // when the close succeeded.
+    //
+    // NOT REPRODUCED: `closeException.addSuppressed(flushException)` when both
+    // fail. The caller sees the close failure with the right identity and
+    // without the suppressed flush one attached.
+    match (flush_result, close_result) {
+        (_, Err(close_error)) => Err(close_error),
+        (Err(flush_error), Ok(_)) => Err(flush_error),
+        (Ok(_), Ok(_)) => Ok(None),
+    }
 }
 
 // PipedInputStream/OutputStream simplified as BAIS/BAOS
@@ -25074,6 +25275,30 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __rows_before = r.dump_registrations().len();
     let dc = "java/nio/channels/DatagramChannel";
 
+    // `provider()` — the platform `SelectorProvider`, not `null`.
+    //
+    // `AbstractSelectableChannel.provider()` reads a `private final
+    // SelectorProvider provider` field that this VM's synthetic channel never
+    // populates, so the accessor answered `null` and the documented route
+    // `dc.provider().openDatagramChannel()` was an NPE at a site that no longer
+    // names the cause. `Selector.provider()` was repaired the same way and the
+    // static `SelectorProvider.provider()` already resolves here — MEASURED,
+    // `sun.nio.ch.EPollSelectorProvider`, the same object HotSpot's instance
+    // accessor hands back (`probes/ResidualProbe.java`).
+    r.register(
+        dc,
+        "provider",
+        "()Ljava/nio/channels/spi/SelectorProvider;",
+        |ctx, _args| {
+            ctx.invoke(
+                "java/nio/channels/spi/SelectorProvider",
+                "provider",
+                "()Ljava/nio/channels/spi/SelectorProvider;",
+                &[],
+            )
+        },
+    );
+
     // open() → DatagramChannel
     r.register(
         dc,
@@ -25164,6 +25389,39 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     r.register(dc, "isConnected", "()Z", native_dc_is_connected);
     r.register(dc, "write", "(Ljava/nio/ByteBuffer;)I", native_dc_write);
     r.register(dc, "read", "(Ljava/nio/ByteBuffer;)I", native_dc_read);
+    // The Gathering/ScatteringByteChannel pair. Absent until now, so the JDK's
+    // own `DatagramChannelImpl` bytecode ran against a synthetic receiver and
+    // died on a null `writeLock`/`readLock`. W7-9 section 6.
+    r.register(
+        dc,
+        "write",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_dc_write_gathering,
+    );
+    r.register(
+        dc,
+        "read",
+        "([Ljava/nio/ByteBuffer;II)J",
+        native_dc_read_scattering,
+    );
+    // The one-argument forms the interfaces also declare, defined by the JDK as
+    // the three-argument ones over the whole array.
+    r.register(dc, "write", "([Ljava/nio/ByteBuffer;)J", |ctx, args| {
+        let srcs = obj_arg92(args, 1)?;
+        let n = ctx.array_length(srcs) as i32;
+        native_dc_write_gathering(
+            ctx,
+            &[args[0], args[1], Value::Int(0), Value::Int(n)],
+        )
+    });
+    r.register(dc, "read", "([Ljava/nio/ByteBuffer;)J", |ctx, args| {
+        let dsts = obj_arg92(args, 1)?;
+        let n = ctx.array_length(dsts) as i32;
+        native_dc_read_scattering(
+            ctx,
+            &[args[0], args[1], Value::Int(0), Value::Int(n)],
+        )
+    });
 
     // send(ByteBuffer, SocketAddress) → int
     // Was deferred to datagram.rs, which resolved the channel through its own
@@ -26316,6 +26574,172 @@ fn native_dc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     buf_set_position(ctx, buffer, view.pos + received as i32);
     Ok(Some(Value::Int(received as i32)))
+}
+
+/// `DatagramChannel.write(ByteBuffer[], int, int) -> long` — the gathering form.
+///
+/// NOT a loop over the single-buffer native, and that is the whole difficulty
+/// `W7-9` §6 named when it declined to implement this ("not composable from the
+/// single-buffer natives that do exist: for a datagram channel a scattering
+/// read consumes exactly one datagram"). A gathering write must produce ONE
+/// datagram from all the source buffers; writing each buffer in turn would put
+/// N datagrams on the wire and a receiver would see N messages.
+///
+/// So the buffers are concatenated VM-side into one payload — the same
+/// `bb_storage_view` / `bb_read_byte` machinery `native_dc_write` uses — and
+/// sent once. Positions are then advanced by exactly what the socket took, in
+/// buffer order, which is what `GatheringByteChannel` specifies.
+///
+/// Before this, the JDK's own `DatagramChannelImpl.write(ByteBuffer[],int,int)`
+/// bytecode ran against our synthetic channel and died on
+/// `NullPointerException: … because "this.writeLock" is null` — our own
+/// uninitialised state surfacing from inside library code, where the caller
+/// expected either bytes or a named refusal. Netty's datagram path uses this
+/// overload (`GatheringByteChannel`), which is why `W7-9` called it "genuinely
+/// absent, and genuinely reachable".
+fn native_dc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let srcs = obj_arg92(args, 1)?;
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = ctx.array_length(srcs) as i32;
+    // `Objects.checkFromIndexSize`, the JDK's own precondition.
+    if offset < 0 || length < 0 || offset > count - length {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!("offset {offset}, length {length}, array length {count}")),
+        }
+        .into());
+    }
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.write: channel has no UDP socket".into(),
+    })?;
+
+    let mut payload: Vec<u8> = Vec::new();
+    for index in offset..offset + length {
+        let Value::Object(Some(buffer)) = ctx.get_array_element(srcs, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        let remaining = (view.lim - view.pos).max(0) as usize;
+        for step in 0..remaining {
+            payload.push(bb_read_byte(ctx, view, view.pos as usize + step)?);
+        }
+    }
+    let sent = ctx
+        .fd_table()
+        .udp_send_connected(fd, &payload)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("DatagramChannel.write: {e}"),
+        })?;
+
+    // Advance each source by the part of it that actually went out. A short
+    // send leaves the tail buffers untouched rather than silently consumed.
+    let mut left = sent;
+    for index in offset..offset + length {
+        if left == 0 {
+            break;
+        }
+        let Value::Object(Some(buffer)) = ctx.get_array_element(srcs, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        let remaining = (view.lim - view.pos).max(0) as usize;
+        let taken = remaining.min(left);
+        buf_set_position(ctx, buffer, view.pos + taken as i32);
+        left -= taken;
+    }
+    Ok(Some(Value::Long(sent as i64)))
+}
+
+/// `DatagramChannel.read(ByteBuffer[], int, int) -> long` — the scattering form.
+///
+/// The mirror of [`native_dc_write_gathering`], and it has the same reason for
+/// not being a loop: a scattering read consumes exactly ONE datagram and
+/// spreads it across the buffers. Reading per-buffer would consume one datagram
+/// each and silently drop whatever did not fit the first.
+///
+/// Bytes beyond the buffers' total remaining are DISCARDED, which is the
+/// datagram contract — `ScatteringByteChannel` says the rest of the datagram is
+/// dropped, not held for the next read.
+fn native_dc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let dsts = obj_arg92(args, 1)?;
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let length = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = ctx.array_length(dsts) as i32;
+    if offset < 0 || length < 0 || offset > count - length {
+        return Err(RuntimeError::IndexOutOfBoundsException {
+            message: Some(format!("offset {offset}, length {length}, array length {count}")),
+        }
+        .into());
+    }
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.read: channel has no UDP socket".into(),
+    })?;
+
+    let mut capacity = 0usize;
+    for index in offset..offset + length {
+        let Value::Object(Some(buffer)) = ctx.get_array_element(dsts, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        capacity += (view.lim - view.pos).max(0) as usize;
+    }
+    let mut bytes = vec![0u8; capacity];
+    // Same blocking-region bracket and re-sync as `native_dc_read`: the recv
+    // parks without touching the Java heap, and a stop-the-world pause during
+    // it may move the destination ARRAY.
+    let mut held = vec![Value::Object(Some(dsts))];
+    ctx.begin_blocking_region();
+    let recv = ctx.fd_table().udp_recv(fd, &mut bytes);
+    ctx.end_blocking_region_refs(&mut held);
+    let dsts = match held[0] {
+        Value::Object(Some(a)) => a,
+        _ => dsts,
+    };
+    let (received, _) = match recv {
+        Ok(received) => received,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(Some(Value::Long(0)));
+        }
+        Err(error) => {
+            return Err(RuntimeError::IOException {
+                message: format!("DatagramChannel.read: {error}"),
+            }
+            .into());
+        }
+    };
+
+    let mut placed = 0usize;
+    for index in offset..offset + length {
+        if placed >= received {
+            break;
+        }
+        let Value::Object(Some(buffer)) = ctx.get_array_element(dsts, index as usize) else {
+            continue;
+        };
+        let view = bb_storage_view(ctx, buffer)?;
+        let remaining = (view.lim - view.pos).max(0) as usize;
+        let take = remaining.min(received - placed);
+        for step in 0..take {
+            bb_write_byte(ctx, view, view.pos as usize + step, bytes[placed + step])?;
+        }
+        buf_set_position(ctx, buffer, view.pos + take as i32);
+        placed += take;
+    }
+    Ok(Some(Value::Long(placed as i64)))
 }
 
 /// `DatagramChannel.send(ByteBuffer, SocketAddress) -> int`.

@@ -19,6 +19,438 @@ load ~3** — against the inherited base rate of "roughly one in three runs of
 lever is host quietness, not a flag, and it is the difference between a defect
 nobody could bisect and one anybody can.
 
+**READ BOTH 2026-09-02 ADDENDA, THE "(later)" ONE FIRST.** Where things stand:
+the fail-closed fix REDUCED this defect and did not close it — the
+`NullPointerException` face still reproduces at the shipped default at
+`--Xmx 256m` on a quiet host (2 of 3 runs in one batch on a release binary).
+`--Xmx 1g` and `--Xmx 4g` are clean over 1500 s each, so the title's "small
+heap" premise is right again. And the residue this page treats as evidence of a
+missed root has been MEASURED and is not one: `local_oop`, the count that names
+a missed root, is zero over ~370 frames. Everything below the 2026-09-01
+addendum is the historical record, including three readings this page later
+withdrew.
+
+## ADDENDUM 2026-09-01: the COST is gone; the HOLE is not. Both were measured on one binary
+
+Two things this page states as current are no longer true, and one thing it
+implies is not true either. All figures below are `dev@56d6c3722`, one binary,
+`/proc/loadavg` recorded on every run as this page requires — and the host was
+BUSY (load 8–26), which matters in the direction noted at each row.
+
+### 1. The cost this page trades away has already been repaid
+
+`bbd9d05a9 fix(jit): name a direct call's staged argument oops in its safepoint
+map` (2026-08-30, hours after the fix above) closed the dominant
+`staged_unmappable` population. The trade this page documents — *"on
+String-heavy code the fix stops relocation entirely"*, `compaction_cycles`
+26 → 0 — does not reproduce:
+
+| probe | `compaction_cycles` | `objects_relocated` | `relocation_skipped_jit` |
+|---|---:|---:|---:|
+| gate ON (default) | 13 | 70 032 | **0** |
+| `CRATONVM_JIT_RELOC_GATE_ON_MAP_INCOMPLETE=0` | 13 | 70 014 | 0 |
+
+Not one cycle declines. The named regression is gone with it:
+`org.h2.test.store.TestMVStoreTool` at `--Xmx 1g` ran **clean to a 900 s cap in
+both arms** (`oom=0`), against the 57–61 s OOM this page records.
+
+So **`Next` items 2 and 3 are closed**: the follow-up that removes the cost
+landed, and there is no longer a cost that would justify defaulting
+`CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT` to OFF.
+
+### 2. RETRACTED — `stale_live` is an upper bound, not a liveness proof
+
+**The first version of this addendum claimed the gate leaves live stale words at
+its shipped default. That claim is withdrawn: the measurement it rests on does
+not support it, and the witness it named is a demonstrated false positive.**
+
+`report_remap_residue` classifies a from-space word as LIVE by ONE test:
+
+```rust
+let class = if live_hi <= 0 { "unknown" }
+            else if off < live_hi { "LIVE" }     // <- the whole test
+            else { "dead" };
+```
+
+`live_frame_hi` is the **spill high-water mark**, not a liveness bound. Every
+word below it is called LIVE, including a local slot the method has not written
+yet, an `int` local whose 8-byte home still holds a previous frame's pointer,
+and any spill slot below the watermark that is currently dead. The page already
+learned the weaker form of this once — the raw `stale_words` count was an upper
+bound until the `live_hi` split was added — and the split narrowed the bound
+without turning it into a proof.
+
+So the honest reading of the numbers below is "at most this many", not "this
+many":
+
+| arm | result | frames | words classified LIVE |
+|---|---|---:|---:|
+| gate ON (default) | clean to 900 s cap | 13 | ≤ 15 |
+| `..._MAP_INCOMPLETE=0` | `rc=1` NPE at 497 s | 128 | ≤ 322 |
+
+The gate-OFF arm still FAILS and the gate-ON arm still passes, which is real and
+is the bisect this page already had. What is **not** established is that any
+particular word in the gate-ON arm is a missed root.
+
+### 3. The witness was dead storage, and the bytecode proves it
+
+`probes/SafepointMapResidue.java` (25 lines, no H2, ~2 minutes) reliably reaches
+the instrument and reports one stable frame:
+
+```text
+[remap-frame] method=java/lang/StringConcatHelper.doConcat:(...)
+  sp_id=51 cov_complete=true live_hi=96
+  mapped=[ 8=.. 16=.. 40=.. ] rewritten=1
+  stale_words=18 stale_live=1 stale_dead=17
+  [LIVE off=32 stale=0x20019013eb8->0x200102599b8]
+```
+
+Dumping the map inputs gave `local_mask=Some(19)`, and `local_offset(k)` is
+`8*(k+1)`, so the named slots 8/16/40 are locals 0, 1 and 4. Offset 32 is
+local 3. That looked like "the mask omits a live reference local".
+
+**It is not. `javap -c` on the real method settles it:**
+
+```text
+25: istore_3          // local 3 = newLength — an INT
+30: astore 4          // local 4 = buf (byte[]) — the reference
+```
+
+Bit 4 of the mask can only be set after `astore 4` at pc 30, which is after
+`istore_3` at pc 25. So at every safepoint where the mask reads `Some(19)`,
+local 3 holds an `int` — and the mask naming locals 0, 1 and 4 is **exactly
+right**. The pointer sitting at offset 32 is stale bytes in a slot that does not
+hold a reference at that program point: dead storage below the watermark, which
+is the one thing the LIVE test cannot tell apart from a missed root.
+
+**The lesson this page has now taught a third time.** Its own history is a WARN
+read as a discriminator (wrong twice), then a raw residue count that was an
+upper bound. `stale_live` is the same shape one refinement later. A residue
+count cannot be evidence of a missed root without an independent statement of
+what the slot HOLDS at that pc — and there is one available:
+`docs/.../reference` on the verifier type maps makes exactly that point, and
+`javap -c -l` scopes settle it by hand in a minute.
+
+
+### 4. The cause census printed six of its seven causes — and the seventh is ZERO
+
+`map_incomplete_cause::snapshot()` returns seven; `driver.rs` printed
+`causes[0..=5]`. A method whose only unnameable references were inline-scope
+locals therefore printed all-zero causes — "no cause", from a cause census.
+**The `Which of the seven fired` section above was read off that line**, so the
+column that was missing is precisely the one its conclusion could not have
+ruled out. Fixed, with a `const` assert so a new variant is a compile error
+rather than another silent column.
+
+**Then the fixed census answered, and it is not the seventh cause either.** On
+the witness method, with all seven columns printing:
+
+```text
+[oopcov] frameslot-detail method=java/lang/StringConcatHelper.doConcat:(...)
+  precise_maps=true inline_sites=1 safepoints=11 mapped=11 unmapped_pcs=[]
+  causes(marks_inexact=0 oop_in_reg=0 stack_deep=0 local_deep=0
+         staged_deep=0 staged_unmappable=0 inline_local_unmappable=0)
+```
+
+That is worth having on its own: every safepoint of that method is mapped,
+`unmapped_pcs` is empty, and no cause fires. An eighth counter
+(`LOCAL_MASK_UNREACHED`, for the silent `None` branch where the locals are
+skipped without setting `map_incomplete`) was added at the same time and also
+reads zero.
+
+**What that does NOT establish** — and the first version of this addendum said
+it did — is that a live reference is going unnamed. All eight zeros are
+consistent with the simpler reading, which §3 shows is the true one: the map is
+right and the residue line is a slot that does not hold a reference at that pc.
+A complete census reading zero on a correct map is what a correct map looks
+like.
+
+### 5. What is actually left, and what the next instrument has to be
+
+The remaining question is unchanged from `Next` item 2, and it is now honestly
+open rather than falsely answered:
+
+* the gate-OFF arm reproduces the corruption; the gate-ON arm does not, over
+  900 s at load 8–18. That is the bisect, and it stands.
+* **no missed root has been exhibited under the shipped default.** Everything
+  offered as one so far has been either dead storage (§3) or unverified.
+* so the fail-closed gate may well be sufficient today, and the cost of keeping
+  it is now nil (§1). That is a materially better position than this page
+  describes, and it should not be undone on the strength of a residue count.
+
+**Before any repair, the instrument needs to be able to say "live".** A word
+below `live_frame_hi` that the map does not name is a missed root only if the
+slot holds a reference at that bci. Two oracles exist in-tree for that and
+neither is wired to this report:
+
+* the **local-oop mask itself** — if the slot is a local, the mask already says
+  whether it is a reference, and a LIVE classification that contradicts the mask
+  is either a real miss or (as here) a slot that is not a live local at all;
+* the **verifier type maps**, which this repo already records as the independent
+  oracle for a never-mapped word.
+
+Cross-checking the residue against either would have retired this witness in one
+run instead of one commit. That, not another cause counter, is the next thing to
+build.
+
+
+### Where that leaves the page
+
+* **OPEN**, but less alarmingly than it reads. The corruption reproduces with
+  the gate OFF and not with it ON; the gate now costs nothing; and no missed
+  root has been exhibited under the shipped default. `Next` item 2 stays open
+  because nothing has PROVED the map complete — not because anything has shown
+  it short.
+* The next thing to build is an instrument that can say "live", not another
+  cause counter. See §5.
+* The three faces, the `ZGC_RELOCATE=0` bisect, the residue instrument and the
+  fail-closed gate all stand as written.
+* What must not be carried forward is the cost table and the
+  `RELOCATE_UNDER_PROVEN_JIT` recommendation: both describe a binary that is two
+  commits old.
+
+## ADDENDUM 2026-09-02: the instrument that can say "live" now exists, and it says NO MISSED ROOT
+
+§5 named the one thing to build before any repair: an instrument that can tell a
+MISSED ROOT from DEAD STORAGE, because `stale_live` cannot. It is built, it is
+committed, and it has been run on both this page's witness and this page's
+workload. **`local_oop`, the only count that names a missed root, is ZERO on
+both.**
+
+### What was added
+
+`OopMapEntry` now carries, per safepoint, the compiler's own answers about its
+own frame — all of it diagnostic, nothing gates on it:
+
+| field | question it answers |
+|---|---|
+| `local_oop_mask: Option<u64>` | is java local `k` a reference at this bci? `None` (dataflow never reached here, so the map named NO locals) is deliberately NOT the same value as `Some(0)` |
+| `num_locals` | is this offset a java local at all, or past the band? |
+| `inline_local_scopes: Vec<(base, n, mask)>` | the same, per live SPLICE — spliced locals come out of the operand-spill band, so the mask above cannot address them |
+| `non_oop_stack_slots` + `stack_marks_exact` | did this safepoint's own operand-stack model classify that spill slot as a non-reference? Only spendable when the marks were exact — a padded mark vector is a default, not a proof |
+
+`report_remap_residue` puts every stale word below `live_frame_hi` to those, in
+order, and prints a VERDICT rather than adding to a count. `classify_stale_local`
+is a pure function with 8 unit tests, one of which pins the retracted witness
+(mask `Some(19)`, offset 32 → `local-not-oop`). `[remap-residue-summary]` at exit
+carries the run totals, with `frames`, `frames_with_inline_scopes` and
+`frames_with_stack_model` as ENGAGEMENT counters, because a zero from an
+instrument that never fired is not a reading.
+
+### The witness this page named: explained, in one run
+
+`probes/SafepointMapResidue.java`, shipped default, ~2 minutes:
+
+```
+[remap-residue-summary] frames=28 frames_with_live_stale=1 local_oop=0
+  local_not_oop=1 local_unreached=0 ... duplicate_of_mapped=0 mapped_alias=0
+  outside_locals=0
+
+[remap-frame] method=java/lang/StringConcatHelper.doConcat sp_id=51
+  cov_complete=true live_hi=96 local_mask=Some(19) num_locals=5
+  mapped=[ 8=.. 16=.. 40=0x20010200938 ] rewritten=1
+  [LIVE off=32 k=3 local-not-oop region=java-local stale=0x20010256d18->0x20010200938]
+```
+
+Offset 32 is local 3; the mask names locals 0, 1 and 4 (offsets 8, 16, 40 —
+exactly what the map holds); `javap -c` shows `25: istore_3`. The instrument now
+states in one line what previously took a bytecode session to establish, which is
+the whole point of §5.
+
+### The workload this page is about: 59 of 61 explained, none of them a root
+
+`org.h2.test.store.TestRandomMapOps`, `--Xmx 256m`, shipped default (gate ON),
+1500 s cap, host at load 20, aggregated over the streamed per-frame lines:
+
+| | |
+|---|---:|
+| frames reported | 64 |
+| frames with a LIVE stale word | 50 |
+| **`local_oop` (missed roots)** | **0** |
+| `duplicate_of_mapped` | 55 |
+| `mapped_alias` | 3 |
+| `local_not_oop` | 1 |
+| `outside_locals` (unexplained) | 2 |
+
+No corruption, no exception, no OOM in the run.
+
+**`duplicate_of_mapped` is the shape this page had been staring at.** The map
+names a group of spill slots and the stale words are the copies a few slots
+below them, holding the SAME objects at their pre-move addresses:
+
+```
+mapped=[ .. 232=0x2001027ec28 240=0x2001027ec98 248=.. 256=.. ]
+[LIVE off=224 .. stale=0x20018c20218->0x2001027ec28]   <- same object as slot 232
+[LIVE off=216 .. stale=0x20018c20288->0x2001027ec98]   <- same object as slot 240
+```
+
+The object is named, rewritten and not lost. What is left behind is an abandoned
+copy — which is what "a live COPY of a reference in a frame word" always meant,
+and it costs nothing.
+
+### The instrument's own false positive, found and fixed in the same session
+
+The first H2 run under the oracle reported `local_oop=1` — the tripwire firing.
+It was wrong, and the line it printed proves it:
+
+```
+method=org/h2/mvstore/FileStore.readChunkFooter sp_id=49
+  mapped=[ 8=0x20010461ee8 48=.. 56=.. 128=.. ] rewritten=4
+  [LIVE off=8 k=0 LOCAL-OOP-UNMAPPED region=java-local stale=0x20010461ee8->0x20010418118]
+```
+
+`rewritten` equals the slot count, so **slot 8 was named and rewritten** — the
+value sitting in it is one the rewrite had just written. It still answers to
+`pointer_map.get()` because a slide moves objects into space other objects
+vacated, so a TO-space address can alias another object's FROM-space address.
+
+That is a property of the whole residue instrument, not of the oracle:
+**"this word is a key of the pointer map" is not proof that the word is stale.**
+It is now a verdict of its own (`mapped_alias`, 3 on the H2 run), the mapped
+check runs before every other oracle, and a unit test pins it. Anyone reading an
+older `stale_live` number should assume it contains this population too.
+
+### What is NOT measured, stated plainly
+
+* **The IR tier has no oracle.** Both remaining `outside_locals` words are in one
+  frame, `FileStore.accountForRemovedPage`, whose line reads `local_mask=None
+  num_locals=0` — `ir_lower` records no dataflow, so the oracle is silent by
+  construction, not by measurement. Every unexplained word in the final run is
+  there.
+* **Two of the four oracles never fired.** `frames_with_inline_scopes=0` and
+  `frames_with_stack_model=0` on every run: no reported frame had a safepoint
+  INSIDE a splice, and none carried a frame-resident operand entry the model
+  called a non-reference. Their zeros are engagement zeros and must not be read
+  as findings. (A frame's `inlined=[..]` is the method list, not a live scope at
+  that bci.)
+* **Everything above is on a `livedbg` binary** (no LTO, opt-level 1). Not a
+  preference: a release build was attempted twice and both times the fat-LTO
+  link was OOM-killed (`signal: 9`), the second at `-j 1`, on a host reporting
+  0–4 GiB available with 48 logged-in users. Map CONTENT is what is being
+  measured and does not depend on how the VM itself was optimized, but a slower
+  binary performs fewer operations per second, so "no corruption in 1500 s" is a
+  weaker statement than the same wall clock on a release build.
+* **The 4g arm was ATTEMPTED and is still unmeasured.** The 2026-08-30 L7
+  addendum says the failure is not small-heap-only, so re-running `--Xmx 4g`
+  against the shipped default is the other thing that would retire this page. It
+  ran 22 minutes, reported 19 frames with `local_oop=0`, and then died `rc=137`
+  — `dmesg` shows `oom_reaper: reaped process ... (cvm-mapor5-live)`. That is
+  the HOST killing a 4 GiB heap on a box with ~5 GiB available and 48 logged-in
+  users, not a VM defect and not a result. It needs a quiet host or a second
+  machine.
+
+### Where that leaves the page, 2026-09-02
+
+**SUPERSEDED the same day — read the "(later)" addendum below.** The 4g arm WAS
+re-measured (clean), and something worse turned up in its place: the NPE still
+reproduces at the shipped default at 256m. The bullets below stand except for
+the first, which claimed the 4g arm was the only thing left.
+
+* Still **OPEN**, and the reason is no longer the 4g arm: it is that the defect
+  itself still reproduces. Everything this page asked for as INSTRUMENTATION has
+  been done.
+* `Next` item 1 (the instrument) is **CLOSED** — built, tested, committed, and
+  it answers the witness in one run.
+* `Next` items 2 and 3 were closed by the 2026-09-01 addendum and stay closed.
+* **Nothing in two workloads and four runs has exhibited a missed root at the
+  shipped default.** That is now a measurement with engagement counters behind
+  it rather than an absence of evidence.
+* Read `local_oop` and `inline_local_oop`, not `stale_live`. The old number
+  counts dead spill, abandoned copies of named roots, and to-space addresses
+  that alias from-space keys — all three of which this session watched mislead a
+  reader, twice including me.
+
+## ADDENDUM 2026-09-02 (later): the defect is NOT fixed — it still reproduces at the shipped default
+
+The addendum above concluded that the only thing keeping this page open was an
+un-re-measured `--Xmx 4g` arm. **That is wrong, and the correction is the more
+important half of the day.** The 4g arm was measured and is clean; what is not
+clean is the heap size this page is named after.
+
+All of the following is one RELEASE binary built from `dev@777688aa5`
+(`cargo build --release`, fat LTO — the host finally had the memory for it),
+`org.h2.test.store.TestRandomMapOps`, `/proc/loadavg` recorded on every run.
+
+| arm | heap | runs | NPE | OOM | clean | times |
+|---|---|---:|---:|---:|---:|---|
+| **shipped default**, batch A | 256m | 3 | **2** | 0 | 1 | 866 s, 388 s |
+| **shipped default**, batch B | 256m | 4 | 0 | 0 | 4 | 900 s cap |
+| **shipped default**, long arm | 256m | 1 | 0 | 0 | 1 | 1500 s cap |
+| shipped default | 1g | 1 | 0 | 0 | 1 | 1500 s cap |
+| shipped default | 4g | 1 | 0 | 0 | 1 | 1500 s cap |
+| `CRATONVM_ZGC_RELOCATE=0` | 256m | 4 | 0 | **4** | 0 | 296–573 s |
+| `CRATONVM_ZGC_RELOCATE_UNDER_PROVEN_JIT=0` | 256m | 4 | 0 | **2** | 2 | 688 s, 860 s |
+
+The failure is the `NullPointerException` face this page already documents,
+with the same shape:
+
+```
+seed:-6609831345401105555 op:14 java.lang.NullPointerException
+  at org.h2.mvstore.RandomAccessStore.readStoreHeader(RandomAccessStore.java:260)
+  at org.h2.mvstore.FileStore.start(FileStore.java:944)
+  at org.h2.mvstore.MVStore.<init>(MVStore.java:296)
+```
+
+### What this overturns
+
+* **"The gate-ON arm does not reproduce, over 900 s at load 8–18" is withdrawn.**
+  That was ONE run on a busy host. On a quiet host the same binary fails twice
+  in three runs. This page's own 2026-08-29 section says the lever is host
+  quietness and that a contended box hid the defect — the gate-ON arm was then
+  measured on a contended box anyway.
+* **The fail-closed gate reduced the rate; it did not close the hole.** Two
+  failures in eight shipped-default runs today, against "9 in 9" before the fix.
+  That is a real improvement and it is not a fix.
+* **The 4g claim of the L7 addendum does not reproduce on current dev.** 1500 s
+  clean at 4g and at 1g. The title's "small heap" premise is right again.
+
+### What the batches do NOT support
+
+Batch A failed 2 of 3 and batch B failed 0 of 4 on the SAME binary, same heap,
+same workload. Batch B ran concurrently with the `RELOCATE=0` arm at loads
+4.9–20.5. So the per-batch rate is not stable and **no rate quoted from a single
+batch is worth anything** — including the two clean batches. Run them serially
+on an idle host before believing any number here.
+
+### The relocation lever still points the same way, and still has no clean control
+
+Neither switch produces a clean arm at 256m: both remove the NPE and substitute
+the fragmentation `OutOfMemoryError` this page's cost section describes —
+`RELOCATE=0` in 4 of 4, the narrower `RELOCATE_UNDER_PROVEN_JIT=0` in 2 of 4.
+Consistent with relocation being the lever, and **not a control**: an arm that
+trades one failure for another cannot isolate either. The page has hit this
+shape before, and the fix is a heap size where neither failure mode is forced —
+which 1g and 4g are, and at which the NPE does not appear either.
+
+### And the oracle says it is not a missed root
+
+Across every run above, on ~370 reported frames spanning two heap sizes and both
+binaries, **`local_oop` and `inline_local_oop` are ZERO**: not one frame word
+below the live watermark that the compiler's own "must be oop" dataflow proves
+is a reference and the map failed to name. The stale words are dead spill,
+abandoned copies of roots the map DOES name, and to-space/from-space address
+aliases.
+
+That is a negative result and it is the useful kind. The hypothesis this page
+has pursued since 2026-08-29 — *the map is short, relocation rewrites what it
+names and leaves a live reference behind* — is not what the instrument built to
+detect it finds. Either the defect is elsewhere in the relocation path (the
+object header, the forwarding table, a non-frame root), or it is in a frame the
+oracle cannot speak for. The next step is to widen the instrument to the
+non-frame roots, not to keep looking for an unnamed local.
+
+### Where that actually leaves the page
+
+* **OPEN, and more open than the addendum above claimed.** The defect
+  reproduces at the shipped default. Retiring it would have been wrong.
+* The 4g/1g arms are closed: clean, release binary, 1500 s each.
+* The next measurement is a SERIAL batch on an idle host — at least 10 runs at
+  256m, nothing else on the machine — to get a base rate that a fix can be
+  measured against. Every rate on this page so far was taken with something else
+  running.
+* The next INSTRUMENT is not another frame-word oracle. `local_oop=0` is now
+  well-evidenced; look outside the compiled frame.
+
 ## ADDENDUM 2026-08-30 (L7 corpus lane): it is NOT a small-heap defect — 4g fails too
 
 The `--jdk-only` corpus run hit this class at `--Xmx 1g` and could not attribute

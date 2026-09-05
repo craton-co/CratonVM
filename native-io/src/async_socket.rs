@@ -1010,7 +1010,9 @@ fn deliver_future_completion(ctx: &mut dyn NativeContext, c: FutureCompletion) {
                         "(Ljava/lang/Throwable;)Z",
                         &[Value::Object(Some(throwable))],
                     );
-                    let _ = ctx.invoke_virtual(future, "postComplete", "()V", &[]);
+                    // See `native_cf_complete`: `postComplete` is bytecode,
+                    // so the by-NAME native resolver misses on every call.
+                    let _ = ctx.invoke_virtual_bytecode_only(future, "postComplete", "()V", &[]);
                 }
             }
             ctx.remove_global_root(msg_gref);
@@ -3274,6 +3276,34 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// answers `sun.nio.ch.WindowsAsynchronousServerSocketChannelImpl`. Since
 /// dispatch keys on the receiver's class, moving this class's 12 registrations
 /// onto the `Impl` strands every receiver this function returns.
+/// `AsynchronousSocketChannel.provider()` / `AsynchronousServerSocketChannel
+/// .provider()` — the platform provider, not `null`.
+///
+/// Both are `final` accessors over a `private final AsynchronousChannelProvider
+/// provider` field, and this file's own slot map parks `F_OPEN` in that slot
+/// (see `aio_assc_open`'s doc comment, which measures the collision and
+/// explains why renumbering it needs one change across two crates). The
+/// accessor therefore could not read a provider out of the field, and answered
+/// `null`.
+///
+/// Registering the accessor sidesteps the field entirely: the STATIC
+/// `AsynchronousChannelProvider.provider()` already resolves on this VM —
+/// MEASURED, it answers `sun.nio.ch.LinuxAsynchronousChannelProvider` — and it
+/// is the same singleton HotSpot hands back from the instance accessor. So
+/// this is a delegation to a working path, not a second source of truth, and
+/// it leaves the slot-map repair exactly as open as it was.
+///
+/// MEASURED on HotSpot 25 (`probes/ResidualProbe.java`): the static and both
+/// instance accessors return the SAME object.
+fn aio_channel_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ctx.invoke(
+        "java/nio/channels/spi/AsynchronousChannelProvider",
+        "provider",
+        "()Ljava/nio/channels/spi/AsynchronousChannelProvider;",
+        &[],
+    )
+}
+
 fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let _ = job_sender();
     // Concrete, per `ASSC_IMPLS`. This is the site the doc comment above calls
@@ -3630,6 +3660,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         aio_asc_open_group,
     );
     r.register(asc, "isOpen", "()Z", aio_asc_is_open);
+    r.register(
+        asc,
+        "provider",
+        "()Ljava/nio/channels/spi/AsynchronousChannelProvider;",
+        aio_channel_provider,
+    );
     r.register(asc, "close", "()V", aio_asc_close);
     r.register(
         asc,
@@ -3716,6 +3752,12 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         aio_assc_open_group,
     );
     r.register(assc, "isOpen", "()Z", aio_asc_is_open);
+    r.register(
+        assc,
+        "provider",
+        "()Ljava/nio/channels/spi/AsynchronousChannelProvider;",
+        aio_channel_provider,
+    );
     r.register(assc, "close", "()V", aio_assc_close);
     r.register(
         assc,

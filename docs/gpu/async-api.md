@@ -109,6 +109,79 @@ try (GpuExecutor exec = GpuExecutor.open()) {
 submissions are. Treat it like a `java.util.concurrent.ExecutorService`:
 one owner thread closes it, many threads may submit while it is open.
 
+### Submission handles must be released
+
+The handle-based API (`dispatchNamedHandle`, `GpuStream.submitMethod`)
+hands back a `long` that names an entry in the offload runtime's
+submission registry. That entry pins the submission's CUDA stream and
+event, and the registry is **process-global** -- not per-executor and not
+per-VM. Release each handle when you are done with it:
+
+```java
+long h = exec.dispatchNamedHandle("Pipeline", "scale", "([I[I)V", args);
+exec.awaitSubmission(h);
+exec.releaseSubmission(h);   // <- required; the registry has no other drain
+```
+
+`releaseSubmission` is the only drain. Closing the executor does **not**
+sweep the registry, and cannot: the map is global, so a close-time
+drain-all would free submissions belonging to another executor in the
+same process.
+
+The value-returning API (`submit`/`launch`/`submitV` -> `GpuFuture.get()`)
+registers a submission too, but you do not manage it by hand:
+`GpuFutureImpl` registers itself with `StreamCleaner` (a
+`java.lang.ref.Cleaner`), and the cleaning action calls `releaseFuture`
+once the future becomes unreachable. So those handles are released **when
+the future is collected**, and the registry's occupancy for that API is
+bounded by collection frequency rather than by the life of the process.
+
+Measured, 500 `submitV` + `get()` calls with the arrays hoisted out of
+the loop so the loop itself allocates almost nothing:
+
+```
+no collection forced   registered=500 released=0   live_at_exit=500 peak_live=500
+System.gc() every 50   registered=500 released=500 live_at_exit=0   peak_live=50
+```
+
+`peak_live` tracks the collection interval exactly. The first row is not
+a leak -- it is a program that never gave the collector a reason to run,
+which for a real workload is unusual. If you hold thousands of futures
+between collections and that matters, take the handle API instead and
+release explicitly.
+
+Both of these only work as described since 2026-09-02. Before that
+`releaseFuture` did not reach the offload registry, so **neither** path
+drained: forcing a collection every 50 iterations still left
+`released=0 live_at_exit=500`.
+
+**This was broken until 2026-09-02** and is worth knowing about if you
+are reading older code. `GpuExecutor.releaseSubmission(h)` compiles to
+`Native.releaseFuture(h)`, which removed the entry from
+`native-builtins`' own future table and stopped there; the offload
+runtime's registry, keyed by the same handle, was never touched. It had
+exactly one insert and one remove, and the remove had no production
+caller at all, so **no program could drain it however correctly it was
+written**. `bench-gpu/GpuAsyncChainBench.java`, which awaits and releases
+every one of its handles, still reported:
+
+```
+[cratonvm] gpu submissions: registered=2001 released=0 live_at_exit=2001 peak_live=2001
+```
+
+and tripped the runtime's own "1024 submissions are alive" warning. With
+the drain wired the same run reports:
+
+```
+[cratonvm] gpu submissions: registered=2001 released=2001 live_at_exit=0 peak_live=400
+```
+
+`peak_live` is now the program's own outstanding-chain length rather than
+every submission it ever made. That census line is printed on any run
+that registered a submission; `live_at_exit` should be 0 for a program
+that releases what it takes, and `CRATONVM_GPU_NO_SUBMISSION_DRAIN=1`
+restores the old behaviour if you need to compare.
+
 ## `GpuFuture<T>`
 
 Returned by every `submit` / `launch`. Modelled on

@@ -3323,8 +3323,8 @@ fn sk_find_mut(
 /// stale ObjectRef values for any entry whose underlying objects moved;
 /// see the SkState doc-block for the residual behaviour.
 #[allow(dead_code)]
-pub fn sk_table_update_after_gc<S: std::hash::BuildHasher>(
-    pointer_map: &std::collections::HashMap<usize, usize, S>,
+pub fn sk_table_update_after_gc(
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;

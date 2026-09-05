@@ -1439,89 +1439,21 @@ mod tests {
         assert!(!ZgcPhase::ConcurrentRelocate.is_stw());
     }
 
-    /// FINDING 8 (2026-08-07). **The test that would have caught the missing
-    /// remap counter.**
-    ///
-    /// The `match` below is exhaustive over the *simulation*'s phase enum
-    /// (`super::ZgcPhase`, the state variable in `zgc.rs`). A collector is
-    /// driven by that enum; this module is what records the time. Adding a
-    /// variant over there without deciding where its nanoseconds land is now a
-    /// **compile error here**, which is exactly the gate `ConcurrentRemap`
-    /// needed and did not have: the simulation carried the phase, this module
-    /// had no counter for it, and nothing in either module noticed.
-    ///
-    /// `SimPhase::None` is the one legitimate `None` — "mutator running" is the
-    /// absence of a phase, not an unmeasured one.
-    #[test]
-    fn every_simulation_phase_except_idle_has_a_metrics_counter() {
-        use super::super::ZgcPhase as SimPhase;
-
-        fn counter_for(sim: SimPhase) -> Option<ZgcPhase> {
-            match sim {
-                // Not a phase: the collector is idle and the mutator is running.
-                SimPhase::None => None,
-                SimPhase::PauseMarkStart => Some(ZgcPhase::PauseMarkStart),
-                SimPhase::ConcurrentMark => Some(ZgcPhase::ConcurrentMark),
-                SimPhase::PauseMarkEnd => Some(ZgcPhase::PauseMarkEnd),
-                SimPhase::ConcurrentProcessNonStrongRefs => {
-                    Some(ZgcPhase::ConcurrentProcessNonStrongRefs)
-                }
-                SimPhase::ConcurrentResetRelocationSet => {
-                    Some(ZgcPhase::ConcurrentResetRelocationSet)
-                }
-                SimPhase::PauseRelocateStart => Some(ZgcPhase::PauseRelocateStart),
-                SimPhase::ConcurrentRelocate => Some(ZgcPhase::ConcurrentRelocate),
-                SimPhase::ConcurrentRemap => Some(ZgcPhase::ConcurrentRemap),
-            }
-        }
-
-        let sim_phases = [
-            SimPhase::None,
-            SimPhase::PauseMarkStart,
-            SimPhase::ConcurrentMark,
-            SimPhase::PauseMarkEnd,
-            SimPhase::ConcurrentProcessNonStrongRefs,
-            SimPhase::ConcurrentResetRelocationSet,
-            SimPhase::PauseRelocateStart,
-            SimPhase::ConcurrentRelocate,
-            SimPhase::ConcurrentRemap,
-        ];
-
-        let m = metrics();
-        for sim in sim_phases {
-            match counter_for(sim) {
-                None => assert_eq!(
-                    sim,
-                    SimPhase::None,
-                    "SimPhase::{sim:?} maps to no metrics counter. Only the idle \
-                     state may: every other phase's time has to land somewhere \
-                     or the report loses it silently.",
-                ),
-                Some(phase) => {
-                    // Recordable, and it lands in its own slot.
-                    m.record_phase(phase, 1_000);
-                    assert_eq!(
-                        m.phase_stats(phase).count,
-                        1,
-                        "{sim:?} maps to {phase:?}, which did not record",
-                    );
-                }
-            }
-        }
-        // Eight simulation phases recorded 1_000 ns each; nothing else did.
-        assert_eq!(m.total_stw_ns(), 8_000);
-        for unmapped in [
-            ZgcPhase::ConcurrentMarkContinue,
-            ZgcPhase::ConcurrentSelectRelocationSet,
-            ZgcPhase::Sweep,
-        ] {
-            assert_eq!(
-                m.phase_stats(unmapped).count,
-                0,
-                "{unmapped:?} is a metrics-only phase and must not have been touched",
-            );
-        }
-    }
+    // FINDING 8's first half is gone with the simulation it cross-checked
+    // (2026-09-02).
+    //
+    // `every_simulation_phase_except_idle_has_a_metrics_counter` matched
+    // exhaustively over `zgc::ZgcPhase` -- the SIMULATION's phase state
+    // variable -- so that adding a variant there without deciding where its
+    // nanoseconds landed was a compile error here. That was a real gate and it
+    // caught a real gap (`ConcurrentRemap` had a phase and no counter).
+    //
+    // Its subject no longer exists: the simulation was deleted, and the
+    // collector that runs (`ZgcRealHeap`) drives this module directly. The
+    // obligation the test encoded now belongs to whichever phase machine a
+    // future concurrent collector uses; `ZgcPhase::ALL` and the
+    // label/`is_stw` pinning above are what remain, and they are about THIS
+    // module's own consistency rather than about a second enum's.
 
     /// FINDING 8, second half: the remap phase is a *concurrent* counter with
     /// its own four TSV columns, not an alias of anything.

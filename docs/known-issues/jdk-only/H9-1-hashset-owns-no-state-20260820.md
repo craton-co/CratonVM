@@ -491,6 +491,60 @@ one-liner and is not proposed here.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-02.** §7 opened "Nothing below has been
+> run." All four arms have now been run, on a binary built from this tree
+> (mtime identical across every arm below, so this is one binary throughout).
+>
+> **§7a, the armed dial — "the number this lane exists to hold". The prediction
+> HOLDS.**
+>
+> ```text
+> --jdk-only + CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/HashSet
+>   125 of 128 passed; failed: RMapGcStress RJdkVarHandleNullCoord RJdkVarHandleModeSupport
+> ```
+>
+> * `RMapGcStress` remains a failure — the record's central prediction.
+> * **`RSerial PASS`.** §7a's falsifier was "a drop below 103 falsifies this
+>   change, and the first suspect is §2a's read-safety audit — specifically
+>   `RSerial`". It did not fire.
+> * Not 100%, so §8's argument stands: §7a says 104/104 "would mean the marker
+>   was the `RMapGcStress` HashSet face after all", and that is not what
+>   happened. Saying which, as instructed.
+> * The two `RJdkVarHandle*` failures are **not this record's**. Both vectors
+>   were ADDED on 2026-09-02 (`c67a89f0b`, `303ed8b5c`, an unrelated varhandle
+>   lane) — three weeks after this record was written, and nothing to do with
+>   `HashSet`. They are red on dev and belong to that lane.
+>
+> **§7b, the unarmed arms — the counts are STALE and cannot be re-checked.**
+>
+> ```text
+>                          predicted        measured
+> CRATONVM_ARGS=--jdk-only   104 / 104      119 / 125
+> SUITE=all                   99 / 104      119 / 125
+> SUITE=core                  63 /  64       81 /  85
+> ```
+>
+> The suite has grown from 104 vectors to 125 (and to 128 by the time §7a ran,
+> three more arriving mid-session). No total here can be compared with a
+> 104-vector baseline. **"Same five" is worse than stale — it is uncheckable**,
+> because this record never enumerates the five, so there is no set to compare
+> against. That half of §7b expired the way `H3-1` §5's `−7` did: not wrong,
+> unmeasurable.
+>
+> **And §7b's own premise needed defending.** The arms are required to be
+> "verdict-neutral". They are not, on their face: arms 1 and 2 schedule the
+> identical 125 vectors and differ only in the flag, yet three vectors fail
+> strict and pass compatible, and three do the reverse. **All six pass when run
+> alone in BOTH modes**, ABBA-interleaved — so the difference is the full-suite
+> run, not the mode, and §7b's neutrality survives. See
+> [`the-suite-ab-that-was-the-harness-20260902.md`](the-suite-ab-that-was-the-harness-20260902.md).
+> Read naively, those six would have been reported as this record's arms
+> detecting a mode effect.
+>
+> **What this does NOT verify.** §566's `false 1` / `true 1` probe was not run,
+> and §§1–4 remain grep-and-read of the tree as the banner says. This note
+> covers §7 only.
+
 ## 7. VERIFICATION PLAN
 
 Nothing below has been run. `TIMEOUT`, `JDK` and `CV` as in `H0-4` §1;

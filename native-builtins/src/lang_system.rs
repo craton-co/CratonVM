@@ -582,6 +582,18 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
          unjoined={unjoined} trigger={trigger}"
     );
     report_vector_intrinsics();
+    // The invoke cache's hit rate, when asked for. It is the acceptance
+    // criterion for pc-keying the cache key: a `put` and a `get` that
+    // disagree about a site's pc store and seek under different keys, and
+    // the ONLY symptom is a lower hit rate -- missing the cache is always
+    // safe, so no correctness test can see it.
+    cratonvm_classloading::resolution::invoke_cache_stats_summary();
+    // The FFM element fast path's engagement, on the same exit path and
+    // for the same reason as the censuses below: a JUnit runner or a
+    // benchmark harness leaves through `System.exit`, so a line printed
+    // anywhere else appears in zero logs of the runs that matter. Silent
+    // unless the process touched a segment. See `ffm_fast::exit_summary`.
+    crate::ffm_fast::exit_summary();
     report_filechannel_fast_io();
     // The socket transfer / selector census. Same exit path and the same
     // argument as `report_filechannel_fast_io` above: a throughput number
@@ -602,6 +614,26 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     // would report it in zero logs.
     cratonvm_types::scalar_deopt_census::exit_summary();
     cratonvm_types::cell_census::exit_summary();
+    // Same exit path and the same argument: the netty runner this counter was
+    // built for exits through `System.exit` on its failing test, so a line
+    // printed only from `vm-cli`'s normal-return arm is absent from every run
+    // worth reading. See `arena_translation_exit_summary`.
+    crate::unsafe_natives_ext::arena_translation_exit_summary(
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_STATS").is_some(),
+    );
+    // A3 (2026-09-01): the descriptor-coercion guard and the ref-word
+    // degradation guard used to print per occurrence at WARN — 2048 lines on a
+    // hello-world boot, which is how an instrument stops being read. They now
+    // count silently and report here, for the same reason as the two above: a
+    // JUnit runner leaves through `System.exit`. Both are `Once`-guarded and
+    // print nothing at zero.
+    cratonvm_types::compact_value::coercion_census::exit_summary();
+    cratonvm_types::compact_value::degradation_exit_summary();
+    // The JVMS 6.5 uninstantiable-receiver census, on the same exit path and
+    // for the same reason: a JUnit runner leaves through `System.exit`, so a
+    // summary printed anywhere else appears in zero logs of a suite sweep.
+    // Silent unless a native handed back an abstract/interface receiver.
+    cratonvm_native_api::instantiable::exit_summary();
     // Same argument, same exit path: the post-remap stale-frame-word detector
     // splits its hits into words something RESUMES from and words nothing
     // reads, and `resumed_from=0 dead_region=N` is the REPAIRED state rather
@@ -4892,7 +4924,21 @@ pub(crate) fn native_system_init_phase1(
     // this helper defensive: it ensures the real `java/io/PrintStream`
     // class is loaded so the `charset` field is resolvable, and it
     // verifies the write actually landed.
-    fn install_charset(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+    /// The charset name a system stream should carry: its `*.encoding`
+    /// property when the launcher or the platform set one, UTF-8 otherwise.
+    ///
+    /// Reading the PROPERTY rather than calling
+    /// `cratonvm_native_api::os_encoding` directly is what makes
+    /// `-Dstdout.encoding=…` on the command line work, exactly as it does on
+    /// HotSpot: the property table has already absorbed the `-D` overrides by
+    /// the time `initPhase1` runs.
+    fn std_stream_encoding(ctx: &dyn NativeContext, key: &str) -> String {
+        ctx.get_system_property(key)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "UTF-8".to_string())
+    }
+
+    fn install_charset(ctx: &mut dyn NativeContext, stream: ObjectRef, encoding: &str) {
         // Ensure the real PrintStream class is loaded so `charset` is a
         // resolvable field name. (No-op in pure synthetic-jdk mode.)
         let _ = ctx.ensure_class_initialized("java/io/PrintStream");
@@ -4905,15 +4951,25 @@ pub(crate) fn native_system_init_phase1(
         // caller that encodes through this stream dies with
         // `AbstractMethodError` rather than the NPE this helper exists to
         // prevent -- a worse error, one frame further from the cause. See
-        // `docs/known-issues/jdk-only/bug-printstream-charset-answers-the-abstract-base-20260825.md`.
+        // `bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md`
+        // (retired 2026-09-01 with both of its residuals closed; the stamp
+        // below is one of them).
         //
         // This runs during `initPhase1`, which is why the hand-allocated stub
         // was reached for in the first place, so the real call is attempted
         // defensively and the stub stays as the fallback: bootstrap ordering
         // decides which one lands, and neither outcome is worse than today's.
         // `PrintStream.charset()` repairs a stub survivor on first read.
-        let cs_obj = {
-            let want = ctx.create_string("UTF-8");
+        // `encoding` is the STREAM's encoding, not a constant: HotSpot gives
+        // `System.out` the console's charset (`ANSI_X3.4-1968` under `LANG=C`,
+        // `Cp1251` on a 1251 Windows host) and only `file.encoding` is pinned
+        // to UTF-8. Stamping UTF-8 unconditionally is what made
+        // `System.out.print("Ж")` write UTF-8 bytes where HotSpot writes `?`
+        // — `printstream_encode` and `install_real_stream_fields` below both
+        // read THIS object, so the stamp decides the bytes as well as the
+        // answer to `charset()`.
+        let resolve = |ctx: &mut dyn NativeContext, name: &str| -> Option<ObjectRef> {
+            let want = ctx.create_string(name);
             match ctx.invoke(
                 "java/nio/charset/Charset",
                 "forName",
@@ -4927,16 +4983,28 @@ pub(crate) fn native_system_init_phase1(
                         Some("java/nio/charset/Charset")
                     ) =>
                 {
-                    real
+                    Some(real)
                 }
-                _ => {
+                _ => None,
+            }
+        };
+        let cs_obj = match resolve(ctx, encoding) {
+            Some(real) => real,
+            // The host named an encoding this image has no charset for (a
+            // synthetic-JDK build asked for `cp866`, say). A stand-in that
+            // CLAIMS that encoding while everything downstream writes UTF-8
+            // would be worse than either honest answer, so degrade the whole
+            // stream to UTF-8 rather than the name alone.
+            None => match resolve(ctx, "UTF-8") {
+                Some(utf8) => utf8,
+                None => {
                     let cs_fields = ctx.class_num_total_fields(cs_class).max(1);
                     let stub = ctx.alloc_object(cs_class, cs_fields);
-                    let name = ctx.create_string("UTF-8");
+                    let name = ctx.create_string(encoding);
                     ctx.set_field(stub, 0, Value::Object(Some(name)));
                     stub
                 }
-            }
+            },
         };
         // Use field-by-name so we hit the real-JDK `charset` slot (its
         // declared index differs from any synthetic ordering).
@@ -5095,12 +5163,14 @@ pub(crate) fn native_system_init_phase1(
     }
 
     if let Some(out_stream) = ctx.get_system_stream("out") {
-        install_charset(ctx, out_stream);
+        let enc = std_stream_encoding(ctx, "stdout.encoding");
+        install_charset(ctx, out_stream, &enc);
         install_real_stream_fields(ctx, out_stream, "out");
         ctx.set_static_field_by_name("java/lang/System", "out", Value::Object(Some(out_stream)));
     }
     if let Some(err_stream) = ctx.get_system_stream("err") {
-        install_charset(ctx, err_stream);
+        let enc = std_stream_encoding(ctx, "stderr.encoding");
+        install_charset(ctx, err_stream, &enc);
         install_real_stream_fields(ctx, err_stream, "err");
         ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }
@@ -5641,6 +5711,45 @@ fn debug_string_field(body: &str, field: &str) -> Option<String> {
         from = after;
     }
     None
+}
+
+/// The FORMAT half of [`define_class_linkage_error`], for the callers that must
+/// not take the rest.
+///
+/// `MethodHandles.Lookup.define{,Hidden}Class` is specified with a SPLIT
+/// contract, and the split falls exactly on `VmError`'s Linkage/Runtime line:
+///
+/// * bytes that are not a well-formed ClassFile  -> `ClassFormatError`
+/// * bytes that name a class in a different package from the lookup class, or
+///   a lookup without the right mode -> `IllegalArgumentException`
+///
+/// So those doors cannot use `define_class_linkage_error`, which re-types
+/// EVERY recovered variant: the backend reports a define into `java.util` as
+/// `RuntimeError::SecurityException` (JVMS 5.3.5, and correct for the
+/// `ClassLoader` door), and handing that to Java would answer
+/// `SecurityException` where the JDK answers `IllegalArgumentException`. This
+/// returns `Some` only for the linkage/format family, leaving the caller's own
+/// `IllegalArgumentException` wrapper in place for everything else.
+///
+/// Measured, not assumed: `probes/DynClassGenSweep.java` carries a
+/// `define.lookupWrongPackage` row precisely so a change on this surface that
+/// over-reaches is visible as a regression rather than as a silent one.
+pub(crate) fn lookup_define_format_error(
+    class_name: &str,
+    method: &str,
+    msg: &str,
+) -> Option<MethodCallFailed> {
+    match typed_define_class_error(class_name, method, msg) {
+        Some(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Linkage(e))) => {
+            Some(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Linkage(e),
+            ))
+        }
+        // `typed_define_class_error` already re-homes every `ClassFile` variant
+        // onto a `Linkage` one (a `ClassFile` variant is UNCATCHABLE), so the
+        // arm above is the whole format family.
+        _ => None,
+    }
 }
 
 /// Turn a `define_class_full` failure string back into the typed JVM error the

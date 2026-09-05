@@ -939,6 +939,46 @@ pub trait NativeClassAccess {
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 
+    /// Is an instance of `class_id` assignable to `target_class_name`, asked
+    /// the LOADER-BLIND way the bytecode asks it?
+    ///
+    /// This is the third door onto one rule, and it exists for the reason
+    /// [`synthetic_implements_declared`] and [`aastore_element_assignable`]
+    /// exist: the walk was written once, for `checkcast`/`aastore`, and every
+    /// reflective caller that asks a SECOND, narrower question is how two doors
+    /// come to disagree about one object.
+    ///
+    /// [`is_subclass`] is not that question. It compares `ClassId`s, so under a
+    /// forked loader it refuses a value whose class chain names the target
+    /// under a different id — and while it does walk the interface DAG, it
+    /// walks the one recorded on the value's own class, which for a
+    /// `@CompileWithForkedClassLoader` copy can name the OTHER loader's
+    /// interface. `ClassManager::is_assignable_to_name` compares NAMES over
+    /// supers and interfaces transitively, is cycle-safe and depth-capped, and
+    /// is what `typecheck::aastore_element_assignable` already uses for exactly
+    /// this case.
+    ///
+    /// # `None` is the honest answer, and callers must treat it as "allow"
+    ///
+    /// `None` means this context cannot answer — the default for a host with no
+    /// VM hierarchy behind it (mocks, the fabricated-class harnesses). A caller
+    /// that turns a `false` into a refusal must leave `None` alone, or a test
+    /// mock starts throwing `ClassCastException` at correct code.
+    ///
+    /// **This does NOT carry the proxy hatches.** A `java.lang.reflect.Proxy`
+    /// instance and a lambda proxy acquire their interfaces at RUNTIME,
+    /// invisibly to any static walk, and `aastore_element_assignable` has a
+    /// separate block for each. A caller that refuses on `Some(false)` must
+    /// apply those itself.
+    ///
+    /// [`synthetic_implements_declared`]: Self::synthetic_implements_declared
+    /// [`aastore_element_assignable`]: Self::aastore_element_assignable
+    /// [`is_subclass`]: Self::is_subclass
+    fn class_assignable_to_name(&self, class_id: ClassId, target_class_name: &str) -> Option<bool> {
+        let _ = (class_id, target_class_name);
+        None
+    }
+
     /// Does the VM's `checkcast`/`instanceof` admit an instance of `class_id`
     /// as a `target_class_name` on a relationship that is **declared** rather
     /// than present in the loaded class hierarchy?
@@ -1955,6 +1995,39 @@ pub trait NativeClassAccess {
     fn module_for_package(&self, pkg: &str) -> Option<String> {
         let _ = pkg;
         None
+    }
+
+    /// Is any currently-LOADED class a member of `package_slash` (immediate
+    /// members only; `""` is the default package)?
+    ///
+    /// The question `ClassLoader.getDefinedPackage` actually asks. A loader
+    /// DEFINES a package once it has defined a class in it, which is why the
+    /// class-file *visibility* probes above cannot answer it: the boot image
+    /// contains `java/awt/image/*.class` on every run, and HotSpot still
+    /// answers `null` for `java.awt.image` until something loads one.
+    ///
+    /// # The default is `false`, and that is the safe direction
+    ///
+    /// An implementation that has not overridden this answers "no class of
+    /// that package is loaded", which makes the module-backed arm of
+    /// `classloader::builtin_loader_defines_package` decline rather than
+    /// fabricate. Declining is the answer `getDefinedPackage`'s contract
+    /// prefers (a missing `Package` over an invented one) and is exactly what
+    /// this VM did before that arm existed.
+    fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        let _ = package_slash;
+        false
+    }
+
+    /// [`Self::any_loaded_class_in_package`], narrowed to the classes ONE
+    /// loader defined. `loader_id` is the flat `ClassLoaderId` numbering
+    /// [`Self::loader_id_of_class`] reports.
+    ///
+    /// Same `false` default, for the same reason: an implementation that has
+    /// not overridden this declines rather than fabricating.
+    fn any_loaded_class_in_package_for_loader(&self, package_slash: &str, loader_id: u32) -> bool {
+        let _ = (package_slash, loader_id);
+        false
     }
 
     /// Mark a class as hidden (JEP 371). Hidden classes are not discoverable via
@@ -4507,6 +4580,22 @@ pub trait NativeGpuAccess: NativeInvokeAccess {
     ///
     /// Default impl is a no-op (no GPU offload). The VM override
     /// calls `runtime::offload::device_cache::release(handle)`.
+    /// Drop the offload runtime's registry entry for one async
+    /// submission handle.
+    ///
+    /// The handle is the same one `gpu_future_synchronize` /
+    /// `gpu_future_await` take: the Java "future handle" IS the offload
+    /// submission handle. Default no-op so a host without the offload
+    /// runtime (or a `gpu-offload`-less build) needs no arm.
+    ///
+    /// Added 2026-09-02. `offload::SUBMISSIONS` had one insert and one
+    /// remove, and the remove had no production caller -- no Java
+    /// program, however correctly written, could drain the registry,
+    /// because `Native.releaseFuture` only removed from
+    /// `native-builtins`' own `state::futures` map. This is the missing
+    /// half of that path.
+    fn gpu_release_submission(&mut self, _handle: u64) {}
+
     fn gpu_release_array_cache(&mut self, _handle: u64) {}
 
     /// Phase 10 #1 — wipe the explicit-submit input-residency cache.
@@ -6734,6 +6823,59 @@ impl NativeMethodRegistry {
         &self.refused
     }
 
+    /// The refusals that did **not** retire their method — every
+    /// [`JdkOnlyViolation::SyntheticNativeRegistered`] whose triple was already
+    /// owned, so an earlier native survived and still serves in strict mode.
+    ///
+    /// Returns `(class, method, descriptor, survivor)`. This is the species
+    /// `registrar_drift.rs` is structurally blind to (it compares a
+    /// synthetic-only pass against a shipping one, and this is two SHIPPING
+    /// passes) and that `duplicate_registration_gate.rs` names as its blind
+    /// spot 3 (a dropped registration leaves no census row at all).
+    pub fn refusals_that_left_a_survivor(&self) -> Vec<(&str, &str, &str, &str)> {
+        self.refused
+            .iter()
+            .filter_map(|v| match v {
+                JdkOnlyViolation::SyntheticNativeRegistered {
+                    class,
+                    method,
+                    descriptor,
+                    survivor: Some(survivor),
+                    ..
+                } => Some((
+                    class.as_str(),
+                    method.as_str(),
+                    descriptor.as_str(),
+                    survivor.as_str(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `"<kind>@<file>:<line>"` of the registration that currently owns this
+    /// triple, or `None` when nothing does.
+    ///
+    /// Called only from the `JdkOnly` refusal arm, which is bounded by the
+    /// number of refusals rather than by the ~3,100 registrations, so the
+    /// `format!` is affordable there for the same reason the site string is.
+    fn surviving_owner(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<String> {
+        let class_state = self.class_prefilter(class_name)?;
+        let idx = self.slot_index_from_state(class_state, class_name, method_name, descriptor)?;
+        let slot = self.slots.get(idx as usize)?;
+        let site = self
+            .provenance
+            .get(slot.reg_index as usize)
+            .map(|p| format!("{}:{}", p.site.file(), p.site.line()))
+            .unwrap_or_else(|| "<no provenance>".to_string());
+        Some(format!("{}@{}", slot.kind.as_str(), site))
+    }
+
     /// Enable real-JDK-mode dropping of synthetic natives whose hardcoded
     /// field-slot layout corrupts the real JDK object (see
     /// [`drop_real_layout_synthetic`](Self)). Call before the `register_*`
@@ -7138,12 +7280,19 @@ impl NativeMethodRegistry {
             // is bounded by the number of refusals (which the gate drives to
             // zero), not by the ~3,100 registrations.
             let site = core::panic::Location::caller();
+            // The refusal is only a RETIREMENT when nothing already owns the
+            // triple. See `JdkOnlyViolation::SyntheticNativeRegistered`'s
+            // `survivor` doc: an earlier registration survives the refusal and
+            // keeps serving, so strict mode runs that older native rather than
+            // the real bytecode the policy was asking for.
+            let survivor = self.surviving_owner(class_name, method_name, descriptor);
             self.refused
                 .push(JdkOnlyViolation::SyntheticNativeRegistered {
                     class: class_name.to_string(),
                     method: method_name.to_string(),
                     descriptor: descriptor.to_string(),
                     registered_by: Some(format!("{}:{}", site.file(), site.line())),
+                    survivor,
                 });
             // Return WITHOUT inserting: nothing is pushed to `registrations` /
             // `categories` / `provenance` / `slots`, so the refused triple never
@@ -10562,7 +10711,13 @@ mod tests {
                 method,
                 descriptor,
                 registered_by,
+                survivor,
             }] => {
+                assert!(
+                    survivor.is_none(),
+                    "nothing was registered for this triple before the refusal, \
+                     so the refusal really did retire it: {survivor:?}"
+                );
                 assert_eq!(class, "j/J");
                 assert_eq!(method, "fake");
                 assert_eq!(descriptor, "()I");

@@ -198,9 +198,38 @@ pub mod mic_prof {
     }
 
     #[inline]
+    #[cfg(target_arch = "x86_64")]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// The same counter off x86-64, where `_rdtsc` does not exist.
+    ///
+    /// AArch64's equivalent is the virtual counter `CNTVCT_EL0`, unprivileged
+    /// under Linux by default. It ticks at a fixed frequency rather than the
+    /// core clock, so these numbers are NOT comparable across architectures --
+    /// which is fine, because every consumer uses them as deltas within one
+    /// process. Anything else falls back to the monotonic clock so the counters
+    /// keep working rather than the crate refusing to build.
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cnt: u64;
+            // SAFETY: CNTVCT_EL0 is a read-only counter, unprivileged on Linux.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+            cnt
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        }
     }
 
     /// Counter families for the re-entrancy gate. Depth is tracked PER FAMILY,
@@ -367,6 +396,16 @@ pub mod mic_prof {
             "[GETFIELD_CENSUS] helper_calls={}",
             super::GETFIELD_HELPER_CALLS.load(Ordering::Relaxed)
         );
+        // The JIT reference-slot census, printed beside the two above because it
+        // answers the third question in the same family. Those two ask "was it
+        // emitted" and "did it fall through to the helper"; this one asks
+        // whether the ZGC load-barrier seam those helpers funnel through ever
+        // RAN. Without a denominator, a seam wired into an arm that never
+        // executes and a seam that runs cleanly are the same silence -- the
+        // failure mode this file's other censuses were each built after. The
+        // colored-word tripwire counters print even when the per-site half is
+        // switched off.
+        super::ref_load_census::report();
     }
 }
 
@@ -586,6 +625,7 @@ thread_local! {
             arithmetic: Cell::new(false),
             npe: Cell::new(false),
             npe_action: Cell::new(0),
+            npe_compiled_frames: std::cell::RefCell::new(None),
             deopt: Cell::new(false),
         }
     };
@@ -756,6 +796,36 @@ fn forward_jit_reference_args(
     replacement
 }
 
+/// Repair one JIT argument if the collector moved the object it names.
+///
+/// # The seventh plausibility filter in this file, and why it looks like none
+///
+/// The `raw >= 1 << 48` test below is 2.5.5 of
+/// `docs/feature-designs/zgc-jit-load-barrier.md`: a hand-rolled plausibility
+/// check that does not call `plausible_heap_pointer`, so it does not appear in
+/// any grep for the idiom and was missed by that document's first draft. It
+/// degrades to "skip forwarding" rather than to null, which is why it is not on
+/// the silent-null list -- but a ZGC colored word has bit 63 set and would trip
+/// it, so the argument would silently NOT be forwarded, with no diagnostic.
+///
+/// It is deliberately left alone. JIT arguments arrive already barriered: they
+/// came from a caller's barriered load or from a fresh allocation, which
+/// carries the allocating color by construction. That is an ASSUMPTION rather
+/// than a proof, and it is the same class of assumption as J2, so it is
+/// recorded here instead of being rediscovered.
+///
+/// # Why the ZGC load barrier is NOT plumbed through here
+///
+/// 2.5.5 suggests this as the natural home for the dispatch, because
+/// `vm.mem.heap.load_and_forward` below is already this file's
+/// backend-dispatching chokepoint for moving collectors. That reading does not
+/// survive the signature: `load_and_forward` takes an `ObjectRef` -- a machine
+/// pointer the caller has already built -- and therefore cannot accept a
+/// colored word at all. It repairs a plain address the compacting slide moved
+/// (its `Zgc` arm is a real `forwarded_after_slide` lookup, not a no-op); it
+/// does not decode a color. The colored-word chokepoint has to take the SLOT,
+/// which is what [`jit_load_ref_slot`] and `.agent-requests/A9-gc-barrier.txt`
+/// are about.
 #[inline]
 fn forward_jit_arg_at(
     vm: &SharedVm,
@@ -845,7 +915,24 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() {
+        // Publish this thread's shadow-stack ADDRESS, plus the `base`/`end` of
+        // its backing buffer, so a GC initiator that freezes this thread can
+        // scan the window it cannot otherwise reach -- and can verify the
+        // address still describes THIS buffer before trusting `top`.
+        // Once per thread. See
+        // `cratonvm_gc::gc_quiescence::publish_self_shadow_addr`.
+        if crate::jit::conservative_roots::xt_peer_shadow_scan_enabled() {
+            crate::jit::conservative_roots::publish_self_shadow_addr_once(
+                &thread.shadow_stack as *const _ as usize,
+                thread.shadow_stack.base,
+                thread.shadow_stack.end,
+            );
+        }
+        if if crate::runtime::env_cache::hot_lookup_cache() {
+            crate::runtime::env_cache::dbg_shadow()
+        } else {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some()
+        } {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
@@ -865,6 +952,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         t.set(thread as *mut JvmThread);
         old
     });
+    cratonvm_jit::x64::publish_jit_thread_mirror(thread as *mut JvmThread as usize);
     // Suspend any borrow held by an outer JIT level: the nested JIT call about
     // to run is a child reborrow of `thread`, not an aliasing sibling, so it
     // must start its own borrow level. The outer borrow is frozen on the call
@@ -921,6 +1009,7 @@ pub fn restore_jit_thread(scope: JitThreadScope) {
         report_shadow_overflow_once();
     }
     JIT_THREAD.with(|t| t.set(scope.prev_ptr));
+    cratonvm_jit::x64::publish_jit_thread_mirror(scope.prev_ptr as usize);
     #[cfg(debug_assertions)]
     restore_jit_borrow(scope.prev_borrow);
 }
@@ -962,6 +1051,7 @@ fn report_shadow_overflow_once() {
 /// Clear the JIT thread pointer after JIT execution completes.
 pub fn clear_jit_thread() {
     JIT_THREAD.with(|t| t.set(std::ptr::null_mut()));
+    cratonvm_jit::x64::publish_jit_thread_mirror(0);
 }
 
 /// The consolidated out-of-band JIT→interpreter signal block — see the
@@ -994,6 +1084,22 @@ struct JitSignals {
     arithmetic: Cell<bool>,
     npe: Cell<bool>,
     npe_action: Cell<u8>,
+    /// The COMPILED frames that were live when a JIT helper signalled the NPE.
+    ///
+    /// An implicit NPE in compiled code is not thrown where it happens: the
+    /// helper sets `npe`, returns `i64::MIN`, compiled code returns to the
+    /// interpreter, and only THEN is the `java/lang/NullPointerException`
+    /// constructed. `fillInStackTrace` therefore runs on a stack the compiled
+    /// frames have already left, and the trace loses every method between the
+    /// throw site and the first interpreter frame — the whole point of the
+    /// trace. Snapshot them while they are still on the stack; the drain hands
+    /// them to the throwable. See
+    /// `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`.
+    ///
+    /// `RefCell` rather than `Cell` because the payload is not `Copy`; it is
+    /// only ever borrowed for the length of a `take`/`replace`, never across a
+    /// call, so it cannot be re-entered.
+    npe_compiled_frames: std::cell::RefCell<Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>>,
     deopt: Cell<bool>,
 }
 
@@ -1010,11 +1116,14 @@ pub(crate) struct DrainedJitSignals {
     pub aioobe: Option<(i64, i64)>,
     pub arithmetic: bool,
     pub npe: bool,
+    /// The compiled frames that were live when the helper signalled `npe`.
+    /// See `JitSignals::npe_compiled_frames`; drained here so that no path
+    /// can construct the NPE without also being handed the frames it is
+    /// about to lose.
+    pub npe_compiled_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
     /// Drained alongside `npe` for hygiene (a stale action code must not
-    /// outlive its NPE), but not yet consumed by the JIT-return drains —
-    /// they throw the bare NPE exactly as before this consolidation
-    /// (attaching the JEP-358 action message here is a follow-up).
-    #[allow(dead_code)]
+    /// outlive its NPE). Read by the two restash paths, which put it back with
+    /// the flag and the frame snapshot — see [`restash_jit_pending_npe`].
     pub npe_action: u8,
     pub deopt: bool,
 }
@@ -1039,9 +1148,53 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
         npe: s.npe.take(),
+        npe_compiled_frames: s.npe_compiled_frames.borrow_mut().take(),
         npe_action: s.npe_action.take(),
         deopt: s.deopt.take(),
     })
+}
+
+/// Kill switch for the compiled-frame snapshot taken when a JIT helper signals
+/// an implicit NPE. Default ON; `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT=1` restores
+/// the historical (frame-losing) trace, so the difference is an A/B inside one
+/// binary rather than a comparison across two builds.
+fn npe_frame_snapshot_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT").is_none()
+    })
+}
+
+/// Snapshot the live compiled frames for a JIT-signalled NPE.
+///
+/// Called from the two `set_jit_pending_npe*` setters, i.e. from inside the
+/// helper, with every compiled frame between the throw site and the
+/// interpreter still on the stack. Cheap by construction: this records the
+/// same small structs the GC root walk already builds, and does no class-store
+/// lookup, no string formatting and takes no lock.
+fn snapshot_npe_compiled_frames(trap_key: u32) {
+    if !npe_frame_snapshot_enabled() {
+        return;
+    }
+    let mut frames = crate::jit::conservative_roots::active_compiled_frames();
+    // The one frame the walk cannot put a line on is the one that raised: an
+    // inline null check publishes no safepoint id. `trap_key` is the site id its
+    // cold trampoline passed in, and this is the only place both the key and
+    // the frames exist at once.
+    crate::jit::conservative_roots::apply_npe_trap_site(&mut frames, trap_key);
+    JIT_SIGNALS.with(|s| {
+        *s.npe_compiled_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
+    });
+}
+
+/// Take the compiled frames snapshotted for a pending JIT NPE, if any.
+///
+/// The drain calls this beside [`take_jit_pending_npe`]. Always a `take`: a
+/// snapshot that outlived its NPE would be attached to an unrelated throwable,
+/// and a trace that is confidently wrong is worse than one that is short.
+pub fn take_jit_pending_npe_compiled_frames(
+) -> Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>> {
+    JIT_SIGNALS.with(|s| s.npe_compiled_frames.borrow_mut().take())
 }
 
 /// Store a pending Java exception from JIT dispatch. Called when
@@ -1117,6 +1270,38 @@ pub(crate) fn stash_jit_pending_npe() {
     set_jit_pending_npe();
 }
 
+/// Raise the pending-NPE flag WITHOUT taking a compiled-frame snapshot.
+///
+/// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
+/// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
+/// take leaves `npe_compiled_frames` untouched, so the snapshot from the trap
+/// is still there and is still the right one; taking another would overwrite it
+/// with a stack the raising frame has already left.
+pub(crate) fn set_jit_pending_npe_flag_only() {
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(0);
+    });
+}
+
+/// Put back an NPE that [`take_all_jit_signals`] drained WHOLE -- flag, JEP-358
+/// action code and the compiled-frame snapshot -- exactly as it was found.
+///
+/// The action code was previously dropped by every restash (the setter resets
+/// it to `0`), so an implicit NPE that took a round trip through a door which
+/// declined to service it lost its "Cannot load from int array" message. Both
+/// halves travel together because both describe the same trap.
+pub(crate) fn restash_jit_pending_npe(
+    action: u8,
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(action);
+        *s.npe_compiled_frames.borrow_mut() = frames;
+    });
+}
+
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
 /// taken pending-AIOOBE payload. See `stash_jit_pending_exception` for the
 /// OSR drain-without-route rationale.
@@ -1132,7 +1317,46 @@ pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
 /// address if a collection intervened, because the slot it comes out of is
 /// rooted and remapped (`memory/roots.rs` §10, `memory/gc.rs` §10).
 pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
-    thread.jit_pending_exception.take()
+    let exc = thread.jit_pending_exception.take();
+    if exc.is_some() {
+        drain_superseded_implicit_signals();
+    }
+    exc
+}
+
+/// Drop the implicit-trap flags when a real exception is being delivered.
+///
+/// An implicit signal (`npe`, `aioobe`, `arithmetic`) is a REQUEST for a
+/// throwable, not a throwable. Once another exception is in flight, that request
+/// can never be granted: the frame whose trap raised it is unwinding, and no
+/// door downstream owns the flag. Leaving it set is not inert -- the next
+/// unrelated JIT call drains it and builds a fresh exception at a site that
+/// never faulted.
+///
+/// The shape that found this (2026-09-03, see
+/// `known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`): the
+/// lambda direct arm finishes a deopted body in the interpreter and returns a
+/// zero with the real NPE parked in `jit_pending_exception`, exactly as its
+/// contract says. Compiled code then evaluates the second operand of the same
+/// expression before its post-invoke guard fires, dereferences the SAME null and
+/// raises a second trap. The first exception is delivered and caught; the second
+/// flag survives two iterations and surfaces as a `NullPointerException` for a
+/// receiver that was never null.
+///
+/// This is the same rule [`take_all_jit_signals`] already applies by taking
+/// everything at once -- stated for the other consumption point, so the two
+/// cannot disagree about whether a signal outlives the exception that overtook
+/// it. The deopt flag is deliberately NOT dropped: it describes the compiled
+/// frame's fate, which an exception does not settle.
+fn drain_superseded_implicit_signals() {
+    if take_jit_pending_npe() {
+        // The snapshot was taken for a raise that will never happen; a later
+        // drain would attach frames the raising code has long since left.
+        let _ = take_jit_pending_npe_action();
+        let _ = take_jit_pending_npe_compiled_frames();
+    }
+    let _ = take_jit_pending_aioobe();
+    let _ = take_jit_pending_arithmetic();
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -1216,6 +1440,7 @@ fn set_jit_pending_npe() {
         s.npe.set(true);
         s.npe_action.set(0);
     });
+    snapshot_npe_compiled_frames(0);
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -1224,10 +1449,23 @@ fn set_jit_pending_npe() {
 /// JEP-358 message to the JIT-originated NPE.
 #[inline]
 fn set_jit_pending_npe_action(code: u8) {
+    set_jit_pending_npe_action_at(code, 0);
+}
+
+/// As [`set_jit_pending_npe_action`], with the id of the inline null-check
+/// site that trapped (`0` when the caller has none).
+///
+/// Only the inline null-check stubs can name a site: they are the shape whose
+/// bci is otherwise unrecoverable, because the check is not a GC-capable call
+/// and so publishes no safepoint id. Every other NPE-signalling helper is a
+/// call, and its frame's slot already holds an id `activation_bci` can use.
+#[inline]
+fn set_jit_pending_npe_action_at(code: u8, trap_key: u32) {
     JIT_SIGNALS.with(|s| {
         s.npe.set(true);
         s.npe_action.set(code);
     });
+    snapshot_npe_compiled_frames(trap_key);
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
@@ -1367,7 +1605,22 @@ pub extern "C" fn jit_npe_with_action(code: i64) {
     // matching every other array/field helper's entry (the next GC must
     // re-scan after we deopt back out to the interpreter).
     crate::jit::conservative_roots::note_jit_boundary();
-    set_jit_pending_npe_action(code as u8);
+    // The argument is PACKED: the low byte is the JEP-358 action code, and the
+    // upper 24 bits are the inline null-check site id, or zero. A stub that
+    // sets only the action (the historical shape, and the reason-10 precise
+    // putfield path) therefore reads back as `trap_key == 0` with no special
+    // case. See `x64::inlining::NpeTrapSite` and
+    // `x64::Compiler::emit_null_check_store_stubs`.
+    //
+    // `as u64` before the shift, not `as u32`: the sign of an `i64` argument is
+    // nobody's business here and an arithmetic shift on a hypothetical negative
+    // would fabricate a key.
+    let packed = code as u64;
+    // Truncation: the low byte IS the action code by construction.
+    let action = (packed & 0xff) as u8;
+    // Truncation: `record_npe_trap_site` caps ids at 24 bits.
+    let trap_key = ((packed >> 8) & 0x00ff_ffff) as u32;
+    set_jit_pending_npe_action_at(action, trap_key);
     // Out-of-band deopt signal: the stub loads `i64::MIN` as the return value
     // (same invariant as `jit_bastore`'s null arm did before).
     set_jit_deopt_pending();
@@ -2857,7 +3110,9 @@ unsafe fn resolve_callee_cached(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -2928,7 +3183,15 @@ pub(crate) fn implicit_signal_of(
 fn restash_implicit_signal(signal: ImplicitSignal) {
     match signal {
         ImplicitSignal::Aioobe { index, length } => stash_jit_pending_aioobe(index, length),
-        ImplicitSignal::Npe => stash_jit_pending_npe(),
+        // `set_jit_pending_npe_flag_only`, NOT `stash_jit_pending_npe`. This
+        // door drains the NPE with `take_jit_pending_npe()`, which takes the
+        // FLAG and leaves the compiled-frame snapshot where the helper put it.
+        // Re-stashing through the ordinary setter would take a SECOND snapshot
+        // here -- one frame shallower, because the callee whose code raised the
+        // NPE has already returned -- and silently overwrite the real one. The
+        // trace would still be plausible and would be missing exactly the frame
+        // it was taken to keep.
+        ImplicitSignal::Npe => set_jit_pending_npe_flag_only(),
         ImplicitSignal::Arithmetic => stash_jit_pending_arithmetic(),
         ImplicitSignal::None => {}
     }
@@ -2947,6 +3210,7 @@ fn materialize_implicit_signal(
     vm: &SharedVm,
     thread: &mut JvmThread,
     signal: ImplicitSignal,
+    npe_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
@@ -2959,13 +3223,29 @@ fn materialize_implicit_signal(
             )
             .ok()
         }
-        ImplicitSignal::Npe => crate::runtime::exceptions::create_exception_object(
-            vm,
-            thread,
-            "java/lang/NullPointerException",
-            None,
-        )
-        .ok(),
+        ImplicitSignal::Npe => {
+            let exc = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/NullPointerException",
+                None,
+            )
+            .ok()?;
+            // The frames the helper snapshotted at the trap. Without this the
+            // NPE materialised HERE -- i.e. every implicit NPE routed into a
+            // compiled callee's own handler -- keeps the frameless trace
+            // `fillInStackTrace` just built, which is the whole defect the
+            // snapshot exists to close. Attaching it in the constructor arm
+            // rather than at each door is what stops a fourth door from
+            // silently reopening it.
+            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                vm,
+                &thread.frames,
+                exc,
+                npe_frames,
+            );
+            Some(exc)
+        }
         ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
             vm,
             thread,
@@ -3420,7 +3700,15 @@ unsafe fn route_implicit_exc_through_callee(
         // own `idiv`, because there is one body — a `getMessage()` that changed
         // with the dispatch route would be its own wrong answer, and this used
         // to be kept true by hand.
-        let exc = materialize_implicit_signal(vm, thread, implicit);
+        // This door drained the FLAG only (`take_jit_pending_npe`), so the
+        // snapshot is still in the signal record; take it here so it is
+        // consumed by exactly the throwable it belongs to.
+        let npe_frames = if implicit == ImplicitSignal::Npe {
+            take_jit_pending_npe_compiled_frames()
+        } else {
+            None
+        };
+        let exc = materialize_implicit_signal(vm, thread, implicit, npe_frames);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3658,7 +3946,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // outgoing arguments still identify that callee, and run its handler at
     // the recorded throw bci.  Re-entering the callee from bytecode 0 used to
     // duplicate all side effects before a caught bounds/null/divide exception.
-    let signals = take_all_jit_signals(thread);
+    let mut signals = take_all_jit_signals(thread);
     let throw_pc = if signals.athrow_bci >= 0 {
         signals.athrow_bci as usize
     } else {
@@ -3695,6 +3983,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
+                signals.npe_compiled_frames.take(),
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -3722,7 +4011,11 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
         stash_jit_pending_aioobe(index, length);
     }
     if signals.npe {
-        stash_jit_pending_npe();
+        // Restore the snapshot the drain took WITH the flag, rather than
+        // letting the setter take a fresh one here: `take_all_jit_signals`
+        // moved it out, and a second `active_compiled_frames()` at this point
+        // describes a shallower stack than the trap did.
+        restash_jit_pending_npe(signals.npe_action, signals.npe_compiled_frames.take());
     }
     if signals.arithmetic {
         stash_jit_pending_arithmetic();
@@ -3861,7 +4154,9 @@ unsafe fn try_resume_trapped_callee(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
@@ -4293,7 +4588,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // moving collector rewrites object addresses. (Resolves the prior
         // FIXME that called `heap.collect_garbage` with an unchecked
         // StopTheWorldToken.)
-        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
     }
     // GC-overhead limit: if forced GCs keep freeing almost nothing, the heap is
     // full of live objects — surface OOM now instead of limping on slivers
@@ -4645,6 +4940,18 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         );
     }
 
+    // The header is complete from here on. ZGC needs every TLAB object in its
+    // start registry before anything else can observe the address (the
+    // registry is a mutator-path oracle there, not only the sweep's), and
+    // this helper is the one call the inline allocator always makes -- so
+    // this is where an inline-allocated object is registered. A no-op on the
+    // backends whose sweeps parse the chunk linearly. `zgc/vm_tlab.rs`.
+    {
+        let footprint = HEADER_SIZE
+            + compact_body.map_or(num_fields as usize * SLOT_SIZE, |body| body as usize);
+        vm.mem.heap.note_tlab_object(raw_ptr, footprint);
+    }
+
     // Reconstruct the typed handle and finish init.
     let obj_ref = cratonvm_types::ObjectRef::from_raw(raw_ptr);
 
@@ -4854,12 +5161,20 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // over-sized object. In all cases the inline bump did not commit a
     // half-initialized object: the TLAB cursor in memory is the
     // last-allocated-object's end, so `retire()` here is safe.
-    let total_size = cratonvm_types::HEADER_SIZE
-        + (num_fields as usize).saturating_mul(cratonvm_types::SLOT_SIZE);
+    // The shape planner, not a bare legacy size. This site reserves the region
+    // that `tlab_alloc_object_guarded_refill` stamps a header onto, so a legacy
+    // reservation here with a compact header there is an object claiming a
+    // smaller size than it was given -- which every header-strided heap walk
+    // then misparses.
+    let (total_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+        class_id,
+        num_fields as usize,
+        crate::runtime::interpreter::tlab_site::JIT_NEW,
+    );
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -4921,7 +5236,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         None => {
             if let Some((thread, _guard)) = jit_thread_mut() {
                 thread.tlab.retire();
-                crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
             }
             if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm) {
                 if let Some(obj_ref) = heap.try_alloc_object_full(class_id, num_fields as usize) {
@@ -5778,7 +6093,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
     if heap.try_alloc_young_probe(total_size).is_none() {
         if let Some((thread, _guard)) = jit_thread_mut() {
             thread.tlab.retire();
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
         }
     }
 
@@ -5945,6 +6260,13 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
     *elem_ptr = val as u8;
+    // The host just wrote this array, so a GPU input-cache entry
+    // mirroring it is stale. `jit_iastore` has carried this since Phase
+    // 10 #2; this helper did not, because `byte[]` could not be
+    // marshalled and so was never cached. It became cacheable on
+    // 2026-09-02 and this line landed with the same change.
+    #[cfg(feature = "gpu-offload")]
+    crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
@@ -6158,9 +6480,17 @@ fn jit_decode_ref_word(raw: u64, site: &'static str) -> i64 {
 /// bit set: a stale `0x8D8D8D8D8D8D8D8D` has bit 63 set but fails that, so a
 /// `--features zgc` build running Generational or G1 keeps the old degrade for
 /// real garbage. This bit-pattern test is used instead of "is ZGC the selected
-/// backend?" deliberately: `jit_aaload` receives no `vm_ptr` at all, and
-/// `cratonvm_gc::vm_heap::VmHeap` exposes no backend accessor — see the report
-/// accompanying this change.
+/// backend?" deliberately: `cratonvm_gc::vm_heap::VmHeap` exposes no backend
+/// accessor, and three of the five sites that reach this arm (`jit_getfield`'s
+/// legacy 16-byte `Value` cell and `jit_getstatic`'s two) no longer hold the
+/// SLOT by the time they get here, so they cannot dispatch through
+/// [`jit_load_ref_slot`] at all -- see the report accompanying this change.
+///
+/// The clause that used to lead that sentence -- "`jit_aaload` receives no
+/// `vm_ptr` at all" -- stopped being true on 2026-09-01, when that helper
+/// gained a leading `vm_ptr` and site A became barriered. It is named here
+/// rather than silently deleted, because a rationale that has quietly stopped
+/// holding misdirects the next reader more than no rationale would.
 #[cold]
 #[inline(never)]
 fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
@@ -6178,29 +6508,86 @@ fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
     // is clear, so `is_colored_word(0)` is false.
     #[cfg(feature = "zgc")]
     {
-        // TODO(zgc): once the load barrier is wired into this helper arm this
-        // branch becomes unreachable, because the word reaching here will
-        // already be a plain address. The barrier entry point is
-        // `cratonvm_gc::zgc::barrier::z_load(&AtomicU64, &ZBarrierContext)`
-        // (gc/src/zgc/barrier.rs, fn z_load); the intended plumbing is through the
-        // existing `VmHeap::load_and_forward` chokepoint this file already uses
-        // for moving collectors (`forward_jit_arg_at`), so that the JIT read
-        // helpers acquire the barrier by dispatching on the backend rather than
-        // by growing a ZGC special case per site. Keep this panic as the
-        // tripwire for a site that was missed.
+        // TODO(zgc) -- RESTATED 2026-09-01 after following the plumbing the
+        // previous wording named. Two of its premises did not survive reading
+        // the source, so they are corrected here rather than left to be
+        // rediscovered:
+        //
+        //  * "through the existing `VmHeap::load_and_forward` chokepoint" does
+        //    not work. That function (gc/src/vm_heap.rs, `pub fn
+        //    load_and_forward`) genuinely does dispatch on the backend, and its
+        //    `Zgc` arm genuinely does work -- `forwarded_after_slide`, the
+        //    relocation-table lookup that repairs a reference the compacting
+        //    slide moved. But its parameter is an `ObjectRef`: a MACHINE
+        //    POINTER the caller has already fabricated, and a colored word is
+        //    not one. Handed a colored word it would build an `ObjectRef` out
+        //    of bit-63 bits, fail `is_object_address`, and hand the SAME word
+        //    back unchanged -- a silent no-op that additionally violates
+        //    `cratonvm_gc::zgc::vaddr::debug_assert_plain_word`. It is the
+        //    chokepoint for a DIFFERENT hazard (post-slide forwarding of a
+        //    plain address), not for colored-word decoding.
+        //  * A barrier cannot be taken at THIS point under any design.
+        //    `cratonvm_gc::zgc::barrier::z_load` takes `&AtomicU64` -- the
+        //    SLOT, not the loaded word -- because its slow path CAS-heals the
+        //    slot in place; and it returns a bare 42-bit heap OFFSET, which the
+        //    caller must add the heap base to. By the time control reaches this
+        //    cold arm the slot address is gone and only the word survives.
+        //
+        // The barrier therefore belongs one frame up, in [`jit_load_ref_slot`],
+        // which is now the single seam this file funnels its raw reference-slot
+        // reads through -- one seam dispatching on the backend, rather than the
+        // per-site ZGC special cases the original TODO rightly forbade. The
+        // backend-dispatching call that seam must make does not exist yet and
+        // has to be ADDED to `gc/src/vm_heap.rs`; its exact signature, and what
+        // its `Zgc` arm must do, are written down in
+        // `.agent-requests/A9-gc-barrier.txt`. This branch becomes unreachable
+        // the moment that lands, because the word arriving here will already be
+        // a plain address.
+        //
+        // Keep the panic as the tripwire for a site that was missed. It has
+        // never fired -- and today it CANNOT, which is a different fact and the
+        // more important one: `vm/src/vm/vm_init.rs` pins
+        // `const RELOCATION_REQUESTED: bool = false`, `ZgcRealHeap::
+        // set_barrier_color` (the sole writer of the colored state) has no
+        // non-test caller, and `vaddr::color` has no production caller at all.
+        // No colored word is stored in a heap slot in any shipping
+        // configuration, so this tripwire is armed where nothing can reach it.
+        // That is exactly why the two counters below exist: without them, "the
+        // tripwire is armed and zero words reached it" and "the tripwire is
+        // armed in a place a word cannot reach" produce identical silence.
         if cratonvm_gc::zgc::vaddr::is_colored_word(raw)
             && cratonvm_gc::zgc::vaddr::is_well_formed(raw)
         {
-            panic!(
-                "ZGC colored word {raw:#018x} reached the JIT read helper `{site}` \
-                 with no load barrier: bit 63 (Z_COLORED_TAG) is set by \
-                 gc/src/zgc/vaddr.rs so this word is a legitimate reference that \
-                 has not been unmasked, not corruption. Barrier it via \
-                 cratonvm_gc::zgc::barrier::z_load and plausibility-check the \
-                 UNMASKED address; do not degrade it to null (that is the silent \
-                 heap corruption of zgc-jit-load-barrier.md J1) and do not weaken \
-                 plausible_heap_pointer to admit it."
-            );
+            // Unconditional, unlike the per-site counters: this arm is `#[cold]`
+            // and a clean run never reaches it, so the increment costs nothing
+            // and this is the one number that must be readable without anyone
+            // having remembered to set a diagnostic flag first.
+            ref_load_census::COLORED_WORDS_SEEN
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !zgc_jit_load_barrier_suppressed() {
+                panic!(
+                    "ZGC colored word {raw:#018x} reached the JIT read helper `{site}` \
+                     with no load barrier: bit 63 (Z_COLORED_TAG) is set by \
+                     gc/src/zgc/vaddr.rs so this word is a legitimate reference that \
+                     has not been unmasked, not corruption. Barrier it via \
+                     cratonvm_gc::zgc::barrier::z_load and plausibility-check the \
+                     UNMASKED address; do not degrade it to null (that is the silent \
+                     heap corruption of zgc-jit-load-barrier.md J1) and do not weaken \
+                     plausible_heap_pointer to admit it."
+                );
+            }
+            // `CRATONVM_ZGC_NO_JIT_LOAD_BARRIER` is set, so the operator has
+            // asked to get PAST the tripwire. That re-arms exactly the
+            // silent-null corruption of `zgc-jit-load-barrier.md` J1 for the
+            // rest of the run, which is why it is counted separately -- a
+            // bring-up run can then say how many live references it turned into
+            // null -- and announced once on stderr, for the reason the
+            // compressed-oops gate in `vm_init.rs` states about itself: a silent
+            // fallback looks identical to a successful run, and the operator has
+            // to be able to see which one they got.
+            ref_load_census::COLORED_WORDS_DEGRADED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn_once_jit_load_barrier_suppressed(raw, site);
         }
     }
     // Counts the event under the `Jit` source and emits the one-shot diagnostic
@@ -6215,10 +6602,569 @@ fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
     0
 }
 
-// SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to a reference array object. Null triggers a pending NPE + `i64::MIN`
-// deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
-pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
+/// Per-site census of the raw heap reference-slot reads this file performs, and
+/// of the ZGC colored words that reached them.
+///
+/// # Why a census, when there is already a tripwire
+///
+/// [`jit_ref_word_implausible`] panics on a well-formed colored word and does
+/// nothing whatsoever otherwise. So "the seam is wired and four billion
+/// reference loads went through it" and "the seam is wired into an arm that
+/// never executes" produce byte-identical output: silence. This tree has been
+/// bitten by that shape repeatedly -- an instrument armed where it cannot fire
+/// reads as a clean result -- and this particular tripwire is a live instance
+/// of it, because no colored word is stored in a heap slot in any shipping
+/// configuration today (the argument is on the tripwire itself). These counters
+/// supply the denominator, so a future `[JIT_REF_LOADS] getfield_compact_ref=0`
+/// reads as "the seam is in the wrong arm" rather than as "nothing went wrong".
+///
+/// # Why the per-site counts are gated, and gated on a cached flag read
+///
+/// `jit_getfield`'s compact-reference arm is the hottest read in this VM. This
+/// file has already measured ONE unconditional relaxed increment on that path
+/// at ~2-3 ns of a 9 ns reference-field read (see
+/// [`getfield_census_counting_enabled`]), and an *uncached* `runtime_var_os` on
+/// the same path at a 3.4x regression (see [`compact_inline_dbg`]). So the
+/// per-site increments sit behind the same cached-`OnceLock` gate those two
+/// use, and the default configuration pays one relaxed load.
+///
+/// [`COLORED_WORDS_SEEN`] and [`COLORED_WORDS_DEGRADED`] are deliberately NOT
+/// gated. They are incremented only from the `#[cold]`
+/// [`jit_ref_word_implausible`] arm, which a clean run never reaches, so they
+/// cost nothing -- and they are the two numbers that must be readable without
+/// anyone having remembered to set a diagnostic flag first.
+pub mod ref_load_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `jit_aaload`'s element read. Category A of
+    /// `docs/feature-designs/zgc-jit-load-barrier.md` 2.3: a raw
+    /// reference-array element load, barriered where it stands.
+    pub const AALOAD_ELEMENT: usize = 0;
+    /// `jit_getfield`'s compact-reference field read. Site B of that document's
+    /// 2.5.1 table, and the arm every Category-A inline lowering falls back to
+    /// once `zgc_read_barrier_blocks_inline_fields` routes it here.
+    pub const GETFIELD_COMPACT_REF: usize = 1;
+    /// `jit_getfield`'s legacy 16-byte `Value` cell. Site D: the word has
+    /// already been laundered through an `ObjectRef` by `read_value_atomic`, so
+    /// this counts an arm whose barrier belongs UPSTREAM, not a barriered load.
+    pub const GETFIELD_LEGACY_VALUE: usize = 2;
+    /// `jit_getstatic`'s `System.in` intercept. Site E; same upstream caveat as
+    /// [`GETFIELD_LEGACY_VALUE`], with `crate::vm::get_static_shared` as the
+    /// upstream.
+    pub const GETSTATIC_SYSTEM_IN: usize = 3;
+    /// `jit_getstatic`'s general object arm. Site F; same upstream caveat.
+    pub const GETSTATIC_OBJECT: usize = 4;
+
+    const N: usize = 5;
+    const NAMES: [&str; N] = [
+        "aaload_element",
+        "getfield_compact_ref",
+        "getfield_legacy_value",
+        "getstatic_system_in",
+        "getstatic_object",
+    ];
+
+    static COUNTS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Well-formed ZGC colored words that reached a JIT read helper with no
+    /// load barrier. **Zero is the only good value, and today zero is also the
+    /// only reachable value** -- see the tripwire's own comment for why. A
+    /// non-zero count is proof that a Category-A site was missed.
+    ///
+    /// Ungated and unconditional: incremented only from a `#[cold]` arm.
+    pub static COLORED_WORDS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+    /// The subset of [`COLORED_WORDS_SEEN`] that `CRATONVM_ZGC_NO_JIT_LOAD_BARRIER`
+    /// let past the tripwire, each of which was then handed to compiled code as
+    /// `null` -- i.e. the exact silent-heap-corruption count for a run that
+    /// deliberately disarmed the tripwire.
+    ///
+    /// This is the kill switch's engagement counter. A run with the switch set
+    /// and this reading `0` did not exercise the suppressed path at all, which
+    /// is a different result from "the suppressed path behaved".
+    pub static COLORED_WORDS_DEGRADED: AtomicU64 = AtomicU64::new(0);
+
+    /// Reference-slot loads that went through `VmHeap::load_ref_slot_barriered`
+    /// -- the ones where [`super::jit_load_ref_slot`] had a `&VmHeap` to
+    /// dispatch on.
+    ///
+    /// **This is the wiring's engagement counter, and it is the number the
+    /// tripwire cannot supply.** [`COLORED_WORDS_SEEN`] reads `0` whether every
+    /// load was barriered or the barrier call sits in an arm nothing executes;
+    /// this tree has been bitten by an instrument armed where it cannot fire
+    /// often enough that the denominator gets written down rather than
+    /// inferred. Non-zero means the barriered route RAN.
+    ///
+    /// Gated on [`enabled`], because `GETFIELD_COMPACT_REF` -- the only site
+    /// that increments it today -- is the hottest reference read in the VM and
+    /// one UNGATED relaxed increment there has already been measured at a
+    /// quarter of the read. It shares the single `enabled()` test with the
+    /// per-site count inside [`note_route`], so the default configuration pays
+    /// exactly what it paid before this counter existed.
+    pub static BARRIERED_LOADS: AtomicU64 = AtomicU64::new(0);
+
+    /// Reference-slot loads that took the RAW read because the seam had no
+    /// `&VmHeap` to reach the barrier through.
+    ///
+    /// **Expected `0`, and ungated so a non-zero value cannot hide behind an
+    /// unset diagnostic flag.** Since 2026-09-01 there is NO caller that passes
+    /// `None`: `jit_getfield`'s compact-reference arm always had a `vm_ptr`,
+    /// and `jit_aaload` gained one (`.agent-requests/B8-abi.txt`), so both of
+    /// this file's slot-holding sites pass `Some(..)`.
+    ///
+    /// That changed what a zero MEANS here, and the difference is the whole
+    /// value of the number. It used to read "the only `None` caller is a helper
+    /// no emitter calls, so nothing reached the raw route". It now reads "no
+    /// `None` route exists in this tree at all". A non-zero count is therefore
+    /// no longer merely surprising: it says a NEW call site of the seam was
+    /// added without a heap to dispatch on, and that those reference loads were
+    /// not barriered -- harmless while nothing arms the barrier, and exactly
+    /// risk J1 of `docs/feature-designs/zgc-jit-load-barrier.md` the moment
+    /// something does.
+    ///
+    /// Ungated is affordable precisely because it is not on a hot path: the
+    /// seam is `#[inline(always)]` and `heap` is a compile-time `Some` at both
+    /// call sites, so in a release build the `!barriered` branch folds out of
+    /// both and this increment is emitted nowhere at all. Keeping the `None`
+    /// arm (rather than narrowing the seam to a bare `&VmHeap`) is deliberate:
+    /// it is what makes a future third call site declare, in its own argument
+    /// list, whether it can reach the barrier -- and fail loudly here if not.
+    pub static UNBARRIERED_LOADS: AtomicU64 = AtomicU64::new(0);
+
+    /// Is anything going to READ the per-site counters this run?
+    ///
+    /// Cached for the reason [`super::compact_inline_dbg`] documents: a
+    /// per-call `runtime_var_os` on the `jit_getfield` path is itself the
+    /// regression. `CRATONVM_DBG_JIT_REF_LOADS` is declared in
+    /// `.agent-requests/A9-flags.txt`.
+    #[inline]
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_REF_LOADS").is_some()
+        })
+    }
+
+    /// Count one reference-slot read at `slot`, one of the `*_ELEMENT` /
+    /// `GETFIELD_*` / `GETSTATIC_*` constants above.
+    #[inline(always)]
+    pub fn note(slot: usize) {
+        if enabled() {
+            if let Some(c) = COUNTS.get(slot) {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// [`note`], plus which ROUTE the load took: `barriered = true` when
+    /// [`super::jit_load_ref_slot`] had a `&VmHeap` and called
+    /// `VmHeap::load_ref_slot_barriered`, `false` when it fell back to the raw
+    /// `read_ref_slot`.
+    ///
+    /// # Why the route needs a number of its own
+    ///
+    /// A per-site count says a load happened; it does not say whether that load
+    /// went through the barrier. With the barrier unarmed the two routes return
+    /// bit-identical values, so nothing observable separates "the barrier is
+    /// wired and ran four billion times" from "the barrier call sits in an arm
+    /// that never executes" -- the failure this module was created to make
+    /// impossible, reappearing one level down. `COLORED_WORDS_SEEN` cannot
+    /// answer it either: it is `0` in both cases, and stays `0` for a third
+    /// reason (nothing colors a slot today).
+    ///
+    /// # Why the two counters are gated differently
+    ///
+    /// [`BARRIERED_LOADS`] rides the SAME `enabled()` test as the per-site
+    /// count, so the hot `getfield` arm pays one cached-flag read in total,
+    /// exactly what it paid before this existed. [`UNBARRIERED_LOADS`] is
+    /// ungated, which is affordable because `barriered` is a compile-time
+    /// constant at every call site of the `#[inline(always)]` seam: since both
+    /// callers pass `Some(..)` (2026-09-01) the increment folds out of a
+    /// release build entirely, and it would be emitted only into a future
+    /// `None` caller. An expected-zero tripwire that only a diagnostic flag can
+    /// reveal is not much of a tripwire.
+    #[inline(always)]
+    pub fn note_route(slot: usize, barriered: bool) {
+        if !barriered {
+            UNBARRIERED_LOADS.fetch_add(1, Ordering::Relaxed);
+        }
+        if enabled() {
+            if let Some(c) = COUNTS.get(slot) {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            if barriered {
+                BARRIERED_LOADS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Per-site counts, or `None` when the census is gated off.
+    ///
+    /// **Not `Some(vec![0; N])` when off.** A gated counter reported as a
+    /// number is indistinguishable from a path that never ran, which is the
+    /// precise misreading this module exists to prevent -- the same rule
+    /// [`super::jit_getfield_helper_calls`] states for its own counter.
+    pub fn snapshot() -> Option<Vec<(&'static str, u64)>> {
+        if !enabled() {
+            return None;
+        }
+        Some(
+            NAMES
+                .iter()
+                .zip(COUNTS.iter())
+                .map(|(n, c)| (*n, c.load(Ordering::Relaxed)))
+                .collect(),
+        )
+    }
+
+    /// The two ungated tripwire counters, `(seen, degraded_by_kill_switch)`.
+    /// Always real numbers; see the statics' own docs.
+    pub fn colored_word_counts() -> (u64, u64) {
+        (
+            COLORED_WORDS_SEEN.load(Ordering::Relaxed),
+            COLORED_WORDS_DEGRADED.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(barriered, unbarriered)` -- which ROUTE the seam's loads took.
+    ///
+    /// `barriered` is `None` when the per-site census is gated off, for the
+    /// same reason [`snapshot`] returns `None` rather than a vector of zeros:
+    /// a gated counter reported as a number is indistinguishable from a path
+    /// that never ran, and that is the exact misreading these counters exist
+    /// to prevent. `unbarriered` is ungated and always real.
+    pub fn route_counts() -> (Option<u64>, u64) {
+        let barriered = if enabled() {
+            Some(BARRIERED_LOADS.load(Ordering::Relaxed))
+        } else {
+            None
+        };
+        (barriered, UNBARRIERED_LOADS.load(Ordering::Relaxed))
+    }
+
+    /// One `[JIT_REF_LOADS]` line. Prints the tripwire counters unconditionally
+    /// and says so explicitly when the per-site half is switched off, so the
+    /// reader is never left inferring which of the two zeros they are holding.
+    ///
+    /// `barriered=` is the wiring's engagement number and appears only with the
+    /// census on, because it rides the hot path. `unbarriered=` is always
+    /// printed, is expected to be `0`, and a non-zero value means a reference
+    /// load skipped the barrier.
+    pub fn report() {
+        let (seen, degraded) = colored_word_counts();
+        let (barriered, unbarriered) = route_counts();
+        match snapshot() {
+            None => eprintln!(
+                "[JIT_REF_LOADS] per-site counts OFF (set CRATONVM_DBG_JIT_REF_LOADS=1) \
+                 unbarriered={unbarriered} colored_words_seen={seen} \
+                 colored_words_degraded={degraded}"
+            ),
+            Some(rows) => {
+                let mut line = String::from("[JIT_REF_LOADS]");
+                for (name, n) in rows {
+                    line.push_str(&format!(" {name}={n}"));
+                }
+                if let Some(b) = barriered {
+                    line.push_str(&format!(" barriered={b}"));
+                }
+                line.push_str(&format!(
+                    " unbarriered={unbarriered} colored_words_seen={seen} \
+                     colored_words_degraded={degraded}"
+                ));
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    /// [`report`], but silent on a run that has nothing to say: the per-site
+    /// census is off AND no colored word ever reached a helper.
+    ///
+    /// This is the shape an exit-path caller wants (`Once`-guarded, silent when
+    /// there is no news), matching `cratonvm_types::compact_value::
+    /// degradation_exit_summary`. Wiring request: `.agent-requests/A9-wiring.txt`.
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let (seen, _) = colored_word_counts();
+            let (_, unbarriered) = route_counts();
+            // `unbarriered != 0` is news even with the per-site census off: it
+            // names reference loads that did not go through the load barrier
+            // at all, which is the one thing this file cannot afford to report
+            // as silence.
+            if !enabled() && seen == 0 && unbarriered == 0 {
+                return;
+            }
+            report();
+        });
+    }
+}
+
+/// Per-site JIT reference-load counts, or `None` when the census is gated off.
+/// See [`ref_load_census::snapshot`] for why `None` and not a vector of zeros.
+pub fn jit_ref_load_census() -> Option<Vec<(&'static str, u64)>> {
+    ref_load_census::snapshot()
+}
+
+/// `(colored_words_seen, colored_words_degraded)` -- the two ungated tripwire
+/// counters. See [`ref_load_census::COLORED_WORDS_SEEN`].
+pub fn jit_colored_word_counts() -> (u64, u64) {
+    ref_load_census::colored_word_counts()
+}
+
+/// `(barriered, unbarriered)` reference-slot loads -- the wiring's engagement
+/// numbers.
+///
+/// `barriered` is `None` when the per-site census is gated off, for the reason
+/// [`ref_load_census::snapshot`] gives; `unbarriered` is always a real number
+/// and is expected to be `0`. See [`ref_load_census::note_route`].
+pub fn jit_ref_load_routes() -> (Option<u64>, u64) {
+    ref_load_census::route_counts()
+}
+
+/// Has the operator asked the JIT read helpers NOT to enforce the ZGC
+/// load-barrier invariant?
+///
+/// `CRATONVM_ZGC_NO_JIT_LOAD_BARRIER` is the kill switch for the one behaviour
+/// this file's ZGC arm has: the [`jit_ref_word_implausible`] tripwire. Set, a
+/// well-formed colored word is counted and degraded to null instead of
+/// panicking -- which is J1's silent heap corruption, deliberately re-armed so
+/// that a barrier bring-up run can get past a first colored word and collect a
+/// census instead of dying on it. Unset (the default) the tripwire panics,
+/// which is today's behaviour byte for byte.
+///
+/// It is A/B-able in one binary on purpose: the alternative -- two builds --
+/// is the cross-binary A/B this repo has repeatedly found is not an A/B.
+///
+/// Cached for the same reason [`compact_inline_dbg`] is: the read would
+/// otherwise sit on a path a bring-up run takes per reference load. Declared in
+/// `.agent-requests/A9-flags.txt`.
+#[cfg(feature = "zgc")]
+fn zgc_jit_load_barrier_suppressed() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_NO_JIT_LOAD_BARRIER").is_some()
+    })
+}
+
+/// Announce, once, that the kill switch above turned a live reference into
+/// `null`.
+///
+/// On stderr rather than through `tracing`, for the reason the compressed-oops
+/// refusal in `vm/src/vm/vm_init.rs` gives for its own stderr line: the
+/// degraded run looks identical to a clean one from the outside, and the
+/// operator has to be able to see which one they got. Once, because the
+/// per-event count is [`ref_load_census::COLORED_WORDS_DEGRADED`]'s job and a
+/// per-load print would bury it.
+#[cfg(feature = "zgc")]
+fn warn_once_jit_load_barrier_suppressed(raw: u64, site: &'static str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[cratonvm] CRATONVM_ZGC_NO_JIT_LOAD_BARRIER is set: the ZGC colored word \
+             {raw:#018x} that reached the JIT read helper `{site}` was DEGRADED TO NULL \
+             instead of tripping the missing-load-barrier panic. Compiled code has just \
+             been handed null for a live object (zgc-jit-load-barrier.md J1). Every \
+             further occurrence is counted silently in [JIT_REF_LOADS] \
+             colored_words_degraded. Unset the variable to restore the tripwire."
+        );
+    });
+}
+
+/// The single seam through which this file turns a raw heap reference SLOT into
+/// the `i64` compiled code expects -- and the one place a ZGC load barrier has
+/// to be installed.
+///
+/// # Why one seam and not a barrier per site
+///
+/// The `TODO(zgc)` this discharges was explicit that the JIT read helpers must
+/// "acquire the barrier by dispatching on the backend rather than by growing a
+/// ZGC special case per site", and it is right: seven hand-written colored-word
+/// tests are seven chances for the eighth reader to be missed, which is risk J1
+/// of `docs/feature-designs/zgc-jit-load-barrier.md` verbatim
+/// (`emit_load_string_value_ptr` was already missed once by exactly that class
+/// of gate). Sites A and B of that document's 2.5.1 table are the only two
+/// arms in this file that hold a SLOT when the plausibility filter runs, and
+/// both now come here.
+///
+/// # What is wired now, and what is not
+///
+/// The barrier call itself now EXISTS: `VmHeap::load_ref_slot_barriered`
+/// (`gc/src/vm_heap.rs`) takes the SLOT, dispatches on the backend inside
+/// `gc/`, and so keeps every ZGC detail there instead of growing the per-site
+/// ZGC special case the design forbids. Its `Generational` / `G1` arms and its
+/// unarmed `Zgc` arm are literally `read_ref_slot(slot)`; only an ARMED ZGC
+/// barrier delegates to `ZgcRealHeap::load_barrier_slot`, which owns the
+/// fast/slow path, the offset-0/null disambiguation and -- the part a fresh
+/// implementation gets wrong -- the 42-bit-offset-to-address conversion that
+/// `gc/src/zgc/relocate.rs` and `gc/src/zgc/mark.rs` both carry warnings about.
+///
+/// Both call sites are wired. Site B (`jit_getfield`'s compact-reference arm)
+/// always had a `&VmHeap`: that helper takes `vm_ptr` and binds
+/// `vm = &*(vm_ptr as *const SharedVm)`, so it passes `Some(&vm.mem.heap)`.
+/// Site A (`jit_aaload`) was the last gap -- declared `(array_ptr, index)` with
+/// no `vm_ptr`, so it had nothing to reach a heap through and could only pass
+/// `None`. On 2026-09-01 it gained a leading `vm_ptr`
+/// (`.agent-requests/B8-abi.txt`) and passes `Some(heap_from_vm(vm_ptr))`. The
+/// ABI change was affordable because no emitter calls `helpers.aaload`; the
+/// row's own comment in `jit-api/src/helpers_abi.rs` carries that argument.
+///
+/// So `heap` is `Some(..)` at every call site in this file, and
+/// [`ref_load_census::UNBARRIERED_LOADS`] is expected `0` for a STRONGER reason
+/// than before: there is no `None` route left to take, rather than one that
+/// nothing happens to reach. The `None` arm is kept anyway -- see that
+/// counter's own doc for why a future caller has to say so in its argument
+/// list rather than be given a global to reach for.
+///
+/// # Why `None` and not a cached heap handle
+///
+/// A thread-local (or process-global) `*const VmHeap`, installed from
+/// [`heap_from_vm`], would avoid the ABI change and cost one cached read on a
+/// path that already pays a census increment. It was rejected as a
+/// USE-AFTER-FREE, not on taste:
+///
+///  * This process creates and drops several `SharedVm`s on one thread --
+///    `native::jni::set_process_vm`'s own comment names "a test that builds a
+///    second `Vm` in-process" as an expected case -- and nothing inside this
+///    file can clear a cached handle at VM teardown. `jit_aaload` can be the
+///    first helper a thread runs after a new VM starts, so even a
+///    poison-on-mismatch rule never gets to observe the change in time.
+///    Reading a freed `VmHeap`'s enum discriminant on the GC read path is UB,
+///    and it would be UB introduced by a change whose entire claim is that it
+///    alters nothing.
+///  * Caching an `Arc<SharedVm>` would fix the lifetime and buy two new
+///    problems: it keeps a VM alive past its owner, which is exactly why
+///    `native::jni::PROCESS_VM` deliberately holds a `Weak`; and a
+///    `thread_local!` holding `Option<Arc<SharedVm>>` is one of the shapes
+///    `vm/src/lib.rs`'s teardown shim blames for the Windows
+///    `STATUS_ACCESS_VIOLATION` at test exit. Caching the `Weak` instead puts
+///    an `upgrade`/drop refcount round trip -- a contended atomic pair -- on
+///    the hottest reference read in the VM.
+///  * The safe resolvers that already exist are not affordable per load:
+///    `native::jni::process_vm_strict` takes a `parking_lot::Mutex`, runs a
+///    `Vec::retain` and upgrades a `Weak`, and answers `None` whenever more
+///    than one VM is live.
+///
+/// The `None` fallback is the raw read, and that is the point: it is not
+/// silently unbarriered. A colored word arriving through it still reaches the
+/// [`jit_decode_ref_word`] tripwire and panics naming the site, rather than
+/// being degraded to a null (risk J1). Missing the barrier fails LOUDLY.
+/// [`ref_load_census::UNBARRIERED_LOADS`] counts every load that took it --
+/// ungated, and expected `0`.
+///
+/// # ARENA MUTEX -- read this before arming the barrier
+///
+/// `ZgcRealHeap::load_barrier_slot` reaches the heap base through
+/// `ZMarkContext::heap_base()`, which takes `self.arena.lock()`. So an ARMED
+/// barrier takes the ZGC arena mutex ONCE PER REFERENCE LOAD. That is
+/// pre-existing inside `load_barrier_slot` and inert today, because nothing
+/// arms the barrier -- but wiring this seam is what puts it on the hot path,
+/// and it is a deadlock hazard for any future caller that is already holding
+/// that lock when a reference load happens. Whoever flips
+/// `RELOCATION_REQUESTED` should meet this before their first run rather than
+/// after: the base is a per-cycle constant and wants to be hoisted out of the
+/// lock, not taken 10^9 times.
+///
+/// Site A raises the stakes rather than adding a new hazard. `jit_aaload` is a
+/// reference-ARRAY element read -- the body of `for (Object o : arr)` -- so an
+/// armed barrier takes and releases that one mutex per loop iteration, on every
+/// mutator thread at once; and the deadlock arm is reachable from anything that
+/// walks references while already holding the arena (a relocation or marking
+/// helper that re-enters compiled code). Neither is an argument for leaving
+/// site A unbarriered: an unbarriered read under an ARMED barrier is a wrong
+/// ANSWER, while a slow correct one is recoverable. They are the argument for
+/// hoisting the base out of `heap_base()` BEFORE the first armed run.
+///
+/// # The precondition a caller must already satisfy for that to be legal
+///
+/// `z_load` takes `&AtomicU64`, which is a promise about the SLOT, not about
+/// the word: it must be an 8-byte-aligned, exactly-8-byte location that is
+/// valid for WRITES as well as reads, because the barrier's slow path
+/// self-heals it with a `compare_exchange`. Both current callers satisfy this
+/// only while compressed oops are off -- with `narrow_oops_enabled()` the slot
+/// is FOUR bytes ([`cratonvm_types::narrow_oop::read_ref_slot`] branches on
+/// exactly that) and viewing it as an `AtomicU64` would be unsound. ZGC plus
+/// compressed oops is already refused at VM init
+/// (`vm/src/vm/vm_init.rs`, the `narrow_oops` gate) -- and
+/// `load_ref_slot_barriered` now re-checks the width ITSELF, before the armed
+/// test, so a narrow unarmed run still takes the ordinary plain read and a
+/// narrow armed one refuses rather than truncating. It does not inherit the
+/// guarantee from this comment, which is what the `gc/` side was asked for.
+///
+/// # HOW WE KNOW A DEFAULT RUN IS UNCHANGED
+///
+/// Not "measured equivalent" -- the value returned is the same EXPRESSION.
+/// `load_ref_slot_barriered` is written as an early return on the one arm that
+/// differs, and that arm is unreachable: `vm/src/vm/vm_init.rs` pins `const
+/// RELOCATION_REQUESTED: bool = false`; `ZgcRealHeap::set_barrier_color`, the
+/// sole writer of the colored state, has no non-test caller; and
+/// `barrier_good_mask` never leaves `vaddr::Z_REMAPPED`, so
+/// `load_barrier_armed()` is false for the process lifetime. Every reachable
+/// configuration -- `Generational`, `G1`, `--no-default-features`, and ZGC as
+/// shipped -- therefore evaluates `read_ref_slot(slot)`, exactly as this
+/// function did before. What is added is two relaxed `AtomicBool` loads and
+/// two not-taken branches on site B, both behind `#[inline]`, which is the
+/// price `load_ref_slot_barriered`'s own doc comment quotes for itself.
+///
+/// # Safety
+///
+/// `slot` must point at a live reference slot of the current width
+/// ([`cratonvm_types::narrow_oop::ref_field_size`]) inside a live object -- the
+/// same contract as `read_ref_slot`, which the `None` arm is a thin wrapper
+/// over. When `heap` is `Some`, it must be the heap that OWNS that slot:
+/// passing another VM's heap would, once the barrier is armed, forward the
+/// reference through the wrong relocation table and return a pointer into the
+/// wrong arena. Both call sites take it from the `SharedVm` they were handed,
+/// which is the only way to satisfy that without a global.
+#[inline(always)]
+unsafe fn jit_load_ref_slot(
+    slot: *const u8,
+    heap: Option<&VmHeap>,
+    census_slot: usize,
+    site: &'static str,
+) -> i64 {
+    ref_load_census::note_route(census_slot, heap.is_some());
+    let raw = match heap {
+        // THE BARRIER. Backend dispatch lives inside `gc/`; see this
+        // function's doc comment for why it cannot live here.
+        Some(h) => h.load_ref_slot_barriered(slot),
+        // No `&VmHeap` reachable at this call site (site A only). Raw read --
+        // and the tripwire below is what stops that being silent.
+        None => read_ref_slot(slot),
+    };
+    // The plausibility test runs on the UNMASKED address the barrier returned,
+    // never on a colored word. That ordering is the whole point: filtering the
+    // colored word first is what silently nulls a live reference (risk J1), and
+    // `plausible_heap_pointer` is deliberately NOT weakened to admit one --
+    // doing so would leave the tripwire unable to fire, which is worse than
+    // the state this replaces.
+    jit_decode_ref_word(raw, site)
+}
+
+
+// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm
+// pointer -- the universal JIT-helper caller contract, the same one jit_aastore
+// and jit_getfield state. It is read only on the successful element-read path:
+// the null/implausible-array arm and the out-of-bounds arm both return before
+// `heap_from_vm` is reached, which is what lets the null-array unit test below
+// call this helper with a vm_ptr of 0. array_ptr must be 0 (null) or a
+// valid heap pointer to a reference array object. Null triggers a pending NPE +
+// `i64::MIN` deopt sentinel; out-of-bounds is handled gracefully by the bounds
+// check below.
+//
+// vm_ptr is FIRST, matching `jit_aastore(vm_ptr, array_ptr, index, val)` and
+// `jit_getfield(vm_ptr, obj_ptr, field_index)`: every VM-touching helper in the
+// table puts the VM in arg0, and a helper that put it last would be exactly the
+// asymmetry `accessor_name_matches_field` exists to catch the consequences of.
+// The C declaration lives in `jit-api/src/helpers_abi.rs`; the two halves are
+// pinned together by `let _: HelperFnAaload = jit_aaload;` further down this
+// file, which is why this change could not land half done.
+pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -6247,17 +7193,54 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size());
     // Degrade an implausible element reference to null instead of returning bits
-    // the JIT will deref → SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
+    // the JIT will deref -> SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
     // `read_prim_element`'s Reference arm; valid refs (or 0=null) pass through.
     //
-    // TODO(zgc): this is a raw reference-array element load — Category A in
-    // `docs/feature-designs/zgc-jit-load-barrier.md` §2.3. Under `VmHeap::Zgc`
-    // the word must go through `cratonvm_gc::zgc::barrier::z_load`
-    // (gc/src/zgc/barrier.rs, fn z_load) BEFORE any plausibility test, and the test
-    // must then be applied to the barrier's unmasked address, not to the
-    // colored word. `jit_decode_ref_word` fails loudly meanwhile.
-    let raw = read_ref_slot(elem_ptr);
-    jit_decode_ref_word(raw, "jit_aaload/element")
+    // Site A ("raw reference-array element load", Category A of
+    // `docs/feature-designs/zgc-jit-load-barrier.md` 2.3, and site A of its
+    // 2.5.1 table). This is one of only TWO arms in this file that still hold
+    // the SLOT when the plausibility filter runs, so it is one of the two that
+    // can take the barrier where it stands. It goes through
+    // [`jit_load_ref_slot`], the file's single seam, rather than through a
+    // ZGC test of its own.
+    //
+    // BARRIERED as of 2026-09-01. This was the LAST unbarriered slot-holding
+    // reference read in the file. The seam's barrier call needs a `&VmHeap`;
+    // this helper used to receive no `vm_ptr`, so it had nothing to reach one
+    // through and passed `None`. A cached thread-local or process-global heap
+    // handle was considered and rejected as a use-after-free -- the argument is
+    // on [`jit_load_ref_slot`] -- so the gap was closed the way
+    // `.agent-requests/B8-abi.txt` wrote out: a leading `vm_ptr`, exactly as
+    // `jit_aastore` already has one, plus ONE line in
+    // `jit-api/src/helpers_abi.rs`. It cost nothing at any emitter, because no
+    // emitter calls `helpers.aaload` -- `aaload` is lowered inline by
+    // `x64::arrays::emit_ref_aload_regs`, and `grep -rn "helpers\.aaload"
+    // jit/src` is empty -- so there was no emitted `call` whose argument
+    // registers had to be rearranged.
+    //
+    // `heap_from_vm(vm_ptr)` rather than an open-coded
+    // `&(*(vm_ptr as *const SharedVm)).mem.heap`: it is the same deref plus the
+    // `debug_assert!(vm_ptr != 0)` every other VM-touching helper in this file
+    // already relies on, so the caller contract stays stated in ONE place. It
+    // is evaluated HERE, after both guard arms, which is why the `vm_ptr == 0`
+    // the null-array unit test passes is never dereferenced. And the heap it yields is by
+    // construction the one that OWNS `elem_ptr` -- `array_ptr` was handed to us
+    // by compiled code running against this same VM -- which is the seam's
+    // `Some(..)` contract.
+    //
+    // The tripwire behind this call is NOT retired by the barrier; it is what
+    // proves no site was missed. A colored word reaching `jit_decode_ref_word`
+    // still panics naming the site rather than being degraded to null (risk
+    // J1), and `plausible_heap_pointer` is still not weakened to admit one. The
+    // panic simply became UNREACHABLE from here, because the word the seam now
+    // hands it is an unmasked address -- and the plausibility test runs on that
+    // unmasked address, never on the colored word.
+    jit_load_ref_slot(
+        elem_ptr,
+        Some(heap_from_vm(vm_ptr)),
+        ref_load_census::AALOAD_ELEMENT,
+        "jit_aaload/element",
+    )
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -6834,9 +7817,24 @@ fn compiled_frames_above() -> String {
         return "none: code-range table empty".to_string();
     }
     let mut rbp: usize;
+    // The frame-pointer register, by name. x86-64 calls it RBP; AAPCS64 calls
+    // it X29 and the chain has the same shape (saved FP at `[FP]`, return
+    // address at `[FP+8]`), so the walk below is unchanged. Any other
+    // architecture has no name for it here and the diagnostic says so rather
+    // than walking a garbage value.
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: reads a register. No memory is accessed by the asm itself.
     unsafe {
         std::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads a register. No memory is accessed by the asm itself.
+    unsafe {
+        std::arch::asm!("mov {}, x29", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return "none: no frame-pointer register known for this architecture".to_string();
     }
     let mut out: Vec<String> = Vec::new();
     let mut depth = 0usize;
@@ -7406,6 +8404,77 @@ pub fn jit_getfield_primitive_in_ref_slot() -> u64 {
     JIT_GETFIELD_PRIMITIVE_IN_REF_SLOT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Corrupt legacy `Value` cells this crate has decoded at a JIT helper door.
+///
+/// Also increments `cratonvm_types::cell_census`, so the process-wide total
+/// stays right; kept separately because "a JIT helper read one" and "a
+/// collector read one" want different searches.
+pub static JIT_CORRUPT_VALUE_CELLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`JIT_CORRUPT_VALUE_CELLS`].
+pub fn jit_corrupt_value_cells() -> u64 {
+    JIT_CORRUPT_VALUE_CELLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read one legacy 16-byte `Value` cell with its discriminant SCREENED — the
+/// VM-crate counterpart of `gc::heap::read_value_cell_checked`.
+///
+/// # Why a raw `read_value_atomic` is not acceptable here
+///
+/// `read_value_atomic` loads two words and `transmute`s them into a `Value`
+/// with no validation. If those 16 bytes were not a `Value` — array payload
+/// read through the flat-object path, or a punned/torn write — the result is an
+/// enum holding an out-of-range discriminant, which is UB *the instant it
+/// exists*, before anything looks at it.
+///
+/// What that UB costs is neither hypothetical nor a fault at the read. A
+/// `match` on a Rust enum needs no default arm and therefore gets **no bounds
+/// check**: LLVM indexes its jump table directly — `movsxd rax, [r10 + rax*4]`
+/// — because a valid discriminant is in range by construction. The garbage tag
+/// becomes the index. That is the decoded faulting instruction of the eight
+/// hibernate-orm JSON/XML `hs_err` files, and it sits in
+/// `gc::heap::coerce_field_value_for_slot` — one frame ABOVE the reader that
+/// built the bad `Value`, which is why auditing read sites for jump tables
+/// found nothing at the read sites themselves. See
+/// `internal/fixed-bugs/hib-orm-json-xml-function-tests-segfault-g1-zgc-FIXED-20260901.md` §3.
+///
+/// Screening at the read turns that into `Value::Object(None)` plus a counted,
+/// rate-limited report naming the slot and both raw words.
+///
+/// # Safety
+/// `ptr` must name 16 readable, 8-byte-aligned bytes inside a live allocation.
+#[inline]
+unsafe fn jit_read_value_cell_checked(ptr: *const Value, site: &'static str) -> Value {
+    match cratonvm_types::read_value_checked_atomic(ptr) {
+        Some(v) => v,
+        None => {
+            JIT_CORRUPT_VALUE_CELLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = cratonvm_types::cell_census::note_decoded();
+            if n < 32 {
+                cratonvm_types::cell_census::note_reported();
+                // SAFETY: caller contract — 16 readable, 8-byte-aligned bytes.
+                // Per-word atomic so the diagnostic cannot tear against a
+                // concurrent plain writer.
+                let raw0 = (*(ptr as *const std::sync::atomic::AtomicU64))
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let raw1 = (*((ptr as *const u8).add(8) as *const std::sync::atomic::AtomicU64))
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: "cratonvm::jit::guard",
+                    slot = ?ptr,
+                    raw0 = format!("{raw0:#018x}"),
+                    raw1 = format!("{raw1:#018x}"),
+                    "{site}: corrupt Value cell (out-of-range discriminant) — \
+                     returning null instead of a UB-on-match Value. Heap \
+                     reference-integrity defect (see HIB-CV-32).",
+                );
+            }
+            Value::Object(None)
+        }
+    }
+}
+
 /// Calls that arrived with `GETFIELD_RECEIVER_PROVEN_OOP` set — the engagement
 /// counter for the trusted-receiver arm, printed beside the total so "adopted"
 /// and "helped" stay separable.
@@ -7517,19 +8586,45 @@ unsafe fn jit_getfield_impl(
         if storage.is_reference() {
             // Degrade an implausible reference (stale/garbage from a GC
             // root-coverage gap) to null instead of handing the JIT bits it
-            // will later deref → SIGSEGV. Mirrors `read_prim_element`'s
+            // will later deref -> SIGSEGV. Mirrors `read_prim_element`'s
             // Reference arm so interpreter and JIT decode a stale ref slot
             // identically. Valid refs (or 0=null) always pass through.
             //
-            // TODO(zgc): this is THE compact-reference field load — the
+            // TODO(zgc) -- site B, THE compact-reference field load: the
             // helper-arm site `docs/feature-designs/zgc-jit-load-barrier.md`
-            // §2.5 names, and the fallback every Category-A inline arm takes
-            // once `zgc_blocks_inline_ref_loads()` is on. Under `VmHeap::Zgc`
-            // the barrier (`cratonvm_gc::zgc::barrier::z_load`,
-            // gc/src/zgc/barrier.rs:994) goes between `read_ref_slot` and the
-            // plausibility test, which then asks about the unmasked address.
-            let raw = read_ref_slot(ptr);
-            return jit_decode_ref_word(raw, "jit_getfield/compact-ref");
+            // 2.5 names, and the fallback every Category-A inline arm takes
+            // once `zgc_read_barrier_blocks_inline_fields` is on. Like site A
+            // it still holds the SLOT here, so the barrier belongs between the
+            // slot read and the plausibility test, with the test then asking
+            // about the UNMASKED address.
+            //
+            // DISCHARGED for this site. It goes through [`jit_load_ref_slot`],
+            // the file's single seam, WITH the heap: this helper takes
+            // `vm_ptr` and `vm` is already bound above, so the seam calls
+            // `VmHeap::load_ref_slot_barriered` and the plausibility test then
+            // runs on the address that call returns rather than on the slot
+            // word. `&vm.mem.heap` reuses the reference this function has
+            // already dereferenced instead of adding a second raw deref of
+            // `vm_ptr`, and it is by construction the heap that OWNS `ptr`,
+            // which is the seam's `Some(..)` contract. Site A does the same
+            // since 2026-09-01, via `heap_from_vm(vm_ptr)`; it had no `vm_ptr`
+            // at all until then, which is what made this arm the only barriered
+            // slot-holding read in the file for a day.
+            //
+            // This is the hottest reference read in the VM, which is why the
+            // seam is `#[inline(always)]` and why its census increment is
+            // behind a cached gate -- one UNGATED relaxed increment on this
+            // path has already been measured at a quarter of the read (see
+            // `getfield_census_counting_enabled`). The new route counter
+            // shares that one cached test rather than adding a second, and the
+            // barrier itself costs two relaxed `AtomicBool` loads and two
+            // not-taken branches while nothing arms it.
+            return jit_load_ref_slot(
+                ptr,
+                Some(&vm.mem.heap),
+                ref_load_census::GETFIELD_COMPACT_REF,
+                "jit_getfield/compact-ref",
+            );
         }
         // PLAIN-SLOT TEARING FIX (2026-07-06): was `std::ptr::read(ptr as
         // *const Value)` -- a non-atomic 16-byte copy that can tear against a
@@ -7586,7 +8681,12 @@ unsafe fn jit_getfield_impl(
     // PLAIN-SLOT TEARING FIX (2026-07-06): see the matching note on the
     // compact-layout branch above -- was `std::ptr::read(ptr as *const
     // Value)`, non-atomic, tearable against a concurrent plain putfield.
-    let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // DISCRIMINANT-SCREENED, and the `match` below is why. `read_value_atomic`
+    // would `transmute` these 16 bytes into a `Value` unconditionally; the
+    // multi-arm `match val` a hundred lines down then indexes a jump table by
+    // the tag with no bounds check. See `jit_read_value_cell_checked`, and
+    // `coerce_field_value_for_slot` for the crash that shape produced.
+    let val: Value = jit_read_value_cell_checked(ptr as *const Value, "jit_getfield/legacy-slot");
     // A REFERENCE load whose slot does not hold a reference.
     //
     // The legacy 16-byte slot carries its own discriminant, so unlike the
@@ -7784,17 +8884,39 @@ unsafe fn jit_getfield_impl(
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
         Value::Object(Some(r)) => {
-            // Live filter, unlike the compact-layout twin above:
-            // `read_value_atomic` (types/src/value.rs:1570) is a raw
-            // `transmute` of two relaxed word loads and validates nothing, so
-            // this `ObjectRef` can hold arbitrary bits straight off the slot.
+            // Live filter, unlike the compact-layout twin above. The read is
+            // now discriminant-screened (`jit_read_value_cell_checked`), which
+            // rules out an invalid TAG — it says nothing about the payload, so
+            // this `ObjectRef` can still hold arbitrary bits straight off the
+            // slot and the plausibility gate below is still load-bearing.
             //
-            // TODO(zgc): legacy 16-byte reference field. Under `VmHeap::Zgc`
-            // the barrier belongs on the slot read, i.e. before the `Value` is
-            // reconstituted — a colored word must never be fabricated into an
-            // `ObjectRef` (`cratonvm_gc::zgc::vaddr::debug_assert_plain_word`
-            // is the tripwire for exactly that). Entry point:
-            // `cratonvm_gc::zgc::barrier::z_load`, gc/src/zgc/barrier.rs:994.
+            // TODO(zgc) -- site D of `docs/feature-designs/zgc-jit-load-barrier.md`
+            // 2.5.1, and NOT a barrier site. Written out precisely because the
+            // previous wording ("the barrier belongs on the slot read") named
+            // the destination without naming what stops it being taken here.
+            //
+            // The missing fact is a SLOT. The word below is `r.as_ptr()` off an
+            // `ObjectRef` that `read_value_atomic` (types/src/value.rs) already
+            // fabricated, several lines upstream, by transmuting two relaxed
+            // word loads. `cratonvm_gc::zgc::barrier::z_load` needs
+            // `&AtomicU64` -- the slot itself, because its slow path CAS-heals
+            // it -- and there is nothing here to hand it. Worse, building an
+            // `ObjectRef` out of a colored word is itself the violation
+            // `cratonvm_gc::zgc::vaddr::debug_assert_plain_word` exists to
+            // catch, so on a colored word the damage is done before control
+            // arrives.
+            //
+            // What would have to change, and where: `read_value_atomic`'s
+            // reference arm must take the barrier at ITS slot read, before the
+            // `Value` is reconstituted. That is `types/` (or a `gc/`-side
+            // accessor it delegates to), not this file -- and it is shared with
+            // the interpreter, which is the point: one barriered path instead of
+            // two that can disagree about when a slot was healed.
+            //
+            // Counted anyway, so "this arm ran N times" stays separable from
+            // "this arm never runs". The count is of an UNBARRIERED read;
+            // `jit_decode_ref_word` still fails loudly on a colored word.
+            ref_load_census::note(ref_load_census::GETFIELD_LEGACY_VALUE);
             let raw = r.as_ptr() as u64;
             jit_decode_ref_word(raw, "jit_getfield/legacy-value-slot")
         }
@@ -7958,7 +9080,10 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
         let existing = if let Some(storage) = storage {
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed)
         } else {
-            cratonvm_types::read_value_atomic(ptr as *const Value)
+            // Screened even though this is diagnostic-only: `{:?}` on a `Value`
+            // is itself a `match` over the discriminant, so an unscreened read
+            // here would crash the very run that armed the trace.
+            jit_read_value_cell_checked(ptr as *const Value, "jit_putfield_int/pfi-trace")
         };
         let cid_off = obj_ptr as *const u8;
         let cid: u32 = std::ptr::read(cid_off as *const u32);
@@ -8208,7 +9333,11 @@ pub unsafe extern "C" fn jit_putfield_object(
     // Atomic per-word read/write: the slot is read concurrently by the GC
     // marker and (possibly) written by another mutator thread; pair both ends
     // through the atomic helpers so the access is well-defined and tear-free.
-    let old_value: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+    // Screened: a corrupt cell decodes to `Object(None)` and is skipped by the
+    // `if let` below, rather than becoming an invalid `Value` and then an
+    // `ObjectRef` pushed onto the mark queue.
+    let old_value: Value =
+        jit_read_value_cell_checked(ptr as *const Value, "jit_putfield_ref/satb-pre");
     if let Value::Object(Some(_)) = old_value {
         let heap = heap_from_vm(vm_ptr);
         heap.satb_barrier(old_value);
@@ -8217,6 +9346,66 @@ pub unsafe extern "C" fn jit_putfield_object(
     if val != 0 {
         let heap = heap_from_vm(vm_ptr);
         heap.write_barrier(obj_ref, value);
+    }
+}
+
+/// F-08 — G1's post-write barrier, called from the slow arm of the JIT's
+/// INLINE G1 barrier.
+///
+/// # What the caller has already proved, and what it has not
+///
+/// The inline sequence reaches this call only when both of its filters have
+/// failed to prove there is nothing to remember: `val_ptr` is non-null, and
+/// `obj_ptr` and `val_ptr` do not lie in the same G1 region. Those are exactly
+/// the two conditions `G1Collector::post_write_barrier_rset` itself tests
+/// first, so the inline arm is eliding calls the callee would have returned
+/// from — not calls it would have acted on. Everything else, including an
+/// address outside G1's arena and a destination region that is Free, is left
+/// to the callee, which already handles all of it.
+///
+/// # Why this is not [`jit_write_barrier`]
+///
+/// That helper routes through `VmHeap::write_barrier`, which carries a
+/// `debug_assert!` requiring an SATB pre-barrier on the same thread whenever a
+/// mark cycle is active. The assertion is correct for a general store and
+/// wrong for this caller: the inline arm stores only into a field whose OLD
+/// value is NULL (that is the arm's own precondition, tested inline and
+/// bailing to `jit_putfield_object` otherwise), and a null old value is exactly
+/// the case `satb_pre_barrier` returns from immediately. No pre-barrier fires,
+/// none is owed, and the debug assertion would fire on a correct program.
+/// Weakening it would remove the check from every other caller; a separate
+/// entry point says the thing once, here.
+///
+/// It also skips the generational card-marking dispatch entirely, going
+/// straight to G1's remembered-set barrier, which is the only collector this
+/// helper is ever wired for by the emitter (`g1_inline_barrier_available`
+/// requires a published `JIT_G1_BARRIER` table, and only `G1Collector`
+/// publishes one). A non-G1 heap reaching here is a no-op rather than a
+/// misfiled card: the match below has one arm.
+///
+/// # Safety
+///
+/// Called from JIT-compiled code. `vm_ptr` must be a valid `SharedVm` pointer;
+/// `obj_ptr` and `val_ptr` are raw heap words and are screened here exactly as
+/// [`jit_write_barrier`] screens them, because a stale or garbage receiver must
+/// take the null path rather than be dereferenced.
+pub unsafe extern "C" fn jit_g1_post_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache,
+    // exactly as `jit_write_barrier` does. Omitting it would leave a stale
+    // frame census behind a call that can reach the collector.
+    crate::jit::conservative_roots::note_jit_boundary();
+    if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        return;
+    }
+    if val_ptr == 0 {
+        return;
+    }
+    let heap = heap_from_vm(vm_ptr);
+    if let cratonvm_gc::vm_heap::VmHeap::G1(g1) = heap {
+        g1.post_write_barrier_rset(
+            ObjectRef::from_raw(obj_ptr as usize as *mut u8),
+            ObjectRef::from_raw(val_ptr as usize as *mut u8),
+        );
     }
 }
 
@@ -8746,11 +9935,25 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
             let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
             return match val {
                 Value::Object(Some(r)) => {
-                    // TODO(zgc): `System.in` is an ordinary static reference
-                    // slot; see the general `getstatic` arm below for the
-                    // barrier placement. `zgc-jit-load-barrier.md` §8 Q5 flags
-                    // statics as the one shape that is not atomic today, so
-                    // this slot may need the non-healing barrier variant.
+                    // TODO(zgc) -- site E of
+                    // `docs/feature-designs/zgc-jit-load-barrier.md` 2.5.1, and
+                    // NOT a barrier site, for the same structural reason as
+                    // site D: `crate::vm::get_static_shared` has already turned
+                    // the static slot into a `Value`, so this arm holds an
+                    // `ObjectRef` and not an `&AtomicU64`.
+                    //
+                    // Where it belongs: inside `get_static_shared`
+                    // (`vm/src/vm/vm_object.rs`), which is the read the
+                    // interpreter takes too -- so barriering there merges the
+                    // two paths instead of duplicating one.
+                    //
+                    // One extra hazard this arm carries that D does not: 8 Q5
+                    // of that document flags statics as the one slot shape that
+                    // is not atomic today, so a static may not be CAS-healable
+                    // and may need the non-healing barrier variant. That is a
+                    // question for the `get_static_shared` change, not for this
+                    // call site.
+                    ref_load_census::note(ref_load_census::GETSTATIC_SYSTEM_IN);
                     let raw = r.as_ptr() as u64;
                     jit_decode_ref_word(raw, "jit_getstatic/System.in")
                 }
@@ -8769,14 +9972,19 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
         Value::Object(Some(r)) => {
-            // TODO(zgc): the general `getstatic` reference arm. Under
-            // `VmHeap::Zgc` the barrier belongs inside the statics read
-            // (`crate::vm::get_static_shared`) so the interpreter and the JIT
-            // share one barriered path, not here where the `ObjectRef` has
-            // already been built. Entry point:
-            // `cratonvm_gc::zgc::barrier::z_load`, gc/src/zgc/barrier.rs:994.
-            // Open question `zgc-jit-load-barrier.md` §8 Q5: a static slot is
-            // not atomic today, so it may not be CAS-healable.
+            // TODO(zgc) -- site F of
+            // `docs/feature-designs/zgc-jit-load-barrier.md` 2.5.1, and NOT a
+            // barrier site. Identical in shape to site E above: the
+            // `ObjectRef` was built by `crate::vm::get_static_shared`, so this
+            // arm has a word and no slot, and the barrier belongs inside that
+            // function (`vm/src/vm/vm_object.rs`) where the interpreter reads
+            // the same statics. 8 Q5's non-atomic-static caveat applies here
+            // too.
+            //
+            // Counted so that "the general getstatic object arm ran" is
+            // distinguishable from "only the System.in intercept ran" -- the
+            // two arms have different remedies and the same silence.
+            ref_load_census::note(ref_load_census::GETSTATIC_OBJECT);
             let raw = r.as_ptr() as u64;
             jit_decode_ref_word(raw, "jit_getstatic/object")
         }
@@ -8811,9 +10019,38 @@ pub mod gs_prof {
     }
 
     #[inline]
+    #[cfg(target_arch = "x86_64")]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// The same counter off x86-64, where `_rdtsc` does not exist.
+    ///
+    /// AArch64's equivalent is the virtual counter `CNTVCT_EL0`, unprivileged
+    /// under Linux by default. It ticks at a fixed frequency rather than the
+    /// core clock, so these numbers are NOT comparable across architectures --
+    /// which is fine, because every consumer uses them as deltas within one
+    /// process. Anything else falls back to the monotonic clock so the counters
+    /// keep working rather than the crate refusing to build.
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cnt: u64;
+            // SAFETY: CNTVCT_EL0 is a read-only counter, unprivileged on Linux.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+            cnt
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        }
     }
 
     pub struct CycGuard<'a> {
@@ -12292,6 +13529,281 @@ fn loader_faithful_static_owner(
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // with known signatures matching the compiled method's calling convention.
 #[allow(clippy::too_many_arguments)]
+/// Consecutive declines after which a compiled call site stops consulting
+/// the offload hook.
+///
+/// The hook is not free: a decline costs ~0.5 us, against ~10 ns for the
+/// compiled call it is standing in front of. A site whose arrays are
+/// always below `--gpu-min-work` would pay that forever, which would
+/// trade the 40x this whole change removes for a new one on the kernel
+/// call itself.
+///
+/// Shares `CRATONVM_GPU_MIN_WORK_GIVEUP` with the interpreter's
+/// per-site promotion, because it is the same policy question about the
+/// same kind of site. `0` never retires. Unlike the interpreter's
+/// version this needs no pc-keying caveat: a `JitInvokeInfo` IS one call
+/// site, so retiring one cannot deoptimise its siblings.
+#[cfg(feature = "gpu-offload")]
+fn compiled_offload_giveup_after() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_MIN_WORK_GIVEUP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(256)
+    })
+}
+
+/// What one compiled call site is, as far as offload is concerned.
+///
+/// Keyed by `JitInvokeInfo` address, which IS the site, so a decision
+/// here cannot leak to another call of the same method elsewhere.
+#[cfg(feature = "gpu-offload")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompiledOffloadSite {
+    /// Not a kernel call. The overwhelming majority, and the reason this
+    /// is resolved ONCE per site rather than per call.
+    NotKernel,
+    /// A kernel call that has declined `n` times in a row.
+    Active(u32),
+    /// Declined past the cap; the hook is never consulted here again.
+    Retired,
+}
+
+/// Per-site offload state.
+///
+/// AUDIT 2026-09-04. This started as a name lookup on every compiled
+/// dispatch -- `offload_hook::is_kernel(class, method, descriptor)`,
+/// which allocates three `Box<str>` to build its key. Measured on
+/// `GpuHookOverheadBench`, that put `small_ns_per_call` at **214 ns**
+/// against 13.8 for the same loop without `--gpu`: the string work, not
+/// the hook, and paid by every compiled static call in the program.
+///
+/// The name lookup now happens once, the first time a site is seen, and
+/// every later call is one `usize` hash. The retirement streak lives in
+/// the same entry, so a retired site costs that one lookup and nothing
+/// else.
+#[cfg(feature = "gpu-offload")]
+fn compiled_offload_sites(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<usize, CompiledOffloadSite>> {
+    static T: std::sync::OnceLock<
+        parking_lot::RwLock<rustc_hash::FxHashMap<usize, CompiledOffloadSite>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Decode the JIT argument slots of a STATIC call into `Value`s.
+///
+/// One slot per declared parameter, including `long`/`double` -- the JIT
+/// flattens its outgoing argument array rather than using JVM slot
+/// widths, which is the same assumption `forward_jit_reference_args`
+/// makes when it walks this descriptor.
+///
+/// `None` on any descriptor this cannot read exactly. Guessing would
+/// hand the marshaller an argument list that does not match the kernel
+/// signature, and the failure would be a wrong ANSWER on the device
+/// rather than a refusal.
+#[cfg(feature = "gpu-offload")]
+///
+/// # SAFETY
+///
+/// A non-zero reference slot is treated as a live heap pointer. That is
+/// the same contract `forward_jit_reference_args` runs under one line
+/// earlier in the caller, and these are the arguments it just forwarded.
+unsafe fn decode_static_args(
+    descriptor: &str,
+    args: &[i64],
+) -> Option<Vec<cratonvm_types::Value>> {
+    use cratonvm_types::{ObjectRef, Value};
+    let bytes = descriptor.as_bytes();
+    let mut p = bytes.iter().position(|&b| b == b'(')? + 1;
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0usize;
+    while p < bytes.len() && bytes[p] != b')' {
+        let raw = *args.get(i)?;
+        let v = match bytes[p] {
+            b'I' | b'Z' | b'B' | b'S' | b'C' => {
+                p += 1;
+                Value::Int(raw as i32)
+            }
+            b'J' => {
+                p += 1;
+                Value::Long(raw)
+            }
+            b'F' => {
+                p += 1;
+                Value::Float(f32::from_bits(raw as u32))
+            }
+            b'D' => {
+                p += 1;
+                Value::Double(f64::from_bits(raw as u64))
+            }
+            b'L' => {
+                while p < bytes.len() && bytes[p] != b';' {
+                    p += 1;
+                }
+                p = p.checked_add(1)?;
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(raw as *mut u8)))
+                }
+            }
+            b'[' => {
+                while p < bytes.len() && bytes[p] == b'[' {
+                    p += 1;
+                }
+                if p < bytes.len() && bytes[p] == b'L' {
+                    while p < bytes.len() && bytes[p] != b';' {
+                        p += 1;
+                    }
+                }
+                p = p.checked_add(1)?;
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(raw as *mut u8)))
+                }
+            }
+            _ => return None,
+        };
+        out.push(v);
+        i += 1;
+    }
+    // Every declared parameter consumed exactly one slot, and there were
+    // exactly that many. A mismatch means this walk and the JIT disagree
+    // about the argument layout, which is not something to offload on.
+    if i != args.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Try to run this compiled `invokestatic` on the GPU.
+///
+/// `Some(ret)` when the device ran it and `ret` is what the compiled
+/// caller should receive; `None` to fall through to the ordinary
+/// dispatch below, which is always safe -- `try_dispatch` leaves the
+/// operand stack and locals untouched on every refusal and on every
+/// failure.
+///
+/// # SAFETY
+///
+/// `info` and `args` are the dispatch helper's own, already validated
+/// and GC-forwarded. The thread borrow is the standard `jit_thread_mut`
+/// scoped one.
+#[cfg(feature = "gpu-offload")]
+unsafe fn try_compiled_offload(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    site: usize,
+    args: &[i64],
+) -> Option<i64> {
+    use crate::runtime::offload::DispatchOutcome;
+    use cratonvm_types::Value;
+
+    let cap = compiled_offload_giveup_after();
+
+    // One `usize` hash on the hot path. The name lookup behind
+    // `is_kernel` runs once per site, on the miss.
+    let state = {
+        let known = compiled_offload_sites().read().get(&site).copied();
+        match known {
+            Some(st) => st,
+            None => {
+                let st = if cratonvm_jit::offload_hook::is_kernel(
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                ) {
+                    CompiledOffloadSite::Active(0)
+                } else {
+                    CompiledOffloadSite::NotKernel
+                };
+                compiled_offload_sites().write().insert(site, st);
+                st
+            }
+        }
+    };
+    match state {
+        CompiledOffloadSite::NotKernel | CompiledOffloadSite::Retired => return None,
+        CompiledOffloadSite::Active(_) => {}
+    }
+
+    cratonvm_types::gpu_compiled_offload_census::note_considered();
+
+    let Some(values) = (unsafe { decode_static_args(info.descriptor, args) }) else {
+        cratonvm_types::gpu_compiled_offload_census::note_undecodable();
+        return None;
+    };
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        cratonvm_types::gpu_compiled_offload_census::note_undecodable();
+        return None;
+    };
+
+    // `frame_idx` reaches only a `tracing::debug!` inside `try_dispatch`,
+    // and `tracing` is built with `max_level_info`, so it is compiled out
+    // of every release binary. There is no compiled frame index to give.
+    let outcome = crate::runtime::offload::try_dispatch(
+        vm,
+        thread,
+        0,
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+        &values,
+    );
+    let Ok(outcome) = outcome else {
+        cratonvm_types::gpu_compiled_offload_census::note_undecodable();
+        return None;
+    };
+
+    match outcome {
+        DispatchOutcome::Handled => {
+            cratonvm_types::gpu_compiled_offload_census::note_offloaded();
+            compiled_offload_sites()
+                .write()
+                .insert(site, CompiledOffloadSite::Active(0));
+            // A `)V` kernel: the results reached Java through the D2H
+            // writeback into the output array, and the caller expects
+            // nothing on its operand stack.
+            Some(0)
+        }
+        DispatchOutcome::HandledWithValue(v) => {
+            cratonvm_types::gpu_compiled_offload_census::note_offloaded();
+            compiled_offload_sites()
+                .write()
+                .insert(site, CompiledOffloadSite::Active(0));
+            match v {
+                Value::Int(i) => Some(i as i64),
+                Value::Long(l) => Some(l),
+                // Only `)I`/`)J` reductions are transparently dispatched,
+                // so anything else here means the dispatcher and this
+                // decode disagree. Fall through rather than invent a
+                // return value.
+                _ => None,
+            }
+        }
+        _ => {
+            cratonvm_types::gpu_compiled_offload_census::note_declined();
+            if cap > 0 {
+                let CompiledOffloadSite::Active(n) = state else {
+                    return None;
+                };
+                let n = n.saturating_add(1);
+                let next = if n > cap {
+                    cratonvm_types::gpu_compiled_offload_census::note_site_retired();
+                    CompiledOffloadSite::Retired
+                } else {
+                    CompiledOffloadSite::Active(n)
+                };
+                compiled_offload_sites().write().insert(site, next);
+            }
+            None
+        }
+    }
+}
+
 pub unsafe extern "C" fn jit_invoke_dispatch(
     vm_ptr: i64,
     info_ptr: i64,
@@ -12411,6 +13923,21 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // not receive a stale byte-array/object argument after a moving GC.
     let forwarded_args = forward_jit_reference_args(vm, info, args_slice);
     let args_slice = forwarded_args.as_deref().unwrap_or(args_slice);
+
+    // GPU offload, from COMPILED code.
+    //
+    // Placed here and not later: every probe below this line is a
+    // per-callsite memo that ends in a CALL to the callee, so reaching any
+    // of them has already decided not to offload. Placed here and not
+    // EARLIER because it needs `args_slice` post-forwarding -- a moving
+    // collection during the SATB flush above can have relocated the very
+    // arrays the kernel is about to marshal.
+    #[cfg(feature = "gpu-offload")]
+    if info.invoke_kind == 3 && cratonvm_jit::offload_hook::any_kernels() {
+        if let Some(ret) = try_compiled_offload(vm, info, info_ptr as usize, args_slice) {
+            return ret;
+        }
+    }
 
     // JIT dispatch normally calls a custom loader's inherited bytecode
     // directly. ClassLoader's resource methods must throw NPE for a null name
@@ -14571,14 +16098,23 @@ unsafe fn varhandle_instance_field_read_bits(
 /// A baked direct call has no `JitInvokeInfo` of its own (see
 /// `bytecode_walk.rs`: `info_ptr` is `None` for a thin helper), so the cold arm
 /// cannot hand the generic dispatcher the site's real descriptor. These stand
-/// in for it, and for a PRIMITIVE return that substitution is not observable:
-/// the descriptor's only readers are the argument decode (one reference
-/// coordinate either way), `unbox_poly_return_checked`'s return-type rules and
-/// `coerce_native_return`, and all three see the identical return char. It is
-/// observable for a REFERENCE return — `varhandle_reference_return_mismatch`
-/// compares against the site's declared class — which is exactly why the bind
-/// refuses those and leaves them on the funnel with their real info.
-const VARHANDLE_READ_DESCRIPTORS: [&str; 8] = [
+/// in for it.
+///
+/// For a PRIMITIVE return the substitution is not observable: the descriptor's
+/// only readers are the argument decode (one reference coordinate either way),
+/// `unbox_poly_return_checked`'s return-type rules and `coerce_native_return`,
+/// and all three see the identical return char.
+///
+/// For a REFERENCE return there is one reader that CAN tell the difference —
+/// `varhandle_reference_return_mismatch`, which compares against the site's
+/// declared class — and the two reference kinds exist to answer it without a
+/// descriptor. `REF_OBJECT` needs no answer (its stand-in IS its real
+/// descriptor, and no box is refused at an `Object` return); `REF_STRICT` names
+/// a site no box can satisfy at all, so `varhandle_read_direct_reference`
+/// raises on any box the cold arm produces. See
+/// `cratonvm_jit::VARHANDLE_BOX_ACCEPTING_RETURNS` for the thirteen types that
+/// fall between the two and are therefore not bound.
+const VARHANDLE_READ_DESCRIPTORS: [&str; cratonvm_jit::VARHANDLE_READ_KINDS] = [
     "(Ljava/lang/Object;)Z",
     "(Ljava/lang/Object;)B",
     "(Ljava/lang/Object;)C",
@@ -14587,6 +16123,15 @@ const VARHANDLE_READ_DESCRIPTORS: [&str; 8] = [
     "(Ljava/lang/Object;)J",
     "(Ljava/lang/Object;)F",
     "(Ljava/lang/Object;)D",
+    // REF_OBJECT. Not a stand-in at all: a site of this kind declares exactly
+    // this descriptor, so the cold arm dispatches with the real one.
+    "(Ljava/lang/Object;)Ljava/lang/Object;",
+    // REF_STRICT. Here it IS erased, and the one reader that can tell the
+    // difference is `unbox_poly_return_checked`'s W6-1 rule. That rule is
+    // reproduced for this kind in `varhandle_read_direct_impl`, which needs no
+    // descriptor: the kind exists precisely because NO boxed primitive is
+    // assignable to what such a site declared.
+    "(Ljava/lang/Object;)Ljava/lang/Object;",
 ];
 
 /// Synthetic call sites for the cold arm of the `VarHandle` read helpers, one
@@ -14603,6 +16148,8 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(0, 5),
     vh_read_info(0, 6),
     vh_read_info(0, 7),
+    vh_read_info(0, 8),
+    vh_read_info(0, 9),
     vh_read_info(1, 0),
     vh_read_info(1, 1),
     vh_read_info(1, 2),
@@ -14611,6 +16158,8 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(1, 5),
     vh_read_info(1, 6),
     vh_read_info(1, 7),
+    vh_read_info(1, 8),
+    vh_read_info(1, 9),
     vh_read_info(2, 0),
     vh_read_info(2, 1),
     vh_read_info(2, 2),
@@ -14619,6 +16168,8 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(2, 5),
     vh_read_info(2, 6),
     vh_read_info(2, 7),
+    vh_read_info(2, 8),
+    vh_read_info(2, 9),
     vh_read_info(3, 0),
     vh_read_info(3, 1),
     vh_read_info(3, 2),
@@ -14627,18 +16178,22 @@ static VARHANDLE_READ_INFOS: [JitInvokeInfo; cratonvm_jit::VARHANDLE_READ_SLOTS]
     vh_read_info(3, 5),
     vh_read_info(3, 6),
     vh_read_info(3, 7),
+    vh_read_info(3, 8),
+    vh_read_info(3, 9),
 ];
 
 /// One entry of [`VARHANDLE_READ_INFOS`]. `num_jit_args: 2` counts the
 /// receiver — the `VarHandle` itself — plus the single coordinate, matching
 /// `INTEGER_INT_VALUE_INFO`'s `1` for a zero-argument `invokevirtual`.
-const fn vh_read_info(mode: usize, ret: usize) -> JitInvokeInfo {
+const fn vh_read_info(mode: usize, kind: usize) -> JitInvokeInfo {
     JitInvokeInfo {
         class_name: "java/lang/invoke/VarHandle",
         method_name: cratonvm_jit::VARHANDLE_READ_MODES[mode],
-        descriptor: VARHANDLE_READ_DESCRIPTORS[ret],
+        descriptor: VARHANDLE_READ_DESCRIPTORS[kind],
         num_jit_args: 2,
-        return_type: cratonvm_jit::VARHANDLE_READ_RETURNS[ret],
+        return_type: cratonvm_jit::varhandle_read_slot_return(
+            mode * cratonvm_jit::VARHANDLE_READ_KINDS + kind,
+        ),
         invoke_kind: 0,
         declaring_class_id: 0,
     }
@@ -14683,8 +16238,10 @@ unsafe fn varhandle_read_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, slot: 
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
-    let site_ret =
-        cratonvm_jit::VARHANDLE_READ_RETURNS[slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len()];
+    let site_ret = cratonvm_jit::varhandle_read_slot_return(slot);
+    if cratonvm_jit::varhandle_read_slot_is_reference(slot) {
+        return varhandle_read_direct_reference(vm, vm_ptr, vh, receiver, slot);
+    }
     // No SATB flush and no reference-argument forwarding, unlike
     // `jit_invoke_dispatch`: this arm cannot allocate, cannot reach a
     // safepoint, and returns a primitive. It also takes no thread borrow —
@@ -14708,6 +16265,141 @@ unsafe fn varhandle_read_direct_impl(vm_ptr: i64, vh: i64, receiver: i64, slot: 
         args.as_ptr() as i64,
         2,
     )
+}
+
+/// The REFERENCE half of [`varhandle_read_direct_impl`], split out because it
+/// differs from the primitive half in the two places a reference result costs
+/// something.
+///
+/// **The handoff root.** A reference the callee hands back is live only in a
+/// register until the caller stores it, so it has to be published where the
+/// collector can see it. That is what the primitive arm's comment means when it
+/// says it takes no thread borrow: it does not need one, and this arm does.
+/// `jit_thread_mut` here is the same borrow `jit_invoke_dispatch` takes one
+/// frame further in, so the funnel round trip this bind removes was paying for
+/// it anyway.
+///
+/// **W6-1 on the cold arm.** `REF_STRICT` names a site whose declared return
+/// type NO boxed primitive is assignable to (the classification is
+/// `cratonvm_jit::varhandle_read_helper_slot`'s, and it declines the thirteen
+/// types where the answer would depend on which wrapper arrived). So when the
+/// cold arm's dispatch produces a box, that is a `WrongMethodTypeException`
+/// with no further information needed — which is exactly what
+/// `unbox_poly_return_checked` would have raised for the site's real
+/// descriptor, and the only observable this bind's erased stand-in would
+/// otherwise have lost.
+///
+/// The FAST arm needs no such check: `varhandle_instance_field_read_bits`
+/// refuses a reference site over a primitive variable, and a reference variable
+/// holding a box is served by the funnel's own copy of this read today with no
+/// check either.
+///
+/// # SAFETY
+///
+/// See [`varhandle_read_direct_impl`].
+unsafe fn varhandle_read_direct_reference(
+    vm: &SharedVm,
+    vm_ptr: i64,
+    vh: i64,
+    receiver: i64,
+    slot: usize,
+) -> i64 {
+    if vh != 0 && receiver != 0 {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(bits) =
+                varhandle_instance_field_read_bits(vm, vh as u64, receiver as u64, b'L', Some(thread))
+            {
+                VARHANDLE_READ_DIRECT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                JIT_FUNNEL_BYPASS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return bits;
+            }
+        }
+        // The borrow and its guard end here, before the cold arm below takes
+        // its own inside `jit_invoke_dispatch`.
+    }
+    VARHANDLE_READ_DIRECT_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let args = [vh, receiver];
+    let bits = jit_invoke_dispatch(
+        vm_ptr,
+        &VARHANDLE_READ_INFOS[slot] as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    );
+    if cratonvm_jit::varhandle_read_slot_kind(slot) != cratonvm_jit::VARHANDLE_READ_KIND_REF_STRICT
+        || bits == i64::MIN
+        || bits == 0
+    {
+        // Not the strict kind, the dispatch already threw (`i64::MIN` is the
+        // deopt sentinel and is not a representable object address), or the
+        // access answered `null` — which W6-1 leaves alone by construction.
+        return bits;
+    }
+    varhandle_strict_reference_return_check(vm, slot, bits)
+}
+
+/// `unbox_poly_return_checked`'s W6-1 rule, reproduced for a `REF_STRICT` slot
+/// whose cold arm has just produced `bits`.
+///
+/// Returns `bits` unchanged for everything outside the fire set — a value that
+/// is not a live object, a class the manager cannot name, and any object that
+/// is not one of the eight primitive wrappers. Those are the same exclusions
+/// `varhandle_reference_return_mismatch` makes, and for the same reason: a
+/// synthetic stand-in, an un-nameable fabricated class or a genuine reference
+/// value keeps today's behaviour.
+///
+/// # SAFETY
+///
+/// `bits` is whatever `jit_invoke_dispatch` returned for a reference-returning
+/// site; it is heap-validated here before any dereference.
+unsafe fn varhandle_strict_reference_return_check(vm: &SharedVm, slot: usize, bits: i64) -> i64 {
+    if !crate::vm::vm_exec::vh_strict_reference_return() {
+        return bits;
+    }
+    let Some(obj) = vm.mem.heap.is_object_address(bits as usize) else {
+        return bits;
+    };
+    let class_id = vm.mem.heap.class_id_of(obj);
+    let actual = {
+        // Scoped: `create_exception_object` below takes the class-manager WRITE
+        // lock to load the throwable and must not find this read guard held —
+        // the same confinement `varhandle_reference_return_mismatch` documents.
+        let cm = vm.classes.class_manager.read();
+        match cm.get_class(class_id).map(|c| c.name.to_string()) {
+            Some(name) => name,
+            None => return bits,
+        }
+    };
+    if !crate::vm::vm_exec::is_primitive_wrapper_class_name(&actual) {
+        return bits;
+    }
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return bits;
+    };
+    // Not the funnel's wording, because this arm genuinely does not have the
+    // site's descriptor to quote — it has the fact that MADE the descriptor
+    // unnecessary. Saying that is more useful than quoting the erased stand-in,
+    // which would name `java/lang/Object` and be a lie.
+    let message = format!(
+        "VarHandle access site declares a reference return type that no boxed \
+         primitive satisfies, but the access produced {}",
+        actual.replace('/', ".")
+    );
+    match crate::runtime::exceptions::create_exception_object(
+        vm,
+        thread,
+        "java/lang/invoke/WrongMethodTypeException",
+        Some(&message),
+    ) {
+        Ok(exc) => handle_jit_dispatch_error(
+            vm,
+            thread,
+            crate::error::MethodCallFailed::ExceptionThrown(exc),
+            &VARHANDLE_READ_INFOS[slot],
+        ),
+        // Exception construction failed; the legacy silent path is still
+        // better than a fabricated sentinel with nothing behind it.
+        Err(_) => bits,
+    }
 }
 
 /// The thin direct-call target for slot `SLOT` of
@@ -14739,7 +16431,7 @@ fn varhandle_read_direct_fns() -> [usize; cratonvm_jit::VARHANDLE_READ_SLOTS] {
     }
     slots!(
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30, 31,
+        25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
     )
 }
 
@@ -15881,8 +17573,15 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape_at(
+                        class_id,
+                        slots,
+                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                    );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -15902,14 +17601,35 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                     // bytes `set_field_as(.., b'I')` would store, minus that
                     // path's per-call header read + layout dispatch. A
                     // primitive store takes no write barrier.
-                    // SAFETY: `object` is a live legacy-layout allocation
-                    // with >= 1 slot (`slots.max(1)` above); the cell is
-                    // exclusively ours until published below.
-                    unsafe {
-                        std::ptr::write(
-                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
-                            Value::Int(value),
-                        );
+                    // ...but ONLY when it really is legacy. That premise was
+                    // an assumption about which allocator this site calls, not
+                    // a property of the object, and `CRATONVM_COMPACT_TLAB_ALLOC`
+                    // falsified it: with compact planning on, `java.lang.Integer`
+                    // gets a packed 4-byte `value` and this 16-byte `Value` cell
+                    // overwrote it and the bytes after it. `FjpProbe` summed
+                    // boxed integers and returned 215812748544 instead of
+                    // 499999500000 -- no collection involved, exactly as the
+                    // note on `tlab_alloc_object_inner` described. The cold arm
+                    // immediately below has always used the layout-aware store
+                    // and says why; this asks the object rather than assuming.
+                    // SAFETY: `object` was just allocated here, so its first
+                    // HEADER_SIZE bytes are a live, fully written `ObjectHeader`.
+                    let compact = cratonvm_types::is_compact_object(unsafe {
+                        &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
+                    });
+                    if compact {
+                        vm.mem.heap.set_field_as(object, 0, Value::Int(value), b'I');
+                    } else {
+                        // SAFETY: `object` is a live legacy-layout allocation
+                        // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
+                        // immediately above, not assumed; the cell is
+                        // exclusively ours until published below.
+                        unsafe {
+                            std::ptr::write(
+                                object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                                Value::Int(value),
+                            );
+                        }
                     }
                     // Object-return handoff root (see `call_integer_native_raw`).
                     thread.native_pending_return = Some(object);
@@ -15997,6 +17717,7 @@ static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
         set_jit_pending_npe();
@@ -16013,6 +17734,9 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
         // costs ~0 here (see the hashmap-half-gap closeout doc: restoring all
         // three probes measured inside run-to-run noise).
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
+            if census {
+                crate::runtime::interp_census::note_int_value_direct(false);
+            }
             return match vm.mem.heap.get_field(object, 0) {
                 Value::Int(value) => value as i64,
                 _ => 0,
@@ -16021,6 +17745,9 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
+    if census {
+        crate::runtime::interp_census::note_int_value_direct(true);
+    }
     let args = [receiver];
     jit_invoke_dispatch(
         vm_ptr,
@@ -16129,8 +17856,15 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     cache.set(Some((vm_key, class_id.as_u32(), resolved as u32)));
                     resolved
                 });
-                use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-                let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+                // The shape planner, not a bare legacy size: every TLAB object
+                // site has to agree with the header its allocation will be
+                // stamped with. See `plan_tlab_object_shape`.
+                let (requested_size, _, _) =
+                    crate::runtime::interpreter::plan_tlab_object_shape_at(
+                        class_id,
+                        slots,
+                        crate::runtime::interpreter::tlab_site::JIT_HELPER,
+                    );
                 let tlab_object = if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
                     crate::runtime::interpreter::tlab_alloc_object(
                         thread,
@@ -16149,14 +17883,26 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
                     // zeroed 16-byte `Value` cells), so field 0 is the `Value`
                     // cell at `HEADER_SIZE`. A primitive store takes no write
                     // barrier.
-                    // SAFETY: `object` is a live legacy-layout allocation with
-                    // >= 1 slot (`slots.max(1)` above); the cell is exclusively
-                    // ours until published below.
-                    unsafe {
-                        std::ptr::write(
-                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
-                            Value::Long(value),
-                        );
+                    // ...but ONLY when it really is legacy -- see the
+                    // `Integer` twin for the miscompile that premise produced.
+                    // SAFETY: `object` was just allocated here, so its first
+                    // HEADER_SIZE bytes are a live, fully written `ObjectHeader`.
+                    let compact = cratonvm_types::is_compact_object(unsafe {
+                        &*(object.as_ptr() as *const cratonvm_types::ObjectHeader)
+                    });
+                    if compact {
+                        vm.mem.heap.set_field_as(object, 0, Value::Long(value), b'J');
+                    } else {
+                        // SAFETY: `object` is a live legacy-layout allocation
+                        // with >= 1 slot (`slots.max(1)` above) -- now CHECKED
+                        // immediately above, not assumed; the cell is
+                        // exclusively ours until published below.
+                        unsafe {
+                            std::ptr::write(
+                                object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                                Value::Long(value),
+                            );
+                        }
                     }
                     thread.native_pending_return = Some(object);
                     return object.as_ptr() as i64;
@@ -16230,6 +17976,7 @@ pub unsafe extern "C" fn jit_long_value_of_direct(vm_ptr: i64, value: i64) -> i6
 /// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
+    let census = crate::runtime::interp_census::direct_binds_enabled();
     let raw = receiver as u64;
     if raw == 0 {
         set_jit_pending_npe();
@@ -16244,8 +17991,18 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
         // `get_field` dereference.
         if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
             match vm.mem.heap.get_field(object, 0) {
-                Value::Long(value) => return value,
-                Value::Int(value) => return i64::from(value),
+                Value::Long(value) => {
+                    if census {
+                        crate::runtime::interp_census::note_long_value_direct(false);
+                    }
+                    return value;
+                }
+                Value::Int(value) => {
+                    if census {
+                        crate::runtime::interp_census::note_long_value_direct(false);
+                    }
+                    return i64::from(value);
+                }
                 // Anything else is a shape the registered native answers 0 for;
                 // hand it to the generic dispatcher rather than guessing, so the
                 // two paths cannot disagree.
@@ -16255,6 +18012,9 @@ pub unsafe extern "C" fn jit_long_long_value_direct(vm_ptr: i64, receiver: i64) 
     }
     // Defensive fallback: hand the call to the generic dispatcher (same
     // machinery the non-direct site would have used).
+    if census {
+        crate::runtime::interp_census::note_long_value_direct(true);
+    }
     let args = [receiver];
     jit_invoke_dispatch(
         vm_ptr,
@@ -17711,7 +19471,7 @@ fn call_integer_native_raw_inner(
                         && (vm.mem.heap.needs_gc_for_jit_allocation()
                             || vm.mem.heap.old_gen_needs_gc())
                     {
-                        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+                        crate::runtime::interpreter::maybe_gc_forced_pub_at(vm, thread, "jit-helpers");
                     }
                     vm.mem.heap.clear_young_spill_pressure();
                 }
@@ -18717,12 +20477,35 @@ unsafe fn try_lambda_site_direct_call(
                     crate::runtime::interpreter::lambda_site_bump_unresumable();
                 }
                 Err(crate::error::MethodCallFailed::ExceptionThrown(exc)) => {
-                    // Same contract as the MIC hit path: leave it in
-                    // `jit_pending_exception` for the compiled caller's own
-                    // post-invoke check, and return the null/zero sentinel.
+                    // Park it for the compiled caller's own post-invoke check —
+                    // and return the sentinel that check actually tests for.
+                    //
+                    // This used to return `0`, described as "the null/zero
+                    // sentinel". **There is no such sentinel.**
+                    // `emit_post_invoke_exception_check` compares `RAX` against
+                    // `i64::MIN` and consults `dispatch_threw` only on that
+                    // comparison; `0` is a perfectly ordinary null reference
+                    // return and the check keeps it. The parked exception then
+                    // sat unclaimed while compiled code carried on with a null.
+                    //
+                    // It looked correct for a year because of what usually
+                    // FOLLOWS a SAM call: unboxing the result
+                    // (`Integer.intValue`) was a CALL, and that call crossed
+                    // into Rust and delivered the pending exception a moment
+                    // later at a site that could route it. Making the box/unbox
+                    // intrinsic default-ON removed the call — the unbox became
+                    // an inline load with a null-receiver guard — and the
+                    // exception escaped its own `catch`. See
+                    // `docs/known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`.
+                    //
+                    // `i64::MIN` is right for every return type: for a
+                    // reference it cannot be a valid heap address, and for the
+                    // `J`/`D`/`F` shapes where it IS a representable value the
+                    // check disambiguates through `dispatch_threw`, which finds
+                    // exactly the signal parked on the line above.
                     set_jit_pending_exception(thread, exc);
                     crate::runtime::interpreter::lambda_site_bump_resumed();
-                    return Some(0);
+                    return Some(i64::MIN);
                 }
                 Err(_) => {
                     crate::runtime::interpreter::lambda_site_bump_unresumable();
@@ -18788,7 +20571,10 @@ fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
         stash_jit_pending_aioobe(index, length);
     }
     if sig.npe {
-        stash_jit_pending_npe();
+        // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
+        // frames belong to the trap, not to this drain, so put back the ones
+        // that were taken instead of sampling a fresh (shallower) stack.
+        restash_jit_pending_npe(sig.npe_action, sig.npe_compiled_frames);
     }
     if sig.arithmetic {
         stash_jit_pending_arithmetic();
@@ -22054,10 +23840,18 @@ mod tests {
 
     #[test]
     fn jit_aaload_null_sets_pending_npe() {
-        // SAFETY: array_ptr is 0 (null), so the function returns early without dereferencing.
-        // JVMS §aaload: NPE on null array.
+        // SAFETY: array_ptr is 0 (null), so the function returns early without
+        // dereferencing. JVMS §aaload: NPE on null array.
+        //
+        // `vm_ptr` is deliberately 0, and that is sound ONLY because of the
+        // ordering: `plausible_heap_pointer(0)` is false, so the helper takes
+        // the NPE arm and returns before `heap_from_vm(vm_ptr)` is reached.
+        // State it rather than leaving a bare 0 -- if that ordering ever
+        // changes, this argument becomes a null deref instead of a wrong
+        // answer. Pass a real `SharedVm` (as `jit_aaload_oob_sets_pending_aioobe`
+        // does) if this test ever grows past the guard arm.
         let _ = take_jit_pending_npe();
-        let result = unsafe { jit_aaload(0, 0) };
+        let result = unsafe { jit_aaload(0, 0, 0) };
         assert_eq!(result, i64::MIN);
         assert!(
             take_jit_pending_npe(),
@@ -22383,9 +24177,14 @@ mod tests {
     #[test]
     fn jit_aaload_oob_sets_pending_aioobe() {
         let _ = take_jit_pending_aioobe();
-        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 3);
-        // SAFETY: arr_ptr is a live Object[3]; index 3 is OOB.
-        let r = unsafe { jit_aaload(arr_ptr, 3) };
+        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 3);
+        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
+        // SAFETY: arr_ptr is a live Object[3]; index 3 is OOB, so the helper
+        // returns on the bounds check BEFORE the element read and never reaches
+        // `heap_from_vm`. Unlike the null-array test above, this one has a VM in
+        // hand, so it passes a live `vm_ptr` and does not depend on that
+        // ordering to be sound.
+        let r = unsafe { jit_aaload(vm_ptr, arr_ptr, 3) };
         assert_eq!(r, i64::MIN, "aaload OOB must return the deopt sentinel");
         assert_eq!(take_jit_pending_aioobe(), Some((3, 3)));
     }
@@ -23784,6 +25583,11 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         .and_then(|shared| shared.mem.heap.jit_card_table_info())
         .unwrap_or((0, 0, 0));
 
+    // `(pre, post, young_floor)` — all-zero until a collector publishes a
+    // reference-store barrier plan. Read once, so the three fields below can
+    // never name three different generations of the table.
+    let ref_store_gates = cratonvm_gc::jit_ref_store_gate_addrs();
+
     let helpers = JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
@@ -23935,6 +25739,40 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // keeps the native dispatch it has today.
         ffm_segment_get: jit_ffm_segment_get as *const () as usize,
         ffm_segment_set: jit_ffm_segment_set as *const () as usize,
+        // Reference-store barrier gates. All three come from ONE call, so a
+        // half-wired plan — two live addresses and a stale third — is not
+        // expressible here: `jit_ref_store_gate_addrs` returns all-zero until a
+        // collector has published, and all-zero is what every emitter arm reads
+        // as "keep the full-helper path you have today".
+        //
+        // Deliberately NOT conditioned on the collector in this file. "May
+        // compiled code skip this call" belongs to the collector that answers
+        // it, and it answers by publishing or declining to; a second copy of
+        // that decision here is exactly how `region_bounds_addr` came to mean
+        // two different things at once.
+        ref_store_pre_gate: ref_store_gates.0,
+        ref_store_post_gate: ref_store_gates.1,
+        ref_store_post_young_floor: ref_store_gates.2,
+        // The mask shape of the same plan, as a VALUE. Read from the same
+        // published table and in the same breath as the three addresses above,
+        // so a plan cannot be observed half-applied; a publisher supplies
+        // either this or the floor, never both.
+        ref_store_post_skip_mask: usize::from(cratonvm_gc::jit_ref_store_post_skip_mask()),
+        // F-08 -- G1's inline post-write barrier: the geometry table, and the
+        // call target its slow arm uses.
+        //
+        // A THIRD table address in this struct, and the third is not a
+        // duplicate of either of the first two. `region_bounds_addr` above is
+        // the table whose EMPTINESS under G1 closes defect G1-2 -- nothing may
+        // ever publish into it for G1. `read_bounds_addr` answers the read-side
+        // "is this address mapped". This one carries the numbers an inline G1
+        // barrier needs in order to BE a barrier: arena base, arena length,
+        // region mask, plus the F-05 card table's base and shift. Wired
+        // unconditionally; the table itself is all-zero unless a G1 collector
+        // has published, and the emitter treats a zero length as "no inline
+        // barrier".
+        g1_barrier_addr: cratonvm_gc::jit_g1_barrier_addr(),
+        g1_post_write_barrier: jit_g1_post_write_barrier as *const () as usize,
         // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
         // off by default) — address of the process-global VM's
         // stw_requested flag byte. `process_vm()` is published by
@@ -24059,6 +25897,7 @@ const _: () = {
     let _: HelperFnPutfieldFloat = jit_putfield_float;
     let _: HelperFnPutfieldDouble = jit_putfield_double;
     let _: HelperFnPutfieldObject = jit_putfield_object;
+    let _: HelperFnG1PostWriteBarrier = jit_g1_post_write_barrier;
 
     // Statics.
     let _: HelperFnGetstatic = jit_getstatic;
@@ -25176,7 +27015,7 @@ mod varhandle_read_direct_helper_tables {
     /// site returning `J` would run `get`'s `Z` body, read the right field and
     /// return the wrong width.
     #[test]
-    fn the_thirty_two_slots_are_thirty_two_distinct_functions() {
+    fn every_slot_is_its_own_distinct_function() {
         let addrs = varhandle_read_direct_fns();
         let unique: std::collections::HashSet<usize> = addrs.iter().copied().collect();
         assert_eq!(
@@ -25204,39 +27043,88 @@ mod varhandle_read_direct_helper_tables {
     #[test]
     fn each_synthetic_call_site_matches_its_slot() {
         for (slot, info) in VARHANDLE_READ_INFOS.iter().enumerate() {
-            let mode = slot / cratonvm_jit::VARHANDLE_READ_RETURNS.len();
-            let ret = slot % cratonvm_jit::VARHANDLE_READ_RETURNS.len();
+            let mode = cratonvm_jit::varhandle_read_slot_mode(slot);
             assert_eq!(info.class_name, "java/lang/invoke/VarHandle");
             assert_eq!(info.method_name, cratonvm_jit::VARHANDLE_READ_MODES[mode]);
-            assert_eq!(info.return_type, cratonvm_jit::VARHANDLE_READ_RETURNS[ret]);
+            assert_eq!(
+                info.return_type,
+                cratonvm_jit::varhandle_read_slot_return(slot)
+            );
             assert_eq!(info.invoke_kind, 0, "a read mode is an invokevirtual site");
             // The receiver (the handle) plus one coordinate.
             assert_eq!(info.num_jit_args, 2);
-            // And the round trip: the recognition maps this info's own name and
-            // descriptor back to this slot.
-            assert_eq!(
-                cratonvm_jit::varhandle_read_helper_slot(info.method_name, info.descriptor),
-                Some(slot),
-            );
+            // And the round trip. The two REFERENCE slots share one descriptor
+            // by construction — `REF_STRICT`'s is erased, which is the whole
+            // reason `varhandle_read_direct_impl` reproduces W6-1 for it
+            // instead of leaving it to the descriptor — so the round trip is
+            // asserted to land on the `REF_OBJECT` slot of the SAME mode
+            // rather than on `slot` itself.
+            let round_trip =
+                cratonvm_jit::varhandle_read_helper_slot(info.method_name, info.descriptor);
+            let expected = if cratonvm_jit::varhandle_read_slot_is_reference(slot) {
+                mode * cratonvm_jit::VARHANDLE_READ_KINDS
+                    + cratonvm_jit::VARHANDLE_READ_KIND_REF_OBJECT
+            } else {
+                slot
+            };
+            assert_eq!(round_trip, Some(expected), "slot {slot}");
         }
     }
 
-    /// The erased descriptors carry a primitive return and exactly one
-    /// reference coordinate — the substitution the cold arm is only allowed to
-    /// make because a primitive return makes it unobservable. A reference
-    /// return here would silently disable `unbox_poly_return_checked`'s W6-1
-    /// rule for every declined read.
+    /// What each erased descriptor is allowed to be, per kind.
+    ///
+    /// * a PRIMITIVE slot's substitution is unobservable, because the
+    ///   descriptor's only readers — the argument decode,
+    ///   `unbox_poly_return_checked`'s return-type rules and
+    ///   `coerce_native_return` — all see the identical return char;
+    /// * a `REF_OBJECT` slot's is not a substitution at all: a site of that
+    ///   kind declares exactly `(L…;)Ljava/lang/Object;`, and W6-1 cannot fire
+    ///   at an `Object` return anyway;
+    /// * a `REF_STRICT` slot's IS erased, and that is exactly why
+    ///   `varhandle_strict_reference_return_check` exists. This row is the one
+    ///   that says the erasure is deliberate rather than an oversight — the
+    ///   pairing that must not be broken silently is "erased descriptor here,
+    ///   W6-1 reproduced there".
+    ///
+    /// An `[` or `V` return in this table would be a slot the recogniser can
+    /// never produce, so it is asserted absent rather than handled.
     #[test]
-    fn no_synthetic_call_site_carries_a_reference_return() {
-        for info in VARHANDLE_READ_INFOS.iter() {
-            assert!(
-                !matches!(info.return_type, b'L' | b'[' | b'V'),
-                "{} returns {}",
-                info.descriptor,
-                info.return_type as char,
-            );
+    fn every_synthetic_call_site_carries_its_kinds_erasure() {
+        for (slot, info) in VARHANDLE_READ_INFOS.iter().enumerate() {
             assert!(info.descriptor.starts_with("(Ljava/lang/Object;)"));
+            assert!(!matches!(info.return_type, b'[' | b'V'));
+            let kind = cratonvm_jit::varhandle_read_slot_kind(slot);
+            if kind == cratonvm_jit::VARHANDLE_READ_KIND_REF_OBJECT
+                || kind == cratonvm_jit::VARHANDLE_READ_KIND_REF_STRICT
+            {
+                assert_eq!(info.return_type, b'L', "slot {slot}");
+                assert_eq!(info.descriptor, "(Ljava/lang/Object;)Ljava/lang/Object;");
+            } else {
+                assert!(
+                    !matches!(info.return_type, b'L'),
+                    "{} returns {}",
+                    info.descriptor,
+                    info.return_type as char,
+                );
+            }
         }
+        // The pairing, stated as an assertion rather than only in prose: the
+        // strict kind is the only one whose descriptor lies, and the file that
+        // holds this table also holds the check that makes the lie harmless.
+        // A source witness, for the reason `source-witness-tests-read-the-working-tree`
+        // gives: `CARGO_MANIFEST_DIR` is `<repo>/vm`, so this reads the working
+        // tree and an unbuilt edit still fails here. What it pins is that the
+        // erased descriptor above is CALLED-OUT-TO rather than merely declared:
+        // deleting the call and keeping the function would leave the strict
+        // slot silently unchecked.
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jit/helpers.rs"),
+        )
+        .expect("read helpers.rs");
+        assert!(
+            text.contains("varhandle_strict_reference_return_check(vm, slot, bits)"),
+            "REF_STRICT carries an erased descriptor with nothing reproducing W6-1",
+        );
     }
 }
 
@@ -25386,7 +27274,7 @@ const FFM_CARRIER_SLOTS: u32 = 6;
 // `HEADER_SIZE + index * SLOT_SIZE` lies inside the allocation.
 unsafe fn ffm_read_long_slot(obj_ptr: i64, index: usize) -> Option<i64> {
     let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + index * SLOT_SIZE);
-    match cratonvm_types::read_value_atomic(ptr as *const Value) {
+    match jit_read_value_cell_checked(ptr as *const Value, "ffm_read_long_slot") {
         Value::Long(v) => Some(v),
         _ => None,
     }

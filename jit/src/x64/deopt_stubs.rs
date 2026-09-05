@@ -445,12 +445,23 @@ impl Compiler {
         // Locals: oop-ness from the intersection-dataflow mask (only when the
         // forward dataflow reached this PC; otherwise treat as non-oop).
         //
-        // In a method with MORE THAN 64 LOCALS this mask is not merely truncated
-        // at bit 63 — `compute_local_oop_masks` returns EMPTY vectors for
-        // `max_locals > 64`, so `oop_reached` is `false`, `oop_mask` is `0`, and
-        // `is_oop` below reads FALSE FOR EVERY LOCAL, slot 0 included. Measured
-        // on an 84-local probe: `oop_reached=false oop_mask=0x0` while three
-        // reference locals were live.
+        // In a method with MORE THAN 64 LOCALS this mask used to be not merely
+        // truncated at bit 63: `compute_local_oop_masks` returned EMPTY vectors
+        // for `max_locals > 64`, so `oop_reached` was `false`, `oop_mask` was
+        // `0`, and `is_oop` below read FALSE FOR EVERY LOCAL, slot 0 included.
+        // Measured on an 84-local probe: `oop_reached=false oop_mask=0x0` while
+        // three reference locals were live.
+        //
+        // CHANGED 2026-09-03 (`CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS`, default-on).
+        // The method path now runs the same analysis once per 64-local window,
+        // so such a method DOES have a mask and `is_oop` answers truthfully for
+        // slots 0..63. Above slot 63 nothing changes here -- this reads one
+        // `u64`, so point 1 below still holds verbatim and
+        // `classify_local_kinds` is still the reference authority up there. What
+        // is gone is the sharp edge where slot 0 of an 84-local method read
+        // non-oop for no reason but its neighbours' count.
+        //
+        // `=0` restores the empty vectors and every sentence above it.
         //
         // This comment used to say that was "sound only because
         // `can_deopt_resume` (later) gates such methods off". That is not what
@@ -895,7 +906,7 @@ impl Compiler {
                 // `float`/`double` in XMM or a spill slot), so it stays
                 // `Unsupported` — exactly what `typed_local_frame_value` does
                 // for a `LocalKind::Float`/`Double` that claims a GPR home.
-                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
+                StackSlot::CalleeSaved(r) | StackSlot::Scratch(r, ..) => {
                     if is_oop {
                         FrameValue::RegisterRef(*r)
                     } else if indy_tag == Some(b'J') {
@@ -1184,7 +1195,20 @@ impl Compiler {
             let bc_pc = self.orig_bci(bc_pc);
             let stub_offset = self.buf.pos();
 
-            // At this point RAX=array pointer, RCX=index, R10D=array length.
+            // At this point RAX=array pointer and RCX=index; the length is
+            // NOT live in a register. `emit_bounds_check` folded its load into
+            // the compare (`CMP ECX, [RAX+len]`), so this cold path re-loads it
+            // here — RAX still holds the array pointer, and the fast path just
+            // dereferenced that same header word, so the load cannot fault.
+            //
+            // MOV R10D, DWORD [RAX + ARRAY_LENGTH_OFFSET]
+            // Encoding: 44 8B 50 xx (REX.R + MOV r32, r/m32 + ModRM(01, R10, RAX) + disp8)
+            // A `const` item, not an inline call — see the identical binding
+            // in `emit_bounds_check`.
+            const LEN_DISP: u8 =
+                crate::x64::disp::disp8_const(cratonvm_types::ARRAY_LENGTH_OFFSET as i64) as u8;
+            self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]);
+
             // Set up jit_throw_aioobe(index, length, array_ptr, bytecode_pc).
             #[cfg(target_os = "windows")]
             {
@@ -1254,12 +1278,15 @@ impl Compiler {
 
         // Distinct action codes in first-seen order (small set, ≤ ~18). Emit one
         // stub per code; all JZ sites with that code patch to it.
-        let mut emitted: Vec<u8> = Vec::new();
-        for &(action, _) in &entries {
-            if emitted.contains(&action) {
+        //
+        // `emitted` now carries THREE offsets per action, because a described
+        // trap site enters the same stub one instruction later. See the
+        // trampoline loop below.
+        let mut emitted: Vec<(u8, usize, usize)> = Vec::new();
+        for &(action, _, _) in &entries {
+            if emitted.iter().any(|&(a, _, _)| a == action) {
                 continue;
             }
-            emitted.push(action);
 
             let stub_offset = self.buf.pos();
 
@@ -1278,6 +1305,13 @@ impl Compiler {
             }
             self.buf.emit(&(action as u32).to_le_bytes()); // Cast: x86-64 imm32
 
+            // Everything from here on is independent of WHICH site trapped, so
+            // a described site's trampoline can set its own argument and jump
+            // straight here rather than duplicating the call, the sentinel and
+            // the epilogue.
+            let tail_offset = self.buf.pos();
+            emitted.push((action, stub_offset, tail_offset));
+
             // CALL jit_npe_with_action (absolute). Sets JIT_PENDING_NPE + the
             // action code + the deopt flag. RAX is clobbered by the call.
             self.emit_call_absolute(self.helpers.jit_npe_with_action);
@@ -1291,14 +1325,50 @@ impl Compiler {
             // Standard method epilogue: restore callee-saved regs and return.
             self.emit_epilogue();
 
-            // Patch every recorded JZ branch with THIS action to this stub.
-            for &(a, patch_off) in &entries {
-                if a != action {
-                    continue;
-                }
-                let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
-            }
+        }
+
+        // Now the branch targets. A site with no recorded trap goes straight to
+        // its action's stub, exactly as every site did before 2026-09-02. A
+        // described site gets ten cold bytes of its own:
+        //
+        //     MOV <arg0>, imm32(action | key << 8)     ; 5
+        //     JMP rel32 -> that action's tail          ; 5
+        //
+        // which is the side channel the NPE frame snapshot needs and the GC's
+        // safepoint-id slot must not become. Nothing on the FAST path moves:
+        // the `TEST`/`JZ` pair the null check emits is byte-for-byte what it
+        // was, and only the `JZ`'s destination differs.
+        for &(action, patch_off, trap_key) in &entries {
+            let Some(&(_, stub_offset, tail_offset)) =
+                emitted.iter().find(|&&(a, _, _)| a == action)
+            else {
+                continue;
+            };
+            let target = if trap_key == 0 {
+                stub_offset
+            } else {
+                let tramp = self.buf.pos();
+                // The packed argument. `action` is a `u8` and `trap_key` is
+                // capped at 24 bits by `record_npe_trap_site`, so the two never
+                // overlap and `jit_npe_with_action` can split them with a mask
+                // and a shift.
+                let packed = (action as u32) | (trap_key << 8);
+                #[cfg(target_os = "windows")]
+                self.buf.emit_byte(0xB9); // MOV ECX, imm32
+                #[cfg(not(target_os = "windows"))]
+                self.buf.emit_byte(0xBF); // MOV EDI, imm32
+                self.buf.emit(&packed.to_le_bytes());
+                // JMP rel32 to the tail. The tail was emitted above, so the
+                // displacement is known here and needs no patch list.
+                self.buf.emit_byte(0xE9);
+                let after = self.buf.pos() + 4;
+                // Cast: x86-64 rel32 displacement, both ends buffer positions.
+                let rel = (tail_offset as i64) - (after as i64);
+                self.buf.emit(&(rel as i32).to_le_bytes());
+                tramp
+            };
+            let rel32 = (target as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
+            self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -1379,6 +1449,20 @@ impl Compiler {
             Some(map) => map.get(pc).map(|&b| b as usize).unwrap_or(pc),
             None => pc,
         }
+    }
+
+    /// The hot half of a merged post-call sentinel check: `RAX != i64::MIN`
+    /// branches past BOTH the callee-deopt check and the exception check in
+    /// one compare (`merged_call_sentinel_enabled`). Returns the rel32 patch
+    /// the caller lands on `.keep`, after the two cold checks -- which keep
+    /// their own compares, and now run only when the callee actually returned
+    /// the sentinel. R10 is clobbered, as it already was by the exception
+    /// check.
+    pub(super) fn emit_call_sentinel_fast_skip(&mut self) -> usize {
+        self.buf.emit(&[0x49, 0xBA]); // MOV R10, imm64
+        self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        self.emit_jcc_rel32_patch(0x85) // JNE .keep
     }
 
     pub(super) fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {

@@ -588,10 +588,19 @@ fn init_locals_from_parts(
     // overwrites any stale recycled content so no kind leaks across reuse.
     let mut locals = u64_vec_to_compact(vals);
     locals.clear();
-    locals.resize(n, CompactValue::uninitialized());
     kinds.clear();
+    // Arguments first, filler second, so every slot is written exactly once.
+    // The previous order (`resize` to `n`, then overwrite the leading argument
+    // slots) wrote each argument slot twice on every frame push — nine bytes
+    // per slot, on the hottest path in the VM. The end state is identical:
+    // `push_args_to_locals` lays down exactly the slots `copy_args_to_locals`
+    // would have, and the `resize` below fills exactly the ones it would have
+    // left as filler.
+    push_args_to_locals(&mut locals, &mut kinds, args, n);
+    locals.resize(n, CompactValue::uninitialized());
     kinds.resize(n, LKIND_OTHER);
-    copy_args_to_locals(&mut locals, &mut kinds, args);
+    debug_assert_eq!(locals.len(), n, "locals must be exactly max_locals long");
+    debug_assert_eq!(kinds.len(), n, "kinds must parallel locals");
     (locals, kinds, eff)
 }
 
@@ -728,6 +737,50 @@ fn tls_soa_pool_clear() {
     });
 }
 
+/// Append the argument slots to freshly-cleared `locals` / `kinds`, in the
+/// JVMS layout (category-2 values take two slots, the upper one unset).
+///
+/// # Why this exists beside [`copy_args_to_locals`]
+///
+/// [`init_locals_from_parts`] used to `resize` both buffers to `max_locals`
+/// and then overwrite the leading argument slots — so every argument slot was
+/// written **twice** on every frame push, once with the filler and once with
+/// the argument. Pushing the arguments first and resizing the *remainder*
+/// writes each slot exactly once, which is the same end state by construction:
+/// the filler value is identical (`CompactValue::uninitialized()` /
+/// `LKIND_OTHER`) and it now only ever lands in slots no argument occupies.
+///
+/// `cap` is `effective_max_locals`, which is already clamped to at least the
+/// slots the arguments need, so the bound below is defensive rather than
+/// load-bearing — it preserves [`copy_args_to_locals`]'s clamp exactly.
+fn push_args_to_locals(
+    locals: &mut Vec<CompactValue>,
+    kinds: &mut Vec<u8>,
+    args: &[Value],
+    cap: usize,
+) {
+    for arg in args {
+        if locals.len() >= cap {
+            return;
+        }
+        // Paired with the `lkind_of_value` mark below — a `double` argument
+        // keeps its NaN payload across the call boundary.
+        locals.push(CompactValue::from_value_kinded(*arg));
+        kinds.push(lkind_of_value(arg));
+        // Category 2 values (long, double) occupy two slots; the upper half is
+        // left uninitialised by JVM convention.
+        if arg.is_category2() && locals.len() < cap {
+            locals.push(CompactValue::uninitialized());
+            kinds.push(LKIND_OTHER);
+        }
+    }
+}
+
+/// In-place argument copy into already-sized buffers.
+///
+/// Retained for the callers that hand over a slice they did not just build
+/// (deopt resume, frozen-frame rehydration). The frame-push path uses
+/// [`push_args_to_locals`] instead — see that function for why.
 fn copy_args_to_locals(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Value]) {
     let mut slot = 0;
     for arg in args {
@@ -854,6 +907,136 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
 /// effective behaviour of the round-4 wave-1 permanent-ban Vec for hot
 /// loops whose IR the JIT genuinely can't lower.
 pub const OSR_MAX_ATTEMPTS: u32 = 5;
+
+/// The four buffer-shaped pieces of a cached-method frame.
+///
+/// Built once and consumed either by [`Frame::new_pooled_cached_compact`],
+/// which returns a `Frame` by value, or by
+/// [`FrameStack::emplace_cached_compact`], which writes one straight into the
+/// stack slot. Sharing the build is what keeps the two from drifting.
+struct CachedCompactParts {
+    locals: Vec<CompactValue>,
+    local_kinds: Vec<u8>,
+    stack: ValueStack,
+    eff_max_locals: u16,
+}
+
+/// Take the locals and operand-stack buffers for a call to `cached` from the
+/// thread's pools and lay the arguments into them.
+///
+/// Identical in every observable to what `new_pooled_cached_compact` did
+/// inline before this was factored out: same filler, same category-2 layout,
+/// same `effective_max_locals` clamp, same pooled `ValueStack`.
+#[inline]
+fn build_cached_compact_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[(CompactValue, u8)],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> CachedCompactParts {
+    let needed: usize = args
+        .iter()
+        .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
+        .sum();
+    let n = (cached.max_locals as usize).max(needed);
+    let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
+    let (vals, mut kinds) = locals_pool.pop().unwrap_or_default();
+    let mut locals = u64_vec_to_compact(vals);
+    locals.clear();
+    kinds.clear();
+    locals.reserve(n);
+    kinds.reserve(n);
+    for (cv, tag) in args {
+        locals.push(*cv);
+        match *tag {
+            b'J' => {
+                kinds.push(LKIND_LONG);
+                locals.push(CompactValue::uninitialized());
+                kinds.push(LKIND_OTHER);
+            }
+            b'D' => {
+                kinds.push(LKIND_DOUBLE);
+                locals.push(CompactValue::uninitialized());
+                kinds.push(LKIND_OTHER);
+            }
+            _ => kinds.push(LKIND_OTHER),
+        }
+    }
+    locals.resize(n, CompactValue::uninitialized());
+    kinds.resize(n, LKIND_OTHER);
+    debug_assert_eq!(locals.len(), n);
+    debug_assert_eq!(kinds.len(), n);
+    let padded_max = (cached.max_stack as usize).max(16) + 8;
+    let stack = if let Some((vals, tags)) = stacks_pool.pop() {
+        ValueStack::from_pooled(vals, tags, padded_max)
+    } else {
+        ValueStack::new(padded_max)
+    };
+    CachedCompactParts {
+        locals,
+        local_kinds: kinds,
+        stack,
+        eff_max_locals,
+    }
+}
+
+
+/// [`build_cached_compact_parts`] for arguments that are still `Value`s.
+///
+/// The general dispatchers decode their arguments before they know which
+/// callee shape they have, so they cannot use the fast doors' verbatim
+/// `(slot, tag)` transfer. Everything after that point is the same, and
+/// sharing [`CachedCompactParts`] is what lets them share the emplace.
+#[inline]
+fn build_cached_value_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> CachedCompactParts {
+    let (locals, local_kinds, eff_max_locals) =
+        init_locals_pooled(cached.max_locals, args, locals_pool);
+    let padded_max = (cached.max_stack as usize).max(16) + 8;
+    let stack = if let Some((vals, tags)) = stacks_pool.pop() {
+        ValueStack::from_pooled(vals, tags, padded_max)
+    } else {
+        ValueStack::new(padded_max)
+    };
+    CachedCompactParts {
+        locals,
+        local_kinds,
+        stack,
+        eff_max_locals,
+    }
+}
+
+/// [`build_cached_value_parts`] for callers outside this module. Tuple, for
+/// the same reason [`take_cached_compact_parts`] is one.
+#[inline]
+pub(crate) fn take_cached_value_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> (Vec<CompactValue>, Vec<u8>, ValueStack, u16) {
+    let p = build_cached_value_parts(cached, args, locals_pool, stacks_pool);
+    (p.locals, p.local_kinds, p.stack, p.eff_max_locals)
+}
+
+/// [`build_cached_compact_parts`] for callers outside this module.
+///
+/// Returns the pieces as a tuple so the struct itself can stay private:
+/// `(locals, local_kinds, stack, effective_max_locals)`.
+#[inline]
+pub(crate) fn take_cached_compact_parts(
+    cached: &CachedBytecodeMethod,
+    args: &[(CompactValue, u8)],
+    locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+) -> (Vec<CompactValue>, Vec<u8>, ValueStack, u16) {
+    let p = build_cached_compact_parts(cached, args, locals_pool, stacks_pool);
+    (p.locals, p.local_kinds, p.stack, p.eff_max_locals)
+}
 
 impl Frame {
     /// Return `true` if a fresh OSR attempt should be made for `entry_pc`
@@ -1095,14 +1278,187 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let (locals, local_kinds, eff_max_locals) =
-            init_locals_pooled(cached.max_locals, args, locals_pool);
-        let padded_max = (cached.max_stack as usize).max(16) + 8;
-        let stack = if let Some((vals, tags)) = stacks_pool.pop() {
-            ValueStack::from_pooled(vals, tags, padded_max)
-        } else {
-            ValueStack::new(padded_max)
-        };
+        // CR-CLO-2 cached half lives in `from_cached_compact_parts` now:
+        // `CachedBytecodeMethod` does not yet carry a method slot (see the
+        // field doc — its 38 struct literals live in four crates and none has
+        // a `..` tail), so `method_index` is `None` there for both
+        // constructors, and that is the only line that changes when it lands.
+        let CachedCompactParts {
+            locals,
+            local_kinds,
+            stack,
+            eff_max_locals,
+        } = build_cached_value_parts(&cached, args, locals_pool, stacks_pool);
+        Frame::from_cached_compact_parts(cached, locals, local_kinds, stack, eff_max_locals)
+    }
+
+    /// Reset this frame in-place for tail-call elimination.
+    /// Reuses the existing Vec allocations (locals, stack) to avoid allocation.
+    /// `new_pooled_cached` for arguments that are still operand-stack slots.
+    ///
+    /// The invoke fast door hands over `(slot, descriptor tag)` pairs read
+    /// straight off the caller's operand stack, so each argument is copied
+    /// once, `CompactValue` to `CompactValue`, with no `Value` in between.
+    /// `tag` is the descriptor's first byte for the parameter (`b'L'` for the
+    /// receiver): `b'J'` / `b'D'` occupy two local slots with the same filler
+    /// `copy_args_to_locals` writes, everything else one. The slot bits are
+    /// stored verbatim, which is exactly what `from_value_kinded` produced
+    /// from the decoded `Value` (`long` / `double_raw` / tagged scalars), so
+    /// the resulting locals are bit-identical to the general path's.
+    pub fn new_pooled_cached_compact(
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[(CompactValue, u8)],
+        locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+        stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
+    ) -> Self {
+        let CachedCompactParts {
+            locals,
+            local_kinds: kinds,
+            stack,
+            eff_max_locals,
+        } = build_cached_compact_parts(&cached, args, locals_pool, stacks_pool);
+        let class_id = cached.declaring_class_id;
+        let code = cached.code.clone();
+        let max_stack = cached.max_stack;
+        Self {
+            class_id,
+            pc: 0,
+            last_instr_pc: 0,
+            locals,
+            local_kinds: kinds,
+            stack,
+            code,
+            max_stack,
+            max_locals: eff_max_locals,
+            inner: {
+                count_frame_kind(false);
+                FrameInner::Cached(cached)
+            },
+            method_index: None,
+            backward_count: 0,
+            osr_attempt_counts: Vec::new(),
+            monitor_on_exit: None,
+            seq: next_frame_seq(),
+            exec_epoch: 0,
+        }
+    }
+
+    /// Rebuild this frame in place as a call to `cached`, reusing its
+    /// `locals`, `local_kinds` and operand-stack buffers.
+    ///
+    /// This is [`Self::new_pooled_cached_compact`] with the allocation
+    /// question already answered: the frame is a retired slot of the thread's
+    /// `FrameStack` (see `FrameStack::push_cached_compact_reusing`), so its
+    /// four buffers are already here and none of them has to travel through
+    /// the thread's pools. Measured 2026-09-02, that churn — not the filling
+    /// of the buffers — is what `frame_build` and `ret_recycle` are mostly
+    /// made of.
+    ///
+    /// Every field is overwritten, so nothing of the retired frame survives
+    /// into the new one. The buffers' *contents* above what this writes are
+    /// not live: `locals` is sized and filled here exactly as the constructor
+    /// does, and the operand stack is empty with `len = 0`.
+    pub fn reset_cached_compact(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[(CompactValue, u8)],
+    ) {
+        let needed: usize = args
+            .iter()
+            .map(|(_, t)| if matches!(*t, b'J' | b'D') { 2 } else { 1 })
+            .sum();
+        let n = (cached.max_locals as usize).max(needed);
+        let eff_max_locals = u16::try_from(n).unwrap_or(u16::MAX);
+
+        self.locals.clear();
+        self.local_kinds.clear();
+        self.locals.reserve(n);
+        self.local_kinds.reserve(n);
+        for (cv, tag) in args {
+            self.locals.push(*cv);
+            match *tag {
+                b'J' => {
+                    self.local_kinds.push(LKIND_LONG);
+                    self.locals.push(CompactValue::uninitialized());
+                    self.local_kinds.push(LKIND_OTHER);
+                }
+                b'D' => {
+                    self.local_kinds.push(LKIND_DOUBLE);
+                    self.locals.push(CompactValue::uninitialized());
+                    self.local_kinds.push(LKIND_OTHER);
+                }
+                _ => self.local_kinds.push(LKIND_OTHER),
+            }
+        }
+        self.locals.resize(n, CompactValue::uninitialized());
+        self.local_kinds.resize(n, LKIND_OTHER);
+        debug_assert_eq!(self.locals.len(), n);
+        debug_assert_eq!(self.local_kinds.len(), n);
+
+        self.reset_cached_tail(cached, eff_max_locals);
+    }
+
+    /// Everything a cached-frame reset does once its locals are laid down:
+    /// the operand stack, and every scalar field.
+    ///
+    /// Shared by [`Self::reset_cached_compact`] and [`Self::reset_cached_value`]
+    /// so the two argument representations cannot drift in what they leave
+    /// behind. Every field is overwritten, so nothing of the retired frame
+    /// survives into the new one.
+    #[inline]
+    fn reset_cached_tail(&mut self, cached: Arc<CachedBytecodeMethod>, eff_max_locals: u16) {
+        self.stack
+            .reset_in_place((cached.max_stack as usize).max(16) + 8);
+
+        self.class_id = cached.declaring_class_id;
+        self.pc = 0;
+        self.last_instr_pc = 0;
+        self.code = cached.code.clone();
+        self.max_stack = cached.max_stack;
+        self.max_locals = eff_max_locals;
+        self.method_index = None;
+        self.backward_count = 0;
+        self.osr_attempt_counts.clear();
+        self.monitor_on_exit = None;
+        self.seq = next_frame_seq();
+        self.exec_epoch = 0;
+        count_frame_kind(false);
+        self.inner = FrameInner::Cached(cached);
+    }
+
+    /// [`Self::reset_cached_compact`] for arguments that are still `Value`s.
+    ///
+    /// The general dispatchers' half of frame-slot reuse. `push_args_to_locals`
+    /// is the same function `init_locals_pooled` uses, so the locals this
+    /// leaves are those `Frame::new_pooled_cached` would have built — the
+    /// difference is only that the buffers were already here.
+    pub fn reset_cached_value(&mut self, cached: Arc<CachedBytecodeMethod>, args: &[Value]) {
+        let eff_max_locals = effective_max_locals(cached.max_locals, args);
+        let n = eff_max_locals as usize;
+
+        self.locals.clear();
+        self.local_kinds.clear();
+        self.locals.reserve(n);
+        self.local_kinds.reserve(n);
+        push_args_to_locals(&mut self.locals, &mut self.local_kinds, args, n);
+        self.locals.resize(n, CompactValue::uninitialized());
+        self.local_kinds.resize(n, LKIND_OTHER);
+        debug_assert_eq!(self.locals.len(), n);
+        debug_assert_eq!(self.local_kinds.len(), n);
+
+        self.reset_cached_tail(cached, eff_max_locals);
+    }
+
+
+    /// A `Frame` from pieces [`build_cached_compact_parts`] produced.
+    #[inline]
+    fn from_cached_compact_parts(
+        cached: Arc<CachedBytecodeMethod>,
+        locals: Vec<CompactValue>,
+        local_kinds: Vec<u8>,
+        stack: ValueStack,
+        eff_max_locals: u16,
+    ) -> Self {
         let class_id = cached.declaring_class_id;
         let code = cached.code.clone();
         let max_stack = cached.max_stack;
@@ -1120,12 +1476,6 @@ impl Frame {
                 count_frame_kind(false);
                 FrameInner::Cached(cached)
             },
-            // CR-CLO-2 cached half: `CachedBytecodeMethod` does not yet carry a
-            // method slot (see the field doc — its 38 struct literals live in
-            // four crates and none has a `..` tail, so the field cannot be
-            // added from here without breaking the workspace). When it lands
-            // this becomes `cached.method_index`, resolved once per method
-            // instead of once per push, and this is the only line that changes.
             method_index: None,
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
@@ -1135,8 +1485,6 @@ impl Frame {
         }
     }
 
-    /// Reset this frame in-place for tail-call elimination.
-    /// Reuses the existing Vec allocations (locals, stack) to avoid allocation.
     pub fn reset_for_tail_call(
         &mut self,
         class_id: ClassId,
@@ -1303,6 +1651,35 @@ impl Frame {
         match &self.inner {
             FrameInner::Owned(_) => None,
             FrameInner::Cached(cm) => Some(cm),
+        }
+    }
+
+    /// This frame's method return-type tag byte — the character after `')'`
+    /// in its descriptor, or `b'V'` for void and for a malformed descriptor.
+    ///
+    /// # Why it is a method rather than a call to `jit::return_type`
+    ///
+    /// `areturn` needs this on **every** reference return, to pick the
+    /// `coerce_value_for_return_validated` shape, and in object-oriented
+    /// bytecode most returns are reference returns. The call it replaces
+    /// (`crate::jit::return_type(frame.method_descriptor())`) is a linear scan
+    /// of the descriptor string for `')'`, so a method returning
+    /// `Ljava/util/Map;` from a two-reference-parameter signature paid forty
+    /// byte comparisons per return.
+    ///
+    /// A `Cached` frame answers from the `OnceLock` on its shared
+    /// `CachedBytecodeMethod`, so the scan happens once per method. An
+    /// `Owned` frame has no such record and keeps the scan — those are the
+    /// uncached, reflective and synthetic pushes, not the hot path.
+    ///
+    /// `CachedBytecodeMethod::return_tag` honours
+    /// `CRATONVM_JIT_NO_DESCRIPTOR_FACTS`, so the switch reverts this to the
+    /// per-return scan on both arms.
+    #[inline]
+    pub fn return_tag(&self) -> u8 {
+        match &self.inner {
+            FrameInner::Cached(cm) => cm.return_tag(),
+            FrameInner::Owned(o) => cratonvm_jit::return_type(&o.method_descriptor),
         }
     }
 
@@ -2331,6 +2708,18 @@ pub struct FrameStack {
     /// Backing storage. Never reallocated except through `grow_for`, which
     /// bumps `reloc_epoch`.
     buf: Vec<Frame>,
+    /// Logical top of stack. `buf.len()` is the **high-water mark**: the
+    /// slots in `depth..buf.len()` hold retired frames whose `locals`,
+    /// `local_kinds` and operand-stack buffers are kept allocated, so the
+    /// next call at that depth is built in them instead of routing a fresh
+    /// set through the thread's pools.
+    ///
+    /// Nothing above `depth` is live: every accessor on this type is
+    /// bounded by it, so the GC root scan, the stack walker and every
+    /// `frames[i]` see exactly the frames they saw before. A retired
+    /// frame's leftover contents are overwritten by
+    /// [`Frame::reset_cached_compact`] before the slot becomes live again.
+    depth: usize,
     /// Incremented every time the backing buffer is reallocated with live
     /// frames in it — i.e. every time frame addresses change. Wrapping is
     /// harmless: consumers only ever compare for equality across a short
@@ -2344,6 +2733,7 @@ impl FrameStack {
     pub const fn new() -> Self {
         Self {
             buf: Vec::new(),
+            depth: 0,
             reloc_epoch: 0,
         }
     }
@@ -2360,7 +2750,10 @@ impl FrameStack {
     /// How many more frames can be pushed with **no** frame moving.
     #[inline(always)]
     pub fn stable_headroom(&self) -> usize {
-        self.buf.capacity() - self.buf.len()
+        // Measured against the LIVE depth, not the allocation: a push
+        // overwrites a retired slot before it appends, so a retired slot is
+        // headroom.
+        self.buf.capacity() - self.depth
     }
 
     /// Guarantee that the next `additional` pushes will not move any frame.
@@ -2371,7 +2764,7 @@ impl FrameStack {
     /// across the pushes.
     #[inline(always)]
     pub fn reserve_stable(&mut self, additional: usize) {
-        if self.buf.len().saturating_add(additional) > self.buf.capacity() {
+        if self.depth.saturating_add(additional) > self.buf.capacity() {
             self.grow_for(additional);
         }
     }
@@ -2385,7 +2778,7 @@ impl FrameStack {
     fn grow_for(&mut self, additional: usize) {
         let len = self.buf.len();
         let cap = self.buf.capacity();
-        let needed = len.saturating_add(additional);
+        let needed = self.depth.saturating_add(additional);
         let target = if cap == 0 {
             // No frames exist yet, so nothing can move: no epoch bump.
             needed.max(FRAME_STACK_INITIAL_STABLE_CAP)
@@ -2408,7 +2801,7 @@ impl FrameStack {
     /// type-level docs. The pointer itself is always safe to obtain.
     #[inline(always)]
     pub fn frame_ptr(&mut self, idx: usize) -> *mut Frame {
-        if idx < self.buf.len() {
+        if idx < self.depth {
             // SAFETY: idx is in bounds, so the offset is inside the allocation.
             unsafe { self.buf.as_mut_ptr().add(idx) }
         } else {
@@ -2419,7 +2812,7 @@ impl FrameStack {
     /// Raw pointer to the top frame, or null when the stack is empty.
     #[inline(always)]
     pub fn current_ptr(&mut self) -> *mut Frame {
-        let len = self.buf.len();
+        let len = self.depth;
         if len == 0 {
             std::ptr::null_mut()
         } else {
@@ -2441,89 +2834,131 @@ impl FrameStack {
     /// [`Self::reserve_stable`] for that.
     #[inline(always)]
     pub fn current_mut(&mut self) -> Option<&mut Frame> {
-        self.buf.last_mut()
+        self.live_mut().last_mut()
     }
 
     // ── Drop-in `Vec<Frame>` surface ────────────────────────────────────
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.depth
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.depth == 0
     }
 
     #[inline(always)]
     pub fn iter(&self) -> std::slice::Iter<'_, Frame> {
-        self.buf.iter()
+        self.live().iter()
     }
 
     #[inline(always)]
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Frame> {
-        self.buf.iter_mut()
+        self.live_mut().iter_mut()
     }
 
     #[inline(always)]
     pub fn first(&self) -> Option<&Frame> {
-        self.buf.first()
+        self.live().first()
     }
 
     #[inline(always)]
     pub fn last(&self) -> Option<&Frame> {
-        self.buf.last()
+        self.live().last()
     }
 
     #[inline(always)]
     pub fn last_mut(&mut self) -> Option<&mut Frame> {
-        self.buf.last_mut()
+        self.live_mut().last_mut()
     }
 
     #[inline(always)]
     pub fn get(&self, idx: usize) -> Option<&Frame> {
-        self.buf.get(idx)
+        self.live().get(idx)
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Frame> {
-        self.buf.get_mut(idx)
+        self.live_mut().get_mut(idx)
     }
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[Frame] {
-        &self.buf
+        self.live()
     }
 
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [Frame] {
-        &mut self.buf
+        self.live_mut()
     }
 
     /// Push a frame. Existing frames keep their addresses unless this call has
     /// to grow the buffer — see [`Self::reserve_stable`] to rule that out.
     #[inline(always)]
     pub fn push(&mut self, frame: Frame) {
+        // `CRATONVM_DBG_INTERP_FRAMES=1` — the census of what actually runs
+        // interpreted. One relaxed load when unarmed; see
+        // `crate::runtime::interp_census`.
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                frame.class_name(),
+                frame.method_name(),
+                frame.method_descriptor(),
+            );
+        }
         self.reserve_stable(1);
-        self.buf.push(frame);
+        if self.depth < self.buf.len() {
+            // Overwrite a retired slot. Its buffers are dropped with it;
+            // `push_frame_and_fire_entry` harvests them into the thread
+            // pools first, so the pooled constructors keep the recycling
+            // they have always relied on.
+            self.buf[self.depth] = frame;
+        } else {
+            self.buf.push(frame);
+        }
+        self.depth += 1;
     }
 
     /// Pop the top frame. Never moves any remaining frame.
     #[inline(always)]
     pub fn pop(&mut self) -> Option<Frame> {
+        if self.depth == 0 {
+            return None;
+        }
+        // A by-value pop hands the frame out, so the retired tail above it
+        // cannot stay behind: drop it and let the frame leave normally.
+        self.buf.truncate(self.depth);
+        self.depth -= 1;
         self.buf.pop()
     }
 
     /// Drop everything above depth `len`. Never moves any surviving frame.
     #[inline(always)]
     pub fn truncate(&mut self, len: usize) {
-        self.buf.truncate(len);
+        if len < self.depth {
+            self.depth = len;
+        }
+    }
+
+    /// `truncate`, and release the retired slots above it in the same step.
+    ///
+    /// This is the shape the pooled recycle path wants: it has just harvested
+    /// the top frame's buffers, so the husk must actually be dropped rather
+    /// than retired with nothing in it.
+    #[inline(always)]
+    pub fn truncate_hard(&mut self, len: usize) {
+        if len < self.depth {
+            self.depth = len;
+        }
+        self.buf.truncate(self.depth);
     }
 
     /// Drop every frame. Retains the (stable) capacity.
     #[inline(always)]
     pub fn clear(&mut self) {
+        self.depth = 0;
         self.buf.clear();
     }
 
@@ -2537,7 +2972,9 @@ impl FrameStack {
     #[inline]
     pub fn insert(&mut self, idx: usize, frame: Frame) {
         self.reserve_stable(1);
+        self.buf.truncate(self.depth);
         self.buf.insert(idx, frame);
+        self.depth += 1;
     }
 }
 
@@ -2558,18 +2995,208 @@ impl std::fmt::Debug for FrameStack {
     }
 }
 
+impl FrameStack {
+    /// The live frames, `0..depth`. Everything the rest of the VM can see.
+    #[inline(always)]
+    fn live(&self) -> &[Frame] {
+        &self.buf[..self.depth]
+    }
+
+    #[inline(always)]
+    fn live_mut(&mut self) -> &mut [Frame] {
+        let d = self.depth;
+        &mut self.buf[..d]
+    }
+
+    /// Retire the top frame without destroying it, keeping its buffers in the
+    /// slot for the next call at this depth. The frame stops being live the
+    /// instant `depth` drops.
+    #[inline(always)]
+    pub fn retire_top(&mut self) -> bool {
+        if self.depth == 0 {
+            return false;
+        }
+        self.depth -= 1;
+        true
+    }
+
+    /// Whether a retired slot is waiting at the current depth.
+    #[inline(always)]
+    pub fn has_retired_slot(&self) -> bool {
+        self.depth < self.buf.len()
+    }
+
+    /// The retired slot at the current depth, for harvesting its buffers
+    /// before an ordinary by-value push overwrites it.
+    #[inline(always)]
+    pub fn retired_slot_mut(&mut self) -> Option<&mut Frame> {
+        if self.depth < self.buf.len() {
+            let d = self.depth;
+            Some(&mut self.buf[d])
+        } else {
+            None
+        }
+    }
+
+    /// Rebuild the retired slot at the current depth as a frame for `cached`
+    /// and make it live, reusing its buffers. `false` when no slot is retired,
+    /// and the caller builds a frame the ordinary way.
+    #[inline]
+    pub fn push_cached_compact_reusing(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[(CompactValue, u8)],
+    ) -> bool {
+        if self.depth >= self.buf.len() {
+            return false;
+        }
+        // `CRATONVM_DBG_INTERP_FRAMES=1` — this is a frame push like any
+        // other, and the census must see it. It is recorded here rather than
+        // in `reset_cached_compact` because `FrameStack::push` records at the
+        // same level, and because a reset that is not a push (tail call) is
+        // not a new frame.
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
+        let d = self.depth;
+        self.buf[d].reset_cached_compact(cached, args);
+        self.depth += 1;
+        true
+    }
+
+    /// [`Self::push_cached_compact_reusing`] for the general dispatchers,
+    /// whose arguments are still `Value`s.
+    ///
+    /// The two differ only in how the argument slots are laid down; the
+    /// resulting locals are identical, which is what
+    /// [`Frame::reset_cached_value`] and [`Frame::reset_cached_compact`]
+    /// sharing [`Frame::reset_cached_tail`] pins.
+    #[inline]
+    pub fn push_cached_value_reusing(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        args: &[Value],
+    ) -> bool {
+        if self.depth >= self.buf.len() {
+            return false;
+        }
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
+        let d = self.depth;
+        self.buf[d].reset_cached_value(cached, args);
+        self.depth += 1;
+        true
+    }
+
+
+    /// Build a frame for `cached` **in** the stack's next slot.
+    ///
+    /// The counterpart to [`Self::push_cached_compact_reusing`] for the case
+    /// where no slot is retired — the first call at a depth, and every
+    /// by-value push, which harvests and trims the slot it would have reused.
+    /// `push` receives a `Frame` that has already been built somewhere else
+    /// and moves ~220 bytes into the slot; this writes the struct where it
+    /// belongs, so the only things that travel are the three buffer handles
+    /// the caller just took from the pools.
+    ///
+    /// The struct literal is written by `ptr::write` in this function, so the
+    /// destination is known to the compiler at the point of construction and
+    /// there is no intermediate to copy from.
+    #[inline]
+    pub fn emplace_cached_compact(
+        &mut self,
+        cached: Arc<CachedBytecodeMethod>,
+        locals: Vec<CompactValue>,
+        local_kinds: Vec<u8>,
+        stack: ValueStack,
+        eff_max_locals: u16,
+    ) {
+        if crate::runtime::interp_census::interp_frames_enabled() {
+            crate::runtime::interp_census::record_interp_frame(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            );
+        }
+        self.reserve_stable(1);
+        if self.depth < self.buf.len() {
+            // A retired slot is here after all (a caller that did not harvest).
+            // Assigning drops it, which is exactly what `push` would have done.
+            self.buf[self.depth] = Frame::from_cached_compact_parts(
+                cached,
+                locals,
+                local_kinds,
+                stack,
+                eff_max_locals,
+            );
+        } else {
+            let class_id = cached.declaring_class_id;
+            let code = cached.code.clone();
+            let max_stack = cached.max_stack;
+            count_frame_kind(false);
+            let seq = next_frame_seq();
+            // SAFETY: `reserve_stable(1)` guarantees `capacity > buf.len()`,
+            // and `depth == buf.len()` in this branch, so `dst` is the one
+            // slot past the last initialised element and is valid for a write
+            // of a `Frame`. `set_len` publishes it only after it is fully
+            // initialised, and nothing in between can panic or observe it.
+            unsafe {
+                let dst = self.buf.as_mut_ptr().add(self.depth);
+                std::ptr::write(
+                    dst,
+                    Frame {
+                        class_id,
+                        pc: 0,
+                        last_instr_pc: 0,
+                        locals,
+                        local_kinds,
+                        stack,
+                        code,
+                        max_stack,
+                        max_locals: eff_max_locals,
+                        inner: FrameInner::Cached(cached),
+                        method_index: None,
+                        backward_count: 0,
+                        osr_attempt_counts: Vec::new(),
+                        monitor_on_exit: None,
+                        seq,
+                        exec_epoch: 0,
+                    },
+                );
+                self.buf.set_len(self.depth + 1);
+            }
+        }
+        self.depth += 1;
+    }
+
+    /// Drop every retired slot, releasing their buffers.
+    pub fn trim_retired(&mut self) {
+        let d = self.depth;
+        self.buf.truncate(d);
+    }
+}
+
 impl std::ops::Deref for FrameStack {
     type Target = [Frame];
     #[inline(always)]
     fn deref(&self) -> &[Frame] {
-        &self.buf
+        self.live()
     }
 }
 
 impl std::ops::DerefMut for FrameStack {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut [Frame] {
-        &mut self.buf
+        self.live_mut()
     }
 }
 
@@ -2577,14 +3204,14 @@ impl<I: std::slice::SliceIndex<[Frame]>> std::ops::Index<I> for FrameStack {
     type Output = I::Output;
     #[inline(always)]
     fn index(&self, index: I) -> &Self::Output {
-        std::ops::Index::index(&*self.buf, index)
+        std::ops::Index::index(self.live(), index)
     }
 }
 
 impl<I: std::slice::SliceIndex<[Frame]>> std::ops::IndexMut<I> for FrameStack {
     #[inline(always)]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        std::ops::IndexMut::index_mut(&mut *self.buf, index)
+        std::ops::IndexMut::index_mut(self.live_mut(), index)
     }
 }
 
@@ -2593,7 +3220,7 @@ impl<'a> IntoIterator for &'a FrameStack {
     type IntoIter = std::slice::Iter<'a, Frame>;
     #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
-        self.buf.iter()
+        self.live().iter()
     }
 }
 
@@ -2602,7 +3229,7 @@ impl<'a> IntoIterator for &'a mut FrameStack {
     type IntoIter = std::slice::IterMut<'a, Frame>;
     #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
-        self.buf.iter_mut()
+        self.live_mut().iter_mut()
     }
 }
 
@@ -2610,15 +3237,20 @@ impl IntoIterator for FrameStack {
     type Item = Frame;
     type IntoIter = std::vec::IntoIter<Frame>;
     #[inline(always)]
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        // Retired slots are not frames anyone may see.
+        self.trim_retired();
         self.buf.into_iter()
     }
 }
 
 impl FromIterator<Frame> for FrameStack {
     fn from_iter<T: IntoIterator<Item = Frame>>(iter: T) -> Self {
+        let buf: Vec<Frame> = iter.into_iter().collect();
+        let depth = buf.len();
         Self {
-            buf: iter.into_iter().collect(),
+            buf,
+            depth,
             reloc_epoch: 0,
         }
     }
@@ -2627,8 +3259,10 @@ impl FromIterator<Frame> for FrameStack {
 impl From<Vec<Frame>> for FrameStack {
     #[inline]
     fn from(buf: Vec<Frame>) -> Self {
+        let depth = buf.len();
         Self {
             buf,
+            depth,
             reloc_epoch: 0,
         }
     }
@@ -2636,7 +3270,8 @@ impl From<Vec<Frame>> for FrameStack {
 
 impl From<FrameStack> for Vec<Frame> {
     #[inline]
-    fn from(fs: FrameStack) -> Vec<Frame> {
+    fn from(mut fs: FrameStack) -> Vec<Frame> {
+        fs.trim_retired();
         fs.buf
     }
 }
@@ -2644,6 +3279,91 @@ impl From<FrameStack> for Vec<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the frame-push locals layout against the resize-then-overwrite form
+    /// it replaced.
+    ///
+    /// `init_locals_from_parts` used to size both buffers to `max_locals` and
+    /// then copy the arguments over the leading slots; it now pushes the
+    /// arguments and resizes the remainder, so each slot is written once. The
+    /// two must produce byte-identical buffers, or a frame starts life with the
+    /// wrong local — which is a silent wrong value, and for a reference slot a
+    /// GC-root question.
+    ///
+    /// Covers the three shapes that make the layouts differ: category-2
+    /// arguments (two slots, upper one filler), a tail of unset locals, and the
+    /// defensive clamp where the arguments alone would overrun `max_locals`.
+    #[test]
+    fn pushed_locals_match_the_resize_then_copy_layout() {
+        fn reference(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, Vec<u8>) {
+            let n = effective_max_locals(max_locals, args) as usize;
+            let mut locals = vec![CompactValue::uninitialized(); n];
+            let mut kinds = vec![LKIND_OTHER; n];
+            copy_args_to_locals(&mut locals, &mut kinds, args);
+            (locals, kinds)
+        }
+
+        let obj_free_cases: Vec<(u16, Vec<Value>)> = vec![
+            (0, vec![]),
+            (4, vec![]),
+            (4, vec![Value::Int(7)]),
+            (4, vec![Value::Int(1), Value::Int(2)]),
+            // Category-2: each takes two slots with the upper half unset.
+            (4, vec![Value::Long(0x1234_5678_9abc_def0)]),
+            (4, vec![Value::Double(-0.0)]),
+            (6, vec![Value::Long(1), Value::Int(2), Value::Double(3.5)]),
+            // Mixed with a null reference, and with a retaddr.
+            (5, vec![Value::Object(None), Value::Int(9)]),
+            (5, vec![Value::ReturnAddress(11), Value::Float(1.5)]),
+            // Declared max_locals SMALLER than the arguments need: the
+            // effective count is clamped up, and both forms must agree on it.
+            (1, vec![Value::Long(5), Value::Long(6)]),
+            (0, vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+        ];
+
+        for (max_locals, args) in obj_free_cases {
+            let (want_locals, want_kinds) = reference(max_locals, &args);
+            let (got_locals, got_kinds, eff) = init_locals_from_parts(max_locals, &args, None);
+            assert_eq!(
+                eff as usize,
+                want_locals.len(),
+                "effective_max_locals for max_locals={max_locals} args={args:?}"
+            );
+            assert_eq!(
+                got_locals.iter().map(|c| c.raw_bits()).collect::<Vec<_>>(),
+                want_locals.iter().map(|c| c.raw_bits()).collect::<Vec<_>>(),
+                "locals differ for max_locals={max_locals} args={args:?}"
+            );
+            assert_eq!(
+                got_kinds, want_kinds,
+                "local kinds differ for max_locals={max_locals} args={args:?}"
+            );
+        }
+    }
+
+    /// The same equivalence when the buffers come from the pool with stale
+    /// content in them — the recycled bytes must not survive into either form.
+    #[test]
+    fn pushed_locals_do_not_leak_recycled_slots() {
+        let args = vec![Value::Int(3)];
+        let dirty_vals: Vec<u64> = vec![0xDEAD_BEEF_DEAD_BEEF; 16];
+        let dirty_kinds: Vec<u8> = vec![LKIND_LONG; 16];
+        let (locals, kinds, eff) =
+            init_locals_from_parts(4, &args, Some((dirty_vals, dirty_kinds)));
+        assert_eq!(eff, 4);
+        assert_eq!(locals.len(), 4);
+        assert_eq!(kinds.len(), 4);
+        assert_eq!(locals[0].as_int(), Some(3));
+        assert_eq!(kinds[0], LKIND_OTHER);
+        for i in 1..4 {
+            assert_eq!(
+                locals[i].raw_bits(),
+                CompactValue::uninitialized().raw_bits(),
+                "slot {i} kept recycled content"
+            );
+            assert_eq!(kinds[i], LKIND_OTHER, "kind {i} kept recycled content");
+        }
+    }
 
     #[test]
     fn frame_creation_with_args() {
@@ -2753,6 +3473,168 @@ mod tests {
         assert_eq!(thawed.method_name(), "m");
     }
 
+    /// A `CachedBytecodeMethod` shaped for the frame-install tests.
+    fn cached_probe(
+        name: &str,
+        descriptor: &str,
+        max_locals: u16,
+        max_stack: u16,
+    ) -> Arc<CachedBytecodeMethod> {
+        Arc::new(CachedBytecodeMethod {
+            declaring_class_id: ClassId::new(0),
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from(name),
+            method_descriptor: Arc::from(descriptor),
+            source_file: Some(Arc::from("Target.java")),
+            code: padded_bytecode(&[0xb1]),
+            exception_table: Arc::from(Vec::<ExceptionTableEntry>::new().into_boxed_slice()),
+            max_stack,
+            max_locals,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
+            intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Everything a caller can observe about an installed frame, so the three
+    /// install paths can be compared as wholes rather than field by field
+    /// (`seq` excluded: it is a fresh counter value by design).
+    fn frame_shape(f: &Frame) -> (ClassId, usize, u16, u16, usize, Vec<u64>, Vec<u8>) {
+        (
+            f.class_id,
+            f.pc,
+            f.max_stack,
+            f.max_locals,
+            f.stack.len(),
+            f.locals.iter().map(|c| c.raw_bits()).collect(),
+            f.local_kinds.clone(),
+        )
+    }
+
+    #[test]
+    fn rebuilding_a_retired_slot_holds_what_a_by_value_push_held() {
+        // The claim the general dispatchers' slot reuse rests on. If these two
+        // can differ, a call that happens to find a retired slot runs with
+        // different locals from the same call that does not — which is a
+        // wrong-answer bug that no test of either path alone can see.
+        let cached = cached_probe("m", "(IJLjava/lang/Object;)V", 6, 3);
+        let args = [
+            Value::Int(7),
+            Value::Long(-9_000_000_000),
+            Value::Object(None),
+        ];
+
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+        let fresh = Frame::new_pooled_cached(
+            Arc::clone(&cached),
+            &args,
+            &mut locals_pool,
+            &mut stacks_pool,
+        );
+
+        // A frame that has been used and is now being rebuilt: dirty locals, a
+        // non-empty operand stack, a pc partway through, a monitor to release.
+        let mut used = Frame::new_pooled_cached(
+            cached_probe("other", "(D)V", 12, 9),
+            &[Value::Double(1.5)],
+            &mut locals_pool,
+            &mut stacks_pool,
+        );
+        used.pc = 17;
+        used.backward_count = 42;
+        let _ = used.stack.push(Value::Int(1234));
+        used.reset_cached_value(Arc::clone(&cached), &args);
+
+        assert_eq!(frame_shape(&used), frame_shape(&fresh));
+        assert_eq!(used.backward_count, 0);
+        assert!(used.monitor_on_exit.is_none());
+        assert_eq!(used.method_name(), "m");
+    }
+
+    #[test]
+    fn the_value_and_compact_resets_lay_down_the_same_locals() {
+        // `reset_cached_value` and `reset_cached_compact` are the two argument
+        // representations of one operation. A `long` is the case that can
+        // diverge: it occupies two local slots and the upper half is filler.
+        let cached = cached_probe("m", "(JI)V", 4, 2);
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+
+        let mut by_value =
+            Frame::new_pooled_cached(Arc::clone(&cached), &[], &mut locals_pool, &mut stacks_pool);
+        by_value.reset_cached_value(Arc::clone(&cached), &[Value::Long(5), Value::Int(6)]);
+
+        let mut by_slot =
+            Frame::new_pooled_cached(Arc::clone(&cached), &[], &mut locals_pool, &mut stacks_pool);
+        by_slot.reset_cached_compact(
+            Arc::clone(&cached),
+            &[
+                (CompactValue::from_value_kinded(Value::Long(5)), b'J'),
+                (CompactValue::from_value_kinded(Value::Int(6)), b'I'),
+            ],
+        );
+
+        assert_eq!(frame_shape(&by_slot), frame_shape(&by_value));
+    }
+
+    #[test]
+    fn an_emplaced_value_frame_matches_a_pushed_one() {
+        // The other half of the ladder: no retired slot, so the frame is
+        // written into the next slot instead of being built and moved.
+        let cached = cached_probe("m", "(FI)V", 5, 4);
+        let args = [Value::Float(2.5), Value::Int(-3)];
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+
+        let mut pushed = FrameStack::new();
+        pushed.push(Frame::new_pooled_cached(
+            Arc::clone(&cached),
+            &args,
+            &mut locals_pool,
+            &mut stacks_pool,
+        ));
+
+        let mut emplaced = FrameStack::new();
+        let (locals, kinds, stack, eff) =
+            take_cached_value_parts(&cached, &args, &mut locals_pool, &mut stacks_pool);
+        emplaced.emplace_cached_compact(Arc::clone(&cached), locals, kinds, stack, eff);
+
+        assert_eq!(emplaced.len(), 1);
+        assert_eq!(frame_shape(&emplaced[0]), frame_shape(&pushed[0]));
+    }
+
+    #[test]
+    fn a_value_reuse_push_is_refused_when_no_slot_is_retired() {
+        // `push_cached_value_reusing` must never grow the stack: the caller
+        // reads `false` as "build one", and a version that pushed anyway would
+        // install the frame twice.
+        let cached = cached_probe("m", "()V", 1, 1);
+        let mut frames = FrameStack::new();
+        assert!(!frames.push_cached_value_reusing(Arc::clone(&cached), &[]));
+        assert_eq!(frames.len(), 0);
+
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+        frames.push(Frame::new_pooled_cached(
+            Arc::clone(&cached),
+            &[],
+            &mut locals_pool,
+            &mut stacks_pool,
+        ));
+        assert!(frames.retire_top());
+        assert!(frames.push_cached_value_reusing(cached, &[]));
+        assert_eq!(frames.len(), 1);
+    }
+
     #[test]
     fn a_cached_frame_reports_no_index_until_the_shared_entry_carries_one() {
         // Pins the documented state of the cached half: `CachedBytecodeMethod`
@@ -2775,7 +3657,9 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            descriptor_facts_cache: std::sync::OnceLock::new(),
             intercept_shape_cache: std::sync::OnceLock::new(),
+            interp_invocations: std::sync::atomic::AtomicU32::new(0),
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),

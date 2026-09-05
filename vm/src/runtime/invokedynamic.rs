@@ -442,7 +442,21 @@ pub unsafe fn execute_jit_string_concat_raw(
     if arg_types.len() != arg_count || (arg_count != 0 && args_ptr.is_null()) {
         return None;
     }
-    let raw_args = std::slice::from_raw_parts(args_ptr, arg_count);
+    // NOT `from_raw_parts(args_ptr, 0)` when there are no arguments:
+    // `from_raw_parts` requires a non-null, aligned pointer even for a length
+    // of zero, and the guard directly above deliberately admits a NULL
+    // `args_ptr` in exactly that case (a zero-arg call sequence pushes
+    // nothing, so the compiled code has no argument block to point at). A
+    // debug build's `unsafe precondition` check aborts the process on it. The
+    // twin in `execute_jit_indy_generic_raw` below is where that was observed;
+    // this one is the same shape and is corrected with it rather than left as
+    // the copy that still aborts. (A zero-argument concat is `"" + ""` folded
+    // to a site with no operands — rare, not impossible.)
+    let raw_args = if arg_count == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args_ptr, arg_count)
+    };
     let mut values = Vec::with_capacity(arg_count);
     for (&raw, ty) in raw_args.iter().zip(arg_types.iter()) {
         let value = match ty {
@@ -496,6 +510,25 @@ pub unsafe fn execute_jit_string_concat_raw(
         });
     thread.frames.pop();
     result
+}
+
+/// `CRATONVM_JIT_INDY_LAMBDA_FAST` — default-ON, `=0` opts out. See the fast
+/// path in [`execute_jit_indy_generic_raw`].
+fn jit_indy_lambda_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static GATE: AtomicU8 = AtomicU8::new(0);
+    match GATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INDY_LAMBDA_FAST") {
+                Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+                Err(_) => true,
+            };
+            GATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 /// Execute a compiled `LambdaMetafactory` site — the generic half of the
@@ -555,7 +588,20 @@ pub unsafe fn execute_jit_indy_generic_raw(
         }
         .into());
     }
-    let raw_args = std::slice::from_raw_parts(args_ptr, arg_count);
+    // NOT `from_raw_parts(args_ptr, 0)` when there are no arguments:
+    // `from_raw_parts` requires a non-null, aligned pointer even for a length
+    // of zero, and the guard directly above deliberately admits a NULL
+    // `args_ptr` in exactly that case (a zero-arg call sequence pushes
+    // nothing, so the compiled code has no argument block to point at). A
+    // debug build's `unsafe precondition` check aborts the process on it —
+    // `cratonvm-vm --test class_loader_unload_regression
+    // custom_loader_metadata_is_reclaimed_with_jit`, whose lambda call sites
+    // take exactly this door.
+    let raw_args = if arg_count == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args_ptr, arg_count)
+    };
     let mut values = Vec::with_capacity(arg_count);
     for (&raw, ty) in raw_args.iter().zip(arg_types.iter()) {
         // Descriptor-typed, never bits-typed: a category-2 value must not be
@@ -574,6 +620,55 @@ pub unsafe fn execute_jit_indy_generic_raw(
             }
             _ => Value::Int(raw as i32),
         });
+    }
+    // Frame-free fast path: an already-bootstrapped `LambdaMetafactory` site
+    // is nothing but an allocation, and the frame below exists only to carry
+    // the captures to it on an operand stack. Skipping it removes the largest
+    // single population in the `CRATONVM_DBG_INTERP_FRAMES` census of
+    // `HibfixComposeProbe2` — 63.5 % of every interpreted frame push on that
+    // workload was this bridge.
+    //
+    // Deliberately narrow. It engages only when the site is ALREADY in the
+    // resolution cache (so bootstrapping still runs its normal course through
+    // `execute_invokedynamic`), only for `ResolvedCallSite::Lambda`, and only
+    // when the site's capture count agrees with what the call sequence pushed.
+    // Anything else falls through to the frame path unchanged.
+    //
+    // `site_pc = 0` matches what the synthetic frame's `pc` already was, so the
+    // zero-capture singleton key is byte-identical to today's.
+    // `CRATONVM_JIT_INDY_LAMBDA_FAST=0` restores the frame path so the two arms
+    // can be priced in one binary.
+    if jit_indy_lambda_fast_enabled() && site.return_type == b'L' {
+        let cached = {
+            let cache = shared.classes.resolution_cache.read();
+            match cache.get_call_site(site.class_id, site.cp_index) {
+                Some(ResolvedCallSite::Lambda(lcs)) => Some(lcs.clone()),
+                _ => None,
+            }
+        };
+        if let Some(lcs) = cached {
+            if lcs.capture_types.len() == arg_count {
+                let proxy = allocate_lambda_proxy_from_values(
+                    shared,
+                    thread,
+                    lcs.proxy_class_id,
+                    values,
+                    0,
+                )?;
+                return Ok((proxy.as_ptr() as i64, Some(proxy)));
+            }
+            // Capture-count disagreement: fall through to the frame path,
+            // which raises the internal error rather than guessing. `values`
+            // was moved above only inside the taken branch.
+            return Err(VmError::Internal {
+                message: format!(
+                    "jit indy bridge: lambda site expects {} captures, call sequence pushed {}",
+                    lcs.capture_types.len(),
+                    arg_count
+                ),
+            }
+            .into());
+        }
     }
     let frame_idx = thread.frames.len();
     // `new_from_arcs`, not `new`: every part is precomputed on the site, so
@@ -1938,25 +2033,7 @@ fn allocate_lambda_proxy(
     capture_types: &[char],
 ) -> Result<(), MethodCallFailed> {
     let num_captures = capture_types.len();
-
-    // Fast path: a zero-capture call site whose singleton was already
-    // minted on a prior invocation just returns the cached instance —
-    // matches real HotSpot's cached-INSTANCE-field optimization for
-    // non-capturing lambdas (see LAMBDA_SINGLETON_CACHE above).
-    // Per-INSTRUCTION identity: see LAMBDA_SINGLETON_CACHE's doc comment.
     let site_pc = thread.frames[frame_idx].pc;
-    if num_captures == 0 {
-        if let Some(cached) = lambda_singleton_cache()
-            .lock()
-            .get(&(shared.vm_identity, proxy_class_id, site_pc))
-            .copied()
-        {
-            thread.frames[frame_idx]
-                .stack
-                .push(Value::Object(Some(cached)))?;
-            return Ok(());
-        }
-    }
 
     // Pop captured values (pushed left-to-right, pop right-to-left)
     let mut captures: Vec<Value> = Vec::with_capacity(num_captures);
@@ -1964,6 +2041,47 @@ fn allocate_lambda_proxy(
         captures.push(thread.frames[frame_idx].stack.pop()?);
     }
     captures.reverse();
+
+    let proxy_ref =
+        allocate_lambda_proxy_from_values(shared, thread, proxy_class_id, captures, site_pc)?;
+    thread.frames[frame_idx]
+        .stack
+        .push(Value::Object(Some(proxy_ref)))?;
+    Ok(())
+}
+
+/// The frame-free half of [`allocate_lambda_proxy`]: everything from the
+/// zero-capture singleton probe to the field stores, given the captures as
+/// values rather than as operand-stack entries.
+///
+/// Split out for the compiled `invokedynamic` bridge, which has the captures in
+/// a spill buffer and had to build (and then discard) a whole interpreter frame
+/// just to hand them to this code — see `execute_jit_indy_generic_raw`'s fast
+/// path. `site_pc` is the singleton cache's per-INSTRUCTION key component; the
+/// bridge passes `0`, which is exactly what its synthetic frame's `pc` was.
+fn allocate_lambda_proxy_from_values(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    proxy_class_id: ClassId,
+    mut captures: Vec<Value>,
+    site_pc: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let num_captures = captures.len();
+
+    // Fast path: a zero-capture call site whose singleton was already
+    // minted on a prior invocation just returns the cached instance —
+    // matches real HotSpot's cached-INSTANCE-field optimization for
+    // non-capturing lambdas (see LAMBDA_SINGLETON_CACHE above).
+    // Per-INSTRUCTION identity: see LAMBDA_SINGLETON_CACHE's doc comment.
+    if num_captures == 0 {
+        if let Some(cached) = lambda_singleton_cache()
+            .lock()
+            .get(&(shared.vm_identity, proxy_class_id, site_pc))
+            .copied()
+        {
+            return Ok(cached);
+        }
+    }
 
     // GC-safety: captures sits in a raw Rust Vec, invisible to the
     // collector (native stale-local family). The fallback allocation path
@@ -2001,7 +2119,7 @@ fn allocate_lambda_proxy(
         Some(obj) => obj,
         None => {
             thread.tlab.retire();
-            super::interpreter::maybe_gc_forced_pub(shared, thread);
+            super::interpreter::maybe_gc_forced_pub_at(shared, thread, "invokedynamic");
             match shared
                 .mem
                 .heap
@@ -2045,12 +2163,7 @@ fn allocate_lambda_proxy(
             .insert((shared.vm_identity, proxy_class_id, site_pc), proxy_ref);
     }
 
-    // Push the proxy object onto the stack
-    thread.frames[frame_idx]
-        .stack
-        .push(Value::Object(Some(proxy_ref)))?;
-
-    Ok(())
+    Ok(proxy_ref)
 }
 
 /// Parse the return type of a method descriptor as a class name.

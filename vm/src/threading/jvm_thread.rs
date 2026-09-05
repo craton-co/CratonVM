@@ -795,6 +795,13 @@ pub struct JvmThread {
     /// See [`crate::runtime::interpreter::site_cache`] for the validity
     /// argument — read it before adding a `put` call site.
     pub field_sites: crate::runtime::interpreter::FieldSiteCache,
+    /// Quickened instance-field sites: the receiver class the site last
+    /// resolved against and the compact-layout offset / storage kind of the
+    /// field in that class, so the `getfield` / `putfield` fast arms can
+    /// load or store without resolving anything. Same key and epoch
+    /// validation as `field_sites`; filled by the slow handler on the access
+    /// that resolved the field.
+    pub fast_field_sites: crate::runtime::interpreter::FastFieldSiteCache,
 
     /// Per-thread resolved-method site cache — the same "resolved constant
     /// pool" for the `(descriptor, num_params)` pair that the argument-popping
@@ -821,6 +828,12 @@ pub struct JvmThread {
     /// from `class_sites` on purpose — see `CastSiteCache`'s docs for why a
     /// shared table would let a `checkcast` fill answer a `new`.
     pub cast_sites: crate::runtime::interpreter::CastSiteCache,
+
+    /// Per-thread memo for the interface receiver-selection re-check that
+    /// `execute_invokevirtual_cached` performs on every `invokeinterface`
+    /// cache hit. See `IfaceSelectSiteCache` for what it stores and why the
+    /// value has to carry the receiver class as well as the site.
+    pub iface_select_sites: crate::runtime::interpreter::IfaceSelectSiteCache,
 
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///
@@ -1070,9 +1083,11 @@ impl JvmThread {
             string_case_cache: Vec::new(),
             invoke_cache: InvokeCache::new(),
             field_sites: crate::runtime::interpreter::FieldSiteCache::new(),
+            fast_field_sites: crate::runtime::interpreter::FastFieldSiteCache::new(),
             method_sites: crate::runtime::interpreter::MethodSiteCache::new(),
             class_sites: crate::runtime::interpreter::ClassSiteCache::new(),
             cast_sites: crate::runtime::interpreter::CastSiteCache::new(),
+            iface_select_sites: crate::runtime::interpreter::IfaceSelectSiteCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
             pin_count: 0,
@@ -1167,6 +1182,21 @@ impl JvmThread {
         operand_stack_pool: &crate::runtime::alloc_fastpath::VecPool<u64>,
         tag_pool: &crate::runtime::alloc_fastpath::VecPool<u8>,
     ) -> bool {
+        if self.frames.is_empty() {
+            return false;
+        }
+        if !crate::runtime::env_cache::no_frame_slot_reuse() {
+            // Retire the frame where it lies. Its four buffers stay in the
+            // slot, and the next call at this depth is rebuilt in them by
+            // `FrameStack::push_cached_compact_reusing` -- no pool round
+            // trip, no `Vec` headers moved, no `Frame` moved. Nothing above
+            // the new depth is live, so nothing scans what it left.
+            //
+            // A by-value push at this depth still harvests the slot first
+            // (see `push_frame_and_fire_entry`), so the pooled constructors
+            // keep the recycling they have always had.
+            return self.frames.retire_top();
+        }
         let depth = self.frames.len();
         let Some(top) = self.frames.last_mut() else {
             return false;
@@ -1190,6 +1220,31 @@ impl JvmThread {
 
     /// Thread-local pool first, VM-wide pools once it is full. Shared by both
     /// recycle entry points so the routing policy cannot drift between them.
+    /// Move a retired frame slot's buffers into the thread pools, so an
+    /// ordinary by-value push may overwrite the slot without losing them.
+    ///
+    /// No-op when no slot is retired, which is the case on every first call at
+    /// a given depth and whenever `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` is set.
+    pub fn harvest_retired_slot(&mut self) {
+        let Some(slot) = self.frames.retired_slot_mut() else {
+            return;
+        };
+        let (local_vals, local_tags, stack_vals, stack_tags) = slot.take_pool_parts_in_place();
+        self.frames.trim_retired();
+        // A husk whose buffers were already harvested (the pooled recycle path,
+        // i.e. `CRATONVM_JIT_NO_FRAME_SLOT_REUSE`) hands back four EMPTY `Vec`s.
+        // Pushing those into the pools poisons them: the next frame build pops
+        // a zero-capacity buffer and reallocates from scratch, which measured
+        // as a 2-3x regression with `ret_recycle` at 427 cycles against 17.
+        if local_vals.capacity() == 0 && stack_vals.capacity() == 0 {
+            return;
+        }
+        if self.locals_pool.len() < MAX_POOL_SIZE {
+            self.locals_pool.push((local_vals, local_tags));
+            self.stacks_pool.push((stack_vals, stack_tags));
+        }
+    }
+
     fn route_pool_parts(
         &mut self,
         local_vals: Vec<u64>,

@@ -42,14 +42,14 @@ fn next_event_id() -> u32 {
 /// to [`Stream::record_event`]. Recording is not implicit on
 /// construction.
 pub struct Event {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     inner: EventCuda,
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     inner: EventStub,
     id: u32,
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu-driver"))]
 pub(crate) struct EventStub {
     /// `Some(stream_id)` after a successful `Stream::record_event`.
     pub(crate) recorded_on: std::sync::Mutex<Option<u32>>,
@@ -59,13 +59,13 @@ pub(crate) struct EventStub {
 // `sys::CUevent` directly and free it in `Drop`. The event is bound
 // to the device's primary context — we retain an `Arc<CudaDevice>`
 // to keep that context alive for the event's lifetime.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 struct EventCuda {
-    cu_event: cudarc::driver::sys::CUevent,
-    device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
+    cu_event: crate::drvsys::CUevent,
+    device: crate::backend::drv::DeviceHandle,
     /// The context free list this handle came from and returns to.
     /// See `backend_cuda::DeviceContextInner::event_pool`.
-    pool: std::sync::Arc<crate::backend_cuda::EventPool>,
+    pool: std::sync::Arc<crate::backend::EventPool>,
     /// Raw `CUstream` this event was last recorded on, or `0`.
     ///
     /// Read by [`Stream::wait_event`] to skip a wait that cannot mean
@@ -78,6 +78,29 @@ struct EventCuda {
     /// because each one waits on the `last_write` its predecessor
     /// stamped onto the same stream.
     recorded_on: std::sync::atomic::AtomicUsize,
+    /// Latched once this event has been OBSERVED complete.
+    ///
+    /// A CUDA event that has fired can never un-fire, so a
+    /// `cuStreamWaitEvent` on it is provably a no-op from that moment on
+    /// and can be skipped with no driver call at all. That is not a
+    /// corner case: a resident input buffer keeps the `last_write` its
+    /// upload or its zeroing stamped on it FOREVER — nothing rewrites
+    /// the slot, because nothing writes the buffer — so every later
+    /// launch that consumes it waited again on an event that had fired
+    /// long ago. With the dispatch path handing out streams round-robin
+    /// from a pool of four, the same-stream elision below never fires
+    /// for those, and the census read `waits issued=237 elided=0`.
+    ///
+    /// See `Stream::wait_event` for how the two flags are used together.
+    completed: std::sync::atomic::AtomicBool,
+    /// Set once the wait site has spent a `cuEventQuery` on this event.
+    ///
+    /// The probe is what turns an unknown event into a latched one, but
+    /// an event that is genuinely still in flight would otherwise pay a
+    /// query on EVERY wait — a driver call added to the one it was
+    /// meant to remove. Probing at most once per event bounds the cost
+    /// at one query and keeps the win for the case above.
+    probed: std::sync::atomic::AtomicBool,
 }
 
 // # Safety
@@ -95,16 +118,16 @@ struct EventCuda {
 // created on. Driving an event from an unbound thread is undefined
 // per the CUDA driver model. See `DeviceContext`'s `# Safety`
 // paragraph in `lib.rs` for the bridge-wide caller contract.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 // SAFETY: every public operation binds the retained owning device on the
 // current thread before using the raw event handle.
 unsafe impl Send for EventCuda {}
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 // SAFETY: CUDA serializes event operations and the retained device keeps the
 // handle's context alive; each driving thread binds that context first.
 unsafe impl Sync for EventCuda {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu-driver")]
 impl Drop for EventCuda {
     fn drop(&mut self) {
         // Return the handle to the context's free list rather than
@@ -127,7 +150,7 @@ impl Drop for EventCuda {
 impl Event {
     /// Create a fresh event. The event is NOT yet recorded — call
     /// [`Stream::record_event`] to associate it with a stream.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn new(_ctx: &DeviceContext) -> Result<Self> {
         // Stub mode: no real driver, but event construction is a
         // pure-Rust operation (allocating a Mutex + assigning an id),
@@ -143,7 +166,7 @@ impl Event {
         })
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn new(ctx: &DeviceContext) -> Result<Self> {
         let device = ctx.inner().device().clone();
         let pool = ctx.inner().event_pool().clone();
@@ -160,7 +183,7 @@ impl Event {
         // worst possible shape for a latent unbound-context bug.
         device
             .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         if let Some(cu_event) = pool.take() {
             cratonvm_types::gpu_event_census::note_recycled();
             return Ok(Self {
@@ -169,6 +192,8 @@ impl Event {
                     device,
                     pool,
                     recorded_on: std::sync::atomic::AtomicUsize::new(0),
+                    completed: std::sync::atomic::AtomicBool::new(false),
+                    probed: std::sync::atomic::AtomicBool::new(false),
                 },
                 id: next_event_id(),
             });
@@ -177,10 +202,7 @@ impl Event {
         // sync event: we don't want the (slightly more expensive)
         // timing variant since the bridge never measures elapsed
         // GPU time.
-        let cu_event = cudarc::driver::result::event::create(
-            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
-        )
-        .map_err(|e| DeviceError::Driver(format!("cuEventCreate: {e:?}")))?;
+        let cu_event = crate::backend::drv::event_create()?;
         cratonvm_types::gpu_event_census::note_created();
         Ok(Self {
             inner: EventCuda {
@@ -188,6 +210,8 @@ impl Event {
                 device,
                 pool,
                 recorded_on: std::sync::atomic::AtomicUsize::new(0),
+                completed: std::sync::atomic::AtomicBool::new(false),
+                probed: std::sync::atomic::AtomicBool::new(false),
             },
             id: next_event_id(),
         })
@@ -197,15 +221,42 @@ impl Event {
     /// [`Stream::wait_event`] can elide a same-stream wait. Cuda-mode
     /// only; the stub backend tracks the same thing as a stream id in
     /// `EventStub::recorded_on`.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn set_recorded_on(&self, stream: cudarc::driver::sys::CUstream) {
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn set_recorded_on(&self, stream: crate::drvsys::CUstream) {
+        // Order matters, and so does clearing FIRST. Recording an event
+        // that had already fired puts it back in flight, and a reader
+        // that saw `completed` between the store and the clear would
+        // skip a wait it needs. Clearing before publishing the new
+        // stream means the worst a racing reader can see is "not
+        // latched", which costs a wait rather than dropping one.
+        self.inner.completed.store(false, Ordering::Release);
+        self.inner.probed.store(false, Ordering::Release);
         self.inner
             .recorded_on
-            .store(stream as usize, Ordering::Relaxed);
+            .store(stream as usize, Ordering::Release);
+    }
+
+    /// Latch this event as observed-complete. See `EventCuda::completed`.
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn note_completed(&self) {
+        self.inner.completed.store(true, Ordering::Release);
+    }
+
+    /// Has this event been observed complete? See `EventCuda::completed`.
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.inner.completed.load(Ordering::Acquire)
+    }
+
+    /// Claim the one probe this event is allowed at a wait site.
+    /// Returns `true` to the single caller that may spend the query.
+    #[cfg(feature = "gpu-driver")]
+    pub(crate) fn claim_probe(&self) -> bool {
+        !self.inner.probed.swap(true, Ordering::AcqRel)
     }
 
     /// The raw stream this event was last recorded on, or `0`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub(crate) fn recorded_on_raw(&self) -> usize {
         self.inner.recorded_on.load(Ordering::Relaxed)
     }
@@ -223,16 +274,16 @@ impl Event {
     /// completion marker, and `ctx.compute` for `launch_on_stream`'s
     /// kernel-completion marker). Cuda-mode only — the stub backend
     /// has no real event handle.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     #[allow(dead_code)]
-    pub(crate) fn cu_event_raw(&self) -> cudarc::driver::sys::CUevent {
+    pub(crate) fn cu_event_raw(&self) -> crate::drvsys::CUevent {
         self.inner.cu_event
     }
 
     /// Block until this event is reached on whatever stream recorded
     /// it. Returns `Err(DeviceError::NoDriver)` in stub mode if the
     /// event was never recorded.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn synchronize(&self) -> Result<()> {
         let guard = self
             .inner
@@ -248,7 +299,7 @@ impl Event {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn synchronize(&self) -> Result<()> {
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
         // context to this thread before driving the event. The
@@ -258,14 +309,17 @@ impl Event {
         self.inner
             .device
             .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         // `cuEventSynchronize` is a host-side wait: returns when the
         // event has completed on whatever stream recorded it. If the
         // event was never recorded the call returns immediately (the
         // CUDA driver treats an unrecorded event as already-complete).
         // SAFETY: the owning device was bound above and keeps this event live.
-        unsafe { cudarc::driver::result::event::synchronize(self.inner.cu_event) }
-            .map_err(|e| DeviceError::Driver(format!("cuEventSynchronize: {e:?}")))
+        unsafe { crate::backend::drv::event_synchronize(self.inner.cu_event) }?;
+        // Returning from `cuEventSynchronize` IS an observation of
+        // completion, and the cheapest one there is to record.
+        self.note_completed();
+        Ok(())
     }
 
     /// Returns `true` if the recorded work has completed. Returns
@@ -276,7 +330,7 @@ impl Event {
     /// keep work pending — so this returns `Ok(true)` exactly when
     /// the event has been recorded on some stream, and `Ok(false)`
     /// otherwise.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn query(&self) -> Result<bool> {
         let guard = self
             .inner
@@ -286,7 +340,7 @@ impl Event {
         Ok(guard.is_some())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn query(&self) -> Result<bool> {
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
         // context to this thread before querying the event (see
@@ -294,25 +348,41 @@ impl Event {
         self.inner
             .device
             .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         // cudarc's `result::event::query` returns `Ok(())` when the
         // event has fired and an `Err(CUDA_ERROR_NOT_READY)` when it
         // is still in flight. We map the not-ready code to
         // `Ok(false)` so callers don't have to grep for the specific
         // driver error variant; anything else is a genuine failure.
         // SAFETY: the owning device was bound above and keeps this event live.
-        match unsafe { cudarc::driver::result::event::query(self.inner.cu_event) } {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                use cudarc::driver::sys::CUresult;
-                if e.0 == CUresult::CUDA_ERROR_NOT_READY {
-                    Ok(false)
-                } else {
-                    Err(DeviceError::Driver(format!("cuEventQuery: {e:?}")))
-                }
+        match unsafe { crate::backend::drv::event_query(self.inner.cu_event) }? {
+            true => {
+                // A fired event never un-fires until something records
+                // it again, and `set_recorded_on` clears this. See
+                // `EventCuda::completed`.
+                self.note_completed();
+                Ok(true)
             }
+            false => Ok(false),
         }
     }
+}
+
+/// `CRATONVM_GPU_WAIT_LATCH=0` turns off the completed-event elision.
+///
+/// Default-on, because eliding a wait on an event that has already fired
+/// is exactly equivalent to issuing it. The switch exists so the change
+/// can be priced on ONE binary, and so a driver that somehow disagrees
+/// with "a fired event never un-fires" can be ruled out in one run
+/// rather than one build.
+#[cfg(feature = "gpu-driver")]
+fn wait_latch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_WAIT_LATCH")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true)
+    })
 }
 
 impl Stream {
@@ -326,7 +396,7 @@ impl Stream {
     /// In cuda mode this would call `cuEventRecord` on the stream's
     /// raw handle. Returns once the *queue* of operations has been
     /// updated — it does not wait for the event to fire.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn record_event(&self, event: &Event) -> Result<()> {
         // Update the event's recorded-on field first so a concurrent
         // observer that sees the op-log entry will also see the
@@ -344,7 +414,7 @@ impl Stream {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn record_event(&self, event: &Event) -> Result<()> {
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
         // context to this thread before driving the stream/event. The
@@ -355,15 +425,14 @@ impl Stream {
             .inner
             .device
             .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         // `cuEventRecord(event, stream)` enqueues the event onto the
         // stream's command queue. Subsequent `cuEventQuery` /
         // `cuEventSynchronize` calls observe completion of any work
         // ahead of this point on the stream.
         // SAFETY: event and stream share the bound owning context and remain
         // live for this synchronous enqueue.
-        unsafe { cudarc::driver::result::event::record(event.inner.cu_event, self.raw()) }
-            .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))?;
+        unsafe { crate::backend::drv::event_record(event.inner.cu_event, self.raw()) }?;
         event.set_recorded_on(self.raw());
         Ok(())
     }
@@ -376,7 +445,7 @@ impl Stream {
     /// have been recorded already — `cuStreamWaitEvent` itself
     /// permits waiting on a not-yet-recorded event (the wait simply
     /// becomes a no-op).
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu-driver"))]
     pub fn wait_event(&self, event: &Event) -> Result<()> {
         self.record_op(crate::StreamOp::EventWait {
             event_id: event.id(),
@@ -384,7 +453,7 @@ impl Stream {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu-driver")]
     pub fn wait_event(&self, event: &Event) -> Result<()> {
         // An event recorded on THIS stream needs no wait: everything
         // queued on a stream before a point is already ordered before
@@ -397,6 +466,23 @@ impl Stream {
             cratonvm_types::gpu_event_census::note_wait_elided();
             return Ok(());
         }
+        // A wait on an event that has ALREADY fired is a no-op, whatever
+        // stream recorded it. The dispatch path hands out streams
+        // round-robin, so the same-stream test above almost never fires
+        // for it, and a resident input buffer keeps one `last_write`
+        // for its whole life — every launch re-waited on an event that
+        // completed long ago. See `EventCuda::completed`.
+        if wait_latch_enabled() {
+            if event.is_completed() {
+                cratonvm_types::gpu_event_census::note_wait_elided_latched();
+                return Ok(());
+            }
+            // At most one query per event: see `EventCuda::probed`.
+            if event.claim_probe() && matches!(event.query(), Ok(true)) {
+                cratonvm_types::gpu_event_census::note_wait_elided_latched();
+                return Ok(());
+            }
+        }
         cratonvm_types::gpu_event_census::note_wait_issued();
         // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
         // context to this thread before driving the stream/event (see
@@ -405,27 +491,20 @@ impl Stream {
             .inner
             .device
             .bind_to_thread()
-            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            .map_err(crate::backend::drv::bind_err)?;
         // `cuStreamWaitEvent(stream, event, CU_EVENT_WAIT_DEFAULT)`
         // inserts a barrier on this stream that blocks all subsequent
         // submissions until `event` fires on whichever stream
         // recorded it. The wait itself does not block the host.
         // SAFETY: event and stream share the bound owning context and remain
         // live for this synchronous enqueue.
-        unsafe {
-            cudarc::driver::result::stream::wait_event(
-                self.raw(),
-                event.inner.cu_event,
-                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-            )
-        }
-        .map_err(|e| DeviceError::Driver(format!("cuStreamWaitEvent: {e:?}")))
+        unsafe { crate::backend::drv::stream_wait_event(self.raw(), event.inner.cu_event) }
     }
 }
 
 // ─────────────────────────── tests ───────────────────────────────────
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(all(test, not(feature = "gpu-driver")))]
 mod tests {
     //! Stub-mode unit tests for `Event` and the new `Stream` methods.
     //!

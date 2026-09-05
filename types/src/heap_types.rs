@@ -266,6 +266,47 @@ pub const FIELD_CELL_PAYLOAD64_OFFSET: usize = 8;
 /// invariant for the upper bound of the dense id space.
 pub const AUTOBOX_CLASS_ID: ClassId = ClassId::new(u32::MAX);
 
+// ---------------------------------------------------------------------------
+// The `Result<(), i32>` array-store channel
+// ---------------------------------------------------------------------------
+
+/// The `Err` code every `set_array_element` / `get_array_element` returns when
+/// the index is out of range, or the receiver is not an array at all.
+///
+/// The channel is an `i32` while the index is a `usize`, and the four backends
+/// all wrote `Err(index as i32)`. That truncates: an index of `0x8000_0000`
+/// reports `i32::MIN`, and `RuntimeError::aioobe` then names a NEGATIVE index
+/// in the exception message for a store whose index was positive. Saturating
+/// instead is faithful for every index a real array can hold — `MAX_ARRAY_LENGTH`
+/// is `i32::MAX`, so `i32::MAX` is already out of range for every array this VM
+/// can build — and it is what keeps [`ARRAY_STORE_OUT_OF_MEMORY`] below
+/// unambiguous: no out-of-range index can ever produce that code.
+#[inline]
+pub const fn oob_index_code(index: usize) -> i32 {
+    if index >= i32::MAX as usize {
+        i32::MAX
+    } else {
+        index as i32
+    }
+}
+
+/// The `Err` code a `set_array_element` returns when the store needed an
+/// auto-box wrapper and the heap could not allocate one.
+///
+/// Storing a primitive `Value` into a reference array allocates a one-field
+/// `AUTOBOX_CLASS_ID` wrapper (see `cratonvm_gc::autobox`). All four backends did
+/// that through the INFALLIBLE `alloc_object`, which prints
+/// `FATAL: out of heap space` and calls `std::process::abort()` — so a Java
+/// program that filled the heap while a native was copying primitives into an
+/// `Object[]` died with no stack trace, no `OutOfMemoryError`, and no chance
+/// for a `catch (OutOfMemoryError)` to run. That is a *Java-level* condition
+/// with a *Java-level* answer, and this code carries it back out to the caller
+/// so the interpreter can raise `java.lang.OutOfMemoryError` instead.
+///
+/// [`oob_index_code`] guarantees this value cannot also mean "index
+/// `i32::MIN`": every out-of-range code is in `0..=i32::MAX`.
+pub const ARRAY_STORE_OUT_OF_MEMORY: i32 = i32::MIN;
+
 /// Exclusive upper bound on sequentially-assigned (dense, from-0) `ClassId`s.
 ///
 /// The class loader assigns ids `0, 1, 2, …`; this is the first value it must
@@ -326,12 +367,35 @@ const _: () = assert!(
     "ARRAY_DATA_OFFSET must fit a signed disp8 for JIT array element access"
 );
 
-/// Byte offset of the array-length/object-shape word.
-// 8, not 12, since `identity_hash_code` left the header on 2026-08-07 and
-// `shape` moved up into its place. Every JIT array-length load is emitted
-// from this constant, so the displacement follows automatically -- which is
-// the whole reason it is a named constant and not a literal.
+/// Byte offset of the array-length/object-shape word: the `shape` field of
+/// [`ObjectHeader`], which sits immediately after the 4-byte `class_id`.
+//
+// **4.** This comment read "8, not 12" directly above a value of `4` -- both
+// numbers wrong, and wrong in a way no test could catch, because every JIT
+// array-length load is emitted FROM the constant and so tracked the value
+// while the prose drifted. (It was 12 while the header still carried
+// `kind`/`element_type`/`gc_age`/`gc_flags` and `identity_hash_code` ahead of
+// `shape`; the 32 -> 24 -> 16 shrink of 2026-08-06/07 moved `shape` up behind
+// `class_id`.) The const assert below is the fix that lasts: the offset is now
+// derived from the struct at build time, so a future field reorder is a
+// compile error rather than another stale sentence.
 pub const ARRAY_LENGTH_OFFSET: usize = 4;
+
+// The value is not a choice — it is `shape`'s actual offset in the
+// `#[repr(C)]` header. Pin it, so a field reorder cannot leave every emitted
+// `MOV r32, [obj + ARRAY_LENGTH_OFFSET]` reading `class_id` instead.
+const _: () = assert!(
+    ARRAY_LENGTH_OFFSET == core::mem::offset_of!(ObjectHeader, shape),
+    "ARRAY_LENGTH_OFFSET must equal the byte offset of ObjectHeader::shape"
+);
+// Emitted as a signed disp8 against the object base at every JIT array-length
+// site (`x64/arrays.rs`, `ir_lower.rs`), so it must fit -128..=127 or those
+// instructions silently address BEFORE the object. `disp::disp8_const` makes
+// that a build failure at the emission sites; this makes it one here too.
+const _: () = assert!(
+    ARRAY_LENGTH_OFFSET <= 127,
+    "ARRAY_LENGTH_OFFSET must fit a signed disp8 for JIT array-length loads"
+);
 pub const NUM_SLOTS_OFFSET: usize = 4;
 // --- The quartet, in mark-word bits 48..63 ---------------------------------
 //
@@ -699,6 +763,56 @@ pub fn primitive_array_kind_tags_byte(descriptor: &str) -> Option<u8> {
     Some((ObjectKind::Array as u8) | (elem << 2))
 }
 
+/// Does the word at `ptr` look like a real object HEADER, judged only from the
+/// header itself?
+///
+/// The heap-free half of `G1Collector::is_object_address`: that function is a
+/// range check (`is_addr_in_live_region`) followed by exactly these header
+/// tests, and only the range half needs a collector. Callers that already know
+/// the address is inside a live, **committed** heap range can use this to
+/// finish the job.
+///
+/// # Why this exists
+///
+/// `conservative_roots::band_has_unpublished_word_with_map` decides a compiled
+/// frame's spill word is an unpublished oop from `addr_is_movable(w)` alone —
+/// an address-RANGE test, where every sibling instrument in that file requires
+/// `is_object_address`. A word that merely lands in the heap's range is called
+/// a live reference, and audit §16-§18 measured what that costs: the analogous
+/// raw counters run to hundreds or thousands of words with `verifier_oop=0` on
+/// every one of them.
+///
+/// It could not be screened before, for two reasons that are now gone: there
+/// is no `&VmHeap` on that path (this function needs none), and the published
+/// range covered reserved-but-uncommitted pages where reading a header faults
+/// (§18 bounded it by the commit).
+///
+/// # Safety
+///
+/// `ptr` must be readable for `MARK_WORD_OFFSET + 8` bytes and 8-aligned. The
+/// caller owes that; there is no way to check it from here.
+#[inline]
+pub unsafe fn plausible_object_header_at(ptr: *const u8) -> bool {
+    // Same order and the same bounds as the collector's own screen, so the two
+    // cannot drift into disagreeing about what an object is.
+    let Some(kind) = object_kind_from_tag(unsafe { kind_tag_at(ptr) }) else {
+        return false;
+    };
+    if unsafe { array_element_type_from_tag(element_type_tag_at(ptr)) }.is_none() {
+        return false;
+    }
+    // A filler is not an object a root can name.
+    if matches!(kind, ObjectKind::HumongousFiller) {
+        return false;
+    }
+    const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
+    let header = unsafe { &*(ptr as *const ObjectHeader) };
+    match kind {
+        ObjectKind::Array => header.array_length() <= i32::MAX as u32,
+        _ => header.num_slots() <= MAX_PLAUSIBLE_SLOTS,
+    }
+}
+
 #[inline]
 pub fn object_kind_from_tag(tag: u8) -> Option<ObjectKind> {
     match tag {
@@ -727,16 +841,22 @@ pub fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
 
 /// The header stored at the beginning of every heap-allocated object/array.
 ///
-/// Layout (32 bytes total, 8-byte aligned):
-/// - `class_id`: ClassId (4 bytes) -- MUST stay at offset 0 (JIT contract)
-/// - `kind`: ObjectKind (1 byte)
-/// - `element_type`: ArrayElementType (1 byte, only meaningful for arrays)
-/// - `gc_age`: u8
-/// - `gc_flags`: u8
-/// - `identity_hash_code`: i32 (4 bytes)
-/// - `shape`: u32 (array length, or full instance-field count)
-/// - `forwarding_ptr`: *mut u8 (8 bytes, used by GC for object relocation)
-/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 24)
+/// Layout (**16 bytes** total, 8-byte aligned) — the three `#[repr(C)]`
+/// fields below and nothing else:
+/// - `class_id`: `ClassId` (4 bytes, offset 0) -- MUST stay there (JIT contract)
+/// - `shape`: `u32` (4 bytes, offset [`ARRAY_LENGTH_OFFSET`] = 4) -- array
+///   length, or full instance-field count
+/// - `mark_word`: `AtomicU64` (8 bytes, offset [`MARK_WORD_OFFSET`] = 8) --
+///   lock state, identity hash, GC forwarding target, AND the
+///   `kind`/`element_type`/`gc_age`/`gc_flags` quartet in bits 48..63
+///
+/// This list said "32 bytes total" and named five fields that no longer exist
+/// as fields — `kind`, `element_type`, `gc_age`, `gc_flags` (folded into the
+/// mark word's bits 48..63), `identity_hash_code` and `forwarding_ptr` (both
+/// absorbed by the mark word) — with `mark_word` at offset 24. It described
+/// the header as it stood before the 32 -> 24 -> 16 shrink of 2026-08-06/07.
+/// Read the field docs, and the const-asserted offsets beside the constants,
+/// rather than this summary; those cannot go stale silently.
 ///
 /// NOTE: `Clone`/`Copy` were removed when `mark_word: AtomicU64` was added,
 /// since atomics are `!Copy`. Header copies must now go through explicit
@@ -1521,6 +1641,78 @@ impl ObjectHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The heap-free header screen accepts what the collector's own
+    /// `is_object_address` accepts and rejects the two things the band test was
+    /// calling live references: a filler, and a word that is merely a number.
+    #[test]
+    fn the_object_header_screen_separates_headers_from_numbers() {
+        let obj = ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            3,
+        );
+        let ptr = &obj as *const ObjectHeader as *const u8;
+        assert!(
+            unsafe { plausible_object_header_at(ptr) },
+            "an ordinary object header must pass"
+        );
+
+        let arr = ObjectHeader::new(
+            ClassId::new(8),
+            ObjectKind::Array,
+            ArrayElementType::Long,
+            16,
+            16,
+        );
+        assert!(
+            unsafe { plausible_object_header_at(&arr as *const ObjectHeader as *const u8) },
+            "an array header must pass"
+        );
+
+        let filler = ObjectHeader::new(
+            ClassId::new(9),
+            ObjectKind::HumongousFiller,
+            ArrayElementType::Reference,
+            0,
+            0,
+        );
+        assert!(
+            !unsafe { plausible_object_header_at(&filler as *const ObjectHeader as *const u8) },
+            "a humongous filler is not an object a root can name"
+        );
+
+        // ...and the population the band test was flagging: plain integers
+        // whose value happens to land in the heap's address range.
+        //
+        // A FILTER, NOT A PROOF, and the test says so rather than pretending
+        // otherwise. The kind and element-type tags are a handful of bits, so
+        // some arbitrary words decode to a valid pair by chance; what this
+        // screen removes is the large majority, which is the difference
+        // between the band test's range-only question and a question about
+        // objects. Asserted as a rate over a spread, because an assertion on
+        // one hand-picked word would be a coin toss dressed as a property.
+        let mut rejected = 0usize;
+        const N: usize = 256;
+        for i in 0..N {
+            // Values with no relationship to a header layout.
+            let junk: [u64; 4] = [
+                0x1234_5678 ^ (i as u64),
+                (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                u64::MAX - i as u64,
+                i as u64,
+            ];
+            if !unsafe { plausible_object_header_at(junk.as_ptr() as *const u8) } {
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected * 4 >= N * 3,
+            "the screen must reject the large majority of arbitrary words              (rejected {rejected} of {N}); it is what separates \"a word in the              heap's range\" from \"an object\""
+        );
+    }
 
     // Helper to create a default ObjectHeader for testing.
     fn make_header() -> ObjectHeader {

@@ -959,7 +959,7 @@ pub fn get_or_create_app_loader(
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     obj = ctx.read_native_pin(obj_pin, obj);
     platform = ctx.read_native_pin(platform_pin, platform);
-    ctx.set_field_by_name(obj, "parent", Value::Object(Some(platform)));
+    set_both_parent_fields(ctx, obj, platform);
     // Populate the REAL static `java.lang.ClassLoader.scl` so the real-JDK
     // `ClassLoader.getSystemClassLoader()` bytecode (reached when a call site
     // does not resolve to our native; observed in
@@ -972,6 +972,53 @@ pub fn get_or_create_app_loader(
     set_app_loader(vm, Some(obj));
     ctx.unpin_native_roots(platform_pin);
     Ok(obj)
+}
+
+/// Write the parent link into BOTH `parent` fields a built-in loader carries.
+///
+/// # There are two of them, and they are different fields
+///
+/// ```text
+///   java/lang/ClassLoader              private final ClassLoader        parent
+///   jdk/internal/loader/BuiltinClassLoader
+///                                      private final BuiltinClassLoader parent
+/// ```
+///
+/// A field is identified by its NAME AND DESCRIPTOR, and these two differ in
+/// both descriptor and declaring class. `set_field_by_name` resolves from the
+/// object's own class upwards, so on an `AppClassLoader` it finds
+/// `BuiltinClassLoader`'s and stops — leaving `java.lang.ClassLoader.parent`
+/// null forever.
+///
+/// That was invisible for as long as every reader was one of ours: the
+/// `getParent()` native resolves by name too, so it read the field that HAD
+/// been written and answered the platform loader. Real JDK bytecode does not:
+/// `ClassLoader.getPackage` is `getfield #108 // Field parent:Ljava/lang/ClassLoader;`,
+/// read the null, and took the `parent == null` branch to
+/// `BootLoader.getDefinedPackage` — so `Package.getPackage("java.sql")` walked
+/// past the platform loader that defines it and answered null, while
+/// `platform.getPackage("java.sql")` called directly answered correctly. The
+/// same field is read directly by `ClassLoader.loadClass`'s delegation and by
+/// `checkClassLoaderPermission`; this is not a `getPackage` quirk.
+///
+/// MEASURED with `Field.set(app, platform)` from Java: one write, and
+/// `app.getPackage("java.sql")` goes from `null` to `package java.sql` in the
+/// same run.
+///
+/// Only the built-in loaders need this. `URLClassLoader` and every ordinary
+/// user subclass inherit `ClassLoader.parent` with nothing shadowing it, so
+/// the by-name write there already lands on the field the JDK reads.
+fn set_both_parent_fields(ctx: &mut dyn NativeContext, loader: ObjectRef, parent: ObjectRef) {
+    // The derived one first, by name: this is the write that was already here,
+    // and the `getParent()`/`getName()` natives resolve the same way.
+    ctx.set_field_by_name(loader, "parent", Value::Object(Some(parent)));
+    // Then `java.lang.ClassLoader`'s own, addressed through the DECLARING
+    // class so the shadow cannot capture it. `resolve_field_index` starts its
+    // walk at the class it is given, and superclass fields keep their indices
+    // in a subclass instance.
+    if let Some(index) = ctx.resolve_field_index("java/lang/ClassLoader", "parent") {
+        ctx.set_field(loader, index, Value::Object(Some(parent)));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3826,7 +3873,7 @@ pub(crate) fn cl_define_class_basic(
             tracing::error!(
                 "[define_class] panic while reading byte array for {name_str}; aborting"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str.clone(),
                 message: "defineClass: panic while reading bytecode array".into(),
             }
@@ -3838,7 +3885,7 @@ pub(crate) fn cl_define_class_basic(
     // never reach `define_class_full` (cheap CAFEBABE magic check).
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!("[define_class] invalid magic for {name_str}; rejecting");
-        return Err(LinkageError::ClassFormatError {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
             class_name: name_str.clone(),
             message: "defineClass: not a valid class file (bad magic)".into(),
         }
@@ -3883,7 +3930,7 @@ pub(crate) fn cl_define_class_basic(
             tracing::error!(
                 "[define_class] panic inside define_class_full for {name_str}; aborting"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str.clone(),
                 message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
             }
@@ -4287,7 +4334,7 @@ pub(crate) fn define_class_via_full(
         Ok(r) => r,
         Err(_) => {
             tracing::error!("[define_class] panic inside define_class_full for {name}; aborting");
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
             }
@@ -4757,7 +4804,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
             "Unsafe.defineClass({name_str}): rejecting bytecode of length {length} \
              (max={UNSAFE_DEFINE_CLASS_MAX_BYTES})"
         );
-        return Err(LinkageError::ClassFormatError {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
             class_name: name_str,
             message: format!(
                 "Unsafe.defineClass: bytecode length {length} out of range (max {UNSAFE_DEFINE_CLASS_MAX_BYTES})"
@@ -4805,7 +4852,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 "Unsafe.defineClass({name_str}): panic while reading byte array; \
                  throwing ClassFormatError"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str,
                 message: "Unsafe.defineClass: failed to read bytecode array".into(),
             }
@@ -4820,7 +4867,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Malformed bytes → ClassFormatError (JVMS 5.3.5), not a silent null.
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!("Unsafe.defineClass({name_str}): bad magic — throwing ClassFormatError");
-        return Err(LinkageError::ClassFormatError {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
             class_name: name_str,
             message: "Unsafe.defineClass: not a valid class file (bad magic)".into(),
         }
@@ -4871,7 +4918,7 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 "Unsafe.defineClass({name_str}): panic inside define_class_full; \
                  throwing ClassFormatError"
             );
-            return Err(LinkageError::ClassFormatError {
+            return Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: name_str,
                 message: "Unsafe.defineClass: panic inside backend (likely malformed bytecode)"
                     .into(),
@@ -5030,6 +5077,53 @@ pub(crate) fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -
         }
     }
     false
+}
+
+/// Kill switch for the first-hit `ClassLoader.getResource` walk below.
+/// `CRATONVM_GETRESOURCE_FIRST_HIT=0` restores the whole-list walk that builds
+/// every matching URL and returns element 0. Default ON.
+///
+/// A same-binary lever, not a safety valve: the two walks are required to
+/// answer identically (`class_path.rs`'s
+/// `the_incremental_walk_returns_what_the_whole_list_walk_returns_first`), so
+/// the only thing this flag can change is how much of the classpath was
+/// touched to get there. That makes it the A/B for the cost, which is the one
+/// claim a page about a throughput gap has to be able to check.
+fn get_resource_first_hit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var_os("CRATONVM_GETRESOURCE_FIRST_HIT")
+                .as_deref()
+                .and_then(|s| s.to_str()),
+            Some("0")
+        )
+    })
+}
+
+/// The first classpath URL for `resource_name`, stopping at the entry that
+/// answers.
+///
+/// The one implementation behind BOTH singular resource doors —
+/// `ClassLoader.getResource` here and `Class.getResource` in `lang_class` —
+/// because they had the same whole-list-then-take-element-0 shape and a fix to
+/// one of them is a fix a bisect can miss on the other.
+///
+/// Falls back to the whole-list walk for a GLOB name, which can match several
+/// names inside a single classpath entry: "the first URL this entry serves"
+/// would silently drop the rest, and `resource_name_supports_incremental_scan`
+/// is the predicate that knows the difference.
+pub(crate) fn first_resource_url(
+    ctx: &mut dyn NativeContext,
+    resource_name: &str,
+) -> Option<String> {
+    if get_resource_first_hit_enabled() && ctx.resource_name_supports_incremental_scan(resource_name)
+    {
+        return ctx
+            .next_resource_url(resource_name, 0, 0)
+            .map(|(url, _, _)| url);
+    }
+    ctx.find_all_resource_urls(resource_name).into_iter().next()
 }
 
 fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5262,9 +5356,28 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // same name. Fall back to "classpath:<name>" when only `find_resource`
     // (raw bytes) succeeds — covers synthetic test loaders that override
     // find_resource without participating in the structured walk.
-    let urls = ctx.find_all_resource_urls(resource_name);
-    let url_str = if let Some(first) = urls.first() {
-        first.clone()
+    //
+    // STOP AT THE FIRST HIT. `next_resource_url` walks the same segments in
+    // the same order and yields the same elements as `find_all_resource_urls`
+    // (its own doc states the enumeration-to-exhaustion equivalence), so
+    // element 0 is identical either way — but the whole-list call kept
+    // scanning after it had the answer. For an archive entry that costs a hash
+    // probe; for a DIRECTORY entry it costs an `exists()` and a canonicalize,
+    // i.e. filesystem syscalls, on every remaining entry of the classpath.
+    //
+    // `getResource` is one call per class discovered by a ShrinkWrap package
+    // scan (`ClassLoaderAsset.<init>` is `classLoader.getResource(name)`),
+    // which is what made a quarkus `TestResourceManager.start()` several times
+    // slower than HotSpot — HotSpot's `getResource` returns at the first hit.
+    // The incremental walk already existed for the lazy `getResources`
+    // enumeration; the singular door had simply never been wired to it.
+    //
+    // The gate is required: a GLOB name can match several entries WITHIN one
+    // classpath entry, and "the first URL this entry serves" would drop the
+    // rest — `resource_name_supports_incremental_scan` is what excludes those,
+    // and they fall through to the whole-list walk below.
+    let url_str = if let Some(first) = first_resource_url(ctx, resource_name) {
+        first
     } else if ctx.find_resource(resource_name).is_some() {
         format!("classpath:{name}")
     } else {
@@ -7837,7 +7950,7 @@ pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) 
 /// # 2026-08-22: step 1 used to be "built-in loaders ARE the global classpath"
 ///
 /// It is not true of the application loader, and `RLangPackages` failed its
-/// FIRST check on it (`WORKER-5-NOTE-8`), in BOTH modes:
+/// FIRST check on it, in BOTH modes:
 ///
 /// ```text
 ///   appLoader.getDefinedPackage("java.lang")   HotSpot null   CratonVM java.lang
@@ -7857,17 +7970,47 @@ pub(crate) fn loader_is_builtin(ctx: &mut dyn NativeContext, loader: ObjectRef) 
 pub(crate) fn package_class_files_visible_to_loader(
     ctx: &mut dyn NativeContext,
     loader: Option<ObjectRef>,
+    package_name: &str,
     class_glob: &str,
 ) -> bool {
     let Some(loader) = loader else {
+        // No receiver object at all: this IS the boot loader, so ask the boot
+        // loader's own definition question before falling back.
+        if let Some(answer) =
+            builtin_loader_defines_package(ctx, BuiltinLoaderKind::Boot, package_name)
+        {
+            return answer;
+        }
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     };
     let loader_class = ctx.class_name_of_id(ctx.class_id_of_object(loader));
     if loader_is_builtin(ctx, loader) {
+        // The MODULE route first: for the boot and platform loaders it is the
+        // only route there is. A class-path segment probe cannot answer for
+        // them at all -- the boot image is a jimage, and a `java/sql/*.class`
+        // glob over it returns nothing, which is why `java.sql` read `null` on
+        // the platform loader and `java.lang` read `null` on the boot loader
+        // (taking `Package.getPackage` down with it) until this arm existed.
+        if let Some(kind) = builtin_loader_kind(loader_class.as_deref()) {
+            if let Some(answer) = builtin_loader_defines_package(ctx, kind, package_name) {
+                return answer;
+            }
+        }
         return match builtin_loader_segment(loader_class.as_deref()) {
-            Some(segment) => !ctx
-                .find_resource_urls_in_segment(class_glob, segment)
-                .is_empty(),
+            // The application loader's `-cp` segment, AND a loaded class. The
+            // segment probe alone answers the visibility question this whole
+            // function exists to stop answering: HotSpot's
+            // `app.getDefinedPackage("com.example.app")` is `null` until a
+            // class in it is defined and non-null after, and a class-file glob
+            // cannot tell those two instants apart. Spring's
+            // `BeanDefinitionLoader.findPackage` — the caller the app arm was
+            // written for — loads a class from the package before asking
+            // again, so it keeps working on the answer HotSpot gives it.
+            Some(segment) => {
+                !ctx.find_resource_urls_in_segment(class_glob, segment)
+                    .is_empty()
+                    && ctx.any_loaded_class_in_package(&package_name.replace('.', "/"))
+            }
             // The boot loader, or a built-in shape this VM does not recognise:
             // the historical global probe, unchanged.
             None => !ctx.find_all_resource_urls(class_glob).is_empty(),
@@ -7879,7 +8022,361 @@ pub(crate) fn package_class_files_visible_to_loader(
     if loader_has_recorded_url_set(ctx, loader) {
         return false;
     }
+    // Step 4 -- a custom loader this VM has no URL view of -- was the LAST arm
+    // still answering the visibility question this function exists to stop
+    // answering. `new ClassLoader(null) {}`, which defines nothing at all,
+    // claimed every application package on the process class path:
+    //
+    //   custom.getDefinedPackage("com.example.app")   HotSpot null   was: a Package
+    //
+    // Ask the loader's OWN definitions instead. A user-defined loader has a
+    // namespace id of its own, and `any_loaded_class_in_package_for_loader`
+    // answers exactly "did THIS loader define a class in this package" -- which
+    // is `getDefinedPackage`'s contract, and is what the loaders this arm was
+    // written for actually need:
+    //
+    // * ByteBuddy's `JavaDispatcher$DynamicClassLoader` asks about the package
+    //   it has just defined `Invoker` into, so it still answers non-null;
+    // * `GroovyClassLoader.definePackageInternal` reads
+    //   `getDefinedPackage(p) == null` before `definePackage(p, ...)`. The
+    //   FIRST class in a package answers null (as on HotSpot, and as the
+    //   caller wants), the second answers non-null and the duplicate
+    //   `definePackage` -- `IllegalArgumentException: <pkg>` -- is skipped.
+    //
+    // A loader with no namespace id of its own (id < 3: it delegates to the
+    // built-in chain) keeps the historical global probe, unchanged.
+    let namespace = loader_namespace_id(ctx, loader);
+    if namespace >= cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED {
+        return ctx.any_loaded_class_in_package_for_loader(
+            &package_name.replace('.', "/"),
+            namespace,
+        );
+    }
     !ctx.find_all_resource_urls(class_glob).is_empty()
+}
+
+/// Which of the three built-in loaders this is, by class name.
+///
+/// Separate from [`builtin_loader_segment`] on purpose: that one answers
+/// "which slice of the class path does this loader own", which is a question
+/// only the application and platform loaders have an answer to, and it is the
+/// WRONG question for a loader whose classes come out of a jimage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BuiltinLoaderKind {
+    Boot,
+    Platform,
+    Application,
+}
+
+pub(crate) fn builtin_loader_kind(loader_class: Option<&str>) -> Option<BuiltinLoaderKind> {
+    match loader_class? {
+        "jdk/internal/loader/ClassLoaders$AppClassLoader" | "sun/misc/Launcher$AppClassLoader" => {
+            Some(BuiltinLoaderKind::Application)
+        }
+        "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
+        | "sun/misc/Launcher$ExtClassLoader" => Some(BuiltinLoaderKind::Platform),
+        "jdk/internal/loader/ClassLoaders$BootClassLoader" => Some(BuiltinLoaderKind::Boot),
+        _ => None,
+    }
+}
+
+/// The JDK's own boot / platform module tables, read out of the running image.
+///
+/// `jdk.internal.module.ModuleLoaderMap$Modules.{bootModules,platformModules}`
+/// are the two `Set<String>` statics the JDK's own module system consults to
+/// decide which built-in loader defines a module's packages. Reading them beats
+/// keeping a hand-copied list in Rust: the answer then comes from the image the
+/// run actually loaded, and a JDK that moves a module between the two tables
+/// moves this VM with it.
+///
+/// Memoised on SUCCESS ONLY. A failure -- the class not yet initialisable this
+/// early in boot, a stripped or non-JDK image -- answers `None` and is retried
+/// on the next call, which selects the historical class-path probe. That is the
+/// pre-existing behaviour, never a silent "this loader defines nothing".
+struct BuiltinModuleSets {
+    boot: std::collections::HashSet<String>,
+    platform: std::collections::HashSet<String>,
+}
+
+const MODULE_LOADER_MAP_MODULES: &str = "jdk/internal/module/ModuleLoaderMap$Modules";
+
+thread_local! {
+    /// Re-entrancy guard for [`jdk_builtin_module_sets`].
+    ///
+    /// Reading the tables runs Java: a class initialisation and three
+    /// `invoke_virtual`s. If anything on that path reached
+    /// `getDefinedPackage` again the cache would still be cold and the read
+    /// would recurse without bound. The guard answers `None` on re-entry,
+    /// which selects the historical class-path probe for that one inner call —
+    /// the same fail-soft every other failure arm here takes.
+    static READING_MODULE_SETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn jdk_builtin_module_sets(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinModuleSets>> {
+    // `OrderedPlMutex` at the leaf level, not a raw `Mutex`: this crate
+    // re-enters the VM, so a global lock with no `LockLevel` is a deadlock the
+    // order checker cannot see, and `lock_discipline_ratchet` refuses one
+    // ("Do NOT raise the baseline").
+    //
+    // `Scratch` is honest here rather than convenient. The guard is never held
+    // across anything: the read below runs Java -- a class initialisation and
+    // three `invoke_virtual`s -- and it runs with NOTHING locked, because both
+    // acquisitions are single statements that publish or fetch an `Arc` and
+    // end. Nothing is taken while holding this, which is exactly what L0 means.
+    static CACHE: OnceLock<OrderedPlMutex<Option<Arc<BuiltinModuleSets>>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| OrderedPlMutex::new(None, LockLevel::Scratch));
+    // Bound to a local FIRST. An `if let` scrutinee temporary lives to the end
+    // of the whole `if let`, so a guard taken there would still be held in an
+    // `else` arm the next edit adds.
+    let hit = cell.lock().clone();
+    if let Some(hit) = hit {
+        return Some(hit);
+    }
+    if READING_MODULE_SETS.with(|f| f.replace(true)) {
+        return None;
+    }
+    let sets = jdk_builtin_module_sets_uncached(ctx);
+    READING_MODULE_SETS.with(|f| f.set(false));
+    let sets = sets?;
+    *cell.lock() = Some(Arc::clone(&sets));
+    Some(sets)
+}
+
+fn jdk_builtin_module_sets_uncached(ctx: &mut dyn NativeContext) -> Option<Arc<BuiltinModuleSets>> {
+    let cid = ctx
+        .ensure_class_initialized(MODULE_LOADER_MAP_MODULES)
+        .ok()
+        .or_else(|| ctx.class_id_by_name(MODULE_LOADER_MAP_MODULES))?;
+    let boot = read_static_string_set(ctx, cid, "bootModules")?;
+    let platform = read_static_string_set(ctx, cid, "platformModules")?;
+    Some(Arc::new(BuiltinModuleSets { boot, platform }))
+}
+
+/// One `static final Set<String>` field, walked into a Rust set.
+///
+/// The set and its iterator are held as GLOBAL ROOTS across the `invoke_virtual`
+/// calls rather than as raw `ObjectRef`s: `iterator()`/`next()` allocate, so a
+/// collection can move both between one call and the next, and a moved receiver
+/// is the shape that has cost this codebase whole sessions. Runs once per VM.
+fn read_static_string_set(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    field: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let index = ctx.static_field_index_by_name(class_id, field)?;
+    let set = match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(set)) => set,
+        _ => return None,
+    };
+    let set_root = ctx.add_global_root(set);
+    let out = read_string_set_rooted(ctx, set_root);
+    ctx.remove_global_root(set_root);
+    out
+}
+
+fn read_string_set_rooted(
+    ctx: &mut dyn NativeContext,
+    set_root: usize,
+) -> Option<std::collections::HashSet<String>> {
+    let set = ctx.resolve_global_root(set_root)?;
+    let iterator = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return None,
+    };
+    let it_root = ctx.add_global_root(iterator);
+    let mut out = std::collections::HashSet::new();
+    // Bounded for the same reason `real_defined_package_names` is: a runaway
+    // iterator must not hang a boot-time lookup. The JDK's two tables hold
+    // ~50 names between them.
+    for _ in 0..4096 {
+        let Some(it) = ctx.resolve_global_root(it_root) else {
+            break;
+        };
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let Some(it) = ctx.resolve_global_root(it_root) else {
+            break;
+        };
+        let Ok(Some(Value::Object(Some(name)))) =
+            ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[])
+        else {
+            break;
+        };
+        if let Some(name) = ctx.read_string(name) {
+            out.insert(name);
+        }
+    }
+    ctx.remove_global_root(it_root);
+    // An EMPTY table is a failed read, not an answer: the JDK never ships one.
+    // Reporting `None` keeps the caller on its historical probe instead of
+    // freezing "nothing is defined" into the memo.
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Is `package_slash` in a module the JDK's own table assigns to the PLATFORM
+/// loader?
+///
+/// Memoised per package. A package's module cannot change once the image is
+/// loaded, and `Class.getClassLoader()` is asked far more often than there are
+/// packages -- so the lookup is a short-string hash, not a module-registry walk
+/// plus an `Arc` clone, on every call.
+///
+/// A package whose module is not yet known is NOT memoised: answering `false`
+/// because the module registry had not been populated yet, and then freezing
+/// it, is how a memo turns a boot-order accident into a permanent wrong answer.
+fn package_is_platform_defined(ctx: &mut dyn NativeContext, package_slash: &str) -> bool {
+    // `OrderedPlMutex` at the leaf level, not a raw `Mutex`, for the same
+    // reason as `jdk_builtin_module_sets` below: this crate re-enters the VM,
+    // so a global lock with no `LockLevel` is a deadlock the order checker
+    // cannot see, and `lock_discipline_ratchet` refuses one outright ("Do NOT
+    // raise the baseline").
+    //
+    // `Scratch` is the honest level and not merely a convenient one: the guard
+    // is never held across anything. The lookup below runs Java — module-set
+    // construction plus `module_for_package` — and it runs with NOTHING
+    // locked, because both acquisitions are single statements that read or
+    // publish and end.
+    static MEMO: OnceLock<OrderedPlMutex<std::collections::HashMap<String, bool>>> =
+        OnceLock::new();
+    let memo = MEMO
+        .get_or_init(|| OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch));
+    // Bound to a local FIRST: an `if let` scrutinee temporary lives to the end
+    // of the whole `if let`, so a guard taken there is still held in an `else`
+    // arm the next edit adds.
+    let hit = memo.lock().get(package_slash).copied();
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let Some(sets) = jdk_builtin_module_sets(ctx) else {
+        return false;
+    };
+    let Some(module) = ctx.module_for_package(package_slash) else {
+        return false;
+    };
+    let answer = sets.platform.contains(&module);
+    memo.lock().insert(package_slash.to_string(), answer);
+    answer
+}
+
+/// The PLATFORM loader, when `class_name` (slash form) is an image class whose
+/// module the JDK assigns to it -- and `None` for a boot-module class, an
+/// application class, or an image this VM cannot read the tables out of.
+///
+/// # Not every image class is boot-loaded
+///
+/// This VM reads the whole jimage through one class path and tags every class
+/// in it `ClassLoaderId::Bootstrap`, so `Class.getClassLoader()` answered
+/// `null` for all of them. The JDK does not: `ModuleLoaderMap` splits the
+/// image's modules between the boot and platform loaders, and the ~24 platform
+/// modules (`java.sql`, `java.net.http`, `java.scripting`, `jdk.httpserver`, ...)
+/// are DEFINED by `ClassLoaders$PlatformClassLoader`. MEASURED:
+///
+/// ```text
+///   java.sql.Connection .getClassLoader()   HotSpot PlatformClassLoader   was null
+///   javax.script.ScriptEngine...            HotSpot PlatformClassLoader   was null
+///   java.lang.String    .getClassLoader()   HotSpot null                  null
+///   java.awt.Color      .getClassLoader()   HotSpot null (java.desktop is BOOT)
+/// ```
+///
+/// The direction matters the way it does for an application class reported as
+/// bootstrap-loaded: `null` means "the boot loader owns this" to every caller
+/// that keys a cache, picks a proxy loader, or decides a delegation parent.
+///
+/// This changes the REPORTED loader only. Class definition, resource
+/// resolution and loader namespaces are untouched -- the class store stays
+/// flat, and `is_builtin_loader_class` already keeps `Class.getResource*` off
+/// the loader-delegation path for every built-in loader, the platform one
+/// included.
+pub(crate) fn platform_loader_for_image_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+) -> Option<ObjectRef> {
+    let (package_slash, _) = class_name.rsplit_once('/')?;
+    if !package_is_platform_defined(ctx, package_slash) {
+        return None;
+    }
+    get_or_create_platform_loader(ctx).ok()
+}
+
+/// The PLATFORM loader when `module_name` is one the JDK's own table assigns to
+/// it; `None` for a boot module, an application module, or an unreadable image.
+///
+/// The module-name form of [`platform_loader_for_image_class`], for
+/// `Module.getClassLoader()`. The JDK keeps the two answers in step -- every
+/// class in `java.sql` reports the same loader its module does -- so they have
+/// to come from the same table or a caller can catch this VM contradicting
+/// itself with two calls.
+pub(crate) fn platform_loader_for_module(
+    ctx: &mut dyn NativeContext,
+    module_name: &str,
+) -> Option<ObjectRef> {
+    let sets = jdk_builtin_module_sets(ctx)?;
+    if !sets.platform.contains(module_name) {
+        return None;
+    }
+    get_or_create_platform_loader(ctx).ok()
+}
+
+/// Is `loader` the VM's platform-loader singleton?
+///
+/// Identity first, class name as the real-JDK fallback -- the same two-step
+/// [`loader_namespace_id_at`] uses, and for the same reason: the JDK can
+/// manufacture another `PlatformClassLoader` object before our singleton is
+/// observed.
+pub(crate) fn is_platform_loader_object(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
+    platform_loader_of(ctx.vm_identity()).is_some_and(|p| p.as_ptr() == loader.as_ptr())
+        || ctx
+            .class_name_of_id(ctx.class_id_of_object(loader))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+}
+
+/// Does this built-in loader DEFINE `package_name` (dot form)?
+///
+/// `None` means "not answerable here" -- the module tables could not be read, or
+/// the application loader, whose packages come off the `-cp` segment and whose
+/// existing probe is right. The caller turns `None` back into that probe.
+///
+/// Two conjuncts, and both are load-bearing:
+///
+/// * the package's module is in the JDK's own table for THIS loader. Module
+///   membership alone is a capability, not a definition;
+/// * a class in that package is actually LOADED. HotSpot defines a package when
+///   a loader defines a class in it, so `plat.getDefinedPackage("java.sql")` is
+///   `null` until something loads a `java.sql` class and non-null after --
+///   which is what [`NativeContext::any_loaded_class_in_package`] answers.
+///
+/// A package in NO named module (the class path's unnamed module) is defined by
+/// neither the boot nor the platform loader, so those two answer a definite
+/// `false` rather than falling through to a global probe that would hand the
+/// boot loader every application package on the class path.
+fn builtin_loader_defines_package(
+    ctx: &mut dyn NativeContext,
+    kind: BuiltinLoaderKind,
+    package_name: &str,
+) -> Option<bool> {
+    if kind == BuiltinLoaderKind::Application {
+        return None;
+    }
+    let sets = jdk_builtin_module_sets(ctx)?;
+    let slash = package_name.replace('.', "/");
+    let table = match kind {
+        BuiltinLoaderKind::Boot => &sets.boot,
+        BuiltinLoaderKind::Platform => &sets.platform,
+        BuiltinLoaderKind::Application => unreachable!("returned above"),
+    };
+    let in_table = ctx
+        .module_for_package(&slash)
+        .is_some_and(|module| table.contains(&module));
+    if !in_table {
+        return Some(false);
+    }
+    Some(ctx.any_loaded_class_in_package(&slash))
 }
 
 /// Which class-path segment a built-in loader OWNS, or `None` for the boot
@@ -7898,14 +8395,17 @@ fn builtin_loader_segment(loader_class: Option<&str>) -> Option<u8> {
         "jdk/internal/loader/ClassLoaders$AppClassLoader" | "sun/misc/Launcher$AppClassLoader" => {
             Some(2)
         }
-        // The platform loader owns the extension segment. NOTE: this VM does
-        // not model the JDK's platform MODULE set, so a genuinely
-        // platform-defined package (`java.sql`) answers `null` here where
-        // HotSpot answers non-null. That is a KNOWN residual, recorded in
-        // `WORKER-5-NOTE-8`: it trades a fabricated `Package` for a missing
-        // one, in the direction `getDefinedPackage`'s contract prefers, and no
-        // corpus vector asks the question. Modelling the module set is the
-        // real fix and is a much larger job.
+        // The platform loader's extension segment, which is empty on a normal
+        // run. It is reached only when the module tables above could NOT be
+        // read: `builtin_loader_defines_package` answers for both the platform
+        // and the boot loader before this match, and a segment probe cannot
+        // answer for either of them anyway — the boot image is a jimage, and a
+        // `java/sql/*.class` glob over it returns nothing.
+        //
+        // That was the residual the 2026-08-22 narrowing knowingly shipped
+        // (`java.sql` read `null` on the platform loader), and it was wider
+        // than the one package it named. Closed 2026-09-01 by the module route;
+        // this arm is the fail-soft under it, not the answer.
         "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
         | "sun/misc/Launcher$ExtClassLoader" => Some(1),
         _ => None,
@@ -9121,8 +9621,18 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
 
     // Validate magic + minimal length (8 bytes = magic + minor + major).
+    // BAD BYTES ARE A `ClassFormatError`, not an `IllegalArgumentException`.
+    // The `ClassLoader.defineClass` door three thousand lines above already
+    // raises `LinkageError::ClassFormatError` here; these `Lookup` doors were
+    // the two that did not, and a caller cannot catch what it is not thrown.
+    // `ClassFormatError` is an `Error`; `IllegalArgumentException` is a
+    // RuntimeException -- a bytecode generator that guards its emit with
+    // `catch (ClassFormatError)` (which is what you write, because that is what
+    // the JVM throws) sees nothing and lets a genuinely malformed class escape
+    // as an unrelated runtime failure somewhere else.
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
-        return Err(RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
+            class_name: "<hidden>".to_string(),
             message: "Lookup.defineClass: not a valid class file (bad magic)".into(),
         }
         .into());
@@ -9348,8 +9858,10 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let byte_array = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         Some(Value::Object(None)) => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "defineHiddenClass: bytes must not be null".into(),
+            // A NULL array is an NPE, as `Objects.requireNonNull(bytes)` in the
+            // JDK's own body gives. Measured on jdk-25.0.3.9-hotspot.
+            return Err(RuntimeError::NullPointerException {
+                message: Some("defineHiddenClass: bytes must not be null".to_string()),
             }
             .into());
         }
@@ -9390,8 +9902,12 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
 
     // --- 2. Validate the class file magic + minimal header length. ---
+    // Same rule as `Lookup.defineClass` above: malformed bytes are a
+    // `ClassFormatError`, and an EMPTY array takes this path too (HotSpot
+    // measures as `ClassFormatError`, not as a null-argument complaint).
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
-        return Err(RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::LinkageError::ClassFormatError {
+            class_name: "<hidden>".to_string(),
             message: "defineHiddenClass: not a valid class file (bad magic)".into(),
         }
         .into());
@@ -10168,6 +10684,17 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/Class;",
         lk_ensure_initialized,
     );
+    // BOTH of these lose their slot. `lookup_define::register_lookup_define_class`
+    // re-registers the identical triples on the WP2.3-B implementations, and
+    // runs after this function from both registrars (`lib.rs` and
+    // `reflect_annotations.rs`), so `lk_define_class` / `lk_define_hidden_class`
+    // below are never dispatched — `--dump-native-registry` reports
+    // `owns_slot: true` on `lookup_define.rs:901` and `:909`.
+    //
+    // Kept, and kept in step with the winner, because that is cheaper than
+    // re-deriving them if the ordering is ever reversed. Do NOT fix a measured
+    // `Lookup.define*` defect here: a fix applied to this pair changes nothing
+    // observable. (It cost a full 34-minute rebuild to learn that once.)
     r.register(lk, "defineClass", "([B)Ljava/lang/Class;", lk_define_class);
     r.register(lk, "defineHiddenClass", "([BZ[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)Ljava/lang/invoke/MethodHandles$Lookup;", lk_define_hidden_class);
     // findVirtual/findStatic/findConstructor/findGetter/findSetter/findSpecial/

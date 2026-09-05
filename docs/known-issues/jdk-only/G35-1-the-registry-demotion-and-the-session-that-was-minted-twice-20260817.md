@@ -20,6 +20,41 @@ NOMINATION in §6. Probes: `scratchpad/probe/{PA,PB,PC}.java`.
 
 ---
 
+> **VERIFIED AGAINST A BINARY 2026-09-03.** "After: NOT MEASURED — and could not
+> be." Two of §0's three predictions have now been measured, and both land at or
+> beyond what they promised.
+>
+> ```text
+>                        predicted            measured (--jdk-only, vs HotSpot 25)
+> RJdkBridge1            PASS, 394 checks     PASS, 483 checks   diff EMPTY
+> RSslLiveSession        13 failing rows      fails=0            diff EMPTY
+> ```
+>
+> **`RJdkBridge1` — the prediction was exactly right.** §0 measured it dying in
+> `uri` at `RJdkBridge1.java:1181` on `negp.getPort() == -1`, with the five
+> completed sections summing to 154 and `sectionEnd("uri", 50)` never reached. It
+> now runs to `PASS RJdkBridge1 (483 checks)`, byte-identical to the oracle. 483
+> rather than 394 because the vector grew; the count is the vector's OWN
+> self-report on its last line, not a line count — the output is 182 lines, and
+> reading those as checks would have looked like a run that still stops early.
+>
+> **`RSslLiveSession` beat its prediction.** §0 measured 95 checks with **14
+> failing rows** and predicted **13**. The vector's own tally now reads
+> `CK RSslLiveSession fails=0`, on both VMs, with an empty diff. Not 13, not 1 —
+> none.
+>
+> **This record and `G14-1` had the SAME before-state and predicted opposite
+> outcomes, and both were right about their own reach.** Both measured
+> `RJdkBridge1` dying on `negp.getPort() == -1`. `G14-1` predicted "still dies at
+> check 197" because the blocking fix lived in `net_phase_e.rs`, which that lane
+> could not edit. This lane owned that file and predicted PASS. The vector
+> passes. A prediction that names what it cannot reach is worth more than one
+> that hedges.
+>
+> **Still unmeasured:** §0's third row, the URI authority surface at 51 of 121
+> diverging rows predicted to 0. That needs its own row-by-row run and this note
+> did not do it.
+
 ## 0. The headline
 
 | vector | before (MEASURED, `9ae371468`) | after (PREDICTED) |

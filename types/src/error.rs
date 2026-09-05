@@ -250,6 +250,28 @@ pub enum JdkOnlyViolation {
         descriptor: String,
         /// Registration site, captured by `#[track_caller]` in the registry.
         registered_by: Option<String>,
+        /// `"<kind>@<file>:<line>"` of the registration that STILL OWNS this
+        /// triple after the refusal, or `None` when the refusal genuinely
+        /// retired the method to bytecode.
+        ///
+        /// # Why a refusal is not automatically a retirement
+        ///
+        /// `register` is last-write-wins, and the `JdkOnly` arm returns without
+        /// inserting. When an EARLIER registration of the same triple already
+        /// owns the slot, refusing the later one does not hand the method to
+        /// real JDK bytecode — **the earlier native survives as the winner**,
+        /// the two modes run different code, and nothing said so. Measured at
+        /// nine triples across the whole registry, both modes
+        /// (`docs/known-issues/jdk-only/`, the refused-`SyntheticStub`
+        /// fall-through record); five of the nine are this shape and the other
+        /// four are deliberate per-mode branching in `lang_system.rs`.
+        ///
+        /// Worse for the metric: when the survivor's kind is `Intrinsic`, the
+        /// §1.4 shadow census never counts it either — every recorder skips
+        /// `NativeKind::Intrinsic` — so without this field the row is an
+        /// invisible non-retirement AND invisible to the number that tracks
+        /// retirements.
+        survivor: Option<String>,
     },
     /// A `NativeKind::SyntheticStub` was about to be dispatched (§1.3).
     SyntheticNativeInvocation {
@@ -691,6 +713,7 @@ impl JdkOnlyViolation {
                 method,
                 descriptor,
                 registered_by,
+                survivor,
             } => {
                 json_field(&mut out, &mut first, "class", Some(class.as_str()));
                 json_field(&mut out, &mut first, "method", Some(method.as_str()));
@@ -706,6 +729,7 @@ impl JdkOnlyViolation {
                     "registered_by",
                     registered_by.as_deref(),
                 );
+                json_field(&mut out, &mut first, "survivor", survivor.as_deref());
             }
             JdkOnlyViolation::SyntheticNativeInvocation {
                 class,
@@ -1318,6 +1342,17 @@ pub enum RuntimeError {
 
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
+
+    /// `java.lang.InternalError` -- a JVM-internal invariant the caller cannot
+    /// have violated, raised where HotSpot raises it.
+    ///
+    /// Distinct from [`MethodCallFailed::InternalError`], which is documented
+    /// as the UNCATCHABLE form and is not a Java throwable at all. This one is
+    /// an ordinary catchable `Error`, which is what HotSpot throws from
+    /// `Unsafe.objectFieldOffset(Class, String)` when the class has no such
+    /// field.
+    #[error("internal error: {message}")]
+    InternalError { message: String },
 }
 
 fn format_optional_message(message: &Option<String>) -> String {
@@ -1622,6 +1657,36 @@ impl RuntimeError {
                 i64::from(length),
             )),
         }
+    }
+
+    /// The Java exception for an `Err` code out of a heap `set_array_element`
+    /// / `get_array_element`.
+    ///
+    /// That channel is a bare `i32` carrying two different conditions, and
+    /// only one of them is an index:
+    ///
+    /// * [`ARRAY_STORE_OUT_OF_MEMORY`] — the store needed an auto-box wrapper
+    ///   (a primitive `Value` into a reference array) and the heap could not
+    ///   allocate one. Before 2026-09-03 the backends allocated that wrapper
+    ///   through their INFALLIBLE `alloc_object`, which prints
+    ///   `FATAL: out of heap space` and `std::process::abort()`s — so this
+    ///   condition took the whole VM down with no stack trace and no chance
+    ///   for a `catch (OutOfMemoryError)` to run. It is an
+    ///   `OutOfMemoryError` and nothing else.
+    /// * anything else — an out-of-range index, in `0..=i32::MAX` by
+    ///   construction ([`oob_index_code`]), which is an AIOOBE exactly as
+    ///   [`RuntimeError::aioobe`] builds it.
+    ///
+    /// Every call site that turns an array-store `Err` into a Java exception
+    /// must come through here rather than calling `aioobe` directly, or the
+    /// heap-full case is reported to the program as a negative array index.
+    pub fn array_store_fault(code: i32, length: i32) -> Self {
+        if code == crate::ARRAY_STORE_OUT_OF_MEMORY {
+            return RuntimeError::OutOfMemoryError {
+                message: "Java heap space".to_string(),
+            };
+        }
+        RuntimeError::aioobe(code, length)
     }
 
     /// An AIOOBE carrying a message that is not the array-access shape —
@@ -1978,6 +2043,9 @@ impl RuntimeError {
                 ("java/util/regex/PatternSyntaxException", None)
             }
             RuntimeError::NotImplemented { feature: _ } => return None,
+            RuntimeError::InternalError { message } => {
+                ("java/lang/InternalError", Some(message.as_str()))
+            }
         };
         let (class_name, borrowed) = pair;
         // A synthesised message wins over the table's `None`. The two are
@@ -2809,6 +2877,9 @@ mod tests {
                 method: "fake".into(),
                 descriptor: "(I)Ljava/lang/String;".into(),
                 registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+                // The interesting arm: a refusal that did NOT retire its
+                // method, because an earlier registration still owns the slot.
+                survivor: Some("intrinsic@native-builtins/src/phases_early.rs:21878".into()),
             },
             JdkOnlyViolation::SyntheticNativeInvocation {
                 class: "com/example/Strict".into(),
@@ -3033,6 +3104,7 @@ mod tests {
             method: "fake".into(),
             descriptor: "(I)Ljava/lang/String;".into(),
             registered_by: Some("native-builtins/src/lib.rs:1234".into()),
+            survivor: None,
         };
         assert!(registered
             .render(Some(25), false)

@@ -1931,7 +1931,7 @@ fn lookup_known_system_library_symbol(name: &str, c_name: &std::ffi::CStr) -> Op
     static LIBZSTD_HANDLE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let handle = *LIBZSTD_HANDLE.get_or_init(|| {
         for lib in [b"libzstd.so.1\0".as_slice(), b"libzstd.so\0".as_slice()] {
-            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const i8, libc::RTLD_LAZY) };
+            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
             if !handle.is_null() {
                 return Some(handle as usize);
             }
@@ -2566,7 +2566,7 @@ pub fn unbox_poly_return_checked(
 /// fire on disjoint method names (`invokeExact` versus the `VarHandle` access
 /// modes) and share only the funnel they sit in, so one going wrong in the
 /// field must not force the other off.
-fn vh_strict_reference_return() -> bool {
+pub(crate) fn vh_strict_reference_return() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {
         !matches!(
@@ -2608,6 +2608,16 @@ fn boxed_primitive_supertypes(wrapper: &str) -> &'static [&'static str] {
         "java/lang/Character" | "java/lang/Boolean" => &[OBJ, CMP, SER, CONSTABLE],
         _ => &[],
     }
+}
+
+/// Is `name` one of the eight primitive wrapper classes?
+///
+/// The predicate half of [`PRIMITIVE_WRAPPER_CLASSES`], exposed because the
+/// `VarHandle` reference-read thin direct bind reproduces W6-1 on its own cold
+/// arm (`jit::helpers::varhandle_strict_reference_return_check`) and the two
+/// must fire on exactly the same eight classes.
+pub(crate) fn is_primitive_wrapper_class_name(name: &str) -> bool {
+    PRIMITIVE_WRAPPER_CLASSES.contains(&name)
 }
 
 /// The `VarHandle` access modes that RETURN the accessed variable, paired with
@@ -3908,7 +3918,7 @@ fn safe_native_call_impl(
             .swap(false, std::sync::atomic::Ordering::Relaxed);
     let mut requested_gc = false;
     if native_array_gc && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared) {
-        crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(shared, thread, "vm-exec");
         requested_gc = true;
     }
     // Native-alloc young-pressure relief: when a native allocation wrapper
@@ -3975,7 +3985,7 @@ fn safe_native_call_impl(
                 || shared.mem.heap.hard_alloc_failure())
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
-            crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+            crate::runtime::interpreter::maybe_gc_forced_pub_at(shared, thread, "vm-exec");
             pressure_gc = true;
         }
         // Clear even when the gates said no: the flag was stale (another
@@ -4411,6 +4421,19 @@ pub fn native_return_pushed_to_stack(_shared: &SharedVm, thread: &mut JvmThread)
 /// object graph it touches. Calling this from the safepoint publish bounds
 /// that damage to one safepoint interval. Returns the number of chain
 /// entries + write-backs applied.
+/// `CRATONVM_BLOCKED_WAKE_JIT_REMAP=1` -- remap a waking blocked thread's
+/// COMPILED state (JIT frames, register image, shadow stack), not just its
+/// interpreter frames.
+///
+/// Default OFF only until it is measured; the omission it closes is a
+/// use-after-free. See the block in [`apply_pending_blocked_fixups`].
+fn blocked_wake_jit_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_BLOCKED_WAKE_JIT_REMAP").is_some()
+    })
+}
+
 pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
     use crate::memory::gc::update_value_ref;
     let fixup = {
@@ -4427,6 +4450,41 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
     let mut applied = 0usize;
     if !fixup.is_empty() {
         applied += fixup.len();
+        // THE JIT HALF, and it was missing entirely.
+        //
+        // This function remapped a blocked thread's INTERPRETER frames,
+        // `printed`, `java_thread_obj` and the native root slots -- and nothing
+        // compiled. A peer that entered a blocking region with compiled frames
+        // BELOW it therefore resumed with every JIT-frame oop, register image
+        // and shadow-stack entry still at its pre-move address.
+        //
+        // `apply_pointer_map_to_thread` (the STW-resume path) already carries
+        // exactly this block, and its comment describes the identical defect
+        // for the thread that PARKED at the barrier: "this stranded a
+        // non-initiator's JIT-frame oops at their old addresses after a
+        // relocation -- a use-after-free". Blocked peers are the same bug one
+        // path over, and they are the population the ZGC pinned-peer credit
+        // makes relocation possible under.
+        //
+        // Diagnosed by elimination 2026-09-03: three repairs aimed at the
+        // CURRENT thread's frames (pin unnamed refs, rewrite unmapped
+        // duplicates, `local_mask_unreached` fail-closed) each changed nothing,
+        // while the blanket guard -- the only remedy that also covers PEERS --
+        // was 0 SIGSEGV in 4. See
+        // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+        //
+        // Sound here for the same reason it is sound there: these walks are
+        // thread-local (`JIT_ENTRY_CHAIN`, this thread's shadow stack) and this
+        // function runs ON the waking thread, before it can re-enter compiled
+        // code. Re-remapping an already-rewritten slot is harmless -- a second
+        // lookup of a to-space address misses.
+        if blocked_wake_jit_remap_enabled() {
+            crate::jit::conservative_roots::remap_active_jit_frames(&fixup);
+            crate::jit::conservative_roots::remap_register_image_words(&fixup, Some(shared));
+            if crate::jit::conservative_roots::shadow_stack_enabled() {
+                thread.shadow_stack.remap(&fixup);
+            }
+        }
         for frame in &mut thread.frames {
             frame.update_local_refs(&fixup, &shared.mem.heap);
             frame.stack.update_object_refs(&fixup, &shared.mem.heap);
@@ -8944,6 +9002,20 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         false
     }
 
+    fn class_assignable_to_name(&self, class_id: ClassId, target_class_name: &str) -> Option<bool> {
+        // The SAME walk `typecheck::aastore_element_assignable` reaches for when
+        // its ClassId-comparing checks have run out — see the boundary's doc for
+        // why a reflective caller must not ask a narrower question than the
+        // bytecode does.
+        Some(
+            self.shared
+                .classes
+                .class_manager
+                .read()
+                .is_assignable_to_name(class_id, target_class_name),
+        )
+    }
+
     fn synthetic_implements_declared(&self, class_id: ClassId, target_class_name: &str) -> bool {
         // Via the `pub use typecheck::*` re-export in `interpreter.rs`, exactly
         // as `aastore_element_assignable` below reaches its predicate: one
@@ -9949,6 +10021,22 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|s| s.to_string())
     }
 
+    fn any_loaded_class_in_package(&self, package_slash: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package(package_slash)
+    }
+
+    fn any_loaded_class_in_package_for_loader(&self, package_slash: &str, loader_id: u32) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .any_loaded_class_in_package_for_loader(package_slash, loader_id)
+    }
+
     fn set_class_hidden(&mut self, class_id: ClassId) {
         let mut cm = self.shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
@@ -10793,10 +10881,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         }
         // Check if the receiver is a lambda proxy.
-        let call_site = {
-            let proxies = self.shared.classes.lambda_proxies.read();
-            proxies.get(&receiver_class_id).cloned()
-        };
+        let call_site = self.shared.classes.lambda_call_site_for(receiver_class_id);
         if crate::runtime::env_cache::invoke_virtual_entry_trace()
             && method_name == "aotContributedInitializerStartsManagementContext"
         {
@@ -11158,9 +11243,10 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                             Some(obj) => obj,
                             None => {
                                 self.thread.tlab.retire();
-                                crate::runtime::interpreter::maybe_gc_forced_pub(
+                                crate::runtime::interpreter::maybe_gc_forced_pub_at(
                                     self.shared,
                                     self.thread,
+                                    "vm-exec-alloc-retry",
                                 );
                                 self.shared.mem.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
                                     MethodCallFailed::InternalError(crate::error::VmError::Runtime(
@@ -11481,9 +11567,18 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
-                && method_name == "aotContributedInitializerStartsManagementContext"
-            {
+            // Name first, then the (now cached) gate: the name compare fails
+            // on its length for every other method, so the trace costs one
+            // `usize` compare on the path every native->Java callback takes.
+            // `CRATONVM_JIT_HOT_LOOKUP_CACHE=0` restores the original order and
+            // the uncached read.
+            if if crate::runtime::env_cache::hot_lookup_cache() {
+                method_name == "aotContributedInitializerStartsManagementContext"
+                    && crate::runtime::env_cache::needs_exact_trace()
+            } else {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                    && method_name == "aotContributedInitializerStartsManagementContext"
+            } {
                 let global_id = self
                     .shared
                     .classes
@@ -12744,7 +12839,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // a death spiral, and OOM is the honest answer. Reporting `false` there
         // rather than `true` is what keeps this from becoming that spiral.
         self.thread.tlab.retire();
-        crate::runtime::interpreter::maybe_gc_forced_pub(self.shared, self.thread);
+        crate::runtime::interpreter::maybe_gc_forced_pub_at(self.shared, self.thread, "vm-exec");
         if crate::runtime::interpreter::gc_overhead_limit_exceeded(self.shared) {
             return false;
         }
@@ -12914,8 +13009,43 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // and its contract is "no-op or VM error, never an out-of-bounds heap
         // write". The caller range-checks; `native-builtins`'s
         // `vh_array_index` is the worked example.
-        let _out_of_range = self.shared.mem.heap.set_array_element(obj, index, value);
+        //
+        // The ONE code that is not an index gets a report. Since 2026-09-03 a
+        // store that needs an auto-box wrapper on a full heap returns
+        // `ARRAY_STORE_OUT_OF_MEMORY` instead of `std::process::abort()`-ing
+        // (see that constant); the interpreter's `*astore` arms raise
+        // `OutOfMemoryError` from it, but this accessor has no error channel to
+        // raise through, so the store is dropped. Dropping it is still the
+        // right behaviour — the alternative was killing the VM — but it must
+        // not be SILENT, because a dropped element is exactly the shape of
+        // defect that takes a week to trace back to a heap that was full for
+        // one millisecond. Reported once per process: a full heap produces
+        // these in floods, and the first one is the one that matters.
+        if let Err(cratonvm_gc::heap::ARRAY_STORE_OUT_OF_MEMORY) =
+            self.shared.mem.heap.set_array_element(obj, index, value)
+        {
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "OutOfMemoryError: Java heap space while auto-boxing a primitive into a                      reference array from native code (index {index}); the element was left                      unchanged. This accessor has no exception channel — see                      ARRAY_STORE_OUT_OF_MEMORY."
+                );
+            }
+        }
         // write_barrier fires automatically inside set_array_element for ref arrays
+        //
+        // Phase 10 #2: the host just wrote this array, so any device
+        // buffer mirroring it is stale.
+        //
+        // AUDIT 2026-09-02: native code writes arrays too, and none of it
+        // went through an interpreter `*astore` arm. `System.arraycopy`
+        // lands here for its per-element shapes, and every other native
+        // array writer that reaches `NativeHeapAccess` does as well. This
+        // is the chokepoint for all of them, which is why the fix is here
+        // rather than in `native-builtins` — that crate cannot see
+        // `input_cache`, and its `gpu-offload` feature is empty.
+        #[cfg(feature = "gpu-offload")]
+        crate::runtime::offload::input_cache::invalidate(obj);
     }
 
     // -- Bulk primitive-array intrinsics (perf override) --------------------
@@ -13377,6 +13507,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 }
             }
         }
+        // Phase 10 #2: `dst` has just been overwritten in bulk, so any
+        // device buffer mirroring it is stale.
+        //
+        // AUDIT 2026-09-02: this is the FAST path — `System.arraycopy`
+        // for same-type primitive arrays takes it and never touches
+        // `set_array_element`, so invalidating there alone left this hole
+        // open. `GpuRuntimeStress`'s `bulk_writes` scenario is the one
+        // that found it: a `System.arraycopy` into a kernel's input array
+        // between submits, after which the next submit computed from the
+        // device copy the host had replaced.
+        //
+        // `src` is not invalidated: a copy READS it and leaves it byte
+        // for byte as the device already has it.
+        #[cfg(feature = "gpu-offload")]
+        crate::runtime::offload::input_cache::invalidate(dst);
         true
     }
 
@@ -13920,8 +14065,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `young_spill_pressure` so the NEXT `safe_native_call` boundary —
         // where every argument is pinned and remappable — runs the
         // orchestrated GC this method cannot (see `safe_native_call_impl`).
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        // The shape planner, not a bare legacy size -- see
+        // `plan_tlab_object_shape`.
+        let (requested_size, _, _) = crate::runtime::interpreter::plan_tlab_object_shape_at(
+            class_id,
+            slots,
+            crate::runtime::interpreter::tlab_site::NATIVE,
+        );
         if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
             if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
                 self.thread,
@@ -16873,6 +17023,27 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     /// cache. Called from `Native.releaseExecutor` so device
     /// buffers cached for plain JVM primitive arrays are freed when
     /// the Java `GpuExecutor` is closed.
+    fn gpu_release_submission(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            // Kill switch: the drain is new and default-on, and its
+            // absence is what the old behaviour was. See
+            // `CRATONVM_GPU_NO_SUBMISSION_DRAIN`.
+            use std::sync::OnceLock;
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            let on = *ENABLED.get_or_init(|| {
+                cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_SUBMISSION_DRAIN").is_none()
+            });
+            if on {
+                crate::runtime::offload::release_submission(handle);
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
     fn gpu_clear_input_cache(&mut self) {
         #[cfg(feature = "gpu-offload")]
         {
@@ -16950,7 +17121,10 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
                     | MethodHandleKind::InvokeSpecial
             );
             if !kind_admitted {
-                tracing::debug!(
+                // See the sibling site in `runtime/offload.rs`: `debug!` is
+                // compiled out in release, so this decision was
+                // unreachable by any RUST_LOG directive.
+                tracing::info!(
                     target: "gpu.offload",
                     handle_kind = ?lcs.impl_handle.kind,
                     target_class = %lcs.impl_handle.class_name,
@@ -17691,15 +17865,28 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             return;
         };
         let mut recorder = self.shared.debug.flight_recorder.lock();
-        let Some(recording) = recorder.get_recording_mut(id) else {
-            return;
-        };
-        recording.settings.enabled_event_names =
-            enabled_names.map(|names| names.iter().cloned().collect());
-        recording.settings.event_thresholds_by_name = thresholds
-            .iter()
-            .map(|(name, nanos)| (name.clone(), *nanos))
-            .collect();
+        {
+            let Some(recording) = recorder.get_recording_mut(id) else {
+                return;
+            };
+            recording.settings.enabled_event_names =
+                enabled_names.map(|names| names.iter().cloned().collect());
+            recording.settings.event_thresholds_by_name = thresholds
+                .iter()
+                .map(|(name, nanos)| (name.clone(), *nanos))
+                .collect();
+        }
+        // A14/A8 (2026-09-01): re-arm the `cratonvm.JitCompileDecision` producer
+        // gate. That event is armed only when a RUNNING recording names it, and
+        // the gate is otherwise refreshed by `refresh_running_ids` — which runs
+        // on start, not on a settings change. Every Java-side settings edit
+        // funnels through this function (`native-builtins/src/jfr.rs`), and
+        // `Recording.enable(...)` changes no recording STATE, so without this
+        // line `r.start()` followed by `r.enable(...)` leaves the producer
+        // permanently dark while the reverse order works — an argument-order
+        // dependence nothing would explain. The `recording` borrow is scoped
+        // above so `recorder` is free to be re-borrowed here.
+        cratonvm_jfr::jit_decision::sync_jit_decision_gate(&recorder);
     }
 
     fn jfr_set_java_output(&mut self, path: &str) {
