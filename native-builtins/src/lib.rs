@@ -4634,6 +4634,15 @@ pub mod logmanager;
 // `org.jboss.logmanager.ExtHandler.<clinit>` ClassCastException on
 // reflective cast.
 pub mod atomic_updater;
+// The Windows attach provider's two `listVirtualMachines()` natives.
+// `#![cfg(windows)]` inside the module, and gated again here, because the
+// LINUX class of the same name declares neither: a `Bridge` registered
+// against a method the runtime image does not have is what the bridge
+// ratchet exists to catch. See the module's own doc comment for the
+// `UnsatisfiedLinkError` this closes and for why only two of the four are
+// registered.
+#[cfg(windows)]
+pub mod attach_provider;
 // T19_H13_BIGINTEGER_INTRINSICS — `java.math.BigInteger.implSquareToLen` /
 // `shiftLeftImplWorker` / `shiftRightImplWorker` / `implMulAdd` / `mulAdd`
 // HotSpot-equivalent native overrides. KC16 boot path constructs a 2048-bit
@@ -19285,6 +19294,12 @@ pub fn register_essential_natives_with_shims(
     t27_tls::register_t27_natives(registry);
     // WP5.2 — real PKCS12 + JKS parser via the `p12` crate + hand-rolled JKS.
     keystore::register_keystore_real(registry);
+    // `sun/tools/attach/AttachProviderImpl.tempPath` / `.volumeFlags` — the
+    // two natives `com.sun.tools.attach.VirtualMachine.list()` needs on
+    // Windows before it reaches the bytecode the Linux leg already runs.
+    // Windows-only: the Linux class declares neither method.
+    #[cfg(windows)]
+    attach_provider::register_attach_provider(registry);
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
     //         and RFC 5280 chain validation backed by rustls-native-certs.
     x509_manager::register_x509_manager_real(registry);

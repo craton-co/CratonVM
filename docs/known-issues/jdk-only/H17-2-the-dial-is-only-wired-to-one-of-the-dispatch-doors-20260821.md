@@ -1,9 +1,57 @@
 # H17-2 — the dial is wired to ONE dispatch door, so "arming a class" only ever affects the calls that reach step 1 cold; and I am retracting H17-1 §2's mechanism
 
-**Status: OPEN — MEASURED, with the mechanism ARGUED and explicitly not
-settled.** Lane H17, 2026-08-21, prebuilt `C:/craton/cratonvm-r8.exe` (clean
-build at `025780ff7`). Oracle HotSpot 25.0.3+9. **No source change, no suite
-run, no build.**
+> **SUPERSEDED 2026-09-05 — §5's load-bearing fact no longer holds, and this
+> page's Status stayed OPEN for two weeks after the work was done.** The
+> `runtime-services-blocker-inventory.md` warning applies to this page itself:
+> *"a row citing a fixed defect is worse than one citing nothing, because it
+> directs effort at work already done."*
+>
+> §5 says, and rests everything on, *"The dial has exactly ONE live call site in
+> the entire repository."* Re-run against `origin/dev` at `37ec2cfd0`, the same
+> grep this page used:
+>
+> ```text
+> jdk_only_dial_yields_to_bytecode(     6 live call sites in 3 files
+>   vm/src/runtime/interpreter/dispatch_static.rs   populate_invoke_cache
+>   vm/src/runtime/interpreter/native_override.rs   revalidate_cached_native (the warm door)
+>   vm/src/vm/vm_exec.rs  x4                        invoke_or_native: the registry-first
+>                                                   probe, its array-type alias retry,
+>                                                   and both arms of the superclass walk
+> env_cache::jdk_only_enforce_shadow_for(   3 sites, one of which is the dial helper
+> ```
+>
+> The fix landed **2026-08-22, the day after this page was written** — the
+> fourteen-door pass named in `native_override.rs`'s
+> `every_force_native_file_asks_the_dial_or_is_exempt`, which is now a
+> structural gate: it walks every `.rs` under `vm/src`, and a file that forces a
+> native without consulting the dial is a RED TEST unless it carries a reasoned
+> row in `FORCE_SITES_EXEMPT`. That list holds **one** entry (`jit_bridge.rs`,
+> `permanent: true`, because `--jdk-only` already refuses to bind any
+> non-`Intrinsic` native in the JIT — a strict superset of what the dial would
+> decline) and the count of UNWIRED holes is asserted `== 0`.
+>
+> **What survives, and it is the valuable half.** §4's order-controlled
+> reflective-door experiment, §1's retraction of `H17-1` §2, and §2's table of
+> four witnesses that do NOT discriminate are all measurements and all stand.
+> So does §7's reading rule — *an armed FAILURE is real; an armed ZERO is
+> unreliable* — which `jdk_only_dial_yields_to_bytecode`'s own doc comment now
+> quotes back. **§7's prediction was never scored**: nobody re-ran `H0-4`'s
+> table against the wired dial, so "armed pass counts go DOWN" remains an open
+> question even though its premise is closed as a defect.
+>
+> **What to do with this page.** Read §1, §2 and §4. Do not plan against §5 or
+> §6 — §6's "why I did not ship a fix" is a decision somebody else reversed the
+> next day. `N1` (instrument the doors) is discharged by the wiring plus that
+> gate; `N5` (decide the dial's contract and write it down) is discharged by
+> `jdk_only_dial_yields_to_bytecode`'s doc comment, which states the
+> conservatism explicitly: a yield needs concrete bytecode to yield *to*, so an
+> armed run still under-prices a retirement of a triple with no `Code` behind
+> it.
+
+**Status: SUPERSEDED (was OPEN) — MEASURED, with the mechanism ARGUED and
+explicitly not settled.** Lane H17, 2026-08-21, prebuilt
+`C:/craton/cratonvm-r8.exe` (clean build at `025780ff7`). Oracle HotSpot
+25.0.3+9. **No source change, no suite run, no build.**
 
 This record does three things: it **disproves three hypotheses** (one of them my
 own, from `H17-1`), it reports the one experiment that discriminates sharply,

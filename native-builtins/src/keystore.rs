@@ -3622,7 +3622,9 @@ fn engine_set_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
 
-    let id = keystore_ensure_store_id(ctx, this);
+    // `this` IS the SPI here -- this is an `engine*` callback -- so the id is
+    // read off the object the fifteen sibling callbacks read theirs off.
+    let id = ensure_store_id_on(ctx, this);
     let entry_class = class_name_of(ctx, entry);
     match entry_class.as_str() {
         "java/security/KeyStore$TrustedCertificateEntry" => {
@@ -4120,6 +4122,20 @@ pub(crate) fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> V
 /// later read resolves the same store.
 pub(crate) fn keystore_ensure_store_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
     let target = unwrap_keystore_spi(ctx, ks_obj);
+    ensure_store_id_on(ctx, target)
+}
+
+/// [`keystore_ensure_store_id`] without the unwrap, for a caller that already
+/// holds the SPI.
+///
+/// Every other `engine*` callback in this file reads its id with a plain
+/// `get_store_id(ctx, this)`; `engine_set_entry` was the one that went through
+/// the unwrapping form, and on a `KeyStoreDelegator` receiver that is how it
+/// came to write its entries somewhere no reader looks. Asking for the id of
+/// the object you were handed is the invariant the other fifteen callbacks
+/// hold, so it is spelled out here rather than left to the unwrap being
+/// harmless.
+fn ensure_store_id_on(ctx: &mut dyn NativeContext, target: ObjectRef) -> i32 {
     let existing = get_store_id(ctx, target);
     if existing != 0 {
         return existing;
@@ -4364,9 +4380,33 @@ fn unwrap_keystore_spi(ctx: &mut dyn NativeContext, keystore_obj: ObjectRef) -> 
         return spi;
     }
     // Fallback: real KeyStore's field order is type(0)/provider(1)/keyStoreSpi(2).
+    //
+    // THE INDEX IS BLIND, SO WHAT IT PRODUCES IS CHECKED BEFORE IT IS BELIEVED.
+    // This helper is also reached with a receiver that is ALREADY an SPI --
+    // `keystore_ensure_store_id` is called from `engine_set_entry`, whose
+    // `this` is the provider's own `KeyStoreSpi`. `KeyStore.getInstance("PKCS12")`
+    // resolves to `sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12`, a
+    // `sun/security/util/KeyStoreDelegator` whose slot 2 is `primaryKeyStore`:
+    // a `java.lang.Class` MIRROR, not a keystore. The name lookup above misses
+    // (a delegator has no `keyStoreSpi` field), the index fired, and every
+    // `setEntry` was stored against the store id of a process-global class
+    // mirror -- which no reader ever asks. `setEntry` returned normally,
+    // `size()`/`aliases()`/`getKey()` answered as if nothing had been stored,
+    // and `store()` serialised an empty keystore. Measured on JDK 25, both
+    // modes, `apps/probes/JdkOnlyPlatformProbe.java`'s `security` section.
+    //
+    // So the candidate must actually BE a `KeyStoreSpi`. When that class
+    // cannot be resolved at all the historical blind behaviour is kept rather
+    // than silently changed on an image that has no such class.
     if ctx.object_num_fields(keystore_obj) > 2 {
         if let Value::Object(Some(spi)) = ctx.get_field(keystore_obj, 2) {
-            return spi;
+            let Some(spi_cid) = ctx.class_id_by_name("java/security/KeyStoreSpi") else {
+                return spi;
+            };
+            let actual = ctx.class_id_of_object(spi);
+            if actual == spi_cid || ctx.is_subclass(actual, spi_cid) {
+                return spi;
+            }
         }
     }
     keystore_obj
@@ -5223,6 +5263,145 @@ mod tests {
             back.entries.keys().collect::<Vec<_>>(),
             vec!["zzz-first", "aaa-second"],
             "insertion order, not alphabetical, and no secret key"
+        );
+    }
+}
+
+/// `unwrap_keystore_spi`'s slot-2 fallback, both directions.
+///
+/// # The defect these hold shut
+///
+/// `KeyStore.setEntry("secret", new SecretKeyEntry(...), new PasswordProtection(pw))`
+/// returned normally and stored NOTHING. Measured on JDK 25 in both
+/// `--real-jdk` and `--jdk-only`:
+///
+/// ```text
+///                          HotSpot   CratonVM
+/// size() after setEntry       1         0
+/// containsAlias("secret")   true     false
+/// getKey("secret", pw)     <key>      null
+/// store(...) byte count      421       122      (an EMPTY keystore)
+/// setKeyEntry(...)   -- the pre-1.5 route to the same thing -- worked
+/// ```
+///
+/// `engine_set_entry` was the one `engine*` callback that read its store id
+/// through `keystore_ensure_store_id`, which UNWRAPS. Its receiver is already
+/// the SPI, and for `KeyStore.getInstance("PKCS12")` that SPI is
+/// `sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12`, a
+/// `sun/security/util/KeyStoreDelegator`. A delegator has no `keyStoreSpi`
+/// field, so the name lookup missed and the blind slot-2 fallback fired --
+/// and slot 2 of `KeyStoreDelegator` is `primaryKeyStore`, a `java.lang.Class`
+/// MIRROR. Every `setEntry` was therefore filed under the store id of a
+/// process-global class mirror, which no reader ever asks for.
+///
+/// # Why a mock and not a source scan
+///
+/// A source witness would pin today's spelling of the guard; these call the
+/// function. The second test is the one that keeps the first honest: a guard
+/// that rejected everything would make the delegator case pass while silently
+/// breaking every real `java.security.KeyStore` wrapper, which is the caller
+/// the fallback exists for.
+#[cfg(test)]
+mod unwrap_keystore_spi_tests {
+    use super::*;
+    use cratonvm_native_api::test_mock::MockNativeContext;
+    // The mock implements these through the trait, so the trait has to be in
+    // scope for `alloc_object` / `set_field` / `class_id_by_name` to resolve.
+    use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+
+    /// Slot 2 of the receiver is a `java.lang.Class`, exactly as it is on a
+    /// `KeyStoreDelegator`. The unwrap must refuse it and answer the receiver.
+    #[test]
+    fn a_slot_two_that_is_not_a_keystore_spi_is_not_followed() {
+        let mut ctx = MockNativeContext::new();
+        let spi_cid = ctx.declare_class("java/security/KeyStoreSpi", &[]);
+        let delegator_cid = ctx.declare_class(
+            "sun/security/pkcs12/PKCS12KeyStore$DualFormatPKCS12",
+            &[
+                ("primaryType", "Ljava/lang/String;"),
+                ("secondaryType", "Ljava/lang/String;"),
+                ("primaryKeyStore", "Ljava/lang/Class;"),
+            ],
+        );
+        let class_mirror_cid = ctx.declare_class("java/lang/Class", &[]);
+        assert_ne!(
+            spi_cid, class_mirror_cid,
+            "the mock handed the same ClassId to two names, so this test could not tell \
+             a Class mirror from a KeyStoreSpi and would pass on the broken tree"
+        );
+
+        let mirror = ctx.alloc_object(class_mirror_cid, 0);
+        let delegator = ctx.alloc_object(delegator_cid, 8);
+        ctx.set_field(delegator, 2, Value::Object(Some(mirror)));
+
+        let got = unwrap_keystore_spi(&mut ctx, delegator);
+        assert_eq!(
+            got, delegator,
+            "unwrap_keystore_spi followed slot 2 to a java.lang.Class. That is how \
+             KeyStore.setEntry came to store its entries against the store id of a \
+             process-global class mirror: setEntry returned normally, threw nothing, and \
+             size()/aliases()/getKey() all answered as if it had never been called."
+        );
+    }
+
+    /// The same fallback, with a slot 2 that IS a `KeyStoreSpi`. It must still
+    /// be followed — otherwise the narrowing above has broken the real
+    /// `java.security.KeyStore` wrapper it was never aimed at.
+    #[test]
+    fn a_slot_two_that_is_a_keystore_spi_is_still_followed() {
+        let mut ctx = MockNativeContext::new();
+        let spi_cid = ctx.declare_class("java/security/KeyStoreSpi", &[]);
+        let wrapper_cid = ctx.declare_class(
+            "java/security/KeyStore",
+            &[
+                ("type", "Ljava/lang/String;"),
+                ("provider", "Ljava/security/Provider;"),
+                ("keyStoreSpi", "Ljava/security/KeyStoreSpi;"),
+            ],
+        );
+
+        let spi = ctx.alloc_object(spi_cid, 1);
+        let wrapper = ctx.alloc_object(wrapper_cid, 4);
+        // By INDEX only: the by-name tier is what a real wrapper answers, and
+        // this test is about the tier underneath it.
+        ctx.set_field(wrapper, 2, Value::Object(Some(spi)));
+
+        let got = unwrap_keystore_spi(&mut ctx, wrapper);
+        assert_eq!(
+            got, spi,
+            "the slot-2 fallback stopped following a genuine KeyStoreSpi. That tier is the \
+             only one that resolves a synthetic KeyStore mirror, so breaking it drops every \
+             staged keystore identity -- the KeyManagerFactory/TrustManagerFactory defect \
+             `keystore_id_from_object` documents."
+        );
+    }
+
+    /// When `java/security/KeyStoreSpi` cannot be resolved at all, the check
+    /// cannot adjudicate and the historical blind behaviour is kept.
+    ///
+    /// Written down as a test because it is a decision, not an accident: an
+    /// image with no such class (a `--synthetic-jdk` mirror) must not have its
+    /// unwrap silently changed by a guard that has nothing to compare against.
+    #[test]
+    fn an_unresolvable_keystore_spi_class_keeps_the_old_behaviour() {
+        let mut ctx = MockNativeContext::new();
+        // Deliberately NOT declaring `java/security/KeyStoreSpi`.
+        let carrier_cid = ctx.declare_class("cratonvm/internal/ks/Carrier", &[]);
+        let inner_cid = ctx.declare_class("cratonvm/internal/ks/Inner", &[]);
+        let inner = ctx.alloc_object(inner_cid, 1);
+        let carrier = ctx.alloc_object(carrier_cid, 6);
+        ctx.set_field(carrier, 2, Value::Object(Some(inner)));
+
+        assert!(
+            ctx.class_id_by_name("java/security/KeyStoreSpi").is_none(),
+            "this test's premise is that the class is unresolvable; the mock resolved it, \
+             so the branch under test was never reached"
+        );
+        assert_eq!(
+            unwrap_keystore_spi(&mut ctx, carrier),
+            inner,
+            "with no KeyStoreSpi to compare against, the fallback must behave as it always \
+             did rather than start refusing on an image that cannot answer the question"
         );
     }
 }
