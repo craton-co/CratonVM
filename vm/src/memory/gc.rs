@@ -1130,7 +1130,7 @@ pub fn update_all_roots(
                 // the covered count alongside the miss count is what makes a
                 // zero mean something.
                 eprintln!(
-                    "[static-slot-verify] covered={covered} missed={missed}                      moved={moved} (covered = slots the scan recorded; moved =                      entries in this collection's pointer map)",
+                    "[static-slot-verify] covered={covered} missed={missed} moved={moved} (covered = slots the scan recorded; moved = entries in this collection's pointer map)",
                     moved = pointer_map.len(),
                 );
             }
