@@ -11698,6 +11698,15 @@ fn ir_drop_home_enabled() -> bool {
 /// Every one of those frame states is unreachable, and they still pin every
 /// intermediate to memory.
 fn ir_carry_single_use_enabled() -> bool {
+    // The level-2 machine list is compared byte-for-byte against these arms
+    // (`the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms`), and
+    // its tiler does not know this form. Residency is switched off under a MIR
+    // mode for exactly this reason -- see the comment at `ls_active` -- and so
+    // is this. A lane whose oracle is "the arms" cannot also be the reason the
+    // arms are not allowed to improve.
+    if isel_emit_enabled() || isel_verify_enabled() {
+        return false;
+    }
     // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_SINGLE_USE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -11750,6 +11759,15 @@ fn ir_carry_single_use_enabled() -> bool {
 /// is what `op_reads_rax_then_rcx` and the carry's RAX contract rest on, and
 /// buying a few more folds is not worth making that conditional.
 fn ir_alu_imm_enabled() -> bool {
+    // The level-2 machine list is compared byte-for-byte against these arms
+    // (`the_machine_level_emits_the_same_bytes_as_the_per_opcode_arms`), and
+    // its tiler does not know this form. Residency is switched off under a MIR
+    // mode for exactly this reason -- see the comment at `ls_active` -- and so
+    // is this. A lane whose oracle is "the arms" cannot also be the reason the
+    // arms are not allowed to improve.
+    if isel_emit_enabled() || isel_verify_enabled() {
+        return false;
+    }
     // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ALU_IMM") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -11839,6 +11857,13 @@ struct OsrEntryForce;
 
 #[cfg(test)]
 impl OsrEntryForce {
+    /// The stubs are default-ON since 2026-09-05, so the test that checks an
+    /// artifact carries none has to ask for the kill switch.
+    fn off() -> OsrEntryForce {
+        OSR_ENTRY_FORCE.with(|c| c.set(Some(false)));
+        OsrEntryForce
+    }
+
     fn on() -> OsrEntryForce {
         OSR_ENTRY_FORCE.with(|c| c.set(Some(true)));
         OsrEntryForce
@@ -11887,6 +11912,13 @@ struct DeoptRegsForce;
 
 #[cfg(test)]
 impl DeoptRegsForce {
+    /// The region is default-ON since 2026-09-05, so the test that checks the
+    /// historical two-argument stub shape has to ask for it explicitly.
+    fn off() -> DeoptRegsForce {
+        DEOPT_REGS_FORCE.with(|c| c.set(Some(false)));
+        DeoptRegsForce
+    }
+
     fn on() -> DeoptRegsForce {
         DEOPT_REGS_FORCE.with(|c| c.set(Some(true)));
         DeoptRegsForce
@@ -18412,9 +18444,16 @@ mod tests {
         );
     }
 
-    /// The stubs are off unless asked for, and an artifact carries none.
+    /// The kill switch really removes them: with `CRATONVM_JIT_IR_OSR_ENTRY=0`
+    /// an artifact carries no entry stub at all.
+    ///
+    /// Until 2026-09-05 this asserted the same thing about the DEFAULT, which
+    /// is what it was. The switch is on now, so the property worth pinning is
+    /// that turning it off still works — a default-on codegen change is only as
+    /// good as its way back.
     #[test]
-    fn no_osr_entry_stub_is_emitted_by_default() {
+    fn the_osr_entry_kill_switch_emits_no_stub() {
+        let _off = OsrEntryForce::off();
         let code = [
             0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
             0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
@@ -18422,7 +18461,7 @@ mod tests {
         let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
         assert!(
             cm.ir_osr_entries.is_empty(),
-            "the entry stubs are opt-in; an artifact must carry none by default",
+            "with the kill switch set an artifact must carry no entry stub",
         );
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
     }
@@ -19399,7 +19438,15 @@ mod tests {
         // stack-arg reserve, the ABI shadow space and, since the register file
         // went default-on (2026-09-02), the estimate's reservation for the
         // callee-saved GP save area — not spill.
-        assert!(after <= 192, "{after} bytes for a 4-slot working set");
+        // The 2026-09-05 default-on of the deopt register image adds its 256
+        // bytes to the same fixed part. Read from the function the frame is
+        // laid out with rather than folded into the literal, so the bound
+        // still means "no spill" on a configuration that reserves neither.
+        let fixed = 192 + ir_deopt_regs_bytes() as usize;
+        assert!(
+            after <= fixed,
+            "{after} bytes for a 4-slot working set (fixed part is {fixed})",
+        );
     }
 
     /// The node ceiling the frame bound implies, before and after.
@@ -19796,7 +19843,10 @@ mod tests {
             // literal here would pin this test to one configuration.
             let locals_size = (num_locals as i32) * 8;
             let bookkeeping = 8 * 5;
-            let saved = ir_saved_xmm_bytes() + ir_saved_gpr_bytes();
+            // `ir_deopt_regs_bytes` joined the other two on 2026-09-05, when
+            // the register image went default-on. Read, not spelled, for the
+            // reason the comment above gives.
+            let saved = ir_saved_xmm_bytes() + ir_saved_gpr_bytes() + ir_deopt_regs_bytes();
             let tail = 32 + 16;
             assert_eq!(
                 lowerer.frame_size,
@@ -22167,6 +22217,10 @@ mod tests {
     #[test]
     fn without_the_flag_no_region_is_reserved_and_nothing_is_spilled() {
         let _ls = LsForce::on();
+        // Default-ON since 2026-09-05, so "without the flag" is now something
+        // this has to ask for. That is the point of the test: the way back has
+        // to keep working.
+        let _dr = DeoptRegsForce::off();
         let mut lo = lowerer_with_resident_gpr(16384, 3);
         assert_eq!(
             lo.deopt_regs_base, 0,
