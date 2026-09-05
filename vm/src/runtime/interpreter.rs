@@ -7209,6 +7209,61 @@ fn execute_frame_from_index(
                 }
                 // xaload: iaload..saload (0x2e..=0x35)
                 0x2e..=0x35 => {
+                    // Quickened attempt first, entirely on raw slots.
+                    //
+                    // This arm used to open by decoding BOTH operands into the
+                    // 16-byte `Value` enum and only then offer them to the
+                    // quickened path — so every array element load paid two
+                    // `CompactValue -> Value` conversions before the fast arm
+                    // could decline them, and the fall-through pushed both
+                    // wide values back. The `*astore` arm below already had
+                    // the right shape (peek the raw slots, decode only on the
+                    // decline), and this is that shape.
+                    //
+                    // `index >= 0` is tested here so a negative index still
+                    // reaches the general path, which owns the AIOOBE and its
+                    // message.
+                    if let Some(zgc) = fast_field_zgc {
+                        if frame.stack.len() >= 2 {
+                            let idx_cv = frame.stack.peek_compact();
+                            let arr_cv = frame.stack.peek_compact_at(1);
+                            if let (Some(index), Some(aptr)) =
+                                (idx_cv.as_int(), arr_cv.as_object_ptr())
+                            {
+                                if index >= 0 && aptr != 0 {
+                                    // SAFETY: an `Object`-tagged operand-stack slot holds a
+                                    // heap address; both arms re-validate the header.
+                                    let arr_ref = unsafe { ObjectRef::from_raw(aptr as *mut u8) };
+                                    frame.stack.pop_compact();
+                                    frame.stack.pop_compact();
+                                    if field_fast::array_load_prim(
+                                        zgc,
+                                        &mut frame.stack,
+                                        arr_ref,
+                                        index,
+                                        opcode,
+                                    ) || (opcode == 0x32
+                                        && field_fast::array_load_ref(
+                                            zgc,
+                                            &mut frame.stack,
+                                            arr_ref,
+                                            index,
+                                        ))
+                                    {
+                                        frame.pc = saved_pc + 1;
+                                        continue;
+                                    }
+                                    // Declined. Restore both operand slots
+                                    // bit-for-bit; neither an array reference
+                                    // nor an `int` index is category-2, so the
+                                    // kind mark `push_compact` writes is the
+                                    // one they already had.
+                                    frame.stack.push_compact(arr_cv);
+                                    frame.stack.push_compact(idx_cv);
+                                }
+                            }
+                        }
+                    }
                     let idx_val = frame.stack.pop_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
                     if let (Value::Object(Some(arr_ref)), Value::Int(index)) = (arr_val, idx_val) {
@@ -7223,25 +7278,8 @@ fn execute_frame_from_index(
                             ));
                             continue;
                         }
-                        // Widening: index conversion
-                        if let Some(zgc) = fast_field_zgc {
-                            if field_fast::array_load_prim(zgc, &mut frame.stack, arr_ref, index, opcode) {
-                                frame.pc = saved_pc + 1;
-                                continue;
-                            }
-                            // `aaload` is the one member of this range the
-                            // primitive arm declines by construction; it has
-                            // its own arm rather than an entry in
-                            // `prim_elem_for_opcode` because a reference
-                            // element needs the barrier and autobox screens a
-                            // primitive one does not.
-                            if opcode == 0x32
-                                && field_fast::array_load_ref(zgc, &mut frame.stack, arr_ref, index)
-                            {
-                                frame.pc = saved_pc + 1;
-                                continue;
-                            }
-                        }
+                        // The quickened attempt already ran above, on the raw
+                        // slots, before either operand was decoded.
                         match shared.mem.heap.get_array_element(arr_ref, index as usize) {
                             Ok(value) => {
                                 frame.stack.push_unchecked(value);

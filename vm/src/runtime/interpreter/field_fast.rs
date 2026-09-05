@@ -326,14 +326,17 @@ pub(super) fn arraylength_fast(stack: &mut ValueStack) -> bool {
         return false;
     }
     if stack.len() == 0 {
+        site_stats::bump(site_stats::ARRLEN_MISS);
         return false;
     }
     // `None` for a null receiver (`SUB_NULL` is not `SUB_OBJECT`), which is
     // what routes the NPE to the general path.
     let Some(ptr) = stack.peek_compact().as_object_ptr() else {
+        site_stats::bump(site_stats::ARRLEN_MISS);
         return false;
     };
     if ptr == 0 {
+        site_stats::bump(site_stats::ARRLEN_MISS);
         return false;
     }
     // SAFETY: `ptr` is the receiver of a verified `arraylength`, so it is a
@@ -343,16 +346,19 @@ pub(super) fn arraylength_fast(stack: &mut ValueStack) -> bool {
     // See `registry_probe_restored` for the full argument.
     let header = unsafe { &*(ptr as *const ObjectHeader) };
     if header.kind() != ObjectKind::Array {
+        site_stats::bump(site_stats::ARRLEN_MISS);
         return false;
     }
     // JVMS: `arraylength` pushes an int, and an array length is bounded by
     // `Integer.MAX_VALUE`. A header claiming more is corrupt; decline to the
     // path that owns that diagnosis rather than wrapping it negative.
     let Ok(len) = i32::try_from(header.array_length()) else {
+        site_stats::bump(site_stats::ARRLEN_MISS);
         return false;
     };
     stack.pop_compact();
     stack.push_int_unchecked(len);
+    site_stats::bump(site_stats::ARRLEN_HIT);
     true
 }
 
@@ -974,10 +980,8 @@ pub(super) fn array_load_ref(
     if crate::runtime::env_cache::no_ref_array_fast() {
         return false;
     }
-    if index < 0 {
-        return false;
-    }
-    if zgc.load_barrier_armed() || cratonvm_gc::autobox::wrapper_exists() {
+    if index < 0 || zgc.load_barrier_armed() || cratonvm_gc::autobox::wrapper_exists() {
+        site_stats::bump(site_stats::REFARR_MISS);
         return false;
     }
     let base = arr.as_ptr() as usize;
@@ -988,13 +992,16 @@ pub(super) fn array_load_ref(
     if header.kind() != ObjectKind::Array
         || header.element_type() != ArrayElementType::Reference
     {
+        site_stats::bump(site_stats::REFARR_MISS);
         return false;
     }
     let index = index as usize;
     if index >= header.array_length() as usize {
+        site_stats::bump(site_stats::REFARR_MISS);
         return false;
     }
     let Some(offset) = index.checked_mul(cratonvm_types::narrow_oop::ref_element_size()) else {
+        site_stats::bump(site_stats::REFARR_MISS);
         return false;
     };
     // SAFETY: `index < length` and the stride is the one `read_prim_element`
@@ -1007,13 +1014,18 @@ pub(super) fn array_load_ref(
     } else if cratonvm_types::plausible_heap_pointer(raw) {
         match CompactValue::try_from_pointer(raw) {
             Some(cv) => cv,
-            None => return false,
+            None => {
+                site_stats::bump(site_stats::REFARR_MISS);
+                return false;
+            }
         }
     } else {
         // The three-way cold decode above; not reproduced here.
+        site_stats::bump(site_stats::REFARR_MISS);
         return false;
     };
     stack.push_compact(cv);
+    site_stats::bump(site_stats::REFARR_HIT);
     true
 }
 
