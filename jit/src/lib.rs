@@ -2890,6 +2890,20 @@ pub struct CompiledMethod {
     /// locals itself, because an SSA body has no fixed local→home map to hand
     /// a trampoline.
     pub ir_osr_entries: Vec<(u32, u32, u32)>,
+    /// This body emits no site that can return the `i64::MIN` sentinel: no
+    /// deopt stub and no call-exception stub.
+    ///
+    /// Which is a different question from `deopt_points.is_empty()`, and the
+    /// difference matters. A deopt POINT is a resume description — the lowerer
+    /// records one per safepoint snapshot that has a native offset, so a loop
+    /// with no calls at all still has eleven of them. What decides whether a
+    /// body can leave abnormally is whether anything JUMPS to a stub, and that
+    /// is `deopt_stub_patches` / `call_exc_patches`.
+    ///
+    /// The OSR door reads it: an optimizing-tier entry has no
+    /// `OsrEntryPlan::resume_after_exit` to resume through, so it may only
+    /// enter a body that cannot take that exit.
+    pub ir_osr_sentinel_free: bool,
     /// real-frame-deopt: boxed deopt points whose addresses are baked as
     /// imm64 into the guard/deopt-trampoline machine code. JIT code holds raw
     /// pointers into these boxes, so — like `_jit_invoke_infos` — they must
@@ -3295,6 +3309,7 @@ impl CompiledMethod {
             safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             ir_osr_entries: Vec::new(),
+            ir_osr_sentinel_free: false,
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
@@ -3380,6 +3395,7 @@ impl CompiledMethod {
             safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
             ir_osr_entries: Vec::new(),
+            ir_osr_sentinel_free: false,
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
