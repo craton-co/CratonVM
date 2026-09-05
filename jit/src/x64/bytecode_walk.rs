@@ -821,11 +821,43 @@ impl Compiler {
                 // `catch` block is now emitted keeps the OSR-entry answer it
                 // had when that block was dead code.
                 let handler_only = handler_only_pcs.get(pc).copied().unwrap_or(false);
+                // The abstract operand stack must be EMPTY here.
+                //
+                // AUDIT 2026-09-04, and this one was wrong code, not a
+                // missed optimisation. Entering part-way through an
+                // expression means the entry prologue has to materialise
+                // the pending operands -- and it does, correctly, for the
+                // entering iteration. What it cannot do is make the LOOP
+                // recompute them: the back edge targets the header, the
+                // operand pushes live ABOVE the entry point, and every
+                // later iteration replays the slots the prologue filled
+                // once.
+                //
+                // `test_classes/jit/OsrStridedValue.java`, entering at the
+                // `iastore` of `a[i] = i + r` with `[a, i, i+r]` pending:
+                //
+                //     --nojit   11 1035 2059 3083 4107 5131
+                //     jit       11   11   11   11   11   11
+                //
+                // The addresses advance because the index is a local in a
+                // register; the VALUE is frozen at the entering
+                // iteration's `i` because it lives in an operand slot
+                // written before the loop. Same shape, same reason, as the
+                // synthetic-guard case just above -- "part-way through,
+                // the abstract operand stack is not the header's" -- which
+                // is why that one already refuses.
+                //
+                // Costs nothing in practice: javac gives every loop header
+                // an empty expression stack, so the pcs this newly refuses
+                // are mid-expression ones the interpreter reaches again a
+                // few bytecodes later at the header.
+                let operand_stack_live = !self.stack.is_empty();
                 if inside_aaload_hoisted
                     || inside_arith_hoisted
                     || inside_len_hoisted
                     || inside_synthetic_guard
                     || handler_only
+                    || operand_stack_live
                 {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
@@ -6380,8 +6412,47 @@ impl Compiler {
                         }
                     }
 
+                    // Check for invoke_info (fallback to jit_invoke_dispatch)
+                    let info_ptr = self
+                        .invoke_info_idx
+                        .get(&pc)
+                        .map(|&i| self.invoke_info[i].1);
+
+                    // A GPU kernel call keeps its dispatch helper.
+                    //
+                    // The offload hook lives in `jit_invoke_dispatch`, and
+                    // this arm has TWO doors that never reach it: the
+                    // inliner (checked first, "most profitable") and this
+                    // backend's own direct-call map. Splicing the kernel's
+                    // body into the caller, or binding a raw CALL to its
+                    // compiled entry, both compile the caller and silently
+                    // end offload at that site -- which is what
+                    // `offload_jit_gate` used to refuse the whole method to
+                    // prevent.
+                    //
+                    // Read off the site's own `JitInvokeInfo`. No info means
+                    // this walk cannot name the callee, so it does not
+                    // filter: failing open leaves the site exactly as it was
+                    // before this existed.
+                    //
+                    // Unarmed (no `--gpu`) `is_kernel` is one relaxed bool,
+                    // so a CPU-only run pays a load per compiled
+                    // invokestatic SITE at compile time and nothing at all
+                    // at run time.
+                    let site_is_gpu_kernel = info_ptr.is_some_and(|ip| {
+                        // SAFETY: `invoke_info` owns every pointer it hands
+                        // out for the life of this compile.
+                        let info = unsafe { &*(ip as *const crate::JitInvokeInfo) };
+                        info.invoke_kind == 3
+                            && crate::offload_hook::is_kernel(
+                                info.class_name,
+                                info.method_name,
+                                info.descriptor,
+                            )
+                    });
+
                     // Check for inline site first (most profitable)
-                    if self.inline_sites.contains_key(&pc) {
+                    if !site_is_gpu_kernel && self.inline_sites.contains_key(&pc) {
                         if self.try_emit_inline(pc) {
                             pc += 3;
                             continue;
@@ -6390,17 +6461,15 @@ impl Compiler {
 
                     // Check for direct call target
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let direct = self.direct_calls_idx.get(&pc).map(|&i| {
-                        let dc = &self.direct_calls[i].1;
-                        note_emit_direct(&self.method_key, pc, dc.entry);
-                        (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
-                    });
-
-                    // Check for invoke_info (fallback to jit_invoke_dispatch)
-                    let info_ptr = self
-                        .invoke_info_idx
-                        .get(&pc)
-                        .map(|&i| self.invoke_info[i].1);
+                    let direct = if site_is_gpu_kernel {
+                        None
+                    } else {
+                        self.direct_calls_idx.get(&pc).map(|&i| {
+                            let dc = &self.direct_calls[i].1;
+                            note_emit_direct(&self.method_key, pc, dc.entry);
+                            (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
+                        })
+                    };
 
                     let direct = direct.filter(|(entry, _, _, _)| {
                         if *entry != crate::JitIntrinsic::ArraycopyPrimitive.as_entry() {

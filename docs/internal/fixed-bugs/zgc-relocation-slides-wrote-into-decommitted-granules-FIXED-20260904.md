@@ -125,3 +125,96 @@ ingredients were measured as engaged, and they were still blind — because the
 ingredient list came from the hypothesis. `objects_relocated=3.2M` proves
 relocation ran; it says nothing about `compact_high_region`, which has its own
 counter (`high_compaction_cycles`) that neither probe read.
+
+## A second workload, and a chase that ran on a stale binary (2026-09-04, later)
+
+`org.h2.test.db.TestLargeBlob` reproduces this page's defect, and it was
+independently chased for most of an evening as if it were a NEW bug, because
+the binary under test predated the fix above.
+
+The reproducer, for anyone who wants a second workload for this family:
+
+```bash
+JDK25=/data/toolchain/jdk-25 CRATONVM_BIN=<binary> CRATONVM_ZGC_ALLOC_TRIGGER=25 \
+  ./run-h2-suite.sh run --category all --start 33 --count 1 --tag lb
+```
+
+`CRATONVM_ZGC_ALLOC_TRIGGER=25` is what makes it work: on this class it is the
+difference between **0 collections and 34**. Nothing ever collected there
+before, so nothing ever slid.
+
+The A/B, interleaved round by round on one host, `b011f0dc0` (which predates
+`19854a573`) against dev tip:
+
+| arm | SIGSEGV |
+|---|---|
+| pre-fix binary | 2 / 5 — and 5 / 7 in an earlier batch, so **7 / 12** |
+| dev tip | **0 / 8** |
+
+Same signature both times: a libc `memcpy`, `rdi` at or one AVX store below a
+2 MiB-aligned fault address, `rbp` holding a 23.9 MB length.
+
+### The two inferences that kept the chase going, both wrong
+
+**"`bytes_copied == occupancy`, so relocation never ran."** That counter is the
+SWEEP shard's — it accumulates the size of every live object the complement
+pass measures, so of course it equals occupancy. The high slide's copies are
+counted by `high_bytes_copied`, which the pause line does not print. Exactly
+the trap the row above this section already records for the two probes: reading
+a relocation question off a counter that does not answer it.
+
+**"The GC summary for cycle 20 printed, then the crash, so the mutator did
+it."** Cycle 20's summary printing means cycle 20 finished. Cycle 21's slide
+crashes before printing anything. A summary line is evidence about the cycle it
+names and about no other.
+
+The general form: `git log` between the tip and whatever built the binary you
+are running, BEFORE building a theory on its behaviour.
+
+### What came out of it anyway
+
+`reservation::recent_decommit_covering` — a 64-slot ring of the spans this
+process handed back to the OS, printed by the crash handler when the fault
+address is inside one, tagged with the give-back's site. This page reached
+`compact_high_region` through gdb; the crash report said nothing. With the ring
+armed the same crash prints `site=free-list-high` and "NOT re-committed since",
+which is the diagnosis, in the report, from one run.
+
+### Confirmed on the full H2 suite, 2026-09-05
+
+Not just on the reproducer. All 218 classes, ZGC, `jit-real`, three shards on
+`vm1`, against the 2026-09-03 ZGC full run taken under comparable contention:
+
+| | baseline (09-03) | dev tip (09-05) |
+|---|---|---|
+| PASS | 176 | **182** |
+| FAIL | 16 | 15 |
+| HANG | 21 | 21 |
+| **CRASH** | **5** | **0** |
+
+**Zero regressions** — no class that passed on 09-03 stopped passing. And no
+`SIGSEGV` or fatal-error report anywhere in the run; the baseline had five, and
+all five are gone:
+
+| class | 09-03 | 09-05 |
+|---|---|---|
+| `db.TestLargeBlob` | CRASH | **PASS** |
+| `db.TestLIRSMemoryConsumption` | CRASH | **PASS** |
+| `unit.TestPerfectHash` | CRASH | **PASS** |
+| `synth.TestPowerOffFs2` | CRASH | FAIL |
+| `store.TestKillProcessWhileWriting` | CRASH | HANG |
+
+The last two still do not pass, but they no longer crash — a different failure,
+to be taken on its own terms rather than as this one.
+
+Worth recording about `TestLargeBlob` specifically: it crashed on 09-03 with NO
+`CRATONVM_ZGC_ALLOC_TRIGGER` set. The trigger was a way to make the defect
+reproduce on demand, not a precondition for it — the suite was meeting this by
+default, on three classes, and one of them (`TestLIRSMemoryConsumption`) had its
+own known-issue page pointed elsewhere.
+
+The remaining movement is HANG/FAIL churn among classes that were already
+failing (`TestCluster` and `TestDiskFull` to PASS, `TestStringCache` HANG to
+PASS, `TestKill` FAIL to HANG, `TestMVStoreCachePerformance` HANG to FAIL).
+HANG totals are identical at 21, and these are 300 s class timeouts on a shared
+box, so read them as contention rather than as signal.

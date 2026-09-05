@@ -898,6 +898,13 @@ pub(super) fn compile_osr_artifact(
                 // method-entry path's `rbc6-handler-reads-unsafe-local` bail
                 // does. A bare "OSR denied" here is what cost this defect a
                 // six-arm shape bisect to find in the first place.
+                // x86-64 only: `first_unsupported_precise_frame_site` is
+                // `#[cfg(target_arch = "x86_64")]`, because the precise-frame
+                // publication it screens for is a property of that backend's
+                // lowering. On another architecture there is no OSR at all (the
+                // aarch64 backend publishes no `osr_pc_to_native`), so there is
+                // nothing to deny and nothing to name.
+                #[cfg(target_arch = "x86_64")]
                 if let Some((pc, op)) = cratonvm_jit::first_unsupported_precise_frame_site(
                     &code,
                     code_len,
@@ -3467,6 +3474,33 @@ pub(super) fn try_osr(
     // wire-tiered-manager Step 5: the OSR compile (or cache reuse) now lives in
     // `compile_osr_artifact`, which the background worker can also call off-thread.
     // The live-frame entry/transfer below stays on the mutator.
+    // ── The optimizing tier at this door: what is wired, and what is not ──
+    //
+    // The ENTRY side below is live and complete: it keys off whatever artifact
+    // arrives, and takes the optimizing tier's own stub whenever the artifact
+    // carries one for this bci (`ir_osr_entry_addr`). A single-pass artifact
+    // carries none and nothing changes for it.
+    //
+    // What this door does not yet do is PRODUCE one. The obvious move — ask
+    // `try_jit_upgrade`, the method-entry door that owns the optimizing tier's
+    // whole input pipeline — is wrong twice over, and asking it is how both
+    // were found:
+    //
+    //   * it declines for POLICY unrelated to OSR. A method that calls any
+    //     native-shadowed target is refused, which is nearly every method with
+    //     a `println` in it — including `probes/OsrTierProbe.java`, the exact
+    //     shape this wiring exists for;
+    //   * and that refusal MARKS THE METHOD BAIL-LISTED, which
+    //     `compile_gate::admit` then honours at this door. Asking a policy
+    //     question can therefore switch OFF the single-pass OSR that works
+    //     today, so a probe must not be able to ask it.
+    //
+    // The extraction is the remaining work: `try_jit_upgrade_with_gate`'s
+    // resolver assembly — the invoke plans, `checkcast_info`, the `new`-site
+    // resolutions, the inline sites — wants separating from its ADMISSION
+    // POLICY so this door can share the first without triggering the second.
+    // That is "route OSR through the common funnel" stated precisely, and it is
+    // a refactor of that function rather than a change to this one.
     let compiled = compile_osr_artifact(
         shared,
         class_id,
@@ -3554,7 +3588,22 @@ pub(super) fn try_osr(
     // A refusal is free of side effects — the check reads metadata and these two
     // slices, allocates one `Vec`, and never enters compiled code — so falling
     // back to `entry_pc`, where the interpreter already is, replays nothing.
-    let plan = match compiled.validate_osr_entry(&osr_state) {
+    // An optimizing-tier stub is admitted by its OWN construction, not by
+    // `validate_osr_entry`: that check proves the offered slots against the
+    // single-pass entry contract — `osr_num_locals`, the per-method local
+    // assignments, the deopt points `osr_trampoline` would seed through — and
+    // an SSA body has none of those. What stands in its place is the refusal
+    // the lowerer already made: a bci gets a stub only when every value live on
+    // entry is one the snapshot names, and `ir_osr_enter` refuses a locals
+    // slice shorter than the stub reads.
+    // Cast: a bci fits u32.
+    let ir_entry = compiled.ir_osr_entry_addr(entry_pc as u32);
+    let plan = match if ir_entry.is_some() {
+        // Nothing to validate, and nothing validated: skip straight past.
+        Ok(None)
+    } else {
+        compiled.validate_osr_entry(&osr_state).map(Some)
+    } {
         Ok(plan) => plan,
         Err(b) => {
             // Only an ARTIFACT-level verdict may be memoed: it is a pure function
@@ -3646,7 +3695,43 @@ pub(super) fn try_osr(
             // `validate_osr_entry` on THIS artifact with THIS state just above, so
             // every seeded slot's JVM type has been checked against the compiled
             // entry's contract and `osr_state.locals` matches `osr_num_locals`.
-            unsafe { compiled.osr_enter_planned(vm_ptr, &osr_state, &plan, thread_ptr) }
+            //
+            // x86-64 only: `osr_enter_planned` is `#[cfg(target_arch =
+            // "x86_64")]`. Reaching here off x86-64 would mean an artifact
+            // published OSR entry points, and no other backend does, so
+            // `should_try_osr` refuses long before here.
+            #[cfg(target_arch = "x86_64")]
+            {
+                match &plan {
+                    // The single-pass trampoline, with its proof.
+                    Some(plan) => unsafe {
+                        compiled.osr_enter_planned(vm_ptr, &osr_state, plan, thread_ptr)
+                    },
+                    // The optimizing tier's own stub. It builds this tier's
+                    // frame, seeds the locals the snapshot at this bci names,
+                    // and jumps into the body — two arguments where the
+                    // trampoline takes twenty layout fields, because the
+                    // lowerer knows the layout and the trampoline never could.
+                    None => unsafe {
+                        compiled.ir_osr_enter(entry_pc as u32, vm_ptr, &jit_locals)
+                    },
+                }
+            }
+            // `None`, NOT `unreachable!()`. The reasoning above is sound and
+            // the panic was still the wrong answer twice over. `None` is this
+            // call's existing word for "no entry was taken" -- the caller
+            // matches `Ok(None) => return None` and the interpreter carries on
+            // in the frame it is already in -- so an argument that turns out to
+            // be wrong on some future backend degrades to running the loop
+            // interpreted instead of aborting the VM. And the panic-free gate
+            // over this module is a TEXT scanner: it does not evaluate `cfg`,
+            // so a site compiled out of every x86-64 build still counted
+            // against a budget of zero and turned the gate red for everyone.
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (&osr_state, &plan, thread_ptr, vm_ptr, &jit_locals);
+                None
+            }
         }));
         // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
         // that did not pop). Before this site's own guard drops, depth should be
@@ -4029,11 +4114,18 @@ pub(super) fn try_osr(
             // this artifact whose `ResumeSemantics` is `REEXECUTE` — instead of
             // trusting `rframe.bci` verbatim. It is the only sanctioned resume
             // point once compiled code has run.
+            // `plan` is `None` for an optimizing-tier entry, which is admitted
+            // only for an artifact with no deopt points — so this arm is
+            // unreachable for one, and guarding rather than unwrapping is what
+            // makes that a refusal instead of a panic if the admission above
+            // ever widens.
             if compiled.can_osr_exit
-                && transfer_osr_exit_into_live_frame(
-                    shared, thread, frame_idx, &rframe, &compiled, &plan,
-                )
-                .is_some()
+                && plan.as_ref().is_some_and(|plan| {
+                    transfer_osr_exit_into_live_frame(
+                        shared, thread, frame_idx, &rframe, &compiled, plan,
+                    )
+                    .is_some()
+                })
             {
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                     eprintln!(

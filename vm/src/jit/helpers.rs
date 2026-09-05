@@ -198,9 +198,38 @@ pub mod mic_prof {
     }
 
     #[inline]
+    #[cfg(target_arch = "x86_64")]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// The same counter off x86-64, where `_rdtsc` does not exist.
+    ///
+    /// AArch64's equivalent is the virtual counter `CNTVCT_EL0`, unprivileged
+    /// under Linux by default. It ticks at a fixed frequency rather than the
+    /// core clock, so these numbers are NOT comparable across architectures --
+    /// which is fine, because every consumer uses them as deltas within one
+    /// process. Anything else falls back to the monotonic clock so the counters
+    /// keep working rather than the crate refusing to build.
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cnt: u64;
+            // SAFETY: CNTVCT_EL0 is a read-only counter, unprivileged on Linux.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+            cnt
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        }
     }
 
     /// Counter families for the re-entrancy gate. Depth is tracked PER FAMILY,
@@ -1305,8 +1334,8 @@ pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
 /// never faulted.
 ///
 /// The shape that found this (2026-09-03, see
-/// `known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`): the
-/// lambda direct arm finishes a deopted body in the interpreter and returns a
+/// `internal/fixed-bugs/jit-superseded-implicit-npe-leak-FIXED-20260903.md`):
+/// the lambda direct arm finishes a deopted body in the interpreter and returns
 /// zero with the real NPE parked in `jit_pending_exception`, exactly as its
 /// contract says. Compiled code then evaluates the second operand of the same
 /// expression before its post-invoke guard fires, dereferences the SAME null and
@@ -7788,9 +7817,24 @@ fn compiled_frames_above() -> String {
         return "none: code-range table empty".to_string();
     }
     let mut rbp: usize;
+    // The frame-pointer register, by name. x86-64 calls it RBP; AAPCS64 calls
+    // it X29 and the chain has the same shape (saved FP at `[FP]`, return
+    // address at `[FP+8]`), so the walk below is unchanged. Any other
+    // architecture has no name for it here and the diagnostic says so rather
+    // than walking a garbage value.
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: reads a register. No memory is accessed by the asm itself.
     unsafe {
         std::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads a register. No memory is accessed by the asm itself.
+    unsafe {
+        std::arch::asm!("mov {}, x29", out(reg) rbp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return "none: no frame-pointer register known for this architecture".to_string();
     }
     let mut out: Vec<String> = Vec::new();
     let mut depth = 0usize;
@@ -9975,9 +10019,38 @@ pub mod gs_prof {
     }
 
     #[inline]
+    #[cfg(target_arch = "x86_64")]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
         unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// The same counter off x86-64, where `_rdtsc` does not exist.
+    ///
+    /// AArch64's equivalent is the virtual counter `CNTVCT_EL0`, unprivileged
+    /// under Linux by default. It ticks at a fixed frequency rather than the
+    /// core clock, so these numbers are NOT comparable across architectures --
+    /// which is fine, because every consumer uses them as deltas within one
+    /// process. Anything else falls back to the monotonic clock so the counters
+    /// keep working rather than the crate refusing to build.
+    #[inline]
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cnt: u64;
+            // SAFETY: CNTVCT_EL0 is a read-only counter, unprivileged on Linux.
+            unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt) };
+            cnt
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        }
     }
 
     pub struct CycGuard<'a> {
@@ -13456,6 +13529,281 @@ fn loader_faithful_static_owner(
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // with known signatures matching the compiled method's calling convention.
 #[allow(clippy::too_many_arguments)]
+/// Consecutive declines after which a compiled call site stops consulting
+/// the offload hook.
+///
+/// The hook is not free: a decline costs ~0.5 us, against ~10 ns for the
+/// compiled call it is standing in front of. A site whose arrays are
+/// always below `--gpu-min-work` would pay that forever, which would
+/// trade the 40x this whole change removes for a new one on the kernel
+/// call itself.
+///
+/// Shares `CRATONVM_GPU_MIN_WORK_GIVEUP` with the interpreter's
+/// per-site promotion, because it is the same policy question about the
+/// same kind of site. `0` never retires. Unlike the interpreter's
+/// version this needs no pc-keying caveat: a `JitInvokeInfo` IS one call
+/// site, so retiring one cannot deoptimise its siblings.
+#[cfg(feature = "gpu-offload")]
+fn compiled_offload_giveup_after() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_MIN_WORK_GIVEUP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(256)
+    })
+}
+
+/// What one compiled call site is, as far as offload is concerned.
+///
+/// Keyed by `JitInvokeInfo` address, which IS the site, so a decision
+/// here cannot leak to another call of the same method elsewhere.
+#[cfg(feature = "gpu-offload")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompiledOffloadSite {
+    /// Not a kernel call. The overwhelming majority, and the reason this
+    /// is resolved ONCE per site rather than per call.
+    NotKernel,
+    /// A kernel call that has declined `n` times in a row.
+    Active(u32),
+    /// Declined past the cap; the hook is never consulted here again.
+    Retired,
+}
+
+/// Per-site offload state.
+///
+/// AUDIT 2026-09-04. This started as a name lookup on every compiled
+/// dispatch -- `offload_hook::is_kernel(class, method, descriptor)`,
+/// which allocates three `Box<str>` to build its key. Measured on
+/// `GpuHookOverheadBench`, that put `small_ns_per_call` at **214 ns**
+/// against 13.8 for the same loop without `--gpu`: the string work, not
+/// the hook, and paid by every compiled static call in the program.
+///
+/// The name lookup now happens once, the first time a site is seen, and
+/// every later call is one `usize` hash. The retirement streak lives in
+/// the same entry, so a retired site costs that one lookup and nothing
+/// else.
+#[cfg(feature = "gpu-offload")]
+fn compiled_offload_sites(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<usize, CompiledOffloadSite>> {
+    static T: std::sync::OnceLock<
+        parking_lot::RwLock<rustc_hash::FxHashMap<usize, CompiledOffloadSite>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Decode the JIT argument slots of a STATIC call into `Value`s.
+///
+/// One slot per declared parameter, including `long`/`double` -- the JIT
+/// flattens its outgoing argument array rather than using JVM slot
+/// widths, which is the same assumption `forward_jit_reference_args`
+/// makes when it walks this descriptor.
+///
+/// `None` on any descriptor this cannot read exactly. Guessing would
+/// hand the marshaller an argument list that does not match the kernel
+/// signature, and the failure would be a wrong ANSWER on the device
+/// rather than a refusal.
+#[cfg(feature = "gpu-offload")]
+///
+/// # SAFETY
+///
+/// A non-zero reference slot is treated as a live heap pointer. That is
+/// the same contract `forward_jit_reference_args` runs under one line
+/// earlier in the caller, and these are the arguments it just forwarded.
+unsafe fn decode_static_args(
+    descriptor: &str,
+    args: &[i64],
+) -> Option<Vec<cratonvm_types::Value>> {
+    use cratonvm_types::{ObjectRef, Value};
+    let bytes = descriptor.as_bytes();
+    let mut p = bytes.iter().position(|&b| b == b'(')? + 1;
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0usize;
+    while p < bytes.len() && bytes[p] != b')' {
+        let raw = *args.get(i)?;
+        let v = match bytes[p] {
+            b'I' | b'Z' | b'B' | b'S' | b'C' => {
+                p += 1;
+                Value::Int(raw as i32)
+            }
+            b'J' => {
+                p += 1;
+                Value::Long(raw)
+            }
+            b'F' => {
+                p += 1;
+                Value::Float(f32::from_bits(raw as u32))
+            }
+            b'D' => {
+                p += 1;
+                Value::Double(f64::from_bits(raw as u64))
+            }
+            b'L' => {
+                while p < bytes.len() && bytes[p] != b';' {
+                    p += 1;
+                }
+                p = p.checked_add(1)?;
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(raw as *mut u8)))
+                }
+            }
+            b'[' => {
+                while p < bytes.len() && bytes[p] == b'[' {
+                    p += 1;
+                }
+                if p < bytes.len() && bytes[p] == b'L' {
+                    while p < bytes.len() && bytes[p] != b';' {
+                        p += 1;
+                    }
+                }
+                p = p.checked_add(1)?;
+                if raw == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(ObjectRef::from_raw(raw as *mut u8)))
+                }
+            }
+            _ => return None,
+        };
+        out.push(v);
+        i += 1;
+    }
+    // Every declared parameter consumed exactly one slot, and there were
+    // exactly that many. A mismatch means this walk and the JIT disagree
+    // about the argument layout, which is not something to offload on.
+    if i != args.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Try to run this compiled `invokestatic` on the GPU.
+///
+/// `Some(ret)` when the device ran it and `ret` is what the compiled
+/// caller should receive; `None` to fall through to the ordinary
+/// dispatch below, which is always safe -- `try_dispatch` leaves the
+/// operand stack and locals untouched on every refusal and on every
+/// failure.
+///
+/// # SAFETY
+///
+/// `info` and `args` are the dispatch helper's own, already validated
+/// and GC-forwarded. The thread borrow is the standard `jit_thread_mut`
+/// scoped one.
+#[cfg(feature = "gpu-offload")]
+unsafe fn try_compiled_offload(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    site: usize,
+    args: &[i64],
+) -> Option<i64> {
+    use crate::runtime::offload::DispatchOutcome;
+    use cratonvm_types::Value;
+
+    let cap = compiled_offload_giveup_after();
+
+    // One `usize` hash on the hot path. The name lookup behind
+    // `is_kernel` runs once per site, on the miss.
+    let state = {
+        let known = compiled_offload_sites().read().get(&site).copied();
+        match known {
+            Some(st) => st,
+            None => {
+                let st = if cratonvm_jit::offload_hook::is_kernel(
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                ) {
+                    CompiledOffloadSite::Active(0)
+                } else {
+                    CompiledOffloadSite::NotKernel
+                };
+                compiled_offload_sites().write().insert(site, st);
+                st
+            }
+        }
+    };
+    match state {
+        CompiledOffloadSite::NotKernel | CompiledOffloadSite::Retired => return None,
+        CompiledOffloadSite::Active(_) => {}
+    }
+
+    cratonvm_types::gpu_compiled_offload_census::note_considered();
+
+    let Some(values) = (unsafe { decode_static_args(info.descriptor, args) }) else {
+        cratonvm_types::gpu_compiled_offload_census::note_undecodable();
+        return None;
+    };
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        cratonvm_types::gpu_compiled_offload_census::note_undecodable();
+        return None;
+    };
+
+    // `frame_idx` reaches only a `tracing::debug!` inside `try_dispatch`,
+    // and `tracing` is built with `max_level_info`, so it is compiled out
+    // of every release binary. There is no compiled frame index to give.
+    let outcome = crate::runtime::offload::try_dispatch(
+        vm,
+        thread,
+        0,
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+        &values,
+    );
+    let Ok(outcome) = outcome else {
+        cratonvm_types::gpu_compiled_offload_census::note_undecodable();
+        return None;
+    };
+
+    match outcome {
+        DispatchOutcome::Handled => {
+            cratonvm_types::gpu_compiled_offload_census::note_offloaded();
+            compiled_offload_sites()
+                .write()
+                .insert(site, CompiledOffloadSite::Active(0));
+            // A `)V` kernel: the results reached Java through the D2H
+            // writeback into the output array, and the caller expects
+            // nothing on its operand stack.
+            Some(0)
+        }
+        DispatchOutcome::HandledWithValue(v) => {
+            cratonvm_types::gpu_compiled_offload_census::note_offloaded();
+            compiled_offload_sites()
+                .write()
+                .insert(site, CompiledOffloadSite::Active(0));
+            match v {
+                Value::Int(i) => Some(i as i64),
+                Value::Long(l) => Some(l),
+                // Only `)I`/`)J` reductions are transparently dispatched,
+                // so anything else here means the dispatcher and this
+                // decode disagree. Fall through rather than invent a
+                // return value.
+                _ => None,
+            }
+        }
+        _ => {
+            cratonvm_types::gpu_compiled_offload_census::note_declined();
+            if cap > 0 {
+                let CompiledOffloadSite::Active(n) = state else {
+                    return None;
+                };
+                let n = n.saturating_add(1);
+                let next = if n > cap {
+                    cratonvm_types::gpu_compiled_offload_census::note_site_retired();
+                    CompiledOffloadSite::Retired
+                } else {
+                    CompiledOffloadSite::Active(n)
+                };
+                compiled_offload_sites().write().insert(site, next);
+            }
+            None
+        }
+    }
+}
+
 pub unsafe extern "C" fn jit_invoke_dispatch(
     vm_ptr: i64,
     info_ptr: i64,
@@ -13575,6 +13923,21 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // not receive a stale byte-array/object argument after a moving GC.
     let forwarded_args = forward_jit_reference_args(vm, info, args_slice);
     let args_slice = forwarded_args.as_deref().unwrap_or(args_slice);
+
+    // GPU offload, from COMPILED code.
+    //
+    // Placed here and not later: every probe below this line is a
+    // per-callsite memo that ends in a CALL to the callee, so reaching any
+    // of them has already decided not to offload. Placed here and not
+    // EARLIER because it needs `args_slice` post-forwarding -- a moving
+    // collection during the SATB flush above can have relocated the very
+    // arrays the kernel is about to marshal.
+    #[cfg(feature = "gpu-offload")]
+    if info.invoke_kind == 3 && cratonvm_jit::offload_hook::any_kernels() {
+        if let Some(ret) = try_compiled_offload(vm, info, info_ptr as usize, args_slice) {
+            return ret;
+        }
+    }
 
     // JIT dispatch normally calls a custom loader's inherited bytecode
     // directly. ClassLoader's resource methods must throw NPE for a null name
@@ -20114,12 +20477,35 @@ unsafe fn try_lambda_site_direct_call(
                     crate::runtime::interpreter::lambda_site_bump_unresumable();
                 }
                 Err(crate::error::MethodCallFailed::ExceptionThrown(exc)) => {
-                    // Same contract as the MIC hit path: leave it in
-                    // `jit_pending_exception` for the compiled caller's own
-                    // post-invoke check, and return the null/zero sentinel.
+                    // Park it for the compiled caller's own post-invoke check —
+                    // and return the sentinel that check actually tests for.
+                    //
+                    // This used to return `0`, described as "the null/zero
+                    // sentinel". **There is no such sentinel.**
+                    // `emit_post_invoke_exception_check` compares `RAX` against
+                    // `i64::MIN` and consults `dispatch_threw` only on that
+                    // comparison; `0` is a perfectly ordinary null reference
+                    // return and the check keeps it. The parked exception then
+                    // sat unclaimed while compiled code carried on with a null.
+                    //
+                    // It looked correct for a year because of what usually
+                    // FOLLOWS a SAM call: unboxing the result
+                    // (`Integer.intValue`) was a CALL, and that call crossed
+                    // into Rust and delivered the pending exception a moment
+                    // later at a site that could route it. Making the box/unbox
+                    // intrinsic default-ON removed the call — the unbox became
+                    // an inline load with a null-receiver guard — and the
+                    // exception escaped its own `catch`. See
+                    // `internal/fixed-bugs/jit-superseded-implicit-npe-leak-FIXED-20260903.md`.
+                    //
+                    // `i64::MIN` is right for every return type: for a
+                    // reference it cannot be a valid heap address, and for the
+                    // `J`/`D`/`F` shapes where it IS a representable value the
+                    // check disambiguates through `dispatch_threw`, which finds
+                    // exactly the signal parked on the line above.
                     set_jit_pending_exception(thread, exc);
                     crate::runtime::interpreter::lambda_site_bump_resumed();
-                    return Some(0);
+                    return Some(i64::MIN);
                 }
                 Err(_) => {
                     crate::runtime::interpreter::lambda_site_bump_unresumable();

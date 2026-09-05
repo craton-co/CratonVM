@@ -114,6 +114,7 @@ pub mod lambda_adapter;
 pub mod loop_analysis;
 pub mod metrics;
 pub mod null_check_elim;
+pub mod offload_hook;
 pub mod osr_coords;
 pub mod pgo;
 pub mod platform;
@@ -2871,6 +2872,24 @@ pub struct CompiledMethod {
     /// Deoptimization points: native code offsets where deopt can occur.
     /// Used by the deopt framework to reconstruct interpreter state.
     pub deopt_points: Vec<deopt::DeoptimizationPoint>,
+    /// `(bci, offset of its OSR entry stub, locals the stub reads)` for every
+    /// bci the OPTIMIZING
+    /// tier's body can be entered at part-way.
+    ///
+    /// Empty on every artifact today: the stubs are emitted only under
+    /// `CRATONVM_JIT_IR_OSR_ENTRY=1`, and nothing calls them yet —
+    /// `compile_osr_artifact` reaches `x64::compile_with_param_slots` directly
+    /// and knows nothing about this tier. Published early so the codegen half
+    /// can be tested on its own, which is the half where a mistake produces a
+    /// plausible wrong number rather than a crash.
+    ///
+    /// Distinct from `osr_pc_to_native`, the SINGLE-PASS door's table: that
+    /// carries a native offset per bci for a body whose locals live at fixed
+    /// homes, and `osr_trampoline` builds the frame around it from outside.
+    /// These are entry POINTS — each builds this tier's frame and seeds the
+    /// locals itself, because an SSA body has no fixed local→home map to hand
+    /// a trampoline.
+    pub ir_osr_entries: Vec<(u32, u32, u32)>,
     /// real-frame-deopt: boxed deopt points whose addresses are baked as
     /// imm64 into the guard/deopt-trampoline machine code. JIT code holds raw
     /// pointers into these boxes, so — like `_jit_invoke_infos` — they must
@@ -3275,6 +3294,7 @@ impl CompiledMethod {
             npe_trap_map: Default::default(),
             safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
+            ir_osr_entries: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
@@ -3359,6 +3379,7 @@ impl CompiledMethod {
             npe_trap_map: Default::default(),
             safepoint_bci_table: Vec::new(),
             deopt_points: Vec::new(),
+            ir_osr_entries: Vec::new(),
             _deopt_point_boxes: Vec::new(),
             oop_maps: Vec::new(),
             // Start unverified: the production codegen path moves a
@@ -3862,6 +3883,56 @@ impl CompiledMethod {
     /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
     /// Lets the interpreter's OSR trigger reuse a cached compile instead of
     /// re-running the whole x64 pipeline on every trigger.
+    /// Address of the OPTIMIZING tier's OSR entry stub for `bci`, if this
+    /// artifact has one.
+    ///
+    /// The stub's ABI is `extern "C" fn(ctx: i64, locals: *const i64) -> i64`:
+    /// it builds this tier's frame itself, seeds the locals the snapshot at
+    /// `bci` names, and jumps into the body. That is the whole interface —
+    /// contrast `osr_enter`, which passes twenty layout fields to
+    /// `osr_trampoline` because the trampoline builds the single-pass frame
+    /// from outside.
+    ///
+    /// `None` on every artifact today; see [`Self::ir_osr_entries`].
+    pub fn ir_osr_entry_addr(&self, bci: u32) -> Option<(usize, u32)> {
+        self.ir_osr_entries
+            .iter()
+            .find(|(b, _, _)| *b == bci)
+            // Cast: an offset inside this artifact's own buffer.
+            .map(|(_, off, needed)| (self.entry as usize + *off as usize, *needed))
+    }
+
+    /// Enter this artifact's optimizing-tier body at `bci`, seeding `locals`.
+    ///
+    /// The whole interface. Contrast [`Self::osr_enter`], which hands
+    /// `osr_trampoline` some twenty layout fields because that trampoline
+    /// builds the single-pass frame from OUTSIDE; this stub builds its own,
+    /// seeds the locals the snapshot at `bci` names, and jumps into the body.
+    ///
+    /// `None` when there is no entry for `bci`, or when the caller offered
+    /// FEWER locals than the stub reads. The second is the admission this call
+    /// owes: the stub indexes `locals[i]` by JVM local index with no bound of
+    /// its own, so a short slice would read past the end of the interpreter's
+    /// snapshot. Refusing is free — the interpreter simply keeps running the
+    /// frame it is already in.
+    ///
+    /// # Safety
+    /// `ctx` must be this VM's context pointer, and the calling thread must be
+    /// the one that installed the JIT thread pointer — the same contract every
+    /// other entry into compiled code carries.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn ir_osr_enter(&self, bci: u32, ctx: i64, locals: &[i64]) -> Option<i64> {
+        let (addr, needed) = self.ir_osr_entry_addr(bci)?;
+        if locals.len() < needed as usize {
+            return None;
+        }
+        // SAFETY: `addr` is inside this artifact's own executable buffer, at an
+        // offset `emit_osr_entry_stubs` recorded for a stub it emitted with
+        // exactly this signature.
+        let f: extern "C" fn(i64, *const i64) -> i64 = std::mem::transmute(addr);
+        Some(f(ctx, locals.as_ptr()))
+    }
+
     pub fn can_osr_enter(&self, entry_pc: usize) -> bool {
         self.can_osr_enter_with(entry_pc, osr_dead_local_entry_allowed())
     }
@@ -6193,6 +6264,22 @@ fn c2_alloc_upgrade_enabled() -> bool {
         // old reason applies again unchanged. See `ir_inline_tlab_enabled`
         // for the repro and for what was ruled out.
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_ALLOC_UPGRADE").is_some()
+    })
+}
+
+/// May a method containing `anewarray` still plan its invokes?
+///
+/// Default yes. `=0` restores the historical coupling, where one reference-array
+/// allocation anywhere in a method discarded `invoke_info` for the whole method
+/// and the builder then refused it at its first invoke.
+fn ir_calls_with_anewarray_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_ANEWARRAY").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
@@ -23571,7 +23658,27 @@ fn try_compile_inner(
                 // arg-escaped by the escape analysis, so it is really allocated
                 // rather than scalar-replaced — see `build_connection_graph`'s
                 // `Op::Call` arm.
-                let call_eligible = scan.anewarray_ops.is_empty();
+                // `ir_compatible` admits up to `IR_MAX_ARRAY_ALLOCATIONS` (16)
+                // `anewarray` ops, "each one lowered through the shared
+                // `emit_new_array_stub`" — and then this line refused
+                // `invoke_info` for a method containing even ONE. Since a
+                // missing map bails the builder at whichever invoke comes
+                // first, the two gates disagreed and the admission gate lost:
+                // the method was admitted, walked, and then refused.
+                //
+                // The `new_ops` half of this same condition was already deleted
+                // as "a term that outlived its reason"; no rationale was ever
+                // recorded for the `anewarray` half, and the IR tier lowers
+                // `anewarray` through its own helper
+                // (`live_anewarray_calls_the_reference_array_helper`).
+                //
+                // Measured on `org.h2.test.db.TestAlter`: 13 of the 35 methods
+                // that lose `invoke_info` lose it here — 37% of the single
+                // largest refusal in the tier.
+                //
+                // `CRATONVM_JIT_IR_CALL_ANEWARRAY=0` restores the coupling.
+                let call_eligible =
+                    scan.anewarray_ops.is_empty() || ir_calls_with_anewarray_enabled();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     // See `builder.set_object_init_pcs` below.
@@ -24307,7 +24414,27 @@ fn try_compile_inner(
                                 }
                             }
                         }
-                        if let Some((entry, callee_needs_ctx)) = direct_target {
+                        // A GPU kernel keeps its dispatch helper.
+                        //
+                        // A raw `CALL` to the callee's entry is the one door in
+                        // this backend that bypasses `jit_invoke_dispatch` for a
+                        // statically-bound site, and that helper is where the
+                        // offload hook now lives. Binding this site directly
+                        // would compile the caller and silently end offload --
+                        // which is exactly what `offload_jit_gate` used to
+                        // refuse to compile the whole method to prevent.
+                        //
+                        // Unarmed (no `--gpu`, or nothing registered) this is
+                        // one relaxed bool. See `crate::offload_hook`.
+                        let site_is_gpu_kernel = is_static
+                            && crate::offload_hook::is_kernel(
+                                cn.as_str(),
+                                mn.as_str(),
+                                desc.as_str(),
+                            );
+                        if let Some((entry, callee_needs_ctx)) =
+                            direct_target.filter(|_| !site_is_gpu_kernel)
+                        {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             if !direct_target_is_thin_helper {
                                 ir_direct_callee_entries

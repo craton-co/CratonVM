@@ -2364,20 +2364,30 @@ pub fn jit_ir_call_virtual() -> bool {
 /// the speculation being "behavior-preserving when off". The documented
 /// contract and the code disagreed, and the code was the one nobody read.
 ///
-/// It produces wrong answers. `probes/TreeTailIterProbe.java`: a compiled
-/// `for (e : treeMap.tailMap(k).entrySet())` iterates ZERO entries while
-/// `entrySet().size()` on the same object says 6, deterministically from
-/// iteration ~502. Handing the same iterator to another method drains nothing
-/// either, so the iterator really is empty -- the speculated `iterator()` body
-/// is spliced against a receiver whose `root` mirror it then reads as null.
-/// That is `org.h2.test.store.TestRandomMapOps` op:1033, which has been failing
-/// H2 in 11-22 s and blocking
+/// It produced wrong answers. `probes/TreeTailIterProbe.java`: a compiled
+/// `for (e : treeMap.tailMap(k).entrySet())` iterated ZERO entries while
+/// `entrySet().size()` on the same object said 6, deterministically from
+/// iteration ~502. That is `org.h2.test.store.TestRandomMapOps` op:1033, which
+/// failed H2 in 11-22 s and blocked
 /// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`,
 /// whose SIGSEGV needs 25-183 s to appear.
 ///
-/// Turning the default off restores exactly the state the surrounding code is
-/// written for. Re-enabling it needs the splice's receiver handling fixed
-/// first, and `probes/TreeTailIterProbe.java` is the check.
+/// **That defect is FIXED**
+/// (`fixed-bugs/guarded-inline-native-screen-asked-the-declaring-class-FIXED-20260904.md`).
+/// It was not the receiver's `root` mirror, which is what this comment used to
+/// say and which no measurement ever supported: `resolve_inline_site_from`
+/// screened for a registered native on the callee's DECLARING class, and the
+/// collection carriers register theirs on the CONCRETE receiver class, so
+/// `TreeMap$EntryIterator.hasNext()` -- declared one class up on
+/// `TreeMap$PrivateEntryIterator` -- was spliced as real JDK bytecode over a
+/// layout that is not the JDK's. The screen now walks the whole
+/// receiver-to-declaring chain, which is the question dispatch asks.
+///
+/// The default stays OFF, because "unsoaked" is still true and that is what the
+/// three `jit/src/lib.rs` comments reason from -- not because the feature is
+/// known-wrong. `vm/tests/jit_guarded_inline_native_shadow.rs` runs the probe
+/// with this flag ON and is the check for anyone raising it; it is the only arm
+/// anywhere that sets it.
 pub fn jit_guarded_virtual_inline() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

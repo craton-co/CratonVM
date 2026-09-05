@@ -1636,6 +1636,61 @@ mod tests {
         Arc::new(SharedVm::new(VmConfig::default()))
     }
 
+    /// **A JNI CRITICAL PIN IS A ROOT, AND SECTION 9c IS WHAT MAKES IT ONE.**
+    ///
+    /// `GetPrimitiveArrayCritical` takes two pins at one call site and they do
+    /// different jobs. `VmHeap::pin_critical_region` pins the object against
+    /// MOVEMENT -- a G1 region, or, on ZGC, an address the relocation-set
+    /// filter reads. `pin_critical_array` pins it against COLLECTION, through
+    /// `cratonvm_gc::pinned`, and section 9c above is the only thing that turns
+    /// that set into roots for the generational, G1 and ZGC backends; before it
+    /// existed they relied on the initiator-only JNI-local scan.
+    ///
+    /// Nothing tested the second half. That is how it comes to be read as the
+    /// first: `ZgcRealHeap::critical_pins` has exactly one reader, inside
+    /// `relocate_stw`, so a reviewer tracing liveness from THAT end finds a pin
+    /// that keeps nothing alive and concludes the contract is broken. It is
+    /// not -- the keep-alive lives here, one crate away -- and this test is the
+    /// evidence at the point where deleting it would do the damage.
+    ///
+    /// The negative assertions are the load-bearing ones. A test that only
+    /// checked "pinned implies root" would still pass if section 9c pushed
+    /// every address it was handed, or if this object were a root by some other
+    /// path; asserting it is NOT a root before the pin and NOT a root after the
+    /// release is what makes the middle assertion mean the pin. They are keyed
+    /// on this object's own address, so a pin taken by a test running beside
+    /// this one cannot perturb them.
+    #[test]
+    fn a_jni_critical_pin_keeps_its_object_alive_with_no_other_reference() {
+        let shared = test_shared_vm();
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        // No frame, no stack, no field: unreachable except through the pin.
+        let thread = JvmThread::new(ThreadId(0), "test");
+
+        assert!(
+            !collect_roots(&shared, &thread).contains(&obj),
+            "an object with no reference must not already be a root, or the \
+             assertion below proves nothing"
+        );
+
+        let token = cratonvm_gc::pinned::pin_tokened(obj.as_ptr() as usize)
+            .expect("a non-null heap address must be pinnable");
+        assert!(
+            collect_roots(&shared, &thread).contains(&obj),
+            "a checked-out array must survive a collection taken while native \
+             code holds the copy -- the copy-back at Release targets the \
+             OBJECT, so reclaiming it writes into recycled memory"
+        );
+
+        cratonvm_gc::pinned::unpin_token(token);
+        assert!(
+            !collect_roots(&shared, &thread).contains(&obj),
+            "Release must give the object back to the collector; a pin that \
+             outlives its critical section holds the array and its whole \
+             transitive closure for the life of the process"
+        );
+    }
+
     #[test]
     fn roots_from_frame_locals() {
         let shared = test_shared_vm();

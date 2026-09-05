@@ -2735,6 +2735,71 @@ not an address\n",
             }
         }
 
+        // Was the faulting ADDRESS inside a heap span this process handed back
+        // to the OS? The question above answers it for executable memory; this
+        // is the same question for the heap, and it exists because the
+        // reserve/commit store changed what a heap use-after-free LOOKS like.
+        //
+        // Before the store, a dangling heap pointer read stale-but-mapped bytes
+        // and the program carried on with wrong data. Now the granules are
+        // unmapped, so it faults -- which is strictly better, but only if the
+        // report says so: otherwise it is an address inside the heap's own
+        // reservation, faulting, with nothing to distinguish it from a wild
+        // pointer. A hit here turns that register dump into a named mechanism,
+        // and the site names WHICH proof was wrong.
+        //
+        // Built after a crash of this exact family was diagnosed through gdb
+        // instead, because the report had nothing to say about it --
+        // `internal/fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+        if fault_addr_is_real {
+            let mut rbuf = [0u8; 16];
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  gc_decommits_total=0x");
+            let n = hex_into_buf(
+                &mut rbuf,
+                cratonvm_gc::reservation::decommits_total() as u64,
+            );
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            if let Some((base, len, site, flags)) =
+                cratonvm_gc::reservation::recent_decommit_covering(fault_addr as usize)
+            {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  fault addr is inside a RECENTLY DECOMMITTED heap span: base=0x",
+                );
+                let n = hex_into_buf(&mut rbuf, base as u64);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" len=0x");
+                let n = hex_into_buf(&mut rbuf, len as u64);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" site=");
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, site.as_bytes());
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                if flags & cratonvm_gc::reservation::DECOMMIT_RECOMMITTED != 0 {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    but the span was COMMITTED AGAIN afterwards, so it is mapped now and this fault is a different question. Read it as address reuse, not as evidence.\n",
+                    );
+                } else {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    *** and NOT re-committed since. This IS a use-after-free of heap memory: something held a pointer into a span the collector proved dead. ***\n",
+                    );
+                    // WHICH proof was wrong is the fork an investigation
+                    // otherwise cannot resolve from a register dump.
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#    site=free-list-* means the span was SWEPT and free-listed while still reachable -- a missing root.\n#    site=*-retract or unbumped-middle means a CURSOR passed over live bytes -- a sweep that mis-sized the live set.\n#    CRATONVM_GC_RESERVE=0 keeps the granules mapped, so the same defect reads stale bytes instead of faulting.\n",
+                    );
+                }
+            } else {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  fault addr is in NO recently decommitted heap span\n",
+                );
+            }
+        }
+
         // Is the faulting PC inside a code buffer this process still HOLDS? The
         // name registry knows only bodies `JitCache::put` published; every
         // `ExecutableBuffer` registers here, including OSR trampolines and

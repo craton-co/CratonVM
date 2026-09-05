@@ -364,7 +364,7 @@ pub(super) struct InlinedChainFrame {
 /// class is not a guess: it is the same context `resolve_inline_site_from` used
 /// when it chose the body to splice, so this walk reaches the same method the
 /// compiler inlined or it reaches nothing.
-fn resolve_inlined_callee(
+pub(super) fn resolve_inlined_callee(
     shared: &SharedVm,
     enclosing_class_id: ClassId,
     method_key: &str,

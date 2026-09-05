@@ -1931,7 +1931,7 @@ fn lookup_known_system_library_symbol(name: &str, c_name: &std::ffi::CStr) -> Op
     static LIBZSTD_HANDLE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let handle = *LIBZSTD_HANDLE.get_or_init(|| {
         for lib in [b"libzstd.so.1\0".as_slice(), b"libzstd.so\0".as_slice()] {
-            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const i8, libc::RTLD_LAZY) };
+            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
             if !handle.is_null() {
                 return Some(handle as usize);
             }
@@ -4421,6 +4421,19 @@ pub fn native_return_pushed_to_stack(_shared: &SharedVm, thread: &mut JvmThread)
 /// object graph it touches. Calling this from the safepoint publish bounds
 /// that damage to one safepoint interval. Returns the number of chain
 /// entries + write-backs applied.
+/// `CRATONVM_BLOCKED_WAKE_JIT_REMAP=1` -- remap a waking blocked thread's
+/// COMPILED state (JIT frames, register image, shadow stack), not just its
+/// interpreter frames.
+///
+/// Default OFF only until it is measured; the omission it closes is a
+/// use-after-free. See the block in [`apply_pending_blocked_fixups`].
+fn blocked_wake_jit_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_BLOCKED_WAKE_JIT_REMAP").is_some()
+    })
+}
+
 pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
     use crate::memory::gc::update_value_ref;
     let fixup = {
@@ -4437,6 +4450,41 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
     let mut applied = 0usize;
     if !fixup.is_empty() {
         applied += fixup.len();
+        // THE JIT HALF, and it was missing entirely.
+        //
+        // This function remapped a blocked thread's INTERPRETER frames,
+        // `printed`, `java_thread_obj` and the native root slots -- and nothing
+        // compiled. A peer that entered a blocking region with compiled frames
+        // BELOW it therefore resumed with every JIT-frame oop, register image
+        // and shadow-stack entry still at its pre-move address.
+        //
+        // `apply_pointer_map_to_thread` (the STW-resume path) already carries
+        // exactly this block, and its comment describes the identical defect
+        // for the thread that PARKED at the barrier: "this stranded a
+        // non-initiator's JIT-frame oops at their old addresses after a
+        // relocation -- a use-after-free". Blocked peers are the same bug one
+        // path over, and they are the population the ZGC pinned-peer credit
+        // makes relocation possible under.
+        //
+        // Diagnosed by elimination 2026-09-03: three repairs aimed at the
+        // CURRENT thread's frames (pin unnamed refs, rewrite unmapped
+        // duplicates, `local_mask_unreached` fail-closed) each changed nothing,
+        // while the blanket guard -- the only remedy that also covers PEERS --
+        // was 0 SIGSEGV in 4. See
+        // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+        //
+        // Sound here for the same reason it is sound there: these walks are
+        // thread-local (`JIT_ENTRY_CHAIN`, this thread's shadow stack) and this
+        // function runs ON the waking thread, before it can re-enter compiled
+        // code. Re-remapping an already-rewritten slot is harmless -- a second
+        // lookup of a to-space address misses.
+        if blocked_wake_jit_remap_enabled() {
+            crate::jit::conservative_roots::remap_active_jit_frames(&fixup);
+            crate::jit::conservative_roots::remap_register_image_words(&fixup, Some(shared));
+            if crate::jit::conservative_roots::shadow_stack_enabled() {
+                thread.shadow_stack.remap(&fixup);
+            }
+        }
         for frame in &mut thread.frames {
             frame.update_local_refs(&fixup, &shared.mem.heap);
             frame.stack.update_object_refs(&fixup, &shared.mem.heap);
