@@ -937,7 +937,7 @@ struct Lowerer<'a> {
     /// `gp_load_value`. `Cell` because `slot_of` takes `&self`.
     /// `(bci, offset of its entry stub)` for every bci this body can be
     /// entered at. Empty unless [`ir_osr_entry_enabled`].
-    osr_entries: Vec<(u32, u32)>,
+    osr_entries: Vec<(u32, u32, u32)>,
     /// Why a bci did not get one. A per-CAUSE census, because the four causes
     /// call for four different next steps and a bare count cannot be acted on.
     osr_refusals: Vec<(&'static str, usize)>,
@@ -8956,6 +8956,8 @@ impl<'a> Lowerer<'a> {
             self.note_osr_refusal(why);
         }
         for (bci, native, seeds) in plans {
+            // Cast: a JVM local index plus one; `max_locals` is u16.
+            let seeds_hi = seeds.iter().map(|(i, _)| *i as u32 + 1).max().unwrap_or(0);
             let stub = self.buf.pos();
             // push rbp ; mov rbp, rsp ; sub rsp, frame_size
             self.buf.emit_byte(0x55);
@@ -9033,8 +9035,13 @@ impl<'a> Lowerer<'a> {
             if !Self::patch_or_bail(&mut self.buf, patch, rel) {
                 return;
             }
+            // The highest JVM local index this stub reads, plus one. The
+            // caller offers a locals snapshot and must not be asked for more
+            // than the interpreter frame holds — `ir_osr_enter` refuses a short
+            // one rather than reading past its end.
+            let locals_needed = seeds_hi;
             // Cast: an offset inside a bounded executable buffer.
-            self.osr_entries.push((bci, stub as u32));
+            self.osr_entries.push((bci, stub as u32, locals_needed));
         }
     }
 
@@ -17513,7 +17520,7 @@ mod tests {
         // The ordinary entry still works, unchanged.
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
 
-        let Some(addr) = cm.ir_osr_entry_addr(4) else {
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
             // Not every configuration admits the header (the refusal census
             // says which clause declined). Assert the shape that IS guaranteed:
             // a refusal is silent and total, never a half-emitted stub.
@@ -17525,19 +17532,29 @@ mod tests {
         };
         // The interpreter's locals at bci 4: local 0 = n, 1 = s, 2 = i.
         let locals: [i64; 3] = [10, 100, 7];
+        // Through the artifact's own entry point, which is what the VM calls:
+        // it re-checks the bci and refuses a locals slice shorter than the stub
+        // reads, so the test exercises the admission as well as the code.
+        //
         // SAFETY: the stub builds and tears down its own frame, reads exactly
         // `locals[0..3]`, and returns the method's `int` result in RAX.
-        let entered: extern "C" fn(i64, *const i64) -> i64 =
-            unsafe { std::mem::transmute::<usize, extern "C" fn(i64, *const i64) -> i64>(addr) };
+        let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(4, 0, l) };
         assert_eq!(
-            entered(0, locals.as_ptr()),
-            124,
+            entered(&locals),
+            Some(124),
             "entering at the header with s=100 i=7 n=10 must run i=7,8,9 and              return 100+7+8+9",
         );
         // A second entry, to catch a stub that works once because it left the
         // frame or a callee-saved register in a state the next entry inherits.
         let again: [i64; 3] = [5, 0, 2];
-        assert_eq!(entered(0, again.as_ptr()), 9, "i=2,3,4 from s=0 is 2+3+4");
+        assert_eq!(entered(&again), Some(9), "i=2,3,4 from s=0 is 2+3+4");
+        // And the admission: a locals slice shorter than the stub reads is
+        // refused rather than read past.
+        assert_eq!(
+            entered(&again[..1]),
+            None,
+            "a short locals snapshot must be refused, not read past",
+        );
     }
 
     /// The stubs are off unless asked for, and an artifact carries none.
