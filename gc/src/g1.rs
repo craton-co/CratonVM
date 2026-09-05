@@ -13352,6 +13352,29 @@ impl G1Collector {
         // finalizer, which is never in the CSet and so never resurrected -- is
         // named in the live set below instead. See `finalizer_addrs_this_pause`
         // and `a_humongous_span_awaiting_finalization_is_not_eagerly_reclaimed`.
+        if gc_flags().g1_dbg_reach && pointer_map.iter().any(|(o, n)| o == n) {
+            let mut free = 0usize;
+            let mut eden = 0usize;
+            let mut surv = 0usize;
+            let mut old_r = 0usize;
+            let mut hstart = 0usize;
+            let mut hcont = 0usize;
+            for r in regions.iter() {
+                match r.region_type {
+                    RegionType::Free => free += 1,
+                    RegionType::Eden => eden += 1,
+                    RegionType::Survivor => surv += 1,
+                    RegionType::Old => old_r += 1,
+                    RegionType::HumongousStart => hstart += 1,
+                    RegionType::HumongousContinuation => hcont += 1,
+                }
+            }
+            eprintln!(
+                "[g1][EVACFAIL] regions={} free={free} eden={eden} surv={surv} old={old_r}                  hstart={hstart} hcont={hcont} map={}",
+                regions.len(),
+                pointer_map.len(),
+            );
+        }
         if pointer_map.iter().any(|(old, new)| old == new) {
             return declined(
                 crate::gc_metrics::eager_decline::EVACUATION_FAILURE,
