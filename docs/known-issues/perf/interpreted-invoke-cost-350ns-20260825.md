@@ -1492,3 +1492,48 @@ interpreted-callee path — still build by value, but they hand the frame to
 `execute_prebuilt_frame` rather than pushing it, so converting them is a change
 to that function's contract and not this one. And the locals **fill** is still
 the precise-oop-map half.
+
+#### Addendum, same day: the doors came back, and this section overstates its reach
+
+Written hours apart, and the second half corrects the first.
+
+`f74e88d8a` turned the monomorphic invoke fast door off on 2026-09-03 and the
+section above was measured in that configuration — doors dark, every
+interpreted call through the general dispatchers. **The door went default-ON
+again the same day** (`9f356eea4`, *"the invoke fast door never recorded its receiver — root cause,
+repaired"*; the code comment reads *"the wrong answers this
+door produced were the receiver profile it was not recording, and it records it
+now"*), and the H2 wrong answer that justified switching it off is fixed and its
+page retired to
+`fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md` — the
+root cause was the guarded-inline native screen asking the declaring class, not
+the door's argument transfer at all.
+
+So the claim above that "the general dispatchers ARE the interpreted call path"
+was true when it was measured and is **false on current dev**. What the census
+says now, `probes/Dispatch.java` 200k x 2 on dev:
+
+```
+door: static hit=1200278 miss=448 special hit=400775 miss=1264 | install: reuse=200066 emplace=29 byvalue=0
+```
+
+1.6M calls served by the doors, 200k by `install_cached_frame` — the virtual and
+interface shapes the doors decline. The install is still engaged, still reuses
+a retired slot on essentially every call it sees (`byvalue=0`), and is still
+worth what it measured on the calls it serves. It is about **11%** of this
+probe's calls rather than all of them.
+
+The 11-13% cyc/call figure is therefore a per-call number for a general-dispatch
+call, measured with the doors off. It is not an 11-13% figure for a workload on
+current dev, and nothing here measured that.
+
+Two things this cost, worth naming rather than filing away:
+
+* The three-arm A/B and the engagement census were both right and both
+  answered the question as posed. What went stale was the **premise** — which
+  path ships — and no arm inside the experiment could have caught that. The
+  check that would have is the one that costs a minute: re-read the gating on
+  `origin/dev` before writing the framing, not once at the start of the work.
+* A door that goes off and back on inside 24 hours is not an unusual event in
+  this tree. A section that says "X is the path now" dates itself; one that says
+  "X served N of M calls in this census, on this commit" does not.
