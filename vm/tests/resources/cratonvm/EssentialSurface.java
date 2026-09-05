@@ -15,7 +15,7 @@ import java.util.ServiceLoader;
  * answer it" policy over them anyway. Recorded in
  * {@code docs/known-issues/jdk-only/F30-1-the-registrar-call-graph-and-the-drifted-arm-20260813.md}
  * &sect;9, and in the internal tree at
- * {@code fixed-bugs/string-length-nosuchmethoderror-in-a-default-build-synthetic-vm-FIXED-20260905.md}.
+ * {@code string-length-nosuchmethoderror-in-a-default-build-synthetic-vm-FIXED-20260905.md}.
  *
  * <p>Deliberately trivial, and deliberately NOT a String conformance fixture:
  * it asks only whether these names RESOLVE. Conformance is a question for a
