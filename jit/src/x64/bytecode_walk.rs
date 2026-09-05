@@ -821,11 +821,43 @@ impl Compiler {
                 // `catch` block is now emitted keeps the OSR-entry answer it
                 // had when that block was dead code.
                 let handler_only = handler_only_pcs.get(pc).copied().unwrap_or(false);
+                // The abstract operand stack must be EMPTY here.
+                //
+                // AUDIT 2026-09-04, and this one was wrong code, not a
+                // missed optimisation. Entering part-way through an
+                // expression means the entry prologue has to materialise
+                // the pending operands -- and it does, correctly, for the
+                // entering iteration. What it cannot do is make the LOOP
+                // recompute them: the back edge targets the header, the
+                // operand pushes live ABOVE the entry point, and every
+                // later iteration replays the slots the prologue filled
+                // once.
+                //
+                // `test_classes/jit/OsrStridedValue.java`, entering at the
+                // `iastore` of `a[i] = i + r` with `[a, i, i+r]` pending:
+                //
+                //     --nojit   11 1035 2059 3083 4107 5131
+                //     jit       11   11   11   11   11   11
+                //
+                // The addresses advance because the index is a local in a
+                // register; the VALUE is frozen at the entering
+                // iteration's `i` because it lives in an operand slot
+                // written before the loop. Same shape, same reason, as the
+                // synthetic-guard case just above -- "part-way through,
+                // the abstract operand stack is not the header's" -- which
+                // is why that one already refuses.
+                //
+                // Costs nothing in practice: javac gives every loop header
+                // an empty expression stack, so the pcs this newly refuses
+                // are mid-expression ones the interpreter reaches again a
+                // few bytecodes later at the header.
+                let operand_stack_live = !self.stack.is_empty();
                 if inside_aaload_hoisted
                     || inside_arith_hoisted
                     || inside_len_hoisted
                     || inside_synthetic_guard
                     || handler_only
+                    || operand_stack_live
                 {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {

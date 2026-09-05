@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-347 tokens.
+348 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -729,6 +729,7 @@ export inherited from a parent shell.
 | `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `ir-param-copy` | `CRATONVM_JIT_IR_PARAM_COPY` |
 | `ir-rpo-layout` | `CRATONVM_JIT_IR_RPO_LAYOUT` |
+| `ir-call-anewarray` | `CRATONVM_JIT_IR_CALL_ANEWARRAY` |
 | `supersede-epoch-skip-useless` | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
@@ -899,10 +900,10 @@ export inherited from a parent shell.
 | `verify-schedule` | `CRATONVM_JIT_VERIFY_SCHEDULE` |
 | `verify-types` | `CRATONVM_JIT_VERIFY_TYPES` |
 | `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
-| `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE / CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
-| `xt-pinned-peer-depth` | `CRATONVM_XT_PINNED_PEER_DEPTH / CRATONVM_XT_PINNED_PEER_DEPTH` |
+| `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
+| `xt-pinned-peer-depth` | `CRATONVM_XT_PINNED_PEER_DEPTH` |
 | `xt-pinned-peer-publish-only` | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` |
-| `xt-peer-shadow-scan` | `CRATONVM_XT_PEER_SHADOW_SCAN / CRATONVM_XT_PEER_SHADOW_SCAN` |
+| `xt-peer-shadow-scan` | `CRATONVM_XT_PEER_SHADOW_SCAN` |
 | `dbg-stale-frame-words` | `CRATONVM_DBG_STALE_FRAME_WORDS` |
 | `pin-unnamed-frame-refs` | `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS` |
 | `remap-unmapped-dupes` | `CRATONVM_JIT_REMAP_UNMAPPED_DUPES` |
