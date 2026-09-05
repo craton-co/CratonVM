@@ -152,12 +152,56 @@ slice**, in either direction.
    against bytes moved rather than counting elements. The surface above
    is the calibration data that design needed and did not have.
 
-   A cheap interim that is strictly better than today: keep a scalar
-   threshold but apply it to BYTES x (1 / estimated ops), i.e. admit when
-   `elements * width / ops` is below a constant. On this surface a
-   constant near 64 KB/op separates every winning cell from every losing
-   one except `double[]` at ops=16, which wins earlier than the rule
-   predicts.
+   ~~A cheap interim: apply the threshold to `elements * width / ops`, a
+   constant near 64 KB/op.~~ **RETRACTED 2026-09-05 -- that rule was
+   never checked against this grid and is badly wrong.** Evaluated at the
+   break-even cells it spans 512 bytes to 8,388,608, a **16,384x
+   spread**; it is the worst of the three obvious products (`n*ops` and
+   `n*ops/width` are both ~32x). Proposing it in the same commit that
+   criticised single-axis reasoning was the same error one level up:
+   an untested rule of thumb.
+
+   No product of `n`, `ops` and `width` can be constant, because the
+   model is a RATIO. See below.
+
+## The cost model, fitted and validated
+
+Break-even is `n* = overhead / (c*ops - k*w)`, so the predicate has to be
+the cost comparison itself, not a product:
+
+    admit  iff   n * (L + c*ops)   >   overhead + k * bytes_moved
+                 \____ CPU ____/       \______ GPU _______/
+
+`bytes_moved` is `2*w*n` (in and out). Fitted to the sweeps on this box:
+
+| term | value | how |
+| --- | --- | --- |
+| `overhead` | **64,152 ns** | intercept of gpu_ns vs n, per type: 63716 / 63815 / 64173 / 64904 |
+| `k` | **0.136 ns/byte** | slope / (2*w): 0.114 / 0.127 / 0.123 / 0.180 |
+| `L` | ~1.0 ns | loop cost per element, from cpu_ns/n at ops=1 vs 4 |
+| `c` | ~0.9 ns | arithmetic cost per op per element, same fit |
+
+The GPU half is strikingly consistent -- four types agree on the
+overhead within 2% and on the transfer slope within a factor of 1.6 --
+which is what makes the transfer-bound reading more than a story.
+
+**Validated against all 80 measured cells** (4 types x 3 intensities x
+6-8 sizes):
+
+| predicate | correct | admits a LOSS | refuses a win |
+| --- | ---: | ---: | ---: |
+| fitted cost model | **77/80 (96%)** | **0** | 3 |
+| current `n >= 4096` | 47/80 (59%) | — | — |
+
+It never admits a loss -- every error is a conservative refusal -- and
+all three misses are `double[]`, which the CPU half underfits at high
+intensity (predicted 21.5 ns/element at ops=16, measured 40.8). A
+per-type `c`, or simply a safety factor on the CPU side, would recover
+them.
+
+That is the shape to implement, and the constants are box-specific:
+they want re-fitting on any device this ships to, which is an argument
+for measuring them at startup rather than baking them in.
 
 Nothing here changes a default. That is deliberate: the fix is a
 behaviour change on the GPU admission path, and it wants its own change
