@@ -1931,7 +1931,7 @@ fn lookup_known_system_library_symbol(name: &str, c_name: &std::ffi::CStr) -> Op
     static LIBZSTD_HANDLE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let handle = *LIBZSTD_HANDLE.get_or_init(|| {
         for lib in [b"libzstd.so.1\0".as_slice(), b"libzstd.so\0".as_slice()] {
-            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const i8, libc::RTLD_LAZY) };
+            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const libc::c_char, libc::RTLD_LAZY) };
             if !handle.is_null() {
                 return Some(handle as usize);
             }

@@ -4,6 +4,19 @@
 //! `CRATONVM_DBG_STALE_OBJREF` — hard-panic assertion for stale native
 //! `ObjectRef` reads (gated, default-inert).
 //!
+//! # ⚠ THIS FLAG IS INERT ON THE DEFAULT COLLECTOR
+//!
+//! It instruments the **`Generational`** backend only. ZGC has been the default
+//! since 2026-08-10 (`gc/Cargo.toml`'s default-on `zgc` feature, and
+//! `VmConfig::default`), so on a stock build **setting this variable changes
+//! nothing and a silent run proves nothing**. Add `-XX:+UseGenerationalGC` to
+//! make it mean anything, and note that doing so changes the collector you are
+//! triaging.
+//!
+//! Called out here rather than only in the Scope paragraph below because it is
+//! the first instrument anyone reaches for on a "native held a stale reference"
+//! crash, and a default-build run of it looks exactly like an exoneration.
+//!
 //! See fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md
 //! and fixed-suite-bugs/wildfly/wildfly-stale-objectref-debug-assertion-scoping.md for
 //! the full writeup of the bug class this catches and the design rationale.

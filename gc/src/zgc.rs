@@ -7266,6 +7266,32 @@ impl ZgcRealHeap {
     }
 
     /// Snapshot of the pinned addresses, for the relocation-set filter.
+    ///
+    /// # THIS IS THE IMMOVABILITY HALF ONLY -- and that is correct
+    ///
+    /// This is the only reader of [`ZgcCounters::critical_pins`], and its one
+    /// caller is inside `relocate_stw`. So a `pin_critical` keeps an object
+    /// where it is and does not, by itself, keep it ALIVE. Read from this end
+    /// alone that looks like a hole in `GetPrimitiveArrayCritical`'s contract,
+    /// which promises the array stays valid until `Release` -- a liveness
+    /// promise, not just an immovability one. It has been read that way, and
+    /// wrongly.
+    ///
+    /// The liveness half is a DIFFERENT MECHANISM taken at the SAME call site.
+    /// `jni_get_primitive_array_critical` calls `VmHeap::pin_critical_region`
+    /// (this table) and then `pin_critical_array`, which pins the object in
+    /// `cratonvm_gc::pinned`; `vm/src/memory/roots.rs` section 9c splices that
+    /// set into the root set for the generational, G1 and ZGC backends alike.
+    /// The two are complementary and neither substitutes for the other:
+    /// removing this one lets a slide move an array a native is about to be
+    /// copied back into, and removing that one lets the array be reclaimed
+    /// under it.
+    ///
+    /// Do not "fix" the apparent gap by rooting these addresses here as well.
+    /// It would double-root every pinned object and put the keep-alive in two
+    /// places that can disagree. If you are here because the pin looks inert,
+    /// the test that says otherwise is
+    /// `roots::tests::a_jni_critical_pin_keeps_its_object_alive_with_no_other_reference`.
     fn critical_pin_addrs(&self) -> Vec<usize> {
         let pins = self.counters.critical_pins.lock();
         if pins.is_empty() {
@@ -9077,7 +9103,14 @@ impl ZgcRealHeap {
                 // `ZObjectStartBits::debug_assert_clear_outside` is what caught
                 // the cursor being the wrong one.
                 base + arena.low_high_water(),
-                base + arena.high_cursor(),
+                // WATER MARK on this side too, and for the mirrored reason.
+                // `retract_high_cursor_into_free_head` RAISES `high_cursor`,
+                // which shrinks `[high_cursor, capacity)` and would leave this
+                // cycle's mark bits below the new cursor uncleared -- read back
+                // as "already marked" once the cursor bumps down over them
+                // again, so the marker never traces those objects. The low end
+                // got `low_high_water` when the bounds landed; this side did not.
+                base + arena.high_low_water(),
                 base + arena.capacity(),
             )
         };
@@ -9115,7 +9148,14 @@ impl ZgcRealHeap {
                     // wherever this one peaked. Reset AFTER the clear -- doing
                     // it earlier hands the clear a bound that does not cover
                     // the bits it has to reach.
-                    self.arena.lock().reset_low_high_water();
+                    {
+                        let mut arena = self.arena.lock();
+                        arena.reset_low_high_water();
+                        // BOTH ends, or the half that is not reset keeps a
+                        // widened bound forever and the saving this file exists
+                        // for decays back to a capacity-sized pass.
+                        arena.reset_high_low_water();
+                    }
                 } else {
                     bits.clear_all();
                 }
@@ -13998,13 +14038,20 @@ impl GarbageCollector for ZgcRealHeap {
             );
         }
 
-        // ---- COMPACTION (opt-in, Phase 4) --------------------------------
+        // ---- COMPACTION (DEFAULT-ON since 2026-08-13) --------------------
         //
-        // Normally non-moving: no object changes address, roots and external
-        // references need no fix-up, and the pointer map is empty. That is
-        // still what every default run does.
+        // THE TWO PARAGRAPHS THAT USED TO OPEN THIS BLOCK SAID THE OPPOSITE,
+        // and it was load-bearing. They called compaction opt-in behind
+        // `CRATONVM_ZGC_RELOCATE=1` and said the non-moving path "is still what
+        // every default run does" -- three months after the default moved. A
+        // reader triaging a crash whose stack runs through `relocate_stw` would
+        // conclude the slide could not have been running. `x64::
+        // zgc_codegen_honours_read_barrier()` also answers `true`
+        // unconditionally now, so `zgc_relocation_permitted`'s old blanket
+        // refusal under the JIT no longer fires either: a default JIT run
+        // compacts.
         //
-        // With `CRATONVM_ZGC_RELOCATE=1` the sweep is followed by a
+        // By default the sweep is followed by a
         // stop-the-world slide that compacts the small-object end and returns
         // a NON-EMPTY pointer map. Three things make that safe to have here:
         //
@@ -14277,6 +14324,216 @@ impl GarbageCollector for ZgcRealHeap {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// **The slide must COMMIT a destination before it memmoves onto it.**
+    ///
+    /// `collect_garbage` opens every cycle with
+    /// `decommit_unbumped_middle() + decommit_free_blocks()`. The second half
+    /// hands the whole granules inside every free-list block back to the OS --
+    /// `madvise(DONTNEED)` + `PROT_NONE` on Unix, `MEM_DECOMMIT` on Windows,
+    /// both of which FAULT on touch rather than reading back zero. A free-list
+    /// block is precisely the kind of hole `relocate_stw` likes to slide a
+    /// survivor into, and the slide writes with a bare `std::ptr::copy` that
+    /// went through none of `Arena::hand_out`'s committing.
+    ///
+    /// So the destination could be unmapped, and the copy took the fault on the
+    /// WRITE. Found as an intermittent `RMapGcStress` `rc=139`: 5 crashes in 20
+    /// runs at `--Xmx 128m`, every one of them a write fault at that
+    /// `ptr::copy`, against 0 in 20 with `CRATONVM_ZGC_RELOCATE=0` (no slide)
+    /// and 0 in 20 with `CRATONVM_GC_RESERVE=0` (nothing decommits).
+    ///
+    /// **Without the fix this test does not fail an assertion -- it SIGSEGVs**,
+    /// because the faulting instruction is the memmove itself. That is the
+    /// nature of the defect and the reason it reached a suite run rather than a
+    /// unit test: nothing on the write path consulted commit state.
+    /// `Arena::is_readable_at` is the read-side guard that already existed;
+    /// `Arena::commit_for_relocation` is the write-side one this test pins.
+    #[test]
+    fn the_slide_commits_a_destination_the_give_back_had_decommitted() {
+        use crate::reservation::GRANULE;
+        const FIELDS: usize = 500;
+        const OBJ: usize = HEADER_SIZE + FIELDS * SLOT_SIZE;
+        // Big enough that the dead prefix below spans several whole granules,
+        // which is what `decommit_free_blocks` rounds inward to.
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        // A wholly dead prefix -- nothing here is ever rooted -- followed by the
+        // survivors that will slide down onto it.
+        let dead_start = heap.alloc_object(ClassId::new(1), FIELDS).as_ptr() as usize;
+        let dead_target = 8 * 1024 * 1024;
+        let mut dead_bytes = OBJ;
+        while dead_bytes < dead_target {
+            let _ = heap.alloc_object(ClassId::new(1), FIELDS);
+            dead_bytes += OBJ;
+        }
+        // Sparse survivor pages -- one live object in every eight -- so the
+        // relocation set actually SELECTS them; a wholly-live page is skipped
+        // and nothing would move. Same shape as `slide_a_low_region`.
+        const PAGE: usize = ZgcRealHeap::Z_LOGICAL_PAGE_BYTES;
+        let per_page = PAGE / OBJ;
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for _page in 0..4 {
+            for i in 0..per_page {
+                let o = heap.alloc_object(ClassId::new(1), FIELDS);
+                if i % 8 == 0 {
+                    // A recognisable payload, so a slide onto memory that
+                    // somehow did NOT fault still cannot pass this silently.
+                    heap.set_field(o, 0, Value::Int(0x5A5A_0000 | roots.len() as i32));
+                    roots.push(o);
+                }
+            }
+        }
+
+        let base = { heap.arena.lock().base_ptr() as usize };
+        let hole_off = dead_start - base;
+
+        // Hand the dead prefix to the free list and give its granules back,
+        // exactly as the start of a collection does.
+        let released = {
+            let mut arena = heap.arena.lock();
+            arena.add_free_block(hole_off, dead_bytes);
+            arena.coalesce_free_list();
+            arena.decommit_free_blocks()
+        };
+        assert!(
+            released >= GRANULE,
+            "the dead prefix must actually return whole granules, got {released} bytes"
+        );
+        // The precondition the slide used to walk into: the hole is now
+        // unmapped, and touching it faults.
+        assert!(
+            !heap.arena.lock().is_readable_at(hole_off + GRANULE),
+            "a decommitted granule must not read as committed"
+        );
+
+        let live: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        let (moved, _reclaimed, map) = heap.relocate_stw_for_test(&live);
+        assert!(
+            moved > 0,
+            "the survivors must slide down into the emptied prefix, or this test \
+             is not exercising the destination-commit path at all"
+        );
+
+        // Every survivor still reads back its payload at its post-slide address.
+        for (i, old) in live.iter().enumerate() {
+            let now = map.get(old).copied().unwrap_or(*old);
+            let obj = unsafe { ObjectRef::from_raw(now as *mut u8) };
+            assert_eq!(
+                heap.get_field(obj, 0),
+                Value::Int(0x5A5A_0000 | i as i32),
+                "survivor {i} lost its payload across the slide"
+            );
+        }
+    }
+
+    /// **The LARGE-OBJECT compactor must commit its destination too.**
+    ///
+    /// The sibling of
+    /// `the_slide_commits_a_destination_the_give_back_had_decommitted`, and the
+    /// reason that one was not enough. `Arena::decommit_free_blocks` walks BOTH
+    /// free lists — `free_high` as well as the low blocks — so a hole at the
+    /// large-object end has had its whole granules handed back to the OS as
+    /// well, and `compact_high_region` packs survivors UP into exactly those
+    /// holes with its own bare `std::ptr::copy`.
+    ///
+    /// Found the honest way: after the low slide was fixed,
+    /// `org.h2.test.store.TestRandomMapOps` at `--Xmx 256m` still took an
+    /// `EXCEPTION_ACCESS_VIOLATION`, and the symbolized frame was
+    /// `compact_high_region` rather than the slide. `RMapGcStress` could never
+    /// have found it — it allocates nothing at or above
+    /// `ZGC_LARGE_OBJECT_MIN`, so its arena has no high end in use at all.
+    ///
+    /// As with the low-end test, the pre-fix failure mode here is a
+    /// SIGSEGV rather than a failed assertion.
+    #[test]
+    fn the_high_compactor_commits_a_destination_the_give_back_had_decommitted() {
+        use crate::reservation::GRANULE;
+        // Comfortably above `ZGC_LARGE_OBJECT_MIN` (64 KiB), so every one of
+        // these is served from the descending high end.
+        const FIELDS: usize = 12_000;
+        let heap = ZgcRealHeap::with_capacity(64 * 1024 * 1024);
+        heap.set_tlab_enabled(false);
+
+        let (base, capacity) = {
+            let a = heap.arena.lock();
+            (a.base_ptr() as usize, a.capacity())
+        };
+
+        // The high end bumps DOWN, so allocation N sits below allocation N-1
+        // and its extent runs up to where the previous one started. Tracking
+        // that boundary gives each object's exact span without having to
+        // re-derive its padded size.
+        let mut top = base + capacity;
+        let mut dead_spans: Vec<(usize, usize)> = Vec::new();
+        let mut alloc_dead = |heap: &ZgcRealHeap, top: &mut usize, spans: &mut Vec<(usize, usize)>| {
+            let o = heap.alloc_object(ClassId::new(1), FIELDS).as_ptr() as usize;
+            spans.push((o, *top));
+            *top = o;
+            o
+        };
+
+        // (1) A long CONTIGUOUS dead run at the very top. Coalesced this is one
+        //     multi-granule block, which is the only shape `decommit_free_blocks`
+        //     can actually hand back (it rounds inward to whole granules), and
+        //     it is where the survivors below will be packed.
+        let mut run_bytes = 0usize;
+        while run_bytes < 6 * GRANULE {
+            let o = alloc_dead(&heap, &mut top, &mut dead_spans);
+            assert!(
+                o > base + capacity / 2,
+                "a {FIELDS}-field object must be served from the high end"
+            );
+            run_bytes += FIELDS * SLOT_SIZE;
+        }
+
+        // (2) Below it, survivors INTERLEAVED with single dead objects. The
+        //     interleaving is what earns the pass: `compact_high_region`
+        //     declines unless `free_bytes - largest` reaches one large object,
+        //     and with a single top hole that difference is zero.
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        for i in 0..8 {
+            let o = heap.alloc_object(ClassId::new(1), FIELDS);
+            top = o.as_ptr() as usize;
+            heap.set_field(o, 0, Value::Int(0x7A7A_0000 | i as i32));
+            roots.push(o);
+            alloc_dead(&heap, &mut top, &mut dead_spans);
+        }
+
+        // Free every dead object and give back what whole granules that yields,
+        // exactly as the start of a collection does.
+        let released = {
+            let mut arena = heap.arena.lock();
+            for (lo, hi) in &dead_spans {
+                arena.add_free_block(lo - base, hi - lo);
+            }
+            arena.coalesce_high();
+            arena.decommit_free_blocks()
+        };
+        assert!(
+            released >= GRANULE,
+            "the dead high run must return whole granules, got {released} bytes"
+        );
+
+        let live: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
+        let (moved, _reclaimed, map) = heap.relocate_stw_for_test(&live);
+        assert!(
+            moved > 0,
+            "the survivors must be packed up into the emptied high region, or \
+             this test is not exercising the high compactor's destination"
+        );
+
+        for (i, old) in live.iter().enumerate() {
+            let now = map.get(old).copied().unwrap_or(*old);
+            let obj = unsafe { ObjectRef::from_raw(now as *mut u8) };
+            assert_eq!(
+                heap.get_field(obj, 0),
+                Value::Int(0x7A7A_0000 | i as i32),
+                "survivor {i} lost its payload across the high compaction"
+            );
+        }
+    }
+
 
     // ------------------------------------------------------------------
     // TLAB chunk recycling
@@ -15077,7 +15334,7 @@ pub(crate) mod tests {
         assert_eq!(owned.committed_bytes(), owned.len());
         assert!(owned.commit_range(0, owned.len()));
         assert_eq!(
-            owned.decommit_range(0, 4 * 1024 * 1024),
+            owned.decommit_range(0, 4 * 1024 * 1024, "test"),
             0,
             "the owned store has nothing to give back and must say so"
         );
