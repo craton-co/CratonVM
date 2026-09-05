@@ -54,11 +54,15 @@ reference entry, so every `aaload` falls through to the full barrier-aware
 `VmHeap::get_array_element`. It costs 47 ns more than an `iaload` + `ifne`
 doing the same work, where HotSpot has the two identical to within noise.
 
-The same arm is worth reading for a second reason: it opens with two
+The same arm was worth reading for a second reason: it opened with two
 `pop_unchecked()` calls, decoding both operands into the 16-byte `Value` enum
-*before* it can even offer them to the quickened path — and on the non-object
-path it pushes both back, keeping them live across the arm. That is the same
-shape as `arraylength` below, in the opcode family that pays it twice.
+*before* it could offer them to the quickened path, and pushed both wide values
+back on the fall-through. Every array element load paid that, `iaload`
+included. **Correction to an earlier draft of this page:** the `*astore` arm
+(`0x4f..=0x56`) does *not* have the defect — it already peeked the raw slots
+and decoded only on the decline. It was one arm out of step with its
+neighbour, not an opcode family. Fixed by giving the load arm the store arm's
+shape.
 
 ## The item that was taken: the registry probe
 
@@ -166,6 +170,13 @@ errors and no harness-blindness flags. That suite is a HotSpot differential —
 a vector passes only when CratonVM's output matches the oracle's — so it is
 the right gate for a change that alters how a field is read.
 
+**Once per collector, because one of these changes is not in the interpreter
+at all.** The autobox latch below touches `G1Collector::get_array_element`,
+and every run above used the default collector, which would never have
+executed it. `CRATONVM_ARGS="--XX:UseGc G1"`: **90 of 90 passed, 0 failed.**
+A change to a collector that is never run under that collector is untested no
+matter how green the default suite is.
+
 Two harness notes for whoever repeats it, because the first attempt was
 worthless and did not look it:
 
@@ -218,6 +229,51 @@ worthless and did not look it:
    `header.shape` read + `push_int_unchecked` is the whole opcode.
 4. **`getstatic` / `putstatic` at 25x** were not investigated. They do not go
    through `field_ptr_for` and were the internal control for this pass.
+
+## The autobox latch: right fix, wrong cause, and it measured nothing
+
+Recorded in full because the negative is the useful part, and because it is the
+**second** time on this page that eliding an `is_object_address` probe has come
+back at zero.
+
+`crate::autobox`'s module note explains that the latch exists so a read does not
+pay "an unconditional `is_object_address` probe plus a header read on EVERY
+compact reference-field read". The FIELD paths took that advice;
+`ZgcRealHeap::get_array_element` (both arms) and `G1Collector::get_array_element`
+did not, and called `autobox_payload` — whose first statement is that probe —
+on every non-null `aaload`. Neither file mentioned `wrapper_exists` anywhere.
+
+Latching them is provably answer-preserving (`autobox_payload` returns `Some`
+only for `AUTOBOX_CLASS_ID`, which cannot exist unless something set the latch)
+and it deletes real work, so it is kept. **It measured nothing:**
+`probes/ArrBurn.java`, 30 M iterations, quiet host (`ctl` 1661–1873 ms
+throughout, `iaload` 2326–2556):
+
+| | min-of-8 | pairwise |
+|---|---:|---|
+| latch (default) | 2949 ms | — |
+| probe restored | 2969 ms | **3/8** |
+
+3/8 is worse than a coin flip. 20 ms in 2960 over 30 M reads is below the noise
+floor, and it is the same answer finding 01 got about the same probe for the
+same reason: the bitmap word is hot, and the probe is worth 1–2 ns.
+
+**What the probe that found this out then said instead.** `ArrBurn` runs
+`aaload` and `iaload` in identical loop shapes over 1024-element arrays:
+**99.9 ns per iteration against 79.0**. They differ in exactly one way —
+`iaload` is served by `array_load_prim`, `aaload` falls through to
+`VmHeap::get_array_element`, because `prim_elem_for_opcode` has no reference
+entry. So the 21 ns is the whole slow path (an enum `dispatch!`, the
+collector's own header and bounds re-reads, an `Acquire` load for the barrier
+arm, `read_prim_element`'s match, and a 16-byte `Value` returned to be
+re-encoded into an 8-byte slot), not one probe. `field_fast::array_load_ref`
+is the arm that follows from that reading.
+
+**The rule this page is now willing to state.** Two probe-elision hypotheses,
+two zeroes. Do not propose a third on locality grounds. The per-bytecode floor
+is high enough to hide these loads, and until it comes down the levers that
+pay are the ones that delete a *path* — a dispatch, a representation
+conversion, a re-read — not the ones that delete a load.
 
 ## Three findings resolved without a change, and why
 
