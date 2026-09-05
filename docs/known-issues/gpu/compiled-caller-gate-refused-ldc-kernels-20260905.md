@@ -73,10 +73,28 @@ Annotations are deliberately still not passed — hint-loosened kernels
 remain the documented "Known limitation" in the module docs. That one is
 a choice; the pool-free call was not.
 
+### Found twice, independently, on the same day
+
+`f5c7963e9 fix(gpu): the JIT gate and the dispatcher disagreed about any
+kernel with an FP constant` landed on `dev` while this was being scoped,
+and makes the identical one-line change. It arrived from a different
+symptom: `bench-gpu/GpuFloatDivChain.divChain`, whose `+ 1.0000001` is an
+`ldc2_w`, measured at 9,276 ms against its int twin's 8 ms.
+
+Its framing is narrower than the defect. That commit reasons that the int
+twin worked because `+ 12345` is a `sipush` "with no pool entry" — true
+of *that* constant, but it generalises the wrong way: `12345` is inside
+`sipush` range (±32767) and `1000003` is not. **The boundary is the
+constant pool, not the type**, which is what `GpuLdcSplit` above shows —
+an `int[]` kernel with a large constant went dark and a `long[]` kernel
+with only `lconst_1` never did. Two independent scopings of this bug each
+generalised from the types their own fixture happened to use ("64-bit
+arrays" here, "FP constants" there), and both were wrong in the same way.
+
 ## Verified
 
-RTX 2060 (sm_75), CUDA 13.3, driver 610.88, Windows 11, JDK 25.0.3, at
-`632d25166`. `GpuIntensitySweep <type> 262144 30 <ops>`, `--gpu-min-work 1`:
+RTX 2060 (sm_75), CUDA 13.3, driver 610.88, Windows 11, JDK 25.0.3.
+`GpuIntensitySweep <type> 262144 30 <ops>`, `--gpu-min-work 1`.
 
 Engagement, before → after — all eight cells now dispatch:
 
@@ -87,22 +105,32 @@ Engagement, before → after — all eight cells now dispatch:
 | `long[]` | **dark** → offloads | **dark** → offloads |
 | `double[]` | **dark** → offloads | **dark** → offloads |
 
-Timing at ops=16, against `CRATONVM_GPU_JIT_GATE_CALLERS=block` as the
-within-binary control:
+Timing at ops=16. The **before** column was measured on the pre-fix
+binary at `632d25166`, single run — it is a 10x effect and does not need
+repeats. The **after** columns are medians of 5, with the full sample
+range, because at this size the run-to-run spread on a desktop is wide
+enough to invent a result from one sample:
 
-| type | before (default) | after (default) | control (`=block`) |
+| type | before (pre-fix) | after, default | after, `=block` control |
 | --- | ---: | ---: | ---: |
-| `double[]` | 8,606,336 ns | **730,570 ns** | 767,843 ns |
-| `long[]` | — | **639,333 ns** | 646,256 ns |
+| `double[]` | 8,606,336 ns | **775,880** (741k–810k) | 874,576 (833k–1134k) |
+| `long[]` | — | **739,426** (681k–964k) | 690,376 (673k–1076k) |
 
-The default arm now edges out the control, which is what "the caller
-compiles AND the site still offloads" is supposed to buy. Before, it lost
-to it by 10.8x.
+Read that table carefully: the fix removes a **10.8x** loss, and after it
+the default and `=block` arms are at **parity — the difference is inside
+the noise, and its sign flips by element type**. An earlier draft of this
+page claimed the default arm "edges out" the control on 730,570 against
+767,843; that was one sample each, a 5% gap on a distribution that spans
+50%, and it did not survive repeats. Parity is the correct claim and the
+expected one: `=block` reaches the device through the interpreter hook,
+so both arms end up offloading the same kernel, and what the fix buys is
+that the caller no longer has to stay interpreted to get there.
 
-Battery: `ci-gate.sh` 5/5, `gate-overbroad.sh` PASS, `runtime-stress.sh`,
-`marshal-stress.sh` (all six kernels engaged), `residency-gc.sh` on three
-collectors, `jit-writer-stale.sh`, and
-`cargo test -p cratonvm-vm --features gpu-offload --lib` (2699 passed).
+Battery at this commit: `ci-gate.sh` 5/5, `gate-overbroad.sh` PASS,
+`runtime-stress.sh`, `marshal-stress.sh` (all six kernels engaged),
+`jit-writer-stale.sh`, and `cargo test -p cratonvm-vm --features
+gpu-offload --lib` (2701 passed). `residency-gc.sh` passes, but flaked
+once in 25 runs — see the note below; it is not this defect.
 
 ## Why `=block` appeared to be a clean control, and only half was
 
@@ -172,3 +200,24 @@ no compiled-caller census line at all, because the site was never even
 *considered*. The census being **absent** rather than zero is itself the
 signal: `gpu_compiled_offload_census::exit_summary` returns early when
 every counter is zero.
+
+## An unrelated flake seen while verifying this
+
+`residency-gc.sh` failed once on this binary ("2 CHECK(S) FAILED") and
+then passed **24 consecutive runs** — 1 in 25 overall, across three
+collectors each time. It is **not** this defect and not the gate — that
+script never exercises the compiled-caller registration path this page is
+about.
+
+The likely explanation is that `dev` does not yet carry either fix from
+[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md)
+(branch `fix/gpu-concurrent-dispatch-race-20260905`, pushed and unmerged
+as of this writing). Both of those races live in `input_cache`, which is
+exactly what `residency-gc.sh` hammers across collections, and both
+produce intermittent wrong answers at single-digit rates. Verified by
+inspection that this tree has neither: no `drain_locked`, and `insert`
+still OR's its filter bit outside the mutex.
+
+Stated as the likely explanation rather than a finding — the failing run
+was not captured in enough detail to name which two checks failed, and a
+rate this low needs the sample sizes that page documents.

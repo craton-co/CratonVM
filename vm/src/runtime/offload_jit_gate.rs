@@ -425,7 +425,6 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
                 continue;
             }
         };
-        };
 
         // ...and then the DISPATCHER's own gates. `Eligible` answers
         // "could this bytecode be lowered to PTX", which is not the
