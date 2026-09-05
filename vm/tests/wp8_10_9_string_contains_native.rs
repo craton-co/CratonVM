@@ -42,12 +42,59 @@
 //! that dropped everything would satisfy (1) just as well.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
-use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::config::{discover_boot_classpath, JdkMode, VmConfig};
 use cratonvm_vm::vm::SharedVm;
 
-fn shared() -> Arc<SharedVm> {
-    Arc::new(SharedVm::new(VmConfig::default()))
+/// A registry built by `vm_init`'s REAL-JDK arm — which is what every
+/// assertion in this file is about, and says so in its own name.
+///
+/// Until 2026-09-05 this was `SharedVm::new(VmConfig::default())`. The header
+/// above already names the shape of that mistake one layer up ("The
+/// requirement was about synthetic mode; the assertion was taken in the other
+/// one") and it was the same mistake again, in the other direction:
+/// `VmConfig::default()` selects `EMBEDDED_DEFAULT_JDK_MODE` =
+/// `JdkMode::Synthetic`. It *read* as a real-JDK registry only because the drop
+/// that produces one was keyed on the Cargo feature instead of on the run — and
+/// a synthetic run with the real-JDK drop applied is a VM with no
+/// `java/lang/String` at all: no bytecode, because there is no JDK image, and
+/// no bridge, because the drop took it. `"abcdef".length()` raised
+/// `NoSuchMethodError` there. Keying the drop on the run is the fix; asking for
+/// the mode by name is this file's half of it.
+///
+/// `None` when no JDK image is reachable: real-JDK mode has nothing to boot
+/// against then. `discover_boot_classpath` is the call `SharedVm::new` itself
+/// makes, so the question is asked in the same words it is answered in.
+fn shared() -> Option<Arc<SharedVm>> {
+    static VM: OnceLock<Option<Arc<SharedVm>>> = OnceLock::new();
+    VM.get_or_init(|| {
+        if discover_boot_classpath(None).is_empty() {
+            return None;
+        }
+        Some(Arc::new(SharedVm::new(
+            VmConfig::default().with_jdk_mode(JdkMode::Real),
+        )))
+    })
+    .clone()
+}
+
+/// Skip loudly rather than pass silently. A green run of this file on a box
+/// with no JDK would assert nothing at all, which is the failure mode a
+/// registry-absence test is least able to notice about itself.
+macro_rules! shared_or_skip {
+    () => {
+        match shared() {
+            Some(vm) => vm,
+            None => {
+                eprintln!(
+                    "skipping: no JDK image reachable (JAVA_HOME -> jmods / lib/modules). \
+                     Every assertion in this file is about a real-JDK registry."
+                );
+                return;
+            }
+        }
+    };
 }
 
 /// Every `java/lang/String` shape whose real-JDK class bytes carry a `Code`
@@ -58,7 +105,7 @@ fn shared() -> Arc<SharedVm> {
 /// the two WP8.10.9 named.
 #[test]
 fn real_jdk_registry_has_no_string_bridge_shadowing_bytecode() {
-    let shared = shared();
+    let shared = shared_or_skip!();
     let registry = &shared.natives.native_methods;
 
     let shadowing: &[(&str, &str)] = &[
@@ -117,7 +164,7 @@ fn real_jdk_registry_has_no_string_bridge_shadowing_bytecode() {
 /// dropped the whole class — a different and much worse change.
 #[test]
 fn real_jdk_registry_keeps_the_one_genuine_string_bridge() {
-    let shared = shared();
+    let shared = shared_or_skip!();
     assert!(
         shared
             .natives
@@ -159,7 +206,7 @@ fn real_jdk_registry_keeps_the_one_genuine_string_bridge() {
 /// it comes back, it comes back with suite numbers and a `register_with_kind`.
 #[test]
 fn string_hash_code_is_left_to_the_bytecode() {
-    let shared = shared();
+    let shared = shared_or_skip!();
     assert!(
         shared
             .natives
@@ -178,7 +225,7 @@ fn string_hash_code_is_left_to_the_bytecode() {
 /// — silently deletes the SBR-02 fix, which is the failure this pins.
 #[test]
 fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
-    let shared = shared();
+    let shared = shared_or_skip!();
     let registry = &shared.natives.native_methods;
 
     // Same default-ON / opt-out reading as the registration site. With the flag
@@ -265,7 +312,7 @@ fn real_jdk_registry_keeps_the_reviewed_string_intrinsics() {
 /// triple falls on is the failure it exists to prevent.
 #[test]
 fn the_surviving_string_registration_set_is_exactly_this() {
-    let shared = shared();
+    let shared = shared_or_skip!();
     let registry = &shared.natives.native_methods;
     let mut actual: Vec<String> = registry
         .dump_registrations()
@@ -345,7 +392,7 @@ Intrinsic valueOf(Ljava/lang/Object;)Ljava/lang/String;";
 /// to notice one. This test is the check the JIT cannot make.
 #[test]
 fn the_jit_latin1_lower_ladder_binds_a_reviewed_intrinsic() {
-    let shared = shared();
+    let shared = shared_or_skip!();
     let kind = shared.natives.native_methods.kind_of(
         "java/lang/StringLatin1",
         "toLowerCase",
