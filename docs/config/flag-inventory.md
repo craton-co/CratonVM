@@ -1211,7 +1211,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_NO_CM_ID_PAIRING` | GC | `CRATONVM_GC=cm-id-pairing` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_GC_NO_EMPTY_OBJECT_RUN` | GC | `CRATONVM_GC=empty-object-run` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` | GC | `CRATONVM_GC=old-interior-pins` | opt-out | on | behaviour | snapshot | gc |
-| `CRATONVM_GC_NO_TLAB_SKIP` | GC | `CRATONVM_GC=no-tlab-skip` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_GC_NO_TLAB_SKIP` | GC | `CRATONVM_GC=tlab-skip` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_NO_VALIDATE_ONCE` | GC | `CRATONVM_GC=validate-once` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_OBJECT_STARTS` | GC | `CRATONVM_GC=object-starts` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_OVERHEAD_LIMIT` | GC | `CRATONVM_GC=overhead-limit` | opt-in | off | behaviour | snapshot | vm |
