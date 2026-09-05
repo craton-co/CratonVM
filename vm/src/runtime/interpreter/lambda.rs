@@ -1413,14 +1413,32 @@ pub(crate) struct LambdaJitSite {
     /// feature under one kill switch.
     code: std::cell::RefCell<Option<cratonvm_jit::RetainedCode>>,
     code_generation: std::cell::Cell<u64>,
-    /// Latched once this site has an inline-cache thunk.
+    /// The inline-cache slot pair this site's thunk was last installed into,
+    /// or `(0, 0)` for none.
     ///
-    /// Without it the Rust arm re-writes the cache slot on every call it still
-    /// serves — measured at 202 000 "installs" for what should be a handful —
-    /// which is not merely wasted work: the slot's first cache line is the one
-    /// the emitted cascade loads on every dispatch from every thread, and
-    /// storing to it repeatedly is how a fast path pays for its own existence.
-    adapter_installed: std::cell::Cell<bool>,
+    /// Without a latch the Rust arm re-writes the cache slot on every call it
+    /// still serves — measured at 202 000 "installs" for what should be a
+    /// handful — which is not merely wasted work: the slot's first cache line
+    /// is the one the emitted cascade loads on every dispatch from every
+    /// thread, and storing to it repeatedly is how a fast path pays for its own
+    /// existence.
+    ///
+    /// **It records WHICH slots, not merely that it installed, and that is the
+    /// whole point.** A bare `bool` latched the site for the life of the
+    /// process — but the slots belong to the CALLER'S COMPILED BODY, and a
+    /// caller gets recompiled: C1 then C2, or an OSR body published beside the
+    /// entry one. The new body's slots are fresh and empty, and a site latched
+    /// `true` could never fill them, so every later dispatch fell back to the
+    /// Rust arm for good.
+    ///
+    /// Measured on `LambdaJitTierUp.warmChecksum`: both thunks installed at
+    /// `site_direct=0` and `site_direct=1` — immediately — and `site_direct`
+    /// still reached 397 002 of 800 000, which is
+    /// `test_inline_cache_takes_over_the_sam_call_site` failing while its
+    /// `site_adapters=2` says the feature engaged. Comparing the pair bounds
+    /// re-installs by the number of distinct bodies, which is small, instead of
+    /// by the number of calls, which is not.
+    adapter_slots: std::cell::Cell<(i64, i64)>,
     /// Latched the first time this site's compiled body DEOPTS.
     ///
     /// A deopt means the body did not complete, and the direct arm has no way
@@ -1461,10 +1479,20 @@ impl LambdaJitSite {
         self.total_args
     }
 
-    /// Claim the one-time inline-cache install for this site, returning `true`
-    /// exactly once. See [`LambdaJitSite::adapter_installed`].
-    pub(crate) fn claim_adapter_install(&self) -> bool {
-        !self.adapter_installed.replace(true)
+    /// Claim the inline-cache install for THIS slot pair, returning `true` the
+    /// first time this site is asked to fill it.
+    ///
+    /// Returns `false` for a repeat of the same pair — the 202 000-re-install
+    /// case the latch exists for — and `true` once more when the caller has
+    /// been recompiled and handed the site a different pair. See
+    /// [`LambdaJitSite::adapter_slots`].
+    pub(crate) fn claim_adapter_install(&self, mic_ptr: i64, pic_ptr: i64) -> bool {
+        let slots = (mic_ptr, pic_ptr);
+        if self.adapter_slots.get() == slots {
+            return false;
+        }
+        self.adapter_slots.set(slots);
+        true
     }
 
     /// Does this site's SAM call need a `checkcast` replayed per call? A
@@ -1734,7 +1762,7 @@ fn build_lambda_jit_site(shared: &SharedVm, proxy_class_id: ClassId) -> SiteVerd
         gate,
         code: std::cell::RefCell::new(None),
         code_generation: std::cell::Cell::new(u64::MAX),
-        adapter_installed: std::cell::Cell::new(false),
+        adapter_slots: std::cell::Cell::new((0, 0)),
         direct_disabled: std::cell::Cell::new(false),
         const_return,
     }))
@@ -1766,7 +1794,11 @@ pub(crate) fn lambda_jit_site_code(
             .map(cratonvm_jit::RetainedCode::new);
         *site.code.borrow_mut() = found;
         site.code_generation.set(generation);
-        site.adapter_installed.set(false);
+        // Forget WHICH slots too: a republished impl means the thunk that
+        // was installed points at the old body. This lifts the latch when the
+        // IMPL is recompiled; `claim_adapter_install` comparing slot pointers
+        // is what covers the CALLER being recompiled, which this never saw.
+        site.adapter_slots.set((0, 0));
         // A moved generation means a publication or an invalidation — including
         // the recompile that a de-speculation drives. The body being probed now
         // is not the one that deopted, so the latch that took this site off the

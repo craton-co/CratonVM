@@ -20202,7 +20202,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// unqualified. Claiming after the attempt instead would trade it for
 /// re-asking (a lock and a layout lookup) on every dispatch a refused site ever
 /// serves, which is the shape of the 202 000 re-installs
-/// `LambdaJitSite::adapter_installed` exists to prevent.
+/// `LambdaJitSite::adapter_slots` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
@@ -20243,7 +20243,7 @@ unsafe fn install_lambda_inline_cache(
         }
         crate::runtime::interpreter::const_probe_note_opaque();
     }
-    if !site.claim_adapter_install() {
+    if !site.claim_adapter_install(mic_ptr, pic_ptr) {
         return;
     }
     // `total_args` is captures plus SAM arguments; the emitter wants them apart,
