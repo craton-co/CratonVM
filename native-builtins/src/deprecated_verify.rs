@@ -319,6 +319,27 @@ pub(crate) fn register_missing_deprecated_shims(r: &mut NativeMethodRegistry) {
     }
 }
 
+/// The deprecated triples NO supported JDK image declares, and which therefore
+/// must NOT be registered.
+///
+/// Public because the manifest above is the ADJUDICATED answer — measured
+/// against JDK 17/21/25 on three platforms by
+/// `scripts/jdk-only-no-image-methods.py` — and a second copy of it,
+/// maintained by hand somewhere else, drifts the moment an API is retired.
+/// `vm/tests/t8_deprecated_conformance.rs` was exactly that copy: it still
+/// asserted `Thread.destroy()V` and `sun/misc/Unsafe.defineClass` were
+/// REGISTERED, four months after both were retired here, so two conformance
+/// tests asserted the opposite of this module's own contract.
+///
+/// Consume this rather than restating it.
+pub fn absent_from_all_supported_images() -> Vec<(&'static str, &'static str, &'static str)> {
+    deprecated_api_manifest()
+        .into_iter()
+        .filter(|a| a.images == ImageStatus::AbsentFromAllSupportedImages)
+        .map(|a| (a.class, a.method, a.descriptor))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
