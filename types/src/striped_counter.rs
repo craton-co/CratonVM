@@ -12,7 +12,7 @@
 //! difference between scaling and not: a `virtual call` microbenchmark went
 //! from 207 ns/op at one thread to 19,900 ns/op at ten, i.e. ten threads doing
 //! a *tenth* of the total work of one
-//! (`fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md`).
+//! (`23-charsetcache-pathological-slowdown.md`).
 //!
 //! [`StripedCounter`] gives each thread its own cache-line-aligned stripe, so
 //! the write path is uncontended, and sums the stripes on the rare read.

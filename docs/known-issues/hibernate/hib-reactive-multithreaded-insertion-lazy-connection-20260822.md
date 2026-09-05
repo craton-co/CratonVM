@@ -618,7 +618,7 @@ Profiling that clean run:
 `VarHandle` operations on a reference field, **uncontended** here because each
 thread owns its futures.
 
-That led to `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
+That led to `varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`
 (FIXED and retired to the internal tree on 2026-08-27):
 
 | operation | HotSpot | CratonVM | ratio |
@@ -674,11 +674,11 @@ and **discard any arm whose control did not fail**.
    `UniRelay.tryFire` force-interpreted by a stale `ForkJoinTask`-subclass
    blocklist, plus a `dup_x2` shape the single-pass backend could not prove.
    Composition is **3.95x** faster and the gap is 446x -> 113x. See
-   `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
-   and `performance/varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
+   `completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`
+   and `varhandle-writes-and-cas-have-no-fast-path-FIXED-20260827.md`.
    The residual is
-   `performance/juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md` (internal), whose successor
-   `performance/completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
+   `juc-primitives-and-composition-after-the-compile-refusals-CLOSED-20260901.md` (internal), whose successor
+   `completablefuture-composition-is-20x-and-5-percent-compiled-CLOSED-20260902.md`
    (internal) closed on 2026-09-02 with composition **1.19x** faster and all
    three of its residuals discharged. What is still open from that line is
    [`../perf/composition-native-callback-and-the-promotion-question-20260902.md`](../perf/composition-native-callback-and-the-promotion-question-20260902.md).
@@ -766,15 +766,15 @@ is generated and machine-local, so it is not committed.
 - `apps/hibernate-reactive/hibernate-reactive-core/src/test/java/org/hibernate/reactive/MultithreadedInsertionWithLazyConnectionTest.java`
 - `apps/hibernate-reactive-suite-runner/HibfixCfProbe.java`, `HibfixCfBound.java`, `hibfix-mtins-run.sh`, `hibfix-dupins-loop.sh`, `hibfix-seqcheck.sh`, `hibfix-commitcheck.sh`, `hibfix-seqtime.sh`, `HibfixComposeProbe.java`, `HibfixVertxBridgeProbe.java`, `hibfix-wtcheck.sh`, `hibfix-arms.sh`, `hibfix-jitab.sh`, `hibfix-seqrace.sh`, `HibfixThreadIdentityProbe.java`
 - `jit/src/lambda_adapter.rs` — the `AdapterKey` of §5.4 and its `site_shape_collisions` counter
-- `fixed-suite-bugs/hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md` §8
-- `fixed-suite-bugs/hibernate/batchtest-mysql-jdbc-batching-NOT-A-VM-DEFECT-20260822.md` — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
+- `hib-reactive-3gc-run-regressions-FIXED-20260824.md` §8
+- `batchtest-mysql-jdbc-batching-NOT-A-VM-DEFECT-20260822.md` — the same "trivial JDK primitive served by a native" shape, and the same conclusion that the funnel's aggregate is small
 
 ---
 
 ## 8. 2026-08-24 — the `invokedynamic` bridge does NOT retire this class (checked, negative)
 
 Recorded because the obvious question after
-`fixed-suite-bugs/jit/techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`
+`techempower-wrong-answer-was-the-indy-trap-FIXED-20260824.md`
 is whether the same merge helps here. `TechEmpowerTest` was retired by
 `730d3e0d9` (compiled code can now EXECUTE an `invokedynamic`), and this class
 sits in the same reactive-dispatch cost family, so it is a reasonable thing to

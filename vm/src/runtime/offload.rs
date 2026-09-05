@@ -2208,7 +2208,7 @@ mod tests {
     // (`ensure_completion_reaper_started` + the host callback calling
     // `enqueue_completion`) needs a live CUDA context to reach its
     // success path at all and is validated on GPU hardware instead
-    // (see `fixed-suite-bugs/gpu-offload-followups-20260711.md`).
+    // (see `gpu-offload-followups-20260711.md`).
 
     #[test]
     fn reaper_finalizes_submission_without_any_poll_call() {

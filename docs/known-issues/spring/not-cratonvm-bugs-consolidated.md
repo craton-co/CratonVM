@@ -20,17 +20,17 @@ classpath dumps, via `run-suite.sh hotspot --list <88-class-list>`.
 ## The other 87 classes
 All 87 remaining common-FAIL classes pass cleanly on stock HotSpot 25 — they
 are genuine CratonVM-specific divergences, tracked in:
-* `fixed-suite-bugs/spring/bug-spring-concurrenthashmap-entrysetview-removeif-npe-20260819-FIXED-20260820.md`
+* `bug-spring-concurrenthashmap-entrysetview-removeif-npe-20260819-FIXED-20260820.md`
   — the `ConcurrentHashMap.entrySet().removeIf()` NPE. **FIXED 2026-08-20**; a
   re-run of the same 90 classes scores 88 OK, the two exceptions being the class
   in the table above and the AOT/Mockito throughput wall
   (`BeanRegistrationsAotContributionTests`).
-* `fixed-suite-bugs/spring/bug-spring-remaining-fail-clusters-20260819-FIXED-20260820.md`
+* `bug-spring-remaining-fail-clusters-20260819-FIXED-20260820.md`
   — the remaining singleton/small-cluster classes. **FIXED 2026-08-20**: an
   immutable-collection serialization defect, a `MethodHandles.collectArguments`
   adapter that reported the wrong type, and a JIT operand-spill miscompile
   between them account for every one.
-* `fixed-suite-bugs/spring/bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`
+* `bug-spring-methodhandle-asspreader-groovy-invocation-cluster-20260819-FIXED-20260820.md`
   — ~11 more classes, `MethodHandle.asSpreader`, confirmed **already fixed**
   on `dev` before this HotSpot baseline was even run (so they no longer
   appear in a fresh CratonVM rerun — not counted as "not a CratonVM bug",

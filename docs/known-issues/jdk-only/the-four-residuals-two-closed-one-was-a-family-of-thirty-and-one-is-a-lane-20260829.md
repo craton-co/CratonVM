@@ -195,7 +195,7 @@ once: the DoD predicate holds and the object model is violated.
 
 ### The FFM half has its own page, written the same day
 
-`fixed-suite-bugs/jdk-only/arena-and-memorysegment-hand-out-an-interface-FIXED-20260901.md`
+`arena-and-memorysegment-hand-out-an-interface-FIXED-20260901.md`
 landed on `dev` while this lane was measuring, and it is the deeper treatment of
 the FFM family: 59 rows, every `Arena` factory and every segment producer, and
 the consequence this page did not have — `jdk.incubator.vector`'s

@@ -10952,7 +10952,7 @@ fn tpe_time_unit_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<Obje
 /// just for direct `new ThreadPoolExecutor(...)` calls.
 /// Falls back to the old two-slot legacy write if queue/unit construction
 /// fails, so callers never see a fully-uninitialized object.
-/// See fixed-suite-bugs/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md.
+/// See ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md.
 pub(crate) fn initialize_real_thread_pool_executor(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -11038,7 +11038,7 @@ pub(crate) fn initialize_real_thread_pool_executor(
     // would read as an all-zero header on first use (AbstractMethodError /
     // stale-pointer livelock under java/util/concurrent/ExecutorService
     // dispatch; see
-    // fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md,
+    // hib-misc-residuals-20260716-FIXED.md,
     // ZonedDateTimeTest/LocalDateTimeTest). Always hand back the CURRENT
     // address so every caller (both the <init> dispatch, which ignores this
     // for void methods, and the factory shims, which do not) sees the live
@@ -11504,7 +11504,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // newFixedThreadPool()/newCachedThreadPool()/newSingleThreadExecutor()
     // never return an STPE. Because register_executors_scheduled_natives
     // (native_stpe_*) is gated off in real-JDK mode (see
-    // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md),
+    // 11-stpe-mainlock-npe-teardown-regression.md),
     // no native shadowed these mistagged objects' methods, so real inherited
     // ScheduledThreadPoolExecutor/ThreadPoolExecutor bytecode ran against a
     // 2-field synthetic object whose ctl/workQueue/mainLock/workers fields
@@ -11531,7 +11531,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // ScheduledThreadPoolExecutor construction) — these objects are now
     // genuinely real, so the drop_real_layout_synthetic assumption holds and
     // real submit/execute/shutdown/shutdownNow bytecode runs end-to-end.
-    // See fixed-suite-bugs/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md.
+    // See ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md.
     r.register(
         ex,
         "newFixedThreadPool",
@@ -13825,7 +13825,7 @@ fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
     // `javax.net.SocketFactory.createSocket()` (this native, used
     // unconditionally regardless of CRATONVM_REAL_NET_SOCKETS) feeding a real
     // `Socket.connect()` call, e.g. UnboundID LDAP SDK's `ConnectThread`
-    // (see jndirealmintegration-ldap-connection-npe.md). Reuse the same
+    // (see jndirealmintegration-ldap-connection-npe-FIXED.md). Reuse the same
     // GC-safe helper `net_phase_e::re1_init_socket_locks` already used by the
     // synthetic `Socket.<init>`/`ServerSocket.accept()` paths, rather than
     // duplicating its pin-across-allocation logic here.
@@ -17668,7 +17668,7 @@ fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallRe
             // instead of the catchable `OutOfMemoryError` HotSpot throws. Use
             // the fallible `try_new_array` (same `try_new_ref_array`/
             // `try_alloc_array_full` idiom as the `ArrayList(int)` abend fix,
-            // see `gaps/crash-01-arraylist-capacity-oom-abend.md`)
+            // see `crash-01-arraylist-capacity-oom-abend.md`)
             // and throw a catchable OOME on `None` instead.
             let Some(arr) = ctx.try_new_array(cratonvm_types::ArrayElementType::Byte, bytes.len())
             else {
@@ -20142,7 +20142,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 let client = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 5)?;
                 // Seed socketLock/closeLock -- this bare allocation skips real
                 // `Socket.<init>`; see net_phase_e::re1_init_socket_locks doc
-                // comment and jndirealmintegration-ldap-connection-npe.md.
+                // comment and jndirealmintegration-ldap-connection-npe-FIXED.md.
                 let client = crate::net_phase_e::re1_init_socket_locks(ctx, client)?;
                 // Get peer address from the stream
                 let (peer_host, peer_port) = {
@@ -22309,7 +22309,7 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // a hardcoded `"INFO: \n"` regardless of the record's actual level or
     // message -- misdiagnosed for a time as a VM interpreter/JIT
     // correctness bug (see the retraction in
-    // fixed-suite-bugs/springboot/exception-table-method-state-loss-cluster.md)
+    // exception-table-method-state-loss-cluster.md)
     // before this stale stub was found. Real `Formatter`/`SimpleFormatter`
     // bytecode verified working directly for the message/level path (via
     // `Formatter.formatMessage`, already natively bridged further down in
@@ -24479,7 +24479,7 @@ fn native_arrays_support_vectorized_mismatch(
 // T2.3 completion — items 2/3/6/8/12 of the java.util.* roadmap.
 // ===========================================================================
 //
-// Scope per `history/roadmap-100.md`:
+// Scope per `roadmap-100.md`:
 //   T2.3.2 — `ConcurrentHashMap.tabAt` / `casTabAt` / `setTabAt`
 //   T2.3.3 — `ArrayList.elementData(int)` package-private accessor
 //   T2.3.6 — `Arrays.parallelSort` for `[I`, `[J`, `[D`, `[Ljava/lang/Object;`

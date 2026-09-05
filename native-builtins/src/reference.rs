@@ -62,7 +62,7 @@ use crate::{REF_FIELD_NEXT, REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, 
 /// later `WeakHashMap.get()` walks forever. See the matching fix in
 /// `vm/src/runtime/interpreter.rs`'s `gc_reference_next_slot` (the GC's own
 /// auto-enqueue path must agree with this one) and
-/// fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
+/// thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
 fn ref_next_slot(ctx: &mut dyn NativeContext, ref_obj: cratonvm_types::ObjectRef) -> usize {
     if ctx.object_num_fields(ref_obj) <= REF_FIELD_NEXT {
         return REF_FIELD_REFERENT; // legacy synthetic 2-field shape
@@ -189,7 +189,7 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
     // `LatentKey.equals(WeakKey)` (or the reverse) never actually reaches
     // Mockito's own bytecode. Confirmed via `Mockito.verify(mock)` throwing
     // `NotAMockException` for a mock created and used successfully moments
-    // earlier (`fixed-suite-bugs/springboot/servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md`
+    // earlier (`servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md`
     // — note that doc's own conclusion: these bridges are a correct fix for a
     // real dispatch defect, but the `NotAMockException` they were first written
     // for had a second, independent cause in `Method.invoke`).

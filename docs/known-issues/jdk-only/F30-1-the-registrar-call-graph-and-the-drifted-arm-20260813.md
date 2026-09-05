@@ -92,15 +92,16 @@ symmetric, and that asymmetry is the whole trap.
 | 1 | real-JDK (incl. `--jdk-only`) | **on** | **real-JDK arm A** — the `else` of `if config.use_synthetic_jdk` | L2001–L2608 | 49 |
 | 2 | real-JDK (incl. `--jdk-only`) | off | **real-JDK arm B** — the `#[cfg(not(feature = "synthetic-jdk"))]` block | L2613–L3276 | 49 |
 | 3 | synthetic-JDK | **on** | **synthetic arm** | L1932–L2000 | 4 |
-| 4 | synthetic-JDK *requested* | off | **real-JDK arm B again** | L2613–L3276 | 49 |
+| 4 | synthetic-JDK *requested* | off | **real-JDK arm B again**, minus the real-layout drop (§9) | L2613–L3276 | 49 |
 
 Facts that make this table non-obvious, each verified in source:
 
 * **Configuration 4 exists and is reachable.** The
-  `#[cfg(not(feature = "synthetic-jdk"))]` block never reads
-  `config.use_synthetic_jdk` (zero non-comment occurrences in L2613–L3276). A
-  feature-off build asked for synthetic mode therefore gets the *real-JDK*
-  registrar set, not an empty registry. `config::require_synthetic_jdk()`
+  `#[cfg(not(feature = "synthetic-jdk"))]` block reads `config.use_synthetic_jdk`
+  in exactly **one** place — since 2026-09-05; it was zero when this record was
+  written, and §9 is what changed and why. Every `register_*` pass in the block
+  is still unconditional, so a feature-off build asked for synthetic mode still
+  gets the *real-JDK* registrar set, not an empty registry. `config::require_synthetic_jdk()`
   rejects that pairing — but its only callers are `libcratonvm/src/lib.rs:479`
   and the CLI, **not** `SharedVm::new`. And `VmConfig::default()`'s JDK mode is
   `EMBEDDED_DEFAULT_JDK_MODE = JdkMode::Synthetic` (`vm/src/config.rs:225`), so
@@ -332,7 +333,7 @@ there.
 | `only_the_synthetic_mode_arm_reaches_register_builtins` | synthetic arm opens with `register_builtins`; neither real arm calls `register_builtins` or `register_synthetic_overrides`; the synthetic arm does not re-run essentials afterwards | any real-JDK arm gains the synthetic-override family; the synthetic arm stops opening with it |
 | `last_write_wins_ordering_holds_inside_both_real_jdk_arms` | 8 ordering pairs, each carrying its incident in the failure message: essentials→io, concurrent→forkjoin, collections→securerandom, collections→properties, and nio_file→file→jar→bulk→zip-output | any of those pairs is inverted, or either member is deleted |
 | `the_synthetic_jdk_feature_still_implies_management` | `vm/Cargo.toml`'s `synthetic-jdk` list contains `"management"` | the implication arm A's ungated JMX calls depend on is dropped |
-| `the_feature_off_arm_never_consults_the_runtime_jdk_mode` | zero non-comment `use_synthetic_jdk` occurrences inside the `cfg(not(synthetic-jdk))` block | someone adds a fourth registration path, invalidating row 4 of §1 |
+| `the_feature_off_arm_consults_the_runtime_jdk_mode_only_for_the_layout_drop` | **exactly one** non-comment `use_synthetic_jdk` occurrence inside the `cfg(not(synthetic-jdk))` block, **and** it is the three-line `if !config.use_synthetic_jdk { native_methods.set_drop_real_layout_synthetic(true); }` (matched line for line) | someone adds a second branch — i.e. a fourth registration path, invalidating row 4 of §1 — or moves the branch onto something other than the layout drop |
 
 Arm location itself is guarded: the three anchors must each match exactly once
 (`if config.use_synthetic_jdk {`, `#[cfg(not(feature = "synthetic-jdk"))]`) or
@@ -445,3 +446,106 @@ deletion must remove **both**.
   only call site is inside `register_synthetic_overrides`?** That is a
   `native-builtins` census, out of this lane's file scope, and it is the highest
   value follow-on from this record.
+
+---
+
+## 9. 2026-09-05 — configuration 4 gets one runtime branch, and why it had to
+
+§1 row 4 is not a curiosity: it is the configuration every in-tree test and
+every embedder that writes `Vm::new(VmConfig::new())` actually runs. This
+record said so on 2026-08-13 and stopped there. What it did not say is what
+that configuration can and cannot *do*, and the answer turned out to be: it
+could not evaluate `"abcdef".length()`.
+
+**The mechanism, in three facts that are each individually reasonable.**
+
+1. `VmConfig::default()` is `JdkMode::Synthetic`, so `SharedVm::new` skips
+   boot-classpath discovery. `java/lang/String` is a VM-minted carrier
+   declaring five methods, with no `Code` attribute anywhere.
+2. `register_builtins` / `register_synthetic_overrides` — the ~5,200 stubs that
+   *are* the synthetic class library — are `#[cfg(feature = "synthetic-jdk")]`,
+   so in a feature-off build they do not exist to be called;
+   `vm/src/native/builtins.rs` supplies no-op stubs. §1 already notes this.
+3. Arm B opened with `native_methods.set_drop_real_layout_synthetic(true)`,
+   unconditionally. `NativeMethodRegistry::register` then drops every
+   `java/lang/String` `Bridge` — the policy
+   `vm/tests/wp8_10_9_string_contains_native.rs` documents, and a correct one
+   whenever there is real bytecode behind it.
+
+Together: no bytecode (fact 1), no synthetic override (fact 2), and the
+essential bridge dropped (fact 3). `String.length()` / `isEmpty()` / `charAt()`
+/ `equals()` resolved nowhere and raised `NoSuchMethodError`; `hashCode()`
+survived only by falling through to `Object`. Fact 3 is the one that can be
+corrected without resurrecting compiled-out code, and it is the one answering
+the wrong question: the drop exists because *"a fake 5-field layout corrupts the
+real 7-field object"*, which presupposes a real object. In configuration 4 there
+is none to protect, and the drop is pure loss.
+
+**The change.** Arm B now reads
+
+```rust
+if !config.use_synthetic_jdk {
+    native_methods.set_drop_real_layout_synthetic(true);
+}
+```
+
+That is the arm's only runtime-mode branch, and the §5.1 gate row pins both
+halves of it: exactly one occurrence, and that occurrence being these three
+lines. No registration pass became conditional, so §3's arm-parity census and
+`the_two_real_jdk_arms_run_the_same_registrars_in_the_same_order` are untouched
+— what they compare is call sequences, and configurations 2 and 4 still run the
+same one.
+
+**One registrar moved with it.**
+`service_loader::register_service_loader_natives`' body was
+`#[cfg(feature = "synthetic-jdk")]` for the same "real-JDK mode should run the
+real bytecode" reason, and had the same hole: configuration 4 has no
+`java/util/ServiceLoader` bytecode either, so `ServiceLoader.load(Driver.class)`
+raised `NoSuchMethodError` with nothing behind it to raise it for. It now reads
+`NativeMethodRegistry::drops_real_layout_synthetic()`, whose own doc comment
+already said a `#[cfg]` guard "is NOT equivalent and must not be used for this".
+`vm_init` sets that flag before every caller of the registrar — arm A at the top
+of its real-JDK `else`, arm B immediately before
+`register_essential_natives_with_shims`, which is what reaches
+`jdbc::register_jdbc_service_loader`, the second caller the gate lives inside the
+function for.
+
+**Witnesses.**
+`vm/tests/wp7_2_jdbc_core_types_reachable.rs::connection_methods_carry_signatures`
+(the `String.length()` half) and
+`vm/tests/wp1_8_real_jar_serviceloader.rs::driver_discovered_from_jar_on_classpath`
+(the ServiceLoader half). Both were red on `dev` before this change and green
+after; both are green under `--features synthetic-jdk` on either side of it,
+which is what identified the defect as configuration-4-only rather than as a
+JDBC or class-loading defect.
+
+**Two lanes reached this from opposite ends on the same day, and both fixes are
+wanted.** `80700c259` / `6bcb9989f` reached the same diagnosis — a default build
+boots a shim class library, `"abc".length()` fails in it, and
+`resultSet_next_is_boolean` "PASSED in that same build, for the sole reason that
+it never calls `String.length()`" — and answered it by *skipping* those probes
+when `config::SYNTHETIC_JDK_COMPILED_IN` is false, so a default build stops
+reporting a shim measurement as a VM measurement. That is right about those
+probes and does not overlap with this change: past `String.length()` what they
+exercise really is a shim, and no registration fix makes the other ~5,200 stubs
+appear in a binary that did not compile them.
+
+It does mean the two witnesses above now skip in a default build, so this fix
+keeps its own, which does not depend on the shim being complete:
+`vm/tests/embedded_default_essential_surface.rs` runs `"abcdef".length()`,
+`isEmpty()`, `charAt(2)`, `substring(3).length()` and
+`ServiceLoader.load(Driver.class)` through the interpreter on a checked-in
+fixture. Paired control, taken by reverting both hunks on the merged tree and
+rebuilding: 2/2 fail with `java/lang/NoSuchMethodError`, 2/2 pass with them
+restored. `charAt` and `substring` are in it because a fix that restored only
+`length()` would be the wrong fix passing the test.
+
+**Three places that were asking about a mode they were not in**, all now saying
+which mode they mean instead of inheriting it from the build:
+`wp8_10_9_string_contains_native.rs` booted `VmConfig::default()` and called the
+result "a real-JDK registry" — it now boots `JdkMode::Real`, and skips loudly
+when no JDK image is reachable rather than asserting nothing in silence;
+`wp7_1_jdbc_driver_loader.rs::jdbc_driver_natives_export_service_loader` and
+`jdbc.rs`'s two `service_loader_*` unit tests used bare registries with one
+`#[cfg]` polarity each, and are now one pair compiled in both builds, each
+setting the flag it is about.

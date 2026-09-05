@@ -21,7 +21,7 @@
 //! deliberately allocate to the ceiling and recover. Two members of this family
 //! were already fixed one call site at a time by threading the fallible
 //! `try_new_array` / `try_new_ref_array` allocators through the offending
-//! native (`gaps/crash-01-arraylist-capacity-oom-abend.md`,
+//! native (`crash-01-arraylist-capacity-oom-abend.md`,
 //! `crash-02-native-capacity-ctor-abort-family.md`); `ByteBuffer.allocate` —
 //! the H2 `TestOutOfMemory` abort — was the third. There are ~1000
 //! `ctx.new_array(..)` call sites, so converting them one by one does not

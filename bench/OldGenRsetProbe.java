@@ -21,7 +21,7 @@
  * program. They are pure functions of the arguments, so any arm that prints
  * different numbers did different work.
  *
- * Suggested arms (see performance/gen-gc-minor-pause-20260902.md):
+ * Suggested arms (see gen-gc-minor-pause-20260902.md):
  *   CRATONVM_DBG=gc-stats,gcpause ... -XX:+UseGenerationalGC -Xmx1g \
  *       -c . OldGenRsetProbe 19 700 16
  */

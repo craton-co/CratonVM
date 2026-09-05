@@ -47,7 +47,7 @@
 //! So: any report, dashboard or doc claiming CratonVM does NUMA-aware
 //! placement is wrong. The topology probe is real and correct; the placement
 //! it would inform does not exist. See
-//! `arch-2026-07-26/refs-metaspace-unloading.md` for what wiring
+//! `refs-metaspace-unloading.md` for what wiring
 //! it would take.
 
 use std::collections::HashMap;

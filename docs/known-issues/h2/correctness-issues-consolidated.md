@@ -73,9 +73,9 @@ Continued on the Azure host (`dev` tip, fresh release build,
 | class | result | verdict |
 |---|---|---|
 | `org.h2.test.store.TestRandomMapOps` | FAIL, 108s, `ClassCastException` | **new correctness finding — see above, not yet root-caused** |
-| `org.h2.test.db.TestOpenClose` | FAIL, 2:04, `OutOfMemoryError` | **superseded 2026-08-29** — the OOM is gone with the ZGC fragmentation repairs; what remains is `Exception in thread "main" java/lang/Object` with no captured frames, split out to `fixed-suite-bugs/h2-suite-bugs/bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md` |
+| `org.h2.test.db.TestOpenClose` | FAIL, 2:04, `OutOfMemoryError` | **superseded 2026-08-29** — the OOM is gone with the ZGC fragmentation repairs; what remains is `Exception in thread "main" java/lang/Object` with no captured frames, split out to `bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md` |
 | `org.h2.test.store.TestMVStoreCachePerformance` | FAIL, 5:55, `OutOfMemoryError` | **superseded 2026-08-29** — no OOM and no arena failure at all now; what remains is a WRONG RECEIVER (`NoSuchMethodError` for `Page.isPersistent()` against a `Page$PageReference`), split out to `bug-h2-testmvstorecacheperformance-pagereference-receiver-20260829.md` |
-| `org.h2.test.store.TestMVStoreTool` | FAIL, 1:33, `OutOfMemoryError` | the ZGC fragmentation defect, four repairs on 2026-08-29 — see `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` |
+| `org.h2.test.store.TestMVStoreTool` | FAIL, 1:33, `OutOfMemoryError` | the ZGC fragmentation defect, four repairs on 2026-08-29 — see `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` |
 
 The rest of the 28 either passed outright (several recovering fully since
 the original rerun — `TestLIRSMemoryConsumption`, `TestDiskFull`,
@@ -93,7 +93,7 @@ result.
   and §3 (not-CratonVM, HotSpot fails too).
 - `hangs-true-vs-perfcliff-RESOLVED-20260821.md` — the resolved triage: of
   the ten classes that still capped, zero are deadlocked or blocked.
-- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the root cause behind three of this doc's four "new" FAILs, retired
   2026-08-29. Two of those three turned out to have a SECOND failure underneath
   the OOM, and each has its own page now.

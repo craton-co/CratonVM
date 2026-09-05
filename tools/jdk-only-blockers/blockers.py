@@ -6,7 +6,7 @@
     target/jdk-only-audit/jdk-<feature>-missing-natives.json
     target/jdk-only-audit/jdk-<feature>-synthetic-dependencies.json
 
-`audits/jdk-only-audit.md` section 6 requires these two files per supported JDK
+`jdk-only-audit.md` section 6 requires these two files per supported JDK
 image, because no static source review can produce an exhaustive missing-method
 list across JDK versions: native surfaces and class-library internals vary by
 image, so the list is *generated per image* and is only valid for that image.

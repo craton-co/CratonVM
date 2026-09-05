@@ -4680,7 +4680,7 @@ pub(crate) fn standard_socket_option(
 /// `channel.supportedOptions().contains(TCP_NODELAY)` before setting it —
 /// does NOT catch it: the `AbstractMethodError` propagates uncaught out of
 /// the calling thread, silently killing it. See
-/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
+/// spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #3 — this silently killed HttpClient5's I/O reactor worker
 /// thread mid-connection-setup, before it ever reached `SocketChannel
 /// .connect()`, hanging every request through
@@ -5017,7 +5017,7 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// `AnnotatedConnectException: finishConnect: Connection refused: /[0:0:0:0:0:0:0:1]:P`
 /// against a `serverLocal=/0.0.0.0:P`, on a run where HotSpot binds `[::]` and
 /// connects. Full record:
-/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+/// `ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
 ///
 /// `FAMILY_INET` — an explicit `ServerSocketChannel.open(StandardProtocolFamily.INET)`
 /// — keeps the v4 wildcard, because that channel IS AF_INET on HotSpot.
@@ -7008,8 +7008,7 @@ mod tests {
 
     /// Regression guard for the Jetty `givenAnInflightRequestWhenTheServerIs
     /// StoppedThenGracefulShutdownCallbackIsCalledWithRequestsActive` hang
-    /// (`jetty-webserver-factory-poststartup-timeout-and-reflective-
-    /// supertype-residuals.md`): `AbstractReactiveWebServerFactoryTests`
+    /// (`jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals-FIXED.md`): `AbstractReactiveWebServerFactoryTests`
     /// builds its client target via `new InetSocketAddress(port)`, which
     /// produces a wildcard host. Connecting to that host verbatim throws
     /// WSAEADDRNOTAVAIL on Windows instead of reaching the server, leaving

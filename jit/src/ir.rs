@@ -7619,7 +7619,7 @@ impl IrBuilder {
                 // `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap
                 // events measured on 2026-08-03 — 69% of every opcode
                 // `IrBuilder::build` had no arm for at all
-                // (`feature-designs/c2/ir-coverage-survey-20260803.md`).
+                // (`ir-coverage-survey-20260803.md`).
                 //
                 // A resolved `int` / `float` constant is a constant node and
                 // nothing else — no memory edge, no safepoint, no GC

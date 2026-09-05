@@ -53,7 +53,7 @@ const CODER_UTF16: i32 = 1;
 //     allocation path in the VM (every `StringBuilder.toString`, `substring`,
 //     `concat`, regex group and boxed number reaches it) and the existing
 //     indices are demonstrably correct, so the change would add risk without
-//     removing a defect. See `audits/jdk-only-object-layout-audit.md`.
+//     removing a defect. See `jdk-only-object-layout-audit.md`.
 
 /// Create a Java String object from a Rust `&str`.
 ///

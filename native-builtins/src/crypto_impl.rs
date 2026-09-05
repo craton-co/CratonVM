@@ -2243,7 +2243,7 @@ pub struct RsaPrivateKey {
     // `route_rsa_to_real` path) as `sun.security.rsa.RSAPrivateKeyImpl`
     // (non-CRT), whose `getEncoded()` is an incomplete 572-byte PKCS#8 that
     // rustls rejects (`failed to parse private key as RSA`). See
-    // fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md.
+    // http-server-sslengine-identity-singleton-clobber-FIXED.md.
     // Convention: `p > q`, matching JDK's `RSAKeyPairGenerator`.
     pub p: Option<BigUint>,
     pub q: Option<BigUint>,
@@ -2750,7 +2750,7 @@ impl Rsa {
     /// (`route_rsa_to_real`) came back as `sun.security.rsa.RSAPrivateKeyImpl`
     /// (non-CRT), whose `getEncoded()` is the incomplete 572-byte PKCS#8 that
     /// broke TLS server identities built from generated keys. See
-    /// fixed-suite-bugs/http-server-sslengine-identity-singleton-clobber-FIXED.md.
+    /// http-server-sslengine-identity-singleton-clobber-FIXED.md.
     pub fn private_key_to_der(key: &RsaPrivateKey) -> Vec<u8> {
         let n_bytes = key.n.to_bytes_be();
         let d_bytes = key.d.to_bytes_be();

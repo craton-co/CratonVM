@@ -13,7 +13,7 @@
 //! garbage pays a full-heap trace per collection.
 //!
 //! The full Spring Boot suite comparison recorded in
-//! `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md` (same binary, only
+//! `zgc-real-fullsuite-regression-RETIRED-20260807.md` (same binary, only
 //! `-XX:+UseZGC` toggled) regressed 46 classes, 35 of them PASS → HANG, and the
 //! regressions cluster on `*AutoConfigurationTests` — the shape that builds and
 //! tears down many Spring `ApplicationContext`s in a loop, i.e. the most

@@ -996,7 +996,7 @@ pub(crate) fn bi_mod_pow_str_opt(base: &str, exp: &str, m: &str) -> Option<Strin
     // `bi_mul_unsigned` (schoolbook decimal) plus one `bi_mod_unsigned`
     // (decimal long division) per exponent bit. For RSA-2048 that is ~2400
     // modular operations on 617-digit numbers, and it is what
-    // `gaps/biginteger-limb-rewrite-scope.md` identified in May as the ~100x
+    // `biginteger-limb-rewrite-scope.md` identified in May as the ~100x
     // constant-factor loss blocking every crypto-heavy suite.
     //
     // `BigInt` (step 1 of that rewrite) has carried a Montgomery `modpow` and

@@ -2310,6 +2310,286 @@ That, and the 2:1 instruction count against a tier that unrolls, is what the
 
 Both switches stay OFF pending that.
 
+#### The single-use intermediates, and the frame states that pin them
+
+The previous section ended by naming what the optimizing tier's loop still
+spends its frame traffic on: pairs of the shape
+
+```text
+mov [rbp-0C0h],rax      ; store the result of an Add
+mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+```
+
+`plan_register_residency` skips every one of these (`single_use` in its census)
+and is right to — their live range is one instruction, so they do not want a
+register, they want not to be written to memory. `CRATONVM_JIT_IR_CARRY_SINGLE_USE`
+is `fused_cmp`'s move generalised to them: when a value has exactly one use and
+its consumer is the very next node in the same block, it stays in the register
+the arm computed it in. RAX when the consumer reads it first, RCX when it reads
+it second — one register move that still removes a memory access.
+
+Neither half of the contract is trusted. The read refuses unless it is the
+planned consumer asking for the planned register, and — for an RAX carry —
+unless `buf.pos()` proves nothing was emitted in between, which is a proof
+rather than an audit of what the arms do. A carry that outlives its consumer,
+or reaches a block boundary or a terminator, refuses too. Both allowlists have
+source-scanning tests that check them against the arms they name.
+
+**The first cut planned ZERO carries, and why is the more useful half of this
+section.** The screen was `deopt_named`, and the IR graph says every candidate
+fails it:
+
+```text
+20: Mul : Int <- [13, 19]  bci=Some(16)
+safepoint[12] bci=17 locals=[3, 12, -, 13, 14] stack=[20]
+safepoint[15] bci=22 locals=[3, 12, -, 13, 14] stack=[20, 22]
+safepoint[16] bci=23 locals=[3, 12, -, 13, 14] stack=[23]
+```
+
+`graph.safepoints` records the **full operand stack at every bci**, so an
+intermediate is named by a frame state from its definition until its consumer
+pops it. That is the same wall the residency file hit — its `blocked_deopt`
+census — reached from a different direction.
+
+And it is worth reading beside what the door reports for this very method:
+`sentinel_free=true`, which is `deopt_stub_patches.is_empty() &&
+call_exc_patches.is_empty()` — **this body emits no deopt stub at all**.
+Thirty-three frame states, not one of them reachable from inside the code, and
+they are what pins every intermediate to memory.
+
+So the change splits in two, and the split is the point. Eliding the LOAD asks
+nothing of the frame: the home word is still written, every frame state still
+resolves through it, and a read of a word RAX already holds becomes no
+instruction. Dropping the STORE keeps the `deopt_named` screen. On this kernel
+that is `planned=4 ... stores_dropped=0 still_deopt_named=4`.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| **+ carry alone** | 57 | 27 | 13 | 14 |
+| + the residency stack | 56 | 19 | 9 | 10 |
+| **+ both** | 55 | **15** | **5** | 10 |
+
+Four carries, four loads gone, `refused=0`, and `ck=5100017428506113` — HotSpot's
+answer — in all four arms.
+
+**And this one is unambiguous on the clock.** Five interleaved arms at
+`n=200,000,000`, nine rounds, host load ~10–12 on 8 cores, single-pass run twice
+as its own control:
+
+| arm | mean ms |
+|---|---|
+| single-pass OSR | 385.7 |
+| single-pass OSR (control) | 385.4 |
+| optimizing door, switches off | 657.4 |
+| **+ carry alone** | **592.4** |
+| **+ carry + the residency stack** | **557.9** |
+
+The control-vs-control floor is **0.08%** — the quietest measurement this file
+has recorded. The carry alone is **9.9%** and beats the door arm in **9 of 9**
+rounds; with the residency stack it is **15.1%**, also 9 of 9. The tier
+inversion goes **1.70x to 1.45x**.
+
+That also revises the previous section's conclusion, in the direction of the
+evidence rather than away from it. Frame stores alone did not explain the gap —
+39% of them bought 6.7%. But frame *round trips on the critical path* do: these
+four loads are each one instruction's distance from the store that fed them, so
+every one is a store-forwarding stall in the middle of a serial recurrence, and
+removing four of them is worth more than removing twelve stores that nothing
+was waiting on.
+
+**What the remaining ten stores are, and the exact rule that would remove
+them.** They are home writes for values named only by frame states no deopt can
+reach. The precise condition is not "no safepoint names it" but *no safepoint
+that names it sits where a deopt can actually be taken* — which is the union of
+
+* **trap bcis**: `Op::Guard`, the `Op::Div`/`Op::Rem` zero guard, calls,
+  allocations, array and field access, `checkcast`, the monitor ops;
+* **safepoint-poll bcis**: the back-edge terminators, where the runtime can
+  transfer a frame out from under the compiled body.
+
+For `OsrTierBench.kernel` the first set is empty and the second is the single
+`If` at bci 10, whose stack is `[14, 3]` — a phi and a parameter, neither of
+them an intermediate. All four carried values would become droppable.
+
+It is a separate change because it removes a backstop rather than adding one.
+`build_deopt_points` currently builds a point for **every** safepoint with a
+native anchor, so a dropped home is caught there today by `frame_value_of`
+refusing the compile. Making these values droppable means also not building the
+unreachable points — at which point the trap/poll classification above is
+load-bearing rather than backstopped, and it deserves its own pass.
+
+#### The loop was computing its own return value, every iteration
+
+Reading the whole emitted loop rather than only its frame operations found
+something bigger than either of the previous two sections was chasing:
+
+```text
+27  mov rax,rbx          ; sum
+28  mov ecx,0F4243h      ; 1000003
+29  imul rax,rcx         ; sum * 1000003L
+30  mov [rbp-0E8h],rax
+31  mov rax,[rbp-80h]
+32  movsxd rax,eax       ; (long) acc
+33  mov [rbp-0F0h],rax
+34  mov rcx,rax
+35  mov rax,[rbp-0E8h]
+36  add rax,rcx
+37  mov [rbp-0F8h],rax
+```
+
+That is `return sum * 1000003L + acc` — the method's **exit expression** —
+computed and discarded on every one of two hundred million iterations. Eleven
+of the loop's fifty-five instructions and three of its fifteen frame
+operations.
+
+**`ir_schedule`'s own header says a data node is "placed as late as possible
+(to minimize register pressure)". It is not.** `find_best_block` picks the
+deepest block that all of a node's INPUTS dominate, which is schedule-EARLY. For
+a value whose inputs are a loop phi and a constant, that is inside the loop —
+whatever its uses do.
+
+`CRATONVM_JIT_IR_SINK_LATE` moves a pure node to the shallowest loop nesting on
+the dominator path between where its inputs put it and where its uses need it,
+and **only when the depth strictly decreases**. The classic schedule-late also
+prefers the latest block at equal depth, to shorten live ranges; that is a
+different trade with a different risk, and leaving it out keeps this pass's
+effect attributable to the one thing it claims.
+
+The obligation it discharges is the safepoint one. A frame state resolves a
+value it names from that value's HOME WORD, and the home is written wherever
+the node is emitted — so a moved node must still dominate every block that can
+anchor a safepoint naming it. That is checked against the final placement, and a
+violation reverts the **whole method** rather than the offending node: reverting
+one node can break another's dominance, so undoing the lot is the only revert
+that is obviously correct.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| **+ sink alone** | 50 | 25 | 14 | 11 |
+| + carry + the residency stack | 55 | 15 | 5 | 10 |
+| **+ all three** | **44** | **10** | **3** | **7** |
+
+`moved=3 reverted_for_safepoints=0`, and `ck=5100017428506113` — HotSpot's
+answer — in all four arms.
+
+**Priced in CPU time, which is what a contended host leaves usable.** Two
+wall-clock runs at load 23–36 produced control-vs-control floors of 3.7% and
+10.0% — unusable for a magnitude, though the paired counts held (the sink arm
+beat its door arm in 17 of 18 rounds). User CPU over the same five interleaved
+arms, nine rounds:
+
+| arm | user CPU (s) |
+|---|---|
+| single-pass OSR | 0.564 |
+| single-pass OSR (control) | 0.568 |
+| optimizing door, switches off | 0.812 |
+| **+ sink alone** | **0.743** |
+| **+ sink + carry + the residency stack** | **0.621** |
+
+The floor is **0.60%**, and every comparison separates in **9 of 9** rounds:
+the sink alone is **8.5%**, all three together **23.5%**. In CPU time the tier
+inversion is **1.435x → 1.097x** — the optimizing tier is now within ten per
+cent of the single-pass body it was 1.7x behind when this arc started. (The
+wall-clock figures earlier in this file are wall clock; on this host CPU time is
+the instrument that survives the load, and it puts the door arm at 1.435x rather
+than 1.70x. Different instruments, not a correction.)
+
+**Engagement outside the probe is small, and that is the reason it stays OFF.**
+Across forty regression-suite classes and 112 optimizing compiles, exactly
+**one** compile sank anything, with zero reverts. The pass is correct and free
+when it does not fire, but a default-on codegen change wants evidence broader
+than one constructed kernel, and this is a targeted fix for a specific shape:
+a loop whose method computes something after it.
+
+#### The constant operands, and the end of the tier inversion
+
+Every binary arithmetic arm in `ir_lower` reads its second operand through
+`gp_load_value(RCX, ..)` and then works register-to-register. When that operand
+is a constant, `ir_const_imm` turns the read into `mov ecx, imm` — so the
+emitted code carries a whole instruction per constant operand that x86 has an
+addressing form for:
+
+```text
+mov ecx,1Fh  / imul eax,ecx        becomes   imul eax,eax,1Fh
+mov ecx,1    / add eax,ecx         becomes   add eax,1
+mov ecx,0FFh / and rax,rcx         becomes   and rax,0FFh
+```
+
+`CRATONVM_JIT_IR_ALU_IMM` folds it. Nine arms, three encoders: the accumulator
+short form for ADD/SUB/AND/OR/XOR (one column of the opcode map, so one helper),
+`IMUL r, r/m, imm32`, and `C1 /digit ib` for the shifts.
+
+**Unlike everything else in this arc it is not shaped like a loop.** The
+residency work, the carry and the sink each need a particular structure to fire
+— a loop-carried value, an adjacent single-use consumer, work that outlives its
+loop. This is every `x + 1`, `x & 0xFF` and `x * 31` in every compiled method.
+
+Two details are load-bearing. The shift count is masked **here**, to 5 bits for
+`ishl`/`ishr`/`iushr` and 6 for the `l` forms: x86 masks a shift count the same
+way, which is exactly what makes the existing `CL` form correct without a mask,
+and an immediate form that inherited that assumption silently would be a
+coincidence rather than a reason. And a `long` constant outside `i32` falls back
+to the register form, because every immediate form here SIGN-EXTENDS its
+`imm32` — `0xFFFFFFFFL` is the case that separates a correct fallback from a
+truncating one. `probes/AluImmProbe.java` checks both against HotSpot, along
+with negative shift counts and the two's-complement edges; it agrees in all five
+arms, `--nojit` included.
+
+Only the SECOND operand folds, never the first, even for the commutative ops.
+`gp_load_value(RAX, node.inputs[0])` being unconditional is what
+`op_reads_rax_then_rcx` and the carry's RAX contract rest on — and it is what
+keeps this change and the RCX carry disjoint by construction, since a carry to
+RCX is planned only when `inputs[1]` is the carried node, which is never a
+constant.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| + the fold alone | 53 | 31 | 17 | 14 |
+| + everything else | 44 | 10 | 3 | 7 |
+| **+ everything** | **40** | **10** | **3** | **7** |
+
+`alu immediates folded: 5`, and `ck=5100017428506113` in every arm.
+
+**And this is where the arc ends.** User CPU, five interleaved arms, nine
+rounds, single-pass run twice as its own control:
+
+| arm | user CPU (s) |
+|---|---|
+| single-pass OSR | 0.586 |
+| single-pass OSR (control) | 0.583 |
+| optimizing door, switches off | 0.916 |
+| + the fold alone | 0.837 |
+| + everything except the fold | 0.663 |
+| **+ everything** | **0.579** |
+
+The floor is **0.39%**. The fold alone is 8.6% (8 of 9 rounds) and 12.7% on top
+of the rest (9 of 9). Within this run the tier inversion goes **1.566x to
+0.990x** — the optimizing tier now **matches** the single-pass body on this
+kernel, where it started 1.7x behind.
+
+Parity, not a win: 0.990 is inside the spread between the two single-pass arms,
+so the honest statement is that the gap this whole section set out to explain is
+gone rather than reversed. Compare within a run and not across runs — the door
+arm alone measured 0.812 s earlier the same day and 0.916 s here, which is more
+drift than several of the effects being measured.
+
+**What it took, in order of size:** taking work out of the loop that was never
+loop work (the sink, 11 instructions), not spilling values whose live range is
+one instruction (the carry), folding constant operands (this, 5), and only then
+the register residency this section spent three days on. The frame traffic fell
+from 31 operations to 10, and the instruction count from 58 to 40 — and the
+first of those was worth less than the second, which is the opposite of the
+premise the work started from.
+
+**Everything above is still default OFF.** Eleven switches, every one measured
+positive on this kernel, none of them defaulted on — because the engagement
+censuses say what a single kernel cannot: the sink fires on 1 optimizing compile
+in 112 across the regression suite. Defaulting these on wants a measurement on a
+real workload, and that is the next thing this file should record.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

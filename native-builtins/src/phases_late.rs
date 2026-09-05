@@ -3363,7 +3363,7 @@ fn register_p61_handler_error_manager(r: &mut NativeMethodRegistry) {
 /// `FileHandler`'s own real fields) -- a raw slot 0/1/2 convention here
 /// silently corrupts `Handler.manager`/`filter`/`formatter` instead of
 /// storing our own bookkeeping. See
-/// fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
+/// filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
 ///
 /// Split out into its own `pub` function (rather than staying inline in
 /// `register_p61_logging`) because `register_p61_logging` is called only
@@ -3397,7 +3397,7 @@ pub fn register_p61_file_handler(r: &mut NativeMethodRegistry) {
     // real fields) -- a raw slot 0/1/2 convention here silently corrupts
     // `Handler.manager`/`filter`/`formatter` instead of storing our own
     // bookkeeping. See
-    // fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
+    // filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
     let fh = "java/util/logging/FileHandler";
     // Real `java.util.logging.FileHandler()` is entirely config-driven (no
     // args): Spring Boot's `logging-file.properties` lists it in `handlers=`
@@ -5914,8 +5914,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     // Groovy's `ClassInfo.getClassInfo(Class)` (backed by
     // `GroovyClassValueJava7 extends ClassValue`) always got back `null`,
     // producing a `ReflectionCache.getCachedClass` NPE during
-    // `GroovySystem.<clinit>` (see fixed-suite-bugs/springboot/
-    // core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md,
+    // `GroovySystem.<clinit>` (see core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md,
     // Cluster C "Residual 5"). Dispatching to `computeValue` WITHOUT caching
     // was tried and reverted at the time (see the BUG-W doc's "Update") because
     // it didn't fix that doc's own MethodHandle-intrinsics target — but a
@@ -6131,7 +6130,7 @@ pub fn forget_vm_classvalue_cache(vm_identity: usize) {
 /// Generational backend's `metadata_pin` consumer runs only inside the
 /// old-gen BFS, so a young value deferred to `metadata_pin` with no other
 /// GC root is silently reclaimed. See `gc/src/vm_heap.rs`'s doc for the full
-/// writeup and `fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`
+/// writeup and `spb1-springframework-util-investigation-FIXED.md`
 /// for the observed corruption shape this pattern produced elsewhere.
 pub fn gc_scan_classvalue_cache_roots(
     vm_identity: usize,

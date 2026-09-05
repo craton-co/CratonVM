@@ -163,7 +163,7 @@
 //! these are leaf caches that belong at `LockLevel::Scratch`; the interesting
 //! minority are the ones held across a `NativeContext` callback, and those are
 //! the actual latent deadlocks this program should surface. That audit is
-//! tracked in `arch-2026-08-04/architecture-review-a1-a9.md` §A6.
+//! tracked in `architecture-review-a1-a9.md` §A6.
 //!
 //! What this gate does is stop the number growing while that work happens. A
 //! new raw lock fails CI; converting one to an ordered wrapper requires

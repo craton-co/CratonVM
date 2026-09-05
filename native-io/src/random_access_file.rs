@@ -556,7 +556,7 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // for it. (The earlier "8 of the 11" and the names `readBytes`, `length`,
 // `setLength` in this marker came from a static read of pre-JDK-19 spellings;
 // the census names the descriptors this crate actually registers.) Residuals:
-// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+// l5-native-io-bridge-residuals-RETIRED-20260810.md
 //
 // COUNT CAVEAT (H8-1, 2026-08-20): the counts above describe the DEFAULT arm.
 // `getFilePointer` is now gated on `crate::real_raf_enabled()`, so under

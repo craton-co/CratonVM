@@ -12,7 +12,7 @@
 //! framework (Log4j 2 LMC), `StringConcatFactory.makeConcatWithConstants`,
 //! `LambdaMetafactory.metafactory`, JSON libraries, and the JVM's own
 //! bootstrap-method invocation path rely on. Coverage gaps here break wide
-//! swaths of modern Java (per `history/roadmap-any-java-app.md` item RC.8).
+//! swaths of modern Java (per `roadmap-any-java-app.md` item RC.8).
 //!
 //! Required output (HotSpot reference, all 8 lines):
 //!   findStatic.prim=7

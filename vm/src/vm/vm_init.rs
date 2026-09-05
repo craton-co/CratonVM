@@ -1405,7 +1405,7 @@ impl SharedVm {
         //
         // Both cells are one-shot and lock-free; see the `VM diagnostic
         // snapshot` section in `runtime::crash_handler` and
-        // `arch-2026-07-26/jdk-mode-determinism.md` §6.1.
+        // `jdk-mode-determinism.md` §6.1.
         crate::runtime::crash_handler::publish_jdk_mode(
             config.jdk_mode(),
             config.java_home.as_deref(),
@@ -1512,7 +1512,7 @@ impl SharedVm {
         // all: the only way to find out where `SharedVm::new` spent its time
         // was to add `Instant::now()` by hand and rebuild. The three phases
         // below are the ones measurement showed actually matter (see
-        // `arch-2026-07-26/startup-and-diagnostics.md` §2):
+        // `startup-and-diagnostics.md` §2):
         //
         //   1. classpath ingestion — `ClassManager::new` constructs the
         //      bootstrap/extension/application `ClassPath`s, and `load_jmod`
@@ -2032,7 +2032,7 @@ impl SharedVm {
         // genuine ~250 MiB direct-buffer working set (chunk writer thread)
         // threw OutOfMemoryError at a ceiling HotSpot doesn't impose at the
         // same heap size. See
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+        // bug-h2-largeblob-direct-memory-oom.md.
         let direct_memory_cap = config
             .max_direct_memory_size
             .unwrap_or(config.max_heap_size);
@@ -2291,7 +2291,7 @@ impl SharedVm {
                 // `CRATONVM_NO_STUBS`, "because some apps currently limp on
                 // these fakes and dropping them surfaces real gaps as clear
                 // errors." Leave it opt-in; do not force it on here. See
-                // fixed-suite-bugs/wildfly/wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md's
+                // wildfly-standalone-boot-stw-jit-takeover-hang-FIXED.md's
                 // 2026-07-14 addendum for the WildFly-boot regression this
                 // caused and how it was found (git bisect).
                 //
@@ -2336,7 +2336,7 @@ impl SharedVm {
                 // real FileHandler() bytecode instead (which throws
                 // NoSuchFileException trying to actually lock a real log
                 // file). Register just the FileHandler natives directly here.
-                // See fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
+                // See filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
                 cratonvm_native_builtins::phases_late::register_p61_file_handler(
                     &mut native_methods,
                 );
@@ -2662,7 +2662,7 @@ impl SharedVm {
                 // registration table is last-write-wins, so this second call was
                 // silently clobbering the correct implementation back to the
                 // naive proleptic-Gregorian one with no timezone offset at all.
-                // See `bug-h2-suite-residual-fail-triage.md`'s
+                // See `bug-h2-suite-residual-fail-triage-FIXED.md`'s
                 // `TestPreparedStatement.testDate8` writeup.
                 cratonvm_native_builtins::deprecated_io_util::register_url_codec(
                     &mut native_methods,
@@ -2880,7 +2880,36 @@ impl SharedVm {
             // real, self-contained StringJoiner bytecode runs instead. Must be set
             // BEFORE any `register_*` pass here. (The synthetic-jdk-feature build
             // sets the same flag in its real-JDK arm above.)
-            native_methods.set_drop_real_layout_synthetic(true);
+            //
+            // Gated on `config.use_synthetic_jdk`, NOT on the Cargo feature —
+            // the same correction `register_synthetic_aqs_natives` and
+            // `register_cyclic_barrier_natives` already carry in the sibling
+            // arm above, for the same reason and with the same failure shape.
+            //
+            // This block is `cfg(not(feature = "synthetic-jdk"))`, which is a
+            // statement about the BUILD, and the flag it sets is a statement
+            // about the RUN. They are not the same question.
+            // `VmConfig::default()` selects `EMBEDDED_DEFAULT_JDK_MODE` =
+            // `JdkMode::Synthetic` (config.rs), so every in-tree test and every
+            // embedder that does not ask for a JDK boots synthetic mode in THIS
+            // build too: boot-classpath discovery is skipped a few hundred lines
+            // above (`!config.use_synthetic_jdk` guards it), and `java/lang/
+            // String` is a minted 5-method carrier with no `Code` anywhere.
+            //
+            // Setting the flag there deleted the only implementation of
+            // `String.length()` / `isEmpty()` / `charAt()` / `equals()` the
+            // binary has — `register_essential_natives_with_shims` registers
+            // them a few lines below and `register` then dropped them — so
+            // `"abcdef".length()` raised `NoSuchMethodError` in a default-build
+            // `Vm::new(VmConfig::new())`. The flag's own rationale ("a fake
+            // 5-field layout corrupts the real 7-field object") presupposes a
+            // real object; in synthetic mode there is none to protect, and the
+            // drop is pure loss. Found by `wp7_2_jdbc_core_types_reachable::
+            // connection_methods_carry_signatures`, whose fixture is the first
+            // in-tree caller to reach `String.length()` on this path.
+            if !config.use_synthetic_jdk {
+                native_methods.set_drop_real_layout_synthetic(true);
+            }
             // set_drop_synthetic_stubs(true) intentionally NOT called here.
             // See the matching real-JDK arm above for why (dev d8092acb
             // regression + revert, 2026-07-14): several SyntheticStub-tagged
@@ -2922,7 +2951,7 @@ impl SharedVm {
             // real FileHandler() bytecode instead (which throws
             // NoSuchFileException trying to actually lock a real log
             // file). Register just the FileHandler natives directly here.
-            // See fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
+            // See filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md.
             cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
             // See the twin above.
             cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
@@ -3028,7 +3057,7 @@ impl SharedVm {
             // TomcatBaseTest.tearDown. The real STPE constructor bytecode runs
             // correctly on CratonVM once the synthetic STPE natives are gone (the
             // native-collections copy is now gated behind synthetic-jdk). See
-            // fixed-suite-bugs/tomcat/11-stpe-mainlock-npe-teardown-regression.md.
+            // 11-stpe-mainlock-npe-teardown-regression.md.
             native_methods.register(
                 "java/util/concurrent/CopyOnWriteArrayList",
                 "addIfAbsent",
@@ -3347,7 +3376,7 @@ impl SharedVm {
                                 ctx.invoke_virtual(cur_it, "next", "()Ljava/lang/Object;", &[])?;
                             let v = nxt.unwrap_or(Value::Object(None));
                             let cur_target = ctx.read_native_pin(target_pin, target);
-// `AbstractCollection.toArray(T[])` stores through
+                            // `AbstractCollection.toArray(T[])` stores through
                             // `aastore`, so a narrowing element is an
                             // `ArrayStoreException` naming the VALUE's class --
                             // not arraycopy's sentence, which is the other
@@ -3400,7 +3429,7 @@ impl SharedVm {
                     let copy = size.min(d_len);
                     for i in 0..copy {
                         let v = ctx.get_array_element(d, i);
-// `ArrayList.toArray(T[])` is a NARROWING copy through
+                        // `ArrayList.toArray(T[])` is a NARROWING copy through
                         // `Arrays.copyOf` / `System.arraycopy`, so arraycopy's
                         // wording, with the source named `java.lang.Object[]`
                         // because `elementData` is one whatever the list's
@@ -4216,7 +4245,7 @@ impl SharedVm {
         // whichever arm of the two mode `cfg` blocks was compiled in. That
         // count is the honest answer to "is real-JDK mode really ~300
         // natives?" (it is not — see
-        // `arch-2026-07-26/startup-and-diagnostics.md` §2.5).
+        // `startup-and-diagnostics.md` §2.5).
         // Note the registry pre-sizes four maps to 4,096 entries
         // unconditionally (`NativeMethodRegistry::new`), i.e. independently of
         // mode; that is one bounded allocation, not per-native work.
@@ -5974,7 +6003,7 @@ impl SharedVm {
     /// shared by both recorders), and until this object existed a TRUNCATED list
     /// was identical in shape to a complete one. Every reader who took the list
     /// as the population was reading a floor with nothing in the file to say
-    /// so — `jdk-only/G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
+    /// so — `G60-1-what-jdk-only-still-overrides-RESOLVED-20260817.md`
     /// §4 had to instruct its readers to count the rows by hand and compare them
     /// against a constant compiled into the VM, which is not a check anyone
     /// performs twice.
@@ -9621,9 +9650,7 @@ impl Vm {
                         }
                     }
                 }
-                if let Ok(raw) =
-                    cratonvm_types::flags::runtime_var("CRATONVM_JFR_ENABLE_EVENTS")
-                {
+                if let Ok(raw) = cratonvm_types::flags::runtime_var("CRATONVM_JFR_ENABLE_EVENTS") {
                     // Setting the variable at all counts as asking, even to an
                     // empty value: that installs an EMPTY whitelist, so the
                     // dump is empty and the startup line below says the filter
@@ -9882,7 +9909,7 @@ impl Vm {
         // report for the thread most crashes happen on. Worker threads need
         // the equivalent publication at their own registration sites; see the
         // cross-owner request in
-        // `arch-2026-07-26/startup-and-diagnostics.md`.
+        // `startup-and-diagnostics.md`.
         crate::runtime::crash_handler::publish_primordial_frame_trace(
             main_thread.frame_trace.clone(),
         );
@@ -11023,9 +11050,10 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
             match key {
                 "name" => name = value.to_string(),
                 "maxevents" => {
-                    max_events = Some(value.parse::<usize>().map_err(|_| {
-                        format!("JFR.start: maxevents=`{value}` is not a number")
-                    })?);
+                    max_events =
+                        Some(value.parse::<usize>().map_err(|_| {
+                            format!("JFR.start: maxevents=`{value}` is not a number")
+                        })?);
                 }
                 other => {
                     return Err(format!(
@@ -11108,8 +11136,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
                 .to_string()
         })?;
         let mut fr = self.debug.flight_recorder.lock();
-        let id =
-            jcmd_jfr_running_recording(&fr, name.as_deref()).map_err(|e| format!("JFR.dump: {e}"))?;
+        let id = jcmd_jfr_running_recording(&fr, name.as_deref())
+            .map_err(|e| format!("JFR.dump: {e}"))?;
         let bytes = fr
             .dump_recording(id, std::path::Path::new(&filename))
             .map_err(|e| format!("JFR.dump: writing `{filename}` failed: {e}"))?;
@@ -11122,8 +11150,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     fn jfr_stop(&self, args: &[String]) -> Result<String, String> {
         let (name, filename) = jcmd_jfr_parse_target(args, "JFR.stop")?;
         let mut fr = self.debug.flight_recorder.lock();
-        let id =
-            jcmd_jfr_running_recording(&fr, name.as_deref()).map_err(|e| format!("JFR.stop: {e}"))?;
+        let id = jcmd_jfr_running_recording(&fr, name.as_deref())
+            .map_err(|e| format!("JFR.stop: {e}"))?;
 
         // DUMP FIRST, STOP SECOND, and the order is load-bearing. Events sit
         // on bounded per-thread rings until something drains them, and
@@ -18769,13 +18797,28 @@ mod registrar_call_graph_witness {
 
     /// The fourth configuration, recorded where it can rot loudly: a build
     /// WITHOUT `synthetic-jdk` that is asked for synthetic mode still lands in
-    /// real-JDK arm B, because that block never reads
-    /// `config.use_synthetic_jdk`. `require_synthetic_jdk` rejects that
-    /// pairing — but only on the CLI / `libcratonvm` entry paths, not in
-    /// `SharedVm::new`, so an embedder (and `VmConfig::default()`, whose JDK
-    /// mode is Synthetic) reaches it.
+    /// real-JDK arm B, because that block calls the same registration passes
+    /// either way. `require_synthetic_jdk` rejects that pairing — but only on
+    /// the CLI / `libcratonvm` entry paths, not in `SharedVm::new`, so an
+    /// embedder (and `VmConfig::default()`, whose JDK mode is Synthetic)
+    /// reaches it.
+    ///
+    /// 2026-09-05: this test used to require that arm B never read
+    /// `config.use_synthetic_jdk` at all. It now reads it in EXACTLY one
+    /// place, and this test pins that it stays exactly one, and stays that one.
+    ///
+    /// The half that was load-bearing is unchanged, and the count assertion is
+    /// still what protects it: no `register_*` pass in arm B is conditional,
+    /// so the configuration above gets the whole real-JDK registrar set rather
+    /// than an empty registry. What the one branch decides is
+    /// `set_drop_real_layout_synthetic`, which is not a registration — it is
+    /// the policy `register` then applies to them — and setting it
+    /// unconditionally deleted `java/lang/String`'s ONLY implementation in
+    /// exactly the configuration this comment describes: no bytecode (no JDK
+    /// image) and no bridge (dropped), so `"abcdef".length()` raised
+    /// `NoSuchMethodError`.
     #[test]
-    fn the_feature_off_arm_never_consults_the_runtime_jdk_mode() {
+    fn the_feature_off_arm_consults_the_runtime_jdk_mode_only_for_the_layout_drop() {
         let src = read(VM_INIT_RS);
         let a = arms(&src);
         let lines: Vec<&str> = src.lines().collect();
@@ -18786,15 +18829,28 @@ mod registrar_call_graph_witness {
             })
             .map(|i| i + 1)
             .collect();
-        assert!(
-            offenders.is_empty(),
+        assert_eq!(
+            offenders.len(),
+            1,
             "the `#[cfg(not(feature = \"synthetic-jdk\"))]` arm branches on \
-             `config.use_synthetic_jdk` at lines {:?}. Today it does not, and that is a \
-             load-bearing fact: a feature-OFF build asked for synthetic mode gets the \
-             real-JDK registrar set rather than an empty registry. Adding a runtime branch \
-             here creates a fourth registration path — update the F30 census in the same \
-             change.",
+             `config.use_synthetic_jdk` at lines {:?}. Exactly ONE such branch is allowed, \
+             and it is the `set_drop_real_layout_synthetic` decision; a second one creates a \
+             fourth registration path — update the F30 census in the same change.",
             offenders
+        );
+        let i = offenders[0] - 1;
+        let got: Vec<&str> = lines[i..i + 3].iter().map(|l| l.trim()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "if !config.use_synthetic_jdk {",
+                "native_methods.set_drop_real_layout_synthetic(true);",
+                "}",
+            ],
+            "arm B's one runtime-mode branch is no longer the layout-drop decision — it \
+             reads {:?}. Either restore it, or decide in the F30 census what the new branch \
+             is and why arm B may have it.",
+            got
         );
     }
 }

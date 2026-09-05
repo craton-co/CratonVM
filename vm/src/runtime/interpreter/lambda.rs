@@ -202,7 +202,7 @@ pub(super) fn checkcast_lambda_instantiated_args(
         // address. Read the CURRENT address back through the caller's pin
         // (`handles`) instead of the raw `args` slice. Confirmed live via
         // CRATONVM_DBG_STALE_OBJREF during WildFly parallel-extension-add --
-        // see fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+        // see wildfly-parallel-boot-stale-objectref-residual.md.
         let idx = num_captures + sam_idx;
         let obj_ref = match handles.get(idx).copied().flatten() {
             Some(h) => thread.native_pin_roots[h],
@@ -1210,7 +1210,7 @@ pub(super) fn try_lambda_default_method_dispatch(
 /// guards against redefinition, not against identity collision; only the key
 /// can do the latter.
 ///
-/// See `feature-designs/vm-process-global-state-round-2.md`.
+/// See `vm-process-global-state-round-2.md`.
 type VmScopedClassPairKey = (usize, u32, u32);
 
 thread_local! {
@@ -2118,7 +2118,7 @@ pub(crate) fn build_lambda_impl_cached(
     // PROBE THE RECEIVER'S CLASS, NOT ONLY THE DECLARING ONE. This is the
     // difference between the two doors a bound method reference and a lambda
     // body take, and it is the whole of the defect that
-    // `jdk-only/a-bound-method-reference-is-a-different-dispatch-door-20260828.md`
+    // `a-bound-method-reference-is-a-different-dispatch-door-20260828.md`
     // (retired to docs internal on 2026-08-30, so the prefix is dropped)
     // records:
     //
@@ -3483,8 +3483,7 @@ pub(crate) fn try_lambda_dispatch(
             // Constructor reference: allocate object, call <init>, return the object.
             // Loader-faithful owner resolution (gated), same rationale as above.
             //
-            // Residual 4 (2026-07-20, fixed-suite-bugs/springboot/
-            // core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md):
+            // Residual 4 (2026-07-20, core-spring-boot-test-config-data-and-classpath-scan-cluster-FIXED.md):
             // this used the PASSIVE-only `lambda_impl_dispatch_override` (cache
             // read, never drives a cold miss) with a loader-blind
             // `load_class(name)` fallback — the exact InvokeStatic gap already

@@ -6,7 +6,7 @@
 Usage:  python3 tools/flag-census/census.py [REPO_ROOT] [OUT_MD]
 
 Defaults to the repo root inferred from this file's location and
-`audits/flag-census.md`.
+`flag-census.md`.
 
 The scan is deliberately *literal-only*: it looks for `"CRATONVM_..."` string
 literals in Rust code (outside `//` comments) and for bare `CRATONVM_...`
@@ -31,7 +31,7 @@ DYNAMIC_NAME = re.compile(r'"CRATONVM_[A-Z0-9_]*\{')
 SKIP_DIRS = {'target', '.git', 'jdk25src', 'node_modules'}
 # The census output and the scanner itself both mention every flag name; scanning
 # them would make the totals self-referential and drift on every regeneration.
-SKIP_FILES = {'audits/flag-census.md', 'tools/flag-census/census.py',
+SKIP_FILES = {'flag-census.md', 'tools/flag-census/census.py',
               'tools/flag-census/render.py'}
 
 # The typed configuration itself. Its sites ARE read sites — they are where the

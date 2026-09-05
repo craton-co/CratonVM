@@ -16,7 +16,7 @@
 //! `apps/nesthost_probe` Java fixture under
 //! `cargo test -p cratonvm-vm --test wp2_10_*`.
 //!
-//! Background (`gaps/wildfly-ejbca-roadmap.md` WP2.10):
+//! Background (`wildfly-ejbca-roadmap.md` WP2.10):
 //! `Class.getNestHost` reflects anonymous-class relationships;
 //! `Class.isHidden()` returns true for hidden classes (defined via
 //! `Lookup.defineHiddenClass`); `Class.forName(hiddenName)` throws

@@ -2762,7 +2762,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // returned -1 ("no mismatch"), and `Arrays.mismatch`/`Arrays.equals`
     // reported two DIFFERENT int[]/long[] arrays as equal. See
     // the internal record
-    // `fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+    // `batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
     //
     // So coerce here rather than trusting ~30 call sites to keep tracking the
     // JDK's field types: the descriptor is right there next to the name, and
@@ -2777,7 +2777,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // `ZipContentTests.entryWithEpochTimeOfZeroShouldNotFail` read the DOS
     // fallback 1980-01-01 instead of the extended timestamp's 1970-01-01. It
     // passes cold and fails once the method is hot, which is the tell. See
-    // `fixed-suite-bugs/springboot/spring-boot-loader-residual-20260723-FIXED.md`.
+    // `spring-boot-loader-residual-20260723-FIXED.md`.
     let set_static_by_name = |field_name: &str, value: Value| {
         let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(class_id) {
@@ -4342,7 +4342,7 @@ std::thread_local! {
     /// with the *primordial* thread's frames or none at all — and the two crash
     /// classes that most need a Java stack (virtual-thread resume heap
     /// corruption, STW-takeover deadlock) both fault on workers. See
-    /// `arch-2026-07-26/startup-and-diagnostics.md` §6.3.
+    /// `startup-and-diagnostics.md` §6.3.
     ///
     /// Thread-local rather than a shared registry, deliberately: the crash
     /// handler runs *on the faulting thread* (Rust panic hook, Windows vectored

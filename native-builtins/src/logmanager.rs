@@ -2807,7 +2807,7 @@ fn native_jboss_log_context_get_logger(
 /// level name (or its decimal `intValue()`) to the canonical `Level` object.
 ///
 /// Real JDK 25 bytecode resolves this through `KnownLevel.findByName`, which
-/// (per `gaps/kc16-blocker-map.md`'s KC16 investigation) walks
+/// (per `kc16-blocker-map.md`'s KC16 investigation) walks
 /// a `ClassLoaderValue`-keyed cache that needs a non-null `Module` for a
 /// class/classloader CratonVM's module-system synthesis doesn't fully cover
 /// — the lookup throws `NullPointerException: Cannot invoke "isNamed" on
@@ -4067,7 +4067,7 @@ fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     // Java-level `System.out`/`System.err` `PrintStream` that JUnit5's
     // `OutputCaptureExtension` substitutes — same bug class as
     // `log_simple`'s fix below; route through the live stream instead.
-    // See fixed-suite-bugs/springboot/propertiesmigration-logfactory-oom-residual-FIXED.md.
+    // See propertiesmigration-logfactory-oom-residual-FIXED.md.
     crate::emit_framework_log(ctx, &format!("{level} [{logger_name}] {message}"));
     if let Some(t) = throwable {
         dump_throwable_to_stderr(ctx, t, "    ");
@@ -5579,7 +5579,7 @@ fn publish_to_jul_handlers_full(
         // through this exact `set_field(record, 1, ...)` call, `index=1`,
         // landing on a fresh zero-field `java/lang/Object`). Same hazard
         // class as `native_bos_flush_locked`
-        // (fixed-suite-bugs/tomcat/dohead-post-fix-sporadic-residuals-FIXED.md).
+        // (dohead-post-fix-sporadic-residuals-FIXED.md).
         let record_pin = ctx.pin_native_root(record);
         // GC SAFETY (2026-07-21, JulGcStressRepro checkcast root cause): the
         // LogRecord `<init>` native invoked by `new_object_initialized` above
@@ -6915,7 +6915,7 @@ fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     // (or this process's raw stderr) sees them fine. Same bug class as the
     // Logback/commons-logging `emit_framework_log` fix — route through the
     // live (possibly test-substituted) stream instead.
-    // See fixed-suite-bugs/springboot/propertiesmigration-logfactory-oom-residual-FIXED.md.
+    // See propertiesmigration-logfactory-oom-residual-FIXED.md.
     crate::emit_framework_log(ctx, &format!("{level} [{logger_name}] {message}"));
 }
 
@@ -7537,7 +7537,7 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // reached this class — those callers only needed the methods not to NPE on
     // the synthetic Logger's null `loggerNode`. Repointing
     // `LogManager.getLogger` at the JBoss shape (the fix in
-    // `julogger-cast-to-jbosslogmanager-logger-20260817.md`) made this the
+    // `julogger-cast-to-jbosslogmanager-logger-20260817-FIXED.md`) made this the
     // shape ORDINARY application code gets back, and the first thing
     // `io.quarkus.test.AbstractQuarkusExtensionTest.beforeAll` does with it is
     // install an `InMemoryLogHandler` on the root logger and later assert on

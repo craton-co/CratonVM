@@ -20,7 +20,7 @@
 //!   descriptor) followed by a verifying `&str` comparison of both. There is
 //!   no per-call-site slot cache, so **every** dispatch that reaches this
 //!   module re-derives the slot from strings. See the cross-owner request in
-//!   `arch-2026-07-26/stackwalk-and-vtable.md` for the
+//!   `stackwalk-and-vtable.md` for the
 //!   quickened-CP slot cache that would make it genuinely O(1).
 //! * The lookup also runs under a read guard on the process-wide
 //!   `RwLock<VtableManager>`, and the interpreter re-opens
@@ -807,7 +807,7 @@ impl VtableManager {
     /// broken" from "entry undispatchable" changes dispatch-tier semantics,
     /// and this pass cannot build or run the suites. Written up as a scoped
     /// proposal in
-    /// `arch-2026-07-26/stackwalk-and-vtable.md`.
+    /// `stackwalk-and-vtable.md`.
     pub fn invalidate_for_override(&mut self, super_class_id: u64, slot: usize) {
         if let Some(vtable) = self.tables.get_mut(&super_class_id) {
             vtable.invalidate_slot(slot);

@@ -33,7 +33,7 @@
 //!
 //! Nothing calls [`StringPool::prune_unreferenced`] yet; wiring it to the
 //! class-unloading path is a `vm`/`gc` change. See
-//! `arch-2026-07-26/value-repr-and-compressed-oops.md`.
+//! `value-repr-and-compressed-oops.md`.
 //!
 //! Two interning modes are offered:
 //!

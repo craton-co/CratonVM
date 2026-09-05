@@ -134,7 +134,7 @@ fn jdn_to_julian(jdn: i64) -> (i64, i64, i64) {
 /// specified in terms of `GregorianCalendar`'s default Julian/Gregorian
 /// hybrid calendar: dates before 1582-10-15 (Gregorian) are interpreted as
 /// Julian calendar dates, not proleptic-Gregorian ones — see
-/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`'s
+/// `bug-h2-suite-residual-fail-triage-FIXED.md`'s
 /// `TestPreparedStatement.testDate8` writeup for the ~10-day discrepancy
 /// this produces if the cutover is ignored.
 pub(crate) fn date_fields_to_millis(
@@ -2442,7 +2442,7 @@ mod tests {
 
     #[test]
     fn test_date_fields_to_millis_julian_before_cutover_matches_proleptic_gregorian_equivalent() {
-        // Regression test for `bug-h2-suite-residual-fail-triage.md`'s
+        // Regression test for `bug-h2-suite-residual-fail-triage-FIXED.md`'s
         // TestPreparedStatement.testDate8: fields (1582, September, 25) are
         // before the 1582-10-15 cutover, so they must be interpreted as a
         // JULIAN calendar date — which is the same instant as proleptic

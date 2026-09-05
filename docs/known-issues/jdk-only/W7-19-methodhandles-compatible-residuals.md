@@ -116,7 +116,7 @@ and those lines exist for whoever runs the class directly. The end-of-run
 `CK RJdkHandles adapt=14` is now `CK RJdkHandles adapt combinators=14`, and two
 lines are new: `CK RJdkHandles steps=37`, and the `PASS` line carries the step
 count. The internal record
-`fixed-bugs/jdk-only-L2-methodtypeform-lambdaforms-null-FIXED-20260811.md`
+`jdk-only-L2-methodtypeform-lambdaforms-null-FIXED-20260811.md`
 quotes the old spelling as its verification marker; that quotation is now stale
 and the file is not this lane's to edit.
 

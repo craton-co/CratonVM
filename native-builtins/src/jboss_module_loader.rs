@@ -766,7 +766,7 @@ pub fn build_local_module_loader(
     // GC-safety: `create_string` below can trigger a moving GC; `loader` is
     // used again in the following `set_field` unpinned otherwise -- the same
     // "Family 1" stale-ObjectRef pattern as the WildFly boot-crash fixes (see
-    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
+    // wildfly-parallel-boot-stale-objectref-residual.md).
     // This is the singleton boot module loader, so every module load run
     // through this path was at risk.
     let loader_pin = ctx.pin_native_root(loader);
@@ -835,7 +835,7 @@ fn build_module_object(
     // across several subsequent GC-triggering calls (`create_string`,
     // `build_resource_root_array`, the `mcl` allocation) before their last
     // use. Same "Family 1" stale-ObjectRef pattern as the WildFly boot-crash
-    // fixes (see fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md)
+    // fixes (see wildfly-parallel-boot-stale-objectref-residual.md)
     // -- pin both now and re-read the forwarded reference before each use.
     let module_pin = ctx.pin_native_root(module);
     let loader_pin = ctx.pin_native_root(loader);
@@ -940,7 +940,7 @@ fn build_module_object(
 /// moving GC, which silently corrupts the exception object per the
 /// `pin_native_root` contract (same "Family 1" stale-ObjectRef pattern as the
 /// WildFly boot-crash fixes; see
-/// fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
+/// wildfly-parallel-boot-stale-objectref-residual.md).
 /// Centralized here instead of repeating the pin/read/unpin dance at each
 /// call site.
 pub fn alloc_single_message_exception(
@@ -1135,7 +1135,7 @@ pub(crate) fn native_loader_load_module(
     // moving GC; `this` is reused as the `loader` argument to
     // `build_module_object` further down, unpinned otherwise. Same
     // "Family 1" pattern as the rest of this file's fixes (see
-    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md).
+    // wildfly-parallel-boot-stale-objectref-residual.md).
     let this_pin = ctx.pin_native_root(this);
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
@@ -3240,7 +3240,7 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
     // "No META-INF/services/org.jboss.as.controller.Extension found" for a
     // seemingly-arbitrary, different extension module each time, exactly the
     // non-deterministic residual documented in
-    // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+    // wildfly-parallel-boot-stale-objectref-residual.md.
     let service_pin = ctx.pin_native_root(service);
 
     let loader = build_local_module_loader(ctx);
@@ -5102,7 +5102,7 @@ mod tests {
     #[test]
     fn wildfly_jboss_modules_service_provider_leak_real_dist_scoping() {
         // Regression guard for
-        // fixed-suite-bugs/wildfly/wildfly-jboss-modules-service-provider-leak.md,
+        // wildfly-jboss-modules-service-provider-leak.md,
         // exercised against a *real* WildFly 32.0.1.Final distribution's
         // modules/ tree (not a synthetic fixture) so the exact conflicting
         // pair from the original repro -- org.jboss.as.jmx and

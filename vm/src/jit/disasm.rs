@@ -8,7 +8,7 @@
 //! contains any entry is dumped to stderr as NASM-formatted x86-64 right
 //! after a successful compile. `1` or `*` dumps every compiled method.
 //!
-//! The gap that motivated this (gaps/gap-jit-fastmath-transform-miscompile.md
+//! The gap that motivated this (gap-jit-fastmath-transform-miscompile.md
 //! Bug 3) could not be pinned without seeing the emitted code: the JIT has no
 //! other way to inspect its output. iced-x86 is decode-only here (no encoder),
 //! and the whole module is inert unless the env var is set.

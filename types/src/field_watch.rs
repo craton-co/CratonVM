@@ -6,7 +6,7 @@
 //!
 //! Software equivalent of a debugger hardware watchpoint, added to chase
 //! the `TestUpgrade` `RootReference`/`MVMap` residual documented in
-//! `fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md`.
+//! `bug-h2-suite-residual-fail-triage-FIXED.md`.
 //! Every construction site of every object in the suspect chain
 //! (`Page`/`RootReference`) was already exhaustively traced and found
 //! clean, yet the end-to-end field value was still observed wrong once.

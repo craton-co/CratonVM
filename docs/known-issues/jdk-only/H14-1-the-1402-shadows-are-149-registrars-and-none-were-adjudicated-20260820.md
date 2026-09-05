@@ -297,7 +297,7 @@ For the 184 rows of rank 1 the responsible line is a single
 restored 14,230 lines later at `:21481`.
 
 The tree already knows ambient inheritance is pervasive
-(`audits/jdk-only-ambient-category-audit.md` measures 6,350
+(`jdk-only-ambient-category-audit.md` measures 6,350
 ambient registrations in `native-builtins` alone). What is new is that the
 **intersection with the observed defect is total**: there is no sub-population
 of deliberately-classified shadows to treat differently from the rest.

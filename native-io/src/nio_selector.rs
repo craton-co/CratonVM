@@ -501,7 +501,7 @@ impl SelectorState {
     /// change here does not self-heal within any bounded window, it stalls
     /// for the caller's full requested timeout. Found while investigating
     /// `JettyClientHttpConnectorBuilderTests`'s 100%-reproducible hang/crash
-    /// (`fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md`):
+    /// (`http-client-connector-teardown-hang-crash-FIXED.md`):
     /// a real, confirmed gap (a registration lost this exact way, verified
     /// via `CRATONVM_DBG_SELECTOR=1` tracing) — but NOT, on its own,
     /// sufficient to fix that specific hang; see the doc for the remaining
@@ -2224,7 +2224,7 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
             // it again. On the WebSocket back-pressure workload that cost 3-11
             // socket-processing tasks per message where HotSpot needs exactly
             // one, which is what grew the connector pool to maxThreads.
-            // See fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md.
+            // See wsremoteendpoint-server-close-never-completes-FIXED.md.
             if interest & OP_WRITE != 0 && h.os_handle().map(os_handle_writable).unwrap_or(true) {
                 ready |= OP_WRITE;
             }

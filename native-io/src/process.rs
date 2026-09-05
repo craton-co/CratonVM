@@ -251,7 +251,7 @@ const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 6;
 /// `cratonvm/synthetic/AnonymousObject$6`, on which EVERY `Process` virtual
 /// (`waitFor`, `isAlive`, `getInputStream`, ...) raised NoSuchMethodError —
 /// first seen as picocli's terminal-width probe failing during
-/// `junit-platform-console --help` (gaps/gap-anonymous-object-getinputstream.md).
+/// `junit-platform-console --help` (gap-anonymous-object-getinputstream.md).
 const SYNTHETIC_PROCESS_CLASS: &str = "cratonvm/synthetic/Process";
 const SYNTHETIC_PROCESS_INPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeInputStream";
 const SYNTHETIC_PROCESS_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputStream";
@@ -3735,7 +3735,7 @@ fn native_process_destroy_forcibly(
 /// or synthetic-JDK mode alike, since `spawn_and_wrap` always allocates the
 /// object under `SYNTHETIC_PROCESS_CLASS`/`java/lang/Process` regardless of
 /// mode) threw `NoSuchMethodError` on `.toHandle()`
-/// (fixed-suite-bugs/wildfly/wildfly-process-tohandle-missing-FIXED.md).
+/// (wildfly-process-tohandle-missing-FIXED.md).
 ///
 /// Builds a REAL `java.lang.ProcessHandleImpl(pid, startTime)` rather than
 /// a bare 1-field synthetic `java/lang/ProcessHandle` — an interface, whose
@@ -4059,7 +4059,7 @@ fn collect_descendant_pids(pid: i64) -> Result<Vec<i64>, ProcessScanError> {
 /// keycloakProcess.descendants().toList() to tell apart the kc.sh wrapper
 /// script's pid from the exec'd java process's pid) threw NoSuchMethodError
 /// before a single test could start its managed Keycloak server — see
-/// fixed-suite-bugs/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap-FIXED.md
+/// pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap-FIXED.md
 /// (this was the next missing-native gap surfaced once that doc's actual
 /// bug, and the ProcessBuilder LinkedList-command bug above, were fixed).
 ///
@@ -5137,7 +5137,7 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // for the per-row `javap` census.
 //
 // Details and the per-row table:
-// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+// l5-native-io-bridge-residuals-RETIRED-20260810.md
 // WHERE `java/lang/Runtime.exec` IS *NOT*. Recorded 2026-08-20 (H3-1) because
 // `G89-1` N2 points a reader at this file for it and the tree says otherwise.
 //

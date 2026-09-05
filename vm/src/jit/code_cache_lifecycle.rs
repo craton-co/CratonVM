@@ -6,7 +6,7 @@
 //! both auditable.
 //!
 //! This closes two adjacent items of the C2 review
-//! (`feature-designs/c2/deep-research-vm-c2.md`):
+//! (`deep-research-vm-c2.md`):
 //!
 //! * P1 *"Add code-cache lifecycle metrics and reclamation"* — acceptance:
 //!   installed/reclaimed bytes, fragmentation, sweeps, failed allocations,
@@ -1486,7 +1486,7 @@ impl std::fmt::Display for CodeCacheLifecycleReport {
 /// # Per-VM state audit: BENIGN — process scope is the CORRECT scope here
 ///
 /// Checked by the 2026-08-01 `vm/src/jit/` cache-keying sweep
-/// (`audits/vm-jit-cache-keying.md`) and deliberately left
+/// (`vm-jit-cache-keying.md`) and deliberately left
 /// process-global. Two independent reasons:
 ///
 ///  * what it tracks is genuinely process-wide. `BodyExtent` names executable

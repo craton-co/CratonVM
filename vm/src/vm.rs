@@ -47,7 +47,7 @@ pub use vm_util::*;
 // because they never meet them. Do not copy a slot number out of this module
 // into production code, and do not treat a green run of these tests as
 // evidence that a native's slot arithmetic survives stub removal.
-// See `audits/jdk-only-object-layout-audit.md`.
+// See `jdk-only-object-layout-audit.md`.
 
 // NEW-11: the inline test module is synthetic-jdk specific (it calls
 // `register_builtins`, asserts synthetic counts, and exercises hand-allocated

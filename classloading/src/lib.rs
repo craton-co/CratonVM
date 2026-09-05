@@ -20,7 +20,7 @@
 ///
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::LoaderFlags`], parsed once at first use. See
-/// `audits/flag-census.md` for the inventory and
+/// `flag-census.md` for the inventory and
 /// `cratonvm_types::flags` for the latching rules.
 #[inline]
 pub(crate) fn loader_flags() -> &'static cratonvm_types::LoaderFlags {
@@ -52,7 +52,7 @@ pub mod proxy_gen;
 pub mod resolution;
 /// The overlay detector's per-class instrument: CratonVM's fabricated slot
 /// model for a well-known JDK class, diffed against the layout the loaded image
-/// actually declares. See `feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md`.
+/// actually declares. See `L4-overlay-detector-blind-spots.md`.
 pub mod shadow_layout;
 pub mod type_maps;
 pub mod verifier;
@@ -86,7 +86,7 @@ pub use class_manager::array_descriptor_element_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 // The fabricated slot MODEL itself, not just its size. `shadow_layout` diffs it
 // against the real layout; a build-time gate over the `*_FIELD_*` constants —
-// the follow-up `audits/jdk-only-object-layout-audit.md` §"A gate worth adding"
+// the follow-up `jdk-only-object-layout-audit.md` §"A gate worth adding"
 // asks for — would want the same table.
 pub use class_manager::synthetic_stub_field_model;
 // The per-class constructor descriptors the synthetic stub declares. Exported
@@ -95,7 +95,7 @@ pub use class_manager::synthetic_stub_field_model;
 pub use class_manager::{
     any_annotation_proxy_defined,
     any_class_redefined,
-    any_duplicate_class_name, class_is_java_util,
+    any_duplicate_class_name, class_is_java_lang_system, class_is_java_util,
     bump_jit_supersede_epoch,
     class_definition_epoch,
     drain_pending_class_hooks,
@@ -113,7 +113,7 @@ pub use class_manager::{
     // `CRATONVM_LOADER_AWARE_RESOLUTION` gate. `vm::runtime::env_cache` and
     // `native-builtins::classloader` both delegate to this instead of
     // keeping their own `OnceLock`-cached env-var copy — see
-    // `fixed-suite-bugs/loader-identity.md`.
+    // `loader-identity.md`.
     loader_aware_resolution,
     register_builtin_classloaders,
     set_current_thread_id,
@@ -127,7 +127,7 @@ pub use class_manager::{
     // "nobody has this name" apart from "several loaders each have their own
     // class under it". Every `Option`-returning lookup collapses the two, and a
     // caller that reads the collapse as "absent" loads a second copy — see
-    // `feature-designs/classloading-identity-audit.md`.
+    // `classloading-identity-audit.md`.
     NameResolution,
     RedefineOptions,
     ResolutionInvalidateHook,

@@ -24,7 +24,6 @@
 //! `Class.isDirectSubType`: `c.getInterfaces(false)` is an invokespecial, the
 //! callee frame was pushed with `this == null`, and `Class.reflectionData()`'s
 //! registered native answers a null receiver with a null RETURN. See
-//! `fixed-suite-bugs/springboot/`
 //! `sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md`.
 //!
 //! The probe deliberately checks the WARM answers — a cold-only test passed
