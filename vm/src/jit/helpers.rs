@@ -20477,12 +20477,35 @@ unsafe fn try_lambda_site_direct_call(
                     crate::runtime::interpreter::lambda_site_bump_unresumable();
                 }
                 Err(crate::error::MethodCallFailed::ExceptionThrown(exc)) => {
-                    // Same contract as the MIC hit path: leave it in
-                    // `jit_pending_exception` for the compiled caller's own
-                    // post-invoke check, and return the null/zero sentinel.
+                    // Park it for the compiled caller's own post-invoke check —
+                    // and return the sentinel that check actually tests for.
+                    //
+                    // This used to return `0`, described as "the null/zero
+                    // sentinel". **There is no such sentinel.**
+                    // `emit_post_invoke_exception_check` compares `RAX` against
+                    // `i64::MIN` and consults `dispatch_threw` only on that
+                    // comparison; `0` is a perfectly ordinary null reference
+                    // return and the check keeps it. The parked exception then
+                    // sat unclaimed while compiled code carried on with a null.
+                    //
+                    // It looked correct for a year because of what usually
+                    // FOLLOWS a SAM call: unboxing the result
+                    // (`Integer.intValue`) was a CALL, and that call crossed
+                    // into Rust and delivered the pending exception a moment
+                    // later at a site that could route it. Making the box/unbox
+                    // intrinsic default-ON removed the call — the unbox became
+                    // an inline load with a null-receiver guard — and the
+                    // exception escaped its own `catch`. See
+                    // `docs/known-issues/jit/bug-jit-superseded-implicit-npe-leak-20260903.md`.
+                    //
+                    // `i64::MIN` is right for every return type: for a
+                    // reference it cannot be a valid heap address, and for the
+                    // `J`/`D`/`F` shapes where it IS a representable value the
+                    // check disambiguates through `dispatch_threw`, which finds
+                    // exactly the signal parked on the line above.
                     set_jit_pending_exception(thread, exc);
                     crate::runtime::interpreter::lambda_site_bump_resumed();
-                    return Some(0);
+                    return Some(i64::MIN);
                 }
                 Err(_) => {
                     crate::runtime::interpreter::lambda_site_bump_unresumable();
