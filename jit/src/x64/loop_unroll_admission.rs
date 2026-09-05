@@ -1387,6 +1387,8 @@ fn test_deopt_point(bci: u32) -> crate::deopt::DeoptimizationPoint {
 /// untransformed artifact can have: mapped back into interpreter-bci space,
 /// EVERY OSR entry in the region — the header's included — lands inside the
 /// FALLBACK copy, which sits after the guard and all four guarded bodies.
+/// "Every entry" is not "every pc": since `abcfaec38` only a pc whose abstract
+/// expression stack is EMPTY gets one, and this test pins both halves of that.
 /// `pc_to_native` is non-decreasing in pc, so comparing native offsets
 /// compares positions.
 ///
@@ -1420,19 +1422,73 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
         22,
         "one slot per interpreter bci, plus the end"
     );
+    // WHICH pcs may be entered at all, since `abcfaec38` (2026-09-04): an OSR
+    // entry pc must have an EMPTY abstract expression stack. Entering
+    // mid-expression lets the prologue materialise the pending operands once,
+    // correctly, for the entering iteration - and then every later iteration
+    // replays those frozen slots while the index advances, which is a
+    // wrong-VALUE bug no termination test can see. HotSpot has the same rule.
+    //
+    // Spelled out for this fixture rather than derived, because the depth at
+    // each pc IS the property:
+    //
+    //   4   iload_2    []        <- header, enterable
+    //   5   iload_0    [i]
+    //   6   if_icmpge  [i, n]
+    //   9   iload_1    []        <- enterable
+    //   10  iload_2    [s]
+    //   11  iadd       [s, i]
+    //   12  istore_1   [s+i]
+    //   13  iinc       []        <- enterable
+    //   16  goto       []        <- enterable, and the back edge
+    const ENTERABLE: [usize; 4] = [4, 9, 13, 16];
+    const MID_EXPRESSION: [usize; 5] = [5, 6, 10, 11, 12];
+
     // Versioning has no back-edge gap: the fallback is a full image of the
-    // region, so every INSTRUCTION in it keeps an entry — including the
-    // back edge itself, where a plain 4x unroll answers `-1` because its
-    // steady state is copy 0, which ends just before it.
-    let mut bci = 4usize;
-    while bci <= 16 {
+    // region, so every ENTERABLE pc in it keeps an entry - including the back
+    // edge itself, where a plain 4x unroll answers `-1` because its steady
+    // state is copy 0, which ends just before it.
+    for bci in ENTERABLE {
         assert!(
             rebuilt[bci] >= 0,
-            "bci {bci}: versioning must not refuse OSR inside the region"
+            "bci {bci}: versioning must not refuse OSR at an empty-stack pc \
+             inside the region"
         );
+    }
+    // BOTH DIRECTIONS, and this half is the one that earns its place. Asserting
+    // only the loop above passes just as well against a build that dropped the
+    // empty-stack rule and went back to publishing every pc - which is exactly
+    // the wrong-value bug that rule fixed. Until 2026-09-05 this test asserted
+    // the OPPOSITE of this loop, over every instruction in the region, and it
+    // was the only thing red on dev when the rule landed.
+    for bci in MID_EXPRESSION {
+        assert_eq!(
+            rebuilt[bci], -1,
+            "bci {bci}: an OSR entry pc must have an empty expression stack"
+        );
+    }
+    // The two lists have to PARTITION the region's real instruction
+    // boundaries, or either could quietly name a pc that is not one - a
+    // mid-instruction byte reads as `-1` and would satisfy the loop above for
+    // the wrong reason.
+    let mut bci = 4usize;
+    let mut walked: Vec<usize> = Vec::new();
+    while bci <= 16 {
+        walked.push(bci);
         bci += bytecode_len_at(&code, bci);
     }
     assert_eq!(bci, 19, "the walk must land past the back edge");
+    let mut listed: Vec<usize> = ENTERABLE
+        .iter()
+        .chain(MID_EXPRESSION.iter())
+        .copied()
+        .collect();
+    listed.sort_unstable();
+    assert_eq!(
+        walked, listed,
+        "the enterable and mid-expression lists must together be exactly the \
+         region's instruction boundaries"
+    );
     assert!(
         rebuilt[16] >= 0,
         "the back-edge bci stays enterable under versioning"
@@ -1446,7 +1502,7 @@ fn a_versioned_artifact_publishes_its_osr_entries_inside_the_fallback_copy() {
          guard, which is not a loop header and so is not a pc the OSR \
          trampoline can reconstruct a compiled state for"
     );
-    for bci in [9usize, 10, 11, 12, 13, 16] {
+    for bci in ENTERABLE {
         assert!(
             rebuilt[bci] >= fallback_off,
             "bci {bci}: a mid-body OSR entry must land in the fallback copy, \
