@@ -181,31 +181,41 @@ stderr:
     Some((stdout, stderr))
 }
 
-/// The hang cap for `VthreadProbe`, and why it is not 60 seconds.
+/// The hang cap for `VthreadProbe`. It is a LIVELOCK GUARD, not a performance
+/// assertion: the test asserts `counted=10000 ok=true`, and this only exists so
+/// a scheduler that stops making progress fails fast instead of hanging the
+/// suite.
 ///
-/// This is a LIVELOCK GUARD, not a performance assertion. The test asserts
-/// `counted=10000 ok=true`; the cap exists only so a scheduler that stops
-/// making progress fails fast instead of hanging the suite.
+/// # It was briefly 300 s, and that was wrong
 ///
-/// It was 60 s, and it flaked: 2 failures in 8 runs in the 2026-09-05 Linux
-/// sweep. Measured rather than guessed at — 20 consecutive runs on that box
-/// under six added spinners:
+/// `vthread_probe_10000_all_increment` flaked in the 2026-09-05 Linux sweep
+/// (2 failures in 8). Twenty runs of the probe under added load looked like a
+/// heavy tail — 20/20 correct, 3.36 s to 26.39 s — so the cap was raised to
+/// 300 s on the theory that 60 s sat inside that tail.
+///
+/// THE TAIL WAS NOT THE STORY. Running the VM DIRECTLY, no test harness
+/// involved, ten times on Windows:
 ///
 /// ```text
-/// 20/20 counted=10000 ok=true
-/// elapsed  min 3.36s   median ~5.5s   max 26.39s
+/// 8 runs   2-4 s   counted=10000 ok=true
+/// 2 runs   killed at 120 s, no output at all
 /// ```
 ///
-/// Every run finished, and finished CORRECTLY. There is no livelock here; the
-/// distribution is heavy-tailed under contention, and 60 s sits inside that
-/// tail once the sweep adds parallel cargo test binaries on top of the load.
-/// A cap has to clear the tail or it is measuring the host, and 26 s observed
-/// with the box already busy is not a ceiling anyone has established.
+/// Bimodal, with nothing in between, and independent of machine load — one
+/// failure came with three background compilers running and three of the
+/// passes came with the same three. That is a HANG, and the loop's original
+/// comment named the suspect: a v-thread scheduler that regresses to a
+/// 1-carrier livelock.
 ///
-/// 300 s still catches what it is for: a 1-carrier livelock does not finish in
-/// five minutes, or in any time. The cost when healthy is zero, because the
-/// cap is only ever reached on failure.
-const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(300);
+/// A hang is not something a cap can fix. Raising it to 300 s bought nothing
+/// except making CI wait five times longer to report a real defect, so it is
+/// back to 60 s — twenty times the healthy runtime and twice the worst
+/// completed run ever measured, which is ample for a guard whose job is to
+/// notice that progress stopped.
+///
+/// The hang itself is recorded in
+/// `docs/known-issues/jit/vthread-probe-intermittent-hang-20260905.md`.
+const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(60);
 
 /// Memoize each probe run so all subtests targeting the same class share one
 /// VM spawn. Keyed by class name.
