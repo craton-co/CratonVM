@@ -4197,9 +4197,14 @@ pub(super) fn op_getstatic(
     // process) in exchange for a relaxed load and a compare here. The lock and
     // the `to_string` now happen only for a field of `java/lang/System`
     // itself, which is where they were always going.
-    let field_name_for_intercept = if crate::classloading::class_is_java_lang_system(
-        field.declaring_class_id,
-    ) {
+    let field_name_for_intercept = if crate::runtime::env_cache::no_system_class_latch() {
+        // The pre-2026-09-05 path, verbatim, so the two arms are comparable
+        // inside one binary. A cross-binary comparison is not an A/B.
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(field.declaring_class_id)
+            .filter(|c| &*c.name == "java/lang/System")
+            .and_then(|c| c.fields.get(field.field_index).map(|f| f.name.to_string()))
+    } else if crate::classloading::class_is_java_lang_system(field.declaring_class_id) {
         let cm = shared.classes.class_manager.read();
         cm.get_class(field.declaring_class_id)
             .and_then(|c| c.fields.get(field.field_index).map(|f| f.name.to_string()))

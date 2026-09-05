@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-352 tokens.
+353 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -824,6 +824,7 @@ export inherited from a parent shell.
 | `field-addr-elide` | `CRATONVM_JIT_NO_FIELD_ADDR_ELIDE` |
 | `arraylength-fast` | `CRATONVM_JIT_NO_ARRAYLENGTH_FAST` |
 | `ref-array-fast` | `CRATONVM_JIT_NO_REF_ARRAY_FAST` |
+| `system-class-latch` | `CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH` |
 | `osr-inline-gate` | `CRATONVM_JIT_NO_OSR_INLINE_GATE` |
 | `invoke-fast-door` | `CRATONVM_JIT_INVOKE_FAST_DOOR / CRATONVM_JIT_NO_INVOKE_FAST_DOOR` |
 | `door-receiver-record` | `CRATONVM_JIT_NO_DOOR_RECEIVER_RECORD` |

@@ -1608,6 +1608,9 @@ pub const INVENTORY: &[E] = &[
     // `VmHeap::get_array_element`; the `0x2e..=0x35` arm's primitive half
     // declines reference elements by construction.
     E { group: Group::JIT, token: "ref-array-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_REF_ARRAY_FAST"), off_word: None, since: "2026-09-05" },
+    // `system-class-latch` — off restores the class-manager read lock and name
+    // comparison `op_getstatic` performed on every getstatic.
+    E { group: Group::JIT, token: "system-class-latch", on_key: None, off_key: Some("CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH"), off_word: None, since: "2026-09-05" },
     // `osr-inline-gate` — off calls `try_osr_with_backoff` on every backward
     // branch instead of only past the smallest OSR threshold.
     E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },

@@ -1931,6 +1931,15 @@ cached_is_set!(no_arraylength_fast, "CRATONVM_JIT_NO_ARRAYLENGTH_FAST");
 /// Token: `CRATONVM_JIT=-ref-array-fast`.
 cached_is_set!(no_ref_array_fast, "CRATONVM_JIT_NO_REF_ARRAY_FAST");
 
+/// `CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH` -- restore the class-manager read lock
+/// and name comparison `op_getstatic` used to perform on EVERY `getstatic` to
+/// decide whether the field was one of `System.out` / `err` / `in`.
+///
+/// Measured 2026-09-05, a `getstatic` + `putstatic` pair cost 86.4 ns against
+/// HotSpot's 3.45 (25x); `op_putstatic` never had the screen, so the pair's
+/// cost is the get half. Token: `CRATONVM_JIT=-system-class-latch`.
+cached_is_set!(no_system_class_latch, "CRATONVM_JIT_NO_SYSTEM_CLASS_LATCH");
+
 /// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
 /// backward branch instead of only once `Frame::backward_count` has reached
 /// the smallest threshold the call could accept. Token:
