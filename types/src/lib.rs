@@ -972,6 +972,90 @@ pub mod gc_entry_census {
     }
 }
 
+/// Offload attempted from COMPILED code, not the interpreter.
+///
+/// AUDIT 2026-09-04. `runtime::offload::try_dispatch` was reachable only
+/// from the interpreter's `execute_invokestatic`, so a JIT-compiled
+/// caller stopped offloading for good. `offload_jit_gate` covered that
+/// by refusing to compile the caller -- measured at 40x on
+/// `GpuHookOverheadBench`, and charged to every line of the method, not
+/// just the kernel call.
+///
+/// Now the compiled dispatch helper consults the hook too. These
+/// counters are how a run says whether that actually happened: a site
+/// bound to a direct `CALL` by some door this does not know about would
+/// simply stop offloading, silently, exactly as before.
+pub mod gpu_compiled_offload_census {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CONSIDERED: AtomicU64 = AtomicU64::new(0);
+    static OFFLOADED: AtomicU64 = AtomicU64::new(0);
+    static DECLINED: AtomicU64 = AtomicU64::new(0);
+    static UNDECODABLE: AtomicU64 = AtomicU64::new(0);
+    static SITES_RETIRED: AtomicU64 = AtomicU64::new(0);
+
+    /// A compiled site was RECOGNISED as a kernel call and entered the
+    /// offload attempt.
+    ///
+    /// Without this the census cannot tell "the hook never ran" from "the
+    /// hook ran and bailed", because both print nothing -- which is
+    /// exactly how the first run of this feature looked green-ish and
+    /// meant nothing.
+    #[inline]
+    pub fn note_considered() {
+        CONSIDERED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The attempt gave up before reaching the dispatcher: the argument
+    /// slots did not decode against the descriptor, no JIT thread was
+    /// installed, or `try_dispatch` returned an error. All three fall
+    /// through to the ordinary compiled call, which is safe -- and all
+    /// three are silent unless counted.
+    #[inline]
+    pub fn note_undecodable() {
+        UNDECODABLE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A compiled call site ran its kernel on the device.
+    #[inline]
+    pub fn note_offloaded() {
+        OFFLOADED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A compiled call site consulted the hook and ran on the CPU.
+    #[inline]
+    pub fn note_declined() {
+        DECLINED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A compiled call site stopped consulting the hook after too many
+    /// consecutive declines. The hook costs ~0.5 us per call; a site
+    /// whose arrays are always small would otherwise pay it forever,
+    /// which is the regression this fix would trade for the one it
+    /// removes.
+    #[inline]
+    pub fn note_site_retired() {
+        SITES_RETIRED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn exit_summary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let con = CONSIDERED.load(Ordering::Relaxed);
+        let off = OFFLOADED.load(Ordering::Relaxed);
+        let dec = DECLINED.load(Ordering::Relaxed);
+        let und = UNDECODABLE.load(Ordering::Relaxed);
+        let ret = SITES_RETIRED.load(Ordering::Relaxed);
+        if con + off + dec + und + ret == 0 {
+            return;
+        }
+        ONCE.call_once(|| {
+            eprintln!(
+                "[cratonvm] gpu compiled-caller offload: considered={con} offloaded={off}                  declined={dec} bailed={und} sites_retired={ret}"
+            );
+        });
+    }
+}
+
 pub mod gpu_jit_gate_census {
     use std::sync::atomic::{AtomicU64, Ordering};
 

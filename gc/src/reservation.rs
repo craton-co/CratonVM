@@ -95,6 +95,134 @@ pub fn process_committed_bytes() -> usize {
     COMMITTED_BYTES.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// The recently-decommitted ring
+// ---------------------------------------------------------------------------
+
+/// How many give-backs are remembered. Small, fixed, and statically allocated:
+/// this is read from a SIGSEGV handler, where nothing may allocate or lock.
+pub const RECENT_DECOMMITS: usize = 64;
+
+/// A ring of the last [`RECENT_DECOMMITS`] spans this process handed back to
+/// the OS, so a crash handler can answer **"is this fault address memory we
+/// gave away?"**
+///
+/// # Why this exists
+///
+/// A use-after-free of HEAP memory reads, in a register dump, exactly like a
+/// wild pointer: an address inside the heap's reservation, faulting, with
+/// nothing to say why. Before the reserve/commit store the same defect merely
+/// read stale bytes and was invisible; now it faults, which is an improvement
+/// only if the crash names the mechanism. The JIT side already answers the
+/// equivalent question for code (`recent_code_free_covering`), and that ring is
+/// the model for this one, including the ordering rule below.
+///
+/// # Re-commit is the trap
+///
+/// A granule handed back can be committed again minutes later, at which point
+/// the address is mapped and a fault there is NOT this. So a slot is not
+/// erased on re-commit -- it is FLAGGED ([`DECOMMIT_RECOMMITTED`]), because
+/// "we gave this away and then took it back" is itself worth reporting, and
+/// erasing it would silently turn a real answer into "no record".
+///
+/// # Reading it
+///
+/// Atomic loads only, no allocation, no lock: async-signal-safe. `base` is
+/// published last with `Release` and read first with `Acquire`, so a torn slot
+/// reads as empty rather than as a wrong range.
+static DECOMMIT_BASE: [AtomicUsize; RECENT_DECOMMITS] =
+    [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
+static DECOMMIT_LEN: [AtomicUsize; RECENT_DECOMMITS] =
+    [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
+static DECOMMIT_FLAGS: [AtomicUsize; RECENT_DECOMMITS] =
+    [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
+/// The `&'static str` naming the collector-level site that released the span.
+/// Split into pointer and length because a `&str` is not atomically storable;
+/// both halves point into `'static` data, so the handler may read them.
+static DECOMMIT_SITE_PTR: [AtomicUsize; RECENT_DECOMMITS] =
+    [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
+static DECOMMIT_SITE_LEN: [AtomicUsize; RECENT_DECOMMITS] =
+    [const { AtomicUsize::new(0) }; RECENT_DECOMMITS];
+static DECOMMIT_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// The span was committed again after this give-back, so its address is mapped
+/// now and a fault inside it is not explained by the give-back alone.
+pub const DECOMMIT_RECOMMITTED: usize = 1 << 0;
+
+/// Total granule spans this process has handed back to the OS.
+/// Async-signal-safe.
+pub fn decommits_total() -> usize {
+    DECOMMIT_SEQ.load(Ordering::Relaxed)
+}
+
+/// Remember that `[addr, addr + len)` went back to the OS from `site`.
+fn record_decommit(addr: usize, len: usize, site: &'static str) {
+    let i = DECOMMIT_SEQ.fetch_add(1, Ordering::Relaxed) % RECENT_DECOMMITS;
+    // Base last, for the reason on the ring's doc.
+    DECOMMIT_BASE[i].store(0, Ordering::Relaxed);
+    DECOMMIT_LEN[i].store(len, Ordering::Relaxed);
+    DECOMMIT_FLAGS[i].store(0, Ordering::Relaxed);
+    DECOMMIT_SITE_PTR[i].store(site.as_ptr() as usize, Ordering::Relaxed);
+    DECOMMIT_SITE_LEN[i].store(site.len(), Ordering::Relaxed);
+    DECOMMIT_BASE[i].store(addr, Ordering::Release);
+}
+
+/// Flag every remembered span that `[addr, addr + len)` overlaps as re-taken.
+///
+/// Called from the commit path, which reaches the OS only for a RUN OF
+/// UNCOMMITTED granules -- an allocation into already-backed memory never gets
+/// here -- so the fixed scan is off every hot path.
+fn note_recommit(addr: usize, len: usize) {
+    let end = addr.saturating_add(len);
+    for i in 0..RECENT_DECOMMITS {
+        let base = DECOMMIT_BASE[i].load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let blen = DECOMMIT_LEN[i].load(Ordering::Relaxed);
+        if addr < base.saturating_add(blen) && base < end {
+            DECOMMIT_FLAGS[i].fetch_or(DECOMMIT_RECOMMITTED, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Was `addr` inside one of the last [`RECENT_DECOMMITS`] spans this process
+/// handed back to the OS? Returns `(base, len, site, flags)`.
+///
+/// Check [`DECOMMIT_RECOMMITTED`] in `flags` BEFORE concluding anything: a
+/// re-committed span is mapped again, so a fault inside it is a different
+/// question. A hit WITHOUT that flag, on a fault address, is a use-after-free
+/// of heap memory and names the release site that made it fatal.
+///
+/// Async-signal-safe: atomic loads and a `'static` string slice.
+pub fn recent_decommit_covering(addr: usize) -> Option<(usize, usize, &'static str, usize)> {
+    for i in 0..RECENT_DECOMMITS {
+        let base = DECOMMIT_BASE[i].load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let len = DECOMMIT_LEN[i].load(Ordering::Relaxed);
+        if addr >= base && addr < base.saturating_add(len) {
+            let ptr = DECOMMIT_SITE_PTR[i].load(Ordering::Relaxed) as *const u8;
+            let slen = DECOMMIT_SITE_LEN[i].load(Ordering::Relaxed);
+            let site = if ptr.is_null() || slen == 0 || slen > 128 {
+                "?"
+            } else {
+                // SAFETY: written by `record_decommit` from a `&'static str`,
+                // whose bytes are valid UTF-8 and outlive the process.
+                unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, slen)) }
+            };
+            return Some((
+                base,
+                len,
+                site,
+                DECOMMIT_FLAGS[i].load(Ordering::Relaxed),
+            ));
+        }
+    }
+    None
+}
+
 /// The heap's backing bytes.
 pub enum HeapStore {
     /// The pre-existing `alloc_zeroed` block. Wholly committed at construction.
@@ -346,10 +474,16 @@ impl HeapStore {
     /// **The caller must prove the range holds nothing live.** There is no
     /// check here and there cannot be one: this type knows about bytes, not
     /// objects.
-    pub fn decommit_range(&mut self, offset: usize, len: usize) -> usize {
+    ///
+    /// `site` names the collector-level reason, and it is not decoration: it
+    /// is stored in the recently-decommitted ring and printed by the crash
+    /// handler, where it is the difference between "a free-listed span was
+    /// still reachable" (a missing root) and "the cursor retracted over live
+    /// bytes" (a sweep defect). See [`recent_decommit_covering`].
+    pub fn decommit_range(&mut self, offset: usize, len: usize, site: &'static str) -> usize {
         match self {
             HeapStore::Owned(_) => 0,
-            HeapStore::Reserved(r) => r.decommit_range(offset, len),
+            HeapStore::Reserved(r) => r.decommit_range(offset, len, site),
         }
     }
 }
@@ -577,6 +711,9 @@ impl Reservation {
         if !ok {
             return false;
         }
+        // This address is mapped again, so a later fault inside it is a
+        // different question from the give-back that preceded it.
+        note_recommit(self.base as usize + first * GRANULE, bytes);
         for g in first..first + count {
             if !self.is_committed(g) {
                 self.set_committed(g, true);
@@ -587,7 +724,7 @@ impl Reservation {
         true
     }
 
-    fn decommit_range(&mut self, offset: usize, len: usize) -> usize {
+    fn decommit_range(&mut self, offset: usize, len: usize, site: &'static str) -> usize {
         if len == 0 || offset >= self.reserved_len {
             return 0;
         }
@@ -605,23 +742,28 @@ impl Reservation {
             match (self.is_committed(g), run_start) {
                 (true, None) => run_start = Some(g),
                 (false, Some(s)) => {
-                    released += self.decommit_granules(s, g - s);
+                    released += self.decommit_granules(s, g - s, site);
                     run_start = None;
                 }
                 _ => {}
             }
         }
         if let Some(s) = run_start {
-            released += self.decommit_granules(s, last - s);
+            released += self.decommit_granules(s, last - s, site);
         }
         released
     }
 
-    fn decommit_granules(&mut self, first: usize, count: usize) -> usize {
+    fn decommit_granules(&mut self, first: usize, count: usize, site: &'static str) -> usize {
         if count == 0 {
             return 0;
         }
         let bytes = count * GRANULE;
+        // Remember the span BEFORE the syscall. A reader of the ring that sees
+        // a span still mapped is harmless; one that faults on a span the ring
+        // does not yet know about gets a crash report with no answer in it,
+        // which is the whole failure this ring exists to prevent.
+        record_decommit(self.base as usize + first * GRANULE, bytes, site);
         // CLEAR THE BITS BEFORE THE SYSCALL, not after.
         //
         // The bitmap is read lock-free (`HeapStore::commit_bits`, consulted by
@@ -886,7 +1028,7 @@ mod tests {
         assert_eq!(res.committed_granules(), 8);
         // A range that starts and ends mid-granule: only granules 2..5 are
         // wholly inside it.
-        let released = res.decommit_range(GRANULE + 16, 4 * GRANULE);
+        let released = res.decommit_range(GRANULE + 16, 4 * GRANULE, "test");
         if released == 0 {
             return; // platform declined; nothing to assert about the split
         }
@@ -911,7 +1053,7 @@ mod tests {
         assert!(res.commit_range(0, 2 * GRANULE));
         // SAFETY: committed above.
         unsafe { *res.base.add(GRANULE + 99) = 0xCD };
-        if res.decommit_range(GRANULE, GRANULE) == 0 {
+        if res.decommit_range(GRANULE, GRANULE, "test") == 0 {
             return; // platform declined
         }
         assert!(res.commit_range(GRANULE, GRANULE));
@@ -932,6 +1074,66 @@ mod tests {
         assert!(!res.commit_range(2 * GRANULE, 1));
     }
 
+    /// **THE RING NAMES THE SPAN, THE SITE, AND WHETHER IT CAME BACK.**
+    ///
+    /// This is the instrument a heap use-after-free is diagnosed with: the
+    /// crash handler asks `recent_decommit_covering(fault_addr)` and prints the
+    /// answer. Three things have to hold for that to be worth printing, and all
+    /// three are asserted here, because each one silently degrades the report
+    /// to a wrong answer rather than to no answer:
+    ///
+    ///  * an address inside a released span is FOUND, and one outside it is not
+    ///    -- a ring that reports every address explains every crash as a
+    ///    use-after-free;
+    ///  * the SITE survives the round trip, since it is what distinguishes a
+    ///    missing root from a mis-sized sweep;
+    ///  * a span committed again is FLAGGED rather than forgotten. An erased
+    ///    slot reads as "no record", which is indistinguishable from a wild
+    ///    pointer -- the exact confusion the ring exists to end.
+    #[test]
+    fn the_decommit_ring_answers_for_a_released_span_and_flags_its_return() {
+        let Some(mut res) = Reservation::reserve(8 * GRANULE) else {
+            return;
+        };
+        assert!(res.commit_range(0, 8 * GRANULE));
+        let base = res.base as usize;
+        let before = decommits_total();
+        if res.decommit_range(2 * GRANULE, 2 * GRANULE, "free-list-low") == 0 {
+            return; // platform declined the give-back; nothing was recorded
+        }
+        assert!(decommits_total() > before, "the give-back must be counted");
+
+        let hit = recent_decommit_covering(base + 2 * GRANULE + 4096)
+            .expect("an address inside the released span must be found");
+        assert_eq!(hit.0, base + 2 * GRANULE);
+        assert_eq!(hit.1, 2 * GRANULE);
+        assert_eq!(hit.2, "free-list-low", "the site must survive the ring");
+        assert_eq!(
+            hit.3 & DECOMMIT_RECOMMITTED,
+            0,
+            "nothing has re-committed this span yet"
+        );
+
+        // Still committed, and never released: a hit here would make every
+        // report a false positive.
+        assert!(
+            recent_decommit_covering(base + 7 * GRANULE).is_none(),
+            "an address outside every released span must NOT be reported"
+        );
+
+        // And the trap: take it back, and the same address must now read as
+        // reuse rather than as evidence.
+        assert!(res.commit_range(2 * GRANULE, 2 * GRANULE));
+        let after = recent_decommit_covering(base + 2 * GRANULE + 4096)
+            .expect("the slot must be kept, not erased");
+        assert_ne!(
+            after.3 & DECOMMIT_RECOMMITTED,
+            0,
+            "a span committed again must be flagged, so the handler stops \
+             calling it a use-after-free"
+        );
+    }
+
     /// **The owned fallback behaves as the block it replaces.**
     #[test]
     fn the_owned_store_is_wholly_committed_and_ignores_decommit() {
@@ -939,7 +1141,7 @@ mod tests {
         assert_eq!(store.len(), 4096);
         assert_eq!(store.committed_bytes(), 4096);
         assert!(store.commit_range(0, 4096));
-        assert_eq!(store.decommit_range(0, 4096), 0);
+        assert_eq!(store.decommit_range(0, 4096, "test"), 0);
         assert_eq!(store.committed_bytes(), 4096);
     }
 }
