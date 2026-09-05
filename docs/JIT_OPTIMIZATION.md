@@ -2310,6 +2310,115 @@ That, and the 2:1 instruction count against a tier that unrolls, is what the
 
 Both switches stay OFF pending that.
 
+#### The single-use intermediates, and the frame states that pin them
+
+The previous section ended by naming what the optimizing tier's loop still
+spends its frame traffic on: pairs of the shape
+
+```text
+mov [rbp-0C0h],rax      ; store the result of an Add
+mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+```
+
+`plan_register_residency` skips every one of these (`single_use` in its census)
+and is right to — their live range is one instruction, so they do not want a
+register, they want not to be written to memory. `CRATONVM_JIT_IR_CARRY_SINGLE_USE`
+is `fused_cmp`'s move generalised to them: when a value has exactly one use and
+its consumer is the very next node in the same block, it stays in the register
+the arm computed it in. RAX when the consumer reads it first, RCX when it reads
+it second — one register move that still removes a memory access.
+
+Neither half of the contract is trusted. The read refuses unless it is the
+planned consumer asking for the planned register, and — for an RAX carry —
+unless `buf.pos()` proves nothing was emitted in between, which is a proof
+rather than an audit of what the arms do. A carry that outlives its consumer,
+or reaches a block boundary or a terminator, refuses too. Both allowlists have
+source-scanning tests that check them against the arms they name.
+
+**The first cut planned ZERO carries, and why is the more useful half of this
+section.** The screen was `deopt_named`, and the IR graph says every candidate
+fails it:
+
+```text
+20: Mul : Int <- [13, 19]  bci=Some(16)
+safepoint[12] bci=17 locals=[3, 12, -, 13, 14] stack=[20]
+safepoint[15] bci=22 locals=[3, 12, -, 13, 14] stack=[20, 22]
+safepoint[16] bci=23 locals=[3, 12, -, 13, 14] stack=[23]
+```
+
+`graph.safepoints` records the **full operand stack at every bci**, so an
+intermediate is named by a frame state from its definition until its consumer
+pops it. That is the same wall the residency file hit — its `blocked_deopt`
+census — reached from a different direction.
+
+And it is worth reading beside what the door reports for this very method:
+`sentinel_free=true`, which is `deopt_stub_patches.is_empty() &&
+call_exc_patches.is_empty()` — **this body emits no deopt stub at all**.
+Thirty-three frame states, not one of them reachable from inside the code, and
+they are what pins every intermediate to memory.
+
+So the change splits in two, and the split is the point. Eliding the LOAD asks
+nothing of the frame: the home word is still written, every frame state still
+resolves through it, and a read of a word RAX already holds becomes no
+instruction. Dropping the STORE keeps the `deopt_named` screen. On this kernel
+that is `planned=4 ... stores_dropped=0 still_deopt_named=4`.
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| **+ carry alone** | 57 | 27 | 13 | 14 |
+| + the residency stack | 56 | 19 | 9 | 10 |
+| **+ both** | 55 | **15** | **5** | 10 |
+
+Four carries, four loads gone, `refused=0`, and `ck=5100017428506113` — HotSpot's
+answer — in all four arms.
+
+**And this one is unambiguous on the clock.** Five interleaved arms at
+`n=200,000,000`, nine rounds, host load ~10–12 on 8 cores, single-pass run twice
+as its own control:
+
+| arm | mean ms |
+|---|---|
+| single-pass OSR | 385.7 |
+| single-pass OSR (control) | 385.4 |
+| optimizing door, switches off | 657.4 |
+| **+ carry alone** | **592.4** |
+| **+ carry + the residency stack** | **557.9** |
+
+The control-vs-control floor is **0.08%** — the quietest measurement this file
+has recorded. The carry alone is **9.9%** and beats the door arm in **9 of 9**
+rounds; with the residency stack it is **15.1%**, also 9 of 9. The tier
+inversion goes **1.70x to 1.45x**.
+
+That also revises the previous section's conclusion, in the direction of the
+evidence rather than away from it. Frame stores alone did not explain the gap —
+39% of them bought 6.7%. But frame *round trips on the critical path* do: these
+four loads are each one instruction's distance from the store that fed them, so
+every one is a store-forwarding stall in the middle of a serial recurrence, and
+removing four of them is worth more than removing twelve stores that nothing
+was waiting on.
+
+**What the remaining ten stores are, and the exact rule that would remove
+them.** They are home writes for values named only by frame states no deopt can
+reach. The precise condition is not "no safepoint names it" but *no safepoint
+that names it sits where a deopt can actually be taken* — which is the union of
+
+* **trap bcis**: `Op::Guard`, the `Op::Div`/`Op::Rem` zero guard, calls,
+  allocations, array and field access, `checkcast`, the monitor ops;
+* **safepoint-poll bcis**: the back-edge terminators, where the runtime can
+  transfer a frame out from under the compiled body.
+
+For `OsrTierBench.kernel` the first set is empty and the second is the single
+`If` at bci 10, whose stack is `[14, 3]` — a phi and a parameter, neither of
+them an intermediate. All four carried values would become droppable.
+
+It is a separate change because it removes a backstop rather than adding one.
+`build_deopt_points` currently builds a point for **every** safepoint with a
+native anchor, so a dropped home is caught there today by `frame_value_of`
+refusing the compile. Making these values droppable means also not building the
+unreachable points — at which point the trap/poll classification above is
+load-bearing rather than backstopped, and it deserves its own pass.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
