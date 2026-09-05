@@ -59,6 +59,25 @@ fn ipc_dbg(msg: impl AsRef<str>) {
     }
 }
 
+/// Phase tracer for the blocking connect, answering to EITHER
+/// `CRATONVM_SUREFIRE_IPC_DBG` or `CRATONVM_DBG_NET`.
+///
+/// Two flags on purpose. The connect path's existing traces are `ipc_dbg`,
+/// gated on `CRATONVM_SUREFIRE_IPC_DBG` — a name nobody reaches for when
+/// investigating a socket stall. `CRATONVM_DBG_NET=1` on a hung connect
+/// therefore printed NOTHING, and the silence read as "this path has no
+/// tracing" rather than "you picked the wrong flag"; that cost most of the
+/// localisation effort in
+/// `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+/// A separate function rather than widening `ipc_dbg` itself, so the ~50
+/// existing IPC sites keep their current gate and only the connect phases
+/// gain the second one.
+fn connect_dbg(msg: impl AsRef<str>) {
+    if ipc_dbg_enabled() || crate::io_flags().dbg_net {
+        eprintln!("[CONNECT-DBG] {}", msg.as_ref());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry of real OS sockets — keyed by integer id stashed in the synthetic
 // SocketChannelImpl / ServerSocketChannelImpl Java object.
@@ -2709,9 +2728,35 @@ fn sc_connect_inner(
         // while keeping `policy_connect`'s SSRF vetting and timeout. That is a
         // rewrite of the VM's busiest connect path and belongs behind its own
         // build + full-vector run, not a drive-by.
+        // PHASE TRACE. These four checkpoints exist to answer one question
+        // that no coarser instrument can: when a blocking connect stops
+        // returning, WHICH part stopped. The pair that used to bracket this
+        // branch (`connect target=` above, `connect success(blocking)` below)
+        // spans the dial, a registry write lock AND a string allocation, so a
+        // stall anywhere in it produced the identical evidence.
+        //
+        //   dial-enter  ... no dial-return  -> inside `policy_connect`, whose
+        //                                      own timeout is documented finite
+        //                                      (30 s), so an indefinite stall
+        //                                      here contradicts that and the
+        //                                      timeout is the thing to doubt
+        //   dial-return ... no registered   -> `tcp_register` /
+        //                                      `tcp_blocking_state`, i.e. the
+        //                                      `tcp_registry()` write lock; a
+        //                                      writer starved by readers looks
+        //                                      exactly like a hung syscall
+        //   registered  ... no success      -> the `cf_set` run or
+        //                                      `create_string`, which
+        //                                      ALLOCATES and can therefore
+        //                                      reach a collection
+        connect_dbg(format!("dial-enter target={target}"));
         ctx.begin_blocking_region();
         let connect_result = crate::outbound_policy::policy_connect(&target);
         ctx.end_blocking_region();
+        connect_dbg(format!(
+            "dial-return target={target} ok={}",
+            connect_result.is_ok()
+        ));
         let stream = match connect_result {
             Ok(s) => s,
             Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
@@ -2732,6 +2777,7 @@ fn sc_connect_inner(
         let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
         let id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
         tcp_blocking_state().write().insert(id, blocking);
+        connect_dbg(format!("registered id={id} local_port={local_port}"));
         cf_set(ctx, this, F_REG_ID, Value::Int(id));
         cf_set(ctx, this, F_CONNECTED, Value::Int(1));
         cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
