@@ -38,6 +38,69 @@ references in compiled frames all changed nothing.
 **Neither fix alone retires this page.** Without the arena fix the class
 crashes; without the credit it logs 6264 OOMs and never finishes.
 
+## ADDENDUM 2026-09-05 (b): re-verified on dev, and the RESIDUAL IS NOW LOCK TIMEOUTS, accounted to the unit
+
+Five runs, release binary built from `091754fbd`, local box, `--Xmx 1g`, the
+invocation this page specifies. This is the first run of this class on a tree
+carrying the cross-collector GC work (`eaea9a588`), whose ZGC changes sit
+directly adjacent to the give-back this page's fix depends on -- so it is both a
+re-verification of the resolution and a regression check on that merge.
+
+| run | wall | `actual` | ref-array OOM | SIGSEGV | `relocation_on_proven_jit` | `relocation_skipped_jit` |
+|---|---|---|---|---|---|---|
+| 1 | 524 s | 99966 | 0 | 0 | 33 | 1 |
+| 2 | 593 s | 99937 | 0 | 0 | 42 | 1 |
+| 3 | 524 s | 99968 | 0 | 0 | 43 | 4 |
+| 4 | 442 s | 99969 | 0 | 0 | 22 | 2 |
+| 5 | 470 s | 99970 | 0 | 0 | 24 | 0 |
+
+**The resolution holds.** 0 OOM and 0 SIGSEGV in 5, matching the `0 / 0 of 5`
+above, and the merge did not disturb the class.
+
+**And the run is not vacuous**, which is the number to check before believing
+any of the rest: `relocation_on_proven_jit` is 22-43, at or above the 22-24 this
+page recorded. Compaction under live JIT frames genuinely ran. A zero there
+would have made a clean result meaningless.
+
+### The remaining shortfall is not this defect, and it accounts exactly
+
+| run | missing | `Timeout trying to lock table "COUNTER"` |
+|---|---|---|
+| 1 | 34 | 34 |
+| 2 | 63 | 63 |
+| 3 | 32 | 32 |
+| 4 | 31 | 31 |
+| 5 | 30 | 30 |
+
+Exact, in every run, the same way `1696 = 1691 OOM + 5 SQLException` accounted
+for the OOM era. With the OOM at zero, **every** missing entry is now a lock
+timeout -- an `SQLException`, which the callable DOES catch and print, unlike the
+`OutOfMemoryError` that sailed past it into an ungot `FutureTask`.
+
+So the residual has changed KIND. It is no longer a GC defect: it is H2's own
+lock timeout firing because the VM is slow enough to trip it. HotSpot runs this
+class in **9 s** with `actual: 100000` and no timeouts; these runs take 442-593 s.
+
+The shortfall tracks wall time, which is what a throughput explanation predicts
+and a correctness one does not:
+
+```text
+442 s -> 31    470 s -> 30    524 s -> 32    524 s -> 34    593 s -> 63
+```
+
+The slowest run has roughly double the timeouts of the fastest. Suggestive
+rather than proven on five points -- the decisive test is to raise H2's
+`LOCK_TIMEOUT` and see the count go to zero without the VM getting any faster.
+If it does, this class's remaining gap belongs on a throughput page and this one
+can be retired outright rather than merely resolved.
+
+**What this means for anyone reading the `actual` figure.** `99937-99970` is not
+a better or worse version of the `98304` at the top of this page; it is a
+different quantity. `98304` was tasks dying silently to `OutOfMemoryError`.
+These are tasks that ran, hit a lock timeout, and reported it. Comparing the two
+numbers as if they measured the same thing is the mistake this section exists to
+prevent.
+
 ## ADDENDUM 2026-09-05: the SIGSEGV had a READ half, and it was open through every run above
 
 The fix this page closed on is the WRITE half of a two-sided defect, and the
