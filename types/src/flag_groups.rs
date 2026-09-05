@@ -1604,6 +1604,10 @@ pub const INVENTORY: &[E] = &[
     // `arraylength-fast` — off routes `arraylength` back through the `Value`
     // round trip and the `VmHeap` enum dispatch, for one header read.
     E { group: Group::JIT, token: "arraylength-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_ARRAYLENGTH_FAST"), off_word: None, since: "2026-09-05" },
+    // `ref-array-fast` — off routes `aaload` back through
+    // `VmHeap::get_array_element`; the `0x2e..=0x35` arm's primitive half
+    // declines reference elements by construction.
+    E { group: Group::JIT, token: "ref-array-fast", on_key: None, off_key: Some("CRATONVM_JIT_NO_REF_ARRAY_FAST"), off_word: None, since: "2026-09-05" },
     // `osr-inline-gate` — off calls `try_osr_with_backoff` on every backward
     // branch instead of only past the smallest OSR threshold.
     E { group: Group::JIT, token: "osr-inline-gate", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_INLINE_GATE"), off_word: None, since: "2026-09-02" },

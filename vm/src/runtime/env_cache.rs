@@ -1920,6 +1920,17 @@ cached_is_set!(no_field_addr_elide, "CRATONVM_JIT_NO_FIELD_ADDR_ELIDE");
 /// Token: `CRATONVM_JIT=-arraylength-fast`.
 cached_is_set!(no_arraylength_fast, "CRATONVM_JIT_NO_ARRAYLENGTH_FAST");
 
+/// `CRATONVM_JIT_NO_REF_ARRAY_FAST` -- route `aaload` back through
+/// `VmHeap::get_array_element`.
+///
+/// `aaload` sits in the same `0x2e..=0x35` dispatch arm as `iaload`, but that
+/// arm's quickened half declines it (`prim_elem_for_opcode` has no reference
+/// entry), so every reference element load took the full path. Measured
+/// 2026-09-05 at 99.9 ns per iteration against `iaload`'s 79.0 in the identical
+/// loop -- 21 ns, where HotSpot has the two identical to within noise.
+/// Token: `CRATONVM_JIT=-ref-array-fast`.
+cached_is_set!(no_ref_array_fast, "CRATONVM_JIT_NO_REF_ARRAY_FAST");
+
 /// `CRATONVM_JIT_NO_OSR_INLINE_GATE` -- call `try_osr_with_backoff` on every
 /// backward branch instead of only once `Frame::backward_count` has reached
 /// the smallest threshold the call could accept. Token:

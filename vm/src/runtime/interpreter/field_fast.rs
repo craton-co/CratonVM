@@ -921,6 +921,102 @@ pub(super) fn array_load_prim(
     true
 }
 
+/// Quickened `aaload`.
+///
+/// Pushes the reference element and returns `true`, or leaves the stack
+/// untouched and returns `false` so the caller keeps `VmHeap::get_array_element`
+/// (which owns every exception and every cold decode).
+///
+/// # Why this exists
+///
+/// `aaload` is in the dispatch loop's `0x2e..=0x35` arm, but that arm's
+/// quickened half declines it: `prim_elem_for_opcode` has no reference entry,
+/// so until now every `aaload` fell through to the full path. Measured
+/// 2026-09-05 on `probes/ArrBurn.java`, 30 M iterations: `aaload` 99.9 ns per
+/// iteration against `iaload`'s 79.0 in the identical loop shape — **21 ns**,
+/// where HotSpot has the two identical to within noise.
+///
+/// The first attempt at this row blamed the autobox screen
+/// (`get_array_element` called `autobox_payload`, whose first act is
+/// `is_object_address`, unlatched). Latching it was correct and is kept, but
+/// it measured **nothing** — 3/8 pairwise, 20 ms in 2960. The cost is not one
+/// probe, it is the whole slow path: a `VmHeap` enum `dispatch!`, the
+/// collector's own header and bounds re-reads, an `Acquire` load for the
+/// barrier arm, `read_prim_element`'s match, and a 16-byte `Value` returned to
+/// be re-encoded into an 8-byte stack slot.
+///
+/// # What it declines, and why each one has to
+///
+/// * **`load_barrier_armed()`** — the barrier arm of `get_array_element`
+///   self-heals the slot through `load_barrier_slot` and has different
+///   semantics from a plain read. Nothing in a default run arms it, but when
+///   something does, this arm must not be the one answering.
+/// * **`autobox::wrapper_exists()`** — a wrapper in a reference slot must be
+///   un-boxed, which is the work the latch beside this screens for. Same
+///   screen, same reason as the compact reference-field arm above.
+/// * **A word that is neither zero nor a plausible heap pointer** — that is
+///   `ref_element_word_implausible`'s population, and it is not one answer but
+///   three: a well-formed ZGC colored word (a hard failure naming the missing
+///   barrier), stale garbage (a counted degrade to null), and the counter that
+///   separates them. Reproducing any of that here would be a second copy of a
+///   diagnosis; declining keeps it in one place.
+///
+/// `raw == 0` is handled rather than declined, because an ordinary null
+/// element is the common case and `decode_ref_element_word`'s cold arm returns
+/// `Object(None)` for it without counting anything.
+#[inline]
+pub(super) fn array_load_ref(
+    zgc: &ZgcRealHeap,
+    stack: &mut ValueStack,
+    arr: ObjectRef,
+    index: i32,
+) -> bool {
+    if crate::runtime::env_cache::no_ref_array_fast() {
+        return false;
+    }
+    if index < 0 {
+        return false;
+    }
+    if zgc.load_barrier_armed() || cratonvm_gc::autobox::wrapper_exists() {
+        return false;
+    }
+    let base = arr.as_ptr() as usize;
+    // SAFETY: `arr` is the array reference of a verified `aaload`, popped from
+    // the operand stack in this same safepoint-free window; its first
+    // `HEADER_SIZE` bytes are a live header. See `registry_probe_restored`.
+    let header = unsafe { &*(base as *const ObjectHeader) };
+    if header.kind() != ObjectKind::Array
+        || header.element_type() != ArrayElementType::Reference
+    {
+        return false;
+    }
+    let index = index as usize;
+    if index >= header.array_length() as usize {
+        return false;
+    }
+    let Some(offset) = index.checked_mul(cratonvm_types::narrow_oop::ref_element_size()) else {
+        return false;
+    };
+    // SAFETY: `index < length` and the stride is the one `read_prim_element`
+    // uses for a reference element, so the slot lies inside the array body.
+    let raw = unsafe {
+        cratonvm_types::narrow_oop::read_ref_slot((base as *const u8).add(cratonvm_types::ARRAY_DATA_OFFSET + offset))
+    };
+    let cv = if raw == 0 {
+        CompactValue::null()
+    } else if cratonvm_types::plausible_heap_pointer(raw) {
+        match CompactValue::try_from_pointer(raw) {
+            Some(cv) => cv,
+            None => return false,
+        }
+    } else {
+        // The three-way cold decode above; not reproduced here.
+        return false;
+    };
+    stack.push_compact(cv);
+    true
+}
+
 /// Quickened primitive `*astore`: stores `val` (already peeked with its kind
 /// mark) and returns `true`, or returns `false` so the caller keeps the
 /// general path.

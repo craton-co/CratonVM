@@ -7229,6 +7229,18 @@ fn execute_frame_from_index(
                                 frame.pc = saved_pc + 1;
                                 continue;
                             }
+                            // `aaload` is the one member of this range the
+                            // primitive arm declines by construction; it has
+                            // its own arm rather than an entry in
+                            // `prim_elem_for_opcode` because a reference
+                            // element needs the barrier and autobox screens a
+                            // primitive one does not.
+                            if opcode == 0x32
+                                && field_fast::array_load_ref(zgc, &mut frame.stack, arr_ref, index)
+                            {
+                                frame.pc = saved_pc + 1;
+                                continue;
+                            }
                         }
                         match shared.mem.heap.get_array_element(arr_ref, index as usize) {
                             Ok(value) => {
