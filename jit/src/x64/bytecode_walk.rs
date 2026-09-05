@@ -556,6 +556,10 @@ impl Compiler {
 
         let mut dead = false; // true after unconditional control transfer
 
+        // Read once for the whole method: see `osr_empty_stack_entry_enabled`
+        // for why this is not a `OnceLock` and not read per pc.
+        let osr_empty_stack_rule = super::osr::osr_empty_stack_entry_enabled();
+
         let mut pc = 0;
         while pc < code_len {
             // Stage 2 (precise oop maps) — track the bytecode PC being emitted
@@ -851,7 +855,28 @@ impl Compiler {
                 // an empty expression stack, so the pcs this newly refuses
                 // are mid-expression ones the interpreter reaches again a
                 // few bytecodes later at the header.
-                let operand_stack_live = !self.stack.is_empty();
+                // `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` gives this rule
+                // an off switch; see `osr::osr_empty_stack_entry_enabled` for
+                // why a soundness rule gets one.
+                let operand_stack_live = !self.stack.is_empty() && osr_empty_stack_rule;
+                if operand_stack_live {
+                    // The switch above changes no ANSWER — that is the page's
+                    // own finding — so its engagement is invisible in output.
+                    // Count it, and name it in the `[cratonvm-jitc]` stream the
+                    // other OSR refusals already use, so "the rule fired" /
+                    // "the switch turned it off" is one grep instead of an
+                    // inference from a diff that is empty either way. See
+                    // `super::osr::OSR_EMPTY_STACK_REFUSALS`.
+                    let n = super::osr::OSR_EMPTY_STACK_REFUSALS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] osr-refuse (operand-stack-live) pc={pc} depth={} #{n}",
+                            self.stack.len()
+                        );
+                    }
+                }
                 if inside_aaload_hoisted
                     || inside_arith_hoisted
                     || inside_len_hoisted

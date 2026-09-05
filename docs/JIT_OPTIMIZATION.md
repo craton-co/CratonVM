@@ -2056,6 +2056,260 @@ optimizing tier's loop body cannot be measured on a workload where that body is
 not what runs.** Every zero this section records against those switches was
 taken on one.
 
+#### Taking on the 1.57x: the census says ONE value of four is in a register
+
+With a workload where the optimizing tier finally owns a loop
+(`probes/OsrTierBench.java` through the OSR door), the residency census is
+readable for the first time on the population that matters. Its kernel has four
+live values — `n`, `sum`, `acc`, `i` — and five registers to put them in:
+
+```text
+[ir-ls] peak_live=15 scan_promoted=19 resident=1 (gp=1) splits=12
+[ir-ls] skipped: split_or_spilled=3 const=7 single_use=20 no_alloc=3
+```
+
+**The allocator promotes nineteen values and the residency file accepts one.**
+`split_or_spilled=3` is the whole loop-carried set minus the one that survived.
+
+**Why the scan evicts exactly the wrong values.** `ls_pick_victim` maximises
+`next_use_distance × SCALE / frequency_weight`, which is the classic rule and is
+right when a reload is paid ONCE. A loop-carried value's next use is across the
+back edge, so its distance is large; and it typically has FEWER uses than a
+temporary in the same body, so its weight is smaller. Both terms point the same
+way, and the value whose eviction costs a store and a reload on *every
+iteration* scores as the best victim available.
+
+Loop-depth weighting cannot separate the two, and that is worth stating plainly
+because the weighting is already there: a loop-carried phi and a temporary in
+the same loop body sit at the SAME depth. What distinguishes them is not where
+they are but how long they live — across the back edge, or not.
+
+**The fix, and what it bought.** `LiveModel::carried` marks a value whose range
+spans a back-edge position, and `ls_carry_relief` divides such a value's
+distance before scoring, which keeps the ordering among carried values while
+moving all of them behind the uncarried ones. It works, deterministically:
+`resident` 1 → 2 and `split_or_spilled` 3 → 2, saturating by a relief of 64.
+
+**It is default OFF, because it is not shown to pay.** The timing arm was
+attempted and is not usable: the host was at load 22 on 8 cores, and this file
+has recorded twice already what a contended host does to an arm. A zero taken
+there is not a zero. That measurement is owed.
+
+**And the census names what actually stands in the way.** Two of the four
+carried values are STILL split, and `plan_register_residency` refuses any split
+value outright — the file has no reload machinery, so "one segment, one
+register, whole range" is the admission. With four carried values and five
+registers there is no reason to split any of them; the scan splits them because
+it allocates them in competition with eleven transients under `peak_live=15`.
+
+So the shape of the remaining work is not a better heuristic. It is **reserving
+the carried set** — assigning those values registers before the scan runs and
+letting everything else compete for what is left, which is what the single-pass
+tier does by colouring locals into callee-saved registers and is why it wins by
+1.57x. The heuristic fix above moves one value; reserving moves the set, and
+this section's own conclusion has been "the live set has to move as a group, or
+not at all" since the four zeros.
+
+#### Reserving the carried set: the whole live set is in registers now
+
+The blocker the previous census named, taken on. `plan_register_residency`
+assigns a register to every LOOP-CARRIED value out of the ones the scan left
+free, before the parameter copy and after the scan — the same door the parameter
+copy already uses, and the same safety argument: **a register in this file that
+the accepted set does not name is written by nothing**, because emission is
+driven by `gp_reg_of` alone.
+
+The point is not that the scan decided badly. It is that it was asked the wrong
+question: it allocated four values that are needed on every iteration in
+competition with eleven transients under `peak_live=15`, so it split them, and
+the file refuses a split value because it has no reload machinery. Reserving
+asks instead — these few are needed every iteration, give each one a register
+and let everything else have the rest.
+
+On `probes/OsrTierBench.java`, with `CRATONVM_JIT_IR_RESERVE_CARRIED=1`:
+
+| | resident | carried_reserved |
+|---|---|---|
+| off | **1** (gp=1) | 0 |
+| on | **5** (gp=5) | 4 |
+
+All five registers in use, and each of the kernel's four loop-carried values has
+one. That is "the live set moves as a group" actually happening, after a
+section-length run of changes that each moved one value.
+
+**Correctness holds**: `ck=25500075088100865`, HotSpot's answer, with the
+reservation on — and the same under `--nojit`.
+
+**The timing is owed, again, and for the same reason.** The control-vs-control
+floor on the day was **6.3%** at host load 12–40 on 8 cores; the arms
+(`base` 691, `reserve` 752, `reserve`+the phi stack 677) all sit inside it. This
+file has now recorded three separate days where a contended host denied an arm,
+and the rule it keeps proving is that a number taken there is not a number.
+Default OFF until it is measured on a quiet one.
+
+**What the measurement should expect to see, when it happens.** Reserving
+removes the RELOADS of the carried set; the write-through home STORES remain
+unless `CRATONVM_JIT_IR_DROP_PHI_HOME` is also on, which is why the two want
+measuring together. The prediction the 1.57x implies is that the pair, not
+either alone, is what closes it.
+
+#### The measurement a contended host cannot deny: the loop body itself
+
+Three days of timing arms have been refused by host load. The emitted code is
+not: it is a deterministic function of the compile, so counting it settles what
+a stopwatch could not. Doing that first required fixing an instrument.
+
+**The OSR door's optimizing artifact was invisible to `CRATONVM_DBG_JIT_DISASM`.**
+The only `osr` dump comes from inside `compile_osr_artifact`, which the door
+SKIPS when it takes an optimizing body — and the background tier worker calls
+that function anyway, so a dump appears, is labelled `osr`, and is the
+single-pass body. It is byte-identical with the door on and off, which reads as
+"the door changes nothing" while `osr_entered_optimizing=1` and a 1.56x timing
+gap say it changes everything. The door now dumps what it actually enters, under
+`osr-optimizing`.
+
+With that, `OsrTierBench.kernel`'s loop body, counted:
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 138 | 52 | 22 | 19 |
+| **+ reserve the carried set** | 152 | **60** | 26 | 23 |
+| + reserve + the phi/home-drop stack | 146 | 50 | 20 | 19 |
+
+**Reserving the carried set ALONE makes the loop worse**, and the mechanism is
+the one this section named long ago: residency is a **write-through read cache
+over a frame-slot-first model**. Promoting a value adds a PUBLISH at its
+definition and does not remove its home STORE, so promoting four more values
+buys four more memory operations per iteration and removes reads only where a
+read already went through `gp_load_value`. `resident=1 → 5` is a real census
+movement and a regression in emitted traffic.
+
+That is a direct correction to the expectation set when the reservation landed,
+which predicted the pair would close the 1.57x. The pair is better than
+reserving alone — 50 against 60 — but it is only 52 → 50 against doing neither,
+on a kernel with four live values whose loop still performs **fifty** frame
+operations. The gap is not going to be closed by promoting more values into a
+cache that cannot remove the stores underneath them.
+
+So both switches stay OFF, and the next move is not another promotion policy.
+It is the one the design page named and the census keeps re-deriving: a value
+that lives in a register for its whole range should have **no home slot and no
+store**. `CRATONVM_JIT_IR_DROP_PHI_HOME` does that for phis, at one site; the
+other forty-nine store sites are what the loop's remaining fifty frame
+operations are made of.
+
+#### The forty-nine store sites, and what removing them did not buy
+
+`CRATONVM_JIT_IR_DROP_PHI_HOME` dropped one frame store, at the one site
+(`emit_copy_op`) where this backend knew both that RAX held a value and *which*
+value it was. Every other definition writes its home through `store_rax`, which
+knew neither. Both facts were available and neither was being passed:
+`lower_data_node_tracked` now records the definition being lowered, and
+`publish_def_at_store` recognises the store whose offset is that definition's
+own home — at which point RAX provably holds it, because the only thing a home
+word is ever written with is its own value.
+
+That makes two per-definition frame operations reachable without editing fifty
+arms:
+
+* `CRATONVM_JIT_IR_PUBLISH_AT_DEF` publishes the register from RAX **at the
+  store**, instead of the generic publish site reloading the word the arm just
+  wrote — the register-to-register publish that site's own comment has called
+  cheaper since it landed;
+* `CRATONVM_JIT_IR_DROP_HOME` then drops the store itself for any value the
+  deopt register image can name, extending the phi case to the arithmetic arms.
+
+`op_home_is_one_store_rax` is an audit of the arms whose lowering writes its
+home exactly once through `store_rax` with RAX holding the value. Arms with a
+home write on one path and not another (`Op::Load`, `Op::CheckCast`,
+`Op::Call`), arms that reach the home another way (`Op::Const`'s immediate
+store, `Op::Param`'s `gp_store_value`, every FP `fp_store_value`), and the
+comparisons — whose home write is conditional on a fusion decision made in
+`lower_terminator` — are all absent. Getting that list wrong is **not silent**:
+`lower_data_node_tracked` refuses the compile when a dropped-home value reaches
+the end of its own lowering unpublished, and `value_home_droppable` additionally
+requires `ir_phi_copy_regs_enabled`, because `gather_phi_copies` is the one
+reader exempt from `slot_of`'s fail-closed refusal.
+
+**First, an instrument correction, because it reverses a published verdict.**
+The loop-body counts in the section above were taken over the range between a
+back edge's target and the jump that takes it — choosing the OUTERMOST such
+pair. On an artifact that carries OSR entry stubs that is the wrong range: a
+stub is emitted AFTER the body and ends by jumping to the loop header, which
+reads as a back edge spanning the loop, the epilogue and the stub. The numbers
+in that table therefore counted the stub's local-zeroing and the epilogue's
+callee-saved restores. Taking the INNERMOST back edge instead:
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| + the phi/register stack | 57 | 29 | 15 | 14 |
+| + `DROP_PHI_HOME` | 56 | 28 | 15 | 13 |
+| + `DROP_HOME` as well | 56 | 28 | 15 | 13 |
+| + reserve the carried set (no drops) | 60 | **25** | 11 | 14 |
+| **reserve + publish-at-def + drop home** | 56 | **19** | 9 | 10 |
+
+**Reserving the carried set alone is not a regression.** Over the real loop it
+takes 31 frame operations to 25 — it removes six RELOADS, exactly what it was
+built to do — and the earlier "52 → 60" was the entry stub being counted, which
+grows with the number of reserved registers because there are more seeds to
+copy. That verdict is withdrawn.
+
+The rest behaves as the design predicts and the census confirms it engaged:
+`dropped_values=4 stores_skipped=6 read_refusals=0 def_publishes=2
+def_stores_skipped=2` with `resident=5 (gp=5)`. Reserving removes the reloads,
+write-through leaves all fourteen stores, and dropping the home removes four of
+them and two more loads. **31 → 19 frame operations, a 39% cut**, with the
+instruction count also down (58 → 56), and `ck=5100017428506113` — HotSpot's
+answer — identical across all six arms.
+
+**And it is worth about 6%.** Four interleaved arms at `n=200,000,000`, nine
+rounds, host load 11–17 on 8 cores, with the single-pass arm run twice as its
+own control:
+
+| arm | mean ms |
+|---|---|
+| single-pass OSR | 398 |
+| single-pass OSR (control) | 408 |
+| optimizing door, switches off | 675 |
+| **optimizing door, full stack** | **630** |
+
+The control-vs-control floor is **2.4%**; the full stack beats the door arm by
+6.7% and does so in 7 of 9 rounds. Real, and far outside the floor.
+
+**It does not close the gap, and that is the finding.** The tier inversion goes
+from 1.68x to 1.56x. Removing 39% of the loop's frame traffic bought 6.7% —
+which refutes, with a number, the assumption this whole line of work has been
+built on: that the optimizing tier's loops are slow *because* they go through
+frame words.
+
+**What the control says instead.** The single-pass body for the same kernel,
+counted the same way, is unrolled two ways and runs **~30 instructions per
+iteration with ZERO frame operations in the hot path** — `i`, `acc`, `sum` and
+`n` live in `r12`, `r13`, `r14`, `r15` from entry to exit, and the only
+`[rbp-...]` traffic in its loop is the safepoint poll's spill on the slow side
+of a `je`. Against that, the optimizing body is 56 instructions and 19 frame
+operations.
+
+So the remaining distance is not one more promotion policy either. Reading what
+those nineteen operations are makes the next target concrete:
+
+```text
+mov [rbp-0C0h],rax      ; store a value
+mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+```
+
+They are SINGLE-USE INTERMEDIATES — the result of an `Op::Add` or `Op::And`
+that feeds exactly one consumer — written to a frame word and reloaded on the
+next instruction. `plan_register_residency` skips every one of them by policy
+(`single_use=20` in its census), and it is right to: they do not want a
+register. They want not to be spilled at all, which is a question about the
+shape of `lower_data_node`'s value model rather than about who gets a register.
+That, and the 2:1 instruction count against a tier that unrolls, is what the
+1.56x is made of.
+
+Both switches stay OFF pending that.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-353 tokens.
+358 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -694,8 +694,12 @@ export inherited from a parent shell.
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
 | `ir-osr-entry` | `CRATONVM_JIT_IR_OSR_ENTRY` |
+| `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
+| `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
+| `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
+| `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
 | `merged-call-sentinel` | `CRATONVM_JIT_MERGED_CALL_SENTINEL` |
 | `ir-cold-arg-stage` | `CRATONVM_JIT_IR_COLD_ARG_STAGE` |
 | `ir-long` | `CRATONVM_JIT_IR_LONG` |
@@ -714,6 +718,7 @@ export inherited from a parent shell.
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
 | `npe-frame-snapshot` | `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` |
 | `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
+| `osr-empty-stack-entry` | `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY` |
 | `osr-pc-refresh` | `CRATONVM_JIT_NO_OSR_PC_REFRESH` |
 | `compiled-frame-lines` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` |
 | `inline-frame-map` | `CRATONVM_JIT_NO_INLINE_FRAME_MAP` |

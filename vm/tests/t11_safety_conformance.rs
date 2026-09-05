@@ -28,8 +28,88 @@ fn ws(rel: &str) -> String {
 // T11.1 — Every `unsafe` block has a `// SAFETY:` comment
 // ===========================================================================
 
-/// Scans a source file for `unsafe {` or `unsafe fn` blocks and checks that
-/// every one is preceded (within 5 lines) by a `// SAFETY:` comment.
+/// How far above an `unsafe` site a governing `// SAFETY:` comment may sit.
+///
+/// It was 5, and 5 punishes the BETTER style. `field_fast.rs` writes one
+/// `// SAFETY (every raw load below): ...` above a twelve-arm `match` whose
+/// arms each contain an `unsafe`; a five-line window credits the first two and
+/// calls the other ten undocumented, so the gate pushed toward ten copies of
+/// one sentence. Twelve lines reaches the head of a `match` or a `let` chain
+/// without reaching into an unrelated statement — measured on this tree, it
+/// takes `x64` from 88% to 100% with no source change at all, which is the
+/// tell that those two were never really undocumented.
+const SAFETY_LOOKBACK: usize = 12;
+
+/// Is `<stem>.rs` under a module directory declared `#[cfg(test)]` by its
+/// parent? Then it is TEST code and no part of a production safety measure.
+///
+/// This is the same rule, and the same trap, as the panic-free gate's
+/// `declared_cfg_test`: read the WHOLE attribute run, because `x64.rs` writes
+/// `#[cfg(test)]` and `#[cfg(target_arch = "x86_64")]` above one `mod tests;`
+/// and remembering only the previous line answers "production".
+fn declared_cfg_test(parent_src: &str, stem: &str) -> bool {
+    let mut run_has_cfg_test = false;
+    for line in parent_src.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("//") || t.starts_with('*') {
+            continue;
+        }
+        let decl = t
+            .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub(super) ")
+            .trim_start_matches("pub ");
+        if decl == format!("mod {stem};") {
+            return run_has_cfg_test;
+        }
+        if t.starts_with("#[") {
+            run_has_cfg_test |= t.starts_with("#[cfg(test)]");
+        } else {
+            run_has_cfg_test = false;
+        }
+    }
+    false
+}
+
+/// The lines of `contents` above the first INLINE `#[cfg(test)] mod x {`.
+///
+/// A `#[cfg(test)] mod tests;` is an EXTERNAL declaration — the code is in
+/// another file — so cutting there would throw away the rest of a production
+/// file. `jit/src/x64.rs` has one at line 273 of 3400.
+fn production_prefix(contents: &str) -> Vec<&str> {
+    let lines: Vec<&str> = contents.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("//") || t.starts_with('*') || !t.starts_with("#[cfg(test)]") {
+            continue;
+        }
+        // Look past further attributes and comments to the item itself.
+        for l2 in lines.iter().take((i + 8).min(lines.len())).skip(i + 1) {
+            let u = l2.trim_start();
+            if u.is_empty() || u.starts_with("//") || u.starts_with('*') || u.starts_with("#[") {
+                continue;
+            }
+            if u.ends_with('{') {
+                return lines[..i].to_vec(); // inline module: the rest is tests
+            }
+            break; // `mod x;` — keep looking
+        }
+    }
+    lines
+}
+
+/// Scans a source file's PRODUCTION section for `unsafe {` / `unsafe fn` and
+/// checks that each is governed by a `// SAFETY:` comment within
+/// [`SAFETY_LOOKBACK`] lines.
+///
+/// # Why the production section, and not the file
+///
+/// This gate measures whether the code SHIPPED is documented. Test modules are
+/// full of `unsafe { compiled.try_call(..) }` and `unsafe extern "C" fn`
+/// stubs, and counting them does not merely add noise — it DROWNS the signal:
+/// 329 of `x64`'s 365 sites were in `x64/tests.rs`, and 169 of `helpers.rs`'s
+/// 182. The reported "88%" was a statement about test code, and the real
+/// production numbers it hid were 100% for `helpers.rs` and 70% for the
+/// interpreter — wrong in both directions at once.
 fn check_safety_comments(path: &str) -> (usize, usize) {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -38,7 +118,7 @@ fn check_safety_comments(path: &str) -> (usize, usize) {
             return (0, 0);
         }
     };
-    let lines: Vec<&str> = contents.lines().collect();
+    let lines: Vec<&str> = production_prefix(&contents);
     let mut total_unsafe = 0usize;
     let mut documented = 0usize;
 
@@ -69,13 +149,32 @@ fn check_safety_comments(path: &str) -> (usize, usize) {
 
         total_unsafe += 1;
 
-        // Check preceding 5 lines for a SAFETY comment
-        let start = i.saturating_sub(5);
+        // Check the preceding `SAFETY_LOOKBACK` lines for a SAFETY comment.
+        let start = i.saturating_sub(SAFETY_LOOKBACK);
         let mut found_safety = false;
         for j in start..=i {
-            if lines[j].contains("// SAFETY:") {
+            // `// SAFETY` — with or without a qualifier before the colon.
+            // Matching the literal `// SAFETY:` scored ZERO for
+            // `// SAFETY (every raw load below): ...`, which is a better
+            // comment than the one the gate was asking for: it says what it
+            // governs. A gate that only accepts one spelling of a convention
+            // measures the spelling.
+            let c = lines[j].trim_start();
+            // A doc comment's `# Safety` section is the documentation an
+            // `unsafe fn` is SUPPOSED to carry — it is what rustdoc renders and
+            // what `clippy::missing_safety_doc` asks for. Only accepting
+            // `// SAFETY:` asked for the wrong convention on every `unsafe fn`
+            // in the tree and scored the right one as zero.
+            let doc = c.strip_prefix("///").map(str::trim_start);
+            if doc.is_some_and(|d| d.starts_with("# Safety")) {
                 found_safety = true;
                 break;
+            }
+            if let Some(rest) = c.strip_prefix("//") {
+                if rest.trim_start().starts_with("SAFETY") {
+                    found_safety = true;
+                    break;
+                }
             }
         }
 
@@ -119,9 +218,19 @@ fn check_safety_comments_tree(file: &str, dir: &str) -> (usize, usize) {
         Ok(e) => e,
         Err(_) => return (total, documented),
     };
+    let parent_src = std::fs::read_to_string(file).unwrap_or_default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        // A submodule the parent declares `#[cfg(test)]` is test code.
+        if declared_cfg_test(&parent_src, &stem) {
             continue;
         }
         let (t, d) = check_safety_comments(&path.to_string_lossy());

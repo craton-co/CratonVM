@@ -137,10 +137,14 @@ fn match_invariant_arraylength(code: &[u8], pc: usize, code_len: usize) -> Optio
 /// * the `arraylength` is not itself a branch target, so the two-instruction
 ///   sequence cannot be entered halfway, and
 /// * the body contains no `wide` prefix (0xc4) and no `jsr`/`ret`
-///   (0xa8/0xc9/0xa9) — the first because `find_modified_locals` cannot decode
-///   a `wide` store and would report a modified local as invariant, the second
-///   because `detect_loops` does not model subroutine control flow, so "the
-///   body" would not be the set of PCs that can run.
+///   (0xa8/0xc9/0xa9). The second because `detect_loops` does not model
+///   subroutine control flow, so "the body" would not be the set of PCs that
+///   can run. The first was once load-bearing for the same reason: the mask
+///   could not decode a `wide` store. That hole is closed in
+///   `find_modified_locals` itself now (it had to be -- three other consumers
+///   share the mask and none of them refused a `wide` body), so the refusal
+///   here is redundant rather than wrong, and is kept because it costs only a
+///   hoist on a shape javac emits rarely.
 pub(super) fn find_array_len_hoists(
     code: &[u8],
     code_len: usize,

@@ -906,6 +906,18 @@ struct Lowerer<'a> {
     /// finding from "it fired and did not pay".
     phi_copy_reg_reads: usize,
     phi_copy_reg_publishes: usize,
+    /// The value `lower_data_node` is currently emitting, so `store_rax` can
+    /// tell the one store that writes a value's OWN home word from the many
+    /// that write an argument stage word, a shadow-stack word, or somebody
+    /// else's slot. `None` everywhere outside a data node's lowering, which is
+    /// what keeps `emit_copy_op`'s store out of this.
+    cur_def: Option<NodeId>,
+    /// Whether that store has happened and published the register.
+    cur_def_published: bool,
+    /// ENGAGEMENT: registers published from RAX at the definition rather than
+    /// reloaded from the home word, and home stores skipped there.
+    reg_publishes_at_def: usize,
+    homes_dropped_at_def: usize,
     /// `deopt_nameable[id]` — a deopt frame may describe `id` as living in its
     /// register rather than in its home word.
     ///
@@ -1426,6 +1438,10 @@ impl<'a> Lowerer<'a> {
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
+            cur_def: None,
+            cur_def_published: false,
+            reg_publishes_at_def: 0,
+            homes_dropped_at_def: 0,
             deopt_nameable: Vec::new(),
             deopt_reg_named: std::cell::Cell::new(0),
             home_dropped: Vec::new(),
@@ -1487,16 +1503,17 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        // Two passes: `phi_home_droppable` borrows `&self`.
+        // Two passes: the droppability predicates borrow `&self`.
         let droppable: Vec<usize> = (0..self.home_dropped.len())
-            .filter(|id| {
-                matches!(
-                    self.graph.nodes.get(*id).map(|n| &n.op),
-                    Some(crate::ir::Op::Phi)
-                )
-            })
             // Cast: an index into the node arena is a `NodeId`.
-            .filter(|id| self.phi_home_droppable(*id as NodeId))
+            .filter(|id| {
+                let id = *id as NodeId;
+                match self.graph.nodes.get(id as usize).map(|n| &n.op) {
+                    Some(crate::ir::Op::Phi) => self.phi_home_droppable(id),
+                    Some(_) => self.value_home_droppable(id),
+                    None => false,
+                }
+            })
             .collect();
         for id in droppable {
             self.home_dropped[id] = true;
@@ -1535,6 +1552,48 @@ impl<'a> Lowerer<'a> {
             self.graph.nodes.get(phi as usize).map(|n| n.ty),
             Some(IrType::Int) | Some(IrType::Long)
         )
+    }
+
+    /// May this ORDINARY value's home word go unwritten?
+    ///
+    /// The same conjunction as [`Self::phi_home_droppable`] with the phi's
+    /// publisher swapped for this one's. A phi is published by `emit_copy_op`
+    /// at every incoming edge; every other value is published by `store_rax`
+    /// at its single home write, which is what `ir_publish_at_def_enabled`
+    /// arranges and what `op_home_is_one_store_rax` certifies exists.
+    ///
+    /// `ir_skip_live_republish_enabled` is required for the same reason it is
+    /// there: without it the generic publish at the end of `lower_data_node`
+    /// would reload the home word nothing wrote, over the top of the register
+    /// this value's definition had just published correctly.
+    fn value_home_droppable(&self, id: NodeId) -> bool {
+        if !(ir_drop_home_enabled()
+            && ir_publish_at_def_enabled()
+            && ir_deopt_regs_enabled()
+            && ir_skip_live_republish_enabled()
+            // `gather_phi_copies` is the ONE reader that is exempt from
+            // `slot_of`'s refusal: it takes the would-be offset from
+            // `slot_of_unwritten` to identify a copy destination. `emit_copy_op`
+            // then reads the SOURCE out of its register -- but only under this
+            // switch. With it off, a dropped-home value used as a phi source
+            // would be loaded from the word nothing wrote, which is the one
+            // silent miscompile this area can produce.
+            && ir_phi_copy_regs_enabled())
+        {
+            return false;
+        }
+        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+            return false;
+        }
+        let Some(node) = self.graph.nodes.get(id as usize) else {
+            return false;
+        };
+        // `Ref` is named by frame slots in the oop map and FP lives in the
+        // other file -- the same two exclusions the phi predicate makes.
+        if !matches!(node.ty, IrType::Int | IrType::Long) {
+            return false;
+        }
+        op_home_is_one_store_rax(&node.op)
     }
 
     /// Describe `id` as living in its register, if that is provably where it
@@ -4288,9 +4347,60 @@ impl<'a> Lowerer<'a> {
 
     /// MOV [RBP - offset], RAX
     fn store_rax(&mut self, offset: i32) {
+        if self.publish_def_at_store(offset) {
+            return;
+        }
         let mut bytes = FrameAccess::new();
         enc_frame_store(RAX, offset, &mut bytes);
         self.buf.emit(bytes.as_slice());
+    }
+
+    /// Recognise the store that writes the CURRENT definition's own home word,
+    /// publish RAX into its register there, and answer whether the store itself
+    /// may now be skipped.
+    ///
+    /// This is what makes the other forty-nine `store_rax` sites reachable
+    /// without editing forty-nine arms. The two facts the register image needed
+    /// -- that RAX holds a particular value, and WHICH value -- are both present
+    /// here and nowhere else in this file: `cur_def` supplies the identity, and
+    /// "the offset is that value's home" supplies the rest, because the only
+    /// thing a home word is ever written with is its own value.
+    ///
+    /// Writing the register cannot disturb an operand still to be read. Every
+    /// input of `id` is live at its definition, and the allocator gives one
+    /// register to one value across its live range, so no input of `id` is in
+    /// `id`'s register. (`deopt_nameable`, which a dropped home requires, is
+    /// stronger still: no value ANYWHERE holds it.)
+    fn publish_def_at_store(&mut self, offset: i32) -> bool {
+        if !ir_publish_at_def_enabled() {
+            return false;
+        }
+        let Some(id) = self.cur_def else {
+            return false;
+        };
+        let home = self
+            .node_slot
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .map(|off| off.get() as i32);
+        if home != Some(offset) {
+            return false;
+        }
+        let Some(reg) = self.assigned_gpr(id) else {
+            // Not resident: nothing to publish, and nothing may be dropped.
+            return false;
+        };
+        self.emit_mov_reg_reg64(reg, RAX);
+        self.mark_gp_reg_live(id);
+        self.reg_publishes_at_def += 1;
+        self.cur_def_published = true;
+        if self.home_dropped.get(id as usize).copied().unwrap_or(false) {
+            self.homes_dropped_at_def += 1;
+            self.home_stores_dropped += 1;
+            return true;
+        }
+        false
     }
 
     /// `MOV qword [RBP - offset], imm32` (sign-extended), or `false` when the
@@ -5603,7 +5713,7 @@ impl<'a> Lowerer<'a> {
             if self.mir_mode == MirMode::Verify {
                 let shadow = self.mir_shadow_tile_bytes(block_idx, id);
                 let before = self.buf.pos();
-                self.lower_data_node(id);
+                self.lower_data_node_tracked(id);
                 let after = self.buf.pos();
                 if let Some(shadow) = shadow {
                     self.mir_shadow_tiles += 1;
@@ -5612,7 +5722,7 @@ impl<'a> Lowerer<'a> {
                 }
                 return;
             }
-            self.lower_data_node(id);
+            self.lower_data_node_tracked(id);
             return;
         };
         self.mir_tiles += 1;
@@ -5620,7 +5730,7 @@ impl<'a> Lowerer<'a> {
             // The per-opcode arm is still the thing that emits, so this mode
             // cannot produce a wrong instruction — only a wrong verdict.
             let before = self.buf.pos();
-            self.lower_data_node(id);
+            self.lower_data_node_tracked(id);
             let after = self.buf.pos();
             let agreed = self
                 .buf
@@ -6112,6 +6222,39 @@ impl<'a> Lowerer<'a> {
         if ir_receiver_guard_cse_enabled() && !self.guarded_receivers.contains(&base) {
             self.guarded_receivers.push(base);
         }
+    }
+
+    /// Lower one data node, with `cur_def` set across it so `store_rax` can
+    /// recognise the node's own home write.
+    ///
+    /// The verification at the bottom is the reason `op_home_is_one_store_rax`
+    /// may be an audited list rather than a proof. If a value whose home was
+    /// dropped finishes its own lowering without its register having been
+    /// published, then nothing wrote the value anywhere and the artifact is
+    /// wrong -- so the compile is refused here, deterministically, at the node
+    /// that did it, rather than later at whichever reader happened to notice.
+    /// A phi is exempt: `lower_data_node` deliberately emits nothing for one
+    /// (`emit_phi_copies` owns it), which is not the same event.
+    fn lower_data_node_tracked(&mut self, id: NodeId) {
+        let prev = self.cur_def;
+        let prev_published = self.cur_def_published;
+        self.cur_def = Some(id);
+        self.cur_def_published = false;
+        self.lower_data_node(id);
+        if self.home_dropped.get(id as usize).copied().unwrap_or(false)
+            && !self.cur_def_published
+            && !matches!(
+                self.graph.nodes.get(id as usize).map(|n| &n.op),
+                Some(Op::Phi)
+            )
+        {
+            self.latch_bailout(Bailout::with_context(
+                BailoutReason::UnallocatedValue { node: id },
+                format!("n{id}'s home was dropped but its lowering published no register"),
+            ));
+        }
+        self.cur_def = prev;
+        self.cur_def_published = prev_published;
     }
 
     fn lower_data_node(&mut self, id: NodeId) {
@@ -11108,6 +11251,94 @@ fn ir_drop_phi_home_enabled() -> bool {
     }
 }
 
+/// Publish a resident value into its register AT ITS DEFINITION, out of RAX,
+/// instead of reloading the home word this backend just wrote -- **default
+/// OFF**, opt in with `CRATONVM_JIT_IR_PUBLISH_AT_DEF=1`.
+///
+/// The generic publish at the end of `lower_data_node` is a LOAD of the word
+/// the arm above it stored, and its own comment has said since it landed that
+/// "a per-arm register-to-register publish would be cheaper still". Doing it
+/// per arm meant editing fifty call sites; doing it in `store_rax` means
+/// recognising, at the one place that writes a home word from RAX, that the
+/// offset being written is the current definition's own home -- at which point
+/// RAX provably holds that value and the copy is free of any question about
+/// where it came from.
+///
+/// It is also the precondition for dropping the store: with the publish reading
+/// the home, a home that is never written cannot be published from.
+fn ir_publish_at_def_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PUBLISH_AT_DEF") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Extend the dropped home from phis to ORDINARY VALUES -- **default OFF**, opt
+/// in with `CRATONVM_JIT_IR_DROP_HOME=1`.
+///
+/// `CRATONVM_JIT_IR_DROP_PHI_HOME` removes one frame store, at the one site
+/// (`emit_copy_op`) where this backend knew both that RAX held the value and
+/// which value it was. Every other definition writes its home through
+/// `store_rax`, which knew neither -- so the loop bodies this tier emits still
+/// perform a store per arithmetic node whose result never leaves its register.
+/// With [`ir_publish_at_def_enabled`] supplying the first fact and
+/// `Lowerer::cur_def` the second, the same conjunction can be asked of any
+/// value: see [`Lowerer::value_home_droppable`].
+fn ir_drop_home_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_HOME") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Does lowering `op` write its result home EXACTLY ONCE, through `store_rax`,
+/// with RAX holding the value at that store?
+///
+/// The list is an audit of `lower_data_node`'s arms, not a guess, and it is the
+/// reason a dropped home is safe for a value that is not a phi. Two shapes are
+/// deliberately absent:
+///
+/// * arms with more than one home write, or a home write on one path and not
+///   another (`Op::Load`, `Op::CheckCast`, `Op::Call`) -- the register would be
+///   published on one path and stale on the other;
+/// * arms that reach the home by a route other than `store_rax`
+///   (`Op::Const`'s immediate store, `Op::Param`'s `gp_store_value`, every FP
+///   result's `fp_store_value`) -- nothing would publish the register at all.
+///
+/// `Op::Cmp`/`Op::LCmp`/`Op::FCmp` are absent for a third reason: a comparison
+/// fused into its consuming `Op::If` emits NOTHING, so its home write is
+/// conditional on a fusion decision made elsewhere. They are single-use by
+/// construction and the residency file does not promote them, so the omission
+/// costs nothing.
+///
+/// Getting this list wrong is not silent: `lower_data_node_tracked` refuses the
+/// compile when a value whose home was dropped reaches the end of its own
+/// lowering unpublished.
+fn op_home_is_one_store_rax(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+            | Op::F2I
+            | Op::F2L
+            | Op::D2I
+            | Op::D2L
+            | Op::ArrayLength
+    )
+}
+
 /// Emit an OSR entry stub for every bci this body can safely be entered at --
 /// **default OFF**, opt in with `CRATONVM_JIT_IR_OSR_ENTRY=1`.
 ///
@@ -11920,6 +12151,26 @@ fn ir_residency_loop_weight_enabled() -> bool {
 ///
 /// Off is exactly the previous emission: the parameter reaches every use
 /// through its frame slot.
+/// Give every LOOP-CARRIED value a register of its own before the transients
+/// compete for one -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_RESERVE_CARRIED=1`.
+///
+/// The census said the residency file accepts ONE of the nineteen values the
+/// scan promotes on a loop kernel, and that two of the four loop-carried values
+/// are refused as SPLIT. With four carried values and five registers nothing
+/// needs splitting; the scan splits them only because it allocates them in
+/// competition with eleven transients. A better spill heuristic moves one value
+/// (`ls_carry_relief`); this moves the set, which is what
+/// `JIT_OPTIMIZATION.md`'s "the live set has to move as a group, or not at all"
+/// has meant since the four zeros.
+fn ir_reserve_carried_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_RESERVE_CARRIED").is_some()
+    })
+}
+
 fn ir_param_prologue_copy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -12535,6 +12786,89 @@ fn plan_register_residency(
         }
     }
 
+    // ── The loop-carried set, reserved out of what the scan left ─────
+    //
+    // Same door the parameter copy below uses, and the same safety argument:
+    // **a register in this file that the accepted set does not name is written
+    // by nothing.** Emission is driven by `gp_reg_of` alone, so a register the
+    // scan used only for values this file then REFUSED is not written by the
+    // emitted code either, and taking it here cannot alias anything.
+    //
+    // What it fixes is not a bad decision by the scan but a bad QUESTION put to
+    // it. The scan allocates the carried values in competition with every
+    // transient in the loop body, under `peak_live` far above the file size, so
+    // it splits them — and `plan_register_residency` refuses a split value
+    // outright, because this backend has no reload machinery. Reserving first
+    // asks instead: these few values are needed on every iteration, give each
+    // one a register and let everything else have the rest.
+    //
+    // Ordered by loop-weighted use count so that, when the carried set is
+    // larger than the file, the registers go to the values read most often
+    // inside the loop.
+    //
+    // Publishing is already handled and needs nothing new: a phi is published
+    // by `emit_phi_copies` at every incoming edge, and any other value by the
+    // generic publish at the end of its own `lower_data_node`. Both are keyed
+    // on `assigned_gpr`, which is what this writes.
+    let mut carried_reserved = 0usize;
+    if ir_reserve_carried_enabled() {
+        let mut taken: Vec<u8> = gp_reg_of.iter().flatten().copied().collect();
+        taken.sort_unstable();
+        taken.dedup();
+        let mut free: Vec<u8> = IR_LOWER_LS_GPRS
+            .iter()
+            .copied()
+            .filter(|r| !taken.contains(r))
+            .collect();
+        let mut cands: Vec<(u64, usize)> = (0..n)
+            .filter(|&id| live.carried.get(id).copied().unwrap_or(false))
+            .filter(|&id| gp_reg_of.get(id).copied().flatten().is_none())
+            // Write-through needs a home to write, exactly as the main loop
+            // above requires.
+            .filter(|&id| plan.node_color.get(id).copied().flatten().is_some())
+            .filter(|&id| {
+                match graph.nodes.get(id) {
+                    // `Ref` is excluded for the safepoint reason the bank match
+                    // gives, not as tuning: `OopMapEntry` names frame slots
+                    // only. FP belongs to the other file.
+                    Some(node) => matches!(node.ty, IrType::Int | IrType::Long)
+                        // A constant is materialised as an immediate by every
+                        // reader, so its register could never be read.
+                        && !matches!(node.op, Op::Const(_))
+                        // A phi is only publishable when its edges publish it.
+                        && (ir_phi_residency_enabled() || !matches!(node.op, Op::Phi)),
+                    None => false,
+                }
+            })
+            .map(|id| (live.weight.get(id).copied().unwrap_or(0), id))
+            .collect();
+        cands.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, id) in cands {
+            let Some(range) = plan.range.get(id).copied().flatten() else {
+                continue;
+            };
+            // The same clobber question the demotion pass asks. Inert for this
+            // file today — every register in it is callee-saved and no fixed
+            // x86 operand names one — but asking it here keeps the two places
+            // that hand out a register from disagreeing about the rule.
+            let Some(pos) = free.iter().position(|r| {
+                let me = PhysReg::gp(*r);
+                !model
+                    .clobbers
+                    .iter()
+                    .any(|(p, regs)| *p >= range.lo && *p <= range.hi && regs.contains(&me))
+            }) else {
+                continue;
+            };
+            let reg = free.remove(pos);
+            gp_reg_of[id] = Some(reg);
+            carried_reserved += 1;
+            if free.is_empty() {
+                break;
+            }
+        }
+    }
+
     // ── Entry parameters, which the allocator cannot reach ───────────
     //
     // `MachineModel::pin_entry_params` pins every `Param` to its INCOMING ABI
@@ -12669,7 +13003,7 @@ fn plan_register_residency(
             "[ir-ls] skipped: split_or_spilled={skip_split} \
              wrong_bank_or_type={skip_bank} no_home={skip_home} phi={skip_phi} \
              const={skip_const} single_use={skip_single_use} param_copies={param_copies} \
-             spilled={skip_spilled} no_alloc={skip_no_alloc}"
+             spilled={skip_spilled} no_alloc={skip_no_alloc} carried_reserved={carried_reserved}"
         );
         eprintln!(
             "[ir-ls] home: droppable={home_droppable} blocked_deopt={blocked_deopt} blocked_phi={blocked_phi} safepoints={}",
@@ -13866,10 +14200,13 @@ pub(crate) fn lower_inner_with_scopes(
             lowerer.deopt_regs_base,
         );
         eprintln!(
-            "[ir-ls] homes: dropped_values={} stores_skipped={} read_refusals={}",
+            "[ir-ls] homes: dropped_values={} stores_skipped={} read_refusals={} \
+             def_publishes={} def_stores_skipped={}",
             lowerer.home_dropped.iter().filter(|d| **d).count(),
             lowerer.home_stores_dropped,
             lowerer.home_read_refusals.get(),
+            lowerer.reg_publishes_at_def,
+            lowerer.homes_dropped_at_def,
         );
     }
 
@@ -17508,10 +17845,6 @@ mod tests {
         assert_eq!(sum(10), 45, "sum 0..9 = 45");
     }
 
-    // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
-    // header self-loops (the condition is at the bottom). Exercises the
-    // if-as-back-edge path + a block whose true edge targets its own head.
-    #[test]
     /// **The one that matters: enter the loop part-way and finish it.**
     ///
     /// `int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }`, whose
@@ -17594,6 +17927,9 @@ mod tests {
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
     }
 
+    // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
+    // header self-loops (the condition is at the bottom). Exercises the
+    // if-as-back-edge path + a block whose true edge targets its own head.
     #[test]
     fn test_lower_do_while_sum() {
         // int f(int n){ int s=0,i=0; do { s+=i; i++; } while(i<n); return s; }
@@ -20267,6 +20603,103 @@ mod tests {
              this test would now pass vacuously"
         );
         out
+    }
+
+    /// `op_home_is_one_store_rax` claims a property of SOURCE the compiler
+    /// cannot check, and it is the whole safety argument for dropping the home
+    /// word of a value that is not a phi: the arm writes its result home
+    /// exactly once, through `store_rax`, with RAX holding the value. So check
+    /// the source.
+    ///
+    /// A second home write on another path would publish the register on one
+    /// path and leave it stale on the other; a home reached by
+    /// `gp_store_value` or `emit_store_frame_imm32` instead would not go
+    /// through `publish_def_at_store` at all, so nothing would publish the
+    /// register and the value would exist nowhere. `fp_store_value` is allowed
+    /// and deliberately so — `Op::Div`, `Op::Rem` and `Op::Neg` take an FP path
+    /// that returns early, and `value_home_droppable` admits only `Int` and
+    /// `Long`, so that path is unreachable for a dropped home.
+    ///
+    /// A failure here is not cosmetic. It says the allowlist has drifted from
+    /// the arms and `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never
+    /// writes a value it later reads.
+    #[test]
+    fn every_droppable_op_writes_its_home_once_through_store_rax() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        // Split at match-arm depth — twelve spaces — on the same convention
+        // `ops_with_a_lowering_arm` documents. A `| Op::` line continues the
+        // arm above it rather than opening one.
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let opens = line.starts_with("            Op::");
+            let continues = line.starts_with("            | Op::");
+            if continues {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if opens {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed and \
+             this test would now pass vacuously"
+        );
+
+        let claimed_src = src
+            .split("fn op_home_is_one_store_rax(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_home_is_one_store_rax is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the allowlist scan found nothing — `op_home_is_one_store_rax` \
+             changed shape and this test would now pass vacuously"
+        );
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| {
+                    panic!("`op_home_is_one_store_rax` claims Op::{name}, which has no arm")
+                });
+            let stores = arm.1.matches("self.store_rax(slot);").count();
+            assert_eq!(
+                stores, 1,
+                "Op::{name}'s arm writes its home through `store_rax` {stores} times, \
+                 not once — `op_home_is_one_store_rax` must not claim it"
+            );
+            for forbidden in ["gp_store_value(", "emit_store_frame_imm32("] {
+                assert!(
+                    !arm.1.contains(forbidden),
+                    "Op::{name}'s arm reaches its home through `{forbidden}`, which \
+                     `publish_def_at_store` never sees — \
+                     `op_home_is_one_store_rax` must not claim it"
+                );
+            }
+        }
     }
 
     /// Every `Op::X` named in `op_defines_result_slot`'s body.

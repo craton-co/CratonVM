@@ -139,34 +139,76 @@ pub(super) fn fast_field_zgc(shared: &SharedVm) -> Option<&ZgcRealHeap> {
     Some(zgc)
 }
 
+/// The raw field accessors below all carry the same obligation, stated once
+/// here and referenced by each.
+///
+/// # Safety
+///
+/// `p` must be a field address produced by [`field_ptr_for`] for a receiver it
+/// accepted, and the width must be the one that receiver's layout records for
+/// that field. `field_ptr_for` is what discharges it: it refuses an address the
+/// heap does not know (`is_object_address`), then refuses a header whose class
+/// id, slot count or compact flag disagrees with the site — so the offset it
+/// adds belongs to the layout the site was filled against, and the bytes are
+/// inside a live object body on a committed page.
+///
+/// Every access is `Relaxed` through an atomic of the field's own width, which
+/// is what makes a torn read impossible when another thread writes the same
+/// slot; ordering is the interpreter's business, not this helper's.
+///
+/// Passing a pointer from anywhere else — a stale operand-stack value, an
+/// address into a decommitted span, a width that disagrees with the layout —
+/// is undefined behaviour, and reads as silent field corruption rather than a
+/// fault.
 #[inline(always)]
 unsafe fn load_u8(p: *mut u8) -> u8 {
     (*(p as *const AtomicU8)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn load_u16(p: *mut u8) -> u16 {
     (*(p as *const AtomicU16)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn load_u32(p: *mut u8) -> u32 {
     (*(p as *const AtomicU32)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn load_u64(p: *mut u8) -> u64 {
     (*(p as *const AtomicU64)).load(Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u8(p: *mut u8, v: u8) {
     (*(p as *const AtomicU8)).store(v, Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u16(p: *mut u8, v: u16) {
     (*(p as *const AtomicU16)).store(v, Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u32(p: *mut u8, v: u32) {
     (*(p as *const AtomicU32)).store(v, Ordering::Relaxed)
 }
+/// # Safety
+///
+/// As [`load_u8`]: `p` must come from [`field_ptr_for`], at this width.
 #[inline(always)]
 unsafe fn store_u64(p: *mut u8, v: u64) {
     (*(p as *const AtomicU64)).store(v, Ordering::Relaxed)
@@ -174,6 +216,13 @@ unsafe fn store_u64(p: *mut u8, v: u64) {
 
 /// Raw reference slot read, honouring compressed oops the way
 /// `read_compact_field` does.
+///
+/// # Safety
+///
+/// As [`load_u8`], and the slot must be a REFERENCE slot: the width read is
+/// decided by `narrow_oops_enabled()` rather than by the argument, so reading a
+/// primitive slot through this would use the wrong width whenever compressed
+/// oops are on.
 #[inline(always)]
 unsafe fn load_ref(p: *mut u8) -> u64 {
     if cratonvm_types::narrow_oop::narrow_oops_enabled() {
@@ -185,6 +234,12 @@ unsafe fn load_ref(p: *mut u8) -> u64 {
 
 /// Raw reference slot write, honouring compressed oops the way
 /// `write_compact_field` does (probe included).
+///
+/// # Safety
+///
+/// As [`load_ref`]. `raw` must be a heap reference or 0 — `narrow_oop::probe`
+/// asserts that in debug builds, and in release an unencodable value would be
+/// truncated by `encode` into a pointer to somewhere else.
 #[inline(always)]
 unsafe fn store_ref(p: *mut u8, raw: u64) {
     cratonvm_types::narrow_oop::probe(raw);
@@ -436,6 +491,8 @@ pub(super) fn getfield_fast_keyed(
             return true;
         }
         FieldStorageKind::Double => {
+            // SAFETY: as the group above — `fp` is this site's validated
+            // field address, and `Double` is an 8-byte slot.
             let v = f64::from_bits(unsafe { load_u64(fp) });
             stack.pop_compact();
             stack.push_double_unchecked(v);
@@ -443,6 +500,8 @@ pub(super) fn getfield_fast_keyed(
             return true;
         }
         FieldStorageKind::Reference => {
+            // SAFETY: as the group above, and the arm is `Reference`, so the
+            // slot is the reference slot `load_ref`'s width rule expects.
             let raw = unsafe { load_ref(fp) };
             if raw == 0 {
                 CompactValue::null()
@@ -617,36 +676,45 @@ pub(super) fn putfield_fast(
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: `fp` came from `field_ptr_for`, and `Boolean` is the
+            // layout's own 1-byte slot for this field.
             unsafe { store_u8(fp, (v & 1) as u8) };
         }
         FieldStorageKind::Byte => {
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: as above; `Byte` is a 1-byte slot.
             unsafe { store_u8(fp, v as u8) };
         }
         FieldStorageKind::Char | FieldStorageKind::Short => {
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: as above; both `Char` and `Short` are 2-byte slots.
             unsafe { store_u16(fp, v as u16) };
         }
         FieldStorageKind::Float => {
             let Some(f) = val.as_float() else {
                 return false;
             };
+            // SAFETY: as above; `Float` is a 4-byte slot, written as bits.
             unsafe { store_u32(fp, f.to_bits()) };
         }
         FieldStorageKind::Long => {
             if kind != ValueStack::KIND_MARK_LONG {
                 return false;
             }
+            // SAFETY: as above; `Long` is an 8-byte slot, and the stack kind
+            // was just checked so `as_long_unchecked` is entitled.
             unsafe { store_u64(fp, val.as_long_unchecked() as u64) };
         }
         FieldStorageKind::Double => {
             if kind != ValueStack::KIND_MARK_DOUBLE {
                 return false;
             }
+            // SAFETY: as above; `Double` is an 8-byte slot, and the stack kind
+            // was just checked.
             unsafe { store_u64(fp, val.raw_bits()) };
         }
         FieldStorageKind::Reference => {
@@ -659,11 +727,17 @@ pub(super) fn putfield_fast(
                 return false;
             };
             if zgc.mark_active() {
+                // SAFETY: as above, on the `Reference` arm, so the slot is a
+                // reference slot. The pre-barrier needs the OLD value before
+                // the store overwrites it.
                 let old = unsafe { load_ref(fp) };
                 if old != 0 {
                     zgc.satb_pre_barrier(old as usize);
                 }
             }
+            // SAFETY: as above, on the `Reference` arm; `raw` is either 0 or
+            // an object pointer taken from `as_object_ptr`, which is what
+            // `store_ref`'s encode step requires.
             unsafe { store_ref(fp, raw) };
         }
     }
@@ -1100,12 +1174,15 @@ pub(super) fn array_store_prim(
             let Some(f) = val.as_float() else {
                 return false;
             };
+            // SAFETY: `p` is this static's slot address, resolved above, and
+            // `Float` is its 4-byte slot.
             unsafe { store_u32(p, f.to_bits()) };
         }
         0x52 => {
             if kind != ValueStack::KIND_MARK_DOUBLE {
                 return false;
             }
+            // SAFETY: as above; `Double` is an 8-byte slot.
             unsafe { store_u64(p, val.raw_bits()) };
         }
         0x54 => {
@@ -1126,6 +1203,7 @@ pub(super) fn array_store_prim(
             let Some(v) = val.as_int() else {
                 return false;
             };
+            // SAFETY: as above; a 2-byte slot.
             unsafe { store_u16(p, v as u16) };
         }
         _ => return false,

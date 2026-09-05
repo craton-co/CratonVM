@@ -3563,6 +3563,27 @@ pub(super) fn try_osr(
     let compiled = match ir_osr {
         Some(c) => {
             cratonvm_jit::metrics::record_osr_event("osr_entered_optimizing");
+            // Dump the body this door is about to ENTER, under a label that
+            // distinguishes it from the single-pass one.
+            //
+            // Without this the optimizing artifact is invisible to
+            // `CRATONVM_DBG_JIT_DISASM`: the only `osr` dump comes from inside
+            // `compile_osr_artifact`, which this arm SKIPS — and the background
+            // tier worker calls that function anyway, so a dump appears, is
+            // labelled `osr`, and is the single-pass body. Reading it while the
+            // door was on showed code that did not change when the residency
+            // flags changed, which is exactly the wrong conclusion and cost
+            // several rounds to catch. The counter said the door had engaged
+            // and the disassembly said it had not; the disassembly was of
+            // another artifact.
+            crate::jit::disasm::maybe_dump(
+                "osr-optimizing",
+                &class_name_arc,
+                &method_name_arc,
+                &descriptor_arc,
+                c.entry_ptr(),
+                c.code_bytes(),
+            );
             c
         }
         None => compile_osr_artifact(
@@ -3769,6 +3790,10 @@ pub(super) fn try_osr(
             {
                 match &plan {
                     // The single-pass trampoline, with its proof.
+                    // SAFETY: `plan` is `validate_osr_entry`'s result for THIS
+                    // artifact at THIS bci, so every seeded slot's JVM type has
+                    // been checked against the compiled entry's contract — the
+                    // argument spelled out above this `cfg` block.
                     Some(plan) => unsafe {
                         compiled.osr_enter_planned(vm_ptr, &osr_state, plan, thread_ptr)
                     },
@@ -3777,6 +3802,11 @@ pub(super) fn try_osr(
                     // and jumps into the body — two arguments where the
                     // trampoline takes twenty layout fields, because the
                     // lowerer knows the layout and the trampoline never could.
+                    // SAFETY: a DIFFERENT contract from the arm above, and the
+                    // reason each arm states its own: this entry takes no plan,
+                    // so what must hold is that `entry_pc` is an OSR entry the
+                    // artifact published and `jit_locals` matches the snapshot
+                    // that bci names.
                     None => unsafe {
                         compiled.ir_osr_enter(entry_pc as u32, vm_ptr, &jit_locals)
                     },

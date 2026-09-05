@@ -19539,16 +19539,40 @@ mod tests {
 
         // ONE step, unbounded budget: pre-F-10 this held the lock from the
         // first gray to the last.
+        let batches_before = gc.mark_lock_batches.load(Ordering::Relaxed);
         let done = gc.concurrent_mark_step(usize::MAX);
         let during_the_step = acquisitions.load(Ordering::Relaxed);
+        let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - batches_before;
 
         stop.store(true, Ordering::Relaxed);
         observer.join().expect("observer thread");
 
         assert!(done, "one unbounded step must drain the whole gray set");
+        // THE CLAIM IS ADMISSION, NOT THROUGHPUT. This asserted `>= 8` and
+        // failed 3 runs in 5 ALONE on an idle host (2026-09-05), and again in
+        // `cargo test --workspace`. The observer is a competing OS thread, so
+        // how MANY times it wins the lock inside one sub-second step is the
+        // scheduler's answer, not this collector's. Pre-F-10 the count is 0 and
+        // stays 0 however the threads interleave, which is what makes `> 0` the
+        // whole of the property: the marker let a waiting writer in before the
+        // step ended.
         assert!(
-            during_the_step >= 8,
-            "a competing writer got the region table {during_the_step} time(s) while the marker drained {GRAYS} objects — pre-F-10 that number is 0, because the marker held the lock for the entire step"
+            during_the_step > 0,
+            "a competing writer NEVER got the region table while the marker drained {GRAYS} \
+             objects — that is the pre-F-10 behaviour, the marker holding the guard for the \
+             entire step"
+        );
+        // And the magnitude claim, taken from a counter the scheduler does not
+        // touch: the marker dropped and retook the guard once per batch. This
+        // is deterministic where the thread-race count is not, so a regression
+        // that reduced the drop RATE without reaching zero still fails here —
+        // which is the part `> 0` alone would have given up.
+        assert!(
+            batches >= GRAYS / MARK_LOCK_BATCH,
+            "the marker drained {GRAYS} grays in {batches} regions-lock acquisition(s); at \
+             MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at least {} — a reading of 1 means \
+             the guard is held for the whole step again (F-10)",
+            GRAYS / MARK_LOCK_BATCH
         );
     }
 

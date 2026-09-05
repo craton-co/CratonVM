@@ -48,6 +48,7 @@ it, or extend the feature, read on.
 | [`lowering-nested-loops.md`](lowering-nested-loops.md) | Rectangular two-dimensional loop mapping. |
 | [`lowering-branches.md`](lowering-branches.md) | Basic-block and join-state lowering for loop-body branches. |
 | [`hardware-ci.md`](hardware-ci.md) | Self-hosted GPU CI scaffolding and enrollment status. |
+| [`../known-issues/gpu/hardware-bring-up.md`](../known-issues/gpu/hardware-bring-up.md) | **Start here with a CUDA device in front of you.** Which backend builds on which OS, the first run, the drain witness and its negative control, the gate battery, and what is still waiting on hardware. |
 | [`../book/src/gpu/overview.md`](../book/src/gpu/overview.md) | User-facing book chapter: what can be offloaded, build modes, CLI flags. |
 | [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The RTX 2060 benchmark writeup (methodology + tables). |
 
