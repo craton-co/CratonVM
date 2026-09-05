@@ -53,6 +53,26 @@ that `take_static_ref_slots` returned `None`, the fast arm was skipped, and the
 verifier never ran. That is the difference between a coverage oracle and a line
 that has never fired.
 
+**Measured**, on `probes`-style churn (400k allocations, live statics, 96 MB
+heap), generational backend:
+
+```text
+[static-slot-verify] covered=178 missed=0 moved=12235
+[static-slot-verify] covered=178 missed=0 moved=12887
+[cratonvm] static root slots: patched=356 full-walk-fallbacks=0
+[cratonvm] static root slots: patched=178 full-walk-fallbacks=0   (ZGC)
+```
+
+`missed=0` against a pointer map of twelve thousand moved objects is the
+coverage evidence. `fallbacks=0` is the one that matters more: it says the
+scan/fix-up pairing held on *every* collection rather than silently degrading to
+the old full walk on some of them, which is the failure mode the take-once
+design is guarding against and the one a coverage number alone would not show.
+
+This is a first reading on one shape of workload, not a soak. The follow-up list
+at the end of this page still asks for it over H2 or Tomcat before anyone builds
+further on the slot path.
+
 **Not landed:** the collector-side half — a relocating collector storing the new
 address *through* the slot, retiring the `PointerMap` for that root class
 entirely. That is an ABI change to `collect_garbage` and belongs with a
@@ -339,7 +359,11 @@ relaxed loads, so the target is known.
    regions — the `any_marked` early return should show up as a step change in
    cleanup cost, and if it does not, the bitmap was not where the time went.
 3. `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` over a real application (H2 corpus,
-   Tomcat) before anyone builds further on finding 1's slot path.
+   Tomcat) before anyone builds further on finding 1's slot path. The reading
+   above (`missed=0`, `fallbacks=0`) is one synthetic workload with 178 static
+   reference slots; a real application has thousands, loads classes while
+   collections are in flight, and exercises the deferral branch this records
+   ahead of.
 4. The **engagement census** for a bitmap-backed `is_object_address` — how many
    probes the bitmap answers versus the heuristic — before finding 5's real fix
    is written, not after.
