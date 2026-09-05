@@ -236,23 +236,60 @@ no compiled-caller census line at all, because the site was never even
 signal: `gpu_compiled_offload_census::exit_summary` returns early when
 every counter is zero.
 
-## An unrelated flake seen while verifying this
+## An unrelated flake seen while verifying this — and what it turned out to be
 
-`residency-gc.sh` failed once on this binary ("2 CHECK(S) FAILED") and
-then passed **24 consecutive runs** — 1 in 25 overall, across three
-collectors each time. It is **not** this defect and not the gate — that
-script never exercises the compiled-caller registration path this page is
-about.
+`residency-gc.sh` failed intermittently during verification: 1 in 25
+first, then **2 in 40** on a binary that already carried both
+`input_cache` race fixes. It is not this defect and not the gate — that
+script never exercises the compiled-caller registration path.
 
-The likely explanation is that `dev` does not yet carry either fix from
-[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md)
-(branch `fix/gpu-concurrent-dispatch-race-20260905`, pushed and unmerged
-as of this writing). Both of those races live in `input_cache`, which is
-exactly what `residency-gc.sh` hammers across collections, and both
-produce intermittent wrong answers at single-digit rates. Verified by
-inspection that this tree has neither: no `drain_locked`, and `insert`
-still OR's its filter bit outside the mutex.
+**A first guess at the cause was wrong, and the refutation is one line of
+fixture.** This page originally blamed the two races in
+[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md),
+because both live in the cache `residency-gc.sh` hammers. But
+`test_classes/gpu/GpuResidencyGc.java` contains **no `Thread`,
+`Executor`, `parallel` or stream** — `main` is a sequence of direct
+calls — and GC relocation runs with the world stopped. Both races need
+two Java threads racing in the cache, so **neither can fire here**. The
+2-in-40 above, on a binary with both fixes in, says the same thing
+empirically. "Lives in the same module" is not attribution.
 
-Stated as the likely explanation rather than a finding — the failing run
-was not captured in enough detail to name which two checks failed, and a
-rate this low needs the sample sizes that page documents.
+**What it actually is.** The script routes each arm's stderr into a temp
+directory it deletes, so the failure looked like an empty arm. Captured
+directly, it is a VM panic:
+
+```
+panic: forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+  types/src/heap_types.rs:1562
+[PANIC_IN] GpuResidencyGc.main pc=127   thread="main-vm"
+```
+
+Same assert text and same file as **Cluster D** of the OPEN page
+`g1-evac-forwarding-assert-and-three-sigsegv-clusters-20260905.md`
+(recorded there at `heap_types.rs:1529`; the file has moved since that
+binary), and the same G1-only scope. One difference to keep in view: that
+page's cluster panics on an evac worker via `gc/src/evac_pool.rs`, this
+one on `main-vm`.
+
+If it is the same defect, the useful part is the reproducer: that page's
+is a 640-class Tomcat suite run on Azure, and this is a single local
+fixture — though see the rate below before treating it as convenient.
+
+**Rate, corrected.** An earlier draft of this note put it at "~4%",
+reading 3 failures in 66 `residency-gc.sh` runs as a per-run rate. That
+is the wrong denominator: each script run launches the VM about twelve
+times (three collectors x four arms), so the observed events are roughly
+3 in 800 launches — order **0.4% per launch**, ten times rarer than
+stated.
+
+**Not established: whether `--gpu` is required.** An alternating A/B of
+150 launches per arm returned **0/150 on both**. That is not evidence of
+independence — at 0.4% it expects about one event per arm, so it cannot
+tell 0 from 1. It does refute the inflated 4% figure, which would have
+made 0/300 essentially impossible.
+
+Reproducing this wants either a few thousand launches per arm or an
+amplifier. Worth noting the events clustered: three fell within one
+stretch of loaded-host activity and none in 300 launches afterwards, so
+whatever forces it may be load- or timing-dependent rather than uniformly
+random, and a quiet-host zero should not be read as a fix.
