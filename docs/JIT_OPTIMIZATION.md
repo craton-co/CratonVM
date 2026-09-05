@@ -2671,6 +2671,68 @@ they do not fire — not because a real workload has been measured. That
 measurement is the next thing this file should record, and until it does, the
 right reading of the parity result is "on this kernel", not "in general".
 
+#### An inline cache that installed, and then stopped being used
+
+Defaulting the optimizing-tier switches on made
+`test_inline_cache_takes_over_the_sam_call_site` fail intermittently — 3 runs
+in 46, never in 60 with the switches off, always at ~398 000 of 800 000
+dispatches "still going through the Rust arm". The number's tightness across
+occurrences (398568, 398618, 398496, 397002) said race, not latency drift.
+
+**Two theories died before the right one, and both are worth recording because
+each looked conclusive.**
+
+* *The optimizing OSR artifact has no inline-cache slots.*
+  `compile_optimizing_artifact` mentions `ic_slots`, `mic_slots` and
+  `pic_slots` exactly zero times, which reads as a smoking gun. It is not: the
+  function routes through `try_compile_with_invokespecial_resolver` into
+  `try_compile_inner`, and *that* builds `ir_ic_slots`. A grep over one
+  function is not a call graph.
+* *The door rebuilds an optimizing artifact it will refuse, delaying OSR
+  entry.* True, and worth fixing on its own — `ir_osr_sentinel_free` requires
+  no deopt stub and no call-exception stub, so **any method containing a call
+  is refused**, and the door was paying a full optimizing compile per OSR
+  attempt for most of them. But memoizing that refusal **did not change the
+  failure rate** (3 in 40). A real inefficiency, not this bug.
+
+**What it actually was.** Adding the counters *as of the instant of install* to
+the `lambda-adapter installed` line settled it in one run:
+
+```text
+lambda-adapter installed ... at site_direct=0 fast_returns=2962
+lambda-adapter installed ... at site_direct=1 fast_returns=3198
+RESULT: 397002 of 800 000 dispatches still went through the Rust arm
+```
+
+Both thunks installed **immediately** — and the site still served 397 002 calls
+from Rust afterwards. The feature engaged and then stopped working, which is
+why `site_adapters=2` looked healthy the whole time.
+
+`claim_adapter_install` latched a bare `bool` for the life of the process. The
+MIC/PIC slots it fills, though, belong to the **caller's compiled body** — and
+callers get recompiled: C1 then C2, or an OSR body published beside the entry
+one. The new body's slots are fresh and empty, and a site already latched
+`true` can never fill them, so every dispatch after the recompile falls back to
+Rust permanently.
+
+The latch is now the **slot pair** rather than a bool. A repeat of the same
+pair still refuses — that is the 202 000-re-install case the latch was added
+for, and it is unchanged — while a different pair claims once more. Re-installs
+are bounded by the number of distinct compiled bodies, which is small, instead
+of by the number of calls, which is not.
+
+| build | failures |
+|---|---|
+| `dev` with the defaults on | 3 / 46 |
+| + the refusal memo alone | 3 / 40 |
+| **+ the slot-keyed latch** | **0 / 108** |
+
+**The bug predates the defaults.** Nothing in the optimizing tier caused it;
+turning the switches on merely made caller recompilation likely enough to
+expose it, and the test was the only thing in the tree sensitive enough to
+notice. Any workload whose lambda call site sits in a method that tiers up has
+been losing its inline cache at the tier-up boundary.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change
