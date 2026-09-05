@@ -90,11 +90,7 @@ cratonvm-types`:
 
 | | count |
 |---|---|
-<<<<<<< HEAD
 | distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,250 |
-=======
-| distinct `CRATONVM_*` identifiers appearing anywhere in Rust source | 1,251 |
->>>>>>> origin/fix/t1-pause-budget-one-sample-20260905
 | exact string literals (i.e. actually named by code, not prose) | 1,177 |
 | **declared** in `flag_groups::INVENTORY` + scalars + group variables | **1171** |
 | declared before this pass | 576 |
