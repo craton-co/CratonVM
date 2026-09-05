@@ -475,6 +475,38 @@ Other gates: 1866/1866 `cratonvm-gc` unit tests, `cargo check --workspace
 `--no-default-features` fallback build — which `gc/Cargo.toml` records as
 UNVERIFIED because no CI job compiles it — verified compiling.
 
+## The two defaults, and the timing that justifies them
+
+Both features shipped opt-in and were defaulted ON after the
+HotSpot-differential regression suite came back **90 passed, 0 failed** with them
+enabled on the generational collector. That answers correctness. It does not
+answer cost, and the give-back in particular does syscalls per collection —
+`madvise`/`VirtualFree` on the way out, and a commit per 2 MiB granule on the way
+back in — so "it passes" and "it is free" are different claims.
+
+Timed on the probe workload, `-XX:+UseGenerationalGC -Xmx 96m`, arms
+interleaved, and **every arm checked for `rc=0` and its `CHURN_OK` line** — the
+first attempt at this table set a bogus `CRATONVM_X=0` as its no-op, which this
+VM refuses as an unknown token, so it may have been timing a process that never
+started:
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| `object-starts` ON | 2524 ms | 2650 ms | 2975 ms | **2650 ms** |
+| `object-starts` OFF | 2624 ms | 3015 ms | 2867 ms | 2867 ms |
+| `gen-uncommit` ON | 2483 ms | 2552 ms | 2566 ms | **2552 ms** |
+| `gen-uncommit` OFF | 2504 ms | 2562 ms | 2670 ms | 2562 ms |
+
+Neither costs measurable time. The give-back is free to within noise while
+returning 30 MiB; the bitmap's median is ~7% faster with it on, though the
+spreads overlap and the honest reading is "no measurable cost, possibly a small
+win" rather than a speedup claim.
+
+What these numbers do NOT cover, and a soak still should: a workload whose young
+arenas GROW (the bitmap is rebuilt there, and that path is exercised by nothing
+above), and a multi-threaded allocator, where the give-back's re-commit syscalls
+land on the allocation path of every thread rather than one.
+
 ## What a follow-up should measure first
 
 1. Re-run the **+153 % four-worker mark** number now that the provider lock is
