@@ -2198,6 +2198,118 @@ store**. `CRATONVM_JIT_IR_DROP_PHI_HOME` does that for phis, at one site; the
 other forty-nine store sites are what the loop's remaining fifty frame
 operations are made of.
 
+#### The forty-nine store sites, and what removing them did not buy
+
+`CRATONVM_JIT_IR_DROP_PHI_HOME` dropped one frame store, at the one site
+(`emit_copy_op`) where this backend knew both that RAX held a value and *which*
+value it was. Every other definition writes its home through `store_rax`, which
+knew neither. Both facts were available and neither was being passed:
+`lower_data_node_tracked` now records the definition being lowered, and
+`publish_def_at_store` recognises the store whose offset is that definition's
+own home — at which point RAX provably holds it, because the only thing a home
+word is ever written with is its own value.
+
+That makes two per-definition frame operations reachable without editing fifty
+arms:
+
+* `CRATONVM_JIT_IR_PUBLISH_AT_DEF` publishes the register from RAX **at the
+  store**, instead of the generic publish site reloading the word the arm just
+  wrote — the register-to-register publish that site's own comment has called
+  cheaper since it landed;
+* `CRATONVM_JIT_IR_DROP_HOME` then drops the store itself for any value the
+  deopt register image can name, extending the phi case to the arithmetic arms.
+
+`op_home_is_one_store_rax` is an audit of the arms whose lowering writes its
+home exactly once through `store_rax` with RAX holding the value. Arms with a
+home write on one path and not another (`Op::Load`, `Op::CheckCast`,
+`Op::Call`), arms that reach the home another way (`Op::Const`'s immediate
+store, `Op::Param`'s `gp_store_value`, every FP `fp_store_value`), and the
+comparisons — whose home write is conditional on a fusion decision made in
+`lower_terminator` — are all absent. Getting that list wrong is **not silent**:
+`lower_data_node_tracked` refuses the compile when a dropped-home value reaches
+the end of its own lowering unpublished, and `value_home_droppable` additionally
+requires `ir_phi_copy_regs_enabled`, because `gather_phi_copies` is the one
+reader exempt from `slot_of`'s fail-closed refusal.
+
+**First, an instrument correction, because it reverses a published verdict.**
+The loop-body counts in the section above were taken over the range between a
+back edge's target and the jump that takes it — choosing the OUTERMOST such
+pair. On an artifact that carries OSR entry stubs that is the wrong range: a
+stub is emitted AFTER the body and ends by jumping to the loop header, which
+reads as a back edge spanning the loop, the epilogue and the stub. The numbers
+in that table therefore counted the stub's local-zeroing and the epilogue's
+callee-saved restores. Taking the INNERMOST back edge instead:
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| door only | 58 | 31 | 17 | 14 |
+| + the phi/register stack | 57 | 29 | 15 | 14 |
+| + `DROP_PHI_HOME` | 56 | 28 | 15 | 13 |
+| + `DROP_HOME` as well | 56 | 28 | 15 | 13 |
+| + reserve the carried set (no drops) | 60 | **25** | 11 | 14 |
+| **reserve + publish-at-def + drop home** | 56 | **19** | 9 | 10 |
+
+**Reserving the carried set alone is not a regression.** Over the real loop it
+takes 31 frame operations to 25 — it removes six RELOADS, exactly what it was
+built to do — and the earlier "52 → 60" was the entry stub being counted, which
+grows with the number of reserved registers because there are more seeds to
+copy. That verdict is withdrawn.
+
+The rest behaves as the design predicts and the census confirms it engaged:
+`dropped_values=4 stores_skipped=6 read_refusals=0 def_publishes=2
+def_stores_skipped=2` with `resident=5 (gp=5)`. Reserving removes the reloads,
+write-through leaves all fourteen stores, and dropping the home removes four of
+them and two more loads. **31 → 19 frame operations, a 39% cut**, with the
+instruction count also down (58 → 56), and `ck=5100017428506113` — HotSpot's
+answer — identical across all six arms.
+
+**And it is worth about 6%.** Four interleaved arms at `n=200,000,000`, nine
+rounds, host load 11–17 on 8 cores, with the single-pass arm run twice as its
+own control:
+
+| arm | mean ms |
+|---|---|
+| single-pass OSR | 398 |
+| single-pass OSR (control) | 408 |
+| optimizing door, switches off | 675 |
+| **optimizing door, full stack** | **630** |
+
+The control-vs-control floor is **2.4%**; the full stack beats the door arm by
+6.7% and does so in 7 of 9 rounds. Real, and far outside the floor.
+
+**It does not close the gap, and that is the finding.** The tier inversion goes
+from 1.68x to 1.56x. Removing 39% of the loop's frame traffic bought 6.7% —
+which refutes, with a number, the assumption this whole line of work has been
+built on: that the optimizing tier's loops are slow *because* they go through
+frame words.
+
+**What the control says instead.** The single-pass body for the same kernel,
+counted the same way, is unrolled two ways and runs **~30 instructions per
+iteration with ZERO frame operations in the hot path** — `i`, `acc`, `sum` and
+`n` live in `r12`, `r13`, `r14`, `r15` from entry to exit, and the only
+`[rbp-...]` traffic in its loop is the safepoint poll's spill on the slow side
+of a `je`. Against that, the optimizing body is 56 instructions and 19 frame
+operations.
+
+So the remaining distance is not one more promotion policy either. Reading what
+those nineteen operations are makes the next target concrete:
+
+```text
+mov [rbp-0C0h],rax      ; store a value
+mov rax,[rbp-0C0h]      ; ...and read the same word straight back
+```
+
+They are SINGLE-USE INTERMEDIATES — the result of an `Op::Add` or `Op::And`
+that feeds exactly one consumer — written to a frame word and reloaded on the
+next instruction. `plan_register_residency` skips every one of them by policy
+(`single_use=20` in its census), and it is right to: they do not want a
+register. They want not to be spilled at all, which is a question about the
+shape of `lower_data_node`'s value model rather than about who gets a register.
+That, and the 2:1 instruction count against a tier that unrolls, is what the
+1.56x is made of.
+
+Both switches stay OFF pending that.
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

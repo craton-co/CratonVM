@@ -20605,6 +20605,103 @@ mod tests {
         out
     }
 
+    /// `op_home_is_one_store_rax` claims a property of SOURCE the compiler
+    /// cannot check, and it is the whole safety argument for dropping the home
+    /// word of a value that is not a phi: the arm writes its result home
+    /// exactly once, through `store_rax`, with RAX holding the value. So check
+    /// the source.
+    ///
+    /// A second home write on another path would publish the register on one
+    /// path and leave it stale on the other; a home reached by
+    /// `gp_store_value` or `emit_store_frame_imm32` instead would not go
+    /// through `publish_def_at_store` at all, so nothing would publish the
+    /// register and the value would exist nowhere. `fp_store_value` is allowed
+    /// and deliberately so — `Op::Div`, `Op::Rem` and `Op::Neg` take an FP path
+    /// that returns early, and `value_home_droppable` admits only `Int` and
+    /// `Long`, so that path is unreachable for a dropped home.
+    ///
+    /// A failure here is not cosmetic. It says the allowlist has drifted from
+    /// the arms and `CRATONVM_JIT_IR_DROP_HOME` would emit a body that never
+    /// writes a value it later reads.
+    #[test]
+    fn every_droppable_op_writes_its_home_once_through_store_rax() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        // Split at match-arm depth — twelve spaces — on the same convention
+        // `ops_with_a_lowering_arm` documents. A `| Op::` line continues the
+        // arm above it rather than opening one.
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let opens = line.starts_with("            Op::");
+            let continues = line.starts_with("            | Op::");
+            if continues {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if opens {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found nothing — `lower_data_node`'s shape changed and \
+             this test would now pass vacuously"
+        );
+
+        let claimed_src = src
+            .split("fn op_home_is_one_store_rax(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_home_is_one_store_rax is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+        assert!(
+            !claimed.is_empty(),
+            "the allowlist scan found nothing — `op_home_is_one_store_rax` \
+             changed shape and this test would now pass vacuously"
+        );
+
+        for name in &claimed {
+            let arm = arms
+                .iter()
+                .find(|(names, _)| names.contains(name))
+                .unwrap_or_else(|| {
+                    panic!("`op_home_is_one_store_rax` claims Op::{name}, which has no arm")
+                });
+            let stores = arm.1.matches("self.store_rax(slot);").count();
+            assert_eq!(
+                stores, 1,
+                "Op::{name}'s arm writes its home through `store_rax` {stores} times, \
+                 not once — `op_home_is_one_store_rax` must not claim it"
+            );
+            for forbidden in ["gp_store_value(", "emit_store_frame_imm32("] {
+                assert!(
+                    !arm.1.contains(forbidden),
+                    "Op::{name}'s arm reaches its home through `{forbidden}`, which \
+                     `publish_def_at_store` never sees — \
+                     `op_home_is_one_store_rax` must not claim it"
+                );
+            }
+        }
+    }
+
     /// Every `Op::X` named in `op_defines_result_slot`'s body.
     fn ops_that_define_a_result_slot() -> std::collections::BTreeSet<String> {
         let src = include_str!("ir_lower.rs");
