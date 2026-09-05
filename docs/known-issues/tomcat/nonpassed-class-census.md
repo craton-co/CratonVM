@@ -97,13 +97,35 @@ worth "fixing" as it stands — see
 [ssl-renegotiation-emulation-limits.md](ssl-renegotiation-emulation-limits.md).
 `TestSsl.testPost` additionally flakes under load, documented there.
 
-### 4. Class-loader leak detection — 2
+### 4. Class-loader leak detection — 2 — **FIXED 2026-09-05**
 
 `catalina.loader.TestWebappClassLoaderMemoryLeak` and
-`TestWebappClassLoaderExecutorMemoryLeak`, 1 of 1 each. Not diagnosed. Both
-assert that a stopped webapp's class loader becomes unreachable, so they are
-sensitive to any reference this VM retains and HotSpot does not — a GC-rooting
-question, not a Tomcat one.
+`TestWebappClassLoaderExecutorMemoryLeak`, 1 of 1 each. **Both now PASS.**
+
+This entry used to read "Not diagnosed … a GC-rooting question, not a Tomcat
+one". That framing was wrong twice over. Neither class asserts anything about
+the loader becoming unreachable — they assert that Tomcat's
+`clearReferencesThreads` actually STOPS a leaked `java.util.Timer` thread (and
+a `ThreadPoolExecutor`), so no GC rooting is involved at all. And both were
+diagnosed: two stacked defects, each hiding the next.
+
+1. `Thread` did not inherit the parent's `contextClassLoader`, so Tomcat's
+   `if (ccl == this)` gate never fired and the stop was never attempted. Fixed
+   2026-06-23 (`CRATONVM_INHERIT_THREAD_CCL`).
+2. With the gate passing, the reflective stop threw
+   `InaccessibleObjectException: module java.base does not "opens java.util" to
+   org.apache.tomcat.catalina` — even though the harness passes
+   `--add-opens java.base/java.util=ALL-UNNAMED`. A modular jar on the CLASS
+   path was being labelled with the module its `module-info.class` declares
+   instead of the unnamed module, which an `ALL-UNNAMED` open cannot reach.
+   Fixed 2026-09-05 (`CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE`).
+
+Defect 2 is why the Linux suite scored these red while the Windows suite scored
+them green on the same commit: the Linux classpath is built from
+`output/build/lib/*.jar` (and `catalina.jar` carries a `module-info.class`),
+the Windows one from the exploded `output/classes` directory, which carries
+none. **A class that passes on one host's classpath and fails on the other's is
+not necessarily a platform difference — check the classpath SHAPE first.**
 
 ### 5. Individually undiagnosed — 4
 

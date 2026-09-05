@@ -788,6 +788,19 @@ pub struct GcFlags {
     /// any suspected parallel-evacuation regression, and a cycle record still
     /// names which evacuator ran.
     pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_SCREEN` — apply the serial evacuator's header
+    /// screens on the PARALLEL arm too: the root-is-an-object-start guard, the
+    /// per-holder element clamp, and the per-candidate plausibility screen.
+    /// Default **ON** ([`parse::on_unless_zero`]); `=0` restores the
+    /// pre-2026-09-05 unscreened walks.
+    ///
+    /// The screens are not new — `scan_and_evacuate_refs`,
+    /// `scan_source_region_for_cset_refs` and the two serial drivers' root
+    /// loops have had them since 2026-08-26/2026-09-02. They simply never
+    /// crossed to the parallel arm, which is the DEFAULT one, so a corrupt or
+    /// interior candidate that the serial path refuses was followed, copied and
+    /// written through. `=0` is the same-binary A/B for that claim.
+    pub g1_parallel_evac_screen: bool,
     /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
     /// pauses taken while a thread is inside compiled code. Default **ON**
     /// ([`parse::on_unless_zero`]); `=0` restores the serial fallback.
@@ -1572,6 +1585,7 @@ impl GcFlags {
             gc_jit_ref_store_gates: on_unless_zero(src, "CRATONVM_GC_JIT_REF_STORE_GATES"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_parallel_evac_screen: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_SCREEN"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
@@ -1720,6 +1734,14 @@ pub struct LoaderFlags {
     /// **Default ON**; `0` / `false` / `no` turn it off.
     /// [`parse::on_unless_off_word`].
     pub boot_module_registry: bool,
+    /// `CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE` — a class from a modular jar
+    /// reached through the CLASS path belongs to the unnamed module, as on
+    /// HotSpot, rather than to the module its `module-info.class` declares.
+    /// **Default ON**; `0` / `false` restore the pre-2026-09-05 behaviour in
+    /// which `--add-opens …=ALL-UNNAMED` could not reach such a class. See
+    /// `ModuleRegistry::named_module_for_package`.
+    /// [`parse::on_unless_zero_or_false`].
+    pub classpath_jar_unnamed_module: bool,
     /// `CRATONVM_ALLOW_JSR_RET` — accept `jsr`/`ret` in the verifier.
     /// [`parse::non_empty_non_zero`].
     pub allow_jsr_ret: bool,
@@ -1799,6 +1821,10 @@ impl LoaderFlags {
                 "CRATONVM_LOADER_AWARE_RESOLUTION",
             ),
             boot_module_registry: on_unless_off_word(src, "CRATONVM_BOOT_MODULE_REGISTRY"),
+            classpath_jar_unnamed_module: on_unless_zero_or_false(
+                src,
+                "CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE",
+            ),
             allow_jsr_ret: non_empty_non_zero(src, "CRATONVM_ALLOW_JSR_RET"),
             harden_manifest_classpath: non_empty_non_zero(
                 src,
