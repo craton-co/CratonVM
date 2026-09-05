@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-340 tokens.
+341 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -728,6 +728,7 @@ export inherited from a parent shell.
 | `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `ir-param-copy` | `CRATONVM_JIT_IR_PARAM_COPY` |
 | `ir-rpo-layout` | `CRATONVM_JIT_IR_RPO_LAYOUT` |
+| `ir-call-anewarray` | `CRATONVM_JIT_IR_CALL_ANEWARRAY` |
 | `supersede-epoch-skip-useless` | `CRATONVM_JIT_SUPERSEDE_EPOCH_SKIP_USELESS` |
 | `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
 | `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |

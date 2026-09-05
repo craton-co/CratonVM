@@ -6196,6 +6196,22 @@ fn c2_alloc_upgrade_enabled() -> bool {
     })
 }
 
+/// May a method containing `anewarray` still plan its invokes?
+///
+/// Default yes. `=0` restores the historical coupling, where one reference-array
+/// allocation anywhere in a method discarded `invoke_info` for the whole method
+/// and the builder then refused it at its first invoke.
+fn ir_calls_with_anewarray_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_ANEWARRAY").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -23571,7 +23587,27 @@ fn try_compile_inner(
                 // arg-escaped by the escape analysis, so it is really allocated
                 // rather than scalar-replaced — see `build_connection_graph`'s
                 // `Op::Call` arm.
-                let call_eligible = scan.anewarray_ops.is_empty();
+                // `ir_compatible` admits up to `IR_MAX_ARRAY_ALLOCATIONS` (16)
+                // `anewarray` ops, "each one lowered through the shared
+                // `emit_new_array_stub`" — and then this line refused
+                // `invoke_info` for a method containing even ONE. Since a
+                // missing map bails the builder at whichever invoke comes
+                // first, the two gates disagreed and the admission gate lost:
+                // the method was admitted, walked, and then refused.
+                //
+                // The `new_ops` half of this same condition was already deleted
+                // as "a term that outlived its reason"; no rationale was ever
+                // recorded for the `anewarray` half, and the IR tier lowers
+                // `anewarray` through its own helper
+                // (`live_anewarray_calls_the_reference_array_helper`).
+                //
+                // Measured on `org.h2.test.db.TestAlter`: 13 of the 35 methods
+                // that lose `invoke_info` lose it here — 37% of the single
+                // largest refusal in the tier.
+                //
+                // `CRATONVM_JIT_IR_CALL_ANEWARRAY=0` restores the coupling.
+                let call_eligible =
+                    scan.anewarray_ops.is_empty() || ir_calls_with_anewarray_enabled();
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     // See `builder.set_object_init_pcs` below.
