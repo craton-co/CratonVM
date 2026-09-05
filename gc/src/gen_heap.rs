@@ -10978,6 +10978,10 @@ impl GenerationalHeap {
                 let mut free_it = existing_free_dbg.iter().peekable();
                 let used_dbg = young_from.used();
                 let mut c = 0usize;
+                // The object the walk last accepted: `(off, size, class_id,
+                // kind, num_slots, array_len)`. A desync is caused by the
+                // object BEFORE the one it lands on, so the report needs both.
+                let mut prev_walk_object: Option<(usize, usize, usize, usize, usize, usize)> = None;
                 while c < used_dbg {
                     // DoHead hardening: robust skip (see skip_free_blocks).
                     if skip_free_blocks(&mut c, &mut free_it).0 {
@@ -10990,15 +10994,72 @@ impl GenerationalHeap {
                     let h = unsafe { &*(optr as *const ObjectHeader) };
                     let tot = gen_object_total_size(h);
                     if tot < HEADER_SIZE || c + tot > used_dbg {
+                        // NAME THE CORRUPTOR, not just the offset. This message
+                        // used to print `off`, `size` and `used` only, which
+                        // says a walk desynced and nothing about WHY -- and the
+                        // desync is not a side note: on
+                        // `io.netty.util.internal.ObjectCleanerTest` under
+                        // `-XX:+UseGenerationalGC` the runs that print it are
+                        // exactly the runs that then report
+                        // `root=N ... REACHABLE NODE WILL BE SWEPT`, and the
+                        // runs that do not print it report `root=0` and pass
+                        // (measured 2026-09-05, both faces on the same binary).
+                        //
+                        // Two things are needed to act on it and neither was
+                        // here: the OFFENDING header's own fields, and the
+                        // PREVIOUS object -- because a walk desyncs at the
+                        // object AFTER the one whose recorded size was wrong,
+                        // so the offset in this message is the victim's, not
+                        // the culprit's.
+                        let hex = |addr: usize, words: usize| -> String {
+                            let mut out = String::new();
+                            for i in 0..words {
+                                let w = addr + i * 8;
+                                if w + 8 > from_base + used_dbg {
+                                    break;
+                                }
+                                // SAFETY: `w` is 8-aligned inside the mapped
+                                // from-space, bounded by `used_dbg` above.
+                                let v = unsafe { *(w as *const u64) };
+                                out.push_str(&format!("{v:016x} "));
+                            }
+                            out
+                        };
+                        let prev_desc = match prev_walk_object {
+                            Some((poff, ptot, pcid, pkind, pslots, plen)) => format!(
+                                "prev off={poff} size={ptot} class_id={pcid:#x} kind={pkind} \
+                                 num_slots={pslots} array_len={plen} words=[{}]",
+                                hex(from_base + poff, 6)
+                            ),
+                            None => "prev=<none: desynced on the first object>".to_string(),
+                        };
                         tracing::warn!(
                             "[sweep-edges] diagnostic walk desynced at off={} \
-                             (size={}, used={}) — arena already corrupt before this sweep",
+                             (size={}, used={}) — arena already corrupt before this sweep; \
+                             here class_id={:#x} kind={} num_slots={} array_len={} \
+                             element_type={:?} gc_flags={:#x} words=[{}]; {}",
                             c,
                             tot,
                             used_dbg,
+                            h.class_id.as_u32(),
+                            ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)),
+                            h.num_slots(),
+                            h.array_length(),
+                            h.element_type(),
+                            h.gc_flags(),
+                            hex(optr as usize, 6),
+                            prev_desc,
                         );
                         break;
                     }
+                    prev_walk_object = Some((
+                        c,
+                        tot,
+                        h.class_id.as_u32() as usize,
+                        ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) as usize,
+                        h.num_slots() as usize,
+                        h.array_length() as usize,
+                    ));
                     // Family-A: side-marked objects are live survivors even
                     // though their header GC_FLAG_MARKED bit is never written
                     // (see `is_unmarked_young` above).

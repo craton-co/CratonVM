@@ -25444,12 +25444,17 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     // `AbstractInterruptibleChannel` and drives `implCloseChannel()`, which
     // `AbstractSelectableChannel` implements (also `final`) in terms of the
     // abstract `implCloseSelectableChannel()`. `socket_channel.rs` registers
-    // both spellings for the stream channels and this family did not, so any
-    // caller that reached the JDK `close()` bytecode -- the reactor does, and
-    // so did the JIT's `final`-method devirtualiser until the native screen in
-    // `invoke::final_devirt_native_shadow` -- ran real `DatagramChannelImpl`
-    // teardown against JDK internals this VM never populated. Both point at
-    // the same body, which is what the JDK's own chain does.
+    // both spellings for the stream channels and this family did not. Both
+    // point at the same body, which is what the JDK's own chain does.
+    //
+    // What these rows DO NOT do: rescue a real `sun.nio.ch.DatagramChannelImpl`
+    // receiver. That class declares `implCloseSelectableChannel` itself, and
+    // the receiver-has-its-own-bytecode rule reaches that declaration before
+    // the walk gets to `DatagramChannel` -- measured with
+    // `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0`, which still dies on
+    // `"this.stateLock" is null`. They answer for a receiver whose class is the
+    // abstract `DatagramChannel` (what this factory minted before 2026-08-21)
+    // and they keep the two families' registration surfaces the same shape.
     r.register(dc, "implCloseChannel", "()V", native_dc_close);
     r.register(dc, "implCloseSelectableChannel", "()V", native_dc_close);
 
@@ -26272,9 +26277,16 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
     // in `probes/CloseDevirtProbe.java`, each leaking a UDP socket and leaving
     // netty's `AbstractChannel.close()` to raise "close() must be invoked
     // after the channel is closed." over a channel that never closed.
-    // `invoke::final_devirt_native_shadow` now refuses that bind; seeding the
-    // fields is the other half, so the JDK body is CORRECT rather than merely
-    // unreachable. Returns a possibly-relocated ref: seeding allocates.
+    // `invoke::final_devirt_native_shadow` now refuses that bind, and that is
+    // the fix. Seeding is defence in depth and is NOT a second one: with the
+    // screen off, a devirtualised `close()` gets one step further and dies on
+    // `"this.stateLock" is null` inside `DatagramChannelImpl
+    // .implCloseSelectableChannel`. Measured, not assumed --
+    // `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN=0` moves
+    // `probes/ChannelCloseDevirtProbe.java` from 0 to 3,493 failures in 4,000
+    // WITH these fields seeded. What seeding buys is that the fields a
+    // constructor would have assigned are assigned, for every reader that is
+    // not this one. Returns a possibly-relocated ref: seeding allocates.
     let dc = crate::socket_channel::init_channel_locks(ctx, dc);
     // "A newly-created channel is always in blocking mode"
     // (`java.nio.channels.SelectableChannel`). Assert it rather than assume

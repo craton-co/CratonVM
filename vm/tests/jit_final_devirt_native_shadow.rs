@@ -28,8 +28,11 @@
 //! `finally`, `outboundBuffer.close(cause)`, which throws
 //! `IllegalStateException: close() must be invoked after the channel is
 //! closed.` on a channel still reading open. `DnsNameResolverTest` logged it
-//! 384 times with the JIT on and **0** times under `--nojit`; see
-//! `docs/known-issues/netty/channeloutboundbuffer-close-ordering-three-classes-20260905.md`.
+//! 384 times with the JIT on and **0** times under `--nojit`. The retirement
+//! page is `channeloutboundbuffer-close-ordering-was-final-devirt-FIXED-20260905`
+//! (cited without a directory prefix on purpose: it lives in the internal tree,
+//! which is stripped from public history, and a path a public checkout cannot
+//! resolve is worse than a name it can search for).
 //!
 //! # Why both arms run
 //!

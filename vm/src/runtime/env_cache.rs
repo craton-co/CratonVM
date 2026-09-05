@@ -524,10 +524,15 @@ pub fn jit_final_devirt() -> bool {
 /// The B arm of an in-binary A/B, and the reason it is a SEPARATE switch from
 /// `CRATONVM_JIT_FINAL_DEVIRT`: turning the whole door off also removes every
 /// devirtualisation the screen would have admitted, so it cannot price the
-/// screen. With this at `0`, `probes/CloseDevirtProbe.java` returns to 3,487
-/// NullPointerExceptions in 4,000 datagram closes and
-/// `probes/ChanStateCensus3.java` to ~398k wrong `isOpen()` answers in 400k;
-/// with it at the default both read zero on the same binary. Counter:
+/// screen. With this at `0`, `probes/ChannelCloseDevirtProbe.java` returns to
+/// ~3,490 `NullPointerException`s in 4,000 datagram closes, against 0 at the
+/// default, on the same binary.
+///
+/// `probes/ChannelStateAfterCloseCensus.java` stays clean in BOTH arms, and
+/// that is not the screen being inert: `socket_channel::mark_jdk_channel_closed`
+/// now writes the JDK's own `closed` flag, so the body this arm devirtualises
+/// to reads the truth. The two fixes overlap on the `isOpen()` half by design;
+/// only the screen covers the `close()` half. Counter:
 /// [`cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED`].
 pub fn jit_final_devirt_native_screen() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
