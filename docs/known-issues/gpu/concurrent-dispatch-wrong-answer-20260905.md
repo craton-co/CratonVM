@@ -2,128 +2,220 @@
 
 ## Status
 
-**Found 2026-09-05 on real hardware, not fixed, not previously recorded.**
+**Found and FIXED 2026-09-05 on real hardware.** Two independent races,
+both in `input_cache`, both of the same family: state guarding a
+mutex-protected structure was mutated outside that mutex. The second was
+only visible once the first was fixed.
+
 Four Java threads dispatching through one `OffloadCache` intermittently
-produce a wrong checksum under `--gpu`. The answer is wrong, not slow, and
-it is a *different* wrong value nearly every time — a race, not a
-miscompute.
+produced a wrong checksum under `--gpu`: a *different* wrong value nearly
+every time, which is a race rather than a miscompute.
 
-Found by `bench-gpu/runtime-stress.sh`'s `concurrent` scenario, which is
-part of `.github/workflows/gpu-selfhosted.yml` but is **not** part of
-`bench-gpu/ci-gate.sh`. Nothing in `ci-gate.sh` reaches this shape, which
-is why a full green gate battery sat beside it.
+Found by `bench-gpu/runtime-stress.sh`'s `concurrent` scenario, which the
+weekly `gpu-selfhosted.yml` job runs but `bench-gpu/ci-gate.sh` does not.
+All five gates in `ci-gate.sh` were green in the same session.
 
-## Rate, and the controls
+## The cause: a lost filter bit between two writers of `ADDR_FILTER`
 
-RTX 2060 (sm_75), CUDA 13.3, driver 610.88, Windows 11, JDK 25.0.3,
-`cratonvm-cli --features gpu-driver` at `b82da0607`. Fixture
-`test_classes/gpu/GpuRuntimeStress.java` scenario 1, `n=65536`, 4 threads,
-8 rounds each. Reference is HotSpot on the same fixture:
-`concurrent=-6512721874358955904`.
+`input_cache` keeps a 64-bit membership filter, `ADDR_FILTER`, so that
+`invalidate` — which runs on **every primitive array store in the VM** —
+can return after one relaxed load for the overwhelming majority of arrays
+that were never marshalled to the device. Its soundness rests on one
+invariant:
 
-| arm | mismatches |
-| --- | ---: |
-| `--gpu` (default: ZGC, device pool on) | **2 / 20** |
-| `--nojit`, no device | 0 / 20 |
-| default JIT, no device | 0 / 20 |
+> every array in the cache has its bit set in the filter.
 
-Forty control runs clean across two host-side configurations, so this is
-the offload path and not a host-side threading defect in the fixture or
-the VM. The script's own doctrine — "the GPU disagrees with HotSpot is
-also what a host-side defect looks like" — is satisfied before the device
-arm is read.
+False positives are fine (a wasted lock and a failed lookup). A false
+*negative* is a wrong answer, because `invalidate` skips an array that
+really is cached, and the host's write then never evicts the device
+mirror.
 
-The scenario is deterministic by construction: each thread writes only
-`results[id]`, all threads are joined before the combine, and the combine
-walks the array in index order. Thread scheduling cannot change the
-answer.
+`insert` OR'd its bit **outside** the cache mutex and then took the lock
+to add the map entry. But `rebuild_filter` *stores* a mask recomputed
+from the whole table, under the lock. So:
 
-## The amplifier: turning the device pool OFF makes it much worse
-
-`CRATONVM_GPU_DEVICE_POOL=0`, same fixture, same reference:
-
-| arm | mismatches |
-| --- | ---: |
-| `--gpu` pool ON | 2 / 20 (10%) |
-| `--gpu` pool OFF | **16 / 30 (53%)** |
-
-This is the opposite of what a pool-aliasing hypothesis predicts, and it
-rules that hypothesis out: a pool handing the same device buffer to two
-threads would get *better*, not worse, when the pool is disabled. Buffer
-reuse was **masking** the race — with pooling off, every dispatch takes a
-fresh `cuMemAlloc` and the threads interleave more.
-
-Use `CRATONVM_GPU_DEVICE_POOL=0` when working on this. 53% is a workable
-repro rate; 10% is not.
-
-## It splits by collector
-
-With the pool-off amplifier:
-
-| collector | mismatches |
-| --- | ---: |
-| `-XX:+UseGenerationalGC` | 13 / 20 |
-| `-XX:+UseZGC` (the default) | 7 / 20 |
-| `-XX:+UseG1GC` | **0 / 40** |
-
-Both collectors that relocate young objects on every cycle fail; G1 did
-not reproduce in 40 runs. That points at the interaction between
-relocation and the input-residency cache under concurrency — the cache is
-keyed by raw heap address (`FxHashMap<ObjectRef, Entry>` behind a
-`Mutex`), so every relocation has to re-key its entries, and the
-concurrent case has four threads' arrays moving while dispatches are in
-flight.
-
-**G1's zero is "did not reproduce", not "immune."** A pass on one
-collector can be a masked failure; G1 relocated fewer cached entries than
-Generational in the single-threaded `residency-gc.sh` run (8 vs 15), so
-it may simply be moving these arrays less often in this window.
-
-## What is already ruled out
-
-* **The `cuda-bridge` layer.** Both `#[ignore]`d driver integration tests
-  pass on this box: `concurrent_dispatch_it` (`one_context_many_threads`,
-  `many_contexts_many_threads`) and `stream_ordering_it` (all three). The
-  race is above the bridge, in `vm/src/runtime/offload.rs`.
-* **The device buffer pool**, per the amplifier above.
-* **Single-threaded residency across relocation.** `residency-gc.sh`
-  passes on all three collectors, with a non-vacuous `re-keyed > 0`
-  census on each. So relocation re-keying is correct when one thread does
-  it; this defect needs the concurrency too.
-
-## Worth checking first
-
-`OffloadCacheRegistry::get_or_create` hands one `Arc<OffloadCache>` to
-every dispatching thread — one input-residency cache, one kernel map, one
-dispatch memo, one submission table, one chunk-stream pool, shared by all
-four. The residency cache's map is `Mutex`-guarded, so the question is
-not whether the map is torn but whether the *window* between a lookup and
-the launch that uses the looked-up device buffer is protected against a
-concurrent relocation re-keying that entry. A lookup that returns a
-device pointer, then a GC that moves the array and re-keys, then a launch
-against the stale pointer, is the shape that fits every observation here:
-intermittent, different-wrong-value, worse with more allocation, absent
-under the one collector that moves these arrays least, and invisible
-single-threaded.
-
-## Repro
-
-```bash
-# needs a --features gpu-driver binary; the fixture is gitignored and
-# runtime-stress.sh compiles it on demand
-CV=target-gpu/release/cratonvm.exe
-JDK=<jdk25>
-TG=test_classes/gpu
-
-REF=$("$JDK/bin/java" -cp "$TG" GpuRuntimeStress 1 65536 | grep '^concurrent=')
-bad=0
-for i in $(seq 1 30); do
-  g=$(CRATONVM_GPU_DEVICE_POOL=0 "$CV" --java-home "$JDK" -cp "$TG" \
-        --gpu GpuRuntimeStress 1 65536 2>/dev/null | grep '^concurrent=')
-  [ "$g" != "$REF" ] && { bad=$((bad+1)); echo "run $i: $g"; }
-done
-echo "$bad / 30 mismatched"
+```
+thread A: insert(X)              thread B: invalidate(Y)
+  ADDR_FILTER |= bit(X)
+                                   lock
+                                   table.remove(Y)
+                                   rebuild_filter()   <- X is not in the
+                                     table yet, so this STORES a mask
+                                     with bit(X) CLEARED
+                                   unlock
+  lock
+  table.insert(X, entry)           <- X is now cached with its
+  unlock                              filter bit clear
 ```
 
-Expect roughly half the runs to mismatch, each with a different value.
-Add `-XX:+UseG1GC` and expect zero.
+From that point every `invalidate(X)` takes the fast path and returns.
+`GpuRuntimeStress.concurrent` mutates its input between rounds
+(`in[i] += 1`), so the very next `scale(in, out)` computes from a stale
+device copy.
+
+`insert` was the **only** one of the six writers of `ADDR_FILTER` that
+did not hold the mutex; `invalidate`, `clear_all`, `drain_compiled_writes`,
+`disable_for_jit_array_writer` and `remap_and_sweep` all already rebuilt
+under it.
+
+### The fix
+
+Take the lock first, so the OR and the map insert cannot be interleaved
+by a concurrent `rebuild_filter`. Three functional lines in
+`vm/src/runtime/offload.rs`. The *order* within the lock is unchanged and
+still matters — bit first, then the entry — because `invalidate` reads
+the filter without the lock and must never see an entry whose bit is
+still clear.
+
+## What this was NOT, and how that was established
+
+The first version of this page guessed at "relocation re-keying under
+concurrency". **That was wrong**, and cheap measurements refuted it
+before any code was read:
+
+* **Not GC.** `gpu_residency_census::exit_summary` prints only when
+  `collections != 0`, and it printed nothing on any collector, on
+  failing runs included. **Zero collections occurred.** An 8 GB heap did
+  not change the rate either (11/20 vs 9/20).
+* **Not device-side ordering.** `CRATONVM_GPU_DISPATCH_STREAMS=1` puts
+  every dispatch on one stream in strict order — still 9/20. Chunking off
+  (`CRATONVM_GPU_CHUNKS=1`): 10/20.
+* **Not the dispatch memo, the transfer path, or the wait latch.**
+  `DISPATCH_MEMO=0` 11/20, `NO_ZEROCOPY=1` 8/20, `WAIT_LATCH=0` 9/20.
+* **Not the device buffer pool.** `CRATONVM_GPU_DEVICE_POOL=0` made it
+  *worse* — 16/30 against 2/20 — which is the opposite of what pool
+  aliasing predicts. Buffer reuse serialises dispatches and was masking
+  the race.
+* **Not the `cuda-bridge` layer.** Both `#[ignore]`d driver integration
+  tests pass on this box: `concurrent_dispatch_it` (2) and
+  `stream_ordering_it` (3).
+
+The collector split (below) is a consequence of the allocator laying
+arrays out at different addresses, not of relocation: with 64 filter bits
+and `(addr >> 3) & 63`, which arrays collide — and therefore how often a
+`rebuild_filter` races an `insert` — is address-dependent.
+
+## Measured
+
+RTX 2060 (sm_75), CUDA 13.3, driver 610.88, Windows 11, JDK 25.0.3.
+Fixture `test_classes/gpu/GpuRuntimeStress.java` scenario 1, `n=65536`,
+4 threads, 8 rounds. HotSpot reference `concurrent=-6512721874358955904`.
+The scenario is deterministic by construction: each thread writes only
+`results[id]`, all threads are joined before the combine, and the combine
+walks the array in index order.
+
+Before and after are two builds from the same worktree differing **only**
+by the fix, so there is no cross-binary confound. The `after` column here
+is after the FIRST fix only — the Generational row is what the second race
+below accounts for, and the final numbers are under "Verification".
+
+| arm | before | after 1st fix |
+| --- | ---: | ---: |
+| default (ZGC, pool off) | 12 / 30 | **0 / 30** |
+| `-XX:+UseZGC`, pool off | 7 / 20 | **0 / 40** |
+| `-XX:+UseGenerationalGC`, pool off | 13 / 20 | 4 / 205 (see below) |
+| `-XX:+UseG1GC`, pool off | 0 / 40 | **0 / 40** |
+| `--gpu` default config | 2 / 20 | — |
+
+Controls, before the fix: `--nojit` 0/20 and JIT-without-device 0/20, so
+the defect was always in the offload path rather than host-side threading.
+
+## The gate that let it through, and what changed
+
+`runtime-stress.sh` ran each scenario **once**. Against a 10% race that
+is a gate which passes 9 times in 10 — this defect was caught only
+because the first run of the day happened to be unlucky. Demonstrated
+directly: run the *old* binary against the *new* script and the
+single-shot `concurrent` check PASSES while the repeat arm fails.
+
+The script now re-runs the concurrent scenario `REPEATS` times (default
+5) under `CRATONVM_GPU_DEVICE_POOL=0`. The flag is not a workaround — it
+is the sensitive configuration, taking the rate from 10% to 53%, and a
+gate should use the sensitive one. At 53% per run, five repeats miss a
+regression of that size about 2% of the time; one run missed it 47% of
+the time.
+
+## The second race: the compiled-store drain cleared its flags too early
+
+Fixing the filter bit left a residual — ~2% under `-XX:+UseGenerationalGC`
+with the JIT on, and 0/100 under `--nojit`. That comparison was suggestive
+and nothing more (at 2%, 100 clean runs happen 13% of the time by chance),
+so it was not treated as a diagnosis.
+
+The mechanism was confirmed with the tree's own kill switch,
+`CRATONVM_JIT_GPU_ARRAY_BARRIER=0`, which un-arms the compiled-store
+barrier and restores `offload_jit_gate`'s refuse-to-compile behaviour.
+**Alternating arms, one binary, 300 runs each**, Generational, pool off:
+
+| arm | before | after |
+| --- | ---: | ---: |
+| barrier armed (default) | **12 / 300** | **0 / 300** |
+| `CRATONVM_JIT_GPU_ARRAY_BARRIER=0` | 0 / 300 | 0 / 300 |
+
+Eight distinct wrong values among the twelve. A 0/300 result if the true
+rate were 4% has probability ~5e-6, so the arms are genuinely different.
+The barrier is not dormant in this scenario either — the census reports 6
+array writers admitted behind it, 27 drains and 28 buckets evicted.
+
+### What was wrong
+
+`drain_compiled_writes` cleared the `DIRTY` bytes with `swap(0)` and only
+*then* took the cache mutex to perform the eviction those flags
+authorised:
+
+```
+thread A: drain                thread B: get_i32(X)
+  swap DIRTY[b] -> 0
+                                 drain: DIRTY all clear, returns early
+                                 lock; reads X   <- STALE: the eviction
+                                   A owes has not happened yet
+  lock; evict bucket b
+```
+
+The getters compounded it a second way: each did
+`drain_compiled_writes(); let g = map().lock();` — two separate
+acquisitions, so even a correctly ordered drain released the lock before
+the lookup reacquired it, leaving a gap a compiled store could land in.
+
+### The fix
+
+`drain_locked(&mut tables)` does the read-clear **and** the eviction with
+the mutex already held, and the seven getters now take one lock across
+drain-then-lookup. `drain_compiled_writes` keeps its unlocked
+`DIRTY.iter().any(...)` pre-filter, which stays sound: it can only produce
+a false *positive* (a wasted lock), never a false negative.
+`remap_and_sweep` drains under its own lock too, still before the re-key.
+
+`vm/src/memory/addr_keyed.rs`'s census caught the new `&mut` parameter as
+a fourth `ObjectRef`-table declaration in the file and had to be
+re-audited — correctly, and worth noting as a guard that works: it is
+still one table, borrowed, so the existing remap+sweep disposition
+covers it.
+
+## Verification
+
+Post-fix, `GpuRuntimeStress` scenario 1, `n=65536`, pool off, 100 runs per
+collector: **0/100 on Generational, ZGC and G1**. Plus the 300+300
+alternating A/B above.
+
+Whole battery on the final binary: `ci-gate.sh` 5/5, `runtime-stress.sh`
+(including the new repeat arm), `marshal-stress.sh`, `residency-gc.sh`
+(all three collectors), `jit-writer-stale.sh`, both `cuda-bridge` driver
+suites, and `cargo test -p cratonvm-vm --features gpu-offload --lib`
+(2699 passed).
+
+## The shape worth remembering
+
+Both bugs are the same mistake in two places: a cheap lock-free
+side-channel guarding an expensive locked structure, updated outside that
+structure's lock.
+
+* `ADDR_FILTER` — a bit OR'd in before the lock, erased by a concurrent
+  rebuild-and-store.
+* `DIRTY` — flags cleared before the lock, so the eviction they
+  authorised had not happened when the next reader looked.
+
+Neither is visible single-threaded, neither needs a GC, and neither
+changes an answer that any single-threaded test checks. When a fast path
+exists to let callers skip a lock, the state that fast path reads is part
+of the locked invariant and has to be maintained under the same lock.
