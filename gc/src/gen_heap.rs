@@ -4327,7 +4327,7 @@ impl GenerationalHeap {
         // zero, so a candidate there is declined outright. No live object is
         // ever in the inactive semi-space, so this changes no valid answer.
         let skip_inactive = self.wipe_in_flight.load(Ordering::Acquire);
-        let mut hit: Option<(usize, usize)> = None;
+        let mut hit: Option<(usize, usize, usize)> = None;
         for (i, (base, end)) in self.region_bounds.iter().enumerate() {
             if skip_inactive && i == 1 {
                 continue;
@@ -4335,11 +4335,14 @@ impl GenerationalHeap {
             let b = base.load(Ordering::Acquire);
             let e = end.load(Ordering::Acquire);
             if addr >= b && addr < e {
-                hit = Some((i, b));
+                // Carry the END out too. The extent check further down used to
+                // re-scan all three bounds pairs -- six more `Acquire` loads --
+                // to find the very region this loop just identified.
+                hit = Some((i, b, e));
                 break;
             }
         }
-        let Some((slot, region_base)) = hit else {
+        let Some((slot, region_base, region_end)) = hit else {
             return None;
         };
 
@@ -4461,11 +4464,25 @@ impl GenerationalHeap {
         // check above matched (not just "some" arena — a header claiming to
         // span from young into old gen is exactly the interior-cell false
         // positive this guards against).
-        let extent_fits = self.region_bounds.iter().any(|(base, end)| {
-            let b = base.load(Ordering::Acquire);
-            let e = end.load(Ordering::Acquire);
-            addr >= b && addr < e && obj_end <= e
-        });
+        //
+        // "The same arena" is the arena the containment loop already found, so
+        // ask it directly instead of re-scanning all three. The three arenas are
+        // separate allocations and therefore disjoint, so the old `any` could
+        // only ever have been satisfied by this same region — but the fallback
+        // below keeps the answer bit-identical without resting on that, at the
+        // cost of a scan that now runs only when the fast test fails, i.e.
+        // essentially never on a real heap.
+        //
+        // This function is the VM's hottest validator: it is what every
+        // conservative stack word, every ambiguous operand slot and every JIT
+        // helper probe goes through, and the loop it replaces was six `Acquire`
+        // loads on top of the six the containment check had already done.
+        let extent_fits = obj_end <= region_end
+            || self.region_bounds.iter().any(|(base, end)| {
+                let b = base.load(Ordering::Acquire);
+                let e = end.load(Ordering::Acquire);
+                addr >= b && addr < e && obj_end <= e
+            });
         if !extent_fits {
             return None;
         }
