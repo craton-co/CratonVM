@@ -20272,7 +20272,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// unqualified. Claiming after the attempt instead would trade it for
 /// re-asking (a lock and a layout lookup) on every dispatch a refused site ever
 /// serves, which is the shape of the 202 000 re-installs
-/// `LambdaJitSite::adapter_installed` exists to prevent.
+/// `LambdaJitSite::adapter_slots` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
@@ -20313,7 +20313,7 @@ unsafe fn install_lambda_inline_cache(
         }
         crate::runtime::interpreter::const_probe_note_opaque();
     }
-    if !site.claim_adapter_install() {
+    if !site.claim_adapter_install(mic_ptr, pic_ptr) {
         return;
     }
     // `total_args` is captures plus SAM arguments; the emitter wants them apart,
@@ -20354,9 +20354,16 @@ unsafe fn install_lambda_inline_cache(
     if installed {
         crate::runtime::interpreter::lambda_site_bump_adapter(site.num_captures());
         if mic_prof::enabled() {
+            // The call counts AT THE MOMENT OF INSTALL. `site_adapters`
+            // alone cannot tell "installed early and served" from
+            // "installed after the workload was over", which is exactly
+            // what an intermittent `site_direct` failure asks.
+            let (fast_returns, site_direct, _) =
+                crate::runtime::interpreter::lambda_jit_engagement();
             eprintln!(
                 "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
-                 captures={} sam_args={sam_args} entry={entry:#x} impl={}",
+                 captures={} sam_args={sam_args} entry={entry:#x} impl={} \
+                 at site_direct={site_direct} fast_returns={fast_returns}",
                 site.num_captures(),
                 class_name,
             );
