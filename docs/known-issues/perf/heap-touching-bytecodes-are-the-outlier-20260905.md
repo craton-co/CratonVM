@@ -219,6 +219,82 @@ worthless and did not look it:
 4. **`getstatic` / `putstatic` at 25x** were not investigated. They do not go
    through `field_ptr_for` and were the internal control for this pass.
 
+## Three findings resolved without a change, and why
+
+These were on the original ranked list. Each was read to the point of a verdict
+rather than left open, because a finding that is quietly dropped comes back.
+
+### The per-access gate loads: mostly not removable, and the count was overstated
+
+The claim was "seven or eight gate loads to read one field", fixable by hoisting
+them into the per-`execute_frame` word beside `fast_field_zgc`. On inspection
+most of them cannot move:
+
+* **The two epochs** (`class_definition_epoch`, `resolution_epoch`, read by
+  `SiteCache::get` on every hit) are the site cache's validity proof. They
+  cannot be hoisted per frame, because **`execute_frame_from_index` runs an
+  entire nested call tree in one invocation** — an interpreted call pushes a
+  frame and `continue`s the same loop — so "per frame entry" is not
+  per-method, it is per outermost interpreter entry. A class defined anywhere
+  in that call tree must invalidate the sites, and hoisting would serve stale
+  ones.
+* **`any_field_watchpoint_active`** has the same problem and it is worse:
+  hoisting it would blind a JVMTI agent's field watchpoints for the duration of
+  a whole call tree. The existing per-access check is the correct design.
+  (The comments on `pgo_enabled` and `single_step_active` describe their
+  tradeoff as "observed on the next `execute_frame` entry (call/return)". That
+  parenthetical is wrong for the same reason — those gates persist across the
+  call tree too. It is defensible for a profiler; it would not be for a
+  debugger's watchpoints.)
+* **`vacated_frames_enabled`**, read by `check_vacated_compact` on every push,
+  is already screened by `fast_field_zgc`, which returns `None` when it is
+  armed. So the check is provably a no-op whenever a fast arm runs, and the
+  only cost left is its own relaxed byte load. Removing it would couple the
+  push helper to that admission gate — a later edit to `fast_field_zgc` would
+  silently drop a GC-safety check — which is not worth one load.
+
+What is left of the finding is one gate load per push. It is recorded as
+**not worth taking**, and the count in the original write-up (7–8) should be
+read as 2–3 that are even candidates.
+
+### The loop-top safepoint poll: no instruction to save on x86-64
+
+The proposal was to replace the per-bytecode `stw_requested.load(Acquire)` with
+a `poll_pending` local set at frame entry. **On x86-64 an `Acquire` load is a
+plain `mov`** — there is no fence to delete, so the only thing the change buys
+is that the compiler may keep the flag in a register, and the only other lever
+is poll *frequency*, which is time-to-safepoint. Weighed against a failure mode
+whose shape is a GC that waits forever for a thread that never polls, that is
+the wrong trade for roughly one L1 hit — especially now that the flag has its
+own cache line and that hit is clean.
+
+**It should be revisited on aarch64.** There `Acquire` is `ldar`, a real
+ordering instruction, and one per bytecode is not free. The aarch64 port is in
+flight; this belongs on its list, not this one.
+
+### The operand-stack kind array: a project with a specific hazard
+
+Collapsing `ValueStack::kinds` / `Frame::local_kinds` from `Vec<u8>` to a packed
+2-bit mask is still the right shape — three values, and the second `Vec` costs a
+bounds check, a cache line and a pooled buffer per frame. It is not a point fix:
+
+* 43 call sites read the two arrays, plus the GC root scan, freeze/thaw, deopt,
+  `snapshot_raw`/`from_snapshot`, and the `Vec<u64> ↔ Vec<CompactValue>`
+  `repr(transparent)` transmute the frame pool depends on. `local_kinds`
+  deliberately **is** the pool tuple's `Vec<u8>` half, so removing it reshapes
+  the pool.
+* `max_stack` and `max_locals` are `u16`. An inline `u64`/`u128` mask therefore
+  needs a spill path for the tail — and a fixed-width structure that silently
+  stops describing slots past its width is precisely the defect this tree has
+  already shipped once, when precise oop maps stopped at 64 locals and said
+  nothing about it.
+
+And `ValueStack`'s own doc names a better endpoint: consume the verifier's
+per-pc type maps (`classloading/type_maps.rs`) so the kind of every slot at
+every pc is a static fact and **no** per-slot runtime tag is needed. That
+deletes the array rather than shrinking it. Whoever takes this should build the
+type-map consumer first.
+
 ## Reproduction
 
 ```bash
