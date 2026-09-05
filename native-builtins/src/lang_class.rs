@@ -19085,7 +19085,7 @@ fn spring_boot_exploded_manifest_attr(
     if layout != "BOOT-INF" && layout != "WEB-INF" {
         return None;
     }
-    let manifest = layout_dir.parent()?.join("../../apps/META-INF").join("MANIFEST.MF");
+    let manifest = layout_dir.parent()?.join("META-INF").join("MANIFEST.MF");
     let cache_key = manifest.display().to_string();
 
     if let Ok(cache) = exploded_manifest_cache().lock() {

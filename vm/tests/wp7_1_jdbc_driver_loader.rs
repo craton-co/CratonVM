@@ -61,7 +61,7 @@ fn class_files_available() -> bool {
 /// VM can read from it after this helper returns.
 fn make_spi_classpath_dir() -> std::path::PathBuf {
     let dir = tempfile::TempDir::new().expect("create temp dir for SPI fixture");
-    let services_dir = dir.path().join("../../apps/META-INF").join("services");
+    let services_dir = dir.path().join("META-INF").join("services");
     std::fs::create_dir_all(&services_dir).expect("create META-INF/services");
     let descriptor = services_dir.join("java.sql.Driver");
     // The SPI-spec line is the binary class name. The driver's enclosing
