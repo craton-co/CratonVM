@@ -808,19 +808,25 @@ impl Arena {
             starts: None,
         };
         a.rearm_alloc_anchors();
-        a.arm_object_starts();
         a
     }
 
     /// Build the exact object-start bitmap, if `CRATONVM_GC_OBJECT_STARTS` is
     /// on and this arena has any capacity to cover.
     ///
-    /// Called from [`Arena::new`]. Deliberately NOT from `grow`: a grown arena
-    /// has a new base and a new span, so the old bitmap would answer for
-    /// addresses that no longer exist. `grow` drops it instead, which turns
-    /// every query into a miss and falls back to the deduction -- correct, and
-    /// visible in the hit census rather than silent.
-    fn arm_object_starts(&mut self) {
+    /// # Why the OWNER arms this and not [`Arena::new`]
+    ///
+    /// A bit per 8 bytes is capacity/64 of side table, and only a heap that
+    /// CONSULTS it gets anything for that. `Arena` is the backing store for the
+    /// generational young semi-spaces, for the evacuation buffers, and for the
+    /// whole of `ZgcRealHeap` -- and ZGC answers `is_object_address` from its
+    /// own registry and would never read a bit of this. Arming in the
+    /// constructor charged the DEFAULT collector 64 MB on a 4 GB heap for a
+    /// table nothing reads. So the constructor no longer arms, and
+    /// `GenerationalHeap` arms the two arenas whose predicate consults it.
+    ///
+    /// Idempotent, and it REBUILDS: see the call in [`Arena::grow`].
+    pub fn arm_object_starts(&mut self) {
         if !object_starts_enabled() || self.data.len() == 0 {
             self.starts = None;
             return;
@@ -3317,6 +3323,19 @@ impl Arena {
         // place `data.len()` moves. `cursor == 0` was just asserted, so there
         // is nothing recorded to preserve.
         self.rearm_alloc_anchors();
+        // The object-start bitmap is indexed off `base` and bounded by `span`,
+        // and `grow_to` has just changed both. Leaving the old one in place
+        // would have it answering for an address space that no longer exists --
+        // in the ACCEPT direction, which means handing back a `Some(true)` for
+        // an address this arena never allocated. Rebuild it over the new
+        // geometry; `cursor == 0` is asserted above, so there is no live base to
+        // preserve and a zeroed bitmap is exactly right.
+        //
+        // Only if it was armed: an unarmed arena stays unarmed, so `grow` never
+        // charges an owner for a table it did not ask for.
+        if self.starts.is_some() {
+            self.arm_object_starts();
+        }
         if gc_flags().dbg_youngstate {
             eprintln!("[youngstate] arena-grow {old_capacity} -> {new_capacity} bytes");
         }
@@ -5027,6 +5046,93 @@ mod tests {
         expected.sort_by_key(|&(off, _)| off);
         super::sort_by_offset(&mut v);
         assert_eq!(v, expected);
+    }
+
+    /// A grown arena must not answer object-start queries from the bitmap it
+    /// had before it moved.
+    ///
+    /// `grow_to` changes both the base and the span, and the bitmap is indexed
+    /// off the base and bounded by the span. Left in place it would answer for
+    /// an address space that no longer exists — in the ACCEPT direction, which
+    /// means handing back `Some(true)` for an address this arena never
+    /// allocated, and a mark-bit write into whatever is actually there.
+    ///
+    /// The arm is explicit here because `Arena::new` deliberately does not do it
+    /// (only `GenerationalHeap` consults the bitmap, and every other `Arena` in
+    /// the process would otherwise pay capacity/64 for nothing).
+    #[test]
+    fn a_grown_arena_rebuilds_its_object_start_bitmap() {
+        let mut a = Arena::new(4096);
+        a.arm_object_starts();
+        if !a.tracks_object_starts() {
+            return; // switch off in this environment; nothing to assert
+        }
+        let p = a.alloc(64, 8).expect("fresh arena has room");
+        let old_addr = p as usize;
+        assert_eq!(
+            a.is_object_start(old_addr),
+            Some(true),
+            "the allocation door must record the base it handed out"
+        );
+
+        a.reset();
+        assert_eq!(
+            a.is_object_start(old_addr),
+            Some(false),
+            "reset invalidates every base; a stale bit would be accepted next cycle"
+        );
+
+        a.grow(1 << 20);
+        assert!(
+            a.tracks_object_starts(),
+            "a grown arena must still track, or the collector silently loses the              fast path with no census entry to show for it"
+        );
+        let q = a.alloc(64, 8).expect("grown arena has room");
+        assert_eq!(
+            a.is_object_start(q as usize),
+            Some(true),
+            "the rebuilt bitmap must be indexed off the NEW base"
+        );
+        // And nothing in the new arena inherits a bit from the old geometry.
+        assert_eq!(a.is_object_start(q as usize + 8), Some(false));
+    }
+
+    /// A freed base stops being a base at the moment the free list learns of it.
+    ///
+    /// Without the removal half, a larger object later allocated over the hole
+    /// sees the stale bit, is accepted at an INTERIOR address, and takes a
+    /// mark-bit write into the middle of a live object — the corruption the
+    /// extent check in `is_object_address` exists to stop.
+    #[test]
+    fn freeing_a_block_clears_its_object_start_bit() {
+        let mut a = Arena::new(4096);
+        a.arm_object_starts();
+        if !a.tracks_object_starts() {
+            return;
+        }
+        let p = a.alloc(64, 8).expect("fresh arena has room");
+        let addr = p as usize;
+        let off = addr - a.base_ptr() as usize;
+        assert_eq!(a.is_object_start(addr), Some(true));
+        a.add_free_block(off, 64);
+        assert_eq!(
+            a.is_object_start(addr),
+            Some(false),
+            "a freed base must stop being a base"
+        );
+    }
+
+    /// An arena nobody armed answers `None`, which is NOT `Some(false)`.
+    ///
+    /// The distinction is the whole safety contract: `None` means "not tracked,
+    /// fall back to the deduction", and a caller that collapsed it to "not a
+    /// base" would reject every live root in an unarmed arena.
+    #[test]
+    fn an_unarmed_arena_answers_none_rather_than_false() {
+        let mut a = Arena::new(4096);
+        let p = a.alloc(64, 8).expect("fresh arena has room");
+        assert!(!a.tracks_object_starts());
+        assert_eq!(a.is_object_start(p as usize), None);
     }
 
     #[test]

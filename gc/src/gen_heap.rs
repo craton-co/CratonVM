@@ -2815,8 +2815,20 @@ impl GenerationalHeap {
 
         let heap = Self {
             layout_domain: std::sync::atomic::AtomicU32::new(cratonvm_types::FIRST_LAYOUT_DOMAIN),
-            young_from: Mutex::new(Arena::new(young_semi_size)),
-            young_to: Mutex::new(Arena::new(young_semi_size)),
+            // Armed here rather than in `Arena::new`: this collector's
+            // `is_object_address` is the only one that consults the bitmap, and
+            // charging every other `Arena` in the process for it (ZGC's whole
+            // heap among them) buys nothing. See `Arena::arm_object_starts`.
+            young_from: Mutex::new({
+                let mut a = Arena::new(young_semi_size);
+                a.arm_object_starts();
+                a
+            }),
+            young_to: Mutex::new({
+                let mut a = Arena::new(young_semi_size);
+                a.arm_object_starts();
+                a
+            }),
             old_gen: Mutex::new(old_gen),
             quarantine: Mutex::new(VecDeque::new()),
             evac_pool: std::sync::OnceLock::new(),
