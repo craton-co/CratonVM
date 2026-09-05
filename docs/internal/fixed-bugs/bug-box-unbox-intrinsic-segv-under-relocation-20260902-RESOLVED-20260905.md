@@ -106,8 +106,12 @@ recipe that section gave (and one it did not: concurrent pairs), and it landed
 default-ON. See **The last open item, CLOSED 2026-09-05** at the end. Nothing
 is outstanding.
 
-`known-issues/jit/` is empty as a result. Eight source comments and three
-sibling pages cite this page by name; the citations were rewritten to NAME the
+This page's retirement left `known-issues/jit/` briefly empty; it is not,
+because `vthread-probe-intermittent-hang-20260905` landed there the same day
+and is open. (Worth knowing for the next person to empty a directory: git
+reads the last page leaving as a directory RENAME and offers to carry a
+sibling's new file along with it.) Eight source comments and four sibling
+pages cite this page by name; the citations were rewritten to NAME the
 write-up rather than its path, since a page under the internal tree is not
 citable by path from outside it.
 

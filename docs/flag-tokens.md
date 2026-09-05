@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-517 tokens.
+518 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -216,6 +216,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `jni-localref` | `CRATONVM_DBG_JNI_LOCALREF` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -583,7 +584,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-366 tokens.
+367 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -789,6 +790,7 @@ export inherited from a parent shell.
 | `zero-unset-locals` | `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
+| `final-devirt-native-screen` | `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN` |
 | `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
@@ -956,7 +958,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-142 tokens.
+145 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1060,6 +1062,9 @@ export inherited from a parent shell.
 | `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `compact-tlab-alloc` | `CRATONVM_COMPACT_TLAB_ALLOC` |
 | `compact-tlab-sites` | `CRATONVM_COMPACT_TLAB_SITES` |
+| `object-starts` | `CRATONVM_GC_OBJECT_STARTS` |
+| `gen-uncommit` | `CRATONVM_GEN_UNCOMMIT` |
+| `static-root-slots` | `CRATONVM_GC_STATIC_ROOT_SLOTS` |
 | `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
