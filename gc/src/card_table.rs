@@ -48,7 +48,13 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Number of bytes covered by a single card.
-pub const CARD_SIZE: usize = 512;
+///
+/// Derived from [`cratonvm_types::CARD_SIZE_BYTES`], which is the single owner:
+/// `g1_cards::G1_CARD_SHIFT` and the x64 emitter's `shr` both come from the same
+/// place, and the emitter's copy is baked into machine code. See that constant
+/// for why three independent values bound by two comments was a hazard rather
+/// than a duplication.
+pub const CARD_SIZE: usize = cratonvm_types::CARD_SIZE_BYTES;
 
 /// Card state: no old→young references detected since last GC.
 pub const CARD_CLEAN: u8 = 0;

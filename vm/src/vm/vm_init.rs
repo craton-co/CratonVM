@@ -1960,9 +1960,22 @@ impl SharedVm {
         // layout registered yet — both of which must observe a stable reference
         // width for the whole process.
         //
-        // Only the generational backend publishes the region bounds the
-        // geometry is derived from, and only its collector has been audited for
-        // narrow slots; G1/ZGC keep full 64-bit references.
+        // TWO gates, and they were one by accident.
+        //
+        // The geometry half is no longer collector-specific: every backend now
+        // publishes its reserved spans into `cratonvm_gc::heap_geometry`, and
+        // `enable_for_live_heap` derives the narrow-oop window from that rather
+        // than from `gen_heap::JIT_REGION_BOUNDS` -- a table whose emptiness
+        // under G1 is load-bearing for something else entirely (defect G1-2,
+        // inline reference stores), so asking it "where is the heap" answered
+        // "nowhere" for two of the three collectors.
+        //
+        // The AUDIT half is real and stays: only the generational collector's
+        // scan and relocation paths have been checked for 4-byte reference
+        // slots. That is a statement about work not yet done, and it belongs
+        // here, in the open, where an operator can read it and a future change
+        // can move it one backend at a time -- not buried in which global table
+        // a helper function happened to read.
         let want_compressed_oops = config.use_compressed_oops
             || matches!(
                 cratonvm_types::flags::runtime_var("CRATONVM_COMPRESSED_OOPS").as_deref(),
@@ -1972,7 +1985,10 @@ impl SharedVm {
             if gc_backend != GcBackend::Generational {
                 eprintln!(
                     "[cratonvm] compressed oops requested but the selected GC backend \
-                     is not generational - running with 64-bit references"
+                     has not been audited for 4-byte reference slots (only the \
+                     generational collector has) - running with 64-bit references. \
+                     The heap geometry itself is published by every backend; this \
+                     is the audit gate, not a missing base/shift."
                 );
             } else {
                 // Reported on stderr, not just through `tracing`: a silent
@@ -4951,6 +4967,15 @@ fn resolution_invalidate_adapter(class_id: u32) {
 /// `clear_all` retires evicted methods rather than freeing their code
 /// immediately, so any still-active frame stays valid.
 fn jit_invalidate_adapter(class_id: u32) {
+    // The socket path's `ByteBuffer` layout cache is keyed by `ClassId` and
+    // holds resolved FIELD SLOTS, so it is invalidated by exactly the events
+    // this hook fires on — a redefine, or a synthetic stub being replaced by
+    // real bytecode with a different field count or order. Its failure mode
+    // without this is the silent one: a transfer reading `position` from a
+    // slot that now holds something else, which desynchronises a channel
+    // rather than raising anything.
+    cratonvm_native_io::socket_fast_io::invalidate_bb_slot_cache();
+
     // Same fan-out rationale as `resolution_invalidate_adapter`: the hook has
     // no VM identity, and `clear_all` retires rather than frees, so evicting
     // another VM's compiled code is a recompile cost, not a hazard. Missing

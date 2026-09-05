@@ -1032,6 +1032,37 @@ pub struct GcFlags {
     /// switch even though the ordering that makes it safe is written down and
     /// tested.
     pub g1_uncommit: bool,
+    /// `CRATONVM_GEN_UNCOMMIT` — return the EVACUATED young semi-space to the
+    /// OS at the end of each young collection, instead of only zeroing it.
+    ///
+    /// **Default-ON opt-out since 2026-09-05** ([`parse::on_unless_zero`]);
+    /// `=0` restores the zero-only behaviour exactly. It shipped opt-in the same
+    /// day and earned the default on a 90/90 HotSpot-differential regression
+    /// suite with it (and the exact object-start bitmap) enabled on this
+    /// collector, having returned 31457280 bytes of a 96 MB heap on the probe
+    /// workload.
+    ///
+    /// The generational collector was the one backend that never gave memory
+    /// back: ZGC does it by default, G1 on request ([`Self::g1_uncommit`]), and
+    /// `gen_heap.rs` contained no `decommit` call at all. Its old generation
+    /// still cannot — that is a `Vec<u8>`, committed in full at construction,
+    /// with no reservation to shrink — but the two young semi-spaces are
+    /// `HeapStore`-backed and the INACTIVE one is, by construction, entirely
+    /// dead the moment the flip completes.
+    ///
+    /// THE COST, which the default does not make go away and which is why the
+    /// opt-out is the first thing to reach for if a compiled frame ever faults
+    /// on a young address: this collector publishes its young arenas' FULL
+    /// reserved range into `JIT_REGION_BOUNDS` and `JIT_READ_BOUNDS`, and a
+    /// decommitted granule FAULTS on touch rather than reading as zero. That
+    /// window is not created here — the young arenas already commit lazily
+    /// while the published bound covers the whole reservation — but it is
+    /// WIDENED, from "granules never yet allocated into" to "granules that held
+    /// objects one collection ago". A compiled access through a STALE reference
+    /// into the evacuated semi-space therefore moves from reading a stale value
+    /// to a SIGSEGV. That is a louder failure, not a new one, but it is a
+    /// behaviour change and it is stated here rather than buried.
+    pub gen_uncommit: bool,
     /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
     /// source walks against a per-arena CARD TABLE, instead of walking every
     /// byte of every named source region. Default **ON**
@@ -1468,6 +1499,11 @@ pub struct GcFlags {
     pub dbg_sweep_edges: bool,
     /// `CRATONVM_DBG_SWEEP_ZERO`
     pub dbg_sweep_zero: bool,
+    /// `CRATONVM_GC_LATE_RESOLVE_DROPPED` -- also run the late grid-resolution
+    /// pass over the candidates `mark_young` DROPPED as free/gap space inside a
+    /// proved anchor span, not only the ones it left unresolved. Over-retention
+    /// only. Default off; see `gen_heap.rs` for the defect it was opened for.
+    pub late_resolve_dropped: bool,
     /// `CRATONVM_DBG_WATCHREF`
     pub dbg_watchref: bool,
     /// `CRATONVM_DBG_WATCH_CELL` — hex address to watch, `0` when disabled.
@@ -1582,6 +1618,7 @@ impl GcFlags {
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
+            gen_uncommit: on_unless_zero(src, "CRATONVM_GEN_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
             g1_card_screen_jit_pinned: on_unless_zero(
@@ -1650,6 +1687,7 @@ impl GcFlags {
             dbg_sweep_census: present(src, "CRATONVM_DBG_SWEEP_CENSUS"),
             dbg_sweep_edges: present(src, "CRATONVM_DBG_SWEEP_EDGES"),
             dbg_sweep_zero: present(src, "CRATONVM_DBG_SWEEP_ZERO"),
+            late_resolve_dropped: present(src, "CRATONVM_GC_LATE_RESOLVE_DROPPED"),
             dbg_watchref: present(src, "CRATONVM_DBG_WATCHREF"),
             dbg_watch_cell: hex_addr_or_zero(src, "CRATONVM_DBG_WATCH_CELL"),
             dbg_youngstate: present(src, "CRATONVM_DBG_YOUNGSTATE"),

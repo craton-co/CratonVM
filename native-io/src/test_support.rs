@@ -106,6 +106,18 @@ pub(crate) struct MockNativeContext {
     class_table: Vec<String>,
     obj_class: HashMap<usize, ClassId>,
     declared_methods: HashSet<(ClassId, String, String)>,
+    /// Declared field slots, keyed by `(ClassId, field name)`.
+    ///
+    /// EMPTY BY DEFAULT, which reproduces the historic behaviour exactly:
+    /// `resolve_field_index_by_class_id` answers `None` for every class no
+    /// test has described. That matters because the stub it replaces returned
+    /// `None` unconditionally, and a native whose fast path is gated on a
+    /// resolvable layout would therefore REFUSE in every unit test — passing
+    /// while proving nothing, because it was testing the mock rather than the
+    /// native. See `declare_field`.
+    field_slots: HashMap<(ClassId, String), usize>,
+    /// Unique per mock instance — see the `vm_identity` impl.
+    vm_identity: usize,
     /// Scripted `InputStream.read([BII)I` payload. `invoke_virtual` serves
     /// bytes from the front of this queue, honouring the caller's requested
     /// length, and returns `-1` once it is empty — i.e. it behaves like a real
@@ -151,6 +163,12 @@ impl MockNativeContext {
             class_table: vec![String::new()],
             obj_class: HashMap::new(),
             declared_methods: HashSet::new(),
+            field_slots: HashMap::new(),
+            vm_identity: {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             stream_bytes: UnsafeCell::new(std::collections::VecDeque::new()),
             stream_scripted: false,
             global_roots: HashMap::new(),
@@ -231,6 +249,20 @@ impl MockNativeContext {
         let cid = self.ensure_mock_class(class_name);
         self.obj_class.insert(obj.as_ptr() as usize, cid);
         obj
+    }
+
+    /// Give `class_name` a field at slot `index`, so
+    /// `resolve_field_index_by_class_id` can answer for it.
+    ///
+    /// Tests that exercise a native which memoizes or resolves field slots
+    /// MUST call this, and should also assert the negative case (an
+    /// undescribed class still refuses) — otherwise a passing test cannot
+    /// distinguish "the fast path ran and was correct" from "the fast path
+    /// refused and the slow path was correct", which are the two outcomes a
+    /// slot-resolution stub silently merges.
+    pub(crate) fn declare_field(&mut self, class_name: &str, field: &str, index: usize) {
+        let cid = self.ensure_mock_class(class_name);
+        self.field_slots.insert((cid, field.to_string()), index);
     }
 
     pub(crate) fn declare_method(&mut self, class_name: &str, method: &str, desc: &str) {
@@ -710,14 +742,21 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         self.named_fields_mut()
             .insert((o.as_ptr() as usize, n.to_string()), v);
     }
-    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-        None
+    fn resolve_field_index(&self, class_name: &str, field: &str) -> Option<usize> {
+        let cid = self.class_table.iter().position(|n| n == class_name)?;
+        self.field_slots
+            .get(&(ClassId::new(cid as u32), field.to_string()))
+            .copied()
     }
-    // Drive-by test fix (cce0079): the trait gained
-    // `resolve_field_index_by_class_id` without this mock being updated —
-    // the lib-test target did not compile on dev.
-    fn resolve_field_index_by_class_id(&self, _c: ClassId, _f: &str) -> Option<usize> {
-        None
+    // Was an unconditional `None` stub. That is not a neutral default: it made
+    // every fast path gated on a resolvable layout refuse inside every unit
+    // test, so such a test asserted the SLOW path's answer and reported it as
+    // the fast path's. Now backed by `declare_field`, and still `None` for any
+    // class a test has not described — so no existing test changes behaviour.
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field: &str) -> Option<usize> {
+        self.field_slots
+            .get(&(class_id, field.to_string()))
+            .copied()
     }
     fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {
@@ -897,6 +936,19 @@ impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
 impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {}
 
 impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
+    /// Every mock is its OWN VM.
+    ///
+    /// The trait default is `0` for every context, which makes any native-side
+    /// cache scoped by `vm_identity` behave as though all tests shared one VM.
+    /// Since each mock restarts its class table at `ClassId(1)`, unrelated
+    /// tests then collide on that id and poison each other's cached layouts —
+    /// which is not merely a test artefact but the multi-VM embedding case in
+    /// miniature. Modelling it here is what makes such a cache's scoping
+    /// testable at all; without it a cross-VM cache bug passes every test.
+    fn vm_identity(&self) -> usize {
+        self.vm_identity
+    }
+
     fn record_printed_value(&mut self, _v: Value) {}
     fn record_printed_line(&mut self, _t: String) {}
     fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {

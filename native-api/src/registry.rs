@@ -4818,6 +4818,56 @@ pub trait NativeSystemAccess: NativeThreadAccess {
         false
     }
 
+    /// Is `addr` one of the VM's `Unsafe`-arena handles rather than a real,
+    /// dereferenceable OS pointer?
+    ///
+    /// This is the distinction [`Self::copy_from_native_memory`] already makes
+    /// internally, surfaced so a caller can *report* which population it is
+    /// serving without attempting a transfer. `cratonvm-native-io`'s socket
+    /// census uses it to answer a question that decides whether a whole class
+    /// of optimisation is reachable at all: the bounce buffer in the direct
+    /// `ByteBuffer` transfer path is removable only for a REAL pointer, since
+    /// an arena handle cannot be handed to the kernel. Measuring the split on a
+    /// live HTTP workload is what tells you whether that work is worth doing —
+    /// and the answer must come from a counter, not from an assumption about
+    /// which allocator the application used.
+    ///
+    /// It exists on this trait rather than as a direct call into
+    /// `cratonvm-native-builtins` (which owns the tag bit) because
+    /// `native-builtins` DEPENDS on `native-io`; the reverse edge would be a
+    /// dependency cycle. Duplicating the tag constant into `native-io` was the
+    /// other option and is worse — a second copy of a magic number that must
+    /// track the arena allocator's, with nothing to notice when it stops.
+    ///
+    /// The default answers `false` — "assume a real pointer". A context that
+    /// does not model the arena has no handles to misreport, and the only
+    /// consumer is diagnostic.
+    fn native_addr_is_arena_handle(&self, _addr: i64) -> bool {
+        false
+    }
+
+    /// [`Self::class_id_of_object`], but resolved through the read barrier the
+    /// way [`Self::get_field_by_name`] resolves it.
+    ///
+    /// The two are NOT interchangeable for a caller that memoizes field slots.
+    /// `class_id_of_object` validates the address and answers `ClassId(0)` when
+    /// it is not a live object base — but if a moving collection relocated the
+    /// object and something else has since been allocated at the old address,
+    /// it answers the class of THAT object instead. Pairing such an id with
+    /// [`Self::get_field`], which forwards internally, would read the new
+    /// object's slot layout out of the forwarded original: a wrong field, in
+    /// bounds, with nothing raised.
+    ///
+    /// `get_field_by_name` never has that problem because it forwards first and
+    /// derives the id from the forwarded object. Any caller resolving an index
+    /// once and reusing it must do the same, which is what this exists for.
+    ///
+    /// The default delegates, because a context with no moving collector has
+    /// nothing to forward.
+    fn class_id_of_object_forwarded(&self, obj: ObjectRef) -> ClassId {
+        self.class_id_of_object(obj)
+    }
+
     /// Record a printed line (for System.out.println capture in tests).
     fn record_printed_line(&mut self, text: String);
 
@@ -6373,6 +6423,15 @@ pub struct NativeMethodRegistry {
     /// `find_by_method_descriptor` to avoid the O(N) linear scan over
     /// `registrations`. Built incrementally on every `register()`.
     by_method_desc: FxHashMap<(u64, u64), NativeCallback>,
+    /// Memo for [`owner_classes_for_method`](Self::owner_classes_for_method):
+    /// `(registrations.len() when built, (method, descriptor) -> owning classes)`.
+    /// Interior-mutable because every caller holds the registry by `&self`.
+    method_owner_index: std::sync::RwLock<
+        Option<(
+            usize,
+            std::collections::HashMap<(Box<str>, Box<str>), Vec<Box<str>>>,
+        )>,
+    >,
     /// Category aligned with `registrations` (index-parallel), for
     /// `dump_registrations` / census output.
     categories: Vec<NativeKind>,
@@ -6618,6 +6677,7 @@ impl NativeMethodRegistry {
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
+            method_owner_index: std::sync::RwLock::new(None),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             current_category: None,
             current_leaf: false,
@@ -7011,6 +7071,56 @@ impl NativeMethodRegistry {
     ) -> Option<NativeKind> {
         self.slot_for_exact(class_name, method_name, descriptor)
             .map(|slot| slot.kind)
+    }
+
+    /// Every class a native for `(method_name, descriptor)` is registered on.
+    ///
+    /// The registry is keyed on the EXACT class name, and every lookup path
+    /// asks it that way — `find`, `resolve_id`, the JIT site cache. This is the
+    /// one question they cannot answer: *given a method, which receivers would
+    /// take a native?* The JIT's `final`-method devirtualiser needs exactly
+    /// that, because it decides at COMPILE time, with no receiver in hand, to
+    /// bind a site straight to the classfile body — and a native registered on
+    /// a SUBCLASS of the declaring class shadows that body for every receiver
+    /// of the subclass. See `invoke::invokevirtual_site_final_owner`, whose
+    /// screen this serves, and the netty
+    /// `channeloutboundbuffer-close-ordering` page for the two defects that
+    /// escaped through the gap.
+    ///
+    /// Cold path: called once per candidate call site while compiling, never
+    /// per execution. The index behind it is built on first use and rebuilt if
+    /// `registrations` has grown since (registration is an init-time activity,
+    /// so in an ordinary run it is built exactly once, and the length check is
+    /// what keeps a late `register()` — the tests do this — from being invisible
+    /// to a cached answer).
+    #[must_use]
+    pub fn owner_classes_for_method(&self, method_name: &str, descriptor: &str) -> Vec<Box<str>> {
+        type Index = std::collections::HashMap<(Box<str>, Box<str>), Vec<Box<str>>>;
+        let mut guard = self
+            .method_owner_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale = match &*guard {
+            Some((built_len, _)) => *built_len != self.registrations.len(),
+            None => true,
+        };
+        if stale {
+            let mut index: Index = std::collections::HashMap::new();
+            for (class, method, desc) in &self.registrations {
+                index
+                    .entry((method.clone(), desc.clone()))
+                    .or_default()
+                    .push(class.clone());
+            }
+            *guard = Some((self.registrations.len(), index));
+        }
+        let Some((_, index)) = &*guard else {
+            return Vec::new();
+        };
+        index
+            .get(&(Box::from(method_name), Box::from(descriptor)))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Snapshot of every registration as `(class, method, descriptor, kind)`,

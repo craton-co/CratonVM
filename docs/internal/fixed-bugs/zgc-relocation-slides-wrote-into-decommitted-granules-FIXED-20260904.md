@@ -3,8 +3,7 @@
 ## Status
 
 **FIXED 2026-09-04.** Retired from
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`,
-which named it "the box/unbox intrinsic SIGSEGVs under a relocating
+`bug-box-unbox-intrinsic-segv-under-relocation-20260902`, which named it "the box/unbox intrinsic SIGSEGVs under a relocating
 collector". It is neither the intrinsic's fault nor relocation's, and the
 intrinsic is default-ON again.
 

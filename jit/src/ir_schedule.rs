@@ -178,8 +178,8 @@ pub struct ScheduleOptions {
     pub sink_pure_late: bool,
 }
 
-/// Sink pure nodes out of loops they are only used outside of -- **default
-/// OFF**, opt in with `CRATONVM_JIT_IR_SINK_LATE=1`.
+/// Sink pure nodes out of loops they are only used outside of -- **default ON**
+/// since 2026-09-05; `CRATONVM_JIT_IR_SINK_LATE=0` is the kill switch.
 ///
 /// This module's own header says a data node is "placed as late as possible
 /// (to minimize register pressure)". It is not: [`find_best_block`] picks the
@@ -192,9 +192,10 @@ pub struct ScheduleOptions {
 /// exit block, and all three were scheduled into the loop body: eleven of the
 /// loop's fifty-five instructions, computed and discarded on every iteration.
 fn sink_late_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SINK_LATE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 

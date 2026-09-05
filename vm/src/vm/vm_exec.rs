@@ -4466,12 +4466,22 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         // path over, and they are the population the ZGC pinned-peer credit
         // makes relocation possible under.
         //
-        // Diagnosed by elimination 2026-09-03: three repairs aimed at the
-        // CURRENT thread's frames (pin unnamed refs, rewrite unmapped
-        // duplicates, `local_mask_unreached` fail-closed) each changed nothing,
-        // while the blanket guard -- the only remedy that also covers PEERS --
-        // was 0 SIGSEGV in 4. See
-        // `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+        // ON ITS OWN MERITS, and the elimination that first argued for it is
+        // withdrawn. That argument ran: three repairs aimed at the CURRENT
+        // thread's frames changed nothing, the blanket guard -- the only
+        // remedy that also covers PEERS -- was 0 SIGSEGV in 4, so the defect
+        // must be a peer resuming un-remapped. Adding this block REFUTED it:
+        // the crash stayed at 3 of 4 against a control at 2 of 2. The guard
+        // worked because it suppresses COMPACTION, and the real fault was
+        // `relocate_stw` sliding into a decommitted arena granule
+        // (`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904`).
+        //
+        // The omission this closes is still real and still free: a peer that
+        // blocked with compiled frames below it resumed with every JIT oop at
+        // its pre-move address, which is a use-after-free whatever else was
+        // true. See the retired
+        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` for the
+        // whole elimination and its retraction.
         //
         // Sound here for the same reason it is sound there: these walks are
         // thread-local (`JIT_ENTRY_CHAIN`, this thread's shadow stack) and this
@@ -17461,6 +17471,27 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
         }
         true
+    }
+
+    fn class_id_of_object_forwarded(&self, obj: ObjectRef) -> ClassId {
+        // The first three lines of `get_field_by_name`, verbatim and for the
+        // same reason: forward FIRST, then take the id from the forwarded
+        // object, so a memoized slot index and the `get_field` that uses it
+        // describe the same object.
+        let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
+        if obj_validated {
+            self.shared.mem.heap.class_id_of_validated(obj)
+        } else {
+            ClassId::new(0)
+        }
+    }
+
+    fn native_addr_is_arena_handle(&self, addr: i64) -> bool {
+        // The same TAG-BIT test `copy_from_native_memory` / `copy_to_native_memory`
+        // classify with, and deliberately not a liveness test: a freed handle is
+        // still a handle, and reporting it as a raw pointer would tell the socket
+        // census that a bounce-free transfer was available when it was not.
+        cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr)
     }
 
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {

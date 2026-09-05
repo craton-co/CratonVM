@@ -462,6 +462,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "fc-fast-io-stats", on_key: Some("CRATONVM_FC_FAST_IO_STATS"), off_key: None, off_word: None, since: "2026-08-23" },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None, since: "2026-07-10" },
+    // The socket transfer / selector engagement census
+    // (`native-io::socket_fast_io::stats`). Diagnostic only: it prints counters
+    // at exit and changes nothing a program can observe.
+    E { group: Group::DBG, token: "sc-io-stats", on_key: Some("CRATONVM_SC_IO_STATS"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None, since: "2026-07-23" },
     E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "force-moving", on_key: Some("CRATONVM_DBG_FORCE_MOVING"), off_key: None, off_word: None, since: "2026-06-03" },
@@ -489,6 +493,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
+    E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
+    // Coverage oracle for the slot list `static-root-slots` builds: after the
+    // fast path has patched the recorded slots, re-walk every static the slow
+    // way and report any that still names a moved address. A miss there is not
+    // a wrong number, it is a live static field left pointing at a vacated
+    // address, and a unit test cannot answer the question on a real class set.
+    E { group: Group::DBG, token: "static-slot-verify", on_key: Some("CRATONVM_DBG_STATIC_SLOT_VERIFY"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::DBG, token: "gcpart", on_key: Some("CRATONVM_DBG_GCPART"), off_key: None, off_word: None, since: "2026-07-22" },
     E { group: Group::DBG, token: "jni-localref", on_key: Some("CRATONVM_DBG_JNI_LOCALREF"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None, since: "2026-07-07" },
@@ -1508,6 +1519,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "zero-unset-locals", on_key: None, off_key: Some("CRATONVM_JIT_NO_ZERO_UNSET_LOCALS"), off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "checkcast-inline", on_key: Some("CRATONVM_JIT_CHECKCAST_INLINE"), off_key: None, off_word: None, since: "2026-08-28" },
     E { group: Group::JIT, token: "final-devirt", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT"), off_key: None, off_word: None, since: "2026-08-28" },
+    E { group: Group::JIT, token: "final-devirt-native-screen", on_key: Some("CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN"), off_key: None, off_word: None, since: "2026-09-05" },
     // Declared 2026-09-02. `final-devirt` above is `java/lang/String`'s
     // problem: String is final, so the rewrite it drives took EVERY String
     // access site away from the inline intrinsic. This is the opt-out for the
@@ -1711,6 +1723,35 @@ pub const INVENTORY: &[E] = &[
     // opt-out-only, same shape as `vector-intrinsics` above: the switch gates
     // REGISTRATION so the off arm is the un-intercepted VM.
     E { group: Group::JIT, token: "fc-fast-io", on_key: Some("CRATONVM_FC_FAST_IO"), off_key: None, off_word: Some("0"), since: "2026-08-23" },
+    // The socket path's per-call cost removals, each separately switchable so
+    // its A/B is one binary and one variable. All default-ON and opt-out-only,
+    // the same shape as `fc-fast-io` above.
+    //
+    // `sc-scratch`      — reuse the thread's transfer buffer instead of
+    //                     allocating and zeroing one sized to the destination's
+    //                     remaining capacity on every call.
+    // `sc-bb-slots`     — memoize `ByteBuffer` field slots per (VM, class)
+    //                     instead of resolving them by name on every transfer.
+    // `sel-ready-cache` — mirror a selector's readiness into the process-global
+    //                     side table only when it CHANGED, not every key every
+    //                     tick.
+    // `sel-fast-keys`   — append ready keys straight into netty's own key set
+    //                     instead of re-entering the interpreter once per key.
+    //
+    // The last two are separate tokens rather than one: they are independent
+    // cuts to the same function, and `sel-ready-cache`'s failure mode (a latched
+    // cache suppressing a real readiness change) is silent, so an A/B that could
+    // only turn both off together could not attribute it.
+    E { group: Group::JIT, token: "sc-scratch", on_key: Some("CRATONVM_SC_SCRATCH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sc-bb-slots", on_key: Some("CRATONVM_SC_BB_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sel-ready-cache", on_key: Some("CRATONVM_SEL_READY_CACHE"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "sel-fast-keys", on_key: Some("CRATONVM_SEL_FAST_KEYS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    // `sc-preresolved` — dial the address an `InetSocketAddress` ALREADY holds
+    // instead of re-resolving its hostname on every connect. Default-ON and
+    // opt-out-only; `=0` restores the per-dial `getaddrinfo`, which is the
+    // "off" arm for
+    // `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+    E { group: Group::JIT, token: "sc-preresolved", on_key: Some("CRATONVM_SC_PRERESOLVED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
     E { group: Group::JIT, token: "strict-callee-roots", on_key: Some("CRATONVM_JIT_STRICT_CALLEE_ROOTS"), off_key: None, off_word: Some("0"), since: "2026-07-27" },
@@ -1803,7 +1844,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "pin-unnamed-frame-refs", on_key: Some("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "remap-unmapped-dupes", on_key: Some("CRATONVM_JIT_REMAP_UNMAPPED_DUPES"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "zgc-jit-blanket-refusal", on_key: Some("CRATONVM_ZGC_JIT_BLANKET_REFUSAL"), off_key: None, off_word: None, since: "2026-09-03" },
-    E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON since 2026-09-05, so it takes an `off_word`: presence alone no
+    // longer decides it and `=0` has to be able to turn it off.
+    E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: Some("CRATONVM_BLOCKED_WAKE_JIT_REMAP"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "xt-keep-unrewritable-on-discharge", on_key: Some("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "zgc-unrewritable-peer-refuses", on_key: Some("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES"), off_key: None, off_word: None, since: "2026-09-04" },
@@ -2030,6 +2073,30 @@ pub const INVENTORY: &[E] = &[
     // which classes actually did. Both exist because the first miscompile it
     // exposed cost a rebuild per hypothesis until they did not.
     E { group: Group::GC, token: "compact-tlab-sites", on_key: Some("CRATONVM_COMPACT_TLAB_SITES"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON opt-out: `collect_roots` records the ADDRESS of every static
+    // slot it finds holding an object, and `update_all_roots` walks that list
+    // instead of re-sweeping every slot of every class under the `statics`
+    // write lock. `=0` restores the full walk, so the two are one binary apart
+    // rather than one build apart. Statics are the first root class in this VM
+    // carried as a SLOT rather than a value -- see `memory::roots::
+    // STATIC_REF_SLOTS` for why they are the ones that can be.
+    // Default-ON opt-out since 2026-09-05: hand the evacuated young semi-space
+    // back to the OS at the end of
+    // each young collection instead of only zeroing it. The generational
+    // collector was the one backend that never gave memory back at all. Off by
+    // default for the same reason `g1-uncommit` is: it publishes the young
+    // arenas' full reserved range to the JIT, and a decommitted granule faults
+    // on touch rather than reading as zero.
+    // Default-ON opt-out since 2026-09-05: maintain an EXACT object-start bitmap
+    // on the arenas whose owner asks for one (a bit per 8
+    // bytes, set in `hand_out`, cleared in `add_free_block` and on reset) and
+    // let `is_object_address` answer from it instead of deducing the answer
+    // from header bytes. Consulted in the ACCEPT direction only -- a miss falls
+    // through to the deduction, because the bitmap is knowably incomplete for
+    // TLAB-allocated objects and using it to REJECT would drop live roots.
+    E { group: Group::GC, token: "object-starts", on_key: Some("CRATONVM_GC_OBJECT_STARTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::GC, token: "static-root-slots", on_key: Some("CRATONVM_GC_STATIC_ROOT_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
