@@ -171,12 +171,27 @@ mod tests {
     /// concurrently in another test sees its own value again.
     const TEST_SLOT: usize = 2;
 
+    /// Serialises the tests below against EACH OTHER.
+    ///
+    /// They share `TEST_SLOT`, and `cargo test` runs them in parallel: one test
+    /// snapshots all three slots while another is mid-write, and the snapshot
+    /// disagrees with itself. That is not a flaw in the table — it is the
+    /// process-global property the module doc states — but it is a flaw in a
+    /// test that reads more of the table than it wrote. Taking one lock is
+    /// cheaper than teaching each test to tolerate the others.
+    ///
+    /// It does NOT serialise against a live backend constructing a heap in some
+    /// other test; that is why these use slot 2, which only the generational old
+    /// gen writes, and why each restores what it found.
+    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn restore(prev: (usize, usize)) {
         publish_heap_span(TEST_SLOT, prev.0, prev.1);
     }
 
     #[test]
     fn an_unpublished_slot_reads_as_zero_and_contributes_nothing() {
+        let _serial = TEST_LOCK.lock();
         let prev = heap_span(TEST_SLOT);
         publish_heap_span(TEST_SLOT, 0, 0);
         assert_eq!(heap_span(TEST_SLOT), (0, 0));
@@ -185,6 +200,7 @@ mod tests {
 
     #[test]
     fn an_inverted_or_empty_span_clears_rather_than_publishing_nonsense() {
+        let _serial = TEST_LOCK.lock();
         let prev = heap_span(TEST_SLOT);
         publish_heap_span(TEST_SLOT, 0x9000, 0x1000);
         assert_eq!(heap_span(TEST_SLOT), (0, 0), "inverted span must not stand");
@@ -195,6 +211,7 @@ mod tests {
 
     #[test]
     fn an_out_of_range_slot_is_declined_rather_than_wrapping_onto_another() {
+        let _serial = TEST_LOCK.lock();
         // The failure this rules out is a write that lands on slot 0 by
         // arithmetic and silently redescribes the live young generation.
         let before: Vec<(usize, usize)> = (0..HEAP_SPAN_SLOTS).map(heap_span).collect();
@@ -205,8 +222,39 @@ mod tests {
         assert_eq!(heap_span(HEAP_SPAN_SLOTS), (0, 0));
     }
 
+    /// **Every backend must publish.** A source witness, and it has to be one.
+    ///
+    /// The defect this guards is not a wrong value, it is a call that does not
+    /// happen — and that is precisely the failure this whole module exists to
+    /// undo. `compressed_oops::enable_for_live_heap` answered "no live heap
+    /// regions published" for G1 and ZGC not because anything was broken but
+    /// because nobody had written the publish, and the symptom surfaced as a
+    /// statement about compressed oops rather than about a missing call. No
+    /// runtime assertion can see a call that was never made.
+    ///
+    /// It cannot be a behavioural test either: this table is process-global and
+    /// this crate's tests share one process, so a test that constructed a G1
+    /// heap and read the table back could have its slot overwritten by a
+    /// generational heap another test built a microsecond later. The `TEST_SLOT`
+    /// tests above stay in their own lane precisely because of that.
+    #[test]
+    fn every_backend_publishes_its_geometry() {
+        for (name, src) in [
+            ("gen_heap", include_str!("gen_heap.rs")),
+            ("g1", include_str!("g1.rs")),
+            #[cfg(feature = "zgc")]
+            ("zgc", include_str!("zgc.rs")),
+        ] {
+            assert!(
+                src.contains("heap_geometry::publish_heap_span("),
+                "{name} no longer publishes its heap geometry. Every consumer of                  `heap_geometry` — the narrow-oop window, a conservative                  scanner's range prefilter — then reads this backend as though                  it had no heap, which is the exact shape of the defect this                  table was added to remove."
+            );
+        }
+    }
+
     #[test]
     fn the_envelope_spans_every_published_slot() {
+        let _serial = TEST_LOCK.lock();
         let prev = heap_span(TEST_SLOT);
         publish_heap_span(TEST_SLOT, 0x4000_0000, 0x5000_0000);
         let (lo, hi) = heap_envelope().expect("a published slot makes an envelope");
