@@ -1,6 +1,8 @@
 # OSR: a strided loop's stored VALUE is computed once and reused
 
-**Status:** open, root-caused to the emitted code, not yet fixed.
+**Status:** PARTIALLY FIXED 2026-09-04. One of two causes is closed; the
+original `cacheCoherence` reproducer still diverges, with a *different*
+wrong value than before.
 **Reproducer:** `test_classes/jit/OsrStridedValue.java` (self-contained,
 no GPU, no `--gpu`).
 **Found:** 2026-09-04, chasing what looked like a GPU offload defect. It
@@ -148,3 +150,56 @@ A fourth **compiled CPU arm** was added on 2026-09-04 and is what now
 reports this. The general lesson is worth more than the defect: a gate
 that keeps methods interpreted removes them from every differential
 suite that reaches the compiled tier only through that gate.
+
+
+## Cause 1 — FIXED: OSR entry with a live expression stack
+
+`jit/src/x64/bytecode_walk.rs` marks a pc OSR-ineligible for several
+reasons (hoisted-loop interiors, synthetic guards, handler-only pcs).
+It did not require the **abstract operand stack to be empty**.
+
+Entering part-way through an expression means the prologue materialises
+the pending operands — correctly, for the entering iteration. What it
+cannot do is make the LOOP recompute them: the back edge targets the
+header, the operand pushes live *above* the entry point, and every later
+iteration replays the slots the prologue filled once.
+
+`operand_stack_live` now joins that rejection set. HotSpot has the same
+rule. It costs nothing in practice — javac gives every loop header an
+empty expression stack, so the newly-refused pcs are mid-expression ones
+the interpreter reaches again a few bytecodes later at the header.
+
+**Evidence it is the right rule:** the minimal reproducer is fixed.
+
+    Min.body, a[i] = i + r      before  11 11 11 11 11 11
+                                after   11 1035 2059 3083 4107 5131
+
+Regression suite 89/90 with the rule in — the one red is
+`RJitLambdaNpeSupersede`, which a pristine dev binary fails identically
+(landed by `4b6437eaf wip:`).
+
+## Cause 2 — STILL OPEN
+
+`OsrStridedValue` / `GpuRuntimeStress.cacheCoherence` still diverge, and
+`i+round` is still frozen at the entering iteration's `i`:
+
+    OsrStridedValue  i+round  22 22 22 22 22 22     (unchanged)
+    OsrCoh           8859114794901677457 expected
+                     6931349745872807313 before the rule
+                     3454959152174638481 after it
+
+The value CHANGED, which is itself information: the rule moved which pc
+OSR enters at, and the loop is still wrong from the new one. So there is
+a second way for the loop body's value computation to end up above the
+back-edge target that does not involve a live expression stack at the
+entry pc.
+
+The distinguishing feature of `OsrStridedValue` against the fixed `Min`
+is **three stores in one loop body**, so the expression stack empties
+between statements — an entry pc can satisfy the new rule and still be
+mid-body. Entering mid-body is only sound if the back edge re-enters at
+the HEADER and the header's code is complete; check what
+`pc_to_native[header]` holds when the walk entered below it, and whether
+the emitted back edge targets the header or the entry.
+
+`CRATONVM_JIT_OSR=0` remains the workaround for both.
