@@ -749,6 +749,30 @@ fn net_sockets() -> &'static RwLock<FxHashMap<i32, NetSocketHandle>> {
 ///    blocking accept. Entries are therefore RETAINED after being applied —
 ///    they are the record of the mode, not a one-shot to-do item — and dropped
 ///    only when the fd is closed ([`close_net_fd`]).
+/// The wildcard address each fd was ASKED to bind, by fd.
+///
+/// `getInetAddress()` on a bound `ServerSocket` must answer with the address
+/// the caller bound, not with the family the kernel happened to give it. Those
+/// differ exactly when the request was a wildcard: `net_bind0` opens a
+/// DUAL-STACK (AF_INET6) listener for an unspecified address so that `::1`
+/// clients are not RST -- a deliberate fix, see the `preferIPv6` comment there
+/// -- and `local_addr()` on that socket reports `::`, whatever was asked for.
+///
+/// `new ServerSocket(0)` binds `0.0.0.0` (this VM's `anyLocalAddress`, which
+/// `InetSocketAddress`'s own wildcard already agrees with), so it reported
+/// `::/0:0:0:0:0:0:0:0` where HotSpot -- on this same machine, dual-stack and
+/// all -- reports `0.0.0.0/0.0.0.0`.
+///
+/// Recorded rather than inferred, because the two wildcards are not
+/// interchangeable: a caller that explicitly binds `[::]` must still be told
+/// `::`, and folding every unspecified `local_addr()` to `0.0.0.0` would lie to
+/// that one instead. Only the WILDCARD case is stored; a specific address needs
+/// no help, since the kernel gives it back unchanged.
+fn net_bound_wildcard_text() -> &'static RwLock<FxHashMap<i32, String>> {
+    static BOUND: OnceLock<RwLock<FxHashMap<i32, String>>> = OnceLock::new();
+    BOUND.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
 fn net_pending_nonblocking() -> &'static RwLock<FxHashMap<i32, bool>> {
     static PENDING: OnceLock<RwLock<FxHashMap<i32, bool>>> = OnceLock::new();
     PENDING.get_or_init(|| RwLock::new(FxHashMap::default()))
@@ -887,6 +911,7 @@ fn close_net_fd(fd: i32) {
         map.insert(fd, NetSocketHandle::Closed)
     };
     net_pending_nonblocking().write().remove(&fd);
+    net_bound_wildcard_text().write().remove(&fd);
     net_opt_forget_fd(fd);
     if io_flags().dbg_net {
         let kind = match &old {
@@ -1241,6 +1266,13 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         TcpListener::bind(target)
     }
     .map_err(|e| net_err(&bind_addr, e))?;
+    // The family the kernel gives back is about to stop matching what was
+    // asked for; remember the request so `localInetAddress` can answer with it.
+    if target.ip().is_unspecified() {
+        net_bound_wildcard_text()
+            .write()
+            .insert(fd, target.ip().to_string());
+    }
 
     // C26 fix: do NOT write the resolved port into FileDescriptor.handle —
     // `handle` is the fd-id sentinel that `net_fd_from_descriptor` falls back
@@ -3326,6 +3358,20 @@ fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         Handle::None => "0.0.0.0".to_string(),
+    };
+    // A wildcard-bound fd answers with the wildcard it was BOUND with. See
+    // `net_bound_wildcard_text`: the dual-stack listener under an unspecified
+    // request reports `::` regardless of which wildcard was asked for, and the
+    // JDK's contract is that `getInetAddress()` gives back the bind address.
+    // Guarded on `is_unspecified` so a specific bind can never be overridden by
+    // a stale entry for a recycled fd.
+    let addr_text = match addr_text.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => net_bound_wildcard_text()
+            .read()
+            .get(&fd)
+            .cloned()
+            .unwrap_or(addr_text),
+        _ => addr_text,
     };
     net_inet_address_from_literal(ctx, &addr_text)
 }

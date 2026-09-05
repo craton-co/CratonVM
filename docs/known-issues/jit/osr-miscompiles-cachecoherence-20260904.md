@@ -1,256 +1,146 @@
-# OSR: a strided loop's stored VALUE is computed once and reused
+# A strided loop's stored VALUE was computed once and reused
 
-**Status:** PARTIALLY FIXED 2026-09-04. One of two causes is closed; the
-original `cacheCoherence` reproducer still diverges, with a *different*
-wrong value than before.
-**Reproducer:** `test_classes/jit/OsrStridedValue.java` (self-contained,
-no GPU, no `--gpu`).
+**Status:** FIXED 2026-09-05. Two causes, both closed.
+**Reproducers:** `test_classes/jit/OsrStridedValue.java`,
+`test_classes/jit/OsrStridedValueMin.java` — self-contained, no GPU.
 **Found:** 2026-09-04, chasing what looked like a GPU offload defect. It
 was not one.
 
-## The defect, in one line
-
-In an OSR-compiled body, a strided loop whose stored value is an
-expression over the induction variable emits that expression **once**;
-subsequent iterations advance the index and re-read the value from the
-frame slot the first iteration wrote.
-
-## Repro
-
-```bash
-javac -d test_classes/jit test_classes/jit/OsrStridedValue.java
-cratonvm --java-home <jdk25> -cp test_classes/jit --nojit OsrStridedValue 65536
-cratonvm --java-home <jdk25> -cp test_classes/jit         OsrStridedValue 65536
-```
+## The symptom
 
 ```java
-for (int round = 0; round < 12; round++) {
-    scale(in, out);                       // a call is REQUIRED to trigger it
-    h = mix(h, sum(out));
-    for (int i = round; i < n; i += 1024) {
-        justRound[i]  = round;            // correct
-        iPlusRound[i] = i + round;        // WRONG
-        in[i]         = i ^ round;        // WRONG
-    }
-}
-```
-
-Sampling the addresses the last round (`round == 11`) wrote:
-
-```
-            addresses 11, 1035, 2059, 3083, 4107, 5131
---nojit   round    11 11 11 11 11 11        <- correct
-          i+round  22 1046 2070 3094 4118 5142
-          i^round  0 1024 2048 3072 4096 5120
-jit       round    11 11 11 11 11 11        <- correct
-          i+round  22 22 22 22 22 22        <- frozen at i = 11
-          i^round  0 0 0 0 0 0              <- frozen at i = 11
-```
-
-The **addresses are right** and the **values are frozen at the first
-iteration's `i`**. `round` is right because it genuinely is
-loop-invariant.
-
-## In the emitted code
-
-`CRATONVM_DBG=jit-disasm CRATONVM_DBG_JIT_DISASM=OsrStridedValue.body`.
-`r12` is `i`, `r13` is `round`:
-
-```
-138d  mov  rax, r13              ; round
-139a  mov  rax, [rbp-80h]        ; the value expression's `i` operand
-139e  xor  eax, ecx              ;   i ^ round
-13a3  mov  [rbp-80h], rax        ; -> slot
-13a7  mov  [rbp-78h], rax        ; -> slot
-      ... guard ...
-13cc  mov  rdx, r13              ; justRound[i] = round      RECOMPUTED
-13d3  mov  rax, [rbp-70h]        ; iPlusRound value FROM SLOT
-1401  mov  rax, [rbp-78h]        ; in value FROM SLOT
-142f  add  r12d, 400h            ; i += 1024
-      ... guard ...
-145a  mov  rdx, r13              ; justRound[i] = round      RECOMPUTED
-1461  mov  rax, [rbp-70h]        ; iPlusRound value FROM SLOT  <-- stale
-148f  mov  rax, [rbp-78h]        ; in value FROM SLOT          <-- stale
-14bd  add  r12d, 400h
-```
-
-### The back edge names the bug
-
-```
-16bc  jmp 0x...13AB
-```
-
-The loop's back edge targets **`13ab`** — the guard — which is *after*
-the value computation at `138d`. So this is **not** an unroll that
-dropped a copy: the value expressions are emitted **above the loop's
-back-edge target**, i.e. outside the loop, and the body from `13ab`
-onward never recomputes them. Every iteration replays the slots the
-pre-loop code wrote once.
-
-That makes it a **label placement** problem: the back-edge target for
-this loop is bound past the first expression of the loop body, so the
-first body expression is executed exactly once, on fall-through.
-
-Note also `139a`/`13a3`: the `xor` reads and writes the *same* slot, so
-that slot is not a stable home for `i` either.
-
-`iPlusRound`'s slot (`-70h`) is never written inside the loop at all —
-its value is produced before the loop and only read within it.
-
-## What it is NOT — every one of these was tested and refuted
-
-| suspect | switch | result |
-|---|---|---|
-| GPU offload / the residency cache | `--gpu` absent entirely | still wrong |
-| the compiled-tier array barrier | `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` | still wrong |
-| IR loop-invariant code motion | `CRATONVM_JIT_LICM=0` | still wrong |
-| IR loop unrolling | `CRATONVM_JIT_UNROLL=0` | still wrong |
-| IR affine strength reduction | `CRATONVM_JIT_REASSOC=0` | still wrong |
-| OSR frame-slot seeding | `CRATONVM_JIT_OSR_SEED_FRAME_SLOTS=0/1` | still wrong |
-| OSR dead-local masking | `CRATONVM_JIT_OSR_DEAD_LOCALS=0`, `..._DEAD_MASK_BLANKET=0` | still wrong |
-| OSR single-pc binding | `CRATONVM_JIT_OSR_SINGLE_PC=1` | still wrong |
-| **OSR itself** | `CRATONVM_JIT_OSR=0` | **correct** |
-| **that one method** | `CRATONVM_JIT_DENY=...body` | **correct** |
-
-No IR-tier optimisation switch moves it, and the emitted idiom
-(`add r12d,400h`, simulated-stack spills through `[rbp-0B0h]`) is the
-single-pass backend's. So this is the **single-pass OSR** path.
-
-Start at whatever binds the back-edge target for a counted loop in
-`jit/src/x64/bytecode_walk.rs` under an OSR compile, and ask why it
-lands one expression late. The three-way trigger (a call in the OUTER
-body, stride > 1, a value expression over the IV) most likely selects
-which pc the loop head is recorded at.
-
-## Minimal trigger
-
-Bisected from `GpuRuntimeStress.cacheCoherence` by deletion. All three
-are required:
-
-* a **call** in the outer loop body (`scale(in, out)`) — remove it and
-  the answer is correct;
-* a **stride greater than 1** — `i += 1` is correct, `i += 1024` is not;
-* a stored value that is an **expression over the induction variable** —
-  `in[i] = 5` is correct, `in[i] = i` is correct, `in[i] = i + round` and
-  `in[i] = i ^ round` are not.
-
-Neither the loop's start value (`i = round` vs `i = 0` vs `i = h & 7`)
-nor its bound (`n` vs a literal) matters; both were tested.
-
-## Why no suite caught it
-
-`bench-gpu/runtime-stress.sh` ran three arms and **none of them compiled
-the method**: HotSpot, `cratonvm --nojit` (interpreted by construction),
-and `cratonvm --gpu`, where `runtime::offload_jit_gate` refuses to
-compile every scenario in that file — they all write a primitive array
-or call an offload-eligible kernel, which is both of that gate's
-reasons.
-
-A fourth **compiled CPU arm** was added on 2026-09-04 and is what now
-reports this. The general lesson is worth more than the defect: a gate
-that keeps methods interpreted removes them from every differential
-suite that reaches the compiled tier only through that gate.
-
-
-## Cause 1 — FIXED: OSR entry with a live expression stack
-
-`jit/src/x64/bytecode_walk.rs` marks a pc OSR-ineligible for several
-reasons (hoisted-loop interiors, synthetic guards, handler-only pcs).
-It did not require the **abstract operand stack to be empty**.
-
-Entering part-way through an expression means the prologue materialises
-the pending operands — correctly, for the entering iteration. What it
-cannot do is make the LOOP recompute them: the back edge targets the
-header, the operand pushes live *above* the entry point, and every later
-iteration replays the slots the prologue filled once.
-
-`operand_stack_live` now joins that rejection set. HotSpot has the same
-rule. It costs nothing in practice — javac gives every loop header an
-empty expression stack, so the newly-refused pcs are mid-expression ones
-the interpreter reaches again a few bytecodes later at the header.
-
-**Evidence it is the right rule:** the minimal reproducer is fixed.
-
-    Min.body, a[i] = i + r      before  11 11 11 11 11 11
-                                after   11 1035 2059 3083 4107 5131
-
-Regression suite 89/90 with the rule in — the one red is
-`RJitLambdaNpeSupersede`, which a pristine dev binary fails identically
-(landed by `4b6437eaf wip:`).
-
-## Cause 2 — STILL OPEN
-
-`OsrStridedValue` / `GpuRuntimeStress.cacheCoherence` still diverge, and
-`i+round` is still frozen at the entering iteration's `i`:
-
-    OsrStridedValue  i+round  22 22 22 22 22 22     (unchanged)
-    OsrCoh           8859114794901677457 expected
-                     6931349745872807313 before the rule
-                     3454959152174638481 after it
-
-The value CHANGED, which is itself information: the rule moved which pc
-OSR enters at, and the loop is still wrong from the new one. So there is
-a second way for the loop body's value computation to end up above the
-back-edge target that does not involve a live expression stack at the
-entry pc.
-
-### Minimised: `test_classes/jit/OsrStridedValueMin.java`
-
-Two nested loops and **no calls at all**:
-
-```java
-for (int i = 0; i < n; i++) a[i] = 0;      // hot -> OSR
 for (int r = 0; r < 12; r++)
     for (int i = 0; i < n; i += 1024) a[i] = i + r;
 ```
 
-    --nojit   11 1035 2059 3083 4107
-    jit       11   11   11   11   11
-
-Three hypotheses tested and refuted while minimising:
-
-* **"three stores in one body"** — no. A three-store version
-  (`a[i]=r; b[i]=i+r; c[i]=i^r;`) with `i = 0` and a trivial call is
-  **correct**.
-* **"the inner loop starts at the outer IV"** — no. `i = 0` and
-  `i = r` both fail, sampled at the indices each actually writes. (An
-  earlier `i = 0` arm reported a vacuous "same" because it sampled
-  `11 + k*1024`, which that loop never touches.)
-* **"a call in the outer body is required"** — no longer. It was, before
-  cause 1 was fixed; the call-free shape fails now.
-
-### What the code shows
-
-`Min4.zeroStart`, inner loop bytecode `27: iload_3 … 44: goto 27`:
-
 ```
-44e  xor eax,eax ; mov r12,rax      ; i = 0            (pc 25/26)
-457  mov rax,r12 ; mov [rbp-30h],rax ; push i          (pc 34)
-45e  mov rax,r13 ; mov [rbp-38h],rax ; push r          (pc 35)
-468  mov rax,[rbp-30h] ; add eax,ecx ; i + r           (pc 36)
-475  mov [rbp-28h],rax               ; -> value slot
-479  cmp r12d,r15d ; jge exit        ; the test        (pc 29)
-48a  mov rax,r14                     ; aload a         (pc 32)
-4a6  mov [rax+rcx*4+10h],edx         ; iastore, value from the slot
-4aa  add r12d,400h
-6ca  jmp 479                         ; BACK EDGE
+--nojit / HotSpot   11 1035 2059 3083 4107
+cratonvm (JIT)      11   11   11   11   11
 ```
 
-The emitted order is pcs **34, 35, 36, then 29, then 32** — the value
-expression is emitted *before* the loop test and the array load, and the
-loop body from `479` onward **contains no code for pcs 33–36 at all**.
-The back edge re-enters at `479`, so those pcs never execute again.
+The **addresses are right** and the **values are frozen at the first
+iteration's `i`**. Anything loop-invariant in the same body (`a[i] = r`)
+stays correct, which is what made it read as an addressing bug.
 
-So this is not "the entry pc had a live stack" (cause 1, fixed): the
-compiled loop body is *missing* the value computation outright, and
-would be wrong from any entry point. The operands appear once, in what
-looks like an OSR-entry reconstruction of the expression stack for a
-resume at bci 37 (`iastore`), and the loop body then reads the slots
-that reconstruction filled.
+## Cause 2 — the real one: `wide iinc` was invisible to LICM
 
-The question for the fix: why does the walk emit pcs 34–36 ahead of pc
-29, and why does the loop body it lays down afterwards skip them? Start
-from whatever seeds the simulated operand stack for an OSR resume bci
-and whether the subsequent walk treats those slots as already populated.
+`find_modified_locals` (`jit/src/x64/escape_analysis.rs`) builds the
+bitmask of locals a loop writes. It had an arm for every narrow store
+form and for `iinc` (0x84) — and **no arm for `wide` (0xc4) at all**.
+Those bytes fell through to the length-only default: the walk stayed
+aligned, so nothing looked broken, and the local was never marked
+modified.
 
-`CRATONVM_JIT_OSR=0` remains the workaround for both causes.
+javac emits `wide iinc` whenever the increment does not fit in a signed
+byte. `i += 1024` is exactly that. So the loop's **induction variable
+read as loop-INVARIANT**, and `find_arith_loop_hoists` hoisted `i + r`
+into the pre-header, where it is computed once and every iteration
+replays the slot.
+
+That is why the trigger looked so arbitrary:
+
+| shape | why |
+|---|---|
+| `i += 1` correct, `i += 1024` wrong | plain `iinc` vs `wide iinc` |
+| `a[i] = 5` correct | constant — no arithmetic run to hoist |
+| `a[i] = i` correct | a bare load is not a hoistable run |
+| `a[i] = i + r` wrong | a run over a "loop-invariant" local |
+| `a[i] = r` correct | genuinely invariant, correctly hoisted |
+
+The bitmask only ever DISABLES a hoist, so over-marking is the safe
+direction; the fix marks the local for `wide iinc` and for every `wide`
+store. `find_modified_locals` also feeds the `aaload`, FP and
+array-length hoisters, so all four shared this blind spot.
+
+**This was never OSR-specific.** `CRATONVM_JIT_OSR=0` appeared to fix it
+only because these fixtures reach the hot loop through OSR and nothing
+else compiles the method. Any hot loop with a `wide iinc` induction
+variable and a hoistable integer expression over it was affected.
+
+Kill switch: `CRATONVM_DISABLE_ARITH_LICM=1` (pre-existing) turns the
+hoister off entirely.
+
+## Cause 1 — also fixed: OSR entry with a live expression stack
+
+`bytecode_walk.rs` marks a pc OSR-ineligible for hoisted-loop interiors,
+synthetic guards and handler-only pcs. It did not require the abstract
+operand stack to be **empty**. Entering mid-expression means the
+prologue materialises the pending operands for the entering iteration,
+and the loop can never recompute them, because the pushes live above the
+back-edge target. `operand_stack_live` now joins that rejection set.
+HotSpot has the same rule.
+
+**Honest note on its evidence.** This landed first, and the reason given
+was that it fixed the single-store reproducer. With cause 2 understood,
+that improvement is attributable to cause 2's hoist no longer being
+reachable from the entry pc the rule moved OSR to — so cause 1 rests on
+the argument, not on a demonstrated failure of its own. It is kept
+because the argument is sound and `osr.rs` states the same invariant
+from the other side (`osr_entry_native[header]` points *before* a
+hoisted preheader precisely so a cold OSR entry runs it).
+
+**Asked and answered.** With cause 2 fixed, every reproducer here is
+correct whether the rule is on or off. So it has no demonstrated failure
+of its own, and it did cost something: a versioning OSR test asserted
+the behaviour it removed (`c82154c4d`). It stays on — a soundness rule
+HotSpot also enforces, costing nothing measurable because a refused
+mid-expression pc is re-reached at the header a few bytecodes later —
+but it is a default-on codegen rule with **no kill switch**, which is a
+gap. One was written and validated (90/90) on 2026-09-05 and lost to a
+concurrent `git reset` in the shared checkout before it landed;
+re-applying it is a small mechanical change and the right next step for
+anyone who wants to re-open the question.
+
+## What it was NOT — tested and refuted
+
+| suspect | switch | result |
+|---|---|---|
+| GPU offload / the residency cache | no `--gpu` at all | still wrong |
+| the compiled-tier array barrier | `CRATONVM_GPU_JIT_ARRAY_WRITERS=allow` | still wrong |
+| IR loop-invariant code motion | `CRATONVM_JIT_LICM=0` | still wrong |
+| IR loop unrolling | `CRATONVM_JIT_UNROLL=0` | still wrong |
+| the single-pass native unroller | `CRATONVM_DISABLE_UNROLL=1` | still wrong |
+| IR affine strength reduction | `CRATONVM_JIT_REASSOC=0` | still wrong |
+| OSR frame-slot seeding / dead-local masking / single-pc | four switches | still wrong |
+| "three stores in one body" | a three-store fixture | **correct** — refuted |
+| "the inner loop starts at the outer IV" | `i = 0` and `i = r` | both wrong — refuted |
+| **single-pass integer LICM** | `CRATONVM_DISABLE_ARITH_LICM=1` | **correct** |
+
+Two readings of mine were wrong on the way and are worth keeping visible.
+The disassembly showed the value expression sitting **above the loop's
+back-edge target**, and I read that as a label-placement bug. The
+observation was right — a pre-header is exactly where a hoist goes — and
+the interpretation was wrong. Earlier still, I read two arms
+(`ARRAY_WRITERS=refuse` passes, `MIN_WORK_GIVEUP=0` fails) as implicating
+the GPU residency barrier; both were true and both were also consistent
+with something else, because both additionally stop the method being
+compiled. **When every discriminating arm shares a side effect, it is not
+discriminating.**
+
+## Why no suite caught it
+
+`bench-gpu/runtime-stress.sh` ran three arms and **none compiled the
+method**: HotSpot, `cratonvm --nojit` (interpreted by construction), and
+`cratonvm --gpu`, where `runtime::offload_jit_gate` refused every
+scenario in the file — they all write a primitive array or call an
+offload-eligible kernel.
+
+A fourth **compiled CPU arm** was added 2026-09-04 and is what reported
+it. The lesson outlives the defect: a gate that keeps methods interpreted
+removes them from every differential suite that reaches the compiled tier
+only through that gate.
+
+## What this unblocks
+
+`CRATONVM_GPU_JIT_GATE_CALLERS=hook`
+(`../perf/gpu-compiled-caller-offload-hook-20260904.md`) was held opt-in
+for exactly one reason: it failed `cache_coherence`. That failure was
+THIS defect — the hook merely became the first thing that ever compiled
+the method. With `wide iinc` visible, `runtime-stress.sh` passes **all
+seven scenarios under `hook`**, as does `jit-writer-stale.sh`.
+
+So the 27-42x that mode is worth is unblocked. Flipping its default is a
+separate change and wants its own validation pass; note that
+`bench-gpu/gate-overbroad.sh`'s arm C is vacuous under `hook` (it toggles
+caller-blocking, which that mode disables outright) and needs rewriting
+first.

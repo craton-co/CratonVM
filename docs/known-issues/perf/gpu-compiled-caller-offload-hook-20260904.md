@@ -1,6 +1,15 @@
 # A compiled caller can offload — but not while it also writes arrays
 
-**Status:** built, measured, and **opt-in**
+**Status:** built, measured, opt-in — **and its blocker is FIXED**
+(2026-09-05: `wide iinc` was invisible to LICM; see
+`../jit/osr-miscompiles-cachecoherence-20260904.md`). `runtime-stress.sh`
+now passes all seven scenarios under `hook`, as does
+`jit-writer-stale.sh`. Nothing in this feature was implicated, as the
+arms below already said. Flipping the default is a separate change and
+wants its own pass — `bench-gpu/gate-overbroad.sh`'s arm C is vacuous
+under `hook` and needs rewriting first.
+
+**Original status:** built, measured, and **opt-in**
 (`CRATONVM_GPU_JIT_GATE_CALLERS=hook`). The default is unchanged.
 **Blocker:** `bench-gpu/runtime-stress.sh`'s `cache_coherence` scenario
 fails under it. Not root-caused.
