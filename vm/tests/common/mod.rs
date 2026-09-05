@@ -37,7 +37,10 @@
 
 #![allow(dead_code)]
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Child, Output};
+use std::time::{Duration, Instant};
 
 /// Environment variable that promotes a skipped prerequisite to a failure.
 pub const REQUIRE_VAR: &str = "CRATONVM_REQUIRE_E2E";
@@ -152,4 +155,98 @@ pub fn require_jdk(found: Option<PathBuf>) -> Option<PathBuf> {
         );
     }
     found
+}
+
+/// Wait for `child` up to `cap`, **draining its pipes the whole time**, and
+/// report what it produced either way.
+///
+/// # Why a test cannot just poll `try_wait`
+///
+/// The shape this replaces is everywhere in `vm/tests`:
+///
+/// ```ignore
+/// let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+/// loop {
+///     match child.try_wait()? {
+///         Some(_) => break,
+///         None if start.elapsed() < CAP => sleep(50ms),
+///         None => { child.kill(); panic!("timed out") }
+///     }
+/// }
+/// let output = child.wait_with_output()?;   // <- the first read of the pipes
+/// ```
+///
+/// Nothing reads either pipe until after the child has exited. A Linux pipe
+/// holds 64 KiB; once the child has written that much it blocks in `write` and
+/// can never exit, so the parent polls out its whole timeout and reports a
+/// hang. The child is not hung — it is waiting for the parent, which is
+/// waiting for it.
+///
+/// Measured 2026-09-04 on `class_loader_unload_regression`: the probe's stdout
+/// was 124 bytes and its **stderr was 101,808** (`[GC]` lines, one pair per
+/// `System.gc()`, and that probe calls it ~180 times). Run with its output to a
+/// file it finishes in under 20 s and prints `ok=true`; run under that poll
+/// loop it "times out" at 180 s, in both jit and nojit modes, deterministically,
+/// on a quiet host. It had nothing to do with class unloading.
+///
+/// The GC noise itself is now gated (`zgc.rs`'s logging block), which removes
+/// this instance. **That is not the fix, and this is** — a test must not depend
+/// on the process it drives staying under 64 KiB, and the next diagnostic
+/// anyone adds should not be able to hang the suite.
+///
+/// # What it returns
+///
+/// Always the output that was captured, plus whether the cap was hit. A timeout
+/// that can show what the child managed to say is a diagnosis; the poll loop's
+/// bare `panic!("timed out")` is what made this cost a session.
+pub struct TimedOutput {
+    pub output: Output,
+    pub timed_out: bool,
+}
+
+pub fn wait_draining(mut child: Child, cap: Duration) -> TimedOutput {
+    // Take the pipes BEFORE the wait and read them on their own threads, so
+    // neither can fill while this function is sleeping.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait().expect("poll child") {
+            Some(s) => break s,
+            None if start.elapsed() < cap => std::thread::sleep(Duration::from_millis(50)),
+            None => {
+                // Killing closes the pipes, which is what lets both readers
+                // reach EOF and join below.
+                let _ = child.kill();
+                timed_out = true;
+                break child.wait().expect("reap killed child");
+            }
+        }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    TimedOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+    }
 }
