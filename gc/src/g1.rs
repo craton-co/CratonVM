@@ -14975,6 +14975,19 @@ impl G1Collector {
             }
         }
         if candidates == 0 {
+            if gc_flags().g1_dbg_reach {
+                eprintln!(
+                    "[g1][MIXWORK] old={} live_gt0={} candidates=0 verdict=false",
+                    regions
+                        .iter()
+                        .filter(|r| r.region_type == RegionType::Old)
+                        .count(),
+                    regions
+                        .iter()
+                        .filter(|r| r.region_type == RegionType::Old && r.live_bytes > 0)
+                        .count(),
+                );
+            }
             return false;
         }
         // The waste floor is a HEADROOM policy: with plenty of Free regions,
@@ -14991,8 +15004,22 @@ impl G1Collector {
         let free = self.free_region_count.load(Ordering::Relaxed);
         let trigger_pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
         let tight = free * 100 < total * (trigger_pct * 2).min(100);
-        tight
-            || reclaimable * 100 >= self.config.heap_size * self.config.heap_waste_percent as usize
+        let verdict = tight
+            || reclaimable * 100 >= self.config.heap_size * self.config.heap_waste_percent as usize;
+        if gc_flags().g1_dbg_reach {
+            eprintln!(
+                "[g1][MIXWORK] old={} live_gt0={} candidates={candidates}                  reclaimable={reclaimable} free={free} tight={tight} verdict={verdict}",
+                regions
+                    .iter()
+                    .filter(|r| r.region_type == RegionType::Old)
+                    .count(),
+                regions
+                    .iter()
+                    .filter(|r| r.region_type == RegionType::Old && r.live_bytes > 0)
+                    .count(),
+            );
+        }
+        verdict
     }
 
     /// Item 2 — close the mixed phase before its pause budget is spent.
