@@ -82,7 +82,27 @@ one op, GPU time tracks bytes moved — 498 us (1B), 926 us (4B),
 which is why the speedup column grows roughly linearly with ops, and why
 wide types look worst exactly where arithmetic is scarcest.
 
-## Recommendation
+## Superseded in part, same day
+
+The recommendation below was drawn at a single size, n = 2^20, where
+every width is at or above break-even. Sweeping `n` instead
+(`docs/gpu/offload-crossover-and-min-work-20260904.md`) found the
+break-even ranges from ~32,000 elements for `byte[]` to over 1,048,576
+for `long[]` -- a ~32x spread, monotonic in bytes per element.
+
+So **"do not scale by width" is too strong**: it holds at n = 2^20 and
+fails near the threshold, which is the only place an admission decision
+is actually made. The 2026-09-02 instinct that wide types need a higher
+bar was right; this document sampled 256x above the boundary and so
+could not see it. It says as much below -- "nothing here is a loss, so
+nothing here locates a refusal boundary" -- which is what prompted the
+follow-up.
+
+Everything else here stands: the transfer-bound model, the flat GPU time
+across intensity, and the fact that `long[]` at 0.59-0.65x does not
+reproduce at this size.
+
+## Recommendation (superseded -- see above)
 
 **Do not scale `--gpu-min-work` by element width.** The change would
 refuse wide-type work that is, at worst, break-even — a pessimisation
