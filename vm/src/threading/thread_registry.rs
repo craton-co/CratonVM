@@ -626,7 +626,28 @@ impl ThreadRegistry {
             // being mutated.
             let tlab = unsafe { &*(addr as *const cratonvm_gc::Tlab) };
             match tlab.reserved_tail() {
-                Some(tail) => out.push(tail),
+                Some(tail) => {
+                    // Paired with `CRATONVM_DBG_WATCH_ALLOC_CID` /
+                    // `CRATONVM_DBG_WATCH_HOLDER`: a published "un-allocated
+                    // tail" that CONTAINS a live object is not a conservative
+                    // degrade -- every linear walk in the sweep skips the span,
+                    // and the mark oracle then answers "gap space, not an
+                    // object" for any root pointing into it, so the object is
+                    // neither scanned nor swept and everything it references is
+                    // reclaimed. Name the owner and its cursor when it happens.
+                    let watch = cratonvm_gc::heap::young_mark_watch();
+                    if watch != 0 && watch >= tail.0 && watch < tail.1 {
+                        eprintln!(
+                            "[TLAB-SKIP] published tail [{:#x},{:#x}) CONTAINS watch {watch:#x}                              — owner java_tid={:?} name={} alive={} tlab_addr={addr:#x}",
+                            tail.0,
+                            tail.1,
+                            entry.java_tid,
+                            entry.name,
+                            entry.alive.load(Ordering::Acquire),
+                        );
+                    }
+                    out.push(tail)
+                }
                 None => retired += 1,
             }
         }

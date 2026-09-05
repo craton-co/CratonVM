@@ -494,6 +494,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "oop-oracle-force-refute", on_key: Some("CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
     E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::GC, token: "no-tlab-skip", on_key: Some("CRATONVM_GC_NO_TLAB_SKIP"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::GC, token: "conditional-tlab-skip-publish", on_key: Some("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
     // way and report any that still names a moved address. A miss there is not
@@ -931,6 +933,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None, since: "2026-06-03" },
     E { group: Group::DBG, token: "sweep-referrers", on_key: Some("CRATONVM_DBG_SWEEP_REFERRERS"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::DBG, token: "sweep-zero", on_key: Some("CRATONVM_DBG_SWEEP_ZERO"), off_key: None, off_word: None, since: "2026-06-16" },
+    E { group: Group::DBG, token: "sweep-trace-class", on_key: Some("CRATONVM_DBG_SWEEP_TRACE_CLASS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "symbolize", on_key: Some("CRATONVM_SYMBOLIZE"), off_key: None, off_word: None, since: "2026-06-01" },
     E { group: Group::DBG, token: "symbolize-dbg", on_key: Some("CRATONVM_SYMBOLIZE_DBG"), off_key: None, off_word: None, since: "2026-06-01" },
     E { group: Group::DBG, token: "threadreg-perf", on_key: Some("CRATONVM_DBG_THREADREG_PERF"), off_key: None, off_word: None, since: "2026-07-25" },
@@ -973,6 +976,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "watch-cause-self", on_key: Some("CRATONVM_DBG_WATCH_CAUSE_SELF"), off_key: None, off_word: None, since: "2026-07-10" },
     E { group: Group::DBG, token: "watch-cell", on_key: Some("CRATONVM_DBG_WATCH_CELL"), off_key: None, off_word: None, since: "2026-07-03" },
     E { group: Group::DBG, token: "watchaddr", on_key: Some("CRATONVM_DBG_WATCHADDR"), off_key: None, off_word: None, since: "2026-07-25" },
+    E { group: Group::DBG, token: "watch-alloc-cid", on_key: Some("CRATONVM_DBG_WATCH_ALLOC_CID"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "watchref", on_key: Some("CRATONVM_DBG_WATCHREF"), off_key: None, off_word: None, since: "2026-07-02" },
     E { group: Group::DBG, token: "weakref", on_key: Some("CRATONVM_DBG_WEAKREF"), off_key: None, off_word: None, since: "2026-06-29" },
     E { group: Group::DBG, token: "wf", on_key: Some("CRATONVM_DBG_WF"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -1086,6 +1090,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "inline-reserve-path", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_RESERVE_PATH"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "code-cache-max-mb", on_key: Some("CRATONVM_JIT_CODE_CACHE_MAX_MB"), off_key: None, off_word: None, since: "2026-06-21" },
     E { group: Group::JIT, token: "conservative-locals", on_key: None, off_key: Some("CRATONVM_NO_CONSERVATIVE_LOCALS"), off_word: None, since: "2026-06-16" },
+    E { group: Group::GC, token: "force-conservative-locals", on_key: Some("CRATONVM_FORCE_CONSERVATIVE_LOCALS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ctor-direct-call", on_key: None, off_key: Some("CRATONVM_NO_CTOR_DIRECT_CALL"), off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "osr-ctor-bind", on_key: None, off_key: Some("CRATONVM_NO_OSR_CTOR_BIND"), off_word: None, since: "2026-08-17" },
     E { group: Group::JIT, token: "real-new-site-flags", on_key: Some("CRATONVM_JIT_REAL_NEW_SITE_FLAGS"), off_key: None, off_word: None, since: "2026-08-17" },
