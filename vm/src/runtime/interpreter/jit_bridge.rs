@@ -3769,6 +3769,10 @@ pub(super) fn try_osr(
             {
                 match &plan {
                     // The single-pass trampoline, with its proof.
+                    // SAFETY: `plan` is `validate_osr_entry`'s result for THIS
+                    // artifact at THIS bci, so every seeded slot's JVM type has
+                    // been checked against the compiled entry's contract — the
+                    // argument spelled out above this `cfg` block.
                     Some(plan) => unsafe {
                         compiled.osr_enter_planned(vm_ptr, &osr_state, plan, thread_ptr)
                     },
@@ -3777,6 +3781,11 @@ pub(super) fn try_osr(
                     // and jumps into the body — two arguments where the
                     // trampoline takes twenty layout fields, because the
                     // lowerer knows the layout and the trampoline never could.
+                    // SAFETY: a DIFFERENT contract from the arm above, and the
+                    // reason each arm states its own: this entry takes no plan,
+                    // so what must hold is that `entry_pc` is an OSR entry the
+                    // artifact published and `jit_locals` matches the snapshot
+                    // that bci names.
                     None => unsafe {
                         compiled.ir_osr_enter(entry_pc as u32, vm_ptr, &jit_locals)
                     },
