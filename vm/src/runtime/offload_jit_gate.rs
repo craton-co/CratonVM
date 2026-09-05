@@ -798,8 +798,9 @@ enum CallerGateMode {
     /// hoisted a loop's induction variable -- and this mode was simply
     /// the first thing that ever compiled the method, because
     /// [`CallerGateMode::Block`] had kept every scenario in that file
-    /// interpreted. Fixed 2026-09-05; see
-    /// `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+    /// interpreted. Fixed 2026-09-05; see the retired
+    /// `osr-miscompiles-cachecoherence-20260904` write-up, named rather
+    /// than linked because it retired to the internal tree.
     ///
     /// With it fixed, all seven `runtime-stress.sh` scenarios pass under
     /// this mode, as do `jit-writer-stale.sh` and the rest.

@@ -1299,6 +1299,13 @@ pub const INVENTORY: &[E] = &[
     // Default-ON: `stackwalker::osr_frame_dedupe_enabled` treats the key's
     // PRESENCE as "report the OSR continuation twice again".
     E { group: Group::JIT, token: "osr-frame-dedupe", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_FRAME_DEDUPE"), off_word: None, since: "2026-08-20" },
+    // Default-ON: an OSR entry pc must have an EMPTY abstract expression stack
+    // (`x64::osr::osr_empty_stack_entry_enabled`, presence-parsed, so `=0`
+    // still turns the rule OFF and `off_word` must stay `None`). A soundness
+    // rule HotSpot also enforces — declared because it is default-on CODEGEN
+    // that landed without a failure of its own, and the page that opened the
+    // question named the missing switch as its last open item.
+    E { group: Group::JIT, token: "osr-empty-stack-entry", on_key: None, off_key: Some("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY"), off_word: None, since: "2026-09-05" },
     // Default-ON: `jit_bridge::osr_pc_refresh_enabled` treats the key's
     // PRESENCE as "stop publishing OSR continuations; report the back-edge".
     // Separate from the dedupe row above because the two answer different

@@ -581,7 +581,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-350 tokens.
+351 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -715,6 +715,7 @@ export inherited from a parent shell.
 | `nested-trace-frames` | `CRATONVM_JIT_NO_NESTED_TRACE_FRAMES` |
 | `npe-frame-snapshot` | `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT` |
 | `osr-frame-dedupe` | `CRATONVM_JIT_NO_OSR_FRAME_DEDUPE` |
+| `osr-empty-stack-entry` | `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY` |
 | `osr-pc-refresh` | `CRATONVM_JIT_NO_OSR_PC_REFRESH` |
 | `compiled-frame-lines` | `CRATONVM_JIT_NO_COMPILED_FRAME_LINES` |
 | `inline-frame-map` | `CRATONVM_JIT_NO_INLINE_FRAME_MAP` |

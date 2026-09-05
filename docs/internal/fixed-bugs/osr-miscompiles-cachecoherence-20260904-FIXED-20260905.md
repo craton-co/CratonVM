@@ -1,10 +1,20 @@
 # A strided loop's stored VALUE was computed once and reused
 
-**Status:** FIXED 2026-09-05. Two causes, both closed.
+**Status:** ✅ RESOLVED 2026-09-05. Two causes closed, the one open item
+this page carried (cause 1's missing kill switch) closed with them, and an
+adjacent hole in the same bitmask closed on the way out. **Retired from**
+`docs/known-issues/jit/`.
 **Reproducers:** `test_classes/jit/OsrStridedValue.java`,
-`test_classes/jit/OsrStridedValueMin.java` — self-contained, no GPU.
+`test_classes/jit/OsrStridedValueMin.java` — self-contained, no GPU — plus
+`test_classes/jit/StridedInvariantValue.java`, which reaches the compiled
+tier by INVOCATION COUNT rather than OSR and so pins the "never
+OSR-specific" claim below instead of leaving it an assertion.
 **Found:** 2026-09-04, chasing what looked like a GPU offload defect. It
 was not one.
+
+The one thing this page handed on — flipping
+`CRATONVM_GPU_JIT_GATE_CALLERS=hook`'s default, which the fix unblocked — was
+taken up and landed by a sibling lane the same day. Nothing is outstanding.
 
 ## The symptom
 
@@ -57,8 +67,26 @@ only because these fixtures reach the hot loop through OSR and nothing
 else compiles the method. Any hot loop with a `wide iinc` induction
 variable and a hoistable integer expression over it was affected.
 
-Kill switch: `CRATONVM_DISABLE_ARITH_LICM=1` (pre-existing) turns the
-hoister off entirely.
+Kill switch: `CRATONVM_JIT=-arith-licm` (pre-existing, and spelled
+`CRATONVM_DISABLE_ARITH_LICM=1` before the flag-group rename) turns the
+hoister off entirely. It is the arm that isolates the cause:
+
+```
+                               the stride-1024 arm of StridedInvariantValue
+HotSpot                        7 1031 2055 3079 4103 5127 6151 7175
+cratonvm --nojit               7 1031 2055 3079 4103 5127 6151 7175
+cratonvm before                7    7    7    7    7    7    7    7   <- wrong
+  … CRATONVM_JIT_OSR=0         7    7    7    7    7    7    7    7   <- still wrong
+  … CRATONVM_JIT=-arith-licm   7 1031 2055 3079 4103 5127 6151 7175
+cratonvm after                 7 1031 2055 3079 4103 5127 6151 7175
+```
+
+`fill` there is INVOKED hot, not entered by OSR, so the middle two rows are
+the whole "never OSR-specific" argument in two lines. The fixture's own
+stride-1 arm prints the correct row in every one of those configurations.
+`CRATONVM_DBG_JIT_GEN=1` names the hoist directly —
+`[JIT_GEN] arith-LICM hoists=1 runs=[(9, 12, 3)]`, bytecode pcs 9..12,
+which is `iload_3 ; iload_2 ; iadd` — and prints nothing after the fix.
 
 ## Cause 1 — also fixed: OSR entry with a live expression stack
 
@@ -84,12 +112,47 @@ correct whether the rule is on or off. So it has no demonstrated failure
 of its own, and it did cost something: a versioning OSR test asserted
 the behaviour it removed (`c82154c4d`). It stays on — a soundness rule
 HotSpot also enforces, costing nothing measurable because a refused
-mid-expression pc is re-reached at the header a few bytecodes later —
-but it is a default-on codegen rule with **no kill switch**, which is a
-gap. One was written and validated (90/90) on 2026-09-05 and lost to a
-concurrent `git reset` in the shared checkout before it landed;
-re-applying it is a small mechanical change and the right next step for
-anyone who wants to re-open the question.
+mid-expression pc is re-reached at the header a few bytecodes later.
+
+**Kill switch: `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1`** (2026-09-05).
+This was the last open item on the page — a default-on codegen rule with
+no way to turn it off. `x64::osr::osr_empty_stack_entry_enabled` is a
+presence-parsed `OnceLock` read (`=0` still turns the rule OFF), declared
+in `types/src/flag_groups.rs` as the JIT token `osr-empty-stack-entry`, so
+`CRATONVM_JIT=-osr-empty-stack-entry` spells it too and `flags` reports it
+when somebody leaves it on. The point is not that the rule is doubtful; it
+is that re-opening the question should not require rebuilding the VM.
+
+## The adjacent hole the same audit turned up
+
+`find_modified_locals` recorded only the LOWER slot of a `long`/`double`
+store. A category-2 store writes two, and the upper one — dead to the
+reader, written by the store all the same — was invisible to every
+consumer of the bitmask, exactly as `wide` had been.
+`loop_analysis::modified_locals_strict`, the reviewed twin of this
+function, has always marked it, and says why in its doc: an invariance
+check built on a set that quietly forgot a write is not a check.
+
+Two tests in `jit/src/x64/tests.rs` had pinned the consequence the wrong
+way round. `p87_fp_loop_hoist_detection` and `p87_fp_hoist_double_and_float`
+both asserted that a `dload_1` is hoistable out of a loop whose body
+contains `dstore_0`, the second with the comment *"this modifies 0, but
+doesn't affect 1"*. `dstore_0` writes slots 0 AND 1. Both fixtures were
+written from what the implementation did, and both therefore certified an
+unsound hoist — the same failure mode as the `find_array_len_hoists` doc
+one section up, where a shared analysis's blind spot was written down as
+a property instead of being fixed.
+
+Fixed on both sides, because they have to agree: the store side marks the
+high half (`find_modified_locals`), and the load side refuses a `dload k`
+when the loop writes k+1 (`find_fp_loop_hoists`). Both directions can only
+REFUSE a hoist, never admit one.
+
+Stated honestly: javac cannot emit the shape. After `dstore_0` slot 1
+holds TOP, so a later `dload_1` fails verification unless something
+re-stores the slot first — which marks it anyway. So this bought no
+measurable behaviour, only agreement between two masks that disagreed and
+the removal of two tests that said the wrong thing out loud.
 
 ## What it was NOT — tested and refuted
 
@@ -133,14 +196,16 @@ only through that gate.
 ## What this unblocks
 
 `CRATONVM_GPU_JIT_GATE_CALLERS=hook`
-(`../perf/gpu-compiled-caller-offload-hook-20260904.md`) was held opt-in
+(`../../known-issues/perf/gpu-compiled-caller-offload-hook-20260904.md`)
+was held opt-in
 for exactly one reason: it failed `cache_coherence`. That failure was
 THIS defect — the hook merely became the first thing that ever compiled
 the method. With `wide iinc` visible, `runtime-stress.sh` passes **all
 seven scenarios under `hook`**, as does `jit-writer-stale.sh`.
 
-So the 27-42x that mode is worth is unblocked. Flipping its default is a
-separate change and wants its own validation pass; note that
-`bench-gpu/gate-overbroad.sh`'s arm C is vacuous under `hook` (it toggles
-caller-blocking, which that mode disables outright) and needs rewriting
-first.
+So the 27-42x that mode is worth is unblocked — and **`CompiledHook` is
+the default since 2026-09-05**, flipped by a sibling lane once this fix
+landed, with `bench-gpu/gate-overbroad.sh`'s arm C rewritten in the same pass
+(it was vacuous under `hook`, which disables the caller-blocking the arm
+toggles). That page carries the measurement and the rewrite; this one has no
+hand-off left.

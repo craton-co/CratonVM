@@ -140,7 +140,9 @@ feature.
 `GpuRuntimeStress.cacheCoherence` is **miscompiled by OSR**.
 `CRATONVM_JIT_DENY` on that one method fixes it; denying `scale`, `sum`
 or `mix` does not. See
-`docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+the retired `osr-miscompiles-cachecoherence-20260904` write-up (fixed
+2026-09-05: the single-pass arith-LICM's invariance mask could not decode
+a `wide iinc`, so a strided loop's stored value was hoisted out of it).
 
 ### What this gate was doing
 

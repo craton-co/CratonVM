@@ -556,6 +556,10 @@ impl Compiler {
 
         let mut dead = false; // true after unconditional control transfer
 
+        // Read once for the whole method: see `osr_empty_stack_entry_enabled`
+        // for why this is not a `OnceLock` and not read per pc.
+        let osr_empty_stack_rule = super::osr::osr_empty_stack_entry_enabled();
+
         let mut pc = 0;
         while pc < code_len {
             // Stage 2 (precise oop maps) — track the bytecode PC being emitted
@@ -851,7 +855,10 @@ impl Compiler {
                 // an empty expression stack, so the pcs this newly refuses
                 // are mid-expression ones the interpreter reaches again a
                 // few bytecodes later at the header.
-                let operand_stack_live = !self.stack.is_empty();
+                // `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` gives this rule
+                // an off switch; see `osr::osr_empty_stack_entry_enabled` for
+                // why a soundness rule gets one.
+                let operand_stack_live = !self.stack.is_empty() && osr_empty_stack_rule;
                 if inside_aaload_hoisted
                     || inside_arith_hoisted
                     || inside_len_hoisted

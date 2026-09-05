@@ -20,7 +20,8 @@
 #                      scenario that writes an array or calls a kernel --
 #                      which is all of them. An OSR miscompilation of
 #                      `cacheCoherence` sat behind that hole; see
-#                      docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md.
+#                      the retired osr-miscompiles-cachecoherence-20260904
+#                      write-up (fixed 2026-09-05).
 #   cratonvm --nojit   the CONTROL. "The GPU disagrees with HotSpot" is
 #                      also what a host-side defect looks like; without
 #                      the control a difference cannot be attributed.
@@ -98,7 +99,7 @@ if [ -s "$TMP/jit" ]; then
     if [ "$got" != "$want" ]; then
       echo "FAIL(jit) $key: control=${want#*=} jit=${got#*=}"
       echo "       no --gpu in this arm -- this is a JIT miscompilation, not offload."
-      echo "       known: docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md"
+      echo "       known: the retired osr-miscompiles-cachecoherence-20260904 write-up"
       FAILS=$((FAILS + 1))
     fi
   done < <(grep '=' "$TMP/cpu")

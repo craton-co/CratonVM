@@ -16,6 +16,35 @@
 
 use super::*;
 
+/// Whether an OSR entry pc is required to have an EMPTY abstract expression
+/// stack (`abcfaec38`, 2026-09-04). Default ON;
+/// `CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY=1` restores the pre-rule behaviour,
+/// which publishes an entry at every instruction boundary.
+///
+/// The rule is a soundness one and HotSpot enforces the same: entering
+/// part-way through an expression lets the prologue materialise the pending
+/// operands once, correctly, for the entering iteration, and the loop can
+/// never recompute them because the pushes live above the back-edge target.
+///
+/// It is switchable anyway because it is DEFAULT-ON CODEGEN WITH NO
+/// DEMONSTRATED FAILURE OF ITS OWN. It landed on the strength of fixing
+/// `test_classes/jit/OsrStridedValueMin.java`, and the defect that fixture
+/// actually had was `find_modified_locals` not decoding `wide iinc`
+/// (`7af844829`) — with that closed, every reproducer on the page is correct
+/// whether this rule is on or off. The argument for it stands and it stays on;
+/// the next person to re-open the question should not have to rebuild the VM
+/// to ask it.
+///
+/// **Call this ONCE per compile and bind the answer**, as the bytecode walk
+/// does above its loop. Not a `OnceLock`: `runtime_var_os`'s own doc says a
+/// flag read is meant to be rare because every gate caches its answer, and a
+/// process-wide latch would also put this out of reach of
+/// `flags::with_thread_overrides`, which is how a declared flag is arranged in
+/// a test.
+pub(super) fn osr_empty_stack_entry_enabled() -> bool {
+    cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_OSR_EMPTY_STACK_ENTRY").is_none()
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Deopt points, exception checks and the stub block
