@@ -1206,7 +1206,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_NO_EMPTY_OBJECT_RUN` | GC | `CRATONVM_GC=empty-object-run` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_NO_OLD_INTERIOR_PINS` | GC | `CRATONVM_GC=old-interior-pins` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_NO_VALIDATE_ONCE` | GC | `CRATONVM_GC=validate-once` | opt-out | on | behaviour | snapshot | gc |
-| `CRATONVM_GC_OBJECT_STARTS` | GC | `CRATONVM_GC=object-starts` | opt-in | off | behaviour | snapshot | gc |
+| `CRATONVM_GC_OBJECT_STARTS` | GC | `CRATONVM_GC=object-starts` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_OVERHEAD_LIMIT` | GC | `CRATONVM_GC=overhead-limit` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GC_PAR_EVAC` | GC | `CRATONVM_GC=par-evac` | default-on | on | behaviour | snapshot | gc, types |
 | `CRATONVM_GC_PAR_MIN_BYTES` | GC | `CRATONVM_GC=par-min-bytes` | opt-in | off | behaviour | snapshot | types |
@@ -1223,7 +1223,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GC_VERIFY_STALE` | DBG | `CRATONVM_DBG=gc-verify-stale` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_GC_YOUNG_PAUSE_MS` | GC | `CRATONVM_GC=young-pause-goal-ms` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_GC_YOUNG_TRIGGER_PERCENT` | GC | `CRATONVM_GC=young-trigger-percent` | opt-in | off | behaviour | snapshot | gc |
-| `CRATONVM_GEN_UNCOMMIT` | GC | `CRATONVM_GC=gen-uncommit` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_GEN_UNCOMMIT` | GC | `CRATONVM_GC=gen-uncommit` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_GETRESOURCE_FIRST_HIT` | COMPAT | `CRATONVM_COMPAT=getresource-first-hit` | default-on | on | behaviour | snapshot | native-builtins |
 | `CRATONVM_GPU_APPROX_MATH` | JIT | `CRATONVM_JIT=gpu-approx-math` | opt-in | off | behaviour | snapshot | jit-cuda |
 | `CRATONVM_GPU_CHUNKS` | GC | `CRATONVM_GC=gpu-chunks` | opt-in | off | behaviour | snapshot | vm |

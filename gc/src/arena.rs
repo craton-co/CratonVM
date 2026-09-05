@@ -134,13 +134,28 @@ impl DeferredWipe {
     }
 }
 
-/// `CRATONVM_GC_OBJECT_STARTS=1` -- maintain an exact object-start bitmap per
-/// arena and let `is_object_address` answer from it instead of deducing the
-/// answer from header bytes. Opt-in; see [`Arena::starts`].
+/// `CRATONVM_GC_OBJECT_STARTS` -- maintain an exact object-start bitmap on the
+/// arenas whose owner asks for one, and let `is_object_address` answer from it
+/// instead of deducing the answer from header bytes. See [`Arena::starts`].
+///
+/// **Default-ON opt-out since 2026-09-05**; `=0` restores the header-shaped
+/// deduction exactly, and is the first thing to set if an object is ever
+/// suspected of being accepted at an address it does not start at.
+///
+/// It shipped opt-in and earned the default on a 90/90 HotSpot-differential
+/// regression suite with it enabled on the generational collector, answering
+/// 1112587 of 1912476 probes on the workload behind that run. The footprint is
+/// capacity/64 of side table and it is charged only to the arenas that consult
+/// it -- the two young semi-spaces -- rather than to every `Arena` in the
+/// process, which is what the first version did (see
+/// [`Arena::arm_object_starts`]).
 fn object_starts_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_OBJECT_STARTS").is_some()
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_GC_OBJECT_STARTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
     })
 }
 
