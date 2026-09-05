@@ -1351,14 +1351,41 @@ enum BufferAccess {
 
 /// Inspect a `ByteBuffer` and return how to access its writable/readable
 /// region. Returns None if `bb` is null or unrecognizable.
+///
+/// Field access goes through [`crate::socket_fast_io::bb_slots`], which
+/// memoizes the slot indices per receiver `ClassId`. The by-name route this
+/// replaced is `resolve_field_index_in_hierarchy` under the class-manager read
+/// lock — a string hash and a hierarchy walk — and it ran four to five times
+/// here, plus twice more in [`buffer_advance`], on EVERY socket transfer, all
+/// of them re-deriving a constant. Same defect and same fix as the
+/// `al_slots_for` per-call re-derivation in `native-collections`.
+///
+/// A class whose layout does not resolve falls back to the by-name route
+/// rather than failing: `get_field_by_name` also serves the synthetic buffer
+/// layouts that `resolve_field_index_by_class_id` does not model, so a refusal
+/// here must degrade to the old path and not to an error.
 fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAccess> {
-    let position = match ctx.get_field_by_name(bb, "position") {
+    use crate::socket_fast_io::slot_int;
+    let slots = crate::socket_fast_io::bb_slots(ctx, bb);
+    let (s_pos, s_lim, s_cap, s_hb, s_off, s_addr) = match slots {
+        Some(s) => (
+            Some(s.position),
+            Some(s.limit),
+            s.capacity,
+            s.hb,
+            s.offset,
+            s.address,
+        ),
+        None => (None, None, None, None, None, None),
+    };
+
+    let position = match slot_int(ctx, bb, s_pos, "position") {
         Value::Int(v) if v >= 0 => v,
         _ => 0,
     };
-    let limit = match ctx.get_field_by_name(bb, "limit") {
+    let limit = match slot_int(ctx, bb, s_lim, "limit") {
         Value::Int(v) if v >= 0 => v,
-        _ => match ctx.get_field_by_name(bb, "capacity") {
+        _ => match slot_int(ctx, bb, s_cap, "capacity") {
             Value::Int(v) if v >= 0 => v,
             _ => 0,
         },
@@ -1368,8 +1395,23 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
     // Heap: `hb` is the byte[]. Try this first; loading the `address`
     // field on a HeapByteBuffer can transitively trigger class loads
     // (java.lang.foreign.MemorySegment) we don't fully support.
-    if let Value::Object(Some(arr)) = ctx.get_field_by_name(bb, "hb") {
-        let base_off = match ctx.get_field_by_name(bb, "offset") {
+    //
+    // NOTE the asymmetry with the direct arm below: when the layout cache
+    // resolved but this class has no `hb` slot at all, `s_hb` is `None` and
+    // `slot_int` would fall back to the by-name lookup, which is exactly the
+    // cost being removed. Ask by name only when the whole layout refused.
+    let hb = match (slots.is_some(), s_hb) {
+        (true, Some(i)) => ctx.get_field(bb, i),
+        (true, None) => Value::Object(None),
+        (false, _) => ctx.get_field_by_name(bb, "hb"),
+    };
+    if let Value::Object(Some(arr)) = hb {
+        let base_off = match (slots.is_some(), s_off) {
+            (true, Some(i)) => ctx.get_field(bb, i),
+            (true, None) => Value::Int(0),
+            (false, _) => ctx.get_field_by_name(bb, "offset"),
+        };
+        let base_off = match base_off {
             Value::Int(v) if v >= 0 => v,
             _ => 0,
         };
@@ -1382,7 +1424,12 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
 
     // Direct: `address` is a non-zero long. Only consult it when the
     // heap-array fast path didn't match.
-    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
+    let address = match (slots.is_some(), s_addr) {
+        (true, Some(i)) => ctx.get_field(bb, i),
+        (true, None) => Value::Object(None),
+        (false, _) => ctx.get_field_by_name(bb, "address"),
+    };
+    if let Value::Long(addr) = address {
         if addr != 0 {
             return Some(BufferAccess::Direct {
                 addr: addr.wrapping_add(position as i64),
@@ -1394,49 +1441,127 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
     None
 }
 
+/// Record which buffer population a transfer served, once per transfer.
+///
+/// Called from the transfer ENTRY points rather than from [`buffer_access`],
+/// which runs twice per read (once for the length, once inside
+/// [`buffer_write_bytes`] after the blocking region, where the access must be
+/// re-derived because a moving collection may have relocated the backing
+/// array). Counting inside it would double every row.
+fn note_buffer_kind(ctx: &dyn NativeContext, access: &BufferAccess) {
+    match access {
+        BufferAccess::Heap { .. } => {
+            crate::socket_fast_io::stats::bump(&crate::socket_fast_io::stats::HEAP_BUF)
+        }
+        BufferAccess::Direct { addr, .. } => crate::socket_fast_io::note_direct_kind(ctx, *addr),
+    }
+}
+
 /// Bump a buffer's position by `n` bytes after a successful read or write.
 fn buffer_advance(ctx: &mut dyn NativeContext, bb: ObjectRef, n: i32) {
-    let cur = match ctx.get_field_by_name(bb, "position") {
+    let slot = crate::socket_fast_io::bb_slots(ctx, bb).map(|s| s.position);
+    let cur = match crate::socket_fast_io::slot_int(ctx, bb, slot, "position") {
         Value::Int(v) => v,
         _ => 0,
     };
-    ctx.set_field_by_name(bb, "position", Value::Int(cur.saturating_add(n)));
+    let next = Value::Int(cur.saturating_add(n));
+    match slot {
+        Some(i) => ctx.set_field(bb, i, next),
+        None => ctx.set_field_by_name(bb, "position", next),
+    }
 }
 
-/// Materialize an owned byte vector representing the writable/readable
-/// region of a buffer. Used for write paths (read from buffer → kernel).
-fn buffer_read_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<Vec<u8>> {
-    match buffer_access(ctx, bb)? {
+/// How many bytes the buffer's readable region holds, clamped exactly the way
+/// [`buffer_read_into`] will clamp when it copies them.
+///
+/// Split out of the old `buffer_read_bytes` so a caller can size ONE
+/// destination for several buffers before copying any of them — which is what
+/// turned the gathering write from `N + 1` allocations and two full copy passes
+/// into one buffer and one pass.
+fn buffer_readable_len(ctx: &mut dyn NativeContext, bb: ObjectRef) -> usize {
+    match buffer_access(ctx, bb) {
+        Some(a) => access_readable_len(ctx, &a),
+        None => 0,
+    }
+}
+
+/// [`buffer_readable_len`] for an access the caller has already decoded.
+///
+/// Exists so a transfer that must ALSO classify the buffer for the census does
+/// not decode it twice — the whole point of the layout cache is that decoding
+/// got cheap, not free.
+fn access_readable_len(ctx: &mut dyn NativeContext, access: &BufferAccess) -> usize {
+    match *access {
+        BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => length as usize,
+        BufferAccess::Heap {
+            arr,
+            offset,
+            length,
+        } if length > 0 => {
+            // The old element-by-element loop stopped at the end of the backing
+            // array; preserve that clamp, or a sliced buffer whose `offset`
+            // reaches past `arr.length` would report bytes that cannot be read.
+            let arr_len = ctx.array_length(arr);
+            let avail = arr_len.saturating_sub(offset as usize);
+            (length as usize).min(avail)
+        }
+        _ => 0,
+    }
+}
+
+/// Copy the buffer's readable region into `dst`, returning the byte count.
+///
+/// Writes into a caller-owned slice rather than returning a fresh `Vec`: the
+/// write paths hand it a region of the thread's reusable
+/// [`crate::socket_fast_io::Scratch`], so a steady-state write allocates
+/// nothing. `dst` may be shorter than the readable region, in which case the
+/// copy is truncated — the caller sized it and the kernel is told the truth
+/// about how many bytes it is being given.
+fn buffer_read_into(ctx: &mut dyn NativeContext, bb: ObjectRef, dst: &mut [u8]) -> usize {
+    match buffer_access(ctx, bb) {
+        Some(a) => buffer_read_into_access(ctx, &a, dst),
+        None => 0,
+    }
+}
+
+/// [`buffer_read_into`] for an access the caller has already decoded.
+fn buffer_read_into_access(
+    ctx: &mut dyn NativeContext,
+    access: &BufferAccess,
+    dst: &mut [u8],
+) -> usize {
+    match *access {
         BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => {
-            let mut v = vec![0u8; length as usize];
+            let n = (length as usize).min(dst.len());
+            if n == 0 {
+                return 0;
+            }
             // `addr` is normally a real `allocateDirect` pointer, but a
             // temp-direct buffer from `Util.getTemporaryDirectBuffer` is an
             // `Unsafe.allocateMemory` arena handle (not dereferenceable).
             // Route through the context so a handle reads from the off-heap
             // store instead of a raw memcpy that would SIGSEGV; for a real
             // pointer this is the same `copy_nonoverlapping`.
-            if !ctx.copy_from_native_memory(addr, &mut v) {
-                return Some(Vec::new());
+            if !ctx.copy_from_native_memory(addr, &mut dst[..n]) {
+                return 0;
             }
-            Some(v)
+            n
         }
         BufferAccess::Heap {
             arr,
             offset,
             length,
         } if length > 0 => {
-            // Bulk read via NativeContext intrinsic. The old element-by-element
-            // loop clamped `length` to whatever fit before `arr_len`; preserve
-            // that by clamping the effective length here.
             let arr_len = ctx.array_length(arr);
             let off = offset as usize;
             let avail = arr_len.saturating_sub(off);
-            let eff_len = (length as usize).min(avail);
-            let mut v = vec![0u8; eff_len];
-            ctx.read_byte_array_into(arr, off, &mut v);
-            Some(v)
+            let n = (length as usize).min(avail).min(dst.len());
+            if n == 0 {
+                return 0;
+            }
+            ctx.read_byte_array_into(arr, off, &mut dst[..n])
         }
-        _ => Some(Vec::new()),
+        _ => 0,
     }
 }
 
@@ -3327,11 +3452,12 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return Err(close_by_interrupt(ctx, this));
     }
 
-    // Determine the writable region. We materialize into a heap buffer here
+    // Determine the writable region. We materialize into a native buffer here
     // and copy into the buffer slot afterwards so we don't hold a registry
     // lock across `set_array_element`.
     let access =
         buffer_access(ctx, bb).ok_or_else(|| ioex("read: ByteBuffer has no decodable layout"))?;
+    note_buffer_kind(ctx, &access);
     let len = match access {
         BufferAccess::Direct { length, .. } => length,
         BufferAccess::Heap { length, .. } => length,
@@ -3339,7 +3465,20 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if len <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let mut buf = vec![0u8; len as usize];
+    // The thread's reusable transfer buffer, NOT a fresh `vec![0u8; len]`.
+    //
+    // `len` is the destination's REMAINING CAPACITY, not the traffic: an event
+    // loop reading a 120-byte request into netty's 64 KiB receive buffer used
+    // to allocate and zero 64 KiB per call. `Scratch` holds the buffer at its
+    // high-water mark, so in steady state this allocates nothing and zeroes
+    // nothing, and returns itself to the thread on drop — including down every
+    // early-return arm below, of which there are seven.
+    //
+    // Its contents are the PREVIOUS transfer's bytes, not zeroes. That is safe
+    // here for the same reason it is safe in the JDK: only the first `n` bytes
+    // the kernel reports are ever read, and `Scratch::prefix` is the only way
+    // this function looks at them.
+    let mut scratch = crate::socket_fast_io::Scratch::new(len as usize);
     // The OS read below may enter a GC-blocking region. Keep the Java buffer
     // rooted and reload it before writing the received bytes back.
     let bb_pin = ctx.pin_native_root(bb);
@@ -3377,9 +3516,9 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 // reborrow ends with the `if` expression, before
                 // `end_blocking_region` takes `&mut` again.
                 let probe: &dyn NativeContext = &*ctx;
-                read_close_aware(id, &s, &mut buf, &|| probe.is_interrupted(false))
+                read_close_aware(id, &s, scratch.as_mut(), &|| probe.is_interrupted(false))
             } else {
-                try_read_nb(&s, &mut buf)
+                try_read_nb(&s, scratch.as_mut())
             };
             ctx.end_blocking_region();
             r
@@ -3439,7 +3578,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
     };
     if n > 0 {
-        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        crate::net::socket_capture('r', id, scratch.prefix(n as usize));
         // Reload `bb` through the pin BEFORE touching it again: the blocking
         // read above may have crossed a GC pause that relocated the object,
         // so the original `bb` reference could be stale here (see
@@ -3478,9 +3617,13 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let hash = fnv1a64(&buf[..n as usize]);
+            let hash = fnv1a64(scratch.prefix(n as usize));
             let dump_len = (n as usize).min(64);
-            let hex: String = buf[..dump_len].iter().map(|b| format!("{b:02x}")).collect();
+            let hex: String = scratch
+                .prefix(dump_len)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             eprintln!(
                 "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
             );
@@ -3524,7 +3667,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 }
             }
         }
-        let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
+        let written = buffer_write_bytes(ctx, bb, scratch.prefix(n as usize));
         buffer_advance(ctx, bb, written);
     }
     ctx.unpin_native_roots(bb_pin);
@@ -3554,7 +3697,24 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             Err(ioex("write: channel not connected"))
         };
     };
-    let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
+    // Copy the source region into the thread's reusable transfer buffer rather
+    // than into a fresh `Vec` sized to `limit - position`. The buffer is
+    // decoded ONCE here and the decoded access is reused for the census and the
+    // copy, instead of being re-derived by each helper in turn.
+    let src_access = buffer_access(ctx, bb);
+    if let Some(a) = &src_access {
+        note_buffer_kind(ctx, a);
+    }
+    let src_len = match &src_access {
+        Some(a) => access_readable_len(ctx, a),
+        None => 0,
+    };
+    let mut scratch = crate::socket_fast_io::Scratch::new(src_len);
+    let copied = match &src_access {
+        Some(a) => buffer_read_into_access(ctx, a, scratch.as_mut()),
+        None => 0,
+    };
+    let data = scratch.prefix(copied);
     if io_flags().dbg_sc_write {
         let position = ctx.get_field_by_name(bb, "position");
         let limit = ctx.get_field_by_name(bb, "limit");
@@ -3746,14 +3906,22 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so we can advance its position by the bytes actually consumed.
     let arr_len = ctx.array_length(srcs) as i32;
     let (start, end) = vec_window(args, arr_len);
-    let mut chunks = Vec::new();
+
+    // PASS 1 — measure and pin, without copying anything.
+    //
+    // The old shape allocated one `Vec` per source buffer here and then
+    // concatenated all of them into one more `Vec` below: `N + 1` allocations
+    // and two full passes over the payload for what the kernel receives as a
+    // single `send`. Netty emits a header buffer plus a body buffer for every
+    // HTTP response, so this is its normal write path, not a corner.
+    let mut chunks: Vec<(usize, ObjectRef, usize)> = Vec::new();
     let mut total: usize = 0;
     for i in start..end {
         if let Value::Object(Some(bb)) = ctx.get_array_element(srcs, i as usize) {
-            let bytes = buffer_read_bytes(ctx, bb).unwrap_or_default();
-            total += bytes.len();
+            let len = buffer_readable_len(ctx, bb);
             let pin = ctx.pin_native_root(bb);
-            chunks.push((pin, bb, bytes));
+            chunks.push((pin, bb, len));
+            total += len;
         }
     }
     if total == 0 {
@@ -3766,9 +3934,41 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         return Ok(Some(Value::Long(0)));
     }
-    let mut data = Vec::with_capacity(total);
-    for (_, _, bytes) in &chunks {
-        data.extend_from_slice(bytes);
+
+    // PASS 2 — copy every source into ONE reusable buffer, back to back.
+    //
+    // Each buffer is re-read through its pin: `pin_native_root` above may have
+    // crossed a collection that relocated an earlier source, and a stale
+    // `ObjectRef` here would copy from a dead address rather than fail.
+    //
+    // `copied` is the running cursor and is what the payload length becomes —
+    // NOT `total`. A source that yields fewer bytes than it measured (a
+    // concurrent `position` change, an unreadable direct handle) must shorten
+    // the payload, not leave a hole of stale scratch bytes in the middle of it
+    // for the peer to parse as protocol.
+    let mut scratch = crate::socket_fast_io::Scratch::new(total);
+    let mut copied: usize = 0;
+    for (pin, bb, len) in chunks.iter_mut() {
+        if *len == 0 {
+            continue;
+        }
+        let live = ctx.read_native_pin(*pin, *bb);
+        let end_off = (copied + *len).min(total);
+        let got = buffer_read_into(ctx, live, &mut scratch.as_mut()[copied..end_off]);
+        *len = got;
+        copied += got;
+    }
+    crate::socket_fast_io::stats::bump(&crate::socket_fast_io::stats::GATHER_FAST);
+    crate::socket_fast_io::stats::add(
+        &crate::socket_fast_io::stats::GATHER_BUFFERS,
+        chunks.len() as u64,
+    );
+    let data = scratch.prefix(copied);
+    if data.is_empty() {
+        for (pin, _, _) in chunks {
+            ctx.unpin_native_roots(pin);
+        }
+        return Ok(Some(Value::Long(0)));
     }
 
     // The channel object itself, pinned LAST so every `unpin_native_roots` on
@@ -3853,11 +4053,11 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Distribute the written count across the source buffers, advancing
         // each position by the portion of its bytes that made it out.
         let mut remaining = n;
-        for (pin, bb, bytes) in &chunks {
+        for (pin, bb, len) in &chunks {
             if remaining <= 0 {
                 break;
             }
-            let consume = (bytes.len() as i32).min(remaining);
+            let consume = (*len as i32).min(remaining);
             let bb = ctx.read_native_pin(*pin, *bb);
             buffer_advance(ctx, bb, consume);
             remaining -= consume;
@@ -3923,7 +4123,13 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(Some(Value::Long(0)));
     }
     let cap = total.min(i32::MAX as i64) as usize;
-    let mut buf = vec![0u8; cap];
+    // Reusable transfer buffer, sized to the COMBINED remaining capacity of
+    // every destination — which is why a per-call `vec![0u8; cap]` hurt more
+    // here than anywhere else on the path: a reactor doing a header+body
+    // scattering read into two 64 KiB buffers allocated and zeroed 128 KiB per
+    // call. See `Scratch`: the contents are the previous transfer's bytes, and
+    // only the `n` the kernel reports are ever scattered out.
+    let mut scratch = crate::socket_fast_io::Scratch::new(cap);
 
     // AUDIT 2026-07-26 (native-io-audit): this path used to call `try_read_nb`
     // with NO `begin_blocking_region`/`end_blocking_region` bracket, unlike
@@ -3955,9 +4161,9 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // interruptible on the same terms.
             let r = if blocking {
                 let probe: &dyn NativeContext = &*ctx;
-                read_close_aware(id, &s, &mut buf, &|| probe.is_interrupted(false))
+                read_close_aware(id, &s, scratch.as_mut(), &|| probe.is_interrupted(false))
             } else {
-                try_read_nb(&s, &mut buf)
+                try_read_nb(&s, scratch.as_mut())
             };
             ctx.end_blocking_region();
             r
@@ -4021,7 +4227,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(Some(Value::Long(-1))); // EOF
     }
     if n > 0 {
-        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        crate::net::socket_capture('r', id, scratch.prefix(n as usize));
         // Scatter the bytes into the destination buffers in order; each call
         // fills one buffer up to its remaining room, then we move to the next.
         let mut consumed = 0usize;
@@ -4030,7 +4236,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 break;
             }
             let bb = ctx.read_native_pin(*pin, *bb);
-            let written = buffer_write_bytes(ctx, bb, &buf[consumed..n as usize]);
+            let written = buffer_write_bytes(ctx, bb, &scratch.prefix(n as usize)[consumed..]);
             if written <= 0 {
                 break;
             }
@@ -6347,12 +6553,15 @@ fn sc_blocking_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let deadline =
         (nanos > 0).then(|| std::time::Instant::now() + Duration::from_nanos(nanos as u64));
 
-    let mut buf = vec![0u8; len];
+    // Reusable transfer buffer — this is the `socket.getInputStream()` adapter
+    // path, so it is per-`read()` on every stream-oriented HTTP client and
+    // server in the corpus, not only on the channel API.
+    let mut scratch = crate::socket_fast_io::Scratch::new(len);
     let arr_pin = ctx.pin_native_root(arr);
     ctx.begin_blocking_region();
     let outcome = loop {
         match resolve_stream(id) {
-            StreamTarget::Ready(stream) => match try_read_nb(&stream, &mut buf) {
+            StreamTarget::Ready(stream) => match try_read_nb(&stream, scratch.as_mut()) {
                 Ok(Some(n)) => break Ok(n),
                 Ok(None) => {}
                 Err(error) => break Err(map_err("blockingRead", error)),
@@ -6381,11 +6590,11 @@ fn sc_blocking_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     if n > 0 {
-        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        crate::net::socket_capture('r', id, scratch.prefix(n as usize));
         // Reload through the pin: the wait above may have crossed a GC pause
         // that relocated the array.
         let arr = ctx.read_native_pin(arr_pin, arr);
-        ctx.write_byte_array_from(arr, off, &buf[..n as usize]);
+        ctx.write_byte_array_from(arr, off, scratch.prefix(n as usize));
     }
     ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Int(n)))
@@ -6404,9 +6613,12 @@ fn sc_blocking_write_fully(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     let id =
         read_reg_id(ctx, this).ok_or_else(|| ioex("blockingWriteFully: channel not connected"))?;
-    let mut data = vec![0u8; len];
-    let copied = ctx.read_byte_array_into(arr, off, &mut data);
-    data.truncate(copied);
+    // Reusable transfer buffer; `copied` (not `len`) is the payload length,
+    // because a short read from the source array must shorten the write rather
+    // than send the buffer's stale tail.
+    let mut scratch = crate::socket_fast_io::Scratch::new(len);
+    let copied = ctx.read_byte_array_into(arr, off, scratch.as_mut());
+    let data = scratch.prefix(copied);
     if data.is_empty() {
         return Ok(None);
     }

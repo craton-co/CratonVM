@@ -583,6 +583,14 @@ pub fn run_shutdown_hooks(ctx: &mut dyn NativeContext, trigger: &str) {
     );
     report_vector_intrinsics();
     report_filechannel_fast_io();
+    // The socket transfer / selector census. Same exit path and the same
+    // argument as `report_filechannel_fast_io` above: a throughput number
+    // quoted without it cannot distinguish "the reusable buffer served every
+    // transfer" from "every transfer allocated and the host happened to be
+    // quieter". Opt-in via `CRATONVM_SC_IO_STATS`, and it prints every row
+    // even when all are zero, because `scratch hit=0` is the single most
+    // useful thing it can say.
+    cratonvm_native_io::socket_fast_io::stats::report();
     crate::craton_gpu::dispatch_timing::report();
     // The corrupt-cell census. HERE and not in `vm-cli`, because a JUnit runner
     // exits through `System.exit` and never reaches `vm-cli`'s normal-return

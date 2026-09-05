@@ -97,6 +97,11 @@ pub mod file_channel;
 pub mod file_channel_fast_read;
 // WP3.4 — non-blocking SocketChannel / ServerSocketChannel with EAGAIN semantics.
 pub mod socket_channel;
+// Per-call cost removal shared by the socket transfer and selector paths: the
+// reusable transfer buffer that replaces `vec![0u8; remaining]`, the
+// per-`ClassId` `ByteBuffer` layout cache that replaces `get_field_by_name`,
+// and the engagement census that says whether either engaged.
+pub mod socket_fast_io;
 // Real non-blocking TCP connect with a pollable OS fd (ES-HANG-02 residual 1).
 pub mod nb_connect;
 // AF_UNIX stream sockets backing `*.open(StandardProtocolFamily.UNIX)` — the

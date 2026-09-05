@@ -17289,6 +17289,27 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         true
     }
 
+    fn class_id_of_object_forwarded(&self, obj: ObjectRef) -> ClassId {
+        // The first three lines of `get_field_by_name`, verbatim and for the
+        // same reason: forward FIRST, then take the id from the forwarded
+        // object, so a memoized slot index and the `get_field` that uses it
+        // describe the same object.
+        let (obj, obj_validated) = self.shared.mem.heap.load_and_forward_checked(obj);
+        if obj_validated {
+            self.shared.mem.heap.class_id_of_validated(obj)
+        } else {
+            ClassId::new(0)
+        }
+    }
+
+    fn native_addr_is_arena_handle(&self, addr: i64) -> bool {
+        // The same TAG-BIT test `copy_from_native_memory` / `copy_to_native_memory`
+        // classify with, and deliberately not a liveness test: a freed handle is
+        // still a handle, and reporting it as a raw pointer would tell the socket
+        // census that a bounce-free transfer was available when it was not.
+        cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr)
+    }
+
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
         // Tag bit, not liveness — see `copy_from_native_memory` above for why.
         if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {

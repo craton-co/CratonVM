@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-507 tokens.
+509 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -189,6 +189,7 @@ export inherited from a parent shell.
 | `fbref` | `CRATONVM_DBG_FBREF` |
 | `fc-fast-io-stats` | `CRATONVM_FC_FAST_IO_STATS` |
 | `field-get` | `CRATONVM_DBG_FIELD_GET` |
+| `sc-io-stats` | `CRATONVM_SC_IO_STATS` |
 | `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
@@ -382,6 +383,7 @@ export inherited from a parent shell.
 | `netty-queue` | `CRATONVM_DBG_NETTY_QUEUE` |
 | `nextint` | `CRATONVM_DBG_NEXTINT` |
 | `nio-bind` | `CRATONVM_DBG_NIO_BIND` |
+| `native-shadow` | `CRATONVM_DBG_NATIVE_SHADOW` |
 | `nocode` | `CRATONVM_DBG_NOCODE` |
 | `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
@@ -573,7 +575,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-253 tokens.
+257 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -786,6 +788,10 @@ export inherited from a parent shell.
 | `vector-intrinsics` | `CRATONVM_VECTOR_INTRINSICS` |
 | `vector-templates` | `CRATONVM_VECTOR_TEMPLATES` |
 | `fc-fast-io` | `CRATONVM_FC_FAST_IO` |
+| `sc-scratch` | `CRATONVM_SC_SCRATCH` |
+| `sc-bb-slots` | `CRATONVM_SC_BB_SLOTS` |
+| `sel-fast-keys` | `CRATONVM_SEL_FAST_KEYS` |
+| `sel-ready-cache` | `CRATONVM_SEL_READY_CACHE` |
 | `strict-callee-roots` | `CRATONVM_JIT_STRICT_CALLEE_ROOTS` |
 | `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
 | `threshold` | `CRATONVM_JIT_THRESHOLD` |
