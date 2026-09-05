@@ -101,6 +101,51 @@ pub fn wrapper_exists() -> bool {
     WRAPPER_CREATED.load(Ordering::Relaxed)
 }
 
+/// Should a reference-ARRAY read consult [`wrapper_exists`] before probing for
+/// a wrapper? Default yes; `CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH=1`
+/// (`CRATONVM_GC=-array-autobox-latch`) restores the unconditional probe.
+///
+/// # Why this existed to be fixed
+///
+/// The module note above explains the latch by saying `gen_heap::get_field`
+/// "used to pay an unconditional `is_object_address` probe plus a header read
+/// on EVERY compact reference-field read, just in case the slot held a
+/// wrapper", and that giving the other heaps that unconditionally "would be a
+/// real regression".
+///
+/// The FIELD read paths took that advice — `get_field` goes through
+/// [`unbox_reference_slot`], which is latched. The reference-**array** read
+/// paths did not: `ZgcRealHeap::get_array_element` (both its barrier arm and
+/// its plain arm) and `G1Collector::get_array_element` called
+/// [`super::GarbageCollector::autobox_payload`] directly, whose first act is
+/// `is_object_address` — the exact probe this latch exists to avoid — on every
+/// non-null `aaload`. Measured 2026-09-05 at +47 ns for an `aaload` over an
+/// `iaload` + `ifne` doing the same work, against HotSpot's −0.8 ns.
+///
+/// # Why the screen cannot change an answer
+///
+/// `autobox_payload` returns `Some` only when the loaded object's header says
+/// `class_id == AUTOBOX_CLASS_ID`, and such an object can only exist if some
+/// site created one — which is exactly what sets the latch, array sites
+/// included (see the module note on why it is deliberately set by those too).
+/// So `wrapper_exists() == false` implies `autobox_payload` would have
+/// returned `None`. The ordering argument for a cross-thread reader is the one
+/// [`wrapper_exists`] already makes.
+#[inline(always)]
+pub fn array_unbox_latch_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH").is_none()
+    })
+}
+
+/// The screen itself: `true` when a reference-array read must go on and probe
+/// for a wrapper. Reads as "the latch is off, or it says a wrapper exists".
+#[inline(always)]
+pub fn array_read_may_hold_wrapper() -> bool {
+    !array_unbox_latch_enabled() || wrapper_exists()
+}
+
 /// Arm [`wrapper_exists`]. Called from every site that allocates a wrapper —
 /// the four `set_array_element`s and [`box_for_reference_slot`].
 #[inline]

@@ -938,7 +938,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-141 tokens.
+142 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1083,6 +1083,7 @@ export inherited from a parent shell.
 | `stream-refresh-each` | `CRATONVM_GC_STREAM_REFRESH_EACH` |
 | `noflag-deposit-skip-jit-scan` | `CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN` |
 | `identity-hash-evict` | `CRATONVM_IDENTITY_HASH_EVICT` |
+| `array-autobox-latch` | `CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH` |
 
 ## `CRATONVM_REAL`
 

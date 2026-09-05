@@ -16992,7 +16992,13 @@ impl GarbageCollector for G1Collector {
         // Un-box the auto-box wrapper the store side installs for a non-Object
         // value — see `set_array_element`, and `GenerationalHeap::
         // get_array_element` for the same read.
-        if element_type == ArrayElementType::Reference {
+        // Latched for the same reason as the two ZGC sites: `autobox_payload`
+        // opens with `is_object_address`, a region/registry probe, and can only
+        // answer `Some` if a wrapper was ever created — which is what sets the
+        // latch. See `crate::autobox::array_read_may_hold_wrapper`.
+        if element_type == ArrayElementType::Reference
+            && crate::autobox::array_read_may_hold_wrapper()
+        {
             if let Value::Object(Some(boxed)) = value {
                 if let Some(inner) = self.autobox_payload(boxed) {
                     return Ok(inner);

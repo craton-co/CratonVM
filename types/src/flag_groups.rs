@@ -2378,6 +2378,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "stream-refresh-each", on_key: Some("CRATONVM_GC_STREAM_REFRESH_EACH"), off_key: None, off_word: None, since: "2026-08-24" },
     E { group: Group::GC, token: "noflag-deposit-skip-jit-scan", on_key: Some("CRATONVM_GC_NOFLAG_DEPOSIT_SKIP_JIT_SCAN"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::GC, token: "identity-hash-evict", on_key: Some("CRATONVM_IDENTITY_HASH_EVICT"), off_key: None, off_word: Some("0"), since: "2026-08-30" },
+    // `array-autobox-latch` — off restores the unconditional `autobox_payload`
+    // probe on every non-null reference-ARRAY element read. That probe opens
+    // with `is_object_address` and can only answer `Some` when a wrapper
+    // exists, which is what the latch records; the FIELD read paths have been
+    // latched since the latch was introduced and the array ones were not.
+    E { group: Group::GC, token: "array-autobox-latch", on_key: None, off_key: Some("CRATONVM_GC_NO_ARRAY_AUTOBOX_LATCH"), off_word: None, since: "2026-09-05" },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0"), since: "2026-07-27" },
     // Default-ON, off for the exact untrimmed string `0` only — the

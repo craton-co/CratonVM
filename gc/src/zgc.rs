@@ -12768,9 +12768,17 @@ impl GarbageCollector for ZgcRealHeap {
                 // unbarriered path performs.
                 Some(addr) => Value::Object(Some(unsafe { ObjectRef::from_raw(addr as *mut u8) })),
             };
-            if let Value::Object(Some(boxed)) = val {
-                if let Some(inner) = self.autobox_payload(boxed) {
-                    return Ok(inner);
+            // Latched: `autobox_payload`'s first act is `is_object_address`,
+            // a registry probe, and it can only answer `Some` if a wrapper was
+            // ever created — which is what sets the latch. See
+            // `crate::autobox::array_read_may_hold_wrapper`; the FIELD read
+            // paths have been latched since the latch was introduced and this
+            // one was not.
+            if crate::autobox::array_read_may_hold_wrapper() {
+                if let Value::Object(Some(boxed)) = val {
+                    if let Some(inner) = self.autobox_payload(boxed) {
+                        return Ok(inner);
+                    }
                 }
             }
             return Ok(val);
@@ -12787,9 +12795,17 @@ impl GarbageCollector for ZgcRealHeap {
         // `Object[]` never holds an `AUTOBOX_CLASS_ID` object, so this cannot
         // change what an `aaload` observes.
         if element_type == ArrayElementType::Reference {
-            if let Value::Object(Some(boxed)) = val {
-                if let Some(inner) = self.autobox_payload(boxed) {
-                    return Ok(inner);
+            // Latched: `autobox_payload`'s first act is `is_object_address`,
+            // a registry probe, and it can only answer `Some` if a wrapper was
+            // ever created — which is what sets the latch. See
+            // `crate::autobox::array_read_may_hold_wrapper`; the FIELD read
+            // paths have been latched since the latch was introduced and this
+            // one was not.
+            if crate::autobox::array_read_may_hold_wrapper() {
+                if let Value::Object(Some(boxed)) = val {
+                    if let Some(inner) = self.autobox_payload(boxed) {
+                        return Ok(inner);
+                    }
                 }
             }
         }
