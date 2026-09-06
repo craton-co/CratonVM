@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-531 tokens.
+532 tokens.
 
 | Token | Expands to |
 | --- | --- |
