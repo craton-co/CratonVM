@@ -4589,25 +4589,48 @@ unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
 
 /// OPT-IN, and the reason is measured, not cautious.
 ///
-/// Driving the lifecycle works exactly as designed: on
-/// `org.h2.test.store.TestMVStoreTool` at `-Xmx256m` it turns 0 mixed pauses
-/// into 15-33, reclaims 620-1034 MB that the collector otherwise never gets
-/// back, and makes the to-space-exhaustion census disappear (3/3 runs). Without
-/// it the same workload dies with `OutOfMemoryError: Java heap space` after
-/// 60-232 young pauses and zero mixed pauses (3/3).
+/// Driving the lifecycle works exactly as designed. On
+/// `org.h2.test.store.TestMVStoreTool` at `-Xmx256m`, one binary, driver on
+/// against driver off:
 ///
-/// It cannot be the default yet because the path it unblocks is broken. Every
-/// driver-on run reports ~32 `corrupt Value cell` heap-integrity errors, always
-/// strictly AFTER the first mixed pause, and one run in three escalates to a
-/// fatal `forwarding target must have its low 2 bits clear` abort. Zero such
-/// reports appear in any driver-off run, including one that took 232 young
-/// pauses -- so it is not "more GC finds more"; it is mixed evacuation. Setting
-/// `CRATONVM_COMPACT_TLAB_ALLOC=0` does not change the count (32 in 2/2), which
-/// rules out the compact/legacy cell-layout mismatch that the raw words first
-/// suggested.
+///   on   16-47 mixed pauses, 680-1382 MB reclaimed by them
+///   off  0-8 mixed pauses, `OutOfMemoryError: Java heap space` 3/3 in 46-102 s
 ///
-/// Turning this on is therefore the way to REACH that defect, not a tuning
-/// knob. Default it on only once mixed evacuation runs clean.
+/// Without it the collector never gets that memory back at all: this hook is
+/// the only caller of either half that a compiled workload reaches.
+///
+/// # Why it is still not the default
+///
+/// Two separate defects were measured behind this switch. The first is FIXED
+/// and is no longer a reason:
+///
+/// 1. CORRUPT CELLS -- GONE. Runs on 2026-09-05 reported >=32 `corrupt Value
+///    cell` errors each, always after the first mixed pause, one in three
+///    ending in a fatal `forwarding target must have its low 2 bits clear`.
+///    That was `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
+///    (fixed the same day, `CRATONVM_G1_PARALLEL_EVAC_SCREEN`), not something
+///    new here: the holder report this branch added printed `class_id`
+///    163587104 = 0x09C02470, the low half of the heap pointer 0x1f509c02470,
+///    which is that page's fabrication pattern verbatim. Re-measured on the
+///    merged tip: 0 corrupt cells in 3/3 driver-on runs.
+///
+/// 2. A SIGSEGV THAT SURVIVED IT -- still open, and the actual blocker. On the
+///    fixed tip, 2 of 3 driver-on runs still die with SIGSEGV, and the count of
+///    `IMPLAUSIBLE legacy header` refusals tracks it exactly: 13 and 8 in the
+///    two that crashed, 0 in the one that did not. The screens now REFUSE the
+///    bad candidates instead of fabricating headers from them, so the crash has
+///    moved rather than gone. The refusals split
+///    `evacuate-src` / `evacuate-dest` / `ref-slot-candidate`, i.e. the source
+///    header, the copy, and a reference slot all reach the screen implausible.
+///
+/// The driver-off arm is NOT a clean negative for (2): it never segfaults, but
+/// it also dies of OOM in 46-102 s and so never reaches the depth where the
+/// fault happens. What the control does establish is that the corrupt-cell
+/// family is gone from both arms.
+///
+/// So this switch is how you REACH the remaining defect, not a tuning knob.
+/// Default it on once a driver-on run survives without implausible-header
+/// refusals.
 fn g1_jit_mark_driver_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -11043,6 +11066,51 @@ unsafe fn jit_typecheck_resolve(
             if crate::runtime::interpreter::annotation_proxy_satisfies_target(
                 vm, *obj_ref, class_name,
             ) {
+                return true;
+            }
+            // Loader-duplication fallback -- the TWIN of the one at the bottom
+            // of this function, which this branch's early `return false` was
+            // hiding from every site that had an id to record.
+            //
+            // The interpreter accepts a same-named class from another loader:
+            // `op_checkcast`/`op_instanceof` both end their assignability
+            // chain in `loader_aware_name_assignable`, and
+            // `CRATONVM_LOADER_AWARE_RESOLUTION` defaults ON. So refusing here
+            // is not "stricter", it is a JIT/interpreter DIVERGENCE -- the same
+            // one the by-name fallback below was already written to close for
+            // `SpringBootContextLoaderAotTests` (Residual 6). That fix landed
+            // on the by-name path only, and a site whose target class WAS
+            // loaded at compile time never reaches it.
+            //
+            // Spring Boot's forked-classpath tests are where the gap shows.
+            // `ModifiedClassPathClassLoader` re-defines a framework jar's
+            // classes in a child loader, and CratonVM's flat store can hand
+            // one CONSTANT_Class reference the app copy while the compiler
+            // resolved this site to the child copy through the compiling
+            // class's own loader. Under `-Jit on` that surfaced as
+            //
+            //   ClassCastException: class org.apache.hc.client5.http.psl.PublicSuffixList
+            //     cannot be cast to class org.apache.hc.client5.http.psl.PublicSuffixList
+            //
+            // out of `PublicSuffixMatcher.<init>`, in four Spring Boot classes
+            // that all pass under `--nojit`. `[DBG_TYPECHECK]` named it
+            // exactly: `recv=(id=3125 loader=Application)` against
+            // `resolved_target=(id=3126 loader=UserDefined(3))`, same binary
+            // name on both sides.
+            if vm
+                .classes
+                .class_manager
+                .read()
+                .is_assignable_to_name(obj_class_id, class_name)
+            {
+                jit_typecheck_trace(
+                    vm,
+                    obj_class_id,
+                    class_name,
+                    lenient,
+                    "recorded-site-loader-duplication-by-name",
+                    Some(target_class_id),
+                );
                 return true;
             }
             jit_typecheck_trace(

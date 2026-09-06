@@ -268,6 +268,23 @@ fn for_each_flat_object_reference_capped(
             // So the next question is not about layout at all: who leaves a
             // forwarding pointer where a walk later reads a `class_id`, and why
             // does `retire_forwards` not reach it? That is where a fix goes.
+            //
+            // ANSWERED AGAIN, and it was not `retire_forwards`. That pointer
+            // came from the PARALLEL evacuator, which had none of the serial
+            // arm's header screens and is the default arm -- fixed the same day
+            // under `CRATONVM_G1_PARALLEL_EVAC_SCREEN`. The `class_id` above,
+            // 163587104 = 0x09C02470, is the low half of the heap pointer
+            // 0x1f509c02470 printed beside it, which is that page's fabrication
+            // pattern verbatim. Re-measured on the merged tip: 0 corrupt cells
+            // in 3/3 driver-on runs, where every run before it had >=32.
+            //
+            // This report therefore has no known live producer. It stays
+            // because the crash it was built to explain did NOT go with it:
+            // 2 of 3 driver-on runs still SIGSEGV, tracking `IMPLAUSIBLE legacy
+            // header` refusals (13 and 8 in the two that crashed, 0 in the one
+            // that did not) rather than corrupt cells. If this fires again it
+            // means a second producer, and the fields above are what separate
+            // it from the one already fixed.
             if cratonvm_types::cell_census::decoded() != census_before {
                 census_before = cratonvm_types::cell_census::decoded();
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
