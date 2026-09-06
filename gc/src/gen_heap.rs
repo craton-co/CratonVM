@@ -3104,7 +3104,9 @@ impl GenerationalHeap {
 
     /// Hand the EVACUATED young semi-space back to the OS.
     ///
-    /// `CRATONVM_GEN_UNCOMMIT` (opt-in). Returns the bytes released.
+    /// `CRATONVM_GEN_UNCOMMIT`, default ON; `=0` is the kill switch and is the
+    /// first thing to set if a compiled frame ever faults on a young address.
+    /// Returns the bytes released.
     ///
     /// # Why this collector had nothing like it
     ///
@@ -9402,7 +9404,7 @@ impl GenerationalHeap {
             let mut spans = young_to.deferred_wipe_spans(&wipe);
             // GIVE BACK FIRST, THEN WIPE WHAT IS LEFT.
             //
-            // `CRATONVM_GEN_UNCOMMIT`, off by default; see
+            // `CRATONVM_GEN_UNCOMMIT`, default ON; see
             // `uncommit_evacuated_young` for what it costs and why the default
             // is a measurement rather than a judgement. This is the arena the
             // collection evacuated FROM, so nothing live is in it, and the very
