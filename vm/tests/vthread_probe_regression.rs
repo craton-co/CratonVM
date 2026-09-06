@@ -20,6 +20,10 @@
 //!                          `Thread.ofVirtual()` builder + .start(Runnable) +
 //!                          Thread.join() round-trip including the
 //!                          `Joined OK` final line.
+//!   * `VthreadGcStress.java` — 3000 virtual threads sleeping 5 ms while one
+//!                          platform thread drives 400 `System.gc()` pauses.
+//!                          The deterministic gate for the STW-arrival hole
+//!                          fixed on 2026-09-05 (see `VTHREAD_PROBE_CAP`).
 //!
 //! The binary path is resolved via `CRATONVM_BIN` env var, then the cargo
 //! `target/{release,debug}` fallback. Class files are produced on-demand via
@@ -82,14 +86,24 @@ fn cratonvm_binary_lookup() -> Option<PathBuf> {
 /// or stale relative to the .java source files. Best-effort.
 fn ensure_probes_compiled() -> bool {
     let classes = probe_classes_dir();
-    let required = ["Counter.class", "Tiny.class", "VthreadProbe.class"];
+    let required = [
+        "Counter.class",
+        "Tiny.class",
+        "VthreadProbe.class",
+        "VthreadGcStress.class",
+    ];
     if required.iter().all(|f| classes.join(f).exists()) {
         return true;
     }
     let _ = std::fs::create_dir_all(&classes);
     let dir = probe_dir();
-    let sources: Vec<PathBuf> = ["Counter.java", "Tiny.java", "VthreadProbe.java"]
-        .iter()
+    let sources: Vec<PathBuf> = [
+        "Counter.java",
+        "Tiny.java",
+        "VthreadProbe.java",
+        "VthreadGcStress.java",
+    ]
+    .iter()
         .map(|f| dir.join(f))
         .filter(|p| p.exists())
         .collect();
@@ -203,19 +217,31 @@ stderr:
 ///
 /// Bimodal, with nothing in between, and independent of machine load — one
 /// failure came with three background compilers running and three of the
-/// passes came with the same three. That is a HANG, and the loop's original
-/// comment named the suspect: a v-thread scheduler that regresses to a
-/// 1-carrier livelock.
+/// passes came with the same three. That is a HANG, and a cap cannot fix a
+/// hang: raising it to 300 s bought nothing except making CI wait five times
+/// longer to report a real defect, so it is back to 60 s — twenty times the
+/// healthy runtime and twice the worst completed run ever measured.
 ///
-/// A hang is not something a cap can fix. Raising it to 300 s bought nothing
-/// except making CI wait five times longer to report a real defect, so it is
-/// back to 60 s — twenty times the healthy runtime and twice the worst
-/// completed run ever measured, which is ample for a guard whose job is to
-/// notice that progress stopped.
+/// # What the hang was (FIXED 2026-09-05)
 ///
-/// The hang itself is recorded in
-/// `docs/known-issues/jit/vthread-probe-intermittent-hang-20260905.md`.
+/// Not the carrier pool, and not the scheduler. A virtual thread that yields
+/// (`Thread.sleep` -> `ContinuationYield`) deposited its root snapshot — which
+/// raises `in_blocked_region` and excludes it from FUTURE pauses — and then
+/// handed itself to `suspend_runtime` WITHOUT arriving for a pause that was
+/// already in flight and had already counted it in `expected`. The carrier
+/// went back to `wait_for_task_until`, nothing on that OS thread ever arrived
+/// for that `tid` again, and `wait_for_all` blocked forever. See
+/// `vthread-probe-intermittent-hang-FIXED-20260905.md`.
+///
+/// This test remains a one-in-five detector for that defect, which is not a
+/// gate — `vthread_gc_stress_completes` below is the deterministic one.
 const VTHREAD_PROBE_CAP: Duration = Duration::from_secs(60);
+
+/// Cap for `VthreadGcStress`. Healthy runs finish in 7-22 s on a loaded
+/// 8-core host; the pre-fix binary hung 8 times out of 8 and was still hung at
+/// 60 s every time, so 120 s is a generous livelock guard rather than a
+/// performance assertion.
+const VTHREAD_GC_STRESS_CAP: Duration = Duration::from_secs(120);
 
 /// Memoize each probe run so all subtests targeting the same class share one
 /// VM spawn. Keyed by class name.
@@ -223,10 +249,12 @@ fn cached_run(class_name: &'static str, timeout: Duration) -> Option<(String, St
     static COUNTER: OnceLock<Option<(String, String)>> = OnceLock::new();
     static TINY: OnceLock<Option<(String, String)>> = OnceLock::new();
     static VTHREAD: OnceLock<Option<(String, String)>> = OnceLock::new();
+    static GC_STRESS: OnceLock<Option<(String, String)>> = OnceLock::new();
     let cell: &OnceLock<Option<(String, String)>> = match class_name {
         "Counter" => &COUNTER,
         "Tiny" => &TINY,
         "VthreadProbe" => &VTHREAD,
+        "VthreadGcStress" => &GC_STRESS,
         other => panic!("unknown vthread probe class: {other}"),
     };
     cell.get_or_init(|| run_probe(class_name, timeout)).clone()
@@ -320,5 +348,46 @@ fn vthread_probe_10000_all_increment() {
     assert!(
         !combined.contains("FAIL"),
         "VthreadProbe explicitly printed FAIL:\n{combined}"
+    );
+}
+
+/// `VthreadGcStress.java` — the deterministic gate for the stop-the-world
+/// arrival hole on the virtual-thread YIELD path (fixed 2026-09-05).
+///
+/// 3000 virtual threads each sleep 5 ms while one platform thread calls
+/// `System.gc()` 400 times, so a pause is nearly always in flight at the
+/// instant a continuation unmounts. That is exactly the window in which the
+/// unfixed VM counted a continuation in a pause's `expected` quota and then
+/// let it become a heap-resident continuation that could never arrive.
+///
+/// Measured on Azure `20.80.105.49`, `dev` tip `a044e1fe1`: **8 hangs in 8**
+/// at a 60 s cap before the fix, **8 clean in 8** (7-22 s) after it. The
+/// `VthreadProbe` test above catches the same defect about one run in five,
+/// which is why this fixture exists.
+#[test]
+fn vthread_gc_stress_completes() {
+    let (stdout, stderr) = match cached_run("VthreadGcStress", VTHREAD_GC_STRESS_CAP) {
+        Some(o) => o,
+        None => return,
+    };
+    let combined = format!("{stdout}
+--- STDERR ---
+{stderr}");
+    if !combined.contains("counted=3000 ok=true") {
+        let counted_line = combined
+            .lines()
+            .find(|l| l.starts_with("counted="))
+            .unwrap_or("(no `counted=` line emitted)");
+        panic!(
+            "VthreadGcStress failed to count all 3000 vthreads.
+             observed: {counted_line}
+             full output:
+{combined}"
+        );
+    }
+    assert!(
+        combined.contains("OK"),
+        "VthreadGcStress printed counted=3000 but never reached the final          'OK' marker. Output:
+{combined}"
     );
 }

@@ -136,6 +136,43 @@ the array is pinned, it is re-read from that pin BEFORE `get_array_element`,
 and the mirror is pinned, refreshed, and only then handed to the chain. Both
 fail if the refresh is removed — checked by removing it.
 
+## The same discipline one level down (2026-09-06, follow-up)
+
+Auditing the twin the fix above names -- `redefineClasses0` -- turned up
+nothing left in the loop itself: it was pinned in the same commit. What the
+audit DID turn up is one level down, in `run_chain_over_bytes`, which both
+loops funnel through.
+
+That walk iterates `snapshot_transformer_chain()`, a `chain.to_vec()` copy.
+The canonical chain is a GC root and is rewritten after a moving collection by
+`remap_transformer_refs` -- whose own comment names the failure it exists to
+stop: a `transformer_ref` left "pointing at the object's *old* address after
+compaction ... a dispatch onto a relocated object the next time
+`run_transformer_chain` invokes `transform`". The remap does not reach a
+snapshot. So with two or more registered transformers, every entry after the
+first is held across the previous transformer's `transform` call -- Java, which
+allocates -- with no pin.
+
+**Hardened, not demonstrated.** A probe that puts an allocating transformer
+ahead of Mockito's, churns ~6 GB through it and calls `System.gc()` twice
+inside the `transform` call was clean 20/20 on a pristine-dev control as well
+as on the fix. The transformer object is registered once and long-lived, so
+reaching it needs an old-gen compaction inside a transform call, and that probe
+never produced one. The snapshot's staleness itself IS asserted
+(`a_snapshot_taken_before_a_relocation_keeps_the_old_address`): the canonical
+chain follows a relocation and the copy does not.
+
+So this half is the same reference discipline applied where the shape exists,
+at the cost of one pin per registered transformer -- not a crash anyone has
+seen. Recorded that way on purpose: the array hazard above was measured at
+~12% of processes, and running the two together under one "fixed" banner would
+overstate the second.
+
+The audit also closed the twin's remaining silence: `redefineClasses0`'s three
+`continue` arms dropped a class the agent asked to redefine without a word,
+which is precisely how the array bug stayed invisible for a day. They now name
+the class they skipped.
+
 ## Repro (for a future regression)
 
 The minimal reproducer is one mock and one call, in Spring Boot's own package

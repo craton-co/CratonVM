@@ -4466,19 +4466,39 @@ fn ls_ctrl_block_of(graph: &Graph, schedule: &Schedule, mut ctrl: NodeId) -> Opt
 }
 
 /// Make a phi interfere with the sources read on its incoming edges --
-/// **opt-in**, `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=1`.
+/// **DEFAULT ON** since 2026-09-06; `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=0` is
+/// the kill switch.
 ///
-/// Off by default because it is a register-pressure change, not a correctness
-/// one: the two downstream guards already make the aliasing harmless, and
-/// lengthening every phi's interval at every incoming edge changes allocation
-/// across the whole tier. On, it should drive
-/// `ir_lower`'s `phi_copy_publish_deferred` to zero -- the allocator stops
-/// minting the aliasing the deferral screen exists to catch -- and that
-/// counter is how to tell whether it is doing anything at all.
+/// It shipped opt-in for one day because it is a register-pressure change and
+/// the first numbers came from a synthetic probe. They were the wrong numbers:
+/// that probe is built to CONTAIN the aliasing, so extending intervals there
+/// genuinely adds interference (+2 spills, +3 reloads). On code that does not
+/// alias, extending a phi's interval by one position changes nothing, and the
+/// measurement that matters is the deterministic one.
+///
+/// `CratonBench`, all seven phases, allocator counters (load-proof, unlike
+/// wall clock on a shared host):
+///
+/// ```text
+///   arithmetic fib sieve matrix hashmap stringregex   IDENTICAL off vs on
+///   bintrees   splits 23->21  scan_reloads 10->7  reg_publishes 4->6
+/// ```
+///
+/// Six of seven byte-identical; the seventh allocates BETTER. The timing arm
+/// over the same phases spread 0.910-1.035 with `publish_deferred` at zero on
+/// every one of them -- i.e. the flag provably could not have done anything,
+/// so that spread is this host's noise floor and not a cost.
+///
+/// Engagement is real and not synthetic. `publish_deferred` with the flag off,
+/// on netty: `DefaultPromiseTest` 8, `ByteBufUtilTest` 2 -- both 0 with it on.
+/// That is the aliasing actually occurring in shipped code, which is also what
+/// says the two downstream guards (`emit_phi_copies`'s deferral screen and
+/// `gp_reg_owner`'s reader interlock) are load-bearing rather than theoretical.
+/// They stay: this removes the CAUSE, they catch anything that still mints one.
 fn phi_edge_interfere_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_EDGE_INTERFERE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
