@@ -231,6 +231,43 @@ fn for_each_flat_object_reference_capped(
             // What is left is this branch's own premise: `is_compact_object`
             // said the holder is NOT compact, so the walk strode 16-byte cells.
             // These are the fields that decided that.
+            //
+            // ANSWERED, first run it fired (2026-09-06, 700 s, 30 mixed pauses,
+            // rc=139). The second horn: the holder is not an object.
+            //
+            //   holder=0x1f506711e40 class_id=163587104 num_slots=501
+            //                        mark=0x310001f509c02470 gc_age=3
+            //   holder=0x1f50e091ad8 class_id=163587104 num_slots=501
+            //                        mark=0x200001f509c02470 gc_age=2
+            //   holder=0x1f50e646b20 class_id=163587104 num_slots=501
+            //                        mark=0x100001f509c02470 gc_age=1
+            //
+            // Three addresses, one shape, ages 1/2/3: ONE object that three
+            // successive evacuations copied. `class_id` 163587104 is 0x09C02470
+            // and `num_slots` 501 is 0x1F5, so the header's first eight bytes are
+            // the single word 0x000001F509C02470 -- a HEAP POINTER, in a run
+            // whose heap is at 0x1f5.......  The mark word beside it is
+            // well-formed (a plausible quartet, an age that increments per
+            // copy), so this is not a torn header: something wrote a pointer
+            // over the `class_id`/`shape` dword pair and left the mark alone.
+            //
+            // The cells the walk then read are the payload of a Java string --
+            // raw0=0x6f57206f6c6c6548 is "Hello Wo", raw1=0x3532363620646c72 is
+            // "rld 6625". The walk is reading string bytes as reference cells.
+            //
+            // The producer is named one line earlier in the same log:
+            //   [g1] IMPLAUSIBLE legacy header at ref-slot-candidate (#5):
+            //   obj=0x1f507f00300 class_id=163587104 num_slots=501
+            //   mark=0x000001f50e646b23 claims=0x1f60 bytes source=r127/Old/off=0x30
+            // -- mark 0x...b23 is 0x1f50e646b20 tagged 0x3, a FORWARDING
+            // pointer, and 0x1f50e646b20 is the third holder above. A fourth
+            // report has mark 0x000001f505b00383 against holder 0x1f505b00380:
+            // its own address, tagged 3 -- a SELF-forward, the
+            // evacuation-failure path.
+            //
+            // So the next question is not about layout at all: who leaves a
+            // forwarding pointer where a walk later reads a `class_id`, and why
+            // does `retire_forwards` not reach it? That is where a fix goes.
             if cratonvm_types::cell_census::decoded() != census_before {
                 census_before = cratonvm_types::cell_census::decoded();
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
