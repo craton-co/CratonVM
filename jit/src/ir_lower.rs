@@ -900,12 +900,55 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// `gp_reg_owner[r]` = the node whose value GP register `r` currently
+    /// holds, or `None` before anything published into it.
+    ///
+    /// `gp_reg_live` is indexed by NODE, so on its own it can only say "node
+    /// `id` was published at some point" -- never "and nobody has overwritten
+    /// its register since". The publish sites' shared comment argued that
+    /// nothing could ("the allocator gives a register to one value at a time
+    /// over its live range"), and that is true of two values whose live ranges
+    /// overlap. It is NOT true across an edge: a phi's live range BEGINS at the
+    /// edge, so the allocator may hand it the register of a value whose range
+    /// ENDS there -- and `emit_phi_copies` reads the source values and
+    /// publishes the phis into the SAME sequence of instructions.
+    ///
+    /// The resulting hazard is a wrong value, not a crash. `resolve_parallel_copy`
+    /// orders the edge's copies so every source SLOT is read before it is
+    /// written, and `emit_copy_op`'s comment extends that to registers on the
+    /// grounds that "a register and its home word go stale at the same point".
+    /// They do not, when the register belongs to one node and the word to
+    /// another: an earlier copy's `mov <phi's reg>, rax` publish clobbers a
+    /// register a later copy still reads its own source out of, and
+    /// `resident_gpr` -- consulting only the per-node bit -- hands that register
+    /// back as if it still held the old value.
+    ///
+    /// MEASURED (2026-09-05, `perf/ir-defaults-on-20260905` defaults): Mockito's
+    /// inline mock maker produced class bytes whose forward branch operands were
+    /// left as ASM's `ff ff` placeholder -- `Label.resolve` never patched them,
+    /// because `Label.addForwardReference`'s `forwardReferences[0]` count read
+    /// back wrong -- so CratonVM's verifier rejected the retransformation with
+    /// `branch at offset N targets N-1, which is not an instruction boundary`
+    /// and every `mock()` of a class failed with `MockitoException: Could not
+    /// modify all classes`. 4/4 runs of
+    /// `GrpcChannelBuilderCustomizersTests` under the defaults, 0/8 with either
+    /// `CRATONVM_JIT_IR_PHI_COPY_REGS=0` (removes the publish) or
+    /// `CRATONVM_JIT_LS_CARRY_RELIEF=0` (moves the allocation off the shape).
+    ///
+    /// Sized by the architectural register file, not by the node count: it is a
+    /// map from PHYSICAL register to owner.
+    gp_reg_owner: [Option<NodeId>; 16],
     /// Edge copies that read their source out of a register, and edge copies
     /// that published their phi's register from RAX. Both are ENGAGEMENT
     /// counts: a zero says the wiring never fired, which is a different
     /// finding from "it fired and did not pay".
     phi_copy_reg_reads: usize,
     phi_copy_reg_publishes: usize,
+    /// Publishes DEFERRED to the end of their edge because the phi's register
+    /// is also a source's register on that edge (see `emit_phi_copies`). A
+    /// non-zero here is the wrong-code hazard being taken off the table, not a
+    /// missed optimization: the value is still published, one word-load later.
+    phi_copy_publish_deferred: usize,
     /// The value `lower_data_node` is currently emitting, so `store_rax` can
     /// tell the one store that writes a value's OWN home word from the many
     /// that write an argument stage word, a shadow-stack word, or somebody
@@ -1464,9 +1507,11 @@ impl<'a> Lowerer<'a> {
             reg_of: Vec::new(),
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
+            gp_reg_owner: [None; 16],
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
+            phi_copy_publish_deferred: 0,
             cur_def: None,
             cur_def_published: false,
             reg_publishes_at_def: 0,
@@ -1513,6 +1558,7 @@ impl<'a> Lowerer<'a> {
         self.reg_live = vec![false; residency.reg_of.len()];
         self.reg_of = residency.reg_of;
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
+        self.gp_reg_owner = [None; 16];
         self.gp_reg_of = residency.gp_reg_of;
         // Exclusive ownership, computed once: how many values share each
         // register, and a value is nameable only if the answer for its own is
@@ -1827,8 +1873,31 @@ impl<'a> Lowerer<'a> {
         self.gp_reg_of.get(id as usize).copied().flatten()
     }
 
-    /// Mark `id` readable from its assigned GP register.
+    /// Mark `id` readable from its assigned GP register — and mark whoever held
+    /// that register before UNREADABLE.
+    ///
+    /// The second half is the whole of the interlock. Setting the per-node bit
+    /// says "id's value is in its register"; without dropping the previous
+    /// owner's bit, `resident_gpr` goes on answering that register for a node
+    /// whose value this very instruction has just overwritten. See
+    /// [`Self::gp_reg_owner`] for the edge that makes two nodes share one
+    /// register while both are still being read, and for what it produced.
+    ///
+    /// A node re-published into its own register is not a transfer and clears
+    /// nothing; that is the ordinary definition-site case and the common path.
     fn mark_gp_reg_live(&mut self, id: NodeId) {
+        if let Some(reg) = self.assigned_gpr(id) {
+            if let Some(slot) = self.gp_reg_owner.get_mut(reg as usize) {
+                let previous = slot.replace(id);
+                if let Some(previous) = previous {
+                    if previous != id {
+                        if let Some(cell) = self.gp_reg_live.get_mut(previous as usize) {
+                            *cell = false;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(cell) = self.gp_reg_live.get_mut(id as usize) {
             *cell = true;
         }
@@ -2563,9 +2632,60 @@ impl<'a> Lowerer<'a> {
         } else {
             (HashMap::new(), HashMap::new())
         };
+        // ── The register layer's OWN interference, which the resolver cannot see
+        //
+        // `resolve_parallel_copy` sequentialises over FRAME WORDS. The register
+        // fast path below then reads a source from its assigned GPR and
+        // publishes a destination into the phi's assigned GPR — and two
+        // DISTINCT frame words can be homed in the SAME register, because the
+        // allocator sees a phi's live range as beginning after the merge and a
+        // dying source's as ending at it, so they do not interfere by its
+        // reckoning. They do interfere across the copy sequence: an earlier
+        // copy's publish then overwrites a register a later copy still has to
+        // read, and the resolver's word-level order says nothing about it.
+        //
+        // Measured on
+        // `vm/tests/jit_ir_phi_copy_register_alias_fixtures/PhiCopyRegisterAliasProbe.java`
+        // (and, in the wild, `java.time.Duration.toNanos()` — 198,356 wrong
+        // answers in 200,000 calls): the else-arm of `if (seconds < 0)` emitted
+        //   `mov rbx,rax`   ; publish phi_seconds, whose GPR is RBX
+        //   `mov rax,rbx`   ; read phi_nanos's SOURCE, whose GPR is also RBX
+        // so `nanos` came back as `seconds` and `toNanos()` returned
+        // `seconds * 1e9 + seconds`. `CRATONVM_JIT_IR_PHI_COPY_REGS=0` and
+        // `CRATONVM_JIT_IR_PHI_RESIDENCY=0` each made it disappear, which is
+        // what named this layer as the owner.
+        //
+        // The fix is per-edge and conservative: a phi whose publish register is
+        // ALSO some source's register on this edge does not publish inline.
+        // Its home store is kept (so there is a word to read) and the trailing
+        // residency loop below publishes it from that word — after every source
+        // on the edge has been read. Everything else keeps the reg-to-reg
+        // publish it had. The cost is one load per deferred phi per edge; the
+        // alternative, ordering the two layers together, would have to model a
+        // copy that writes two locations at once.
+        let mut defer_publish: Vec<NodeId> = Vec::new();
+        if ir_phi_copy_regs_enabled() {
+            let src_regs: Vec<(NodeId, u8)> = gathered
+                .iter()
+                .filter_map(|c| self.assigned_gpr(c.src).map(|r| (c.src, r)))
+                .collect();
+            for c in &gathered {
+                if let Some(dst_reg) = self.assigned_gpr(c.phi) {
+                    if src_regs
+                        .iter()
+                        .any(|(src, r)| *r == dst_reg && *src != c.phi)
+                    {
+                        defer_publish.push(c.phi);
+                        self.phi_copy_publish_deferred += 1;
+                    }
+                }
+            }
+        }
         let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) = self.emit_copy_op(op, &src_node_of, &phi_of_dst, &mut published) {
+            if let Err(bailout) =
+                self.emit_copy_op(op, &src_node_of, &phi_of_dst, &defer_publish, &mut published)
+            {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -2597,6 +2717,19 @@ impl<'a> Lowerer<'a> {
                     self.publish_fp_from_slot(c.phi, c.dst, is_double);
                 }
             }
+        } else {
+            // The publish `emit_copy_op` skipped for an aliasing phi still has
+            // to happen, whatever the residency switch says: it was skipped
+            // because doing it inline would have been WRONG, not because it was
+            // unwanted. The loop above covers this when residency is on; this
+            // arm is the same duty when it is off (the inline publish is gated
+            // on `ir_phi_copy_regs_enabled` alone, so it runs in that
+            // configuration too, and so must its deferral).
+            for c in &gathered {
+                if defer_publish.contains(&c.phi) {
+                    self.publish_gp_from_slot(c.phi, c.dst);
+                }
+            }
         }
     }
 
@@ -2612,6 +2745,7 @@ impl<'a> Lowerer<'a> {
         op: CopyOp,
         src_node_of: &HashMap<i32, NodeId>,
         phi_of_dst: &HashMap<i32, NodeId>,
+        defer_publish: &[NodeId],
         published: &mut Vec<NodeId>,
     ) -> CompileResult<()> {
         let scratch = self.phi_copy_scratch_slot_off;
@@ -2682,9 +2816,13 @@ impl<'a> Lowerer<'a> {
         // value whose register a deopt frame can name, whose every reader takes
         // that register, needs no frame word at all — and this store was the
         // last frame traffic left in the loop after the two reloads went.
-        let drop_home = phi_of_dst
-            .get(&dst)
-            .is_some_and(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false));
+        // A deferred publish (see `emit_phi_copies`) reads this word back at the
+        // end of the edge, so the store it would otherwise have dropped is the
+        // only thing that carries the value — keep it.
+        let drop_home = phi_of_dst.get(&dst).is_some_and(|phi| {
+            !defer_publish.contains(phi)
+                && self.home_dropped.get(*phi as usize).copied().unwrap_or(false)
+        });
         if drop_home {
             self.home_stores_dropped += 1;
         } else {
@@ -2700,10 +2838,12 @@ impl<'a> Lowerer<'a> {
         if ir_phi_copy_regs_enabled() {
             if let Some(&phi) = phi_of_dst.get(&dst) {
                 if let Some(dst_reg) = self.assigned_gpr(phi) {
-                    self.emit_mov_reg_reg64(dst_reg, RAX);
-                    self.mark_gp_reg_live(phi);
-                    published.push(phi);
-                    self.phi_copy_reg_publishes += 1;
+                    if !defer_publish.contains(&phi) {
+                        self.emit_mov_reg_reg64(dst_reg, RAX);
+                        self.mark_gp_reg_live(phi);
+                        published.push(phi);
+                        self.phi_copy_reg_publishes += 1;
+                    }
                 }
             }
         }
@@ -14931,11 +15071,15 @@ pub(crate) fn lower_inner_with_scopes(
     // both arms had been running identical machine code.
     if ls_active
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
-        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+        && (lowerer.phi_copy_reg_reads > 0
+            || lowerer.phi_copy_reg_publishes > 0
+            || lowerer.phi_copy_publish_deferred > 0)
     {
         eprintln!(
-            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
-            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={} publish_deferred={}",
+            lowerer.phi_copy_reg_reads,
+            lowerer.phi_copy_reg_publishes,
+            lowerer.phi_copy_publish_deferred,
         );
     }
     if ls_active
@@ -19834,7 +19978,10 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
+                // No `defer_publish`: this fixture drives the memory path only
+                // (`src_node_of`/`phi_of_dst` are empty, so nothing publishes a
+                // register and nothing can alias one).
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &[], &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 
@@ -22372,6 +22519,70 @@ mod tests {
             peak_live: 0,
         });
         lo
+    }
+
+    /// Two values sharing one physical register: publishing the second must
+    /// EVICT the first, or `resident_gpr` keeps naming a register that no
+    /// longer holds it.
+    ///
+    /// The residency plan is allowed to hand one register to any number of
+    /// values whose ranges do not overlap, so this is not a hypothetical: it
+    /// is the ordinary output of the allocator. Before `gp_reg_owner` existed,
+    /// `gp_reg_live` was set at every publish and cleared nowhere, so the
+    /// assertion below read `Some(RBX)` for BOTH nodes -- and the phi-copy
+    /// edge read, which asks about a value far from its own definition, turned
+    /// that stale answer into wrong code (Byte Buddy's ASM writer, through
+    /// Spring Boot's `NestedUrlConnectionTests`).
+    ///
+    /// Asserted on `resident_gpr`, not on `gp_reg_live`, because the predicate
+    /// is what every reader actually calls.
+    #[test]
+    fn publishing_into_a_shared_register_evicts_its_previous_owner() {
+        const RBX: u8 = 3;
+        let mut lo = lowerer_with_resident_gpr(16384, RBX);
+        // A second node in the SAME register — what a non-overlapping pair
+        // looks like coming out of the allocator.
+        if lo.gp_reg_of.len() < 2 {
+            lo.gp_reg_of.resize(2, None);
+            lo.gp_reg_live.resize(2, false);
+        }
+        lo.gp_reg_of[1] = Some(RBX);
+
+        lo.mark_gp_reg_live(0);
+        assert_eq!(lo.resident_gpr(0), Some(RBX), "node 0 published into RBX");
+        assert_eq!(lo.resident_gpr(1), None, "node 1 has not published yet");
+
+        lo.mark_gp_reg_live(1);
+        assert_eq!(lo.resident_gpr(1), Some(RBX), "node 1 now occupies RBX");
+        assert_eq!(
+            lo.resident_gpr(0),
+            None,
+            "node 0 must NOT still claim RBX: node 1's publish overwrote it"
+        );
+
+        // Re-publishing the current occupant is idempotent, not self-eviction.
+        lo.mark_gp_reg_live(1);
+        assert_eq!(lo.resident_gpr(1), Some(RBX));
+    }
+
+    /// The eviction is per REGISTER, not global: a value in a different
+    /// register is untouched by someone else's publish. Without this the
+    /// "fix" could pass the test above by simply clearing everything.
+    #[test]
+    fn publishing_does_not_evict_a_value_in_a_different_register() {
+        const RBX: u8 = 3;
+        const R12: u8 = 12;
+        let mut lo = lowerer_with_resident_gpr(16384, RBX);
+        if lo.gp_reg_of.len() < 2 {
+            lo.gp_reg_of.resize(2, None);
+            lo.gp_reg_live.resize(2, false);
+        }
+        lo.gp_reg_of[1] = Some(R12);
+
+        lo.mark_gp_reg_live(0);
+        lo.mark_gp_reg_live(1);
+        assert_eq!(lo.resident_gpr(0), Some(RBX));
+        assert_eq!(lo.resident_gpr(1), Some(R12));
     }
 
     /// The end-to-end one: a value that exists ONLY in a register at the trap
