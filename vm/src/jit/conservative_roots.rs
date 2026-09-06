@@ -18,7 +18,7 @@
 //!
 //! ## What this module guarantees
 //!
-//! 1. **Per-thread active JIT entry chain.** [`push_jit_entry`] is called
+//! 1. **Per-thread active JIT entry chain.** [`push_jit_entry_at`] is called
 //!    immediately before transferring control to JIT-compiled code; it captures
 //!    the current native stack pointer (an upper bound on the spill region) and
 //!    pushes it onto a thread-local stack. [`pop_jit_entry`] restores the prior
@@ -1094,6 +1094,14 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
 /// chain. **Must be inlined** so the captured SP belongs to the caller's
 /// frame; calling this from a function that immediately returns would record
 /// a stale SP pointing into freed stack memory.
+///
+/// `#[cfg(test)]`: every production entry now captures its own SP and calls
+/// `push_jit_entry_at` directly, because the SP that matters is the one at
+/// the transfer site and not this wrapper's. Only the tests still want the
+/// convenience form, and `no_test_only_public_api` counts a `pub` item whose
+/// sole real caller is a test -- the ratchet was one over its 299 baseline on
+/// pristine dev because of this one.
+#[cfg(test)]
 #[inline(always)]
 pub fn push_jit_entry() -> usize {
     let sp = current_stack_pointer();
