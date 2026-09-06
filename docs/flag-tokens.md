@@ -592,7 +592,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-370 tokens.
+371 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -693,6 +693,7 @@ export inherited from a parent shell.
 | `precise-field-ops` | `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` |
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
+| `precise-indy` | `CRATONVM_JIT_NO_PRECISE_INDY` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
 | `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |
@@ -969,7 +970,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-155 tokens.
+157 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1019,6 +1020,7 @@ export inherited from a parent shell.
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
 | `g1-parallel-evac-screen` | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` |
+| `g1-evac-ref-implausible-refuse` | `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
 | `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |
 | `g1-adaptive-tenuring` | `CRATONVM_G1_ADAPTIVE_TENURING` |
@@ -1046,6 +1048,7 @@ export inherited from a parent shell.
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
 | `gpu-chunk-streams` | `CRATONVM_GPU_CHUNK_STREAMS` |
 | `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
+| `gpu-admit-model` | `CRATONVM_GPU_ADMIT_MODEL` |
 | `gpu-dispatch-streams` | `CRATONVM_GPU_DISPATCH_STREAMS` |
 | `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
 | `jit-gpu-array-barrier` | `CRATONVM_JIT_GPU_ARRAY_BARRIER` |

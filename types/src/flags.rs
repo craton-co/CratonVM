@@ -806,6 +806,27 @@ pub struct GcFlags {
     /// HALF A/B — the abort it exists to reproduce would not come back, and the
     /// arm would read as evidence that the screens were not the fix.
     pub g1_parallel_evac_screen: bool,
+    /// `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` — a reference-slot candidate
+    /// whose legacy header is IMPLAUSIBLE (a class id in the band no loader
+    /// mints, class 0 carrying thousands of fields, or — since 2026-09-06 —
+    /// `class_id`/`shape` recombining to a pointer into this arena) is REFUSED,
+    /// not merely counted. **OPT-IN** ([`parse::non_empty_non_zero`]).
+    ///
+    /// The ROOT supply route has refused on this screen since 2026-09-02
+    /// (`addr_is_followable_object`, whose doc records the eight-kilobyte
+    /// object that gating on the tag screen alone produced), and the
+    /// reference-slot route runs the same check and discards its answer — so
+    /// the parity argument for turning this on is strong.
+    ///
+    /// It is nonetheless OFF by default, and the reason is measurement rather
+    /// than doubt about the parity. On `TestHostConfigAutomaticDeployment-
+    /// XmlExternalWarXml` under G1 it refuses 14-16 candidates per run and the
+    /// run still SIGSEGVs, so it does not fix what it was reached for; and a
+    /// refusal that is WRONG drops a live reference, which produces the
+    /// premature-free corruption this whole investigation is about. Defaulting
+    /// ON would be trading an understood failure for an unmeasured one. Turn it
+    /// on to reproduce the measurement, not to harden a production run.
+    pub g1_evac_ref_implausible_refuse: bool,
     /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
     /// pauses taken while a thread is inside compiled code. Default **ON**
     /// ([`parse::on_unless_zero`]); `=0` restores the serial fallback.
@@ -1744,6 +1765,10 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_screen: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_SCREEN"),
+            g1_evac_ref_implausible_refuse: non_empty_non_zero(
+                src,
+                "CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE",
+            ),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),

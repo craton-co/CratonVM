@@ -1254,6 +1254,12 @@ pub const INVENTORY: &[E] = &[
     // this row is the whole fix.
     E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None, since: "2026-08-11" },
     E { group: Group::JIT, token: "precise-alloc-athrow", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW"), off_word: None, since: "2026-08-17" },
+    // `invokedynamic` (0xba). Bookkeeping, not a new lowering: the bridged arm
+    // already runs `emit_post_invoke_exception_check` and every other arm
+    // deopts unconditionally before the call. It was keeping
+    // `MVMap.flushAppendBuffer` -- 15.2% of CPU on a contended H2 workload --
+    // permanently interpreted.
+    E { group: Group::JIT, token: "precise-indy", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_INDY"), off_word: None, since: "2026-09-06" },
     // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
     // the flip still wants a wall-clock measurement -- see
     // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
@@ -1986,6 +1992,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-narrow-fixup", on_key: Some("CRATONVM_G1_NARROW_FIXUP"), off_key: None, off_word: Some("0"), since: "2026-08-18" },
     E { group: Group::GC, token: "g1-parallel-evac-in-jit", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_IN_JIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-parallel-evac-screen", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::GC, token: "g1-evac-ref-implausible-refuse", on_key: Some("CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-cleanup-walk", on_key: Some("CRATONVM_G1_CLEANUP_WALK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "g1-adaptive-ihop", on_key: Some("CRATONVM_G1_ADAPTIVE_IHOP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-adaptive-tenuring", on_key: Some("CRATONVM_G1_ADAPTIVE_TENURING"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
@@ -2024,6 +2031,12 @@ pub const INVENTORY: &[E] = &[
     // JIT-versus-residency-cache trade for a method that stores into a
     // primitive array — see `vm::runtime::offload_jit_gate::ArrayWriterPolicy`
     // for the measurement that made blocking the JIT the default.
+    // The fitted admission cost model of
+    // docs/gpu/offload-crossover-and-min-work-20260904.md, opt-in. `=1`
+    // replaces nothing -- it runs BESIDE `--gpu-min-work`, refusing work
+    // the scalar threshold admits at a loss. Off by default because the
+    // four fitted constants are one device's.
+    E { group: Group::GC, token: "gpu-admit-model", on_key: Some("CRATONVM_GPU_ADMIT_MODEL"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "gpu-dispatch-streams", on_key: Some("CRATONVM_GPU_DISPATCH_STREAMS"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-jit-array-writers", on_key: Some("CRATONVM_GPU_JIT_ARRAY_WRITERS"), off_key: None, off_word: None, since: "2026-09-02" },
     // The compiled-tier GPU input-residency barrier (2026-09-04). ON by
