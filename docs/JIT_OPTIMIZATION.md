@@ -3233,8 +3233,108 @@ codegen — which is the least favourable place to look for a codegen win. netty
 and hibernate are where the IR-inlining soak measured 8% and 15–26%, and those
 are the arms that would price item 1 on its own terms.
 
-And a per-collector regression sweep. Frequency-driven block layout moves every
-oop-map and safepoint position in every compiled method, which is exactly the
-change the RPO-layout work validated per collector for the same reason. The
-suite is 91/91 on the default collector with the new defaults AND 91/91 with
-every kill switch set; the other four collectors have not been run.
+The per-collector sweep is no longer owed -- it was taken, and the section
+below records both what it found and the G1 flake it turned out NOT to be.
+
+### The per-collector sweep, and the G1 failure that was not this branch's
+
+Owed because frequency-driven block layout moves every oop-map and safepoint
+position in every compiled method. Three collectors exist
+(`parse_gc_algorithm`): ZGC (default), G1, Generational.
+
+| collector | new defaults | every kill switch set |
+|---|---|---|
+| ZGC | 91/91, twice | 91/91 |
+| Generational | 91/91 | — |
+| G1 | 91, 91, **90** (`RMapGcStress`) | 91, 91, **90** (`RTreeRangeGc`) |
+
+**Both arms fail at 1 in 3 full-suite runs, with DIFFERENT vectors, both
+GC-stress.** That is a collector-level intermittency on G1, not something these
+changes introduced — and `RTreeRangeGc` is the vector `known-flaky.txt`'s own
+header records as quarantined at 3/12 (25%) on 2026-08-22, which is the same
+rate.
+
+Two things follow, and the second matters more than the first.
+
+`RMapGcStress` alone on G1 passes **4/4** with the new defaults; it fails only
+inside a full-suite run. So whatever perturbs it needs the suite's own memory
+and GC pressure, which is why running the vector alone — what `known-flaky.txt`
+asks for — cannot measure it.
+
+And **a single G1 suite run is not a gate.** At ~1/3, one green run says little
+and one red run says less. Any claim of the form "91/91 on G1" from one run is
+over-read, this file's earlier ones included.
+
+The hypothesis that was wrong is worth recording because it was well-motivated:
+`RMapGcStress` stresses HashMap and ConcurrentHashMap chains, which is exactly
+where JDK-internal `aastore` on an `Object[] table` lives, and this branch both
+added a new `jit_aastore` call site and moved every oop-map position. The
+all-off arm failing at the same rate refutes it.
+
+### The acceptance gate's evidence list was too narrow, and the measurement said so
+
+The gate shipped refusing 580 bodies on H2. The list omitted constant folding,
+algebraic simplification, GVN and dead-node elimination — real optimizer work —
+on this argument, written when the diagnostic landed:
+
+> the single-pass backend folds constants too, so a graph getting smaller says
+> the optimizer ran, not that its output beats C1's.
+
+It is a reasonable argument and it is wrong. `Transform::Simplified` was added
+to split the refusals by whether `ir_optimize`'s fixpoint loop actually removed
+nodes, and the split came back **296 simplified against 284 inert** — half the
+refusals had the optimizer genuinely work on them.
+
+So the gate was A/B'd against accepting everything. Twenty-one interleaved
+rounds, host load 7, order reversed on alternate rounds:
+
+| arm | wall mean | CPU mean |
+|---|---:|---:|
+| the gate (`evidence`) | 2.315 | 2.458 |
+| the gate again (control) | 2.306 | 2.463 |
+| **`CRATONVM_C2_ACCEPT=always`** | **2.237** | **2.378** |
+
+`always` won **15 of 21** rounds on wall AND on CPU, ~3.4%, against a control
+pair agreeing to 0.4% on the means. **The bodies the gate refused were better,
+and the gate was the thing costing throughput.**
+
+`Simplified` is evidence now. That keeps the half that is provably inert
+refused — 282 methods where the optimizer removed NOTHING — so the abandon path
+still saves their epoch bumps, and stops the gate discarding the half that did
+work:
+
+| census | narrow list | corrected |
+|---|---:|---:|
+| accepted | 238 | **568** |
+| refused (all `inert` now: `simplified=0`) | 580 | **282** |
+| supersedes abandoned | 113 | 42 |
+
+**And the regression that opened this whole section is gone.** Paired counts,
+same harness, same workload:
+
+| comparison | narrow list | corrected list |
+|---|---|---|
+| C2 supersede vs `CRATONVM_C2_SUPERSEDE=0` | c2-off won **16 of 21** on CPU | **coin** — 9/21 CPU, 10/21 wall |
+| the gate vs `CRATONVM_C2_ACCEPT=always` | the gate lost, 6 of 21 | **coin** — 9/21 and 9/21 |
+
+So the gate is now free: indistinguishable from accepting everything, while
+still refusing 282 methods whose optimizing body provably did nothing and
+saving their publishes and epoch bumps. Regression suite 91/91 on ZGC and 91/91
+on G1 with the corrected list, which publishes 568 optimizing bodies instead of
+238.
+
+### A harness defect worth copying, because it produced a fake control
+
+The arm order is reversed on alternate rounds so no arm is systematically first.
+With THREE arms that balances arms 1 and 3 and leaves arm 2 in the middle every
+single round — so the CONTROL pair, which is arms 1 and 2, carries a position
+bias its paired count cannot shed. It read 7 of 21 while its own means agreed to
+0.4%.
+
+Read the paired count off the 1-vs-3 comparison, which is balanced, and read the
+control for its MEANS. A control whose paired count is skewed by position looks
+exactly like a control that has found an effect.
+
+One run was discarded outright rather than reported: host load reached 76 and
+the control pair disagreed with ITSELF by 3.7%, larger than the effect being
+measured. This file has recorded that rule several times and it applied again.

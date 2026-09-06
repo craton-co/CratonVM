@@ -16,6 +16,10 @@ use super::ir::{CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, NO_NODE};
 
 /// Run all optimization passes on the graph.
 pub fn optimize(graph: &mut Graph) {
+    // Node count before any pass, so the fixpoint loop below can report whether
+    // it actually removed anything. Diagnostic only -- see
+    // `ir_evidence::Transform::Simplified`.
+    let nodes_before = graph.live_count();
     // Affine strength-reduction (reassociation). Collapses an unrolled affine
     // recurrence such as `x = x*c1 + c2` (×N) into a single `k*root + c` — the
     // optimization C2 performs via Mul/Add reassociation, which dominated the
@@ -74,6 +78,9 @@ pub fn optimize(graph: &mut Graph) {
         crate::ir_evidence::note(crate::ir_evidence::Transform::Licm);
         gvn(graph);
         eliminate_dead_nodes(graph);
+    }
+    if graph.live_count() < nodes_before {
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Simplified);
     }
 }
 

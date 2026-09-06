@@ -217,6 +217,14 @@ pub fn report_at_exit() {
             cratonvm_jit::ir_evidence::memo_skips(),
             cratonvm_jit::ir_evidence::supersedes_abandoned(),
         );
+        // The split the refusal count needs beside it: of the bodies refused
+        // for want of evidence, how many had `ir_optimize` actually remove
+        // nodes? A large `simplified` means the evidence list is too narrow;
+        // a large `inert` means the tier really did nothing on those methods.
+        let (ref_simpl, ref_inert) = cratonvm_jit::ir_evidence::refusal_split();
+        eprintln!(
+            "[c2-supersede] refusals by optimizer activity: simplified={ref_simpl} inert={ref_inert}"
+        );
         // Array guard elision. Elided AND emitted on both rows, always: an
         // elision count alone cannot tell a working pass from a workload that
         // compiles no array accesses in this tier.

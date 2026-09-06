@@ -71,6 +71,23 @@ pub enum Transform {
     Licm,
     /// A call-site intrinsic was lowered as arithmetic.
     ScalarIntrinsic,
+    /// `ir_optimize`'s fixpoint loop actually removed nodes — constant folding,
+    /// algebraic simplification, GVN or dead-store/dead-node elimination did
+    /// something.
+    ///
+    /// DIAGNOSTIC ONLY, and deliberately absent from [`is_worth_publishing`].
+    /// It exists to answer the question the refusal count raises rather than
+    /// settles: the gate refused 587 bodies on one H2 run, and the evidence
+    /// list omits exactly these passes, so "the gate is refusing bodies that
+    /// did real work" and "the gate is refusing bodies that did nothing" are
+    /// indistinguishable without it. `refused_but_simplified` in the census is
+    /// the split.
+    ///
+    /// It WAS diagnostic-only when it landed, on the argument that the
+    /// single-pass backend folds constants too. The measurement it produced
+    /// refuted that argument the same day and promoted it to evidence — see
+    /// [`is_worth_publishing`].
+    Simplified,
 }
 
 impl Transform {
@@ -87,10 +104,11 @@ impl Transform {
             Transform::Unrolled => "unrolled",
             Transform::Licm => "licm",
             Transform::ScalarIntrinsic => "scalar-intrinsic",
+            Transform::Simplified => "simplified",
         }
     }
 
-    pub const ALL: [Transform; 7] = [
+    pub const ALL: [Transform; 8] = [
         Transform::ScalarReplacement,
         Transform::Inlined,
         Transform::GuardElided,
@@ -98,6 +116,7 @@ impl Transform {
         Transform::Unrolled,
         Transform::Licm,
         Transform::ScalarIntrinsic,
+        Transform::Simplified,
     ];
 }
 
@@ -175,7 +194,26 @@ pub fn is_worth_publishing(bits: u32) -> bool {
         | Transform::Inlined.bit()
         | Transform::GuardElided.bit()
         | Transform::SunkLate.bit()
-        | Transform::ScalarIntrinsic.bit();
+        | Transform::ScalarIntrinsic.bit()
+        // Added 2026-09-06 BY MEASUREMENT, against the argument written here
+        // when `Simplified` landed as a diagnostic.
+        //
+        // That argument was: "the single-pass backend folds constants too, so a
+        // graph getting smaller says the optimizer ran, not that its output
+        // beats C1's." It is a reasonable argument and it is wrong. The split
+        // this bit was added to produce came back 296 simplified against 284
+        // inert on H2 -- half the refusals had `ir_optimize` genuinely remove
+        // nodes -- and an A/B of the gate against `CRATONVM_C2_ACCEPT=always`
+        // then measured the gate LOSING: 2.315 s against 2.237 s of wall clock,
+        // 3.4%, with `always` winning 15 of 21 position-balanced rounds on both
+        // wall and CPU, against a control pair agreeing to 0.4% on the means.
+        //
+        // So the bodies the narrow list refused were better, and the list was
+        // the thing costing throughput. Admitting `Simplified` keeps the half
+        // that is provably inert -- 284 methods where the optimizer removed
+        // NOTHING -- refused, so the abandon path still saves their epoch
+        // bumps, while stopping the gate throwing away the half that did work.
+        | Transform::Simplified.bit();
     bits & WORTH != 0
 }
 
@@ -264,12 +302,38 @@ pub fn accept(evidence: Option<u32>) -> bool {
                 ACCEPTED.fetch_add(1, Relaxed);
                 true
             }
-            Some(_) => {
+            Some(bits) => {
                 REFUSED_NO_EVIDENCE.fetch_add(1, Relaxed);
+                // Split the refusals by whether the optimizer did ANYTHING.
+                // See `Transform::Simplified` for why this is the number the
+                // refusal count needs beside it.
+                if bits & Transform::Simplified.bit() != 0 {
+                    REFUSED_BUT_SIMPLIFIED.fetch_add(1, Relaxed);
+                } else {
+                    REFUSED_AND_INERT.fetch_add(1, Relaxed);
+                }
                 false
             }
         },
     }
+}
+
+static REFUSED_BUT_SIMPLIFIED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REFUSED_AND_INERT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(refused_but_the_optimizer_simplified, refused_and_the_optimizer_did_nothing)`.
+///
+/// The two together are `refused_no_evidence`. A large left-hand number means
+/// the evidence list is too narrow and the gate is refusing bodies the
+/// optimizer genuinely worked on; a large right-hand number means the tier
+/// really is inert on those methods and the gate is right.
+pub fn refusal_split() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        REFUSED_BUT_SIMPLIFIED.load(Relaxed),
+        REFUSED_AND_INERT.load(Relaxed),
+    )
 }
 
 /// `(accepted, refused_no_evidence, refused_by_policy, unjudged)`.
