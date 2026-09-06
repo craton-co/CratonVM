@@ -2031,6 +2031,12 @@ pub const INVENTORY: &[E] = &[
     // JIT-versus-residency-cache trade for a method that stores into a
     // primitive array — see `vm::runtime::offload_jit_gate::ArrayWriterPolicy`
     // for the measurement that made blocking the JIT the default.
+    // The fitted admission cost model of
+    // docs/gpu/offload-crossover-and-min-work-20260904.md, opt-in. `=1`
+    // replaces nothing -- it runs BESIDE `--gpu-min-work`, refusing work
+    // the scalar threshold admits at a loss. Off by default because the
+    // four fitted constants are one device's.
+    E { group: Group::GC, token: "gpu-admit-model", on_key: Some("CRATONVM_GPU_ADMIT_MODEL"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "gpu-dispatch-streams", on_key: Some("CRATONVM_GPU_DISPATCH_STREAMS"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "gpu-jit-array-writers", on_key: Some("CRATONVM_GPU_JIT_ARRAY_WRITERS"), off_key: None, off_word: None, since: "2026-09-02" },
     // The compiled-tier GPU input-residency barrier (2026-09-04). ON by

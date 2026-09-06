@@ -203,6 +203,45 @@ That is the shape to implement, and the constants are box-specific:
 they want re-fitting on any device this ships to, which is an argument
 for measuring them at startup rather than baking them in.
 
+### Implemented 2026-09-06, opt-in
+
+`CRATONVM_GPU_ADMIT_MODEL=1` runs this predicate at the dispatch
+admission site (`try_dispatch`, beside the `--gpu-min-work` check, which
+still applies). The `ops` term comes from a new
+`KernelSignature::body_ops`, counted by the analyzer over the arithmetic
+band it already walks.
+
+**`ops` here is not the `ops` in the table above, and conflating them
+admits losses.** This page's axis is the fixture's parameter, and each of
+those "ops" is `v = v*a +/- b` — **two** arithmetic bytecodes (`javap` on
+`GpuIntensitySweep`: ops=1/4/16 -> 2/8/32, all four types). The runtime
+counts bytecodes, so the fitted `c = 0.9 ns/op` is **0.45 ns per
+arithmetic bytecode**. Implemented first at 0.9 per bytecode, it took 4
+of the 32 ops=1 cells the wrong way — every one an ADMITTED LOSS,
+including `int[]` at n=65536 (0.90x), which is how it was caught: the
+predicate was enabled on device and still offloaded that cell 50/50.
+Desk validation had missed it because the replay was computed in this
+page's units while the code used the other.
+
+Two-sided device check after the correction, `GpuIntensitySweep`, one
+binary, `offloaded=` from the compiled-caller census:
+
+| cell | measured | model off | model on |
+| --- | --- | ---: | ---: |
+| `int[]` n=65536 ops=1 | 0.90x LOSS | 50 | **0** |
+| `long[]` n=262144 ops=1 | 0.79x LOSS | 50 | **0** |
+| `byte[]` n=262144 ops=1 | 4.03x WIN | 50 | **50** |
+| `int[]` n=1048576 ops=1 | 1.90x WIN | 50 | **50** |
+
+`bench-gpu/marshal-stress.sh` now pins `CRATONVM_GPU_ADMIT_MODEL=0`. It
+asserts all six element types dispatch, and at its `n=131072` a CORRECT
+policy refuses `long[]`/`double[]` — 8-byte elements are below
+break-even there. Left unpinned it would become a test of admission
+policy rather than of the marshaller, and would go red the day this is
+defaulted on. Same reason `gate-overbroad.sh` pins the caller-gate mode.
+
+### Still opt-in, deliberately
+
 Nothing here changes a default. That is deliberate: the fix is a
 behaviour change on the GPU admission path, and it wants its own change
 with a kill switch and a regression run, not a number edited into a
