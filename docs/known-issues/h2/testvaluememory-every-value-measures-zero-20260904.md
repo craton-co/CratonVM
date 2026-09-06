@@ -149,31 +149,105 @@ further explicit `System.gc()` calls:
 | CratonVM default | 1435 | 8735 | **8735** | **+7300** |
 | CratonVM `-XX:+UseGenerationalGC` | 1382 | 16067 | **23341** | **+21959** |
 
-Two things this says that the H2 test could not:
+## Minimised 2026-09-06: these are TWO defects, and only one is a leak
 
-* **On the default collector `after` equals `peak` exactly** — 8735 both times.
-  Not "reclaimed less than HotSpot": on this workload the collection reclaimed
-  **nothing at all**, and the H2 test passes only because its 3x threshold is
-  wider than the miss.
-* **On the generational collector `after` is HIGHER than `peak`** — the reading
-  grows by 7 MB across the drop and three collections.
+The single-shot table above cannot tell a collector that reclaims nothing from a
+metric that never falls. Looping the workload separates them. Six shapes at
+`n=125000` (`full` = list+map, `list`, `map`, `array`, `churn` = allocate and
+never store, `bytes`), then the same shapes repeated round after round.
 
-This is the defect, and it is not H2's, not `Utils.getMemoryUsed`'s, and not
-specific to any value type. `TestValueMemory` is a witness that happens to
-assert on the ratio.
+**HotSpot returns to baseline in every shape** — `retained=-512` for all six.
+
+### The default collector does NOT leak. Its `usedKb` simply never falls.
+
+| loop | rounds | `usedKb` |
+|---|---|---|
+| pure churn, `-Xmx256m` | 40 | **1435, flat from round 0** |
+| build-a-list-and-drop-it, `-Xmx256m` | 16 | rises once to **7843, then flat** |
+
+A collector reclaiming nothing would climb ~3 MB per round and die inside a
+256 MB heap. It plateaus instead, so it IS reclaiming. **This corrects the
+sentence this section previously carried** — "on this workload the collection
+reclaimed nothing at all" was wrong, and it was wrong because a single
+before/peak/after triple cannot distinguish a plateau from a leak.
+
+What is true is narrower and still worth fixing: `(totalMemory - freeMemory)`
+does not come back down after a collection. It reports something closer to the
+heap's high-water mark than to the live set, which is why `after == peak`
+exactly, why the H2 test reads 2228 KB where HotSpot reads 488, and why it
+passes only at 2.3x of a 3x threshold. H2's `Utils.getMemoryUsed()` is a
+faithful caller of a JDK contract this VM answers loosely.
+
+### The generational collector DOES retain, and it is the whole allocation
+
+`ChurnLoop` allocates 125,000 immediately-dead `Object`s per round — nothing is
+stored, there is no collection, no map, no array — and calls `System.gc()`:
+
+| round | 0 | 5 | 7 |
+|---|---|---|---|
+| `usedKb` | 3431 | 13415 | 18279 |
+
+**~2.1 MB per round, monotonic.** 125,000 x 16 bytes is ~2 MB, so essentially
+100% of each round's garbage survives. It then degrades: 8 rounds finish
+instantly, 40 rounds exceed a 300 s cap, 200 rounds exceed 900 s — the cost of
+each collection growing with the set it fails to free. It was still thrashing
+rather than throwing when the cap hit, so whether it ends in `OutOfMemoryError`
+is untested.
+
+`churn` is the minimal reproducer and it is much smaller than this page's
+original: no H2, no value types, no collections, no dropped references. Just
+allocation and `System.gc()`.
+
+```java
+public class ChurnLoop {
+    static long usedKb() {
+        System.gc();
+        Runtime r = Runtime.getRuntime();
+        return (r.totalMemory() - r.freeMemory()) >> 10;
+    }
+    public static void main(String[] args) {
+        int rounds = Integer.parseInt(args[0]);
+        int n = Integer.parseInt(args[1]);
+        for (int k = 0; k < rounds; k++) {
+            for (int i = 0; i < n; i++) {
+                Object o = new Object();
+                if (o == null) { System.out.print(""); }   // defeat elision
+            }
+            if (k % 5 == 0 || k == rounds - 1) {
+                System.out.println("round=" + k + " usedKb=" + usedKb()
+                    + " totalKb=" + (Runtime.getRuntime().totalMemory() >> 10));
+            }
+        }
+        System.out.println("SURVIVED all " + rounds + " rounds");
+    }
+}
+```
+
+```bash
+cratonvm --java-home "$JDK25" -XX:+UseGenerationalGC -Xmx256m -cp . ChurnLoop 8 125000
+```
+
+Run it without `-XX:+UseGenerationalGC` for the control: `usedKb` is flat at
+1435 for 40 rounds. The `if (o == null)` is load-bearing — without a use, the
+allocation is a candidate for elimination and the probe measures nothing (which
+is how HotSpot's `list`/`map`/`array` rows come back at `peak` BELOW `before`:
+it elides workloads whose result is never read, so those three HotSpot cells are
+not a statement about HotSpot's collector).
 
 ## Next step
 
-Take `GenRetentionProbe` down to the smallest shape that still shows
-`after == peak`: drop the `IdentityHashMap`, then the `ArrayList`, then vary
-`n`, and find whether the unreclaimed bytes are the element objects, the backing
-arrays, or the map's table. `after > peak` on the generational arm is the
-sharper end and probably the one to pull first — a reading that grows after
-three collections is a different statement from one that fails to shrink.
+The generational arm first — it is the real leak, and its reproducer is now four
+lines. Two questions in order: does a young collection ever consider these
+objects at all (they die before any promotion, so they should never leave the
+nursery), and does `System.gc()` on this collector run a whole-heap mark or only
+the young path. `[GC]` logging is gated behind `--verbose:gc` (see
+`gc/src/zgc.rs`'s logging block) and is the first place to look.
 
-The default collector's 2228 KB against HotSpot's 488 KB in the H2 table is the
-same defect at smaller scale, and it passes today at 2.3x of a 3x threshold. It
-is one regression away from joining this page.
+The default collector's metric is a separate, smaller fix: make
+`freeMemory()` answer from the live set after a collection rather than from the
+allocation high-water mark. Nothing leaks today, so this is a reporting
+correctness item — but it is what puts the H2 test at 2.3x of its 3x threshold,
+one regression away from failing.
 
 ## The rest of the corpus, as of 2026-09-04
 

@@ -29,7 +29,9 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use cratonvm_native_api::fd_table::FdId;
-use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
+use cratonvm_native_api::{
+    NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -373,12 +375,28 @@ fn new_native_thread_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Metho
         return Ok(o);
     }
 
-    let threads = new_object_ref(ctx, "sun/nio/ch/NativeThreadSet")?;
-    let thread_slots = ctx.new_array(ArrayElementType::Long, 2);
-    ctx.set_field_by_name(threads, "elts", Value::Object(Some(thread_slots)));
-    ctx.set_field_by_name(threads, "used", Value::Int(0));
-    ctx.set_field_by_name(threads, "waitingToEmpty", Value::Int(0));
-    Ok(threads)
+    // GC: `threads` is a freshly allocated object that NOTHING in Java refers
+    // to yet, so this Rust local is its only reference — and `new_array` below
+    // allocates. Under the moving collector that leaves the local stale; under
+    // the Generational collector's NON-MOVING young sweep the object is simply
+    // unreachable and gets ZEROED, which is how a live
+    // `sun/nio/ch/NativeThreadSet` came back with an all-zero header.
+    let mut scope = NativeHandleScope::new(ctx);
+    let threads_h = {
+        let o = new_object_ref(&mut *scope, "sun/nio/ch/NativeThreadSet")?;
+        scope.root(o)
+    };
+    let slots_h = {
+        let o = scope.new_array(ArrayElementType::Long, 2);
+        scope.root(o)
+    };
+    let (threads, thread_slots) = (scope.get(&threads_h), scope.get(&slots_h));
+    scope.set_field_by_name(threads, "elts", Value::Object(Some(thread_slots)));
+    let threads = scope.get(&threads_h);
+    scope.set_field_by_name(threads, "used", Value::Int(0));
+    let threads = scope.get(&threads_h);
+    scope.set_field_by_name(threads, "waitingToEmpty", Value::Int(0));
+    Ok(scope.get(&threads_h))
 }
 
 /// `FileChannelImpl.open(FileDescriptor, String, boolean readable, boolean writable, ...)`.
@@ -437,14 +455,63 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let parent = args.last().copied().unwrap_or(Value::Object(None));
     let parent_is_null = matches!(parent, Value::Object(None));
 
-    let channel = new_object_ref(ctx, "sun/nio/ch/FileChannelImpl")?;
-    let close_lock = new_object_ref(ctx, "java/lang/Object")?;
-    let position_lock = new_object_ref(ctx, "java/lang/Object")?;
-    let dispatcher = new_object_ref(ctx, "sun/nio/ch/FileDispatcherImpl")?;
-    let threads = new_native_thread_set(ctx)?;
+    // GC DISCIPLINE FOR THE WHOLE CONSTRUCTION.
+    //
+    // Each of the five allocations below can collect, and until a field store
+    // publishes one of these objects into something Java can reach, the ONLY
+    // reference to it is a Rust local. That is stale-local territory under the
+    // moving collector — which is why the two `pin_native_root` pairs further
+    // down already exist — but it is worse under the Generational collector's
+    // NON-MOVING young sweep: an unreachable object is not moved, it is ZEROED
+    // in place. Measured 2026-09-06 with `CRATONVM_DBG_SWEEP_ZERO=1`: a live
+    // `sun/nio/ch/FileChannelImpl` and its `sun/nio/ch/NativeThreadSet`
+    // reclaimed mid-construction, after which `FileChannel.map` reads the fd
+    // back as 0 and the embedded Kafka broker cannot mmap its index.
+    //
+    // A handle scope is the tree's answer to this family (see
+    // `NativeContext`'s "rooted handle scope" block): the handle is an opaque
+    // slot rather than an `ObjectRef`, so the pre-GC local cannot be read back
+    // by mistake, and `handle_slots` is scanned by `roots.rs`. Re-read every
+    // handle immediately before each use — `set_field_by_name` resolves a field
+    // name and can itself allocate.
+    let mut scope = NativeHandleScope::new(ctx);
+    let fd_h = scope.root(fd_obj);
+    let channel_h = {
+        let o = new_object_ref(&mut *scope, "sun/nio/ch/FileChannelImpl")?;
+        scope.root(o)
+    };
+    let close_lock_h = {
+        let o = new_object_ref(&mut *scope, "java/lang/Object")?;
+        scope.root(o)
+    };
+    let position_lock_h = {
+        let o = new_object_ref(&mut *scope, "java/lang/Object")?;
+        scope.root(o)
+    };
+    let dispatcher_h = {
+        let o = new_object_ref(&mut *scope, "sun/nio/ch/FileDispatcherImpl")?;
+        scope.root(o)
+    };
+    let threads_h = {
+        let o = new_native_thread_set(&mut *scope)?;
+        scope.root(o)
+    };
+    // The two reference-typed ARGUMENTS are rooted by the caller's frame, so
+    // they cannot be reclaimed — but they can MOVE across the allocations
+    // above, and both are stored into the channel below.
+    let path_h = match path {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
+    let parent_h = match parent {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
 
-    ctx.set_field_by_name(channel, "closeLock", Value::Object(Some(close_lock)));
-    ctx.set_field_by_name(channel, "closed", Value::Int(0));
+    let (channel, close_lock) = (scope.get(&channel_h), scope.get(&close_lock_h));
+    scope.set_field_by_name(channel, "closeLock", Value::Object(Some(close_lock)));
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "closed", Value::Int(0));
     // `interruptor` is a FINAL field that the real
     // `AbstractInterruptibleChannel()` constructor always assigns -- it is never
     // null on a live channel. This bridge builds the channel without running
@@ -465,8 +532,13 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // GC: `new_object_initialized` allocates and runs bytecode, either of which
     // can relocate `channel`; pin it across the call and read the live address
     // back (native stale-local family).
-    let channel_ipin = ctx.pin_native_root(channel);
-    let interruptor = ctx
+    // The ad-hoc `pin_native_root`/`read_native_pin` pair that used to wrap
+    // this call is gone: the scope already roots `channel` for the whole
+    // construction, and one pinned call site beside four unpinned allocations
+    // is exactly the "pinning at each call site is weakest of all" shape the
+    // handle-scope block warns about.
+    let channel = scope.get(&channel_h);
+    let interruptor = scope
         .new_object_initialized(
             "java/nio/channels/spi/AbstractInterruptibleChannel$1",
             "(Ljava/nio/channels/spi/AbstractInterruptibleChannel;)V",
@@ -475,22 +547,41 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .ok()
         .flatten()
         .unwrap_or(Value::Object(None));
-    let channel = ctx.read_native_pin(channel_ipin, channel);
-    ctx.unpin_native_roots(channel_ipin);
-    ctx.set_field_by_name(channel, "interruptor", interruptor);
-    ctx.set_field_by_name(channel, "interrupted", Value::Object(None));
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "interruptor", interruptor);
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "interrupted", Value::Object(None));
 
-    ctx.set_field_by_name(channel, "threads", Value::Object(Some(threads)));
-    ctx.set_field_by_name(channel, "positionLock", Value::Object(Some(position_lock)));
-    ctx.set_field_by_name(channel, "fd", Value::Object(Some(fd_obj)));
-    ctx.set_field_by_name(channel, "readable", readable);
-    ctx.set_field_by_name(channel, "writable", writable);
-    ctx.set_field_by_name(channel, "parent", parent);
-    ctx.set_field_by_name(channel, "path", path);
-    ctx.set_field_by_name(channel, "direct", direct);
-    ctx.set_field_by_name(channel, "alignment", Value::Int(-1));
-    ctx.set_field_by_name(channel, "nd", Value::Object(Some(dispatcher)));
-    ctx.set_field_by_name(channel, "fileLockTable", Value::Object(None));
+    let (channel, threads) = (scope.get(&channel_h), scope.get(&threads_h));
+    scope.set_field_by_name(channel, "threads", Value::Object(Some(threads)));
+    let (channel, position_lock) = (scope.get(&channel_h), scope.get(&position_lock_h));
+    scope.set_field_by_name(channel, "positionLock", Value::Object(Some(position_lock)));
+    let (channel, fd_obj) = (scope.get(&channel_h), scope.get(&fd_h));
+    scope.set_field_by_name(channel, "fd", Value::Object(Some(fd_obj)));
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "readable", readable);
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "writable", writable);
+    let channel = scope.get(&channel_h);
+    let parent = match &parent_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => parent,
+    };
+    scope.set_field_by_name(channel, "parent", parent);
+    let channel = scope.get(&channel_h);
+    let path = match &path_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => path,
+    };
+    scope.set_field_by_name(channel, "path", path);
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "direct", direct);
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "alignment", Value::Int(-1));
+    let (channel, dispatcher) = (scope.get(&channel_h), scope.get(&dispatcher_h));
+    scope.set_field_by_name(channel, "nd", Value::Object(Some(dispatcher)));
+    let channel = scope.get(&channel_h);
+    scope.set_field_by_name(channel, "fileLockTable", Value::Object(None));
 
     // Real JDK's FileChannelImpl private constructor ALWAYS registers a
     // Cleaner action here when `parent` is null: `closer = parent == null
@@ -513,11 +604,12 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // is already relied on elsewhere for FileInputStream/FileOutputStream
     // cleanup (see the "P69-Cleaner-realfix" note in lib.rs), so the
     // underlying Cleaner machinery is known-working here.
-    let mut channel = channel;
     let mut closer = Value::Object(None);
     if parent_is_null {
-        let channel_pin = ctx.pin_native_root(channel);
-        let cleaner = ctx
+        // `cleaner` and `closer_runnable` are freshly returned references held
+        // only in Rust locals across each other's allocating calls — the same
+        // shape as the five above, one nesting level down.
+        let cleaner_h = scope
             .invoke(
                 "jdk/internal/ref/CleanerFactory",
                 "cleaner",
@@ -525,35 +617,54 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 &[],
             )
             .ok()
-            .flatten();
-        let closer_runnable = ctx
+            .flatten()
+            .and_then(|v| match v {
+                Value::Object(Some(o)) => Some(scope.root(o)),
+                _ => None,
+            });
+        let fd_obj = scope.get(&fd_h);
+        let runnable_h = scope
             .new_object_initialized(
                 "sun/nio/ch/FileChannelImpl$Closer",
                 "(Ljava/io/FileDescriptor;)V",
                 &[Value::Object(Some(fd_obj))],
             )
             .ok()
-            .flatten();
-        channel = ctx.read_native_pin(channel_pin, channel);
-        if let (Some(Value::Object(Some(cleaner_obj))), Some(runnable)) = (cleaner, closer_runnable)
-        {
-            closer = ctx
+            .flatten()
+            .and_then(|v| match v {
+                Value::Object(Some(o)) => Some(scope.root(o)),
+                _ => None,
+            });
+        if let (Some(ch), Some(rh)) = (cleaner_h, runnable_h) {
+            let (cleaner_obj, runnable, channel) =
+                (scope.get(&ch), scope.get(&rh), scope.get(&channel_h));
+            closer = scope
                 .invoke_virtual(
                     cleaner_obj,
                     "register",
                     "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
-                    &[Value::Object(Some(channel)), runnable],
+                    &[Value::Object(Some(channel)), Value::Object(Some(runnable))],
                 )
                 .ok()
                 .flatten()
                 .unwrap_or(Value::Object(None));
-            channel = ctx.read_native_pin(channel_pin, channel);
         }
-        ctx.unpin_native_roots(channel_pin);
     }
-    ctx.set_field_by_name(channel, "closer", closer);
+    // `closer` is the `Cleanable` `register` just returned — one more freshly
+    // allocated object held only in a Rust local, and `set_field_by_name`
+    // resolves a field name and can allocate. Root it for the one store.
+    let closer_h = match closer {
+        Value::Object(Some(o)) => Some(scope.root(o)),
+        _ => None,
+    };
+    let channel = scope.get(&channel_h);
+    let closer = match &closer_h {
+        Some(h) => Value::Object(Some(scope.get(h))),
+        None => closer,
+    };
+    scope.set_field_by_name(channel, "closer", closer);
 
-    Ok(Some(Value::Object(Some(channel))))
+    Ok(Some(Value::Object(Some(scope.get(&channel_h)))))
 }
 
 fn native_native_thread_set_add(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
