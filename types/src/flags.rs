@@ -1110,9 +1110,27 @@ pub struct GcFlags {
     /// instrument in the tree for finding a stale young reference: it turns one
     /// from a silent stale read into an immediate, attributable SIGSEGV.
     ///
+    /// # The crash is fixed; the default stays off anyway
+    ///
+    /// 2026-09-06: the stale compiled-frame reference this exposed was found
+    /// and fixed — a peer thread's coverage obligation was being discharged by
+    /// PINNING its conservative roots on a collector that cannot honour a pin.
+    /// The ten-second H2 reproduction is gone (0/5, against 5/5 with the old
+    /// accounting restored on the same binary).
+    ///
+    /// So the *first* of the two grounds for the revert is discharged. The
+    /// second is not, and it is the one that decides: concurrent paired arms
+    /// put this switch at 0.942 / 1.015 / 1.042 / 1.070 — free, and buying
+    /// nothing measurable — while it still WIDENS the window in which any
+    /// stale young reference becomes a SIGSEGV rather than a stale read. A
+    /// change with no measured benefit does not earn a default on that trade,
+    /// and the switch is worth more where it is: it is the sharpest instrument
+    /// in the tree for finding the next one of these, which is exactly what it
+    /// just did.
+    ///
     /// See the retired cross-collector page's finding 7 for the ON-by-default
-    /// reasoning this replaces, and the stale-compiled-frame-reference record
-    /// for the defect underneath.
+    /// reasoning this replaces, and the retired stale-compiled-frame-reference
+    /// record for the defect underneath and how it was closed.
     pub gen_uncommit: bool,
     /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
     /// source walks against a per-arena CARD TABLE, instead of walking every
