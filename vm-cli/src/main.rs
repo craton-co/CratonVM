@@ -7536,6 +7536,10 @@ fn main() {
             // unless a native handed back an abstract/interface receiver, so
             // having it on both exit paths is correct.
             cratonvm_native_api::instantiable::exit_summary();
+            // On BOTH arms: the A5 fallback census explains a run whose test
+            // FAILED at least as often as one that returned Ok, and
+            // `report_a5_engagement` below is on the Ok arm only.
+            cratonvm_vm::jit::conservative_roots::report_a5_fallback_census();
             match result {
                 Ok(()) => {
                     cratonvm_vm::jit::conservative_roots::report_a5_engagement();
