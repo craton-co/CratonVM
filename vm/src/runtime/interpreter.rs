@@ -3790,6 +3790,21 @@ pub fn execute(
                                 let aioobe_routed = if let Some((index, length)) =
                                     crate::jit::helpers::take_jit_pending_aioobe()
                                 {
+                                    // Taken BEFORE the construction below, for
+                                    // the same reason as the NPE arm above and
+                                    // with the same consequence when it is not:
+                                    // the bounds-check helper ran the epilogue,
+                                    // so `fillInStackTrace` walks a stack the
+                                    // compiled frames have already left and the
+                                    // throwable keeps an EMPTY trace.
+                                    //
+                                    // This is the door the reproduction in
+                                    // `stack_trace_compiled_aioobe.rs` actually
+                                    // takes, and it was the last of the four to
+                                    // be found — the same order the div-by-zero
+                                    // family was found in, for the same reason.
+                                    let snapshot =
+                                        crate::jit::helpers::take_jit_pending_trap_frames();
                                     let msg =
                                         format!("Index {index} out of bounds for length {length}");
                                     match crate::runtime::exceptions::create_exception_object(
@@ -3799,6 +3814,9 @@ pub fn execute(
                                         Some(&msg),
                                     ) {
                                         Ok(exc) => {
+                                            crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                                                shared, &thread.frames, exc, snapshot,
+                                            );
                                             jit_early_exception = Some(exc);
                                             true
                                         }

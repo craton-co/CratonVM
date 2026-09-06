@@ -305,7 +305,23 @@ pub(crate) fn stw_publish_frame_traces(shared: &SharedVm, initiator: crate::Thre
     let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
     // Nothing to do in the pause itself: the work is what the ARRIVING threads
     // did on their way in. Nothing moves, so there is no pointer map.
-    crate::jit::xt_root_scan::resume(taken);
+    //
+    // This pause still PUBLISHES skip spans -- `stw_take_over_and_wait` does so
+    // unconditionally, for every alive thread's reserved tail -- so it has to
+    // retire them like any other. It did not, and nothing here moves or sweeps,
+    // so the leak was invisible from this function: the set simply outlived the
+    // pause and waited for a collection that does not republish.
+    //
+    // `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE=1` restores that leak in one
+    // binary, which is the only way to show the repair is not vacuous: the
+    // symptom needs a stale span to be CONSUMED, and the consumer is a later
+    // collection on a path that does not republish, not anything this function
+    // does.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE").is_some() {
+        crate::jit::xt_root_scan::resume(taken);
+    } else {
+        retire_skip_spans_and_resume(shared, taken);
+    }
     shared
         .mem
         .gc_barrier
@@ -370,6 +386,43 @@ mod frame_trace_request_tests {
             );
         }
     }
+}
+
+/// End a takeover: retire the published TLAB skip spans, then resume the
+/// frozen peers they describe.
+///
+/// **These are one operation, and they were spelled as two adjacent lines at
+/// eight call sites.** `stw_take_over_and_wait` is the only publisher, and it
+/// publishes unconditionally; the spans describe reserved TLAB tails belonging
+/// to the very threads `taken` is about to release. The instant those threads
+/// resume they bump-allocate into those tails, so a span that outlives its
+/// `resume` no longer describes un-allocated memory -- it covers LIVE objects,
+/// and every sweep walk skips it while `mark_young`'s anchor oracle answers
+/// "free/gap space, not an object" for any root pointing into it. That is the
+/// `ObjectCleanerTest` use-after-free, and it is why the publish was made
+/// unconditional.
+///
+/// The unconditional publish makes a missed clear survivable on the paths that
+/// republish, which is exactly what let a NINTH exit hide: of the nine callers
+/// of `stw_take_over_and_wait`, eight cleared and `stw_publish_frame_traces`
+/// -- reachable from ordinary Java, via `Thread.getStackTrace` -- did not. It
+/// published every alive thread's reserved tail and left the set behind. Any
+/// later collection that does not republish then reads it, and `maybe_gc`'s
+/// single-threaded fast path (`alive_count <= 1`) is precisely such a path: it
+/// sweeps without ever calling `stw_take_over_and_wait`.
+///
+/// So the pairing is a function, not a convention. A tenth exit gets it right
+/// by construction, and `xt_root_scan::resume` should not be called directly
+/// from a GC path.
+///
+/// ORDER, and it is load-bearing: clear BEFORE resume, and both before
+/// `complete_gc` reopens the world. A mutator released early could otherwise
+/// win the next STW, re-freeze the still-suspended peers, publish fresh spans,
+/// and have this initiator's late clear wipe them -- handing the next sweep
+/// the frozen peers' reserved tails to walk and free-list.
+fn retire_skip_spans_and_resume(shared: &SharedVm, taken: crate::jit::xt_root_scan::TakenOver) {
+    shared.mem.heap.clear_jit_tlab_skip_regions();
+    crate::jit::xt_root_scan::resume(taken);
 }
 
 pub(super) fn stw_take_over_and_wait(
@@ -1508,8 +1561,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // tails. A resumed peer that immediately requests the next
                 // GC blocks until `complete_gc` anyway (the barrier is still
                 // closed here), so the reorder introduces no new window.
-                shared.mem.heap.clear_jit_tlab_skip_regions();
-                crate::jit::xt_root_scan::resume(taken);
+                retire_skip_spans_and_resume(shared, taken);
                 // Signal all threads with the pointer map
                 shared.mem.gc_barrier.complete_gc(result.pointer_map);
 
@@ -1788,8 +1840,7 @@ pub(super) fn maybe_gc_forced_at(
             crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
-            shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
-            crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
+            retire_skip_spans_and_resume(shared, taken);
             shared.mem.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
@@ -2090,8 +2141,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
-            shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
-            crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
+            retire_skip_spans_and_resume(shared, taken);
             shared.mem.gc_barrier.complete_gc(result.pointer_map);
         } else {
             safepoint_check(shared, thread);
@@ -6292,8 +6342,7 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         }
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6365,8 +6414,7 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         }
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6480,8 +6528,7 @@ pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThrea
 
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening the
         // world — same race rationale as `maybe_gc`'s epilogue.
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6575,8 +6622,7 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
         tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6694,8 +6740,7 @@ pub(super) fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread)
         );
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
