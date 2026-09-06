@@ -1,6 +1,7 @@
 # 19 netty classes fail on **Generational only** — the moving young cycle corrupts a live object
 
-**Status:** OPEN. Found by a per-collector sweep of the full netty suite.
+**Status:** OPEN, but **currently MASKED on dev — see §0.** Found by a
+per-collector sweep of the full netty suite.
 **This is a correctness defect, not a throughput one**, and it is invisible to
 every run that uses the shipped default collector.
 
@@ -20,6 +21,54 @@ frame home. §7 has the amplifier that reproduces it 3/3.
 | **Binary** | `cvm-netty3gc-20260906.exe`, dev `8d83c7585`. |
 
 ---
+
+## 0. It no longer reproduces on dev, and that is NOT a fix (2026-09-06, late)
+
+Re-checked on dev `da44c949a`, 80 commits after the binary this page was
+written against. Four of the 19 classes, 3 reps each, concurrent, plain
+`-XX:+UseGenerationalGC` — no amplifier, no verifier, the configuration a user
+would actually run:
+
+| class | NPE | timeouts | moving cycles |
+|---|---:|---:|---:|
+| `DuplicatedByteBufTest` | 0 | 0 | 1 |
+| `BigEndianHeapByteBufTest` | 0 | 0 | 1 |
+| `SimpleLeakAwareByteBufTest` | 0 | 0 | 0 |
+| `SlicedByteBufTest` | 0 | 0 | 0 |
+
+**12 runs, zero failures.** And the reason is in the last column: **the moving
+young cycle has stopped running on this workload.** This morning the same
+workload took 9-24 moving cycles per run across four separately-built binaries;
+it now takes 0-1, and the collector says why:
+
+```
+histogram: moving=0 non_moving=314 nonmoving-conservative-jit-roots=15
+                                   nonmoving-coverage-incomplete=299
+reason=unregistered-jit-frame-on-stack   (12 of 14 sampled)
+```
+
+Relocation is necessary for this defect (§3, §4). Relocation no longer happens,
+so the defect no longer fires. **Nothing here shows the corruption was fixed —
+it shows it is no longer exercised.**
+
+That has a specific and uncomfortable consequence. The refusal now dominating
+the histogram is the SAME mechanism the DoHead page documents as a
+Generational-only *throughput collapse* and dismisses as "not a correctness
+bug". On this workload that throughput bug is currently the only thing standing
+between the user and this correctness bug. **Whoever repairs moving-young
+engagement — the obvious and desirable performance fix — re-exposes this.** The
+green above is conditional on a collector declining to do its job.
+
+Not bisected: the shift is consistent across four binaries built today on one
+host, so it is attributed to dev movement rather than host state, but no arm
+rebuilt the old commit to confirm it. Two commits in this exact machinery landed
+in the window (`70c486744` peer pin credit, `65e7bffc2` peer pins G1-only).
+
+One loose end worth a look: the decision line reads
+`unproven_obligation=unregistered-jit-frame-on-stack` while the live flag in the
+same line reads `unregistered_jit_frame=false`. An obligation that outlives the
+condition that set it would over-refuse — which would explain the collapse in
+moving cycles without anything being genuinely safer.
 
 ## 1. The measurement that found it
 
