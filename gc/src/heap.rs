@@ -135,14 +135,22 @@ static SKIP_SPAN_ROOT_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// that is the reading a second copy would eventually drift into.
 ///
 /// `spans` are ABSOLUTE `[start, end)` address pairs; a caller holding offsets
-/// (the generational sweep does) converts before calling.
+/// (the generational sweep does) converts before calling. Passing OFFSETS
+/// here does not fail loudly -- it simply never matches, and a guard that
+/// cannot match reports a clean zero forever, which is worse than no guard.
+/// That is the whole reason the conversion is the caller's job and this
+/// signature takes one representation only.
+///
+/// Returns the number of roots found inside a span, so the invariant can be
+/// tested without reading a process-global counter. Callers ignore it; the
+/// reporting is the point at the call sites.
 pub(crate) fn skip_spans_hold_no_root(
     spans: &[(usize, usize)],
     roots: &[ObjectRef],
     backend: &'static str,
-) {
+) -> usize {
     if spans.is_empty() || roots.is_empty() {
-        return;
+        return 0;
     }
     let mut violations = 0usize;
     let mut first: Option<(usize, usize, usize)> = None;
@@ -158,7 +166,7 @@ pub(crate) fn skip_spans_hold_no_root(
         }
     }
     if violations == 0 {
-        return;
+        return 0;
     }
     SKIP_SPAN_ROOT_VIOLATIONS.fetch_add(violations as u64, Ordering::Relaxed);
     let n = SKIP_SPAN_ROOT_REPORTS.fetch_add(1, Ordering::Relaxed);
@@ -178,6 +186,7 @@ pub(crate) fn skip_spans_hold_no_root(
              neither marked nor swept while everything it references is freed.",
         );
     }
+    violations
 }
 
 #[inline]
@@ -3283,6 +3292,84 @@ mod tests {
     #[test]
     fn header_size_check() {
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
+    }
+
+    /// The skip-span root invariant, and specifically the two ways it can be
+    /// made VACUOUS rather than wrong.
+    ///
+    /// A guard that never matches reports a clean zero forever, and a zero
+    /// from a check nobody has exercised is indistinguishable from a healthy
+    /// collector -- which is exactly how the G1 sweep read as fine for a
+    /// session while it reclaimed live objects. So this pins the two things
+    /// that decide whether a match is even possible: the half-open bound, and
+    /// the address representation.
+    #[test]
+    fn a_root_inside_a_published_skip_span_is_a_violation() {
+        // Spans are ABSOLUTE [start, end). Fake addresses; nothing is read.
+        let spans = [(0x1000usize, 0x2000usize)];
+        let at = |a: usize| unsafe { ObjectRef::from_raw(a as *mut u8) };
+
+        // Inside.
+        assert_eq!(
+            skip_spans_hold_no_root(&spans, &[at(0x1800)], "test"),
+            1,
+            "a root inside a published span must disprove the span"
+        );
+
+        // `start` is INCLUSIVE, `end` is EXCLUSIVE. An off-by-one at the top
+        // bound is the difference between a guard and a decoration.
+        assert_eq!(skip_spans_hold_no_root(&spans, &[at(0x1000)], "test"), 1);
+        assert_eq!(
+            skip_spans_hold_no_root(&spans, &[at(0x2000)], "test"),
+            0,
+            "the end bound is exclusive -- the first byte past a tail is not in it"
+        );
+        assert_eq!(skip_spans_hold_no_root(&spans, &[at(0x0ff8)], "test"), 0);
+
+        // Empty either side is silence, not a match.
+        assert_eq!(skip_spans_hold_no_root(&[], &[at(0x1800)], "test"), 0);
+        assert_eq!(skip_spans_hold_no_root(&spans, &[], "test"), 0);
+    }
+
+    /// `gen_heap` holds skip spans as young-from `(offset, size)` and G1 holds
+    /// them as absolute `[start, end)`. Handing this function the former
+    /// UNCONVERTED does not fail loudly -- it silently never matches. This
+    /// test states that trap as a fact, so a future caller that skips the
+    /// conversion has something to fail against.
+    #[test]
+    fn offsets_passed_as_addresses_silently_never_match() {
+        let base = 0x1_0000usize;
+        let (offset, size) = (0x800usize, 0x400usize);
+        let root = unsafe { ObjectRef::from_raw((base + offset + 0x10) as *mut u8) };
+
+        // The WRONG shape: the raw (offset, size) pair, as `gen_heap` holds it.
+        assert_eq!(
+            skip_spans_hold_no_root(&[(offset, size)], &[root], "test"),
+            0,
+            "offsets cannot match an absolute root -- this is the vacuous case"
+        );
+
+        // The conversion `sweep_young_non_moving` actually performs.
+        assert_eq!(
+            skip_spans_hold_no_root(
+                &[(base + offset, base + offset + size)],
+                &[root],
+                "test"
+            ),
+            1,
+            "converted to absolute [start, end), the same span matches"
+        );
+    }
+
+    /// Every root in a span counts, not just the first: the count is what says
+    /// how much of the root set a stale span swallowed (46, on the netty
+    /// repro), and reporting only the first would have understated it.
+    #[test]
+    fn every_root_in_a_span_is_counted() {
+        let spans = [(0x1000usize, 0x2000usize), (0x5000usize, 0x5100usize)];
+        let at = |a: usize| unsafe { ObjectRef::from_raw(a as *mut u8) };
+        let roots = [at(0x1000), at(0x1ff8), at(0x3000), at(0x5080), at(0x5100)];
+        assert_eq!(skip_spans_hold_no_root(&spans, &roots, "test"), 3);
     }
 
     /// `HIB-DCAST-LATEPHASE.1`, mutator side — the fourth accessor family.
