@@ -24,7 +24,10 @@ statement*, not as a pointer into this tree.
    links die when this tree is dropped. Inline the durable fact instead, or
    name the retired write-up without a path.
    `types/tests/doc_citation_paths.rs::no_source_file_links_into_docs_internal`
-   enforces the source-side half of this.
+   used to enforce the source-side half of this; it was **switched off on
+   2026-09-06** (`#[ignore]`, by request — an in-source link into
+   `docs/internal/` is accepted at this stage), so rule 1 is now a convention
+   with nothing checking it. Re-arming it is deleting one attribute.
 2. **Cite within this tree by a path relative to this directory**, not by a
    `docs/internal/...` path.
 

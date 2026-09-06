@@ -488,7 +488,17 @@ fn report_lost_atomic_receiver(
         // the panic never carried either, because the panic was CAUGHT and
         // its backtrace discarded. Opt-in on the standard variable so an
         // ordinary run pays nothing.
-        if std::env::var_os("RUST_BACKTRACE").is_some() {
+        //
+        // Through `flags::runtime_var_os`, not `std::env` directly, and the
+        // behaviour is unchanged by that: the boundary returns the immutable
+        // snapshot only for a name in `declared_flag_names()`, and
+        // `RUST_BACKTRACE` is not one, so this is the same live read it always
+        // was. The rule it satisfies is `tools/flag-census/check-surface.sh`
+        // check 4 -- core runtime crates read every variable through one
+        // function, so that the census of what this VM reads is a census and
+        // not a sample. An ordinary OS variable is not an exception to that;
+        // it is the case the boundary's live-read arm exists for.
+        if cratonvm_types::flags::runtime_var_os("RUST_BACKTRACE").is_some() {
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
         }
         for entry in ctx.capture_stack_trace(0).iter().rev() {
