@@ -3021,12 +3021,14 @@ Seven changes, each with a kill switch and an engagement census.
 | 2a | IR null-check + bounds-check elimination | **ON** | `CRATONVM_JIT_IR_CHECK_ELIM=0` |
 | 2b | unroll over unreachable frame states | **ON** | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES=0` |
 | 3a | scalar intrinsics lowered as arithmetic | **ON** | `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` |
-| 3b | uncommon trap at an unlowerable site | **ON** | `CRATONVM_JIT_IR_SITE_TRAP=0` |
+| 3b | uncommon trap at an `invokedynamic` site | **ON** | `CRATONVM_JIT_IR_SITE_TRAP=0` |
+| 3b' | ...at an unresolved `checkcast`/`instanceof`/`new` | **OFF** — the coldness argument was refuted; see below | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` |
 | 3c | `aastore` through `jit_aastore` | **ON** | `CRATONVM_JIT_IR_AASTORE=0` |
 | 4a | frequency block layout + list scheduling | **ON** | `CRATONVM_JIT_IR_HOT_LAYOUT=0`, `CRATONVM_JIT_IR_LIST_SCHED=0` |
 | 4b | branch profile window around a C2 nomination | **ON** | `CRATONVM_TIER_PGO_C2_WINDOW=0` |
 | 5 | `ScalarIntrinsic` + `ArrayLoad` may drop their home | **ON** | (rides `CRATONVM_JIT_IR_DROP_HOME`) |
 | 6 | C1→C2 acceptance gate | `evidence` | `CRATONVM_C2_ACCEPT=always` |
+| 6b | a refused supersede abandons the publish | **ON** | rides the gate; `CRATONVM_C2_ACCEPT_MEMO=0` for the memo half |
 | 7 | deferred-`new` look budget | **16** | `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` |
 
 Four of them are worth reading for their reasoning rather than their effect.
@@ -3129,3 +3131,110 @@ And one thing is NOT claimed: that C2's code generation was wrong. It was not.
 The existing arc took `OsrTierBench.kernel` from 1.70x behind to parity, and
 every checksum on every arm of this pass matched HotSpot. The problem was the
 size of the optimizer, not the quality of its emitter.
+
+### The measurement, and the three things it corrected
+
+The section above listed what was owed. It was taken. Three of its claims did
+not survive, and the corrections are more useful than the original text.
+
+#### 1. The unresolved-class trap's coldness argument was wrong
+
+The argument was: "the named class has never been loaded, and a class that has
+never been loaded cannot have been touched by any path that has executed." The
+first clause is true and the conclusion does not follow, because the observation
+is made at COMPILE time. A class not loaded when the method compiles can load a
+moment later, the path then runs, the trap fires on a LIVE path, and the body
+returns the deopt sentinel — on every call, for the life of the process.
+
+`ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir` executes exactly that
+path and caught it on the first run. The fixture predates the trap by years.
+
+Worse, trapping BYPASSES the machinery built for this transience:
+`note_deferred_new_bail` / `take_deferred_new_retry` refuse the method and
+re-offer it once the class loads. With the builder no longer bailing, nothing
+armed that memo and nothing re-offered the method — trading a delayed optimizing
+body for a permanently deopting one. The H2 census shows the repair:
+`deferred-new retries: held=152 spent=2 retired=10 re_offered=1`, where the
+trapping build read `spent=0 re_offered=0`.
+
+So `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` is its own switch and ships **OFF**.
+`invokedynamic` keeps its trap and stays on: there is no "later" for a bootstrap
+this tier will never lower, and the single-pass backend has made that exact
+trade by default since it stopped bailing on indy. The reach claim drops from
+~200 methods to ~150 accordingly.
+
+What would make the other three safe is `DeoptAction::RecompileAndReinterpret`
+instead of `Reinterpret`, so the first trap triggers the recompile that resolves
+the class. `Op::Guard`'s lowering hard-codes the action; parameterising it is
+the work that switch is waiting on.
+
+#### 2. The acceptance gate refused, and then published anyway
+
+The gate discards the optimizing body, `try_compile_inner` falls through to the
+single-pass backend, and `try_jit_compile_callee_slow` puts THAT in the cache —
+replacing a C1 body with an equal one and bumping the process-wide supersede
+epoch, which stales every cached invoke target in every thread. The entire cost
+the gate exists to avoid, paid in full by a gate that refused.
+
+A refused verdict on a method that ALREADY HAS a published body now abandons the
+supersede. Both halves of that condition are load-bearing: a refusal alone is
+not enough, because at the eager first-call door there is no predecessor and
+skipping the publish there would leave the method INTERPRETED.
+
+| H2 census | before | after |
+|---|---:|---:|
+| supersede publishes (`changed`) | 179 | **69** |
+| IC evictions from the epoch bump | 1,558 | **696** |
+| fell through to single-pass | 128 (275 ms) | **19 (42 ms)** |
+| supersedes abandoned | — | **113** |
+
+#### 3. "C2 supersede costs 6% of CPU" is true and was reported as more than it is
+
+**Process CPU counts background compile threads.** The tier's cost is largely
+the compile itself — `lowered=50 (33 ms) fell_through=19 (42 ms)` against a
+~1.9 s run — and that work overlaps with the mutator. Measuring only CPU
+attributes a parallel cost as though it were serial.
+
+Three interleaved runs of `probes/DodJdbcWorkload.java`, order reversed on
+alternate rounds, the default configuration run TWICE as its own floor, paired
+counts (a fair coin under no effect):
+
+| run | host load | CPU: default beats c2-off | WALL: default beats c2-off | control (CPU / wall) |
+|---|---|---|---|---|
+| A | 10 | **5 / 21** | not measured | 9/21 / — |
+| B | mid | **7 / 21** | 11 / 21 | 9/21 / 10/21 |
+| C | 38 | 10 / 25 | 11 / 25 | 12/25 / 11/25 |
+
+The control pair is a coin in every run, in both instruments, which is what
+makes the rest readable.
+
+**On wall clock there is no difference.** 11/21 and 11/25 against controls of
+10/21 and 11/25. **On process CPU, `CRATONVM_C2_SUPERSEDE=0` is a few per cent
+cheaper on a quiet host** (5/21 and 7/21) and washes out on a busy one — the
+signature of background work, not of a slower body.
+
+So the recommendation is NOT to flip the supersede default: the only instrument
+where turning the tier off wins is the one that charges parallel compile work to
+the serial total. And the honest verdict on the seven items is that they are
+**correctness and reach work whose throughput effect on this workload is below
+the measurement floor in both directions** — not a win, and not the regression
+the CPU-only reading suggested.
+
+The pre-change finding that motivated the work stands unaltered: before these
+changes C2 bodies were 6% larger in aggregate than the C1 bodies they replaced
+(81 bigger, 66 smaller, 14 equal over 161 supersedes), and `c2-off` was the
+fastest arm. It is no longer the fastest arm on wall clock.
+
+#### What is still owed
+
+A second real application. Every number here is H2, and H2 is a workload whose
+own profile is dominated by allocation and young-GC throughput rather than JIT
+codegen — which is the least favourable place to look for a codegen win. netty
+and hibernate are where the IR-inlining soak measured 8% and 15–26%, and those
+are the arms that would price item 1 on its own terms.
+
+And a per-collector regression sweep. Frequency-driven block layout moves every
+oop-map and safepoint position in every compiled method, which is exactly the
+change the RPO-layout work validated per collector for the same reason. The
+suite is 91/91 on the default collector with the new defaults AND 91/91 with
+every kill switch set; the other four collectors have not been run.
