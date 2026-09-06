@@ -10490,7 +10490,7 @@ impl G1Collector {
                 .unwrap_or_else(|| "r?".to_string());
             tracing::warn!(
                 "[g1] CORRUPT-CELL HOLDER GRID VERDICT: holder={addr:#x} class_id={cid} \
-                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} source={where_from}",
+                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} source={where_from} {provenance}",
                 (mark >> 56) & 0xF,
             );
         }
