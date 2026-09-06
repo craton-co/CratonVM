@@ -64,11 +64,44 @@ host, so it is attributed to dev movement rather than host state, but no arm
 rebuilt the old commit to confirm it. Two commits in this exact machinery landed
 in the window (`70c486744` peer pin credit, `65e7bffc2` peer pins G1-only).
 
-One loose end worth a look: the decision line reads
-`unproven_obligation=unregistered-jit-frame-on-stack` while the live flag in the
-same line reads `unregistered_jit_frame=false`. An obligation that outlives the
-condition that set it would over-refuse — which would explain the collapse in
-moving cycles without anything being genuinely safer.
+### The obligation/flag mismatch, resolved — and what it exposes
+
+The decision line reads `unproven_obligation=unregistered-jit-frame-on-stack`
+while the live flag in the SAME line reads `unregistered_jit_frame=false`. It
+was filed here as a possible stale obligation. **It is not.** Both are set
+together at one site (`conservative_roots.rs`, the unregistered-frame branch),
+and both are reset once per collection. The reason they disagree is that they
+have **different scopes**:
+
+```rust
+#[cfg(not(test))] static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool   // PROCESS-GLOBAL
+#[cfg(not(test))] static MOVING_YOUNG_INCOMPLETE_REASON:   AtomicUsize  // PROCESS-GLOBAL
+                  thread_local! { UNREGISTERED_JIT_FRAME: Cell<bool> }  // PER-THREAD
+```
+
+The verdict and its reason are process-global first-wins atomics; the flag is
+the collecting thread's own. So the line is reporting a reason **some other
+thread** recorded next to a flag that only ever describes this one. Nothing is
+stale; two differently-scoped facts are printed as though they were one.
+
+**The substantive consequence.** `refresh_moving_young_coverage_for_current_thread`
+runs on every mutator at its root-snapshot deposit, and a mutator whose own
+frames are unproven sets the GLOBAL verdict. **One thread failing its own proof
+therefore refuses relocation process-wide for that cycle** — on a workload with
+many event-loop threads, that needs only one. This is the same blanket
+"any peer in JIT means unproven" behaviour the cross-thread handshake was built
+to replace (§7), re-entering through a different door: not the peer ledger, but
+the global verdict every thread can set. It is a plausible mechanism for the
+moving-cycle collapse in the table above, and it is fail-closed, so it costs
+throughput rather than correctness.
+
+**And a coverage gap worth fixing on its own.** Under `#[cfg(test)]` those same
+two statics become `thread_local!` cells. The stated reason is sound — stop one
+test's deliberate "incomplete" from diverting another's collection — but the
+effect is that **every unit test of this decision path exercises per-thread
+semantics that production does not have.** No test in this machinery can
+observe one thread refusing another's cycle, which is precisely the behaviour
+that matters in a multi-threaded collector.
 
 ## 1. The measurement that found it
 
