@@ -1,13 +1,14 @@
-# Two NPEs in Spring Boot's own jar/nested URL-protocol handlers — two unrelated defects, both fixed
+# Two NPEs in Spring Boot's own jar/nested URL-protocol handlers — two unrelated defects, one fixed, one split out
 
-Status: **FIXED (2026-09-05)**. `JarUrlConnectionTests` 47/47 and
-`NestedUrlConnectionTests` 11/11 on CratonVM with the JIT on and off; both
-pass on HotSpot on the same harness.
+Status: **FIXED for row 1 and for the blocker that had replaced row 2.**
+`JarUrlConnectionTests` is 47/47 and `NestedUrlConnectionTests` 11/11 on
+CratonVM with the JIT on and off, and both pass on HotSpot on the same
+harness. Row 2 leaves a residual that is **not** fixed and now has its own
+page — see the end.
 
 The page this replaces grouped the two rows on shape alone and said so:
-*"could equally be two independent gaps."* They are. The two root causes have
-nothing in common except that Mockito is what arms both — and the second one
-is not in `spring-boot-loader` at all.
+*"could equally be two independent gaps."* They are, and neither guess about
+the shared cause was right.
 
 ## Row 1 — `JarUrlConnectionTests`: a `spy()` earlier in the class dropped `JarFile`'s native shadow
 
@@ -19,18 +20,18 @@ java.lang.NullPointerException: Cannot read field "zsrc" because "<local3>.res" 
 ```
 
 The page's own next step — *"reproduce each in isolation … to rule out
-suite-ordering effects"* — was the whole answer. `getContentTypeWhen
-NotKnownInStreamButKnownNameReturnsDeducedType` **passes alone** and fails in
-the class. Two tests are enough:
+suite-ordering effects"* — was the whole answer.
+`getContentTypeWhenNotKnownInStreamButKnownNameReturnsDeducedType` **passes
+alone** and fails in the class. Two tests are enough:
 
 ```
-getInputStreamWhenNoCachedClosesJarFileOnClose      PASS
-getContentTypeWhenNotKnownInStreamButKnownNameReturnsDeducedType   FAIL (the NPE)
+getInputStreamWhenNoCachedClosesJarFileOnClose                    PASS
+getContentTypeWhenNotKnownInStreamButKnownNameReturnsDeducedType  FAIL (the NPE)
 ```
 
 and the first is the only test in the class that calls `spy(jarFile)`. Three
 other predecessors that call `mock(URLConnection.class)` or
-`mock(JarUrlConnection.class)` do NOT arm it: it has to be a mock of the
+`mock(JarUrlConnection.class)` do NOT arm it: the mock has to be of the
 `JarFile` itself.
 
 **Mechanism.** Mockito's inline mock maker instruments its target's whole
@@ -46,8 +47,8 @@ NPE, for every jar in the process, from that point on.
 **Fix.** `redefine_immune_zip_file_native` in
 `vm/src/runtime/interpreter/native_override.rs`, added to BOTH aggregators
 (`redefine_immune_layout_native` for the invoke-cache paths and
-`redefine_immune_forced_native` for the slow path — an arm added to one only
-is the failure the collections entry already made once).
+`redefine_immune_forced_native` for the slow path — an arm added to one only is
+the failure the collections entry already made once).
 
 This is the third member of a family the file already documents: the
 synthetic-collection arm (a `mock()` anywhere emptied every `HashMap`) and the
@@ -58,12 +59,11 @@ redefinition.** The immunity is method-wise and keyed to the SAME method sets
 the two force-native gates already use, so a `JarFile` method CratonVM does not
 claim stays evictable and an agent can still weave it.
 
-## Row 2 — `NestedUrlConnectionTests`: a JIT register-residency bug, in a method with no jars in it
+## Row 2's blocker — a JIT register-residency bug, in a method with no jars in it
 
-The NPE the original page recorded (`"this.resources" is null` at
-`NestedUrlConnection.connect`) **no longer reproduces**; dev moved between
-2026-09-04 and this session. What that test does today is fail inside
-`mock(NestedUrlConnection.class)`:
+By the time this was investigated, `NestedUrlConnectionTests` was not failing
+with the NPE the original page recorded. It was failing inside
+`mock(NestedUrlConnection.class)`, 100% of the time with the JIT on:
 
 ```
 org.mockito.exceptions.base.MockitoException: Mockito cannot mock this class …
@@ -73,10 +73,10 @@ org.mockito.exceptions.base.MockitoException: Mockito cannot mock this class …
 	at net.bytebuddy.jar.asm.ClassReader.readCode(ClassReader.java:2056)
 ```
 
-JIT-on only, and bisected to one switch: `CRATONVM_JIT_IR_PHI_COPY_REGS`, one
-of the thirteen optimizing-tier defaults flipped ON earlier the same day
-(`a740427a`). `CRATONVM_JIT_DENY` narrowed it to two compiled bodies —
-denying `net/bytebuddy/jar/asm/ClassReader.readCode` AND
+Bisected to one switch, `CRATONVM_JIT_IR_PHI_COPY_REGS`, one of the thirteen
+optimizing-tier defaults flipped ON earlier the same day (`a740427a`), and
+then with `CRATONVM_JIT_DENY` to two compiled bodies: denying
+`net/bytebuddy/jar/asm/ClassReader.readCode` AND
 `net/bytebuddy/jar/asm/Label.resolve` together is the minimal set that makes
 the class pass; either alone still fails.
 
@@ -92,35 +92,49 @@ Nothing read a value far enough from its own definition for that to matter
 until the phi-copy edge read arrived: `emit_copy_op`'s
 `ir_phi_copy_regs_enabled()` branch asks `resident_gpr(source)` at the END of a
 predecessor block, which is exactly where a register can have changed hands
-since the source was published. That is why one switch appeared to be the bug
-and was really only the first reader of a latent one.
+since the source was published. One switch appeared to be the bug and was
+really only the first reader of a latent one.
 
 **Fix.** `gp_reg_owner: [Option<NodeId>; 16]` in `jit/src/ir_lower.rs`:
 `mark_gp_reg_live` evicts the previous occupant of the register it is about to
 write. Every GP register write goes through that one function, so the
 invariant `resident_gpr` actually needs — *this node is the CURRENT occupant of
 its register* — now holds. The optimizing-tier defaults stay ON; nothing was
-reverted.
+reverted. Two lowering tests cover it, and both fail without the eviction.
 
 **Blast radius, stated plainly.** This was a wrong-code regression on dev, and
-`NestedUrlConnectionTests` is where it happened to be caught. `JarUrl
-ConnectionTests` was hit by it too (16 Mockito failures on top of its own NPE),
-and anything that mocks inline through Byte Buddy was exposed.
+`NestedUrlConnectionTests` is where it happened to be caught.
+`JarUrlConnectionTests` was hit by it too (16 Mockito failures on top of its
+own NPE), and anything that mocks inline through Byte Buddy was exposed.
 
 ## Evidence
 
-Binary: release build of dev `a740427a` plus both fixes, `cratonvm-psl4`,
+Binary: release build of dev `d2cfbd543` plus these fixes, `cratonvm-psl4`,
 Azure host 2. Suite runner: `apps/spring-boot-suite-runner`.
 
 | class | before, JIT on | after, JIT on | after, `--nojit` | HotSpot |
 |---|---|---|---|---|
 | `JarUrlConnectionTests` | FAIL (16 + the NPE) | **PASS 47/47** | PASS | PASS |
-| `NestedUrlConnectionTests` | FAIL | **PASS 11/11** | PASS | PASS |
+| `NestedUrlConnectionTests` | FAIL (every `mock()`) | **PASS 11/11** | PASS | PASS |
 
 The HotSpot arm is the cross-check the original page listed as missing: both
 pass on the reference VM, so both rows were genuine CratonVM defects.
 
-## Repro (for a future regression)
+## What did NOT retire with this page
+
+With the two fixes above in place, the ORIGINAL 2026-09-04 symptom of row 2 —
+`"this.resources" is null` out of `NestedUrlConnection.connect` — comes back
+about **1 run in 40 with the JIT on, and only when the host is under load**.
+It is a live, unfixed defect and it has its own page:
+`nestedurlconnection-mock-self-call-intermittent-npe-20260906`, with the
+rate, the load-matched concurrent arms, the five things ruled out, and the
+`SelfCallInfo`-grant-leak hypothesis this VM already has a precedent for.
+
+Recording it separately rather than holding this page open is deliberate: rows
+1 and 2 were never one defect, and row 2's remaining ~2.4% is a different
+question again from the 100% blocker that was sitting on top of it.
+
+## Repro (for a future regression of what IS fixed here)
 
 ```bash
 cd apps/spring-boot-suite-runner
@@ -131,5 +145,5 @@ CV_BIN=<binary> pwsh -File ./run-spring-boot-suite.ps1 -Category all \
 ```
 
 Row 1 needs the whole class (or the two-test pair above) — the failing test
-passes alone. Row 2 needs `-Jit on`; `CRATONVM_JIT_IR_PHI_COPY_REGS=0` is the
-switch that used to hide it.
+passes alone. The Byte Buddy blocker needs `-Jit on`;
+`CRATONVM_JIT_IR_PHI_COPY_REGS=0` is the switch that used to hide it.
