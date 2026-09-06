@@ -107,6 +107,32 @@ fn straystack_enabled() -> bool {
     *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STRAYSTACK").is_some())
 }
 
+/// Cached `CRATONVM_DBG_REFPROC_AUDIT` gate (DoHead-family Generational NPEs,
+/// 2026-09-06). `CRATONVM_DBG_NO_REFPROC=1` cut that family 136 -> 49 NPE
+/// lines over two matched-parallelism rounds — the first arm besides
+/// `NO_MOVING_YOUNG` to move it — but it disables the WHOLE subsystem, so it
+/// names a suspect rather than a write.
+///
+/// The guard census that came next (`CRATONVM_DBG_STRAYSTACK`, 4 classes)
+/// showed why a subsystem-level ablation was as far as that method could get:
+/// in ~90 collections the ONLY guard in `process_references_after_gc` that
+/// ever fired was `SKIP dead ENQUEUE` (1130x). Every shape, identity and
+/// restore refusal read zero — and, decisively, THIS function's three
+/// refusals (`is_subclass_of`, identity stamp, `num_fields >= 2`) print
+/// nothing and count nothing, so that zero never covered them at all. This
+/// function performs ~342 `Object(None)` writes per collection into live
+/// objects' slot 0 and depends entirely on the post-GC restore pass to put
+/// them back; both halves are audited here, because a null that is written
+/// and never restored is indistinguishable at the crash site from a null
+/// written to the wrong object, and this family's symptom is exactly a
+/// reference field read back null.
+#[inline]
+pub(crate) fn refaudit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFPROC_AUDIT").is_some())
+}
+
 /// Cached `CRATONVM_DBG_ARRSTORE` gate (bc math-ec 0x4 smear hunt): validate
 /// primitive-array-store receivers at the write.
 #[inline]
@@ -369,6 +395,15 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     // and an address is not an identity once a compacting collector has
     // re-issued it. See `ReferenceProcessor::referent_class_stamps`.
     let mut referent_classes: Vec<(usize, u32)> = Vec::new();
+    // REFPROC AUDIT (see `refaudit_enabled`): this loop's three refusals are
+    // otherwise silent, so a straystack census reads zero for them whether they
+    // fire ten thousand times or never. `nulled_by_class` is the direct answer
+    // to the question a subsystem ablation cannot ask — WHAT is this write
+    // landing on. Anything in it that is not a `java.lang.ref.*` is the
+    // producer, named.
+    let audit = refaudit_enabled();
+    let (mut n_nulled, mut d_shape, mut d_stamp, mut d_fields) = (0u64, 0u64, 0u64, 0u64);
+    let mut nulled_by_class: std::collections::BTreeMap<String, u64> = Default::default();
     for (ref_obj_addr, _referent, stamp) in pairs.into_iter().chain(soft_pairs) {
         // The Reference object is live (or dead-but-not-yet-collected) at this
         // point, so its memory is valid; writing its referent slot is safe.
@@ -397,6 +432,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         // object can exist yet, so the guard has nothing to judge.
         if let Some(cid) = reference_cid {
             if !class_manager.is_subclass_of(shared.mem.heap.class_id_of(ref_obj), cid) {
+                d_shape += 1;
                 continue;
             }
         }
@@ -409,10 +445,23 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         if stamp != 0 {
             let now = shared.mem.heap.identity_hash_code(ref_obj);
             if now != 0 && now != stamp {
+                d_stamp += 1;
                 continue;
             }
         }
+        if shared.mem.heap.num_fields(ref_obj) < 2 {
+            d_fields += 1;
+        }
         if shared.mem.heap.num_fields(ref_obj) >= 2 {
+            if audit {
+                n_nulled += 1;
+                let cid = shared.mem.heap.class_id_of(ref_obj);
+                let name = class_manager
+                    .get_class(cid)
+                    .map(|c| c.name.as_ref().to_string())
+                    .unwrap_or_else(|| format!("<unresolved cid={}>", cid.as_u32()));
+                *nulled_by_class.entry(name).or_insert(0) += 1;
+            }
             // Read the referent out of the slot BEFORE nulling it, and record
             // its class. The slot is authoritative here in a way the
             // processor's recorded `referent` address is not: every guard
@@ -438,6 +487,12 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         }
     }
     drop(class_manager);
+    if audit {
+        eprintln!(
+            "[refaudit] pre-gc-null nulled={n_nulled} declined_shape={d_shape}              declined_stamp={d_stamp} declined_fields={d_fields} classes={:?}",
+            nulled_by_class
+        );
+    }
     if !referent_classes.is_empty() {
         let mut rp = shared.mem.ref_processor.lock();
         for (ref_obj_addr, class_id) in referent_classes {
@@ -9145,7 +9200,7 @@ pub use site_cache::{
 // delegates to. Only `resolve_method_metadata` was widened.
 pub(crate) mod invoke;
 pub use invoke::*;
-mod gc_and_alloc;
+pub(crate) mod gc_and_alloc;
 pub use gc_and_alloc::*;
 mod opcodes;
 pub use opcodes::*;

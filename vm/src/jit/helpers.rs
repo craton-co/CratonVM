@@ -11448,15 +11448,31 @@ pub unsafe extern "C" fn jit_checkcast(
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "<none>".into());
             let target_cid = cm.find_unique_class_by_name(class_name);
+            // `target_cid` is the LOADER-BLIND unique-by-name answer, which is
+            // `None` the moment two loaders define the name -- so on exactly
+            // the class-identity failures this trace exists to explain it
+            // reports nothing. `site_target` is the identity the decision was
+            // actually made against: the `ClassId` this site's
+            // `CONSTANT_Class` resolved to through the COMPILING class's own
+            // loader (`intern_typecheck_target`). Printed with the loaders of
+            // both sides, because "obj_cid != site_target while both names
+            // match" and "the target was never resolved" are opposite repairs.
+            let site_target = cratonvm_jit::typecheck_target_for_site(class_name_ptr);
+            let loader_of = |id: cratonvm_types::ClassId| {
+                cm.get_class(id).map(|c| format!("{:?}", c.loader_id))
+            };
             eprintln!(
-                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_loader={:?} obj_cls={} target_name={} target_cid={:?} site_target={:?} site_target_loader={:?}",
                 obj_ptr,
                 kind,
                 arr_desc,
                 obj_class_id.as_u32(),
+                loader_of(obj_class_id),
                 obj_cls_name,
                 class_name,
-                target_cid.map(|c| c.as_u32())
+                target_cid.map(|c| c.as_u32()),
+                site_target,
+                site_target.and_then(|t| loader_of(cratonvm_types::ClassId::new(t))),
             );
         }
         // A definitive refusal — the object's class is known and provably not
@@ -13906,7 +13922,30 @@ enum CompiledOffloadSite {
     Active(u32),
     /// Declined past the cap; the hook is never consulted here again.
     Retired,
+    /// The target's declaring class was not loaded when this site was first
+    /// resolved, so neither the registry nor the gate could answer. `n` is how
+    /// many times we have come back; see [`OFFLOAD_SITE_UNRESOLVED_TRIES`].
+    ///
+    /// AUDIT 2026-09-06. Without this the first execution of a site decided
+    /// `NotKernel` FOREVER, using a registry that could not yet know — and the
+    /// class that same dispatch was about to resolve was very often the
+    /// kernel's own. That is the "forward references" limitation in
+    /// `runtime::offload_jit_gate`'s module docs, and it cost the device for
+    /// the life of the process on any caller that got hot before its kernel
+    /// branch was first taken.
+    Unresolved(u8),
 }
+
+/// How many times a site whose target class is still unloaded is re-asked
+/// before it is written off as [`CompiledOffloadSite::NotKernel`].
+///
+/// One retry would do in the ordinary case: the dispatch this helper falls
+/// through to resolves and initializes the class, so the SECOND execution of
+/// the site has a real answer. The cap exists for the case where that dispatch
+/// throws — a site whose every call ends in `NoClassDefFoundError` must not
+/// re-run the gate query forever.
+#[cfg(feature = "gpu-offload")]
+const OFFLOAD_SITE_UNRESOLVED_TRIES: u8 = 4;
 
 /// Per-site offload state.
 ///
@@ -14031,6 +14070,94 @@ unsafe fn decode_static_args(
 /// and GC-forwarded. The thread borrow is the standard `jit_thread_mut`
 /// scoped one.
 #[cfg(feature = "gpu-offload")]
+/// What one compiled static call site is, as far as offload is concerned.
+///
+/// The cheap answer first: `offload_hook`'s registry, populated as a side
+/// effect of `offload_jit_gate` scanning CALLERS. A hit is the common path and
+/// costs the three `Box<str>` `is_kernel` allocates, once per site.
+///
+/// AUDIT 2026-09-06: a MISS used to mean `NotKernel`, permanently. That is
+/// wrong whenever the registry could not have known — the gate skips any call
+/// target whose declaring class is not loaded at the moment the caller is
+/// scanned (its "forward references" limitation), and the first execution of a
+/// site is very often the thing that loads that very class. A caller that got
+/// hot before its kernel branch was first taken therefore lost the device for
+/// the rest of the run, silently, with the census printing zeroes.
+///
+/// So a miss now asks the gate itself:
+///
+/// * [`descriptor_could_ever_dispatch`] first, off `info.descriptor` alone —
+///   no lock, no allocation, no bytecode. `try_dispatch` launches only `)V`, or
+///   `)I`/`)J` for a reduction, and above `--gpu-min-work` 0 it needs an array
+///   parameter. Nearly every compiled static site in a program fails this and
+///   stops here.
+/// * [`target_is_dispatchable_kernel`] for the few that pass — the identical
+///   question `judge_target` asks during a caller scan. `None` means the class
+///   is STILL unloaded, and the site is left [`CompiledOffloadSite::Unresolved`]
+///   so the next call re-asks rather than being written off.
+/// * A kernel it finds is `note_kernel`ed, which is what repairs the
+///   compile-time doors too: `jit/src/lib.rs` and `jit/src/x64/bytecode_walk.rs`
+///   read the same registry to decide whether to bind a static call directly or
+///   inline it, and both of those are one-way once taken.
+/// Does a registry miss get to ask the gate, or is it written off on the spot?
+///
+/// `CRATONVM_GPU_JIT_GATE_LATE_REGISTER=0` restores the pre-2026-09-06
+/// behaviour, in which the FIRST execution of a compiled static call site
+/// decided `NotKernel` permanently from a registry that could not yet know
+/// about a forward-referenced kernel. Kept as a switch and not just as history:
+/// it is the control arm for measuring what the fix is worth, on ONE binary --
+/// see `test_classes/gpu/GpuForwardRef.java`, whose two arms differ only in
+/// whether the caller gets hot before or after the kernel's class is loaded.
+#[cfg(feature = "gpu-offload")]
+fn offload_site_late_register() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_JIT_GATE_LATE_REGISTER")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+#[cfg(feature = "gpu-offload")]
+fn resolve_offload_site(vm: &SharedVm, info: &JitInvokeInfo, tries: u8) -> CompiledOffloadSite {
+    if cratonvm_jit::offload_hook::is_kernel(info.class_name, info.method_name, info.descriptor) {
+        return CompiledOffloadSite::Active(0);
+    }
+    if !offload_site_late_register() {
+        return CompiledOffloadSite::NotKernel;
+    }
+    if !crate::runtime::offload_jit_gate::descriptor_could_ever_dispatch(
+        info.descriptor,
+        vm.config.gpu_min_work,
+    ) {
+        return CompiledOffloadSite::NotKernel;
+    }
+    match crate::runtime::offload_jit_gate::target_is_dispatchable_kernel(
+        vm,
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+    ) {
+        Some(true) => {
+            cratonvm_jit::offload_hook::note_kernel(
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+            );
+            cratonvm_types::gpu_jit_gate_census::note_late_registered(format!(
+                "{}.{}{}",
+                info.class_name, info.method_name, info.descriptor
+            ));
+            CompiledOffloadSite::Active(0)
+        }
+        Some(false) => CompiledOffloadSite::NotKernel,
+        None if tries + 1 >= OFFLOAD_SITE_UNRESOLVED_TRIES => CompiledOffloadSite::NotKernel,
+        None => CompiledOffloadSite::Unresolved(tries + 1),
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
 unsafe fn try_compiled_offload(
     vm: &SharedVm,
     info: &JitInvokeInfo,
@@ -14042,29 +14169,30 @@ unsafe fn try_compiled_offload(
 
     let cap = compiled_offload_giveup_after();
 
-    // One `usize` hash on the hot path. The name lookup behind
-    // `is_kernel` runs once per site, on the miss.
+    // One `usize` hash on the hot path. Everything below the hit runs once per
+    // SITE, not once per call.
     let state = {
         let known = compiled_offload_sites().read().get(&site).copied();
         match known {
+            Some(CompiledOffloadSite::Unresolved(tries)) => {
+                // Come back: the dispatch that followed our last visit
+                // resolved the class, so the gate can answer now.
+                let st = resolve_offload_site(vm, info, tries);
+                compiled_offload_sites().write().insert(site, st);
+                st
+            }
             Some(st) => st,
             None => {
-                let st = if cratonvm_jit::offload_hook::is_kernel(
-                    info.class_name,
-                    info.method_name,
-                    info.descriptor,
-                ) {
-                    CompiledOffloadSite::Active(0)
-                } else {
-                    CompiledOffloadSite::NotKernel
-                };
+                let st = resolve_offload_site(vm, info, 0);
                 compiled_offload_sites().write().insert(site, st);
                 st
             }
         }
     };
     match state {
-        CompiledOffloadSite::NotKernel | CompiledOffloadSite::Retired => return None,
+        CompiledOffloadSite::NotKernel
+        | CompiledOffloadSite::Retired
+        | CompiledOffloadSite::Unresolved(_) => return None,
         CompiledOffloadSite::Active(_) => {}
     }
 

@@ -371,6 +371,24 @@ fn for_each_flat_object_reference_capped(
     }
 }
 
+/// How many objects the parallel evacuator placed in an EXISTING destination
+/// region after its Free pool ran out, instead of failing the evacuation.
+///
+/// Every one of these was an evacuation FAILURE before 2026-09-06 — a
+/// self-forward, a kept CSet region, and a `retry_after_evacuation_failure`
+/// pass — while the serial arm would have found the same space.
+pub static PARALLEL_SHARED_DEST_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the parallel evacuator's TLAB allocator ran out of POOL —
+/// the Free regions reserved before the dispatch — and sent an object down the
+/// evacuation-failure path.
+///
+/// Its serial twin does not fail at the same point: it first scans every
+/// existing non-CSet region of the destination type. A non-zero count here
+/// beside a non-zero `with_room` in the report means the parallel arm declared
+/// to-space exhaustion while to-space still had room.
+pub static PARALLEL_TLAB_POOL_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
+
 /// Rate-limit counter for the corrupt-cell holder report above.
 static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -957,6 +975,124 @@ enum HolderBound {
     RegionEnd,
 }
 
+/// Every to-space copy this pause made, as it looked the instant it was made.
+///
+/// `CRATONVM_G1_EVAC_COPY_WATCH=1` only. The question it exists to answer is
+/// the one `g1-eight-byte-write-at-a-live-objects-base-20260906` could not:
+/// the corrupt holders that walk reports find are TO-SPACE COPIES whose
+/// `class_id`/`shape` dword pair — the object's first eight bytes — has become
+/// a pointer into this arena, with the mark word at +8 intact. Whether they
+/// were sound when `evacuate` copied them was an INFERENCE (candidates screen
+/// clean, holders do not). This makes it a timestamp.
+///
+/// Recording is a push per copy under one lock, which is why it is opt-in: the
+/// point is to be able to run it, not to run it always.
+#[derive(Default)]
+struct CopyWatch {
+    /// `(addr, src, class_id, shape, region_idx, reuse_epoch)` at the moment
+    /// of the copy. The SOURCE is recorded so a mismatch names the from-space
+    /// object it came from; the REGION and its reuse epoch are recorded so the
+    /// cross-pause checkpoint can drop an entry whose region has since been
+    /// freed and handed out again — that is a legitimate change, not a write.
+    entries: Mutex<Vec<(usize, usize, u32, u32, usize, u64)>>,
+    /// How many mismatches each checkpoint found, so a later checkpoint does
+    /// not re-report what an earlier one already did.
+    reported: AtomicUsize,
+}
+
+impl CopyWatch {
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn note_copy(
+        &self,
+        addr: usize,
+        src: usize,
+        class_id: u32,
+        shape: u32,
+        region_idx: usize,
+        reuse_epoch: u64,
+    ) {
+        self.entries
+            .lock()
+            .push((addr, src, class_id, shape, region_idx, reuse_epoch));
+    }
+
+    /// Drop every recorded entry. The cross-pause checkpoint verifies the
+    /// PREVIOUS pause's copies and then starts again, so one pause's worth of
+    /// entries is the most this ever holds.
+    fn clear(&self) {
+        self.entries.lock().clear();
+    }
+
+    /// Re-read every recorded copy's first word and say which ones changed.
+    ///
+    /// `label` names the interval that just closed. Two checkpoints separate
+    /// "a worker did it during the closure" from "the serial drain did it",
+    /// which is the split that decides where to look next.
+    fn verify(
+        &self,
+        label: &'static str,
+        arena: std::ops::Range<usize>,
+        regions: Option<RegionView<'_>>,
+    ) {
+        let entries = self.entries.lock();
+        let mut changed = 0usize;
+        let mut skipped = 0usize;
+        let mut first: Vec<String> = Vec::new();
+        for &(addr, src, cid, shape, ridx, epoch) in entries.iter() {
+            // CROSS-PAUSE ONLY: a region that has been freed and handed out
+            // again since the copy legitimately holds different bytes. Dropping
+            // those is what keeps this checkpoint from reporting the collector
+            // doing its job. `regions = None` is the in-pause case, where no
+            // region can have been recycled yet.
+            if let Some(view) = regions {
+                match view.get(ridx) {
+                    Some(r) if r.region_type != RegionType::Free && r.reuse_epoch == epoch => {}
+                    _ => {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            // SAFETY: `addr` is a to-space copy this pause made; the pause is
+            // still open, so the region is still typed and mapped.
+            let h = unsafe { &*(addr as *const ObjectHeader) };
+            let (now_cid, now_shape) = (h.class_id.as_u32(), h.num_slots());
+            if now_cid == cid && now_shape == shape {
+                continue;
+            }
+            changed += 1;
+            if first.len() < 8 {
+                let paired = (now_cid as u64) | ((now_shape as u64) << 32);
+                first.push(format!(
+                    "obj=0x{addr:x} was(class_id={cid} shape={shape})                      now(class_id={now_cid} shape={now_shape})                      paired=0x{paired:016x} pair_is_arena_pointer={}                      mark=0x{:016x}",
+                    arena.contains(&(paired as usize)),
+                    h.mark_word.load(Ordering::Relaxed),
+                ));
+            }
+        }
+        let _ = skipped;
+        if changed == 0 {
+            // WARN, not INFO. At the default level an `info!` here is invisible,
+            // and "0 changed" then reads exactly like "the checkpoint never
+            // ran" — which is the one thing a reader must be able to tell
+            // apart, because a clean result is the interesting one here.
+            tracing::warn!(
+                "[g1][copy-watch] {label}: {} copies, 0 changed since the copy                  ({skipped} skipped as legitimately recycled).",
+                entries.len()
+            );
+            return;
+        }
+        self.reported.fetch_add(changed, Ordering::Relaxed);
+        tracing::error!(
+            "[g1][copy-watch] {label}: {changed} of {} to-space copies had their FIRST WORD              rewritten after `evacuate` copied them. `class_id`(4)+`shape`(4) IS that word, so              every one of these is an eight-byte write at a live object's base, inside this              pause, in the interval this checkpoint closes. First few: {}",
+            entries.len(),
+            first.join(" | "),
+        );
+        let _ = skipped;
+    }
+}
+
 /// Read-only access to the region table for the screens BOTH evacuators share.
 ///
 /// The serial arm holds the regions guard and can hand out a `&[G1Region]`.
@@ -1239,6 +1375,54 @@ pub fn evacuate_cas_loser_forwards() -> u64 {
     EVACUATE_CAS_LOSER_FORWARDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many times `evacuate_object` was asked to evacuate a from-space object
+/// this pause had ALREADY forwarded, with the forwarding tag no longer in the
+/// object's mark word.
+///
+/// Expected to be ZERO. The tag is the only "already evacuated?" test
+/// `evacuate_object` has had since F-02 (it is a load and a tag compare, not a
+/// `pointer_map` probe), so a cleared tag makes a second copy of a live object
+/// and OVERWRITES the correct `pointer_map` entry with the duplicate's address.
+/// Nothing crashes: the duplicate is a well-formed object, because
+/// `retire_forwards` deliberately preserves the shape quartet. What breaks is
+/// object IDENTITY -- two live copies of one object, some holders rewritten to
+/// each -- which is what the Spring Boot residual measured as reflection
+/// metadata that reads back null, or names the wrong class, or is missing a
+/// method the class declares.
+///
+/// Read it with [`reevacuated_after_retire`]. Non-zero means a driver retired
+/// its forwards before a phase that still evacuates; see
+/// `CRATONVM_G1_RETIRE_FORWARDS_LATE`.
+pub static REEVACUATED_AFTER_RETIRE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`REEVACUATED_AFTER_RETIRE`].
+pub fn reevacuated_after_retire() -> u64 {
+    REEVACUATED_AFTER_RETIRE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pauses on which Phase 3.5 (`resurrect_dead_finalizers`) had candidates and
+/// therefore evacuated something AFTER the main closure had finished.
+///
+/// This is the denominator for [`REEVACUATED_AFTER_RETIRE`]. A retirement
+/// ordering defect between the closure and Phase 3.5 can only show on a
+/// workload where Phase 3.5 actually runs, and "does it run on THIS workload"
+/// was not a question the collector could answer about itself.
+pub static RESURRECT_PHASE_RUNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Objects Phase 3.5 pulled out of the collection set — see
+/// [`RESURRECT_PHASE_RUNS`].
+pub static RESURRECT_PHASE_COPIED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the Phase 3.5 census: `(runs, objects copied)`.
+pub fn resurrect_phase_census() -> (u64, u64) {
+    (
+        RESURRECT_PHASE_RUNS.load(std::sync::atomic::Ordering::Relaxed),
+        RESURRECT_PHASE_COPIED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 #[derive(Default)]
 struct EvacShard {
     objs: usize,
@@ -1281,6 +1465,11 @@ struct SharedEvac<'a> {
     cset: &'a RegionSet,
     /// Free-region indices available for to-space TLAB claiming.
     pool: &'a [usize],
+    /// [`Self::pool`] as a membership test. A region in the pool is, or is
+    /// about to be, some worker's exclusively-owned TLAB, and `retire_tlab`
+    /// STORES its cursor — so the shared-destination fallback below must never
+    /// bump-allocate into one, or that store would clobber the bump.
+    pool_set: &'a RegionSet,
     /// Lock-free claim cursor into `pool`.
     pool_next: &'a AtomicUsize,
     /// Gray-object work queue (to-space addresses awaiting a ref scan).
@@ -1289,6 +1478,8 @@ struct SharedEvac<'a> {
     outstanding: &'a AtomicUsize,
     /// Tenuring threshold copied from the collector config.
     promotion_age: u8,
+    /// `CRATONVM_G1_EVAC_COPY_WATCH=1` only; see [`CopyWatch`].
+    copy_watch: Option<&'a CopyWatch>,
 }
 
 impl<'a> SharedEvac<'a> {
@@ -1413,6 +1604,76 @@ impl<'a> SharedEvac<'a> {
             }
             let i = self.pool_next.fetch_add(1, Ordering::Relaxed);
             if i >= self.pool.len() {
+                // TO-SPACE EXHAUSTION — but exhaustion of WHAT?
+                //
+                // This arm can only ever allocate out of `pool`, the Free
+                // regions reserved before the dispatch. Its serial twin
+                // `alloc_in_type_locked_scan` first scans EVERY existing
+                // non-CSet region of the destination type and bump-allocates
+                // into a partially-filled one, and only then claims a Free
+                // region. So the two arms do not run out at the same time, and
+                // the difference is not a detail: returning `None` here sends
+                // the object down the evacuation-FAILURE path (self-forward,
+                // kept region, `retry_after_evacuation_failure`), which is a
+                // different and much more fragile machine than a copy.
+                //
+                // The number that decides whether that gap is real is how much
+                // room the serial arm WOULD have found at this instant, so
+                // count it here rather than reasoning about it. Rate-limited
+                // and only on the failure path, so a healthy pause pays
+                // nothing.
+                // FALL BACK THE WAY THE SERIAL ARM ALREADY DOES.
+                //
+                // `alloc_in_type_locked_scan` scans every existing non-CSet
+                // region of the destination type and bump-allocates into a
+                // partially-filled one BEFORE it claims a Free region. This arm
+                // only ever had the Free pool, so it declared to-space
+                // exhaustion — and sent the object down the evacuation-FAILURE
+                // path — while to-space was still there. MEASURED 2026-09-06 on
+                // `TestHostConfigAutomaticDeploymentXmlExternalWarXml`:
+                //
+                //   EXHAUSTED ITS POOL: dest_type=Old size=48 pool_len=1
+                //     — but 2017 of 2025 non-CSet Old regions still have room
+                //
+                // for a FORTY-EIGHT byte promotion, and zero such events on the
+                // serial arm in the same census.
+                //
+                // `bump_alloc` takes `&self` and advances the cursor with a
+                // compare-exchange (F-11 made it atomic for exactly this), so a
+                // shared destination is inside the module's discipline — it is
+                // the "atomically-CAS shared regions" half, extended from CSet
+                // regions to destination ones. What it is NOT is a TLAB: a TLAB
+                // owns its region's cursor and `retire_tlab` STORES it, so this
+                // path deliberately leaves `tlab` untouched and hands back one
+                // object's worth of space.
+                if gc_flags().g1_parallel_evac_shared_dest {
+                    if let Some(p) = self.shared_dest_alloc(tlab.dest_type, size) {
+                        return Some(p);
+                    }
+                }
+                let n = PARALLEL_TLAB_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    let mut with_room = 0usize;
+                    let mut of_type = 0usize;
+                    for idx in 0..self.regions_len {
+                        // SAFETY: `idx < regions_len`; a shared read of one
+                        // region, exactly as `seed_source_region` takes.
+                        let r = &*self.regions_base.0.add(idx);
+                        if r.region_type != tlab.dest_type || self.cset.contains(&idx) {
+                            continue;
+                        }
+                        of_type += 1;
+                        if r.data.len().saturating_sub(r.cursor()) >= size {
+                            with_room += 1;
+                        }
+                    }
+                    tracing::warn!(
+                        "[g1] parallel evacuation EXHAUSTED ITS POOL (#{n}): dest_type={:?}                          size={size} pool_len={} — but {with_room} of {of_type} non-CSet                          {:?} regions still have room for it. The SERIAL evacuator                          (`alloc_in_type_locked_scan`) scans those before claiming a Free                          region; this arm never does, so it fails over to the                          evacuation-FAILURE path while to-space is still available.                          `with_room > 0` means the two arms disagree about whether this                          pause is out of space.",
+                        tlab.dest_type,
+                        self.pool.len(),
+                        tlab.dest_type,
+                    );
+                }
                 return None;
             }
             let idx = self.pool[i];
@@ -1445,6 +1706,40 @@ impl<'a> SharedEvac<'a> {
             tlab.len = region.data.len();
             tlab.offset = 0;
         }
+    }
+
+    /// One object's worth of space in an EXISTING non-CSet region of
+    /// `dest_type`, for when the Free pool is gone.
+    ///
+    /// Skips the pool entirely: every region in it is, or is about to become, a
+    /// worker's TLAB, and `retire_tlab` stores that TLAB's offset as the
+    /// region's cursor — a store that would silently discard anything this
+    /// path bumped into the same region. Skips CSet regions for the reason
+    /// `alloc_in_type_locked_scan` spells out: Phase 5 frees them, so a copy
+    /// placed there is lost and every reference to it dangles.
+    unsafe fn shared_dest_alloc(&self, dest_type: RegionType, size: usize) -> Option<usize> {
+        for idx in 0..self.regions_len {
+            if self.pool_set.contains(&idx) || self.cset.contains(&idx) {
+                continue;
+            }
+            // SAFETY: `idx < regions_len`; a shared read, and `bump_alloc`
+            // takes `&self` and is a CAS.
+            let r = &*self.regions_base.0.add(idx);
+            if r.region_type != dest_type {
+                continue;
+            }
+            // F-16: under a reserved heap a region may be address space rather
+            // than memory. An in-use region of the destination type is already
+            // committed, but ask rather than assume.
+            if !self.collector.commit_through_region(idx) {
+                continue;
+            }
+            if let Some((ptr, _)) = r.bump_alloc(size, 8, "parallel-evac:shared-dest") {
+                PARALLEL_SHARED_DEST_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                return Some(ptr as usize);
+            }
+        }
+        None
     }
 
     /// Write a TLAB's final bump cursor back to its region and clear the TLAB.
@@ -1586,6 +1881,29 @@ impl<'a> SharedEvac<'a> {
                 ) {
                     Ok(_) => {
                         forwards.push((old, old));
+                        // The evacuation-FAILURE arm. The first version of this
+                        // watch recorded only the normal-copy winner and so
+                        // could not see the objects an OOM-ing run actually
+                        // produces — this arm is the one to-space exhaustion
+                        // takes, and its objects are queued and walked in
+                        // place, in from-space, exactly like a copy.
+                        if let Some(w) = self.copy_watch {
+                            let h = &*(old_ptr as *const ObjectHeader);
+                            let ridx = self
+                                .collector
+                                .lookup_region_for_addr(old)
+                                .unwrap_or(usize::MAX);
+                            let epoch =
+                                self.view().get(ridx).map(|r| r.reuse_epoch).unwrap_or(0);
+                            w.note_copy(
+                                old,
+                                old,
+                                h.class_id.as_u32(),
+                                h.num_slots(),
+                                ridx,
+                                epoch,
+                            );
+                        }
                         Some((old_ptr, true))
                     }
                     // A racing worker got there first. Its word is FORWARDED by
@@ -1595,7 +1913,28 @@ impl<'a> SharedEvac<'a> {
                     // payload as an address is exactly the INFLATED/FORWARDED
                     // aliasing this encoding was audited against.
                     Err(actual) if ObjectHeader::is_forwarded_mark(actual) => {
-                        Some((ObjectHeader::forwarding_target(actual), false))
+                        // THE THIRD ARM OF THE SAME SHAPE. `evacuate`'s
+                        // already-forwarded fast path records the adopted
+                        // forward (DEFECT-2 part 1) and its copy-path CAS-loser
+                        // arm records it too (the 2026-08-26 "SECOND SITE" fix).
+                        // This one — the CAS loser on the EVACUATION-FAILURE
+                        // path — still returned the winner's target without
+                        // recording it, so `old` reached neither `pointer_map`
+                        // (nothing outside the collector could be remapped off
+                        // it) nor `retire_forwards` (its tag outlived the
+                        // pause, in a KEPT region by construction, where the
+                        // next cycle's fast path reads it as a this-cycle
+                        // answer).
+                        //
+                        // Recorded, not deduplicated: the winner records the
+                        // same pair, and `pointer_map` is a map. Writing it
+                        // from every arm is what makes "every forward this
+                        // pause installed is a key of `pointer_map`" a property
+                        // of the code rather than of which arm happened to run.
+                        let target = ObjectHeader::forwarding_target(actual);
+                        EVACUATE_CAS_LOSER_FORWARDS.fetch_add(1, Ordering::Relaxed);
+                        forwards.push((old, target as usize));
+                        Some((target, false))
                     }
                     Err(_) => None,
                 };
@@ -1645,6 +1984,25 @@ impl<'a> SharedEvac<'a> {
                 forwards.push((old_ptr as usize, new_addr));
                 *objs += 1;
                 *bytes += obj_size;
+                // Record the copy AFTER winning the CAS, so the watch holds
+                // exactly the copies this pause published — a CAS loser's
+                // speculative copy is abandoned to-space garbage and its later
+                // contents mean nothing.
+                if let Some(w) = self.copy_watch {
+                    let ridx = self
+                        .collector
+                        .lookup_region_for_addr(new_addr)
+                        .unwrap_or(usize::MAX);
+                    let epoch = self.view().get(ridx).map(|r| r.reuse_epoch).unwrap_or(0);
+                    w.note_copy(
+                        new_addr,
+                        old_ptr as usize,
+                        new_header.class_id.as_u32(),
+                        new_header.num_slots(),
+                        ridx,
+                        epoch,
+                    );
+                }
                 Some((new_ptr, true))
             }
             // The loser must DECODE the winner's word. `compare_exchange`
@@ -7701,6 +8059,30 @@ impl G1Collector {
                 );
             }
         }
+        // `CRATONVM_G1_EVAC_COPY_WATCH=1` only; see [`CopyWatch`]. Declared here
+        // so it outlives `shared` and can be verified at two checkpoints.
+        // A PROCESS static, not a per-pause local. The in-pause checkpoints
+        // measured 0 of 374k and 0 of 401k copies rewritten, so the interval
+        // that matters is the one BETWEEN pauses: if a copy this pause made is
+        // corrupt when the next pause starts, the writer is not the collector.
+        static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
+        let copy_watch: Option<&CopyWatch> = gc_flags()
+            .g1_evac_copy_watch
+            .then(|| COPY_WATCH.get_or_init(CopyWatch::default));
+        let arena = self.arena_base..self.arena_end;
+        // CHECKPOINT 0 — the previous pause's copies, re-read before this pause
+        // touches anything. Entries whose region has been recycled since are
+        // dropped rather than reported.
+        if let Some(w) = copy_watch {
+            w.verify(
+                "at the START of the next pause",
+                arena.clone(),
+                Some(RegionView::Raw(regions_base, regions_len)),
+            );
+            w.clear();
+        }
+        // Membership test for the reserved pool; see `SharedEvac::pool_set`.
+        let pool_set: RegionSet = pool.iter().copied().collect();
         let pool_next = AtomicUsize::new(0);
         let queue: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let outstanding = AtomicUsize::new(0);
@@ -7710,6 +8092,7 @@ impl G1Collector {
             regions_len,
             cset: cset_set,
             pool: &pool,
+            pool_set: &pool_set,
             pool_next: &pool_next,
             queue: &queue,
             outstanding: &outstanding,
@@ -7719,6 +8102,7 @@ impl G1Collector {
             // moved mid-pause would tenure two objects of the same age
             // differently for no reason the heap could explain.
             promotion_age: self.tenuring_threshold(),
+            copy_watch,
         };
 
         let mut objs = 0usize;
@@ -7871,6 +8255,12 @@ impl G1Collector {
                 }
             });
         }
+        // CHECKPOINT 1 — the parallel closure has ended and every worker has
+        // joined, so anything the watch reports here was written by a WORKER
+        // (or the driver acting as one) while the closure ran.
+        if let Some(w) = copy_watch {
+            w.verify("after the parallel closure", arena.clone(), None);
+        }
         for shard in shards {
             let shard = shard.into_inner();
             objs += shard.objs;
@@ -7924,6 +8314,14 @@ impl G1Collector {
             shared.retire_all(&mut serial_tlab);
         }
 
+        // CHECKPOINT 2 — the serial self-forward drain has run. A mismatch that
+        // is new since checkpoint 1 was written by the DRAIN, not by a worker;
+        // one that was already there is the closure's. Two checkpoints is the
+        // smallest split that decides which half to read.
+        if let Some(w) = copy_watch {
+            w.verify("after the serial self-forward drain", arena.clone(), None);
+        }
+
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
         let mut pointer_map: cratonvm_types::PointerMap =
@@ -7938,50 +8336,32 @@ impl G1Collector {
         // DEFECT-2 FIX (part 2 of 2): restore the evacuator's
         // "`forwarding_ptr == 0` at collection start" invariant for EVERY
         // from-space object forwarded this cycle, not just the self-forwarded
-        // ones.
+        // ones. The loop, and the whole argument for preserving the shape
+        // quartet while clearing the tag, now live in ONE place --
+        // `retire_forwards` -- rather than in a private copy per arm.
         //
-        // The parallel evacuator CAS-installs each forward into the from-space
-        // object's *persistent* `ObjectHeader::forwarding_ptr` (the lock-free
-        // install slot), unlike the serial path which records forwards only in
-        // the per-cycle `pointer_map`. Phase 5 (`free_or_keep_cset`) zeroes the
-        // field for a FREED region, but a KEPT region (one holding a
-        // self-forwarded / evacuation-failed object) is never reset, so the
-        // `forwarding_ptr` of EVERY forwarded object it contains — the
-        // self-forwarded one AND the normally-evacuated bodies left behind —
-        // would persist into the next collection. On the next cycle `evacuate`'s
-        // fast path reads that STALE forward, returns it without re-evacuating or
-        // recording it, and (with part 1) records a stale forward / strands a
-        // root on a from-space object → the rare `java/lang/Object`.
+        // WHERE it runs is the 2026-09-06 correction. This retirement used to
+        // happen HERE, at the end of the evacuator, while the three serial
+        // drivers run theirs between Phase 4 and Phase 5. Two things sit
+        // between those two points.
         //
-        // Clearing only `k == v` (self-forwards) was insufficient: it left the
-        // normally-evacuated bodies in kept regions stale (and clearing them
-        // alone, without part 1's fast-path recording, removed the redirect that
-        // was masking the stuck roots — hence the two halves are landed
-        // together). Clear ALL keys: for a freed region this is redundant (Phase
-        // 5 zeroes it anyway); for a kept region it is the correction. Together
-        // with part 1 this makes the parallel path behave like the serial one —
-        // every forward recorded in `pointer_map`, none persisting across cycles.
-        for &k in pointer_map.keys() {
-            // SAFETY: `k` is a from-space object address forwarded this cycle;
-            // its header is intact and its region is held under the collection's
-            // `regions` lock (Phase 5 has not run yet).
-            unsafe {
-                // Retire the forward. These are from-space objects the cycle
-                // has abandoned, so NEUTRAL is the right resting *lock* state —
-                // the live copy carries the mark word this evacuation
-                // transferred to it.
-                //
-                // The QUARTET is not lock state and must survive: `kind` and
-                // `element_type` are what every linear region walker sizes a
-                // from-space object from, and this store runs while Phase 5 has
-                // not yet zeroed the region. Storing a bare `MARK_NEUTRAL` here
-                // left an abandoned copy claiming to be a zero-slot plain
-                // object.
-                let h = &*(k as *const ObjectHeader);
-                let quartet = ObjectHeader::quartet_of(h.mark_word.load(Ordering::Relaxed));
-                h.mark_word
-                    .store(quartet | cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
-            }
+        // Phase 3.5, `resurrect_dead_finalizers`, re-enters the SERIAL
+        // `evacuate_object` for a dead finalizable's whole transitive closure,
+        // and since F-02 that function's only "already evacuated?" test is the
+        // forwarding tag in the from-space mark word. Retiring the tags first
+        // told Phase 3.5 that every object this pause had already copied was
+        // untouched: it copied each one AGAIN and overwrote the correct
+        // `pointer_map` entry with the duplicate, splitting the object's
+        // identity. Nothing crashed, because `retire_forwards` preserves the
+        // quartet and the duplicate is a well-formed object.
+        //
+        // And Phase 3.5 installs forwards of its OWN. Nothing after this point
+        // retired anything, so those outlived the pause in a kept region, where
+        // the next cycle's fast path reads them as a this-cycle answer.
+        //
+        // `CRATONVM_G1_RETIRE_FORWARDS_LATE=0` puts it back here for a bisect.
+        if !gc_flags().g1_retire_forwards_late {
+            self.retire_forwards(&pointer_map);
         }
 
         (pointer_map, objs, bytes)
@@ -8206,6 +8586,15 @@ impl G1Collector {
         phases.fixup_bytes = census.walked_bytes;
         phase_mark = std::time::Instant::now();
 
+        // F-02, at the protocol point the three serial drivers use: after the
+        // fix-up (which resolves the forwards) and before the reclaim (which is
+        // what makes a kept region's stale forward outlive the pause). The
+        // parallel drivers used to retire inside `parallel_evacuate` instead --
+        // see the note there for what that cost. `pointer_map` here also
+        // carries Phase 3.5's forwards, which the old placement could not.
+        if gc_flags().g1_retire_forwards_late {
+            self.retire_forwards(&pointer_map);
+        }
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
@@ -8483,6 +8872,11 @@ impl G1Collector {
         phases.fixup_bytes = census.walked_bytes;
         phase_mark = std::time::Instant::now();
 
+        // F-02 -- same protocol point as the serial mixed driver; see the note
+        // on the parallel young path.
+        if gc_flags().g1_retire_forwards_late {
+            self.retire_forwards(&pointer_map);
+        }
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -8678,6 +9072,13 @@ impl G1Collector {
         if candidates.is_empty() {
             return;
         }
+        // This phase runs AFTER the closure and evacuates through the serial
+        // `evacuate_object`, whose "already evacuated?" test is the from-space
+        // forwarding tag. Whether it runs at all on a given workload therefore
+        // decides whether a retirement-ordering defect between the two can
+        // show — and nothing counted it. See `RESURRECT_PHASE_RUNS`.
+        let runs = RESURRECT_PHASE_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+        let copied_before = *objects_copied;
         let mut resurrected = Vec::new();
         let scan_resume = work_list.len();
         for old_addr in candidates {
@@ -8721,6 +9122,16 @@ impl G1Collector {
                 objects_copied,
                 bytes_copied,
                 work_list,
+            );
+        }
+        let copied_here = objects_copied.saturating_sub(copied_before) as u64;
+        RESURRECT_PHASE_COPIED.fetch_add(copied_here, Ordering::Relaxed);
+        if runs <= 8 || runs.is_power_of_two() {
+            tracing::warn!(
+                "[g1] Phase 3.5 resurrection RAN (#{runs}): resurrected={} copied={copied_here} \
+                 — every object it copies is evacuated by the SERIAL path, which decides \
+                 \"already evacuated?\" from the from-space forwarding tag alone.",
+                resurrected.len(),
             );
         }
         if !resurrected.is_empty() {
@@ -8807,6 +9218,37 @@ impl G1Collector {
         let observed = mark_atomic.load(Ordering::Acquire);
         if ObjectHeader::is_forwarded_mark(observed) {
             return Some((ObjectHeader::forwarding_target(observed), false));
+        }
+
+        // PREDICT-THEN-VERIFY BACKSTOP. The tag compare above is the whole
+        // "already evacuated?" test, and it is only correct while no phase of
+        // the pause has retired the tags. `pointer_map` is the pause's other
+        // record of the same fact and is never retired, so it can say whether
+        // the tag compare just lied -- for one hash probe on the path that is
+        // about to memcpy an object, which is not the per-slot cost F-02
+        // removed.
+        //
+        // A hit means a second copy of a LIVE object was about to be made and
+        // this address's `pointer_map` entry about to be overwritten with the
+        // duplicate. That is not a degradation, it is an identity split, and it
+        // is silent because the duplicate is well-formed. Count it always (the
+        // count is the only evidence a retirement-order regression exists at
+        // all) and, unless `CRATONVM_G1_REEVAC_GUARD=0`, answer from the map
+        // exactly as the tag would have.
+        if let Some(&existing) = pointer_map.get(&old_addr) {
+            let n = REEVACUATED_AFTER_RETIRE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] evacuation asked to RE-EVACUATE 0x{old_addr:x} (#{n}): this pause \
+                     already forwarded it to 0x{existing:x}, but its mark word no longer \
+                     carries the tag, so the copy path was about to make a SECOND live copy \
+                     and overwrite the forwarding entry with it. A driver retired its \
+                     forwards before a phase that still evacuates."
+                );
+            }
+            if gc_flags().g1_reevac_guard {
+                return Some((existing as *mut u8, false));
+            }
         }
 
         let header = unsafe { &*(old_ptr as *const ObjectHeader) };
@@ -20743,75 +21185,103 @@ mod tests {
         // Large enough that one step is hundreds of batches, small enough to
         // fit an 8 MB heap several times over.
         const GRAYS: usize = 20_000;
-        let gc = Arc::new(make_collector());
-        let grays: Vec<usize> = (0..GRAYS)
-            .map(|_| gc.alloc_object(ClassId::new(1), 0).as_ptr() as usize)
-            .collect();
-        gc.start_concurrent_mark(&stw());
-        gc.mark_worklist.lock().extend(grays);
+        // An attempt is INCONCLUSIVE when the marker drains the whole step
+        // before this thread can queue behind it. That is rare (we queue after
+        // two batches of ~GRAYS/MARK_LOCK_BATCH) and it is not a failure, so
+        // try again -- but never silently pass: running out of attempts is red.
+        const ATTEMPTS: usize = 8;
+        let mut observed: Option<(usize, usize)> = None;
+        for _ in 0..ATTEMPTS {
+            let gc = Arc::new(make_collector());
+            let grays: Vec<usize> = (0..GRAYS)
+                .map(|_| gc.alloc_object(ClassId::new(1), 0).as_ptr() as usize)
+                .collect();
+            gc.start_concurrent_mark(&stw());
+            gc.mark_worklist.lock().extend(grays);
+            let before = gc.mark_lock_batches.load(Ordering::Relaxed);
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(AtomicBool::new(false));
-        let acquisitions = Arc::new(AtomicUsize::new(0));
-        let observer = {
-            let gc = Arc::clone(&gc);
-            let stop = Arc::clone(&stop);
-            let started = Arc::clone(&started);
-            let acquisitions = Arc::clone(&acquisitions);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    {
-                        let _exclusive = gc.regions.write();
-                        acquisitions.fetch_add(1, Ordering::Relaxed);
-                    }
-                    started.store(true, Ordering::Relaxed);
-                    std::thread::yield_now();
-                }
-            })
-        };
+            // THE MARKER RUNS ON ITS OWN THREAD AND THIS THREAD IS THE WAITING
+            // WRITER, which is the whole of the repair.
+            //
+            // The previous shape had it the other way round: a spawned observer
+            // POLLED `regions.write()` in a loop while this thread ran the step,
+            // and the assertion was on how many times it got in. That asked
+            // whether a competing OS thread was SCHEDULED during a sub-second
+            // step, which is the scheduler's answer, not this collector's -- it
+            // failed in 3 of 6 gc-lib-suite runs on unmodified `dev` at host
+            // load ~20 (2026-09-06), while the same binary passed 40 of 40 when
+            // the test was run alone. An earlier session had already cut the
+            // assertion from `>= 8` to `> 0` for the same reason; `> 0` was the
+            // same defect one notch down.
+            //
+            // Blocking removes the scheduler from the claim. `parking_lot`'s
+            // `RwLock` is task-fair, so a thread parked in `write()` is QUEUED:
+            // the marker's next `read()` lines up behind it and the guard is
+            // handed over at the next batch boundary whether or not this thread
+            // ever gets a time slice in between. And the counter that says WHEN
+            // it was handed over is `mark_lock_batches`, which no scheduler
+            // touches -- while we hold the write guard the marker cannot take a
+            // batch, so the value we read is exactly the count at handoff.
+            let marker = {
+                let gc = Arc::clone(&gc);
+                std::thread::spawn(move || gc.concurrent_mark_step(usize::MAX))
+            };
 
-        // Do not start measuring until the observer has demonstrably run.
-        while !started.load(Ordering::Relaxed) {
-            std::thread::yield_now();
+            // Do not queue until the marker is demonstrably inside the step, or
+            // "it was admitted before the step began" would read as a pass.
+            while gc.mark_lock_batches.load(Ordering::Relaxed) - before < 2
+                && !marker.is_finished()
+            {
+                std::hint::spin_loop();
+            }
+            if marker.is_finished() {
+                let done = marker.join().expect("marker thread");
+                let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - before;
+                // "The step outran us" and "the guard was never dropped" both
+                // arrive here, and only the first is a retry. The batch counter
+                // separates them, so the pre-F-10 regression asserts on the
+                // spot with the message that names it instead of being retried
+                // eight times and reported as an unobservable claim.
+                assert!(
+                    batches >= GRAYS / MARK_LOCK_BATCH,
+                    "the marker drained {GRAYS} grays in {batches} regions-lock                      acquisition(s); at MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at                      least {} - a reading of 1 means the guard is held for the whole step                      again (F-10)",
+                    GRAYS / MARK_LOCK_BATCH
+                );
+                assert!(done, "one unbounded step must drain the whole gray set");
+                continue;
+            }
+
+            let granted_at = {
+                let _exclusive = gc.regions.write();
+                gc.mark_lock_batches.load(Ordering::Relaxed) - before
+            };
+            let done = marker.join().expect("marker thread");
+            let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - before;
+
+            assert!(done, "one unbounded step must drain the whole gray set");
+            // The MAGNITUDE claim, from the same scheduler-free counter: the
+            // marker dropped and retook the guard once per batch. Deterministic,
+            // so it is checked on every attempt.
+            assert!(
+                batches >= GRAYS / MARK_LOCK_BATCH,
+                "the marker drained {GRAYS} grays in {batches} regions-lock acquisition(s); at                  MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at least {} - a reading of 1                  means the guard is held for the whole step again (F-10)",
+                GRAYS / MARK_LOCK_BATCH
+            );
+            observed = Some((granted_at, batches));
+            break;
         }
-        acquisitions.store(0, Ordering::Relaxed);
 
-        // ONE step, unbounded budget: pre-F-10 this held the lock from the
-        // first gray to the last.
-        let batches_before = gc.mark_lock_batches.load(Ordering::Relaxed);
-        let done = gc.concurrent_mark_step(usize::MAX);
-        let during_the_step = acquisitions.load(Ordering::Relaxed);
-        let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - batches_before;
-
-        stop.store(true, Ordering::Relaxed);
-        observer.join().expect("observer thread");
-
-        assert!(done, "one unbounded step must drain the whole gray set");
-        // THE CLAIM IS ADMISSION, NOT THROUGHPUT. This asserted `>= 8` and
-        // failed 3 runs in 5 ALONE on an idle host (2026-09-05), and again in
-        // `cargo test --workspace`. The observer is a competing OS thread, so
-        // how MANY times it wins the lock inside one sub-second step is the
-        // scheduler's answer, not this collector's. Pre-F-10 the count is 0 and
-        // stays 0 however the threads interleave, which is what makes `> 0` the
-        // whole of the property: the marker let a waiting writer in before the
-        // step ended.
-        assert!(
-            during_the_step > 0,
-            "a competing writer NEVER got the region table while the marker drained {GRAYS} \
-             objects — that is the pre-F-10 behaviour, the marker holding the guard for the \
-             entire step"
+        // THE ADMISSION CLAIM. Pre-F-10 the marker holds the guard from the
+        // first gray to the last, so a writer that queues mid-step is served
+        // only when the step ends and `granted_at == batches`. Post-F-10 it is
+        // served at the next batch boundary, hundreds of batches short of the
+        // end. There is no thread race left in either reading.
+        let (granted_at, batches) = observed.expect(
+            "every attempt was inconclusive: the marker finished the whole step before this              thread could queue behind it, so the admission claim was never observed",
         );
-        // And the magnitude claim, taken from a counter the scheduler does not
-        // touch: the marker dropped and retook the guard once per batch. This
-        // is deterministic where the thread-race count is not, so a regression
-        // that reduced the drop RATE without reaching zero still fails here —
-        // which is the part `> 0` alone would have given up.
         assert!(
-            batches >= GRAYS / MARK_LOCK_BATCH,
-            "the marker drained {GRAYS} grays in {batches} regions-lock acquisition(s); at \
-             MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at least {} — a reading of 1 means \
-             the guard is held for the whole step again (F-10)",
-            GRAYS / MARK_LOCK_BATCH
+            granted_at < batches,
+            "a writer that queued after 2 of {batches} batches was not served until batch              {granted_at} - the marker held the region table for the entire step (F-10)"
         );
     }
 
@@ -21500,6 +21970,122 @@ mod tests {
             gc.get_field(resurrected, 0),
             Value::Int(0xF1A),
             "the resurrected copy must still hold the object's fields"
+        );
+    }
+
+    /// Phase 3.5 must not make a SECOND copy of an object the closure already
+    /// evacuated.
+    ///
+    /// The two evacuators agree that "where did this object go" is answered by
+    /// the forwarding tag in the from-space mark word (F-02). The parallel
+    /// driver used to RETIRE those tags at the end of `parallel_evacuate`,
+    /// which is before Phase 3.5 rather than after Phase 4 where the serial
+    /// drivers retire theirs — so every already-copied object Phase 3.5 reached
+    /// looked untouched, was copied again, and had its `pointer_map` entry
+    /// overwritten with the duplicate.
+    ///
+    /// Nothing crashes when that happens: `retire_forwards` preserves the shape
+    /// quartet, so the duplicate is a well-formed object. What breaks is
+    /// IDENTITY — the root reaches one copy and the resurrected finalizable's
+    /// field reaches the other. That is what this test measures, rather than
+    /// the counter, because identity is the property the heap owes its users
+    /// and it holds however the collector chooses to implement the check.
+    ///
+    /// Shape of the fixture: one live object named by BOTH a root (so the
+    /// closure copies it in Phase 3) and a dead finalizable (so Phase 3.5
+    /// reaches it again while resurrecting).
+    #[test]
+    fn phase_3_5_does_not_split_the_identity_of_an_object_the_closure_copied() {
+        let gc = make_collector();
+
+        let shared = gc.alloc_object(ClassId::new(88), 1);
+        gc.set_field(shared, 0, Value::Int(0x5EED));
+
+        let fin = gc.alloc_object(ClassId::new(77), 2);
+        let fin_addr = fin.as_ptr() as usize;
+        gc.set_field(fin, 0, Value::Object(Some(shared)));
+        // Something else in Eden so the pause has work beyond these two.
+        let _churn = gc.alloc_object(ClassId::new(1), 1);
+
+        // `shared` is rooted; `fin` is not, so only its finalizer registration
+        // keeps it for one more pause.
+        let mut roots: Vec<ObjectRef> = vec![shared];
+        let (result, dead) =
+            gc.collect_garbage_with_finalizers(&stw(), &mut roots, &[fin_addr], &NoopMonitors);
+
+        assert_eq!(
+            dead.len(),
+            1,
+            "test setup: the dead finalizable must have been resurrected, or              Phase 3.5 never ran and this test checks nothing"
+        );
+        let resurrected = unsafe { ObjectRef::from_raw(dead[0] as *mut u8) };
+        let via_finalizable = match gc.get_field(resurrected, 0) {
+            Value::Object(Some(r)) => r.as_ptr() as usize,
+            other => panic!("the resurrected finalizable's slot 0 reads {other:?}"),
+        };
+        let via_root = roots[0].as_ptr() as usize;
+        assert_eq!(
+            via_root, via_finalizable,
+            "the root and the resurrected finalizable must reach the SAME              object. Two addresses here is an identity split: Phase 3.5 copied              an object the closure had already copied, because the forwarding              tag it decides on had been retired before it ran."
+        );
+        assert_eq!(
+            result.pointer_map.get(&(shared.as_ptr() as usize)).copied(),
+            Some(via_root),
+            "and the pause's forwarding map must name that same copy — it is              what every root, monitor and worklist remap outside the collector              is rewritten through"
+        );
+    }
+
+    /// The PARALLEL twin of
+    /// `no_object_carries_a_forwarding_tag_after_a_pause_that_keeps_regions`.
+    ///
+    /// That test drives `young_collection_serial` explicitly, with a comment
+    /// saying the dispatcher would otherwise pick the parallel evacuator "which
+    /// retires its forwards inside `parallel_evacuate` and would make this test
+    /// vacuous". Both drivers now retire at the same protocol point, so the
+    /// obligation is the same one and both arms must be checked — a mirror that
+    /// only moves in one direction is how the serial arm's retirement test
+    /// passed with `retire_forwards` deleted.
+    #[test]
+    fn the_parallel_driver_also_leaves_no_forwarding_tag_behind() {
+        let gc = make_collector();
+
+        let head = gc.alloc_object(ClassId::new(1), 1);
+        let mut prev = head;
+        for _ in 0..32 {
+            let next = gc.alloc_object(ClassId::new(1), 1);
+            gc.set_field(prev, 0, Value::Object(Some(next)));
+            prev = next;
+        }
+
+        // Leave the evacuator nowhere to copy to, so objects self-forward and
+        // their regions are KEPT — a forward left in a freed region is zeroed
+        // by Phase 5 and would make this vacuous.
+        let region_count = gc.num_regions();
+        for i in 0..region_count {
+            assert!(gc.commit_through_region(i), "fixture: commit must succeed");
+        }
+        gc.with_regions_mut(|regions| {
+            for r in regions.iter_mut() {
+                if r.region_type == RegionType::Free {
+                    r.region_type = RegionType::Old;
+                    r.set_cursor(r.data.len());
+                }
+            }
+        });
+
+        let mut roots: Vec<ObjectRef> = vec![head];
+        let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        assert!(
+            result.pointer_map.iter().any(|(k, v)| k == v),
+            "test setup: the pause must have SELF-FORWARDED something, or no              region is kept and this test cannot observe a surviving forward"
+        );
+
+        let offenders = forwarded_objects_in_heap(&gc);
+        assert!(
+            offenders.is_empty(),
+            "{} object(s) still carry a forwarding tag after a PARALLEL pause,              e.g. 0x{:x}",
+            offenders.len(),
+            offenders.first().copied().unwrap_or(0)
         );
     }
 

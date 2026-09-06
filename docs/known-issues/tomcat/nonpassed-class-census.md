@@ -83,7 +83,21 @@ as a VM defect. It is the cheapest open item on this page.
 | `coyote.http2.TestHttp2Section_5_1` | 2 of 28 |
 | `coyote.http2.TestHttp2Section_8_2` | 1 of 6658 |
 
-Not diagnosed.
+**Three of the four are FIXED (2026-09-05) and were one bug**, not an HTTP/2
+cluster at all: `sun.nio.ch.SocketChannelImpl.stateLock` read null, so the real
+`toString()` bytecode threw `NullPointerException: Cannot enter synchronized
+block` from inside Tomcat's own error and teardown paths and killed the
+connection in flight. `TestFlowControl`, `TestHttp2Section_5_1` and
+`TestHttp2Section_6_1` are `OK` on the fix, at their exact failing counts; so is
+`catalina.core.TestAsyncContextImpl` from section 5, which carried the identical
+signature. Write-up:
+`socketchannelimpl-statelock-null-npe-kills-http-connections-FIXED-20260905.md`.
+
+`TestHttp2Section_8_2` is NOT that bug — its log contains zero `stateLock`
+occurrences. Its row reads `124,300,HANG,21.27`: `rc=124` is this harness's
+cap, `300` is the cap exactly, and the load average as it finished was 21.27.
+A 6658-test class capped on a loaded host is what the loadavg column exists to
+identify. Still undiagnosed, still not shown to be a VM defect.
 
 ### 3. TLS — 2, both accepted limits
 
@@ -131,7 +145,7 @@ not necessarily a platform difference — check the classpath SHAPE first.**
 
 | class | failing |
 |---|---|
-| `catalina.core.TestAsyncContextImpl` | 4 of 70 |
+| `catalina.core.TestAsyncContextImpl` | 4 of 70 — ✅ **FIXED 2026-09-05**, same `stateLock` NPE as the HTTP/2 cluster in section 2 (`OK (70 tests)` on the fix) |
 | `catalina.connector.TestSendFile` | 1 of 2 |
 | `catalina.manager.TestManagerWebapp` | 2 of 4 on 2026-08-25 (1 of 4 on 08-14) — `testServlets` times out reading `GET /manager/jmxproxy` (`:147`), `testJsps` fails `assertTrue(body.contains("Sessions Administration"))` on `/manager/html/sessions` (`:697`). Both reproduce on pristine `dev`; HotSpot is `OK (4 tests)` in 19.6 s. **Not deploy timing** — the deploy itself finishes in 15.5 s and `testBug57700`/`testDeploy` both pass, which is what closed `webapp-deploy-annotation-scan-interpreted-226x-CLOSED-20260825.md` |
 | `catalina.manager.TestHostManagerWebapp` | 1 of 1 — **flaky**: serially `OK` (29 s) on 08-22, `FAILURES` (31 s) on 08-23 |

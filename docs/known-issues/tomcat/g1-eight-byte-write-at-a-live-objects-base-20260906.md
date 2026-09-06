@@ -70,6 +70,97 @@ the allocator instead of by a cast.
 
 These are the walks that *read* the damage. None of them is the writer.
 
+## CORRECTION 2026-09-06: it is NOT `SharedEvac`, and that was measured
+
+The section below inferred "the write happens inside a pause, after the copy"
+from the fact that candidates screen clean and holders do not. **A copy-watch
+refutes it.**
+
+`CRATONVM_G1_EVAC_COPY_WATCH=1` records every to-space copy's first header word
+as `evacuate` makes it — the normal-copy CAS winner AND the
+evacuation-failure self-forward — and re-reads them at three checkpoints:
+after the parallel closure, after the serial self-forward drain, and at the
+START of the next pause (dropping entries whose region has since been recycled).
+
+| checkpoint | copies checked | changed |
+|---|---:|---:|
+| after the parallel closure | 374k, 401k, … (30 pauses) | **0** |
+| after the serial self-forward drain | same | **0** |
+| at the start of the next pause | 447k / 446k / 504k … (3 188 checkpoints) | **0** |
+
+Not one object that `SharedEvac` copied or self-forwarded ever had its first
+word rewritten — inside the pause or between pauses, in runs that went on to
+OOM. **The eight-byte write is not in `SharedEvac`.** Everything below about
+what the corruption physically IS still stands; only the attribution was wrong.
+
+## What IS wrong in `SharedEvac`: it declares to-space exhaustion while to-space is free
+
+The kill switch (parallel 0/10, serial 5/5) has a different explanation, and it
+is a one-line difference between the two allocators:
+
+* the serial `alloc_in_type_locked_scan` scans **every existing non-CSet region
+  of the destination type** and bump-allocates into a partially-filled one, and
+  only then claims a Free region;
+* `SharedEvac::tlab_alloc` can only ever take from `pool` — the Free regions
+  reserved before the dispatch. When the pool is gone it returns `None`, which
+  is the **evacuation-FAILURE** signal: self-forward, keep the CSet region, run
+  `retry_after_evacuation_failure`.
+
+Measured, same census, same class:
+
+```
+[g1] parallel evacuation EXHAUSTED ITS POOL (#1): dest_type=Old size=48
+     pool_len=1 — but 2017 of 2025 non-CSet Old regions still have room for it.
+```
+
+A **forty-eight byte** promotion failing with 2017 usable regions. Same binary,
+arms interleaved, parallel against `CRATONVM_G1_PARALLEL_EVAC=0`: **14 such
+reports in the parallel arm, 0 in the serial arm.**
+That is why the two arms diverge: one of them spends the pause copying and the
+other spends it failing to copy, and the failure path is the fragile one.
+
+`CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` (default ON) gives the parallel arm the
+same fallback: on pool exhaustion, one object's worth of space in an existing
+non-CSet region of the destination type. It is a direct `bump_alloc` and
+deliberately NOT a TLAB — a TLAB owns its region's cursor and `retire_tlab`
+STORES it, which would discard a shared bump — and it skips the pool and the
+CSet for that reason and for Phase 5's.
+
+A SECOND census, again one binary with the arms interleaved, this time the
+fallback off against on, three repetitions each:
+
+| arm | pool-exhaustion reports |
+|---|---|
+| `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST=0` | 16, 19, 14 |
+| default | 9, 0, 0 |
+
+and the `compact reference walk REFUSED a field offset past the holder's own
+body` count goes 8 with the fallback off to 0 with it on. The corruption signal
+tracks the exhaustion, which is the causal chain this page was looking for.
+
+(These are two SEPARATE censuses and the numbers must not be spliced: the
+parallel-vs-serial 14/0 above and the off-vs-on table here were measured in
+different runs, and an earlier revision of this page quoted "16 … and 0 in the
+serial arm" by taking one number from each.)
+
+The clincher is what the exhaustion report says on each arm. It prints how much
+room the serial arm WOULD have found at that instant, and after the fallback has
+already been tried:
+
+| arm | report |
+|---|---|
+| fallback OFF | `dest_type=Survivor size=32 pool_len=28 — but 23 of 24 non-CSet Survivor regions still have room` |
+| fallback ON | `dest_type=Survivor size=176 pool_len=0 — but 0 of 2 non-CSet Survivor regions still have room` |
+
+**Off, it is failing a 32-byte evacuation with 23 of 24 regions usable and 28
+regions still in its own pool. On, it only reports once the heap is genuinely
+full.** The parallel evacuator is no longer manufacturing to-space exhaustion;
+what is left is real.
+
+**It does not make the class pass.** Neither arm is healthy yet — the remaining
+failures are genuine heap exhaustion at `-Xmx2g` (and one CRASH). Pool
+exhaustion was real, is fixed, and is not the whole story.
+
 ## The corruption happens INSIDE a pause, after the copy
 
 `IMPLAUSIBLE legacy header at ref-slot-candidate` is **0** in the runs whose
@@ -79,9 +170,10 @@ copies those same candidates became*. So the pointer is written at the base of
 an object that was sound when it was copied, at some point before the same
 pause scans it.
 
-That is the single most useful narrowing on this page and it is what makes the
-producer findable: it is a write performed by GC code, during a pause, into
-to-space.
+**Superseded — see the CORRECTION above.** The copy-watch shows no such write
+happens to anything `SharedEvac` produced. The complementarity the reasoning
+rested on (corrupt holders and implausible candidates never co-occur) is still
+a real regularity; the conclusion drawn from it was not.
 
 ## Three screens that could not see it
 

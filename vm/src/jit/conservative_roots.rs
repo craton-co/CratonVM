@@ -1841,6 +1841,36 @@ pub fn a5_engagement_enabled() -> bool {
     })
 }
 
+/// Print the A5 FALLBACK census — how many moving-young cycles the A5 probe
+/// diverted, and how many of those it diverted on a word that was not a live
+/// frame at all.
+///
+/// Deliberately NOT folded into [`report_a5_engagement`], which answers a
+/// different question ("does the memo engage") on a different flag. And
+/// deliberately called from BOTH VM exit arms rather than only the `Ok(())`
+/// one: the run this census exists to explain is a run whose test FAILED, and
+/// on that arm `report_a5_engagement` never executes. A census that prints
+/// only when nothing went wrong is a census of the uninteresting population.
+/// `Once`-guarded, so having it on both arms is correct.
+pub fn report_a5_fallback_census() {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if !a5_fallback_dbg() {
+                return;
+            }
+            let (hits, residue, shapeless, filtered) = a5_fallback_census();
+            eprintln!(
+                "[a5-fallback] TOTALS hits={hits} residue={residue} shapeless={shapeless} \
+                 filtered={filtered} residue_filter={} shape_filter={}",
+                a5_residue_filter_enabled(),
+                a5_shape_filter_enabled(),
+            );
+        });
+    }
+}
+
 /// Print the A5 engagement census. Called from the VM's shutdown path.
 pub fn report_a5_engagement() {
     if !a5_engagement_enabled() {
@@ -2352,6 +2382,107 @@ fn return_pc_validation_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_RETPC_VALIDATE").is_none()
+    })
+}
+
+/// How many times the A5 probe diverted a moving-young cycle, split by what
+/// the ONE hit slot it returned actually looked like.
+///
+/// The probe is a raw-word scan, and its own doc comment has named cutting the
+/// false-positive rate as the designated follow-up since it was written. Two
+/// screens exist for that and neither could be judged here, because the
+/// population was never counted: `native_stack_jit_frame_census` re-walks the
+/// whole band (so it is opt-in and off in every real run) and the residue
+/// filter was applied at one of the probe's two call sites only.
+///
+/// `A5_FALLBACK_RESIDUE` counts hits at a slot BELOW this thread's
+/// returned-JIT-frame high-water mark — the leftovers of a compiled frame that
+/// has already returned. `A5_FALLBACK_SHAPELESS` counts hits at a slot that is
+/// not the return-address slot of a frame at all, and is only computed when
+/// something asks for it (it reaches the global code-range table, which the
+/// probe's fast path exists to avoid). Either makes the hit a false positive,
+/// and a false positive costs the young generation its copying collector for
+/// that cycle.
+pub static A5_FALLBACK_HITS: AtomicUsize = AtomicUsize::new(0);
+/// Hits whose slot sits below [`jit_residue_hi`] — see [`A5_FALLBACK_HITS`].
+pub static A5_FALLBACK_RESIDUE: AtomicUsize = AtomicUsize::new(0);
+/// Hits whose slot has no frame shape — see [`A5_FALLBACK_HITS`]. Only counted
+/// when the shape filter or the fallback dump is on.
+pub static A5_FALLBACK_SHAPELESS: AtomicUsize = AtomicUsize::new(0);
+/// Hits a screen suppressed — see [`A5_FALLBACK_HITS`].
+pub static A5_FALLBACK_FILTERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot of the A5 fallback census: `(hits, residue, shapeless, filtered)`.
+pub fn a5_fallback_census() -> (usize, usize, usize, usize) {
+    (
+        A5_FALLBACK_HITS.load(Ordering::Relaxed),
+        A5_FALLBACK_RESIDUE.load(Ordering::Relaxed),
+        A5_FALLBACK_SHAPELESS.load(Ordering::Relaxed),
+        A5_FALLBACK_FILTERED.load(Ordering::Relaxed),
+    )
+}
+
+/// `CRATONVM_DBG_A5_FALLBACK=1` — print the first sixteen A5 probe hits and
+/// then every power of two, naming the slot, whether it is residue, and whether
+/// it has frame shape.
+///
+/// Distinct from [`a5_census_enabled`], which re-walks the whole band to count
+/// EVERY candidate word in it. This one reports what the probe already found.
+/// The probe runs on the per-native-call root-snapshot path — measured at 1.1
+/// million calls in one 240 s run — so it is rate-limited rather than
+/// per-event, and the totals are in [`a5_fallback_census`].
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_fallback_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_FALLBACK").is_some())
+}
+
+/// Kill switch for the residue filter on the MOVING-YOUNG COVERAGE probe —
+/// `CRATONVM_JIT_A5_RESIDUE_FILTER=0` accepts every hit again.
+///
+/// `scan_active_jit_frames` has applied exactly this filter, with exactly this
+/// argument, since the H2 `FileNioMapped.unMap` investigation: a compiled
+/// method that has already returned leaves a return address into JIT code at
+/// every depth below its own `entry_sp`, and that is indistinguishable by
+/// inspection from a live guardless frame. The one live guardless frame the
+/// probe exists for is the process entry point, which sits ABOVE every JIT
+/// entry the run has ever made and therefore above the mark.
+///
+/// The coverage probe in `refresh_moving_young_coverage_for_current_thread` is
+/// the same scan asking the same question and did NOT have it — the cheaper
+/// half of the two, because there a false positive only declines to MOVE (the
+/// sound direction), whereas at the marking site it declines to MARK. The
+/// filter was therefore already trusted in the more dangerous of the two
+/// places.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_residue_filter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_RESIDUE_FILTER").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// Opt-in gate for the frame-shape filter on the moving-young coverage probe —
+/// `CRATONVM_JIT_A5_SHAPE_FILTER=1`.
+///
+/// Default OFF, and deliberately so on two counts.
+/// [`a5_slot_has_frame_shape`] was written as a PRICING instrument and its own
+/// doc says it is "only ever used to decide whether over-detection is
+/// happening, never to suppress a hit that passes"; turning it into a
+/// suppressor is a different claim and needs its own measurement. And it costs
+/// a `lookup_jit_code_range`, i.e. the global table lock that the probe's fast
+/// path was rewritten to avoid.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn a5_shape_filter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_A5_SHAPE_FILTER").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        )
     })
 }
 
@@ -4267,6 +4398,46 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 high.saturating_sub(search_lo),
             );
         }
+        // CLASSIFY THE ONE HIT, then decide. The residue test is a
+        // thread-local read of a mark the probe already maintains, so it runs
+        // on every hit; the shape test reaches the global code-range table and
+        // runs only when something asks. Counting happens whether or not either
+        // screen is armed, which is what lets a run say how much of its OWN
+        // fallback population each screen would convert — the number the two
+        // screens have never had.
+        let hit = match hit {
+            None => None,
+            Some((slot, word)) => {
+                let n = A5_FALLBACK_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+                let residue_hi = jit_residue_hi();
+                let is_residue = residue_hi != 0 && slot < residue_hi;
+                if is_residue {
+                    A5_FALLBACK_RESIDUE.fetch_add(1, Ordering::Relaxed);
+                }
+                let want_shape = a5_shape_filter_enabled() || a5_fallback_dbg();
+                let shapeless = want_shape && !a5_slot_has_frame_shape(slot, high);
+                if shapeless {
+                    A5_FALLBACK_SHAPELESS.fetch_add(1, Ordering::Relaxed);
+                }
+                let filtered = (is_residue && a5_residue_filter_enabled())
+                    || (shapeless && a5_shape_filter_enabled());
+                if a5_fallback_dbg() && (n <= 16 || n.is_power_of_two()) {
+                    eprintln!(
+                        "[a5-fallback] #{n} slot=0x{slot:x} word=0x{word:x} \
+                         residue_hi=0x{residue_hi:x} is_residue={is_residue} \
+                         shapeless={shapeless} filtered={filtered} \
+                         band=[0x{search_lo:x},0x{high:x}) chain_len={}",
+                        JIT_ENTRY_CHAIN.with(|c| c.borrow().len()),
+                    );
+                }
+                if filtered {
+                    A5_FALLBACK_FILTERED.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else {
+                    Some((slot, word))
+                }
+            }
+        };
         if let Some((slot, word)) = hit {
             if dbg {
                 // Name the actual evidence: which slot, which word, how far
@@ -4401,6 +4572,15 @@ pub fn refresh_moving_young_coverage_for_collection(pins_honoured: bool) -> bool
     }
     let mut complete = refresh_moving_young_coverage_for_current_thread();
     let peer_depth = peer_jit_depth();
+    if peer_depth == 0 {
+        // The unguarded door. Everything below is the peer ledger; a zero skips
+        // all of it, so a zero has to be recorded where it happens or it is
+        // indistinguishable from an accounted cycle in every census.
+        cratonvm_gc::gc_quiescence::note_peer_depth_zero(
+            global_jit_depth_raw(),
+            current_thread_jit_depth(),
+        );
+    }
     if peer_depth > 0 {
         let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
         // Depth belonging to peers this cycle discharged by PINNING instead of
@@ -4525,6 +4705,16 @@ fn peer_jit_depth() -> usize {
     GLOBAL_JIT_DEPTH
         .get()
         .saturating_sub(current_thread_jit_depth())
+}
+
+/// The striped process-wide JIT depth, unreduced.
+///
+/// `peer_jit_depth` folds this into a difference and clamps at zero, which
+/// destroys the evidence for whether the zero was a quiet process or an
+/// inconsistent read. The classifier needs the raw value.
+#[inline]
+fn global_jit_depth_raw() -> usize {
+    GLOBAL_JIT_DEPTH.get()
 }
 
 /// May the cross-thread coverage handshake discharge `CROSS_THREAD_JIT_PEER`?

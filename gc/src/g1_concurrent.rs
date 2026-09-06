@@ -740,45 +740,69 @@ mod tests {
     #[test]
     fn parallel_markers_steal_the_wide_frontier_from_each_other() {
         const CHILDREN: usize = 40_000;
-        let g1 = parallel_mark_collector();
-        if g1.mark_worker_count() < 2 {
-            eprintln!("[F-12] parallel marking not exercised: 1 worker on this machine");
-            return;
-        }
-
-        // One root holding CHILDREN references, each child holding one more
-        // object, so a stolen entry is itself worth scanning.
-        let root = g1.alloc_array(ClassId::new(6), ArrayElementType::Reference, CHILDREN);
-        for i in 0..CHILDREN {
-            let child = g1.alloc_object(ClassId::new(7), 1);
-            let leaf = g1.alloc_object(ClassId::new(8), 0);
-            g1.set_field(child, 0, Value::Object(Some(leaf)));
-            g1.set_array_element(root, i, Value::Object(Some(child)))
-                .expect("array store");
-        }
-
-        g1.start_concurrent_mark(&stw());
-        g1.remark(&stw(), &[root]);
-
-        let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
-        for _ in 0..5_000 {
-            if controller.is_quiesced() {
-                break;
+        // THE ATTEMPT IS RETRIED. Whether a peer is SCHEDULED before the owner
+        // drains its own deque is the scheduler's answer; whether it has a
+        // ROUTE to the work is this collector's, and only the second is what
+        // F-12 claims. On 2026-09-06 this test failed in 3 of 6 gc-lib-suite
+        // runs on unmodified `dev` at host load ~20 -- always with
+        // `scans [80010, 0]`, i.e. one worker did the entire frontier before
+        // its peer ran at all -- on a host whose eight cores were already
+        // carrying the suite's own eight test threads.
+        //
+        // Retrying gives nothing up: with `take_marking_work` returning `false`
+        // instead of scanning peers (the arm this test was verified capable of
+        // failing on) there is no route at all, so every attempt reads
+        // `steals == 0` and this still goes red. A fresh collector per attempt
+        // because the frontier is consumed.
+        const ATTEMPTS: usize = 12;
+        let mut last: Option<(Vec<usize>, usize, usize)> = None;
+        for _ in 0..ATTEMPTS {
+            let g1 = parallel_mark_collector();
+            if g1.mark_worker_count() < 2 {
+                eprintln!("[F-12] parallel marking not exercised: 1 worker on this machine");
+                return;
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        controller.request_stop_and_join().expect("workers joined");
 
-        let scans = g1.dbg_mark_worker_scans();
-        let busy = scans.iter().filter(|&&n| n > 0).count();
-        let steals = g1.dbg_mark_steals();
+            // One root holding CHILDREN references, each child holding one more
+            // object, so a stolen entry is itself worth scanning.
+            let root = g1.alloc_array(ClassId::new(6), ArrayElementType::Reference, CHILDREN);
+            for i in 0..CHILDREN {
+                let child = g1.alloc_object(ClassId::new(7), 1);
+                let leaf = g1.alloc_object(ClassId::new(8), 0);
+                g1.set_field(child, 0, Value::Object(Some(leaf)));
+                g1.set_array_element(root, i, Value::Object(Some(child)))
+                    .expect("array store");
+            }
+
+            g1.start_concurrent_mark(&stw());
+            g1.remark(&stw(), &[root]);
+
+            let controller = ConcurrentMarkController::spawn(Arc::clone(&g1));
+            for _ in 0..5_000 {
+                if controller.is_quiesced() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            controller.request_stop_and_join().expect("workers joined");
+
+            let scans = g1.dbg_mark_worker_scans();
+            let busy = scans.iter().filter(|&&n| n > 0).count();
+            let steals = g1.dbg_mark_steals();
+            if steals > 0 && busy >= 2 {
+                return;
+            }
+            last = Some((scans, busy, steals));
+        }
+
+        let (scans, busy, steals) = last.expect("at least one attempt ran");
         assert!(
             steals > 0,
-            "no worker ever stole: per-worker scans {scans:?}. A {CHILDREN}-wide frontier starts life on ONE worker's deque, so zero steals means the peers had no route to the work at all (F-12)"
+            "no worker ever stole in {ATTEMPTS} attempts; last per-worker scans {scans:?}. A              {CHILDREN}-wide frontier starts life on ONE worker's deque, so zero steals means              the peers had no route to the work at all (F-12)"
         );
         assert!(
             busy >= 2,
-            "only {busy} of {} markers scanned anything ({scans:?}) — the deques exist but the work never spread (F-12)",
+            "only {busy} of {} markers scanned anything ({scans:?}) in {ATTEMPTS} attempts -              the deques exist but the work never spread (F-12)",
             scans.len()
         );
     }

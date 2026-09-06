@@ -68,6 +68,7 @@ echo
 [ -f "$GO/GpuWarm.class" ] || { echo "FATAL: $GO/GpuWarm.class missing — compile bench-gpu fixtures first"; exit 1; }
 [ -f "$GO/GpuCompute.class" ] || { echo "FATAL: $GO/GpuCompute.class missing — compile bench-gpu fixtures first"; exit 1; }
 [ -f "$TG/BoundsDeopt2.class" ] || { echo "FATAL: $TG/BoundsDeopt2.class missing — compile test_classes/gpu fixtures first"; exit 1; }
+[ -f "$TG/GpuForwardRef.class" ] || { echo "FATAL: $TG/GpuForwardRef.class missing — compile test_classes/gpu fixtures first"; exit 1; }
 
 # ── gate a: --gpu-info sees a real device ──────────────────────────────
 # `--gpu-info` always exits 0 (both "device found" and "no CUDA driver" are
@@ -226,6 +227,70 @@ if [ "$GATE_REDUCTION" = "1" ]; then
   fi
 else
   skip "dot-reduction gate (GATE_REDUCTION=0 — it is on by default; something turned it off)"
+fi
+echo
+
+# ── gate f: a kernel in ANOTHER CLASS still offloads ───────────────────
+# `offload_jit_gate` populates the compiled-tier offload registry as a side
+# effect of scanning CALLERS, and it can only judge a call target whose
+# declaring class is already loaded. A caller is scanned when it is ADMITTED to
+# the JIT, which is before it runs — so a callee in a second class has usually
+# never been touched at that moment. Until 2026-09-06 such a target was written
+# off by `try_compiled_offload` as NotKernel for the life of the process, on the
+# FIRST execution of the site, using a registry that could not yet know about a
+# class that same dispatch was on its way to loading.
+#
+# Every other GPU fixture in this tree declares its kernels beside its driver —
+# GpuLdcSplit, GpuIntensitySweep, GpuProbe, GpuWarm — so none of them can see
+# this, and the whole existing battery was green while it was live. That is what
+# this gate is for.
+#
+# THE CHECKSUM CANNOT GATE IT, for the same reason as gate e: the kernel
+# computes the same answer on the CPU. GpuForwardRef prints one, and it is here
+# only to prove the two arms did the same work.
+#
+# The arms differ in NOTHING but which class the kernel is declared in, so this
+# is a same-config control rather than a threshold:
+#
+#   sameclass  : GpuForwardRef.scaleHere — the gate can always judge it. Never
+#                affected by this defect, and it is what "working" looks like.
+#   otherclass : GpuForwardRefKernel.scale — the identical body, one class away.
+#
+# Both must dispatch. `otherclass` is allowed one non-dispatching call: the
+# first execution of the site is the thing that loads the class, so the helper
+# re-asks and offloads from the second call on. Requiring ALL of them would be
+# a gate that fails on correct behaviour.
+echo "--- gate f: GpuForwardRef, a kernel one class away from its caller ---"
+if [ -f "$TG/GpuForwardRef.class" ]; then
+  FWD_ITERS=40
+  fwd_ok=1
+  fwd_cs=""
+  for arm in sameclass otherclass; do
+    if [ "$arm" = "sameclass" ]; then pat='GpuForwardRef\.scaleHere'; else pat='GpuForwardRefKernel\.scale'; fi
+    arm_out=$(RUST_LOG="cratonvm_vm::runtime::offload=info" \
+      CRATONVM_GPU_TRACE_BYTES=1 \
+      timeout "$TIMEOUT_S" "$CV_GPU" --gpu --gpu-min-work 1 --java-home "$JDK" \
+      --Xmx 4g -cp "$TG" GpuForwardRef "$arm" 262144 "$FWD_ITERS" 2>&1)
+    arm_cs=$(extract checksum "$arm_out")
+    arm_witness=$(echo "$arm_out" | grep -cE "H2D=[0-9]+ bytes \($pat")
+    echo "  $arm: checksum=$arm_cs dispatch witness lines=$arm_witness/$FWD_ITERS"
+    if [ -z "$arm_cs" ]; then
+      fail "GpuForwardRef[$arm]: could not parse checksum"
+      fwd_ok=0
+    elif [ -z "$fwd_cs" ]; then
+      fwd_cs="$arm_cs"
+    elif [ "$arm_cs" != "$fwd_cs" ]; then
+      fail "GpuForwardRef: checksum differs between arms ($fwd_cs vs $arm_cs) — the arms are not doing the same work"
+      fwd_ok=0
+    fi
+    if [ "$arm_witness" -lt $((FWD_ITERS - 1)) ]; then
+      fail "GpuForwardRef[$arm]: dispatched $arm_witness/$FWD_ITERS times. The answer is still right — the kernel just ran on the CPU. On 'otherclass' this is the 2026-09-06 forward-reference regression (CRATONVM_GPU_JIT_GATE_LATE_REGISTER=0 reproduces it deliberately); on 'sameclass' it is broader than that."
+      fwd_ok=0
+    fi
+  done
+  [ "$fwd_ok" -eq 1 ] && pass "GpuForwardRef: both arms dispatched, checksums agree ($fwd_cs)"
+else
+  fail "GpuForwardRef.class missing — compile test_classes/gpu fixtures first (gate f requires it)"
 fi
 echo
 

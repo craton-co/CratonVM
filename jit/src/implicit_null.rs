@@ -115,12 +115,11 @@ const CAP: usize = 1 << 15;
 
 /// `0` means "empty, or retired". A real faulting PC is never 0.
 ///
-/// Inline `const` blocks rather than a named `const ZERO` repeated: a named
-/// constant of a type with interior mutability is
-/// `clippy::declare_interior_mutable_const`, because every USE of it produces a
-/// fresh value and a reader who writes `ZERO.store(..)` is storing into a
-/// temporary that is discarded. The named constant was the only way to build
-/// this array before inline `const` (Rust 1.79); the workspace MSRV is 1.80.
+/// The inline `const` block is a fresh `AtomicUsize` PER ELEMENT. It replaced a
+/// named `const ZERO`, which worked for the same reason -- a `const` is copied
+/// at each use -- but is the shape `clippy::declare_interior_mutable_const`
+/// warns about, because the same name read anywhere else would silently
+/// produce a temporary to mutate rather than shared state.
 static FAULT_PC: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
 static RECOVER_PC: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
 /// Monotonic high-water mark. Never decreases — see hazard 2.
