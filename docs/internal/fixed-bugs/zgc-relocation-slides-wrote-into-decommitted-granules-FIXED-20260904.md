@@ -203,6 +203,16 @@ all five are gone:
 | `synth.TestPowerOffFs2` | CRASH | FAIL |
 | `store.TestKillProcessWhileWriting` | CRASH | HANG |
 
+**`TestKillProcessWhileWriting`'s HANG is the SUITE'S CAP, not a failure**
+(established 2026-09-06). That class's healthy runtime is 605-716 s under G1 and
+811 s under the default collector, and `run-h2-suite.sh` caps a class at
+`CLASS_TO=300`. It reports HANG whatever the VM does. See
+`known-issues/h2/bug-h2-testkillprocesswhilewriting-g1-oom-20260829.md`, which
+carries the cap finding and the `CLASS_TO=1800` invocation. The suspicion below
+that these are "300 s class timeouts on a shared box" was right about the number
+and one step short of the cause: the cap is below the measurement even on an
+idle host.
+
 The last two still do not pass, but they no longer crash — a different failure,
 to be taken on its own terms rather than as this one.
 

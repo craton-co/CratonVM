@@ -724,6 +724,59 @@ header-vs-region disagreement it contains is still happening.
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
 
+## ADDENDUM 2026-09-06: the SUITE cannot show this class passing, at any state of the fix
+
+This page says the class passes in **605-716 s** under G1, and 811 s for the
+default collector on the same host and binary. The H2 suite runner's default
+per-class timeout is:
+
+```
+apps/h2database-suite-runner/run-h2-suite.sh:40
+CLASS_TO="${CLASS_TO:-300}"          # per-class timeout seconds
+```
+
+**300 s is less than half this class's healthy runtime.** A suite run therefore
+reports `TestKillProcessWhileWriting` as HANG/TIMEOUT whether the defects on
+this page are fixed or not: the instrument's cap is below the measurement.
+
+That is not a hypothetical. It is the row
+`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+records as `store.TestKillProcessWhileWriting | CRASH | HANG` and reads as "no
+longer crashes, still does not pass". The crash half is real progress; the HANG
+half is this cap, and that page's own note that its HANG totals "are 300 s class
+timeouts on a shared box, so read them as contention" is the same observation
+one step short of the cause.
+
+**Anyone re-running this class must raise the cap or they will re-open this
+row:**
+
+```bash
+CLASS_TO=1800 ./run-h2-suite.sh run --category all --class org.h2.test.store.TestKillProcessWhileWriting
+```
+
+`--class-to S` is the equivalent flag. 1800 s is ~2.5x the slowest measured
+pass, which leaves room for a loaded host — this box has run at load 17-48 on 8
+cores all week, and the pass times above were themselves taken on it.
+
+### Why the cap is not simply raised in the runner
+
+`apps/` is `.gitignore`d (line 12), and `git ls-files` does not know
+`run-h2-suite.sh`. The runner is **untracked**: a per-class override added there
+is local to one checkout and disappears for everyone else, which is how the
+fixture losses recorded in `vm/tests/common/mod.rs`'s `require_fixture` doc
+happened. The durable fix is either to track the runner or to carry the cap in
+the invocation, and until one of those happens this note is the record.
+
+### What is NOT re-verified
+
+Both fixes are still on dev (`f1bdfd028`, the finalizable-object humongous
+reclaim gate, and `607a16ea2`, the heap-full auto-box) — confirmed ancestors of
+`b7ca9affa`, so nothing was reverted. But the 3/3 pass is a **2026-09-02**
+measurement and has not been repeated since; dev is 144+ commits on. Re-running
+it needs ~35 min of host time and disk headroom the box did not have on 09-06
+(8.5 GB free, 98% full, three other lanes building). Treat the PASS as
+last-measured-then, not as continuously verified.
+
 ## Why it is a different defect, measured rather than assumed
 
 The parent page's whole subject is `zgc: arena allocation failed` —
