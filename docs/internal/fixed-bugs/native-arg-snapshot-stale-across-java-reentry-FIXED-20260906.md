@@ -143,6 +143,41 @@ Same binary, same host, RTX 2060 box, Windows 11, JDK 25.0.3.
 Answers are byte-identical to HotSpot on `GpuResidencyGc 0 1024 800`
 (`diff` clean over all six output lines).
 
+## The tree's own audit could not see this, and why
+
+`scripts/unpinned-native-local-audit.py` landed on `dev` the same day, from a
+different lane, and its header names this exact family — including "under the
+Generational collector's NON-MOVING young sweep an object nothing else roots is
+ZEROED in place". Independent corroboration of the mechanism, and a tool to
+check the fix against.
+
+It does not see this defect. Measured both ways on the same file:
+
+| source | audit total | mentions of `stream_write` / `stream_fd` |
+|---|---|---|
+| pre-fix | 76 candidates | **0** |
+| post-fix | 76 candidates | 0 |
+
+So the post-fix "clean" is VACUOUS — the sites were never in scope, not
+cleaned. The blind spot is one regex:
+
+```python
+PARAM_REF = re.compile(r"([a-z_][a-z_0-9]*)\s*:\s*(?:&mut\s+)?ObjectRef")
+```
+
+Rule 2 matches a parameter DECLARED `ObjectRef`. A native does not receive its
+receiver that way — it receives `args: &[Value]` and reaches the receiver with
+`args.first()`, or passes the whole slice to a helper that does. That is the
+shape of every registered native in the tree, and it is the shape that crashed.
+
+The script's own docs already record that rule 1 was blind to parameters and
+that closing it found 40 of the 48 sites in the 2026-08-25 audit. This is the
+same lesson one level further out: rule 2 is blind to the ARGUMENT SLICE, which
+is how a native holds the reference it is most likely to hold.
+
+Extending it is a Python-only change with no rebuild, and it belongs to the lane
+that owns the script rather than to this fix.
+
 ## What this does NOT close
 
 The hazard is a PROPERTY OF THE CONTRACT, not of these three functions. Any
