@@ -111,9 +111,16 @@ fragmentation family, 219 of 227 refusals.
 ## Kept, because the reproducer is worth more than the bug
 
 `CRATONVM_XT_PINNED_PEER_UNPINNABLE=1` restores the old accounting on the same
-binary. `CRATONVM_GEN_UNCOMMIT=1` remains the detector that made a silent stale
-read into an attributable SIGSEGV — see the retired cross-collector common-work
-write-up for why that flag is opt-in.
+binary, which is what makes this a fix rather than a quiet reproducer.
+
+`CRATONVM_GEN_UNCOMMIT` is the detector that made a silent stale read into an
+attributable SIGSEGV, and it **went back to ON by default on 2026-09-06** once
+this closed — it had been reverted for a day precisely because of this defect.
+So the default path now carries the loudness: any stale young reference that
+survives anywhere in the VM faults immediately, with the released span, the site
+and the code buffer printed, instead of reading the previous cycle's bytes.
+`CRATONVM_GEN_UNCOMMIT=0` is the first thing to reach for if a compiled frame
+faults on a young address.
 
 ---
 
