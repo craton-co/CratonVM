@@ -326,16 +326,47 @@ SUITE=all                  130 passed, 0 failed         131 passed, 0 failed
 SUITE=core                  90 passed, 0 failed          91 passed, 0 failed
 ```
 
-**Both columns are reported, and the left one is the more useful.** Its single
-failure, `RMapGcStress`, is the shape
-`the-suite-ab-that-was-the-harness-20260902.md` already adjudicated, reproduced
-here on a platform that page never ran on: it fails under concurrency and
-**passes alone**, in the same mode, on the same binary
-(`ONLY="RMapGcStress" CRATONVM_ARGS=--jdk-only` → `1 passed, 0 failed`). It also
-passed in `SUITE=all`, which schedules the identical vectors and differs only in
-the flag. Then it passed in every arm of the next run without anything being
-done to it. A green second run is not evidence that it is fixed; it is the same
-intermittent, and quoting only the right-hand column would hide that.
+**Both columns are reported, and the left one is the more useful.**
+
+### `RMapGcStress` is a HARNESS DEADLINE on a loaded host — and I read it wrong twice before that
+
+The left column's failure looked like the concurrency leakage
+`the-suite-ab-that-was-the-harness-20260902.md` recorded: it failed in one arm,
+passed in `SUITE=all` which schedules the identical vectors, and passed alone.
+On a later cycle it failed in **all three arms at once**, on a merge that had
+just brought `gc/src/heap.rs`, `gc/src/vm_heap.rs` and `types/src/heap_types.rs`
+— a much more alarming shape, and one that reads as a GC regression.
+
+It is neither. **Every failure of it measured here was `rc=124`**, and the
+harness says what that is in the failure line itself:
+
+```text
+RMapGcStress FAIL rc=124: HARNESS FAULT — TIMED OUT; the harness killed
+                  the VM, it did not fail [try TIMEOUT=600]
+```
+
+`regression-suite/run.sh` defaults to `TIMEOUT=120`. This host is Windows with
+about 700 MB free while a fat-LTO `rustc` holds 6 GB, and the GC-stress vectors
+do not finish inside 120 s under that pressure. The control is one command and
+it is decisive:
+
+```text
+ONLY=RMapGcStress  TIMEOUT=600  --jdk-only
+  pre-GC-merge binary    PASS      (the control)
+  post-GC-merge binary   PASS      (the same binary that had just failed at 120)
+```
+
+So the GC merge is exonerated, and so is the concurrency story: the vector needs
+more than 120 s here — in every mode, on every binary, alone or scheduled.
+`RMapResizeGc`'s one failure is the same `rc=124` and clears the same way.
+
+**Two readings were wrong before this one, and both were wrong in the
+flattering direction** — "a known intermittent someone else already
+adjudicated" and "another lane's GC change" are each easier to believe than "my
+host is too slow for the default deadline". What settled it was reading `rc`
+instead of the PASS/FAIL label, and running the previous binary as a control on
+the same loaded host. The arms are therefore run at `TIMEOUT=600`, the value the
+harness itself names.
 
 The strict arm prints its own census, and this is the first time it has been
 taken on Windows. Over 131 vectors, union by triple:
