@@ -56,6 +56,31 @@
 //! block's nodes in exactly that order. That coupling is asserted rather than
 //! assumed: see `the_block_node_order_is_the_emission_order`.
 //!
+//! # The three couplings this pass rests on, all checked
+//!
+//! Each is a property of code that lives elsewhere, so each is written down
+//! here rather than remembered:
+//!
+//! 1. **`Schedule::dom` is indexed by POST-layout block numbers.** The pass
+//!    queries it with post-layout indices, and frequency-driven layout permutes
+//!    the block vector. `schedule_with_options` recomputes the matrix after a
+//!    permutation for exactly this reason ("the dominator relation is a
+//!    property of the CFG, not of its numbering") -- if it ever stopped, every
+//!    dominance answer here would be read from the wrong row.
+//! 2. **`ir_lower` emits a block by walking `Block::nodes` in order.** That is
+//!    what makes the same-block accumulation program order rather than an
+//!    arbitrary topological one. Pinned by
+//!    `the_block_node_order_is_the_emission_order`.
+//! 3. **Every op in [`deref_base_input`] takes its base at `inputs[2]`, and
+//!    none of them CONTINUES with a null base.** `ArrayLoad`/`ArrayStore`/
+//!    `ArrayLength` emit an explicit null test that deopts; `Load`/`Store`
+//!    null-check the receiver or fault into the signal handler; the monitor
+//!    ops compare the helper's `i64::MIN` sentinel and jump to the exception
+//!    epilogue, so "a null receiver takes the NPE path" as their own comment
+//!    says. If any of them ever returned normally on null, the fact this pass
+//!    records past it would be false and the elision would be a wrong-code bug
+//!    rather than a missed check.
+//!
 //! # Fail-closed
 //!
 //! Every unknown answers "check needed". An unplaced node (`usize::MAX` in
