@@ -193,6 +193,17 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// and spills to old gen. Which effect wins is a property of the workload's
 /// survival rate, so this ships as a measurable knob at its historical default
 /// rather than as a new default nobody has swept.
+/// `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` -- let the moving young cycle proceed
+/// even when a conservatively-discovered JIT root lies in young-from. The
+/// pre-2026-09-06 behaviour, kept as a one-binary A/B for the diversion this
+/// flag names; see the term it gates in `collect_garbage_inner`.
+fn gen_no_peer_pin_divert() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_PEER_PIN_DIVERT").is_some()
+    })
+}
+
 fn young_trigger_percent() -> usize {
     static PCT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PCT.get_or_init(|| {
@@ -7422,7 +7433,76 @@ impl GenerationalHeap {
         // veto is a correctness fact, not a policy. See
         // `vm_heap::gpu_relocation_forbidden`.
         let gpu_relocation_forbidden = crate::vm_heap::gpu_relocation_forbidden();
+        // A CHEENY COPY CANNOT HONOUR A PIN (2026-09-06).
+        //
+        // G1 and ZGC answer a conservatively-discovered JIT root by PINNING it
+        // -- G1 excludes its region from the collection set, ZGC withholds its
+        // page from the relocation set. A Cheney copy has no such move: every
+        // live object in from-space is copied, so the only way to honour a pin
+        // is not to copy at all. That is exactly what this collector did until
+        // the cross-thread JIT coverage handshake (2026-08-23) let the moving
+        // cycle run while peers are in JIT -- and the deposit paths' own
+        // comment still asserted the old rule ("they can only over-retain: the
+        // young sweep runs non-moving while any thread is in JIT, so nothing
+        // is relocated") for a year of code that no longer honoured it.
+        //
+        // Term 1 above (`has_conservative_roots && !moving_young`) covers the
+        // legacy path. Under moving-young the cycle proceeds on the per-cycle
+        // COVERAGE PROOF instead -- and that proof is about the frames the JIT
+        // ENTRY CHAIN names, while a conservative scan of the same threads'
+        // native stacks finds a strictly larger set: `is_object_address`
+        // accepts any word that looks like a heap object base, so a raw `long`
+        // or an interior pointer can present as a root, and the slot it came
+        // from may not be a slot at all. Relocating one of those and rewriting
+        // only the map-named slots leaves the raw word naming evacuated,
+        // zeroed space -- measured as a SIGSEGV inside compiled
+        // `java/lang/StringUTF16.compress` on the QDox 4-thread repro, 3 runs
+        // out of 3, with the faulting address inside a span the collector had
+        // just decommitted.
+        //
+        // `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` restores the pre-2026-09-06
+        // behaviour for a one-binary A/B.
+        // The test is "this cycle was handed ANY conservatively-discovered JIT
+        // root", not "one of them lands in young-from".
+        //
+        // The narrower young-from test was measured and is NOT enough: it took
+        // the QDox 4-thread repro from 3/3 SIGSEGV to 1/3, and one crash in
+        // three is not a fix. The registry is over- AND under-approximate at
+        // once -- `is_object_address` admits any word that looks like an
+        // object base, and drops interior/derived pointers that name no base
+        // at all -- so "no pin is in from-space" does not imply "nothing in
+        // from-space is named by an un-rewritable word". G1 and ZGC absorb
+        // that gap because they pin at REGION / PAGE granularity, where a
+        // neighbour's pin covers the miss; an all-or-nothing per-cycle
+        // decision has no such slack, so it has to key on the presence of the
+        // population rather than on a per-address test inside it.
+        //
+        // Nor is it "the published pin set is non-empty": that was measured
+        // too, and gave 3/3 SIGSEGV again. The set is EMPTY on cycles that
+        // still relocate under a live compiled frame -- a peer whose last
+        // deposit found no JIT frames publishes an empty vector and its entry
+        // is removed, and the initiator's own scan can be a no-op -- so
+        // "no pins" does not mean "no un-rewritable roots", it means the
+        // registry could not see them.
+        //
+        // What the term keys on instead: a conservative JIT scan RAN this
+        // cycle, and a compiled frame is live. `conservative_jit_scans()` is
+        // reset by `begin_moving_young_coverage_cycle` and bumped by every
+        // publication INCLUDING an empty one, which is exactly the "this
+        // thread looked" fact its own doc says the set cannot hold. The
+        // conjunct is not decoration: it is what separates a real collection
+        // (every mutator deposits on its way into the pause, so the count is
+        // positive whenever anything is compiled) from a cycle where nobody
+        // scanned -- a unit test driving the collector directly, or
+        // `CRATONVM_GC_PRECISE_ONLY_ROOTS=1`, where the operator has asserted
+        // that the precise maps are the whole root set and there is no
+        // conservative population to protect.
+        let unrewritable_conservative_jit_roots = moving_young
+            && !gen_no_peer_pin_divert()
+            && has_conservative_roots
+            && crate::gc_quiescence::conservative_jit_scans() > 0;
         let divert_non_moving = (has_conservative_roots && !moving_young)
+            || unrewritable_conservative_jit_roots
             || honor_promotion_oom_risk
             || divert_for_incomplete_moving_coverage
             || explicit_full_gc
@@ -7456,7 +7536,9 @@ impl GenerationalHeap {
                         dr::NON_MOVING_COVERAGE_INCOMPLETE,
                         crate::gc_quiescence::moving_young_incomplete_reason(),
                     )
-                } else if has_conservative_roots && !moving_young {
+                } else if (has_conservative_roots && !moving_young)
+                    || unrewritable_conservative_jit_roots
+                {
                     (
                         dr::NON_MOVING_CONSERVATIVE_JIT_ROOTS,
                         crate::gc_quiescence::incomplete_reason::NONE,
