@@ -788,6 +788,24 @@ pub struct GcFlags {
     /// any suspected parallel-evacuation regression, and a cycle record still
     /// names which evacuator ran.
     pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_SCREEN` — apply the serial evacuator's header
+    /// screens on the PARALLEL arm too: the root-is-an-object-start guard, the
+    /// per-holder element clamp, and the per-candidate plausibility screen.
+    /// Default **ON** ([`parse::on_unless_zero`]); `=0` restores the
+    /// pre-2026-09-05 unscreened walks.
+    ///
+    /// The screens are not new — `scan_and_evacuate_refs`,
+    /// `scan_source_region_for_cset_refs` and the two serial drivers' root
+    /// loops have had them since 2026-08-26/2026-09-02. They simply never
+    /// crossed to the parallel arm, which is the DEFAULT one, so a corrupt or
+    /// interior candidate that the serial path refuses was followed, copied and
+    /// written through. `=0` is the same-binary A/B for that claim.
+    ///
+    /// It also stands down `SharedEvac::evacuate`'s last-ditch alignment
+    /// refusal, deliberately: an off word that left one guard armed would be a
+    /// HALF A/B — the abort it exists to reproduce would not come back, and the
+    /// arm would read as evidence that the screens were not the fix.
+    pub g1_parallel_evac_screen: bool,
     /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
     /// pauses taken while a thread is inside compiled code. Default **ON**
     /// ([`parse::on_unless_zero`]); `=0` restores the serial fallback.
@@ -1587,6 +1605,43 @@ pub struct GcFlags {
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,
     /// `CRATONVM_G1_DBG_REACH`
+    /// `CRATONVM_G1_VERIFY_HOLDERS` — re-validate a worklist holder's header
+    /// before walking its slots (ten-findings item 4).
+    ///
+    /// Default OFF. The holder is a to-space copy `evacuate_object` already
+    /// screened at both ends, and the slot loops clamp their bounds to the
+    /// holder's own region rather than trusting its header, so the check buys
+    /// no safety in the pause -- only one cold cache line per holder. It stays
+    /// as an instrument for the one defect that would otherwise be invisible:
+    /// a copy overwritten WITHIN the pause that made it.
+    /// `CRATONVM_G1_HUMONGOUS_MARKS` — mark a humongous span "referenced" as
+    /// the pause's slot loops scan into it (ten-findings item 1).
+    ///
+    /// Default **OFF**. Correct and cheap in isolation, but it reads
+    /// `regions[idx].region_type` for every scanned slot, which after item 4 is
+    /// the only region-table access left on the old->old path. Measured
+    /// engagement on 2026-09-05 was ZERO spans decided, on every workload
+    /// tried: a humongous span's holders are old objects the pause never scans,
+    /// which is exactly why the remembered-set walk exists.
+    pub g1_humongous_marks: bool,
+    /// `CRATONVM_G1_IHOP_COUNTS_REGIONS=0` — measure old-generation occupancy
+    /// for IHOP by summing live bytes instead of counting the regions the old
+    /// generation has taken.
+    ///
+    /// Default **OFF**, on measurement rather than on principle. The argument
+    /// for it is sound -- an Old region is unavailable whether it is 5% or
+    /// 100% full, and 211 regions holding 44.7 MB read as 25% of a 179 MB
+    /// threshold they can never cross -- and it does what it claims: concurrent
+    /// marking engaged in 2 of 6 H2 runs against 0 of 6 for the byte count.
+    ///
+    /// But engaging is not helping. `to_space_exhausted` over the same 12 runs
+    /// was 28/40/37/45/30/98 with it on against 4/21/55/22/25/16 with it off --
+    /// no better, plausibly worse, on the only outcome that matters here. A
+    /// mark cycle that starts is still not a mixed collection that reclaims,
+    /// and until the rest of that chain is understood this changes when G1
+    /// spends effort without changing what it gets back.
+    pub g1_ihop_counts_regions: bool,
+    pub g1_verify_holders: bool,
     pub g1_dbg_reach: bool,
     /// `CRATONVM_G1_DBG_ROOTCENSUS`
     pub g1_dbg_rootcensus: bool,
@@ -1641,6 +1696,7 @@ impl GcFlags {
             gc_jit_ref_store_gates: on_unless_zero(src, "CRATONVM_GC_JIT_REF_STORE_GATES"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_parallel_evac_screen: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_SCREEN"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
@@ -1733,6 +1789,9 @@ impl GcFlags {
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
             g1_dbg_accessor: present(src, "CRATONVM_DBG_G1ACCESSOR"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
+            g1_humongous_marks: present(src, "CRATONVM_G1_HUMONGOUS_MARKS"),
+            g1_ihop_counts_regions: present(src, "CRATONVM_G1_IHOP_COUNTS_REGIONS"),
+            g1_verify_holders: present(src, "CRATONVM_G1_VERIFY_HOLDERS"),
             g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
             g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
             g1_dbg_zero: present(src, "CRATONVM_G1_DBG_ZERO"),
@@ -1791,6 +1850,14 @@ pub struct LoaderFlags {
     /// **Default ON**; `0` / `false` / `no` turn it off.
     /// [`parse::on_unless_off_word`].
     pub boot_module_registry: bool,
+    /// `CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE` — a class from a modular jar
+    /// reached through the CLASS path belongs to the unnamed module, as on
+    /// HotSpot, rather than to the module its `module-info.class` declares.
+    /// **Default ON**; `0` / `false` restore the pre-2026-09-05 behaviour in
+    /// which `--add-opens …=ALL-UNNAMED` could not reach such a class. See
+    /// `ModuleRegistry::named_module_for_package`.
+    /// [`parse::on_unless_zero_or_false`].
+    pub classpath_jar_unnamed_module: bool,
     /// `CRATONVM_ALLOW_JSR_RET` — accept `jsr`/`ret` in the verifier.
     /// [`parse::non_empty_non_zero`].
     pub allow_jsr_ret: bool,
@@ -1870,6 +1937,10 @@ impl LoaderFlags {
                 "CRATONVM_LOADER_AWARE_RESOLUTION",
             ),
             boot_module_registry: on_unless_off_word(src, "CRATONVM_BOOT_MODULE_REGISTRY"),
+            classpath_jar_unnamed_module: on_unless_zero_or_false(
+                src,
+                "CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE",
+            ),
             allow_jsr_ret: non_empty_non_zero(src, "CRATONVM_ALLOW_JSR_RET"),
             harden_manifest_classpath: non_empty_non_zero(
                 src,

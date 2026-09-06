@@ -2533,10 +2533,7 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     //     has a live CHM whenever it has been written through, so this is the
     //     common case, not a corner.)
     //
-    // Drop the aliased reference, then rebuild the clone's own backing from the
-    // entries it actually has. `mirror_loaded_entries_to_properties_backend`
-    // creates the CHM when absent, which is the same lazy construction the
-    // write paths use.
+    // Drop the aliased reference, then give the clone a backing of its own.
     ctx.set_field_by_name(clone_ref, "map", Value::Object(None));
     // `source_has_backing`, not just `!entries.is_empty()`: a CHM-less receiver
     // WITH entries is exactly the `System.getProperties()` case, and rebuilding
@@ -2544,9 +2541,67 @@ fn native_properties_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // already on the clone -- `native_object_clone` replicates it onto the new
     // identity -- so a clone that skips this still holds every entry and still
     // enumerates, through the same path its source does.
-    if source_has_backing && !entries.is_empty() {
-        let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
-        mirror_loaded_entries_to_properties_backend(ctx, clone_ref, &entries);
+    //
+    // COPY THE SOURCE'S CHM, do not re-render the side table. This used to call
+    // `mirror_loaded_entries_to_properties_backend(.., &entries)`, and `entries`
+    // is `Vec<(JavaText, JavaText)>` -- the side table, which holds STRING keys
+    // and STRING values only. A `Properties` is a `Hashtable<Object,Object>` and
+    // Java puts non-String values in one freely; those live in the `map` CHM and
+    // are what `chm_extra_entries` exists to read back. Rebuilding from the
+    // rendered snapshot therefore SILENTLY DROPPED every such entry from the
+    // clone:
+    //
+    // ```text
+    // apps/probes/PropertiesCloneProbe.java, --nojit
+    //   after putAll  size=2 keys=[application.id, bootstrap.servers]
+    //   after clone   size=1 keys=[application.id]        HotSpot: size=2
+    // ```
+    //
+    // and that one lost entry is the whole of the three Spring Boot Kafka
+    // classes on the twelve-unclustered residuals page.
+    // `KafkaStreamsConfiguration.asProperties()` is `putAll(configs)` then
+    // `properties.clone()`, `bootstrap.servers` is a `List<String>`, and Kafka
+    // answers a map without it with `ConfigException: Missing required
+    // configuration "bootstrap.servers" which has no default value`.
+    //
+    // `new ConcurrentHashMap<>(map)` is the real body's own second statement, so
+    // copying the CHM is both the faithful thing and the one that keeps the
+    // clone's enumeration order equal to its source's -- the property
+    // `system-properties-clone-enumerates-in-a-different-order-than-its-source`
+    // was retired for. `entries` is still what orders the side-table half and is
+    // still read above.
+    if source_has_backing {
+        let this_pin = ctx.pin_native_root(this);
+        let fresh = match ctx.new_object("java/util/concurrent/ConcurrentHashMap") {
+            Ok(Some(Value::Object(Some(o)))) => Some(o),
+            _ => None,
+        };
+        if let Some(fresh) = fresh {
+            // Pinned AFTER `this_pin`, so the single `unpin_native_roots(this_pin)`
+            // below releases both (a native-root unpin pops every mark above it).
+            let fresh_pin = ctx.pin_native_root(fresh);
+            let fresh_now = ctx.read_native_pin(fresh_pin, fresh);
+            let _ = ctx.invoke(
+                "java/util/concurrent/ConcurrentHashMap",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(fresh_now))],
+            );
+            let this_now = ctx.read_native_pin(this_pin, this);
+            if let Value::Object(Some(src_chm)) = ctx.get_field_by_name(this_now, "map") {
+                let fresh_now = ctx.read_native_pin(fresh_pin, fresh);
+                let _ = ctx.invoke_virtual(
+                    fresh_now,
+                    "putAll",
+                    "(Ljava/util/Map;)V",
+                    &[Value::Object(Some(src_chm))],
+                );
+            }
+            let fresh_now = ctx.read_native_pin(fresh_pin, fresh);
+            let clone_now = ctx.read_native_pin(clone_pin, clone_ref);
+            ctx.set_field_by_name(clone_now, "map", Value::Object(Some(fresh_now)));
+        }
+        ctx.unpin_native_roots(this_pin);
     }
     let clone_ref = ctx.read_native_pin(clone_pin, clone_ref);
     ctx.unpin_native_roots(clone_pin);

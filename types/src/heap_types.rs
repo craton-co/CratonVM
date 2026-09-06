@@ -1557,15 +1557,34 @@ impl ObjectHeader {
     /// copy; it must not be released against the source afterwards, or the
     /// live destination is left with a dangling `Monitor*`. See
     /// `header-shrink.md` §4.
+    /// `#[track_caller]` so a violation names the CALL SITE, not this
+    /// function.
+    ///
+    /// Added 2026-09-05 for the open G1 forwarding-assert investigation
+    /// (`g1-evac-forwarding-assert-and-three-sigsegv-clusters-20260905.md`),
+    /// whose stated next step is "the exact source of the misaligned
+    /// `target` reaching `make_forwarded` (bad `old_ptr` candidate vs.
+    /// bad `tlab_alloc` result)". Those two possibilities are different
+    /// call sites -- G1 passes `old`/`old_addr` when self-forwarding a
+    /// CAS loser and `new_addr`/`new_ptr` for a copy destination -- so
+    /// the caller's location answers the question directly. Without it
+    /// every report points here, which is the one place that cannot be
+    /// at fault.
+    ///
+    /// The message also carries the offending values. A `target` whose
+    /// low bits are a mark tag reads very differently from arbitrary
+    /// garbage, and the previous message printed neither.
     #[inline(always)]
+    #[track_caller]
     pub fn make_forwarded(prev: u64, target: usize) -> u64 {
         assert!(
             target & (MARK_STATE_MASK as usize) == 0,
-            "forwarding target must have its low 2 bits clear (>= 4-byte aligned)"
+            "forwarding target must have its low 2 bits clear (>= 4-byte aligned): target={target:#018x} (low2={low2:#x}) prev={prev:#018x}",
+            low2 = target & (MARK_STATE_MASK as usize)
         );
         assert!(
             crate::plausible_heap_pointer(target as u64),
-            "forwarding target must be a non-null, 8-byte aligned plausible user-space pointer"
+            "forwarding target must be a non-null, 8-byte aligned plausible user-space pointer: target={target:#018x} prev={prev:#018x}"
         );
         Self::quartet_of(prev) | (target as u64) | MARK_FORWARDED
     }

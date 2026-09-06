@@ -724,6 +724,113 @@ header-vs-region disagreement it contains is still happening.
 defect is closed and which never owned this row. The class **passes under the
 default collector**; only the explicit `-XX:+UseG1GC` arm fails.
 
+## ADDENDUM 2026-09-06: the SUITE cannot show this class passing, at any state of the fix
+
+This page says the class passes in **605-716 s** under G1, and 811 s for the
+default collector on the same host and binary. The H2 suite runner's default
+per-class timeout is:
+
+```
+apps/h2database-suite-runner/run-h2-suite.sh:40
+CLASS_TO="${CLASS_TO:-300}"          # per-class timeout seconds
+```
+
+**The class STRADDLES that cap, so the suite row flaps on host load alone.**
+Re-measured 2026-09-06 on binary `a044e1fe1` (a dev ancestor carrying both
+fixes), five runs interleaved on an idle box, load 4-7:
+
+| arm | rc | seconds |
+|---|---|---:|
+| G1 | 0 | 377 |
+| default | 0 | 224 |
+| G1 | 0 | 266 |
+| default | 0 | 299 |
+| G1 | 0 | 360 |
+
+**G1 3/3 PASS, default 2/2 PASS** — the fix holds, four days and 144+ commits
+after it landed, with the default collector as its control.
+
+Now put those against `CLASS_TO=300`: two of the three G1 runs (377 s, 360 s)
+exceed it and one (266 s) does not. On the LOADED host this page's original
+numbers came from it was 605-716 s and always exceeded it. So the same healthy
+binary reports PASS or TIMEOUT for this class depending on nothing but how busy
+the box is.
+
+That is worse than a cap that always fires. A row that always times out gets
+investigated; a row that flaps gets called flaky and dismissed, and the next
+reader has no reason to suspect the cap at all.
+
+That is not a hypothetical. It is the row
+`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+records as `store.TestKillProcessWhileWriting | CRASH | HANG` and reads as "no
+longer crashes, still does not pass". The crash half is real progress; the HANG
+half is this cap, and that page's own note that its HANG totals "are 300 s class
+timeouts on a shared box, so read them as contention" is the same observation
+one step short of the cause.
+
+**Anyone re-running this class must raise the cap or they will re-open this
+row.** Through the suite (`--only` is the class filter; there is no `--class`
+flag, and `--class-to` is the same knob as `CLASS_TO`):
+
+```bash
+CLASS_TO=1800 ./run-h2-suite.sh run --category all --only TestKillProcessWhileWriting
+```
+
+1800 s is ~2.5x the slowest measured pass, which leaves room for a loaded host —
+this box has run between load 3 and load 104 on 8 cores in a single night.
+
+**The suite cannot select the G1 arm at all**, which is why this page's numbers
+were never suite numbers: `-XX:+UseG1GC` is a vm-cli ARGUMENT
+(`vm-cli/src/main.rs:4682`), the runner passes only `CRATONVM_*` env through to
+the child, and `grep -E "UseG1GC|VM_OPTS" run-h2-suite.sh` returns nothing. Run
+the class directly, exactly as `run_one_class` does (the `cd` into a scratch
+workdir and the watchdog disable both matter — the latter stops a class that
+legitimately takes the whole budget from abort()+dumping):
+
+```bash
+H2=/data/cratonvm/apps/h2database/h2
+CP="$H2/target/classes:$H2/target/test-classes:$(cat $H2/craton-testcp.txt)"
+mkdir -p /tmp/h2kill && cd /tmp/h2kill
+env CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout --kill-after=5 1800 \
+  <cratonvm> -XX:+UseG1GC --java-home <jdk25> --Xmx 1g -c "$CP" \
+  org.h2.test.store.TestKillProcessWhileWriting
+```
+
+Both `target/classes` and `target/test-classes` are required and are NOT in
+`craton-testcp.txt` — that file is the Maven dependency classpath only
+(`mvn dependency:build-classpath`, line 153), and the runner prepends the two
+class dirs at line 160. Omitting them fails in under a second with
+`class not found: org.h2`, which in a results table is indistinguishable from a
+fast failure of the test.
+
+### Why the cap is not simply raised in the runner
+
+`apps/` is `.gitignore`d (line 12), and `git ls-files` does not know
+`run-h2-suite.sh`. The runner is **untracked**: a per-class override added there
+is local to one checkout and disappears for everyone else, which is how the
+fixture losses recorded in `vm/tests/common/mod.rs`'s `require_fixture` doc
+happened. The durable fix is either to track the runner or to carry the cap in
+the invocation, and until one of those happens this note is the record.
+
+### Provenance of the 2026-09-06 re-verification
+
+Both fixes are still on dev (`f1bdfd028`, the finalizable-object humongous
+reclaim gate, and `607a16ea2`, the heap-full auto-box) — confirmed ancestors of
+`b7ca9affa`, so nothing was reverted.
+
+The binary was **not** built for this: the box was at 98% disk with three lanes
+building, and a release build would have filled it. `a044e1fe1` was already
+built in another worktree and was checked for the two properties that make it
+usable — it is an ANCESTOR of dev, and both fix commits are ancestors of IT —
+before any run. A binary from a diverged branch (`978d8e343`, also present and
+also freshly built) was rejected for failing the first test.
+
+The default-collector arm is the control, and it earns its place: it says the
+class and the harness work at all on this binary, so a G1 PASS is a statement
+about G1 rather than about the fixture. The first attempt at this table had NO
+control value at all — all four arms exited in `secs=0` on a classpath error of
+mine — and four rows reading `rc=1` looked exactly like four real failures.
+
 ## Why it is a different defect, measured rather than assumed
 
 The parent page's whole subject is `zgc: arena allocation failed` —

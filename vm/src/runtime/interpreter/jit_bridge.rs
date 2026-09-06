@@ -11357,6 +11357,15 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
+        // The compiled frames this bounds check fired in have already left the
+        // stack, exactly as in the `sig.npe` and `sig.arithmetic` arms: the
+        // helper flagged the signal and the compiled body ran its epilogue, so
+        // `fillInStackTrace` walks a stack that no longer has them. `sig`
+        // carries the snapshot the helper took while they were live; without
+        // draining it here the throwable keeps an EMPTY trace, and the snapshot
+        // is left in the cell for the next take, which belongs to a different
+        // throwable.
+        let trap_snapshot = sig.trap_frames.take();
         let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -11365,6 +11374,12 @@ pub(super) fn execute_jit_call(
             Some(&msg),
         ) {
             Ok(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 let exc_locals = synchronized_args.as_deref().map_or_else(
                     || jit_saved_args_to_values(cached, &saved_args, np),
                     |args| args.to_vec(),
@@ -11837,6 +11852,15 @@ pub(super) fn execute_jit_call_decoded(
         }
     }
     if let Some((index, length)) = sig.aioobe {
+        // The compiled frames this bounds check fired in have already left the
+        // stack, exactly as in the `sig.npe` and `sig.arithmetic` arms: the
+        // helper flagged the signal and the compiled body ran its epilogue, so
+        // `fillInStackTrace` walks a stack that no longer has them. `sig`
+        // carries the snapshot the helper took while they were live; without
+        // draining it here the throwable keeps an EMPTY trace, and the snapshot
+        // is left in the cell for the next take, which belongs to a different
+        // throwable.
+        let trap_snapshot = sig.trap_frames.take();
         let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -11845,6 +11869,12 @@ pub(super) fn execute_jit_call_decoded(
             Some(&msg),
         ) {
             Ok(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12237,6 +12267,15 @@ pub(super) fn execute_jit_call_oneshot(
         }
     }
     if let Some((index, length)) = sig.aioobe {
+        // The compiled frames this bounds check fired in have already left the
+        // stack, exactly as in the `sig.npe` and `sig.arithmetic` arms: the
+        // helper flagged the signal and the compiled body ran its epilogue, so
+        // `fillInStackTrace` walks a stack that no longer has them. `sig`
+        // carries the snapshot the helper took while they were live; without
+        // draining it here the throwable keeps an EMPTY trace, and the snapshot
+        // is left in the cell for the next take, which belongs to a different
+        // throwable.
+        let trap_snapshot = sig.trap_frames.take();
         let msg = cratonvm_types::error::out_of_bounds_message::check_index(index, length);
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -12245,6 +12284,12 @@ pub(super) fn execute_jit_call_oneshot(
             Some(&msg),
         ) {
             Ok(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 return oneshot_route_exception(
                     shared,
                     thread,
