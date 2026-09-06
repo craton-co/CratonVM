@@ -9750,14 +9750,45 @@ impl G1Collector {
     /// Not screened on `class_id == 0` alone: id 0 is a legitimate class id in
     /// this tree (`is_zeroed` needs four fields to agree, and the allocator
     /// tests use it), so it is the SIZE that is impossible, not the id.
+    /// Is `addr` inside a HUMONGOUS span? Such an object legitimately spans
+    /// more than one region, so "its size exceeds a region" says nothing about
+    /// it and must not be read as a refusal.
+    fn addr_is_in_humongous_region(&self, regions: &[G1Region], addr: usize) -> bool {
+        self.lookup_region_for_addr(addr)
+            .and_then(|i| regions.get(i))
+            .is_some_and(|r| {
+                matches!(
+                    r.region_type,
+                    RegionType::HumongousStart | RegionType::HumongousContinuation
+                )
+            })
+    }
+
     fn holder_body_cannot_fit_a_region(&self, header: &ObjectHeader) -> Option<usize> {
         let region_size = self.config.region_size;
         if region_size == 0 {
             return None;
         }
-        let declared = (header.num_slots() as usize).saturating_mul(SLOT_SIZE);
-        if HEADER_SIZE.saturating_add(declared) > region_size {
-            Some(declared)
+        // `object_total_size`, NOT `num_slots * SLOT_SIZE`. The hand-rolled
+        // legacy formula this used to carry is wrong for the two shapes that
+        // actually appear here, and `object_total_size`'s own comment says so:
+        // it "OVER-sizes" a COMPACT instance (whose true body size lives in
+        // `array_length`), and for an ARRAY the body is
+        // `array_length * element_size`, nothing to do with `num_slots`.
+        //
+        // MEASURED CONSEQUENCE, 2026-09-06 (this is a bug this screen HAD, not
+        // a hypothetical): every refusal in two H2 runs — 15 and 14 of them —
+        // was `kind=Array`, `elem=Byte`/`Int`, lengths 82180..1048576. Ordinary
+        // large primitive arrays, refused as impossible because their length
+        // was multiplied by the 16-byte legacy slot stride. Phase 4 then
+        // skipped their rset-edge collection.
+        //
+        // A size of 0 is `object_total_size`'s own "implausible array header"
+        // signal and is left to the caller's existing guards rather than
+        // turned into a refusal here.
+        let size = object_total_size(header);
+        if size > region_size {
+            Some(size)
         } else {
             None
         }
@@ -10819,7 +10850,13 @@ impl G1Collector {
                 }
                 return;
             }
-            if let Some(declared) = self.holder_body_cannot_fit_a_region(header) {
+            if let Some(declared) = self
+                .holder_word0_arena_pointer(header)
+                .is_none()
+                .then(|| self.holder_body_cannot_fit_a_region(header))
+                .flatten()
+                .filter(|_| !self.addr_is_in_humongous_region(regions, obj_ptr as usize))
+            {
                 let n = SERIAL_SCAN_HOLDER_BODY_TOO_BIG.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
                     tracing::warn!(
@@ -11686,9 +11723,17 @@ impl G1Collector {
                 // Screening here rather than inside the two walks is what covers
                 // both with one test: this is the only caller of either, and it is
                 // the only place that holds the region geometry the test needs.
+                // A HUMONGOUS object legitimately spans more than one region,
+                // so "bigger than a region" is not evidence about it. Only the
+                // non-humongous case can use that test.
+                let region_is_humongous = matches!(
+                    regions[i].region_type,
+                    RegionType::HumongousStart | RegionType::HumongousContinuation
+                );
                 let refuse = gc_flags().g1_serial_evac_holder_screen
                     && (self.holder_word0_arena_pointer(header).is_some()
-                        || self.holder_body_cannot_fit_a_region(header).is_some());
+                        || (!region_is_humongous
+                            && self.holder_body_cannot_fit_a_region(header).is_some()));
                 if refuse {
                     let n = PHASE4_HOLDER_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 8 || n.is_power_of_two() {
