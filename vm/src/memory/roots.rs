@@ -346,6 +346,53 @@ pub fn static_root_slot_counts() -> (u64, u64) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// The statics scan's own cost
+// ---------------------------------------------------------------------------
+
+/// Slots visited, slots that held an object, and nanoseconds, summed over every
+/// collection's section 2.
+///
+/// # The residual this is the number for
+///
+/// Section 2 walks EVERY static field of EVERY loaded class on every
+/// collection, young ones included, and the standing proposal is to narrow it
+/// by declared type -- an `int`-declared slot cannot hold an object, so per the
+/// JVM spec it need not be visited. That proposal was parked on the grounds
+/// that this tree has a history of lost-tag values and long-smuggled
+/// `jobject`s and the scan's tolerance for them may be load-bearing.
+///
+/// It is worth what the walk COSTS, and nobody had that. The pair says which
+/// half of it is even addressable: `slots` is what a declared-type filter would
+/// shrink, `objects` is the part that has to be visited whatever the filter
+/// says, and the ratio bounds the saving before anyone reasons about whether
+/// the filter is safe.
+///
+/// Always on: three counter updates per COLLECTION, not per slot.
+static STATICS_SCAN_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_SCAN_OBJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_SCAN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_SCAN_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_statics_scan(slots: u64, objects: u64, nanos: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    STATICS_SCAN_SLOTS.fetch_add(slots, Relaxed);
+    STATICS_SCAN_OBJECTS.fetch_add(objects, Relaxed);
+    STATICS_SCAN_NANOS.fetch_add(nanos, Relaxed);
+    STATICS_SCAN_PASSES.fetch_add(1, Relaxed);
+}
+
+/// `(passes, slots, objects, nanos)` -- see [`STATICS_SCAN_SLOTS`].
+pub fn statics_scan_counts() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        STATICS_SCAN_PASSES.load(Relaxed),
+        STATICS_SCAN_SLOTS.load(Relaxed),
+        STATICS_SCAN_OBJECTS.load(Relaxed),
+        STATICS_SCAN_NANOS.load(Relaxed),
+    )
+}
+
 /// Count a fix-up that found no recorded list and re-walked every static.
 pub fn note_static_slot_fallback() {
     STATIC_SLOT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -557,10 +604,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // anything and could be reclaimed mid-`<clinit>`. Same reasoning applies
     // to the class-lock (`3.`) and CONSTANT_Dynamic (`13.`) sections below.
     {
+        let __st_t0 = std::time::Instant::now();
         let statics = shared.classes.statics.read();
+        let mut __st_slots = 0u64;
+        let mut __st_objects = 0u64;
         for (&class_id, fields) in statics.iter() {
             for val in fields.iter() {
+                __st_slots += 1;
                 if let Value::Object(Some(obj_ref)) = *val {
+                    __st_objects += 1;
                     // BEFORE the deferral branch below, deliberately. The
                     // post-collection fix-up remaps every static slot that holds
                     // an object, whether or not this scan ROOTED it -- a value
@@ -591,6 +643,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 }
             }
         }
+        note_statics_scan(
+            __st_slots,
+            __st_objects,
+            __st_t0.elapsed().as_nanos() as u64,
+        );
     }
 
     mark_scan_section(

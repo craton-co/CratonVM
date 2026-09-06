@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-521 tokens.
+525 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -217,6 +217,10 @@ export inherited from a parent shell.
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
+| `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
+| `markclear` | `CRATONVM_DBG_MARKCLEAR` |
+| `g1-objaddr` | `CRATONVM_DBG_G1_OBJADDR` |
+| `rootfixup` | `CRATONVM_DBG_ROOTFIXUP` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `jni-localref` | `CRATONVM_DBG_JNI_LOCALREF` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -963,7 +967,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-148 tokens.
+149 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1073,6 +1077,7 @@ export inherited from a parent shell.
 | `object-starts` | `CRATONVM_GC_OBJECT_STARTS` |
 | `gen-uncommit` | `CRATONVM_GEN_UNCOMMIT` |
 | `static-root-slots` | `CRATONVM_GC_STATIC_ROOT_SLOTS` |
+| `trigger-lockfree` | `CRATONVM_GC_TRIGGER_LOCKFREE` |
 | `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
