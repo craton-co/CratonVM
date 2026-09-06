@@ -57,7 +57,7 @@ Both functions now use `NativeHandleScope`, the discipline `NativeContext`
 documents for this: a handle is an opaque slot rather than an `ObjectRef`, so
 the pre-GC local cannot be read back by mistake, and `handle_slots` is scanned
 as a root set by `roots.rs`. Every handle is re-read immediately before each use
-— `set_field_by_name` resolves a field name and can itself allocate. The two
+— uniformly, rather than reasoning per store about which calls can collect. The two
 ad-hoc `pin_native_root`/`read_native_pin` pairs are gone; the scope subsumes
 them.
 
@@ -67,6 +67,23 @@ line stores.
 
 Re-running the audit's rule over the patched file reports no unrooted binding
 that survives an allocating call.
+
+## A claim in the first version of this page was wrong
+
+It said the handles are re-read before each use because "`set_field_by_name`
+resolves a field name and can itself allocate". **It cannot.**
+`NativeContextImpl::set_field_by_name` takes `&self`, resolves a field index out
+of the class store under a read lock, and stores through `heap.set_field`. It
+neither allocates nor runs Java.
+
+The re-reads are still there and are still correct — re-reading a handle costs a
+slot load and removes the need to be right about which of the trait's ~600
+methods can collect — but the reason given for them was false, and a later
+reader sizing a window around "field stores can collect" would have got it
+wrong. The `native-io` audit that followed depends on the opposite fact:
+`set_field_by_name` is deliberately NOT in its GC-capable set, which is what
+keeps the window between an allocation and the stores that follow it small
+enough to read.
 
 ## Measurement
 
