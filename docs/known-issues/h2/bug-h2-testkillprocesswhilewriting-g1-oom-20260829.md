@@ -748,15 +748,39 @@ timeouts on a shared box, so read them as contention" is the same observation
 one step short of the cause.
 
 **Anyone re-running this class must raise the cap or they will re-open this
-row:**
+row.** Through the suite (`--only` is the class filter; there is no `--class`
+flag, and `--class-to` is the same knob as `CLASS_TO`):
 
 ```bash
-CLASS_TO=1800 ./run-h2-suite.sh run --category all --class org.h2.test.store.TestKillProcessWhileWriting
+CLASS_TO=1800 ./run-h2-suite.sh run --category all --only TestKillProcessWhileWriting
 ```
 
-`--class-to S` is the equivalent flag. 1800 s is ~2.5x the slowest measured
-pass, which leaves room for a loaded host — this box has run at load 17-48 on 8
-cores all week, and the pass times above were themselves taken on it.
+1800 s is ~2.5x the slowest measured pass, which leaves room for a loaded host —
+this box has run between load 3 and load 104 on 8 cores in a single night.
+
+**The suite cannot select the G1 arm at all**, which is why this page's numbers
+were never suite numbers: `-XX:+UseG1GC` is a vm-cli ARGUMENT
+(`vm-cli/src/main.rs:4682`), the runner passes only `CRATONVM_*` env through to
+the child, and `grep -E "UseG1GC|VM_OPTS" run-h2-suite.sh` returns nothing. Run
+the class directly, exactly as `run_one_class` does (the `cd` into a scratch
+workdir and the watchdog disable both matter — the latter stops a class that
+legitimately takes the whole budget from abort()+dumping):
+
+```bash
+H2=/data/cratonvm/apps/h2database/h2
+CP="$H2/target/classes:$H2/target/test-classes:$(cat $H2/craton-testcp.txt)"
+mkdir -p /tmp/h2kill && cd /tmp/h2kill
+env CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout --kill-after=5 1800 \
+  <cratonvm> -XX:+UseG1GC --java-home <jdk25> --Xmx 1g -c "$CP" \
+  org.h2.test.store.TestKillProcessWhileWriting
+```
+
+Both `target/classes` and `target/test-classes` are required and are NOT in
+`craton-testcp.txt` — that file is the Maven dependency classpath only
+(`mvn dependency:build-classpath`, line 153), and the runner prepends the two
+class dirs at line 160. Omitting them fails in under a second with
+`class not found: org.h2`, which in a results table is indistinguishable from a
+fast failure of the test.
 
 ### Why the cap is not simply raised in the runner
 
