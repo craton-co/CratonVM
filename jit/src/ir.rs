@@ -5442,6 +5442,15 @@ impl IrBuilder {
         if !ir_site_trap_enabled() {
             return false;
         }
+        // The unresolved-class causes are opt-in and off by default; see
+        // `ir_unresolved_class_trap_enabled` for the argument that was refuted.
+        if matches!(
+            cause,
+            TrapCause::UnresolvedTypeCheck | TrapCause::UnresolvedNew
+        ) && !ir_unresolved_class_trap_enabled()
+        {
+            return false;
+        }
         let Some(ctrl) = self.ctrl_opt() else {
             return false;
         };
@@ -8715,6 +8724,50 @@ pub fn ir_site_trap_enabled() -> bool {
         !matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SITE_TRAP").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// May an UNRESOLVED-CLASS site (`checkcast`, `instanceof`, `new`) become a
+/// trap? **Default OFF**; `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` opts in.
+///
+/// # Why this is separate from the indy trap, and why it ships off
+///
+/// The coldness argument for these three was: "the named class has never been
+/// loaded, and a class that has never been loaded cannot have been touched by
+/// any path that has executed." The first clause is true and the conclusion
+/// does not follow from it, because the observation is made at COMPILE time.
+/// A class not loaded when the method compiles can load a moment later, and the
+/// path can then run — at which point the trap fires on a LIVE path, the body
+/// returns the deopt sentinel, and it does so on every execution, forever.
+///
+/// That is not a theory. `ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir`
+/// executes exactly that path: with the trap planted, the compiled body
+/// returned `i64::MIN` instead of the object. The fixture was written years
+/// before this trap existed and it refuted the argument on the first run.
+///
+/// The transient case already has a mechanism, and it is the opposite of this
+/// one: `note_deferred_new_bail` / `take_deferred_new_retry` REFUSE the method
+/// and re-offer it once the class loads. Compiling around the site instead
+/// bypasses that machinery — the builder no longer bails, so nothing arms the
+/// memo and nothing re-offers the method — which trades a delayed optimizing
+/// body for a permanently deopting one.
+///
+/// `invokedynamic` is different and stays on: there is no "later" for a
+/// bootstrap this tier will never lower, and the single-pass backend has made
+/// exactly that trade by default since it stopped bailing on indy.
+///
+/// What would make this safe is `DeoptAction::RecompileAndReinterpret` at these
+/// sites instead of `Reinterpret`, so the first trap triggers the recompile
+/// that resolves the class. `Op::Guard`'s lowering hard-codes the action today;
+/// parameterising it is the work this switch is waiting on.
+pub fn ir_unresolved_class_trap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
         )
     })
 }

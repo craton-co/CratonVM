@@ -6719,14 +6719,21 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// an unexplained miscompile in a spliced body should reach for `=0` first,
 /// which is the whole reason the switch stays.
 pub fn ir_inline_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        )
-    })
+    // Read PER CALL, not cached in a `OnceLock`, and that is deliberate: this
+    // is the one JIT gate a test arranges with `flags::with_thread_overrides`,
+    // because `ir_inline_flag_changes_the_emitted_body` compiles the SAME
+    // method twice in one process with the flag on and then off. Caching it
+    // made the second arm read the first arm's answer, the two bodies came out
+    // identical, and the test that exists to prove this harness can see the
+    // inliner at all failed — which is exactly the vacuity
+    // `ir-inline-gauntlet-soak-20260828` recorded.
+    //
+    // A compile is not a hot path; one `getenv` per compile costs nothing worth
+    // trading a testable switch for.
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
 }
 
 /// Total appended bytecode one compile may splice, across every site and every

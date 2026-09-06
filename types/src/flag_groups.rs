@@ -1472,6 +1472,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-list-sched", on_key: Some("CRATONVM_JIT_IR_LIST_SCHED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-unroll-unreachable-frames", on_key: Some("CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "c2-accept", on_key: Some("CRATONVM_C2_ACCEPT"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "c2-accept-memo", on_key: Some("CRATONVM_C2_ACCEPT_MEMO"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-unresolved-class-trap", on_key: Some("CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-rpo-layout", on_key: Some("CRATONVM_JIT_IR_RPO_LAYOUT"), off_key: None, off_word: Some("0"), since: "2026-09-04" },

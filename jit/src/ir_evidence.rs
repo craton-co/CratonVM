@@ -214,6 +214,9 @@ pub fn accept_policy() -> AcceptPolicy {
             return forced;
         }
     }
+    if PROCESS_FORCE_ALWAYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return AcceptPolicy::Always;
+    }
     use std::sync::OnceLock;
     static P: OnceLock<AcceptPolicy> = OnceLock::new();
     *P.get_or_init(|| {
@@ -490,3 +493,31 @@ pub fn note_memo_skip() {
 pub fn memo_skips() -> u64 {
     MEMO_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Process-wide override forcing [`AcceptPolicy::Always`].
+///
+/// # Why a public function and not just the env var
+///
+/// The policy is latched in a `OnceLock`, so a test binary that sets
+/// `CRATONVM_C2_ACCEPT` after the first compile has already lost. And an
+/// INTEGRATION test lives in its own crate, where the `#[cfg(test)]`
+/// thread-local force in this module is not visible.
+///
+/// The caller that needs this is `jit/tests/ir_vs_singlepass.rs`, whose whole
+/// subject is ROUTING -- "does this bytecode reach the IR pipeline, and does it
+/// answer what the single-pass backend answers". The acceptance gate is a
+/// POLICY layered on top of routing, and its probes are three-bytecode methods
+/// that by construction apply no transform the baseline tier lacks. Running
+/// that harness under the gate measures the gate, not the backends: 17 of its
+/// 20 failures on 2026-09-06 were exactly that.
+///
+/// Deliberately one-way. There is no `force_off`, because the only legitimate
+/// use is a harness declaring "I am testing something the policy is not about",
+/// and a switch that can turn the gate back ON mid-process would let one test
+/// change another's meaning.
+pub fn force_accept_always_for_this_process() {
+    PROCESS_FORCE_ALWAYS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static PROCESS_FORCE_ALWAYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
