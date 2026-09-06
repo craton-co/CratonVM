@@ -166,6 +166,49 @@ running the resolver over the union of words and registers — would have to
 model a copy that writes two locations at once, which the `CopyOp` shape does
 not express.
 
+## The other lane that found this, and why both fixes stay
+
+`11abbff47` (`fix/springboot-psl-loaderjar-20260905`, merged hours after this
+one) reaches the identical root cause from a completely different workload and
+fixes it a different way. Its item 4 states the same sentence this page does --
+`emit_copy_op` "argues that `resolve_parallel_copy`'s slot ordering covers
+registers too -- true while each register belongs to one node, false across an
+edge" -- and its victim was ByteBuddy: ASM's `ff ff` forward-branch
+placeholders went unpatched, CratonVM's own verifier rejected the retransformed
+bytes (`branch at offset 89 targets 88`), and every `mock()` of a class failed.
+Two lanes hit it the same morning because `perf/ir-defaults-on-20260905` turned
+the register fast path on by default that day.
+
+Its fix is `gp_reg_owner`: `mark_gp_reg_live` now marks the register's PREVIOUS
+owner unreadable, so `resident_gpr` stops handing back a register the publish
+just overwrote.
+
+**Both are on `dev` and both are load-bearing. Do not delete either as
+redundant.**
+
+* `gp_reg_owner` TOLERATES the clobber and is the broader of the two: it covers
+  every publish, not only a phi edge, and it sends the stale reader back to its
+  home word.
+* The screen in this page PREVENTS the clobber at the phi edge, which is the
+  one case that interlock cannot repair. `emit_copy_op` reads a source whose
+  home was DROPPED through `assigned_gpr`, deliberately **not**
+  `resident_gpr` -- "there is nothing to fall back to". Clearing `gp_reg_live`
+  therefore does not stop that read; not emitting the clobbering publish does.
+  (The comment there argues such a register "is exclusively its own, a clause
+  of `phi_home_droppable`". This screen is what makes that true at an edge
+  rather than assumed.)
+
+Verified together on dev tip `48fff33f7`, 44 commits after this fix landed and
+with both mechanisms in the same file: the probe reads
+`PHI_COPY_REGISTER_ALIAS_OK` on all five arms (default, `--nojit`, HotSpot,
+`CRATONVM_JIT_IR_PHI_COPY_REGS=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0`);
+`vm/tests/jit_ir_phi_copy_register_alias.rs` passes in 4.81 s; and the
+hibernate-reactive MySQL 23-class union is 22/23 one-class-per-JVM, the single
+failure being `SoftDeleteCollectionTest` with `checkpointTO=2` -- the 30-second
+budget of the sibling retired page on a load-20 host, not a miscompile --
+while `BasicTypesAndCallbacksForAllDBsTest`, the class this fix repaired, is
+28/28.
+
 ## Blast radius
 
 This is not a `java.time` bug. Any method whose merge carries two or more

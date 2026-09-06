@@ -1,4 +1,126 @@
-# A compiled frame keeps a young reference the moving collector moved — and the give-back turns it into a 10-second SIGSEGV
+# A compiled frame keeps a young reference the collector moved — FIXED 2026-09-06
+
+| | |
+|---|---|
+| **Status** | ✅ **FIXED.** A peer thread's compiled frames were discharged from the cross-thread coverage obligation by PINNING their conservative roots — on a collector that does not honour pins and structurally cannot. The generational young collector is Cheney copying: from-space is reclaimed wholesale, so a "pinned" object is faithfully kept ALIVE at a NEW address, with nothing having rewritten the peer's frame. The credit now requires the collector to honour the pin. |
+| **Scope** | `-XX:+UseGenerationalGC` only, JIT only, release only, multi-threaded only. G1 and ZGC were never affected — both consume `gc_quiescence::pinned_jit_roots_snapshot()` and withhold the region/page. |
+| **The fix** | `VmHeap::honours_conservative_pins()`, passed into `refresh_moving_young_coverage_for_collection` as a fourth condition on the pinned-peer credit. |
+
+## The evidence, in one table
+
+`-XX:+UseGenerationalGC --Xmx 512m` over `org.h2.test.jdbc.TestPreparedStatement`,
+`CRATONVM_GEN_UNCOMMIT=1` as the detector on every arm:
+
+| arm | crashes |
+|---|---|
+| before the fix | **4/5** |
+| after the fix | **0/5** |
+| after the fix, `CRATONVM_XT_PINNED_PEER_UNPINNABLE=1` | **5/5** |
+
+The third row is the point. A 10-second stochastic reproducer going quiet is not
+a fix; the same binary with the old accounting restored crashes 5 times out of 5,
+faster than the original, so the first row's absence is attributable.
+
+## How it was found
+
+Two bisects over levers, three reps each, `CRATONVM_GEN_UNCOMMIT=1` throughout.
+
+| lever | crashes |
+|---|---|
+| control | 3/3 |
+| `CRATONVM_NO_MOVING_YOUNG=1` | 0/3 |
+| **`CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0`** | **0/3** |
+| `CRATONVM_JIT_SPILL_NARROW=0` | 2/3 |
+| `CRATONVM_JIT_CALL_SPILL_ELISION=0` | 3/3 |
+| `CRATONVM_JIT_SPILL_ARGS_PUBLISHED=0` | 3/3 |
+| `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` | 2/3 |
+
+The spill levers are the ones the first write-up nominated — the blind GPR
+safepoint spill, whose slots `FrameLayout::is_register_image` excludes from
+verification. **None of them is the cause.** The handshake is, and the second
+bisect split it in two:
+
+| lever | crashes |
+|---|---|
+| `CRATONVM_XT_PINNED_PEER_DEPTH=0` (drop the pinned credit) | 0/3 |
+| `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1` (publish, don't credit) | 0/3 |
+
+and `CRATONVM_DBG_XT_COVERAGE=1` printed the accounting that names it. The last
+line before the fault:
+
+```text
+[xt-coverage] peer_depth=2 proven=0 pinned=2 accounted=true
+```
+
+`proven=0` — nobody proved anything. `pinned=2` — the pin credit alone
+discharged the whole peer depth, and the cycle relocated. The one run in that
+arm that did NOT crash had:
+
+```text
+[xt-coverage] peer_depth=2 proven=0 pinned=0 accounted=false
+```
+
+## Why the pin was not a discharge
+
+`refresh_moving_young_coverage_for_collection` accepts a moving cycle when
+`proven + pinned >= peer_depth`. The `pinned` term already carried three
+conditions and its own paragraph explaining that a single unpinned window voids
+the whole credit. What it never asked was whether **the collector honours a pin
+at all**.
+
+* **G1** withholds the pinned regions from the collection set (`g1.rs` consumes
+  `pinned_jit_roots_snapshot()`).
+* **ZGC** does the same at page granularity.
+* **Generational** has **zero readers** of that snapshot in `gen_heap.rs` or
+  `gen_evac.rs`, and cannot acquire one: a Cheney young collection reclaims
+  from-space wholesale, so every live object in it moves by construction. The
+  pinned addresses reach that backend only through the ROOT set — which keeps
+  them alive, and says nothing about keeping them put.
+
+So on the generational collector the credit discharged a peer's obligation
+against a pin nobody applied. That distinction — *alive* is not *put* — is the
+whole defect.
+
+## After the fix, the accounting reads
+
+```text
+[xt-coverage] peer_depth=2 proven=0 pinned=0 pins_honoured=false accounted=false
+[xt-coverage] peer_depth=3 proven=3 pinned=0 pins_honoured=false accounted=true
+[xt-coverage] peer_depth=6 proven=4 pinned=0 pins_honoured=false accounted=false
+```
+
+Proof-based acceptance is untouched (row 2); only the pin-based discharge is
+refused, and only where the pin is not honoured. G1 and ZGC keep the credit that
+was built for them — it is what stopped ZGC refusing to compact on the H2
+fragmentation family, 219 of 227 refusals.
+
+## Two things that are NOT the fix, and were believed to be
+
+* **The blind GPR safepoint spill.** The first write-up nominated it because
+  `audit_stale_frame_words` classes 11 of its witnesses `gpr-safepoint-spill`
+  and marks that class "unmodelled". Four independent levers over that spill
+  leave the crash in place. The witnesses are real and are an upper bound — the
+  audit walks the whole frame band, so a dead spill slot holding a moved
+  object's old address is counted and is harmless.
+* **The peer resume path not remapping compiled frames.**
+  `apply_pointer_map_to_thread` does call `remap_active_jit_frames`,
+  `remap_register_image_words` and the shadow-stack remap. That path is
+  complete; it was simply never reached for objects that moved out from under a
+  peer whose coverage was discharged by a pin.
+
+## Kept, because the reproducer is worth more than the bug
+
+`CRATONVM_XT_PINNED_PEER_UNPINNABLE=1` restores the old accounting on the same
+binary. `CRATONVM_GEN_UNCOMMIT=1` remains the detector that made a silent stale
+read into an attributable SIGSEGV — see the retired cross-collector common-work
+write-up for why that flag is opt-in.
+
+---
+
+## The original report, as filed on 2026-09-06
+
+Kept below for the reasoning and the raw signatures. Read the sections above
+first: this half nominates the blind GPR spill, and the bisect refuted it.
 
 | | |
 |---|---|

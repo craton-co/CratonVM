@@ -2907,6 +2907,45 @@ impl VmHeap {
         matches!(self, VmHeap::Generational(_))
     }
 
+    /// Does this backend keep a conservatively-PINNED object at its address for
+    /// the rest of the collection?
+    ///
+    /// # What asks, and why the answer is a capability rather than a policy
+    ///
+    /// The cross-thread JIT coverage handshake
+    /// (`conservative_roots::refresh_moving_young_coverage_for_collection`)
+    /// lets a moving cycle proceed while a peer thread holds compiled frames
+    /// nobody could prove rewritable, provided those frames' conservative roots
+    /// were PINNED instead. That discharge is sound exactly when the collector
+    /// about to run honours the pin, and it is a property of the collector, not
+    /// of the frames.
+    ///
+    /// * **G1** — `true`. It evacuates by region and withholds the regions named
+    ///   by `gc_quiescence::pinned_jit_roots_snapshot()` from the collection set.
+    /// * **ZGC** — `true`. Same shape at page granularity; `relocate_stw`
+    ///   consumes the same snapshot.
+    /// * **Generational** — **`false`, and it cannot be otherwise.** The young
+    ///   collector is Cheney copying: from-space is reclaimed WHOLESALE, so
+    ///   every live object in it moves by construction and there is no
+    ///   "withhold this one" to implement. Consistently, `gen_heap.rs` and
+    ///   `gen_evac.rs` contain no reader of the pin snapshot at all — the
+    ///   pinned addresses reach that backend only as ROOTS, which keeps them
+    ///   ALIVE and says nothing about keeping them PUT.
+    ///
+    /// That last distinction is the whole of this method. A peer's frame whose
+    /// roots were "pinned" under the generational collector is a frame whose
+    /// objects were faithfully kept alive at NEW addresses, with nothing having
+    /// rewritten the frame — which is a stale compiled-frame reference, and was
+    /// reproducible in ten seconds on the H2 JDBC corpus.
+    pub fn honours_conservative_pins(&self) -> bool {
+        match self {
+            VmHeap::Generational(_) => false,
+            VmHeap::G1(_) => true,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
+        }
+    }
+
     /// Check if G1 should start concurrent marking (IHOP threshold crossed).
     pub fn g1_should_start_marking(&self) -> bool {
         match self {

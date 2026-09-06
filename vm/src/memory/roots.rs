@@ -1333,7 +1333,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // is not short-circuited away again.
     let coverage_proven = moving_young
         && !moving_young_osr_fallback
-        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
+        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection(
+            // Whether a PIN discharges a peer's coverage obligation is a
+            // question about the collector, so it is answered by the collector
+            // rather than read from a process-global: two live heaps would make
+            // a published capability describe whichever constructed last.
+            shared.mem.heap.honours_conservative_pins(),
+        )
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
     // The SUPPRESSION is additionally opt-in as of 2026-08-21
     // (`CRATONVM_GC_PRECISE_ONLY_ROOTS=1`), and only the suppression — the proof
@@ -2239,10 +2245,22 @@ mod tests {
         // refresh stops running for whatever the test excludes.
         let proof_expr = &src[proof..suppression];
         assert!(
-            proof_expr.contains("refresh_moving_young_coverage_for_collection()"),
+            proof_expr.contains("refresh_moving_young_coverage_for_collection("),
             "`coverage_proven` no longer calls the refresh, so nothing computes \
              the verdict any collector-side gate reads"
         );
+        // AN ARGUMENT IS NOT A TERM, and the difference is the whole of what
+        // this guard protects.
+        //
+        // The refresh takes the collector's `honours_conservative_pins()` as a
+        // parameter, so the proof expression does mention the collector -- and
+        // must, because whether a PIN discharges a peer's coverage obligation
+        // is a question only the collector can answer. What the loop below
+        // forbids is a collector test as a `&&` TERM, which is a different
+        // thing: `&&` short-circuits, so a term would stop the refresh RUNNING
+        // for whatever it excludes, and that is precisely the defect this
+        // scan was written for. A parameter cannot do that -- the call is
+        // made either way.
         for forbidden in ["is_generational", "is_g1", "g1_precise_only_roots"] {
             assert!(
                 !proof_expr.contains(forbidden),

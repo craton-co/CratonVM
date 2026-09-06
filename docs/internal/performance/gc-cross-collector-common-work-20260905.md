@@ -37,7 +37,7 @@ that also invalidates two of this page's own numbers.
 | 5 | give G1 the exact object-start bitmap | **refuted.** G1's predicate is **0.24% of a run** (289,693 calls, 12 ms of 4.9 s) and **99.98% of calls already accept**, so an ACCEPT-only bitmap has almost nothing to short-circuit. |
 | 6a | re-run the +153% four-worker parallel MARKING figure | **confirmed in direction, and it is now small.** The lever engages (`workers_last` 1→4→8, `parallel` 0→23); the drain goes 72 → 76 → 80 ms, monotone. The lock removal took the rest. |
 | 6b | one shared work-stealing GC worker pool | **the throughput case is refuted by 6a**: adding workers to the pool that exists makes it slower, so consolidating pools is a maintenance argument, not a pause one. |
-| 7 | old-generation give-back | **blocked, on a named defect with a reproducer** — see the compiled-frame record. The young give-back's fault window is real and reachable; adding a second one to the old generation before that is fixed would be adding a second way to crash. |
+| 7 | old-generation give-back | **still not worth building, and for a better reason now.** It was blocked on the compiled-frame defect this page's follow-up found; that was fixed on 2026-09-06. What remains is that the old generation is a `Vec<u8>` with no reservation to shrink, and that the young give-back it would copy measures free — so the work is an allocator change for no measured gain. |
 | 8a | lock-free `needs_gc` | **landed**, with the choke point the page asked for and an oracle: **63,661 checks, 0 divergences** on multi-threaded H2. Measured at no difference on 8 threads — it is a shape change, not a throughput claim. |
 | 8b | unify the three remembered sets | **already answered in the tree.** `g1_cards.rs` reassessed it on 2026-09-05 — the stated blocker is indeed gone, and the merge is still not worth making for a different and better reason (thirty shared lines, two genuinely different structures around them). |
 | 8c | ~3,000 lines of unwired machinery | **closed as a scope call, once.** The answer now sits in `gc/src/lib.rs` beside the module declarations, so the next reader meets it where they meet the modules instead of re-deriving it in a fourth file. |
@@ -808,7 +808,12 @@ counters was written to prevent, one level up. They are outside that gate now.
 
 ## What moved out
 
-* The compiled-frame stale young reference — its own record, with the
+* The compiled-frame stale young reference — **found and FIXED on 2026-09-06**,
+  and its record retired with it. The cause was not the blind GPR spill this
+  page's follow-up nominated: a peer thread's coverage obligation was discharged
+  by PINNING its conservative roots on the generational collector, which cannot
+  honour a pin (Cheney reclaims from-space wholesale, and `gen_heap.rs` has no
+  reader of the pin snapshot). Its original record, with the
   ten-second reproducer, the five-arm attribution and the
   `CRATONVM_DBG_STALE_FRAME_WORDS` witnesses naming `org/h2/command/Command.stop`
   and `org/h2/mvstore/tx/Transaction.commit`.
