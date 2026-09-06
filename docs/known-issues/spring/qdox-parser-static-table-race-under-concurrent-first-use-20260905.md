@@ -25,7 +25,7 @@ and collector-independent, which rules out a GC-relocation/timing confound.
 
 ## Why this needed care rather than a fresh investigation
 
-`docs/internal/fixed-bugs/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`
+`beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`
 documents the **identical wrapper message** — `IllegalStateException: Unable to
 parse source file content:` thrown by `SourceFile.getClassName()` — for a
 different class, root-caused to `native_unmod_get` (`native-collections/src/lib.rs`)
