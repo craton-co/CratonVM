@@ -1,9 +1,17 @@
-# The work that is common to all three collectors — 2026-09-05
+# The work that is common to all three collectors — 2026-09-05, closed 2026-09-06
+
+**RETIRED.** Every residual this page carried is discharged below by name: five
+closed by a measurement that turned a hypothesis into a decision, two closed by
+finding the answer already in the tree, one closed by a defect this page's own
+follow-up list found. Two of its three defaults are reverted, and the reason in
+both cases is the evidence rather than the mechanism. What it discovered and
+could not close — a compiled frame that keeps a young reference the collector
+moved — moved to its own record, with a ten-second reproducer this page did not
+have.
 
 A review of `gc/` asking only one question: **what is shared by Generational,
 G1 and ZGC, and what is wrong with it?** Eight findings, what landed against
-each, and — for the ones that did not land in full — what a soak would have to
-answer first.
+each, and what the follow-up measured.
 
 The recurring shape is worth stating up front, because it predicts most of the
 list: **ZGC's modules are where the measurements happened, and almost nothing
@@ -11,6 +19,81 @@ learned there was carried back.** Three of the eight findings are literally
 "the good implementation exists, inside `#[cfg(feature = "zgc")]`".
 
 ---
+
+## The follow-up, 2026-09-06 — what every open item turned out to be
+
+Every row below was an open item on this page on 2026-09-05. None of them is
+one now. The measurements are on Azure host 2, release binaries, and every
+throughput row uses **concurrent paired arms** rather than a sequential ABBA —
+see "How these were measured" at the end, which is the methodological correction
+that also invalidates two of this page's own numbers.
+
+| # | the residual as this page left it | what closed it |
+|---|---|---|
+| 1 | the collector-side slot half: a relocating collector storing through the slot | **priced.** The fix-up it would delete costs 0.2–9.8 ms per collection, scaling with the relocation set. Real, but it is an ABI change across ~35 remap companions for a few percent of a large pause. |
+| 2a | card-marking statics | unchanged: a missed write is a missed root. Not attempted, and now not needed — 2c prices the walk it would accelerate. |
+| 2b | narrow the statics scan by declared type | **refuted by the size of the prize.** The scan is 10–432 µs per collection, and on the biggest static surface measured **72% of the slots already hold an object**, so a declared-type filter could skip at most 28% of it. |
+| 2c | deduplication / feeding the snapshot into the scan | unchanged; both were already decided here with reasons. |
+| 5 | give G1 the exact object-start bitmap | **refuted.** G1's predicate is **0.24% of a run** (289,693 calls, 12 ms of 4.9 s) and **99.98% of calls already accept**, so an ACCEPT-only bitmap has almost nothing to short-circuit. |
+| 6a | re-run the +153% four-worker parallel MARKING figure | **confirmed in direction, and it is now small.** The lever engages (`workers_last` 1→4→8, `parallel` 0→23); the drain goes 72 → 76 → 80 ms, monotone. The lock removal took the rest. |
+| 6b | one shared work-stealing GC worker pool | **the throughput case is refuted by 6a**: adding workers to the pool that exists makes it slower, so consolidating pools is a maintenance argument, not a pause one. |
+| 7 | old-generation give-back | **blocked, on a named defect with a reproducer** — see the compiled-frame record. The young give-back's fault window is real and reachable; adding a second one to the old generation before that is fixed would be adding a second way to crash. |
+| 8a | lock-free `needs_gc` | **landed**, with the choke point the page asked for and an oracle: **63,661 checks, 0 divergences** on multi-threaded H2. Measured at no difference on 8 threads — it is a shape change, not a throughput claim. |
+| 8b | unify the three remembered sets | **already answered in the tree.** `g1_cards.rs` reassessed it on 2026-09-05 — the stated blocker is indeed gone, and the merge is still not worth making for a different and better reason (thirty shared lines, two genuinely different structures around them). |
+| 8c | ~3,000 lines of unwired machinery | **closed as a scope call, once.** The answer now sits in `gc/src/lib.rs` beside the module declarations, so the next reader meets it where they meet the modules instead of re-deriving it in a fourth file. |
+| 8d | volatile striping flat past 4 threads, "cause still unexplained" | **not open — it was fixed on 2026-08-27.** This page read the historical half of `collector.rs`'s own comment as a live finding. The cause was the stripe pool fitting in one cache line; padding each stripe to 128 bytes measured **1.64x at 24 threads** with a 1.00x single-thread control. |
+| f/u 3 | `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` over a real application | **done, and the verifier was corrupting the VM.** See below. |
+| soak | growing young arenas, multi-threaded allocator | **done**, and it took a default with it. |
+
+---
+
+## The verifier this page told you to run was double-remapping live statics
+
+`CRATONVM_DBG_STATIC_SLOT_VERIFY=1` over H2 (`DodH2JdbcSuite`) and Spring Boot
+with an embedded Tomcat over TLS, generational collector:
+
+```text
+h2jdbc  covered=1440 missed=0 chained=0    moved=28044
+h2jdbc  covered=1692 missed=0 chained=547  moved=702
+h2jdbc  covered=1692 missed=0 chained=0    moved=61816
+tcssl   covered=4140 missed=0 chained=0    moved=188939
+tcssl   covered=4729 missed=0 chained=1298 moved=6464
+tcssl   covered=6621 missed=0 chained=2259 moved=112136
+```
+
+**`missed=0` on every collection of both applications**, against pointer maps up
+to 206,002 entries and static surfaces up to 6,621 slots. That is the answer
+this page asked for: the recorded slot list is complete on real applications,
+not only on the 178-slot synthetic it had.
+
+`chained` is the column that was not there before, and it is why the answer took
+two runs. The shipped verifier had a single `missed` count and a premise stated
+in its own comment: *"anything the slot walk covered is already remapped, so a
+second `update_value_ref` on it is a no-op (the new address is not itself a
+key)"*. That premise holds for one Cheney semi-space pair and **fails for a
+composed map**. `collect_garbage_inner` chains the young map's values through
+`compact_map` and then merges `compact_map` whole, and a sliding compaction
+routinely moves object X down onto the address object Y just vacated — so a
+value in the map is a key in the map, for a different object.
+
+The verifier therefore saw its own correctly-patched slots "still resolving",
+counted them as misses, and **applied the map to them a second time**, sending
+each reference to wherever the *previous tenant* of that address went. Up to
+**2,259 live static slots in a single collection**. Diagnostic-mode only — but
+every earlier reading taken through this verifier was taken on a VM it was
+corrupting, which includes this page's own `missed=0 moved=12235` line.
+
+Split into `missed` (the real defect: a slot the scan never recorded) and
+`chained` (a recorded slot whose new address is another object's old one), and
+the second application removed.
+
+---
+
+## The eight findings, as filed on 2026-09-05
+
+Kept verbatim below the correction line. Read the closure table above
+first: several paragraphs here state an open item that is no longer one,
+and two state a measurement the follow-up refuted.
 
 ## 1. Roots are values, not slots
 
@@ -507,6 +590,11 @@ arenas GROW (the bitmap is rebuilt there, and that path is exercised by nothing
 above), and a multi-threaded allocator, where the give-back's re-commit syscalls
 land on the allocation path of every thread rather than one.
 
+
+---
+
+## The follow-up list as it was written, for the record
+
 ## What a follow-up should measure first
 
 1. ~~Re-run the +153 % four-worker number~~ — **attempted, and it produced two
@@ -599,3 +687,128 @@ land on the allocation path of every thread rather than one.
    predicate is already the cheaper of the two — no extent computation and no
    second commit probe — so the expensive half the bitmap replaces in
    `gen_heap` is not there to replace. Measure before building it.
+
+---
+
+## The two defaults, reverted, and the two different reasons
+
+Both were flipped ON on 2026-09-05 on the strength of a 90/0 HotSpot-differential
+regression suite plus a three-run-per-arm sequential ABBA. Both are back to
+opt-in. The switches, the kill switches and the instruments all stay.
+
+### `CRATONVM_GEN_UNCOMMIT` — it SIGSEGVs H2 in ten seconds
+
+`-XX:+UseGenerationalGC` over `org.h2.test.jdbc.TestPreparedStatement` alone:
+
+| arm | rc |
+|---|---|
+| this flag ON | **139**, fault address inside a `site=unbumped-middle` released span, fault pc in a live JIT code buffer |
+| `CRATONVM_GEN_UNCOMMIT=0` | 0 |
+| `CRATONVM_GC_RESERVE=0` (nothing decommits) | 0 |
+| `--nojit` | 0 |
+| `CRATONVM_GC_OBJECT_STARTS=0` | 139 |
+
+Reproduced on `origin/dev`'s own binary, so it is not this branch's. The fault
+address is `rax + 15`, which is `GC_FLAGS_BYTE_OFFSET` — the compact `getfield`
+fast path's flags load through a receiver that points into the semi-space the
+previous collection evacuated and handed back.
+
+This is **exactly** the fault `uncommit_evacuated_young`'s own doc predicted, and
+the flag is behaving as documented: the defect it exposes belongs to a compiled
+frame, not to the give-back. It is the DEFAULT that was wrong. The evidence for
+the flip was a suite that does not run this corpus, and the same measurement
+that justified the flip put the benefit at 2552 ms against 2562 ms — free to
+within noise. A change with no measurable benefit does not get to crash a
+supported collector on a real workload by default.
+
+Note also what this page's own ZGC fix cannot do here. Finding 7 closed the
+identical shape for ZGC by withdrawing `JIT_READ_BOUNDS`, and that would not
+have helped: `emit_trusted_oop_receiver_check_at` emits a bare null test and
+then dereferences the receiver unconditionally, consulting no bounds table at
+all. The read bound is not the only door.
+
+The switch is now the sharpest instrument in the tree for this family — it turns
+a stale young reference from a silent read of the previous cycle's bytes into an
+immediate, attributable SIGSEGV with the span, the site and the code buffer
+already printed. That is what found the compiled-frame record.
+
+### `CRATONVM_GC_OBJECT_STARTS` — its 7% was a measurement artefact
+
+Re-run as concurrent pairs, every arm checked for its probe's own success line:
+
+| workload | pairs | `on/off` ratios | median |
+|---|---|---|---|
+| single-threaded churn, 96 MiB live | 6 | 0.914 1.006 0.888 1.053 0.742 1.077 | 0.96 |
+| 8-thread churn, GROWING young set | 8 | 1.030 1.085 1.001 1.079 1.035 1.059 1.018 0.846 | **1.03** |
+
+Neither reproduces the 7%. The multi-threaded, growing shape — the one this page
+listed as unmeasured, in those words — is **slower in 7 of 8 pairs**. The bitmap
+is rebuilt on every arena growth, which is a mechanism for that and is the path
+nothing had run.
+
+Nothing is wrong with the bitmap. What was wrong was reading a sequential ABBA
+on a machine that ~20 other agents build on.
+
+---
+
+## The oracle's first answer was about the oracle
+
+Worth recording because it is the third instrument on this page to have been
+wrong in a way that read as a finding.
+
+`CRATONVM_DBG_GC_TRIGGER_VERIFY=1` reported **0 divergences in 4550 checks** on
+a single-threaded probe, and then **88 in 69,922** the first time it ran on
+multi-threaded H2. Eighty-eight is a small number and it is exactly the shape a
+missing publish would have — `used` low, `free` and `capacity` agreeing.
+
+It was the verifier. It read the published triple and THEN took the lock, so a
+peer thread allocating between the two reads produced a `published` that lagged
+`actual` by one allocation. Acquire first, then read published, then read the
+arena: under the lock nothing can mutate and nothing can republish, so the two
+must be equal and a divergence means what it says. **63,661 checks, 0
+divergences** on the same workload with the order corrected.
+
+The tell that it was the reader and not the writer was there in the first
+report and worth naming: only ONE of the three published values ever diverged,
+always in the same direction, always by about one object.
+
+## How these were measured, and why two of this page's own numbers do not stand
+
+Every throughput row above is **concurrent paired arms**: both arms started
+within two seconds of each other so they contend with each other and see the
+same host in the same seconds, launch order alternated between pairs so a
+start-order effect cannot masquerade as the treatment, only the ratio read, and
+`/proc/loadavg` recorded per pair.
+
+A sequential ABBA cancels a monotone DRIFT. The disturbance on this box is other
+agents' builds, which is SPIKY, and a spike sitting in an ABBA's two middle
+positions is arithmetically indistinguishable from the treatment — the same
+design once read 1.9x for a JIT flag that costs nothing.
+
+Two numbers on this page were taken that way and do not stand: the
+`object-starts` "median ~7% faster with it on", and the `gen-uncommit` table
+beside it. The give-back's "free to within noise" survives, because concurrent
+pairs put it at 0.942 / 1.015 / 1.042 / 1.070 — still free, now measured under a
+design that could have shown otherwise.
+
+Two readings taken with the same wrong design during this follow-up are recorded
+as refuted rather than deleted: a sequential ABBA put the lock-free GC trigger
+5/5 reps faster and the object-start bitmap 3.8% slower, and concurrent pairs put
+both at 1.0. The failure mode is not subtle and it is not rare.
+
+## The engagement numbers were behind a JIT flag
+
+`[cratonvm] static root slots: patched=…`, `exact object-start answers: hits=…`
+and `generational young uncommit: … bytes` — the three lines this page quotes as
+the proof that its switches engaged — printed only under
+`CRATONVM_JIT_METHOD_STATS`, which is about the JIT and is named in none of
+those records. A reader who set the GC switch and saw no line would have read
+that as "the switch did nothing", which is the exact failure every one of those
+counters was written to prevent, one level up. They are outside that gate now.
+
+## What moved out
+
+* The compiled-frame stale young reference — its own record, with the
+  ten-second reproducer, the five-arm attribution and the
+  `CRATONVM_DBG_STALE_FRAME_WORDS` witnesses naming `org/h2/command/Command.stop`
+  and `org/h2/mvstore/tx/Transaction.commit`.

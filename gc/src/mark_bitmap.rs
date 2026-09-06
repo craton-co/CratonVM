@@ -13,7 +13,50 @@
 //! Gray objects (live but unscanned) are tracked in the mark queue, not in
 //! the bitmap itself.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+// ---------------------------------------------------------------------------
+// `clear` census -- CRATONVM_DBG_MARKCLEAR=1
+// ---------------------------------------------------------------------------
+
+/// Calls to [`MarkBitmap::clear`], calls that actually cleared, the words they
+/// cleared, and the nanoseconds they spent doing it.
+///
+/// # Why the four numbers and not one
+///
+/// The change this measures is the `any_marked` early return, and its whole
+/// value is the calls it turns into nothing. A total time alone cannot see
+/// that: a fast total is equally consistent with "the early return is
+/// carrying almost every call" and with "the bitmaps are small". The pair
+/// `calls` / `worked` is the engagement number -- `worked == calls` means the
+/// early return never fired on this workload and the change bought nothing
+/// here -- and `words` is what says whether the calls that DID work were
+/// clearing anything worth clearing.
+///
+/// Off by default: `Instant::now()` twice per call is cheap next to a
+/// bitmap-wide store loop but not next to the early return, which is one
+/// relaxed load, and instrumenting the fast path with something more expensive
+/// than the fast path is how a census answers a question about itself.
+static CLEAR_CALLS: AtomicU64 = AtomicU64::new(0);
+static CLEAR_WORKED: AtomicU64 = AtomicU64::new(0);
+static CLEAR_WORDS: AtomicU64 = AtomicU64::new(0);
+static CLEAR_NANOS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn clear_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MARKCLEAR").is_some())
+}
+
+/// `(calls, worked, words_cleared, nanos)` -- see [`CLEAR_CALLS`].
+pub fn clear_census() -> (u64, u64, u64, u64) {
+    (
+        CLEAR_CALLS.load(Ordering::Relaxed),
+        CLEAR_WORKED.load(Ordering::Relaxed),
+        CLEAR_WORDS.load(Ordering::Relaxed),
+        CLEAR_NANOS.load(Ordering::Relaxed),
+    )
+}
 
 /// Granularity of the mark bitmap: one bit per 8 bytes of heap.
 /// This matches the minimum object alignment (8-byte aligned headers).
@@ -127,11 +170,21 @@ impl MarkBitmap {
     ///
     /// The early return is the one thing this adds: see [`Self::any_marked`].
     pub fn clear(&self) {
+        let census = clear_census_on();
+        if census {
+            CLEAR_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         if !self.any_marked.load(Ordering::Acquire) {
             return;
         }
+        let t0 = census.then(std::time::Instant::now);
         self.bits.clear_all();
         self.any_marked.store(false, Ordering::Relaxed);
+        if let Some(t0) = t0 {
+            CLEAR_WORKED.fetch_add(1, Ordering::Relaxed);
+            CLEAR_WORDS.fetch_add(self.bits.word_count() as u64, Ordering::Relaxed);
+            CLEAR_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Has anything been marked into this bitmap since the last [`Self::clear`]?

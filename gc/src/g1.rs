@@ -3522,6 +3522,48 @@ pub struct G1PauseSummary {
 // ---------------------------------------------------------------------------
 
 /// G1 garbage collector implementing the `GarbageCollector` trait.
+// ---------------------------------------------------------------------------
+// `is_object_address` census -- CRATONVM_DBG_G1_OBJADDR=1
+// ---------------------------------------------------------------------------
+
+/// Calls, acceptances and nanoseconds inside [`G1Collector::is_object_address`].
+///
+/// # What this is for
+///
+/// `gen_heap`'s sibling predicate got an exact object-start bitmap because it
+/// was ~180 lines of header-shaped deduction with an extent computation and two
+/// commit probes in it. The obvious follow-up -- give G1 one too -- is NOT the
+/// same trade, and the reason is measurable rather than arguable: G1 does not
+/// allocate through `Arena`, so it has no bitmap to consult and would need one
+/// maintained at its own chokepoint; and its predicate is already the cheaper
+/// of the two, with no extent arithmetic and no second commit probe, so the
+/// expensive half a bitmap replaces in `gen_heap` is not there to replace.
+///
+/// Whether the cheap half is worth replacing is a number, and this is the
+/// number: the share of a G1 run spent inside this function at all. Off by
+/// default -- two `Instant::now()` calls around a function whose body is an
+/// alignment test and two byte loads would dominate what it measures, which is
+/// why the reading is a share of a run rather than a per-call cost.
+static G1_OBJADDR_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static G1_OBJADDR_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static G1_OBJADDR_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn g1_objaddr_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_G1_OBJADDR").is_some())
+}
+
+/// `(calls, accepted, nanos)` -- see [`G1_OBJADDR_CALLS`].
+pub fn g1_object_address_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        G1_OBJADDR_CALLS.load(Ordering::Relaxed),
+        G1_OBJADDR_ACCEPTED.load(Ordering::Relaxed),
+        G1_OBJADDR_NANOS.load(Ordering::Relaxed),
+    )
+}
+
 pub struct G1Collector {
     /// Compact-layout domain of the VM that owns this heap. See
     /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
@@ -17031,6 +17073,23 @@ impl G1Collector {
     }
 
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
+        let __t0 = g1_objaddr_census_on().then(std::time::Instant::now);
+        let __r = self.is_object_address_inner(addr);
+        if let Some(t0) = __t0 {
+            G1_OBJADDR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if __r.is_some() {
+                G1_OBJADDR_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            G1_OBJADDR_NANOS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        __r
+    }
+
+    #[inline]
+    fn is_object_address_inner(&self, addr: usize) -> Option<ObjectRef> {
         if addr == 0 || addr & 0x7 != 0 {
             return None;
         }
