@@ -257,7 +257,18 @@ one of them was unguarded.
 reference array whose ninth element holds `good[0] + 3` (inside a live CSet
 region, past its header, not 8-aligned). Pre-fix the pause aborts; post-fix it
 completes, every well-formed element still moves exactly once, and the refusal
-is counted. `cargo test -p cratonvm-gc`: 1858 pass, 0 fail.
+is counted. `cargo test -p cratonvm-gc`: 1876 pass, 0 fail.
+
+Two whole-suite gates, both green on the merged branch:
+
+* `regression-suite/run.sh SUITE=all`: **131 of 131**, including `RJdkModule`
+  and `RServiceLoaderDoubleSource` — the two vectors most exposed to this
+  branch's other change (class-path modular jars becoming unnamed-module).
+* `bench-gpu/residency-gc.sh`, which is the fixture the public page's last
+  revision added: **RESIDENCY SURVIVES RELOCATION ON EVERY COLLECTOR** — ZGC,
+  G1 and Generational, values matching the HotSpot oracle, with the relocation
+  census confirming the arms actually moved objects (G1: cache entries re-keyed
+  across real collections, not a vacuous pass).
 
 ### Measurements
 
@@ -270,12 +281,12 @@ suite's own classpath and flags. The only difference between arms is
 
 | arm | CRASH | PASS | HANG |
 |---|---:|---:|---:|
-| `SCREEN=0` (pre-fix walks) | **3** | 3 | 0 |
-| default (screens armed) | **0** | 5 | 1 |
+| `SCREEN=0` (pre-fix walks) | **4** | 8 | 0 |
+| default (screens armed) | **0** | 12 | 1 |
 
-Crash walls 107.0 / 111.9 / 118.2 s; pass walls 144.9-167.3 s (off) and
-135.5-164.0 s (on). The single `on` HANG is a 600 s cap hit at host load 18 on
-a shared box, not a crash — see the caveat below.
+(Twelve pairs in all: six at host load ~15, three more at load ~8, three on the
+shift-fixed binary. Crash walls 92.0-118.2 s.) The single `on` HANG is a 600 s
+cap hit at load 18 on a shared box, not a crash — see the caveat below.
 
 #### 2. The same A/B across all 15 classes the public page names, n=1
 
@@ -308,28 +319,41 @@ slower than Azure does (`TestHostConfigAutomaticDeploymentXmlExternalWarXml`:
 868 s. `TestFormAuthenticatorB` and `TestHostConfigAutomaticDeploymentDeleteB`
 go CRASH → PASS outright.
 
-#### 4. Cost
+#### 4. Cost — and the divide that was most of it
 
-Not free, not large, and not separable from this host's noise.
-`TestCompiler`, Azure, 3 interleaved repetitions per arm, all six PASS:
+The first measurement said the screens were expensive, and it was right.
+`TestHostConfigAutomaticDeploymentXmlExternalWarXml` is the stable member of
+this set (~100 s, PASSes on both arms), so it is the one to time. Azure, same
+binary, arms interleaved, PASS runs only:
 
-| arm | walls (s) | median |
-|---|---|---:|
-| `SCREEN=0` | 223.5, 203.0, 231.0 | 223.5 |
-| default | 239.9, 202.2, 256.4 | 239.9 |
+| build | `SCREEN=0` walls (s) | default walls (s) | median ratio |
+|---|---|---|---:|
+| before the shift fix | 95.3, 97.1, 111.8 | 108.7, 118.2, 114.3, 131.9 | **1.20** |
+| after | 136.3, 133.8, 152.6, 134.4, 134.0 | 124.7, 143.1, 155.0, 135.4, 132.4 | **1.007** |
 
-Median +7.3%, ranges overlapping (the fastest run of all six is an `on` run).
-Across the ten classes of measurement 2 that PASS on both arms the on/off wall
-ratio ranges 0.89-1.42 with no sign, which on a box carrying load 10-18 and
-other sessions' builds is noise, not a measurement. What can be said from the
-code is the shape of the cost: one extra region-table lookup and two tag-byte
-reads per CSet-bound reference, on a cache line `evacuate` is about to read
-anyway — and the serial arm has paid exactly this since 2026-08-26.
+(The two rows are not comparable to each other — host load was ~8 for the first
+and ~15 for the second. Only the within-row ratio means anything.)
 
-**Do not read a timing arm from this host as a number.** It is shared, it was
-carrying two other sessions' cargo builds throughout, and
-[[reference_a_contended_host_hid_a_defect_that_reproduces_9_of_9]] is on record
-about what that does.
+Twenty percent is not a screen reading two tag bytes. It was
+`classify_candidate_header`'s `(addr - arena_base) / region_size`: `region_size`
+is a runtime value, so that is a real 64-bit `div` — tens of cycles,
+unpipelined — and this function went from "a few conservative roots per pause"
+to "once per CSet-bound reference" the moment the parallel arm started calling
+it. **F-09 removed exactly this divide from `lookup_region_for_addr` and left
+the note explaining why**; the screen was written before that lesson and never
+got it. `holder_walkable_slots` had the same divide and got the same fix.
+
+After the shift the residual is +0.7% median with the arms interleaving on
+individual runs (the fastest of all ten is a screened run), i.e. below what
+this host can resolve. That matches the remaining shape of the work: one
+region-table read and two tag bytes per CSet-bound reference, on a cache line
+`evacuate` is about to touch anyway.
+
+**Do not read a timing arm from this host as a number.** It is shared, it
+carried other sessions' cargo builds throughout, and
+`a-contended-host-hid-a-defect-that-reproduces-9-of-9` is on record about what
+that does. The number that survives that caveat is the RATIO within one
+interleaved run, which is what the table reports.
 
 ## What is NOT closed by this
 
