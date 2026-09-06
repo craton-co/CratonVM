@@ -787,3 +787,86 @@ memory at all — they are the channels the proof asserts and the remap does not
 walk: a resumed register that is reloaded from somewhere other than the
 callee-saved image, or the shadow stack. That is the next measurement, and it is
 a different one from §8's screens.
+
+### 10.11 92 of 109 relocating cycles ran with a peer whose registers the codebase says are not rewritable
+
+`vm/src/threading/thread_state.rs` assigns every `ThreadExecState` a
+`RelocationRule`, and one of them carries an explicit obligation:
+
+```rust
+// Registers and JIT spill slots are not rewritable, so a
+// collection that contributes a frozen peer's conservative roots
+// must call `gc_quiescence::mark_moving_young_coverage_incomplete_because`
+// (or pin the peer's G1 regions).
+ThreadExecState::CompiledUninterruptible => RelocationRule::Forbidden,
+```
+
+`ThreadStateCensus::relocation_blockers()` exists to state the same thing —
+"a non-zero answer is the shadow-side statement of the
+`mark_moving_young_coverage_incomplete_because` obligation". **Nothing outside
+`thread_state.rs` consults `relocation_rule()`**; it has exactly one caller, in
+its own file. So the obligation is discharged, or not, by unrelated code, and
+nothing pairs the two.
+
+`CRATONVM_DBG_RELOCATION_BLOCKERS=1` (added with this section) prints the
+per-state census at the site that decides. Under the §10.4 repro, four reps:
+
+| | relocating cycles | with a `CompiledUninterruptible` peer |
+|---|---:|---:|
+| `coverage_proven=true` | 109 | **92 (84 %)** |
+| `coverage_proven=false` | 205 | 83 (40 %) |
+
+A representative relocating line:
+
+```
+[reloc-blockers] coverage_proven=true blockers=1 (java=0 vm=0 native=0 deopt=0
+                 compiled_uninterruptible=1 parked=1 blocked=2)
+                 moving_young=true osr_fallback=false incomplete=false
+```
+
+`java=0 vm=0`, so the blocker is **not the initiator** — it is a peer thread
+inside compiled code, uninterruptibly. And `incomplete=false`: no caller marked
+the cycle. **The obligation that state's own comment states was not discharged,
+and the collection relocated.**
+
+Note the direction of the association: a relocating cycle is *more* likely to
+have such a peer (84 %) than a non-relocating one (40 %), which is the opposite
+of what the contract asks for.
+
+**Why this fits every constraint this page has accumulated**, where the
+frame-coverage story does not:
+
+* it needs **peers** — every failing test is a `*MultipleThreads` one (§2);
+* the stale reference is **outside the heap** — §6's verifier reads ~0 missed
+  heap rewrites, and a peer's REGISTERS and JIT spill slots are not heap and not
+  frame-band memory;
+* rewriting frame-band memory **does not help** — §10.8, the whole unverifiable
+  tail rewritten, 2/32 vs 11/81, no effect. A register in a thread the collector
+  never walks is not reachable from any of those passes;
+* **G1 and ZGC are unaffected** (§1) — the comment's own parenthesis says why:
+  "or pin the peer's G1 regions". They pin; a Cheney copy cannot
+  (`honours_conservative_pins() == false`), which is §10.1's finding one level
+  up;
+* the **pin credit made it worse** (§10.3) — it manufactured `accounted=true` on
+  exactly these cycles;
+* and `unrewritable_conservative_jit_roots` (§10.1) **refuses precisely this
+  population**, which is why the current default is green and why §0's warning
+  that repairing engagement re-exposes the bug is exactly right.
+
+**What is NOT claimed.** No per-cycle pairing between a `CompiledUninterruptible`
+peer and the fault has been taken — these four reps did not crash, and 84 % is an
+association, not a demonstration that this cycle corrupted that object. The next
+measurement is that pairing: record the peer's register file at the park, and
+after the collection check whether any of its words is a `pointer_map` key.
+`scan_peer_shadow_window` and the helper-window pass already capture a frozen
+peer's GPRs for G1's pin set, so the capture exists and only the comparison is
+missing.
+
+**And a correction to the diagnostic itself, made in the same commit.** Its first
+form printed only `relocation_blockers()` and read `blockers=1` on all 452
+decisions, relocating and not, never 0 — a constant that discriminates nothing.
+That is because `JavaRunning`/`VmRunning` are also `Forbidden`, so on many cycles
+the count is just some running thread. The per-state breakdown is what separates
+"a peer is uninterruptibly in compiled code" from "somebody is running", and
+`relocation_blockers()` on its own should not be used as the obligation oracle
+its doc describes.

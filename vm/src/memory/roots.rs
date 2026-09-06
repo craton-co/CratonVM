@@ -1341,6 +1341,52 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             shared.mem.heap.honours_conservative_pins(),
         )
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
+    // `CRATONVM_DBG_RELOCATION_BLOCKERS=1` -- pair this cycle's relocation
+    // verdict with the thread-state census's own statement of the obligation.
+    //
+    // `ThreadStateCensus::relocation_blockers()` counts threads whose
+    // `ThreadExecState` maps to `RelocationRule::Forbidden`, and its doc calls a
+    // non-zero answer "the shadow-side statement of the
+    // `mark_moving_young_coverage_incomplete_because` obligation". Nothing
+    // outside `thread_state.rs` consults `relocation_rule()`, so the obligation
+    // is discharged (or not) by unrelated code paths and no assertion pairs the
+    // two. A line reading `coverage_proven=true blockers=N` with N > 0 is a
+    // cycle that relocated while some thread's state said it must not.
+    //
+    // Diagnostic only, and read per cycle rather than latched: it is one atomic
+    // census walk under a read lock on a path that is already taking a
+    // safepoint.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RELOCATION_BLOCKERS").is_some() {
+        use crate::threading::ThreadExecState as TES;
+        let census = crate::threading::thread_state_census();
+        // The RAW count is not the answer, and the first run of this
+        // diagnostic is why: `blockers=1` on all 452 decisions across four
+        // reps, relocating and not, never 0. `relocation_rule()` maps
+        // `VmRunning` / `JavaRunning` to `Forbidden` and the COLLECTING thread
+        // is in one of them by construction, so it counts itself. Anything
+        // built on `relocation_blockers() > 0` therefore fires on every cycle
+        // and discriminates nothing -- including that method's own doc, which
+        // calls a non-zero answer "the shadow-side statement of the
+        // `mark_moving_young_coverage_incomplete_because` obligation".
+        //
+        // Print the per-state breakdown so the initiator can be subtracted by
+        // eye and a genuine PEER blocker (`compiled_uninterruptible`, or a
+        // second running thread) is visible.
+        eprintln!(
+            "[reloc-blockers] coverage_proven={coverage_proven} blockers={} \
+(java={} vm={} native={} deopt={} compiled_uninterruptible={} parked={} blocked={}) \
+moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete={}",
+            census.relocation_blockers(),
+            census.get(TES::JavaRunning),
+            census.get(TES::VmRunning),
+            census.get(TES::NativeRunning),
+            census.get(TES::Deoptimizing),
+            census.get(TES::CompiledUninterruptible),
+            census.get(TES::SafepointParked),
+            census.get(TES::NativeBlocked),
+            cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete(),
+        );
+    }
     // The SUPPRESSION is additionally opt-in as of 2026-08-21
     // (`CRATONVM_GC_PRECISE_ONLY_ROOTS=1`), and only the suppression — the proof
     // above still runs on every collector, which is the whole point of the
