@@ -2898,6 +2898,17 @@ pub(super) fn process_references_after_gc(
             }
             continue;
         }
+        if refaudit_enabled() {
+            let cid = shared.mem.heap.class_id_of(obj_ref);
+            eprintln!(
+                "[refaudit] cleared-null addr=0x{actual_addr:x} class={} fields={}",
+                class_manager
+                    .get_class(cid)
+                    .map(|c| c.name.as_ref().to_string())
+                    .unwrap_or_else(|| format!("<unresolved cid={}>", cid.as_u32())),
+                shared.mem.heap.num_fields(obj_ref),
+            );
+        }
         shared.mem.heap.set_field(obj_ref, 0, Value::Object(None));
     }
 
@@ -3000,6 +3011,21 @@ pub(super) fn process_references_after_gc(
         // with fewer than 3 fields (legacy synthetic shape) fall back to the
         // old slot-0 linkage, which is at least consistent with the poll
         // side's identical fallback.
+        if refaudit_enabled() {
+            let rc = shared.mem.heap.class_id_of(ref_obj);
+            let qc = shared.mem.heap.class_id_of(q_obj);
+            let nm = |cid: cratonvm_types::ClassId| {
+                class_manager
+                    .get_class(cid)
+                    .map(|c| c.name.as_ref().to_string())
+                    .unwrap_or_else(|| format!("<unresolved cid={}>", cid.as_u32()))
+            };
+            eprintln!(
+                "[refaudit] enqueue ref=0x{actual_ref:x}/{} q=0x{actual_q:x}/{}",
+                nm(rc),
+                nm(qc)
+            );
+        }
         let old_head = shared.mem.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared
             .mem
@@ -3101,6 +3127,15 @@ pub(super) fn process_references_after_gc(
     // null slot. Runs before `update_after_gc` so processor addresses are still
     // the pre-collection (pointer-map key) view.
     if weakref_clear_enabled() {
+        // REFPROC AUDIT (see `refaudit_enabled`). Every `continue` below leaves
+        // the slot the PRE-GC pass nulled still null, in a Reference that is
+        // live — the comment on the referent screen says so in as many words
+        // ("a refusal leaves the slot NULL"). Two of the five decline paths
+        // print nothing at all, so the straystack census cannot distinguish
+        // "restored everything" from "abandoned half of them". Count each one.
+        let audit = refaudit_enabled();
+        let (mut r_ok, mut r_no_ref, mut r_no_referent, mut r_shape, mut r_stamp, mut r_screen) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut active = ref_proc.weak_phantom_active_pairs();
         // SOFT-CLEAR GAP (2026-08-15): the pre-collection pass also nulled the
         // referent slot of every soft entry its LRU policy condemned. The ones
@@ -3129,7 +3164,10 @@ pub(super) fn process_references_after_gc(
                 {
                     ref_obj_old
                 }
-                None => continue,
+                None => {
+                    r_no_ref += 1;
+                    continue;
+                }
             };
             // The referent survived (this entry was not cleared/enqueued): find
             // its post-collection address (relocated → pointer map; old-gen
@@ -3149,7 +3187,10 @@ pub(super) fn process_references_after_gc(
                 }
                 // Defensive: should not happen for an active entry, but never
                 // write a stale referent — leave the slot null.
-                None => continue,
+                None => {
+                    r_no_referent += 1;
+                    continue;
+                }
             };
             // SAFETY: both addresses are live post-collection object headers.
             let ro = unsafe { ObjectRef::from_raw(ref_obj_new as *mut u8) };
@@ -3172,6 +3213,7 @@ pub(super) fn process_references_after_gc(
                         shared.mem.heap.num_fields(ro),
                     );
                 }
+                r_shape += 1;
                 continue;
             }
             // This pass writes an OBJECT into slot 0, not a null, so a
@@ -3184,6 +3226,7 @@ pub(super) fn process_references_after_gc(
                         "[refproc] SKIP reidentified weak/phantom RESTORE ref @0x{ref_obj_new:x} (identity stamp mismatch)"
                     );
                 }
+                r_stamp += 1;
                 continue;
             }
             // AND THE SAME QUESTION ABOUT THE REFERENT, which nothing asked.
@@ -3229,6 +3272,7 @@ pub(super) fn process_references_after_gc(
                         referent_restore_refusals()
                     );
                 }
+                r_screen += 1;
                 continue;
             }
             if let Some(&want_class) = referent_class_stamps
@@ -3246,13 +3290,20 @@ pub(super) fn process_references_after_gc(
                             referent_restore_refusals()
                         );
                     }
+                    r_screen += 1;
                     continue;
                 }
             }
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
             // re-marks the old→young card.
+            r_ok += 1;
             shared.mem.heap.set_field(ro, 0, Value::Object(Some(rt)));
+        }
+        if audit {
+            eprintln!(
+                "[refaudit] post-gc-restore restored={r_ok} abandoned_no_ref_survivor={r_no_ref}                  abandoned_no_referent_survivor={r_no_referent} abandoned_shape={r_shape}                  abandoned_stamp={r_stamp} abandoned_screen={r_screen}"
+            );
         }
         // Drop entries whose Reference object was collected this cycle so the
         // side-lists stay bounded and the pre-GC null pass never dereferences a

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-515 tokens.
+516 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -453,6 +453,7 @@ export inherited from a parent shell.
 | `refersto` | `CRATONVM_DBG_REFERSTO` |
 | `reflection-factory` | `CRATONVM_DBG_REFLECTION_FACTORY` |
 | `refproc` | `CRATONVM_DBG_NO_REFPROC` |
+| `refproc-audit` | `CRATONVM_DBG_REFPROC_AUDIT` |
 | `refproc-remark` | `CRATONVM_DBG_REFPROC_REMARK` |
 | `remap-trace` | `CRATONVM_DBG_REMAP_TRACE` |
 | `replovr` | `CRATONVM_DBG_REPLOVR` |
