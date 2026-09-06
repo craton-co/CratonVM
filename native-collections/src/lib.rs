@@ -21381,6 +21381,14 @@ const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 ///
 /// `H4-1` §2 calls that shape *"strictly safer than §5's, because dispatch
 /// keys on class: any class left `Bridge` behaves exactly as today"*.
+/// `clippy::enum_variant_names`: every variant ends in `Cluster`, and that is
+/// the point rather than an accident of naming. A "cluster" is `H4-1` §2's unit
+/// — the set of classes that must move families together because they share
+/// storage (`LinkedHashMap` extends `HashMap` and shares its `table`) or a
+/// receiver predicate (`Properties` rides with `Hashtable` because
+/// `is_hashtable_receiver` accepts both). `HashMap` alone would name a class;
+/// `HashMapCluster` names the thing this enum has one variant per.
+#[allow(clippy::enum_variant_names)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum CarrierFamily {
     /// `java/util/HashMap` and `java/util/LinkedHashMap` — one cluster, because
@@ -59969,7 +59977,11 @@ fn chm_reject_bad_ctor_args(
     concurrency: Option<&Value>,
 ) -> Result<(), MethodCallFailed> {
     let bad_cap = matches!(capacity, Some(Value::Int(c)) if *c < 0);
-    let bad_lf = matches!(load_factor, Some(Value::Float(f)) if !(*f > 0.0));
+    // `f.is_nan() || *f <= 0.0`, not `!(*f > 0.0)`: identical truth table
+    // (`!(x > 0)` is true for NaN), but it says the NaN case out loud rather
+    // than leaving it to the reader to notice that negating a partial order is
+    // how it gets caught. `+inf` is a legal load factor either way.
+    let bad_lf = matches!(load_factor, Some(Value::Float(f)) if f.is_nan() || *f <= 0.0);
     let bad_cl = matches!(concurrency, Some(Value::Int(c)) if *c <= 0);
     if bad_cap || bad_lf || bad_cl {
         return Err(RuntimeError::IllegalArgumentException {

@@ -10,7 +10,7 @@ A native registered on an abstract method does not shadow one implementation —
 it intercepts **every** implementor, including classes the application defines.
 That is the standing hazard on `register_interface_natives`, and the 308
 inherited-abstract rows in
-`fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md` are the
+`jdk-only-census-one-class-one-platform-FIXED-20260810.md` are the
 same hazard in a second place. The native census counts *invocations* but has
 never said what they were dispatched against, so the blast radius was
 unmeasured.
