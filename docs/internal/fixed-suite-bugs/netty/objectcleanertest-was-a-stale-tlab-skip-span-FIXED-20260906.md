@@ -95,20 +95,20 @@ ZGC is immune because it does not use this sweep.
 `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` restores the pre-fix guard, in one
 binary:
 
-| arm | non-clean | skip-span guard fired |
-|---|---:|---:|
-| Generational, fixed | 0/8 | 0/8 |
-| Generational, `CONDITIONAL_TLAB_SKIP_PUBLISH=1` | **8/8** | **8/8** |
-| G1, fixed | 0/8 | 0/8 |
-| G1, `CONDITIONAL_TLAB_SKIP_PUBLISH=1` | **8/8** | 0/8 |
+| arm | non-clean | skip-span guard fired | label it printed |
+|---|---:|---:|---|
+| Generational, fixed | 0/8 | 0/8 | — |
+| Generational, `CONDITIONAL_TLAB_SKIP_PUBLISH=1` | **8/8** | **8/8** | `backend="generational"` |
+| G1, fixed | 0/8 | 0/8 | — |
+| G1, `CONDITIONAL_TLAB_SKIP_PUBLISH=1` | **8/8** | **8/8** | `backend="g1"` |
 
 The original page recorded 16 clean follow-up attempts. **All 16 ran the default
 collector**, which is ZGC. One arm per collector would have found it in three
 seconds. See `a-per-collector-sweep-finds-bugs-the-default-cannot-reach`.
 
-## 5. The new guard, and its one honest limit
+## 5. The new guard
 
-`SKIP_SPAN_ROOT_VIOLATIONS` — unconditional, in `sweep_young_non_moving`: **a
+`SKIP_SPAN_ROOT_VIOLATIONS` — unconditional, in both non-moving sweeps: **a
 root pointing into a published skip span disproves the span.** `roots` is the
 exact set the mark phase is about to be given, so the question is decidable
 right there and costs one pass over the roots against a list with at most one
@@ -121,11 +121,37 @@ skipping to prevent — and the guard cannot tell a stale span from a live one,
 only that *this* one is stale. The publish side establishes the invariant; this
 checks it.
 
-**Limit, stated because the table above shows it:** the guard lives in
-`gen_heap.rs`'s sweep, so it fires 8/8 on the Generational pre-fix arm and 0/8
-on the G1 one — G1 has its own sweep in `g1.rs` and no equivalent check. The
-publish fix covers both; the guard covers one. A G1-side twin is the obvious
-follow-up.
+### The G1 twin, and why it is one function and not two
+
+The first cut of the guard lived in `gen_heap.rs`'s sweep alone, so it fired
+8/8 on the Generational pre-fix arm and **0/8 on the G1 one — on runs that were
+failing 8/8**. A check present in one sweep and absent from the other does not
+read as "not implemented here"; it reads as *"the collector is fine here"*, and
+that reading was available for as long as the asymmetry stood.
+
+It is now **one function**, `heap::skip_spans_hold_no_root`, called from both:
+`sweep_young_non_moving` and G1's `collect_garbage` — in each case the
+once-per-collection site that has the roots in hand, before any of them are
+followed. The only real difference between the backends is the span
+representation, and it is a difference worth naming because copying the
+arithmetic across would have been silently wrong: **`gen_heap` holds skip spans
+as young-from `(offset, size)` pairs and G1 holds them as absolute
+`[start, end)`**. The generational caller converts; the shared check takes
+absolute pairs only. A second copy would have had to re-derive that, and a
+guard that quietly never matches is worse than no guard, because it reports a
+zero.
+
+Each fire now names the sweep it came from:
+
+```
+ERROR cratonvm::gc::guard: a ROOT points into a published TLAB skip span …
+      backend="g1" roots_in_spans=46 root="0x24d66a40148" span="0x24d66a3c068+0x8ab0" spans=1
+```
+
+Re-measured on one binary, 8 reps per arm: the G1 pre-fix arm moves
+**0/8 → 8/8** and each arm's logs carry only its own label, so no fire is
+credited to the wrong sweep. Both fixed arms stay `0/8 bad, guard_fired=0/8` —
+the guard is silent when the invariant holds.
 
 ## 6. What it took to find, and the instruments that lied
 
