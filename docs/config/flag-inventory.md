@@ -1182,6 +1182,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_DBG_ZERO` | DBG | `CRATONVM_DBG=g1-dbg-zero` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_G1_EAGER_HUMONGOUS` | GC | `CRATONVM_GC=g1-eager-humongous` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_EDEN_STRIPES` | GC | `CRATONVM_GC=g1-eden-stripes` | opt-in | off | behaviour | snapshot | types |
+| `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` | GC | `CRATONVM_GC=g1-evac-ref-implausible-refuse` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_HUMONGOUS_MARKS` | GC | `CRATONVM_GC=g1-humongous-marks` | opt-in | off | behaviour | snapshot | gc, types |
 | `CRATONVM_G1_IHOP_COUNTS_REGIONS` | GC | `CRATONVM_GC=g1-ihop-counts-regions` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_G1_INLINE_BARRIER` | GC | `CRATONVM_GC=g1-inline-barrier` | default-on | on | behaviour | snapshot | types |
