@@ -349,6 +349,47 @@ impl ModuleRegistry {
         self.package_to_module.get(pkg).map(|s| s.as_str())
     }
 
+    /// [`Self::module_for_package`], but answering the question a CLASS's
+    /// module membership asks: which module does a class in `pkg` belong to?
+    ///
+    /// The difference is the class path. A modular jar reached through `-cp`
+    /// has a `module-info.class` and this registry keeps its descriptor — for
+    /// service discovery, for labelling, for `packages_of` — but **a real JVM
+    /// ignores that descriptor outright**: a modular JAR on the class path is
+    /// treated as an ordinary JAR and its classes land in the UNNAMED module.
+    /// [`Self::service_providers`] already filters on exactly this argument, in
+    /// exactly these words; class membership is the surface that was left
+    /// reading the raw map.
+    ///
+    /// MEASURED 2026-09-05. Tomcat's Linux suite runs `-c .../catalina.jar`,
+    /// and `catalina.jar` carries a `module-info.class` declaring
+    /// `org.apache.tomcat.catalina`. With the raw map,
+    /// `WebappClassLoaderBase.class.getModule()` answered that named module, so
+    /// `--add-opens java.base/java.util=ALL-UNNAMED` — which is qualified to
+    /// the unnamed module, see [`ALL_UNNAMED_TARGET`] — did not reach it, and
+    /// `clearReferencesStopTimerThread`'s `setAccessible` threw
+    /// `InaccessibleObjectException: module java.base does not "opens
+    /// java.util" to org.apache.tomcat.catalina`. HotSpot passes the identical
+    /// classpath and flags. That is
+    /// `TestWebappClassLoaderMemoryLeak`/`…ExecutorMemoryLeak`; the failure is
+    /// invisible when the same classes are reached through EXPLODED directories
+    /// (the Windows suite's classpath), because a directory carries no
+    /// `module-info` to register — which is why one host reproduced it 1/1 and
+    /// the other 0/1 on the same commit.
+    ///
+    /// `--module-path` modules are unaffected: `vm_init` re-registers each one
+    /// with `automatic = false` right after `ClassManager::new`, so
+    /// [`Self::is_class_path_only`] is false for them and they keep their
+    /// names. Platform modules are registered `automatic = false` by the
+    /// boot/ext scan for the same reason.
+    pub fn named_module_for_package(&self, pkg: &str) -> Option<&str> {
+        let name = self.module_for_package(pkg)?;
+        if self.is_class_path_only(name) {
+            return None;
+        }
+        Some(name)
+    }
+
     /// Compute the transitive readability closure and cache it.
     ///
     /// After this call, `reads()` and `can_access()` become meaningful.
@@ -2566,6 +2607,49 @@ mod tests {
         assert!(
             !reg.is_package_open_to("modA", "com/secret", "modB"),
             "ALL-UNNAMED must not reach a named module"
+        );
+    }
+
+    /// A modular jar reached through the CLASS path does not give its classes a
+    /// module NAME, and `--add-opens …=ALL-UNNAMED` therefore reaches them.
+    ///
+    /// This is the whole of the 2026-09-05 Tomcat fix, in its smallest form:
+    /// `catalina.jar` is on `-cp` and carries a `module-info.class` declaring
+    /// `org.apache.tomcat.catalina`, so before
+    /// [`ModuleRegistry::named_module_for_package`] existed, every class in it
+    /// was labelled with that name and `--add-opens
+    /// java.base/java.util=ALL-UNNAMED` — qualified to the unnamed module —
+    /// could not grant it. HotSpot passes the identical classpath and flags.
+    ///
+    /// Both halves are asserted, because either alone is satisfiable by a wrong
+    /// implementation: dropping the name for EVERY module would also pass the
+    /// first assertion, and keeping it for every module would pass the second.
+    #[test]
+    fn a_class_path_jars_module_info_does_not_name_its_classes_module() {
+        let mut reg = ModuleRegistry::new();
+        // A `--module-path` module: `vm_init` re-registers these with
+        // `automatic = false`, which is what `is_class_path_only` reads.
+        reg.register(sample_desc("mod.on.module.path"), vec!["com/mp".to_string()]);
+        // A modular jar found by the APPLICATION class-path scan.
+        let mut cp_jar = sample_desc("org.apache.tomcat.catalina");
+        cp_jar.automatic = true;
+        reg.register(cp_jar, vec!["org/apache/catalina/loader".to_string()]);
+        reg.build_readability_graph();
+
+        assert_eq!(
+            reg.module_for_package("org/apache/catalina/loader"),
+            Some("org.apache.tomcat.catalina"),
+            "the descriptor itself stays in the registry — service discovery              and labelling still want it"
+        );
+        assert_eq!(
+            reg.named_module_for_package("org/apache/catalina/loader"),
+            None,
+            "but a class from that jar is in the UNNAMED module, as on HotSpot"
+        );
+        assert_eq!(
+            reg.named_module_for_package("com/mp"),
+            Some("mod.on.module.path"),
+            "a genuine --module-path module keeps its name"
         );
     }
 
