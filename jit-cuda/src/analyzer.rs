@@ -703,7 +703,7 @@ fn analyze_with_annotations_and_pool_impl(
     // loop-trip work estimate, the backward-branch flag, and whether
     // the body matches the dot-product/sum reduction shape — no second
     // walk needed.
-    let (this_field_cps, estimated_work, has_backward, is_dot_reduction) =
+    let (this_field_cps, estimated_work, has_backward, is_dot_reduction, body_ops) =
         match scan_bytecode(code, hint, is_static, cp) {
             Ok(t) => t,
             Err(reason) => return OffloadVerdict::Rejected(reason),
@@ -761,6 +761,7 @@ fn analyze_with_annotations_and_pool_impl(
         param_kinds,
         return_kind,
         estimated_work,
+        body_ops,
         this_field_cps,
         // Merged from the round-9 branch: the analyzer cannot see across
         // the dispatch boundary, so default `false` (cheaper no-sync
@@ -823,10 +824,17 @@ fn scan_bytecode(
     hint: AdmissionFlags,
     is_static: bool,
     cp: Option<&ConstantPool>,
-) -> Result<(Vec<u16>, usize, bool, bool), Reason> {
+) -> Result<(Vec<u16>, usize, bool, bool, u32), Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
     let mut prev_op: Option<u8> = None;
+    // Arithmetic ops in the body, for the admission cost model's `ops`
+    // term (docs/gpu/offload-crossover-and-min-work-20260904.md). The
+    // band is the one the opcode walk already admits as "arithmetic &
+    // shifts", minus `iinc` (0x84), which is loop-counter bookkeeping
+    // rather than per-element work. Counted over the whole body: for the
+    // counted-loop kernels this gates, the body IS the per-element work.
+    let mut body_ops: u32 = 0;
     // Non-static this-field methods are now rejected outright (the
     // emitter cannot lower them — see the `NonStaticReceiverMisuse`
     // handling in the walk below), so no receiver-access CP indices are
@@ -885,6 +893,13 @@ fn scan_bytecode(
 
     while pc < bytes.len() {
         let op = bytes[pc];
+
+        // Per-element arithmetic, for the admission cost model. Same band
+        // the length table calls "arithmetic & shifts"; `iinc` (0x84) is
+        // outside it already and is loop bookkeeping, not element work.
+        if (0x60..=0x83).contains(&op) {
+            body_ops = body_ops.saturating_add(1);
+        }
 
         if (0x2E..=0x35).contains(&op) && op != 0x32 {
             body_has_array_load = true;
@@ -1039,6 +1054,7 @@ fn scan_bytecode(
         estimated_work,
         has_backward,
         is_dot_product_reduction,
+        body_ops,
     ))
 }
 

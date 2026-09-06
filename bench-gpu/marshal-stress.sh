@@ -41,6 +41,21 @@
 set -u
 export MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
 
+# This script tests the MARSHALLER -- six element types across two
+# transfer paths -- and asserts every one of the six actually dispatched.
+# Admission POLICY is orthogonal to that, and a correct policy breaks the
+# assertion: `CRATONVM_GPU_ADMIT_MODEL=1` refuses `long[]`/`double[]` at
+# this n, because 8-byte elements at n=131072 are below break-even (the
+# measured grid has them at 0.79-0.90x even at 262144). The census then
+# reports 0 transfers for scaleJ/scaleD and the run fails, with every
+# value still matching HotSpot.
+#
+# So pin the scalar threshold, the same way gate-overbroad.sh pins the
+# caller-gate mode whose breadth it measures. Without this the script
+# becomes a test of the admission model rather than of the marshaller,
+# and it would go red the day that model is defaulted on.
+export CRATONVM_GPU_ADMIT_MODEL=0
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 

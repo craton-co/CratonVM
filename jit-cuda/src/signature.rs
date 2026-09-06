@@ -17,6 +17,18 @@ pub struct KernelSignature {
     /// to decide whether the round-trip overhead is worth it for
     /// small inputs.
     pub estimated_work: usize,
+    /// Arithmetic opcodes in the body — the `ops` term of the admission
+    /// cost model in
+    /// `docs/gpu/offload-crossover-and-min-work-20260904.md`.
+    ///
+    /// Distinct from [`Self::estimated_work`], which is a TRIP COUNT (or
+    /// a flat `1 << 20` placeholder). The cost model needs work *per
+    /// element*, and those are different numbers: a 2^20-iteration loop
+    /// doing one multiply and one doing sixteen have the same
+    /// `estimated_work` and a 16x difference in whether offload pays.
+    /// That is why the fitted model beats `n >= 4096` 96% to 59% on the
+    /// measured grid.
+    pub body_ops: u32,
     /// AUDIT 2026-05-17 (round-9 misc CRIT-1): does the launch need the
     /// post-launch event recorded so a subsequent host read-back is
     /// stream-ordered behind the kernel?
