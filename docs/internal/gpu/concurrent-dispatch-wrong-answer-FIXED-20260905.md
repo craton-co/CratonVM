@@ -219,3 +219,83 @@ Neither is visible single-threaded, neither needs a GC, and neither
 changes an answer that any single-threaded test checks. When a fast path
 exists to let callers skip a lock, the state that fast path reads is part
 of the locked invariant and has to be maintained under the same lock.
+
+---
+
+# Residuals, closed 2026-09-06
+
+Both races on this page were fixed and verified on 2026-09-05. What was
+left open was the GATE — this page's own section "The gate that let it
+through" ends by describing a change to `runtime-stress.sh` without
+saying whether anything actually runs it.
+
+## The gate gap is covered, and it is covered by the job this page named
+
+The page opens with
+
+> Found by `bench-gpu/runtime-stress.sh`'s `concurrent` scenario, which
+> the weekly `gpu-selfhosted.yml` job runs but `bench-gpu/ci-gate.sh`
+> does not.
+
+which reads as a coverage hole. It is not one. Read on its own,
+`ci-gate.sh` does not cover concurrent dispatch — but `ci-gate.sh` is one
+step of `gpu-selfhosted.yml`, and the SAME job runs `runtime-stress.sh`
+four steps later, with no `continue-on-error` on either. A failure in the
+repeat arm fails the job exactly as a failed gate would. Moving the
+scenario into `ci-gate.sh` would buy nothing and would cost the gate
+script its "no scenario here takes minutes" property.
+
+What the weekly job runs, in order, all failure-propagating:
+`ci-gate.sh`, `runtime-stress.sh` (including the `REPEATS=5` concurrent
+arm under `CRATONVM_GPU_DEVICE_POOL=0`), `marshal-stress.sh`,
+`residency-gc.sh`, `jit-writer-stale.sh`, and both `cuda-bridge` driver
+suites.
+
+## Re-verified on 2026-09-06
+
+Same hardware — RTX 2060 (sm_75), CUDA 13.3, Windows 11, JDK 25.0.3 —
+on a binary carrying an unrelated change to `offload_jit_gate` (see
+[the compiled-caller gate page](compiled-caller-gate-refused-ldc-kernels-FIXED-20260905.md)),
+which is worth stating because that change arms the compiled dispatch
+helper on every `--gpu` run rather than only once a caller scan has found
+a kernel. If anything were going to disturb the concurrent path, a change
+that makes more sites consult the hook would be it.
+
+```
+=== vm offload runtime stress (n=65536) ===
+PASS concurrent
+PASS cache_coherence
+PASS readonly_inputs
+PASS aliasing
+PASS repeat_submit
+PASS deopt_then_continue
+PASS bulk_writes
+PASS concurrent x5 (pool off, the sensitive configuration)
+ALL RUNTIME STRESS SCENARIOS PASSED
+```
+
+`marshal-stress.sh` passed with all six kernels engaged, `ci-gate.sh` is
+6/6 (it gained a gate), `jit-writer-stale.sh` is 5/5, and
+`cargo test -p cratonvm-vm --features gpu-offload --lib` is 2717 passed.
+
+`residency-gc.sh` is RED, and not for anything on this page — see
+[a new page](../../known-issues/gpu/residency-gc-generational-sigsegv-20260906.md).
+It is deterministic rather than intermittent, it needs the JIT and OSR,
+and it reproduces identically with this page's subsystem untouched.
+
+## The shape, restated because it earned it
+
+Both bugs were one mistake in two places: a cheap lock-free side-channel
+guarding an expensive locked structure, updated outside that structure's
+lock. `ADDR_FILTER` had a bit OR'd in before the lock and erased by a
+concurrent rebuild-and-store; `DIRTY` had flags cleared before the lock,
+so the eviction they authorised had not happened when the next reader
+looked.
+
+Worth noting alongside: the compiled-caller gate page's 2026-09-06
+residual is a third variation on the same theme in the same subsystem —
+a cheap registry consulted to decide a per-site memo, where the registry
+could not yet hold the answer and the memo was taken anyway. Not a race
+that time, but the same trade of a cheap side-channel for the expensive
+truth, and the same failure mode: the fast path answered before the slow
+path could have.

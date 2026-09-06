@@ -1718,10 +1718,7 @@ pub fn try_dispatch(
                 || (runtime_work as u32) < shared.config.gpu_min_work
             {
                 if timed {
-                    cratonvm_types::gpu_refusal_census::add(
-                        2,
-                        mark.elapsed().as_nanos() as u64,
-                    );
+                    cratonvm_types::gpu_refusal_census::add(2, mark.elapsed().as_nanos() as u64);
                 }
                 // Per-call gate, not a property of the method: the next
                 // call at this site may pass a larger array, so the site
@@ -6650,7 +6647,7 @@ pub(crate) mod input_cache {
     /// `-XX:+UseGenerationalGC` failed 12/300 with the barrier armed and
     /// 0/300 with `CRATONVM_JIT_GPU_ARRAY_BARRIER=0`, alternating arms
     /// in one binary. See
-    /// docs/known-issues/gpu/concurrent-dispatch-wrong-answer-20260905.md.
+    /// internal/gpu/concurrent-dispatch-wrong-answer-FIXED-20260905.md.
     fn drain_locked(tables: &mut FxHashMap<usize, FxHashMap<ObjectRef, Entry>>) {
         let mut buckets = 0u64;
         for (i, b) in DIRTY.iter().enumerate() {
@@ -7026,7 +7023,7 @@ pub(crate) mod input_cache {
         // reproduced with zero collections in the run, which is why the
         // remap/sweep path above is not the one at fault.
         //
-        // See docs/known-issues/gpu/concurrent-dispatch-wrong-answer-20260905.md.
+        // See internal/gpu/concurrent-dispatch-wrong-answer-FIXED-20260905.md.
         let mut tables = map().lock();
         ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
         tables.entry(vm).or_default().insert(obj, entry);

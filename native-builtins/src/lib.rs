@@ -8593,7 +8593,8 @@ pub fn register_essential_natives_with_shims(
     // this pair satisfies the same rule the table is built from — a descriptor
     // belongs iff the real class declares it and it is public (or was already
     // registered). It is not registered anywhere else.
-    for cls in &["java/lang/IllegalThreadStateException"] {
+    {
+        let cls = &"java/lang/IllegalThreadStateException";
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
             cls_static,
@@ -21509,7 +21510,6 @@ pub fn register_essential_natives_with_shims(
             let raw = crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0);
             Ok(Some(Value::Int(raw.saturating_mul(1000))))
         });
-        ()
     }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
     // C12-1 (2026-08-12): `java/util/SimpleTimeZone` is DELIBERATELY NOT HERE.
@@ -35073,7 +35073,7 @@ const B64_MIME_LINEMAX: i32 = 76;
 const B64_NO_LINEMAX: i32 = -1;
 
 /// `Base64.Encoder.CRLF` — the line separator of `getMimeEncoder()`.
-const B64_MIME_CRLF: [u8; 2] = [b'\r', b'\n'];
+const B64_MIME_CRLF: [u8; 2] = *b"\r\n";
 
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_CHARS: &[u8; 64] =
@@ -37118,7 +37118,6 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.set_category(__prev_cat);
-    ()
 }
 
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
@@ -45373,7 +45372,6 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // where it used to live in `phases_early.rs`.
 
     // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases;
-    ()
 }
 
 // ===========================================================================

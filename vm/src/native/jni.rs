@@ -333,7 +333,7 @@ pub fn clear_jni_context() {
 /// the property [`clear_jni_context`]'s contract is about.
 pub fn replace_jni_context(shared: &SharedVm) -> Option<Arc<SharedVm>> {
     let arc = shared.get_arc();
-    let prev = JNI_SHARED_VM.with(|c| std::mem::replace(&mut *c.borrow_mut(), Some(arc)));
+    let prev = JNI_SHARED_VM.with(|c| (*c.borrow_mut()).replace(arc));
     JNI_CONTEXT_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
     prev
 }
@@ -10275,8 +10275,8 @@ mod tests {
     fn descriptor_cache_get_hit_and_miss() {
         let mut cache = DescriptorCache::new();
         assert_eq!(cache.get("(I)V"), None);
-        cache.insert("(I)V", vec![b'I']);
-        assert_eq!(cache.get("(I)V"), Some(&[b'I'][..]));
+        cache.insert("(I)V", b"I".to_vec());
+        assert_eq!(cache.get("(I)V"), Some(&b"I"[..]));
         assert_eq!(cache.get("(J)V"), None);
     }
 
@@ -10313,9 +10313,9 @@ mod tests {
             cache.insert(&format!("(I{i})V"), vec![b'I']);
         }
         // Re-inserting an existing key must not evict — it overwrites in place.
-        cache.insert("(I0)V", vec![b'J']);
+        cache.insert("(I0)V", b"J".to_vec());
         assert_eq!(cache.map.len(), DESCRIPTOR_CACHE_CAPACITY);
-        assert_eq!(cache.get("(I0)V"), Some(&[b'J'][..]));
+        assert_eq!(cache.get("(I0)V"), Some(&b"J"[..]));
     }
 
     // -----------------------------------------------------------------------
@@ -10972,7 +10972,7 @@ mod tests {
         // reads 6. Standard UTF-8 writes only 4, leaving two bytes of the
         // caller's buffer uninitialized.
         let emoji = "\u{1f600}";
-        assert_eq!(emoji.as_bytes().len(), 4, "standard UTF-8 is 4 bytes");
+        assert_eq!(emoji.len(), 4, "standard UTF-8 is 4 bytes");
         assert_eq!(
             modified_utf8_len(emoji),
             6,

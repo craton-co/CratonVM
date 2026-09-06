@@ -245,7 +245,7 @@ script never exercises the compiled-caller registration path.
 
 **A first guess at the cause was wrong, and the refutation is one line of
 fixture.** This page originally blamed the two races in
-[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md),
+[concurrent-dispatch-wrong-answer-FIXED-20260905.md](concurrent-dispatch-wrong-answer-FIXED-20260905.md),
 because both live in the cache `residency-gc.sh` hammers. But
 `test_classes/gpu/GpuResidencyGc.java` contains **no `Thread`,
 `Executor`, `parallel` or stream** — `main` is a sequence of direct
@@ -293,3 +293,206 @@ amplifier. Worth noting the events clustered: three fell within one
 stretch of loaded-host activity and none in 300 launches afterwards, so
 whatever forces it may be load- or timing-dependent rather than uniformly
 random, and a quiet-host zero should not be read as a fix.
+
+---
+
+# Residuals, closed 2026-09-06 — and the one that was the same defect again
+
+This page shipped with three things still open. Two were listed as
+"deliberately excluded" in the module docs; the third was an unexplained
+flake noted at the bottom. All three are settled here, and the page moves
+to the internal tree.
+
+## 1. Forward references: the same defect, one class away — 7.5x
+
+The module docs listed this as a known limitation and argued it as a
+corner case:
+
+> A caller compiled/scanned before its callee's class has ever been
+> loaded will not see the callee as eligible and will NOT be blocked
+> from JIT admission — offload can still be silently dropped for that
+> specific caller.
+
+Every clause of that is either an understatement or wrong.
+
+**It is not a corner case.** `offload_jit_gate` scans a caller when the
+caller is ADMITTED to the JIT, which happens *before* the caller runs. A
+callee in another class has therefore usually never been touched at that
+moment — the `invokestatic` under judgement is the very thing that will
+load it. So the gate cannot judge a cross-class kernel *by
+construction*, not by accident of ordering.
+
+**The drop is not limited to "that specific caller", and it is
+permanent.** An unjudged target is never registered with
+`jit_cuda::offload_hook`, and `helpers.rs::try_compiled_offload` memoized
+`CompiledOffloadSite::NotKernel` per call site for the life of the
+process. The first execution of the site decided, from a registry that
+could not yet know, and the class that same dispatch was on its way to
+loading could not change the answer.
+
+**It was worth 7.5x.** Measured on `test_classes/gpu/GpuForwardRef.java`,
+built for this: two kernels with byte-identical bodies and signatures,
+called from the same driver method, differing in NOTHING but which class
+each is declared in.
+
+RTX 2060 (sm_75), CUDA 13.3, Windows 11, JDK 25.0.3. One binary,
+`--gpu --gpu-min-work 1`, n=262144, 40 iterations, 5 runs per cell.
+`CRATONVM_GPU_JIT_GATE_LATE_REGISTER=0` is the control arm — it restores
+the old site memo, so this is a same-binary A/B and not two builds.
+
+| arm | `late-register=0` (the old behaviour) | `late-register=1` (default) |
+| --- | --- | --- |
+| `sameclass` — `GpuForwardRef.scaleHere` | **40/40 dispatch**, 10.2–11.1 ms | **40/40 dispatch**, 10.4–13.1 ms |
+| `otherclass` — `GpuForwardRefKernel.scale` | **0/40 dispatch**, 96.2–116.1 ms | **39/40 dispatch**, 13.6–14.6 ms |
+
+Medians on the `otherclass` row: **104.9 ms → 14.0 ms, a 7.5x loss
+removed**. The checksum was identical in all twenty runs, which is the
+whole problem — the kernel computes the same answer on the CPU, so
+nothing that checks answers could ever have seen this.
+
+Read the `sameclass` row as the control it is: it does not move, in
+engagement or in time, when the flag does. The variable really is the
+declaring class and nothing else.
+
+39 of 40, not 40 of 40, on the fixed `otherclass` arm. That is correct
+and not a residual: the first execution of the site is the thing that
+loads the class, so the helper re-asks on the second call and offloads
+from there on. Requiring 40 would be a gate that fails on right
+behaviour, and `ci-gate.sh`'s new gate f allows exactly one.
+
+### Why the whole battery was green while this was live
+
+Every other GPU fixture in the tree declares its kernels beside its
+driver. `GpuLdcSplit`, `GpuIntensitySweep`, `GpuProbe`, `GpuWarm`,
+`GpuResidencyGc`, `GpuRuntimeStress` — all of them, without exception.
+A kernel in the caller's own class is loaded by construction the moment
+anything calls the caller, so the gate can always judge it and the
+registry is always populated.
+
+`ci-gate.sh` 5/5, `runtime-stress.sh`, `marshal-stress.sh`,
+`jit-writer-stale.sh` and 2700 unit tests could not have found this and
+did not. The fixture that finds it had to be written to have a second
+class, which is a thing no existing one has. `bench-gpu/RayTracerKernel`
+is the one real workload in the tree shaped like this, and it is a
+benchmark, not a gate.
+
+### The census said nothing, again — and now says it
+
+This is the second time on this page that a narrowing was invisible
+because it showed up only as an ABSENCE. The analyzer refusal that
+caused the original defect was a bare `continue` with no counter; the
+"class not loaded" skip beside it was a bare `continue` with no counter
+too, and the two were three lines apart.
+
+Both are counted now. Under the old behaviour the run above prints
+
+```
+gpu jit gate: forward-referenced targets=11 (class not loaded when the
+              caller was scanned), late-registered kernels=0
+```
+
+and under the fix
+
+```
+gpu jit gate: forward-referenced targets=11 ... late-registered kernels=1
+gpu jit gate:   registered late, by the compiled site: GpuForwardRefKernel.scale([I[I)V
+```
+
+`late-registered` is the actionable number: it counts kernels the caller
+scan could not see and the compiled site recovered. A non-zero value is
+not a warning, it is the fix working. The `forward-referenced` counter
+beside it exists so a run where that number is zero can be told from one
+where the question never arose — which is the lesson this page already
+had to learn once.
+
+### The fix
+
+Three parts, all in the direction of "ask the dispatcher's own question
+at a moment when it can be answered":
+
+* `try_compiled_offload` no longer treats a registry miss as `NotKernel`.
+  It asks `offload_jit_gate::target_is_dispatchable_kernel` — the
+  identical judgement a caller scan makes, now factored into
+  `judge_target` so the two cannot drift — and `note_kernel`s a kernel it
+  finds. Registering also repairs every LATER compile, since
+  `jit/src/lib.rs` and `jit/src/x64/bytecode_walk.rs` read the same
+  registry to decide whether to bind a static call directly or inline it,
+  and both of those are one-way once taken.
+* A site whose class is STILL unloaded becomes
+  `CompiledOffloadSite::Unresolved` rather than `NotKernel`, so the next
+  call re-asks. Capped at four tries, for the case where the dispatch
+  that would have loaded the class throws instead.
+* `offload_hook::arm()`. `jit_invoke_dispatch` consults the hook only
+  `if any_kernels()`, and that used to become true only once a caller
+  scan had already found a kernel — so a program whose only kernel is
+  forward-referenced registered nothing, the flag stayed false, the
+  helper never looked, and nothing ever registered it. **The empty case
+  sealed itself shut.** Arming on "there is a device" rather than "we
+  found something" is what lets the registry learn at all. A run without
+  `--gpu` never reaches it and still pays one relaxed bool per compiled
+  static dispatch.
+
+The gate query is not free, so it is screened by
+`descriptor_could_ever_dispatch` first: `try_dispatch` launches only
+`)V`, or `)I`/`)J` for a reduction, and above `--gpu-min-work` 0 it needs
+an array parameter. That is read off `info.descriptor` with no lock, no
+allocation and no bytecode, and it rejects nearly every compiled static
+call site in a program before anything more expensive runs.
+
+What is NOT closed, and it is much narrower than the old bullet: a site
+recompiled BETWEEN the first and second execution of a forward-referenced
+call — the window in which the class exists, the registry does not yet
+know, and a fresh compile can bind directly or inline.
+
+## 2. `invokedynamic`-mediated calls: agreement, not disagreement
+
+The module docs listed this beside the constant-pool and annotation gaps,
+which reads as a third instance of the same mistake. It is not one, and
+saying so is worth a paragraph on a page whose whole subject is a gate
+asking a different question from the dispatcher it models.
+
+Both dispatcher doors are `invokestatic`-only:
+`interpreter/dispatch_static.rs`'s hook is inside `execute_invokestatic`,
+and `jit/helpers.rs::jit_invoke_dispatch` guards its offload attempt on
+`info.invoke_kind == 3`. Neither fires for an `invokedynamic`, so a
+`MethodHandle`-mediated kernel does not offload from the interpreter
+either. The gate treating it as out of scope is the two asking the SAME
+question. It is a feature the offload path does not have — not a gate
+modelling the wrong dispatcher — and it stays open as a feature request
+rather than as a defect.
+
+## 3. The `residency-gc.sh` flake: closed, and what the script does now
+
+The bottom of this page recorded an intermittent `residency-gc.sh`
+failure at roughly 0.4% per VM launch, captured as
+
+```
+panic: forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+```
+
+and hypothesised as the same defect as Cluster D of
+`g1-evac-forwarding-assert-and-three-sigsegv-clusters-20260905.md`.
+
+That hypothesis was right and the page it names has since been fixed and
+retired — it now lives at
+`docs/internal/tomcat/...-the-serial-arms-header-screens-FIXED-20260905.md`.
+The retiring commit `0d28beda7` answers this page's open question
+directly: the misaligned target came from the SELF-FORWARD candidate, the
+three SIGSEGV clusters share one root cause (the unclamped array/flat
+walks write forwarding addresses past the holder), and the kill-switch
+A/B it said was never attempted runs 3 CRASH / 6 with the screens off and
+0 / 6 with them on.
+
+So the "not established: whether `--gpu` is required" note is moot: the
+defect is not GPU-specific and was never in this subsystem. The 2-in-40
+on a binary carrying both `input_cache` fixes was correct evidence and
+correctly read.
+
+`residency-gc.sh` is nonetheless RED on `dev` as of 2026-09-06, for
+something else entirely and not intermittently: a deterministic SIGSEGV
+in the Generational arm, filed at
+[`known-issues/gpu/residency-gc-generational-sigsegv-20260906.md`](../../known-issues/gpu/residency-gc-generational-sigsegv-20260906.md).
+It reproduces 3/3 on a pristine build of this branch's own parent commit,
+interleaved against the branch binary, so it belongs to neither of these
+pages. Worth reading beside this one for the contrast in shape: that is a
+crash under one collector, this was a silent 7.5x under all of them.
