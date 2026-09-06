@@ -196,7 +196,7 @@ pub fn report_at_exit() {
         eprintln!("[c2-supersede] ir site traps planted: {trap_line}");
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
         eprintln!(
-            "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered}              refused_method={refused}"
+            "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"
         );
         // The branch-profile window. `still_open` at exit should be ~0: a
         // nomination that opens the window and never closes it pins branch
@@ -213,14 +213,14 @@ pub fn report_at_exit() {
         // that should be zero.
         let (acc, ref_ev, ref_pol, unjudged) = cratonvm_jit::ir_evidence::census();
         eprintln!(
-            "[c2-supersede] acceptance: accepted={acc} refused_no_evidence={ref_ev}              refused_by_policy={ref_pol} unjudged={unjudged}"
+            "[c2-supersede] acceptance: accepted={acc} refused_no_evidence={ref_ev} refused_by_policy={ref_pol} unjudged={unjudged}"
         );
         // Array guard elision. Elided AND emitted on both rows, always: an
         // elision count alone cannot tell a working pass from a workload that
         // compiles no array accesses in this tier.
         let (ne, nm, be, bm) = cratonvm_jit::ir_check_elim::census();
         eprintln!(
-            "[c2-supersede] ir array guards: null_elided={ne} null_emitted={nm}              bounds_elided={be} bounds_emitted={bm}"
+            "[c2-supersede] ir array guards: null_elided={ne} null_emitted={nm} bounds_elided={be} bounds_emitted={bm}"
         );
         eprintln!(
             "[c2-supersede] ir aastore sites lowered: {}",
