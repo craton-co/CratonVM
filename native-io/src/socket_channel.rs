@@ -68,7 +68,7 @@ fn ipc_dbg(msg: impl AsRef<str>) {
 /// therefore printed NOTHING, and the silence read as "this path has no
 /// tracing" rather than "you picked the wrong flag"; that cost most of the
 /// localisation effort in
-/// `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+/// `internal/fixed-suite-bugs/netty/blocking-connect-re-resolves-the-destination-hostname-FIXED-20260905.md`.
 /// A separate function rather than widening `ipc_dbg` itself, so the ~50
 /// existing IPC sites keep their current gate and only the connect phases
 /// gain the second one.
