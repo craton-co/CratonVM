@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-517 tokens.
+521 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -216,6 +216,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `jni-localref` | `CRATONVM_DBG_JNI_LOCALREF` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -521,6 +522,7 @@ export inherited from a parent shell.
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
+| `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
 | `symbolize` | `CRATONVM_SYMBOLIZE` |
 | `symbolize-dbg` | `CRATONVM_SYMBOLIZE_DBG` |
 | `threadreg-perf` | `CRATONVM_DBG_THREADREG_PERF` |
@@ -563,6 +565,7 @@ export inherited from a parent shell.
 | `watch-cause-self` | `CRATONVM_DBG_WATCH_CAUSE_SELF` |
 | `watch-cell` | `CRATONVM_DBG_WATCH_CELL` |
 | `watchaddr` | `CRATONVM_DBG_WATCHADDR` |
+| `watch-alloc-cid` | `CRATONVM_DBG_WATCH_ALLOC_CID` |
 | `watchref` | `CRATONVM_DBG_WATCHREF` |
 | `weakref` | `CRATONVM_DBG_WEAKREF` |
 | `wf` | `CRATONVM_DBG_WF` |
@@ -576,6 +579,7 @@ export inherited from a parent shell.
 | `invoke-cache-stats` | `CRATONVM_INVOKE_CACHE_STATS` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
+| `field-phases` | `CRATONVM_DBG_FIELD_PHASES` |
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
 | `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
 | `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
@@ -583,7 +587,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-366 tokens.
+369 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -699,9 +703,11 @@ export inherited from a parent shell.
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
+| `osr-optimizing-memo` | `CRATONVM_JIT_OSR_OPTIMIZING_MEMO` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
+| `ir-drop-unreachable-homes` | `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES` |
 | `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
 | `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
 | `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
@@ -789,6 +795,7 @@ export inherited from a parent shell.
 | `zero-unset-locals` | `CRATONVM_JIT_NO_ZERO_UNSET_LOCALS` |
 | `checkcast-inline` | `CRATONVM_JIT_CHECKCAST_INLINE` |
 | `final-devirt` | `CRATONVM_JIT_FINAL_DEVIRT` |
+| `final-devirt-native-screen` | `CRATONVM_JIT_FINAL_DEVIRT_NATIVE_SCREEN` |
 | `devirt-intrinsic-yield` | `CRATONVM_JIT_NO_DEVIRT_INTRINSIC_YIELD` |
 | `inline-calls` | `CRATONVM_JIT_INLINE_CALLS` |
 | `inline-nest` | `CRATONVM_JIT_INLINE_NEST` |
@@ -956,12 +963,15 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-143 tokens.
+152 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
+| `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
+| `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
+| `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
@@ -994,6 +1004,9 @@ export inherited from a parent shell.
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
+| `g1-humongous-marks` | `CRATONVM_G1_HUMONGOUS_MARKS` |
+| `g1-ihop-counts-regions` | `CRATONVM_G1_IHOP_COUNTS_REGIONS` |
+| `g1-verify-holders` | `CRATONVM_G1_VERIFY_HOLDERS` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
@@ -1061,6 +1074,9 @@ export inherited from a parent shell.
 | `jit-ref-store-gates` | `CRATONVM_GC_JIT_REF_STORE_GATES` |
 | `compact-tlab-alloc` | `CRATONVM_COMPACT_TLAB_ALLOC` |
 | `compact-tlab-sites` | `CRATONVM_COMPACT_TLAB_SITES` |
+| `object-starts` | `CRATONVM_GC_OBJECT_STARTS` |
+| `gen-uncommit` | `CRATONVM_GEN_UNCOMMIT` |
+| `static-root-slots` | `CRATONVM_GC_STATIC_ROOT_SLOTS` |
 | `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |

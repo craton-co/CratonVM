@@ -18,6 +18,39 @@ use std::sync::atomic::AtomicU64;
 /// shrink of 2026-08-06.
 pub const HEADER_SIZE: usize = 16;
 
+/// Bytes of heap covered by one card, for EVERY card table and every emitter
+/// that indexes one.
+///
+/// # Why this lives here and not beside a card table
+///
+/// It had three homes and no owner. `gc::card_table::CARD_SIZE` was `512`;
+/// `gc::g1_cards::G1_CARD_SHIFT` was `9` with a doc comment reading "512 bytes,
+/// matching `crate::card_table::CARD_SIZE`"; and the x64 emitter had
+/// `emit_shr_r64_imm8(RCX, 9); // CARD_SIZE = 512`. Three constants that must
+/// agree, bound by two comments.
+///
+/// The third one is why this matters more than tidiness: it is a SHIFT BAKED
+/// INTO MACHINE CODE. A divergence would not surface as a mismatch between two
+/// Rust constants a reader could spot — it would be compiled into a barrier
+/// that dirties the wrong card, and a missed dirty card is a live cross-region
+/// (or old-to-young) edge the next collection never scans, whose referent is
+/// not evacuated and whose region is then freed.
+///
+/// `cratonvm-types` is the only crate all three can name: `cratonvm-jit`
+/// depends on it unconditionally, and `cratonvm-gc` does too.
+pub const CARD_SIZE_BYTES: usize = 512;
+
+/// log2 of [`CARD_SIZE_BYTES`] — the shift an emitter puts in a `shr`.
+pub const CARD_SHIFT: u32 = CARD_SIZE_BYTES.trailing_zeros();
+
+// `trailing_zeros` of a non-power-of-two silently rounds DOWN, so a
+// `CARD_SIZE_BYTES` of 768 would yield a 256-byte card with no diagnostic
+// anywhere. Fail the build instead.
+const _: () = assert!(
+    (1usize << CARD_SHIFT) == CARD_SIZE_BYTES,
+    "CARD_SIZE_BYTES must be a power of two: CARD_SHIFT is derived from it and      is baked into emitted machine code",
+);
+
 // JIT x64 emits array element offsets as a *signed* disp8 whose value is
 // HEADER_SIZE. If HEADER_SIZE exceeds 127 the disp8 wraps negative and the
 // emitted code addresses backwards from the object base. Convert the affected
@@ -1524,15 +1557,34 @@ impl ObjectHeader {
     /// copy; it must not be released against the source afterwards, or the
     /// live destination is left with a dangling `Monitor*`. See
     /// `header-shrink.md` §4.
+    /// `#[track_caller]` so a violation names the CALL SITE, not this
+    /// function.
+    ///
+    /// Added 2026-09-05 for the open G1 forwarding-assert investigation
+    /// (`g1-evac-forwarding-assert-and-three-sigsegv-clusters-20260905.md`),
+    /// whose stated next step is "the exact source of the misaligned
+    /// `target` reaching `make_forwarded` (bad `old_ptr` candidate vs.
+    /// bad `tlab_alloc` result)". Those two possibilities are different
+    /// call sites -- G1 passes `old`/`old_addr` when self-forwarding a
+    /// CAS loser and `new_addr`/`new_ptr` for a copy destination -- so
+    /// the caller's location answers the question directly. Without it
+    /// every report points here, which is the one place that cannot be
+    /// at fault.
+    ///
+    /// The message also carries the offending values. A `target` whose
+    /// low bits are a mark tag reads very differently from arbitrary
+    /// garbage, and the previous message printed neither.
     #[inline(always)]
+    #[track_caller]
     pub fn make_forwarded(prev: u64, target: usize) -> u64 {
         assert!(
             target & (MARK_STATE_MASK as usize) == 0,
-            "forwarding target must have its low 2 bits clear (>= 4-byte aligned)"
+            "forwarding target must have its low 2 bits clear (>= 4-byte aligned): target={target:#018x} (low2={low2:#x}) prev={prev:#018x}",
+            low2 = target & (MARK_STATE_MASK as usize)
         );
         assert!(
             crate::plausible_heap_pointer(target as u64),
-            "forwarding target must be a non-null, 8-byte aligned plausible user-space pointer"
+            "forwarding target must be a non-null, 8-byte aligned plausible user-space pointer: target={target:#018x} prev={prev:#018x}"
         );
         Self::quartet_of(prev) | (target as u64) | MARK_FORWARDED
     }

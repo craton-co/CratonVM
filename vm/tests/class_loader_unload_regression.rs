@@ -146,7 +146,21 @@ fn run(mode: &str) {
     // See `common::wait_draining`. The GC noise is separately gated now, but
     // that is not what makes this safe — a test must not depend on the process
     // it drives staying under 64 KiB.
-    let timed = common::wait_draining(child, Duration::from_secs(180));
+    // THE CAP IS A HANG-CATCHER, SO IT IS SIZED AGAINST CONTENTION, NOT AGAINST
+    // THE ISOLATED TIME. This probe calls `System.gc()` 182 times: 4.5 s alone,
+    // and **183 s** inside a full `cargo test --workspace` on this 8-core host,
+    // where thirty-odd test binaries run at once (measured 2026-09-05, load
+    // average 17-24). At the old 180 s it therefore failed in the workspace run
+    // while passing every time it was run on its own — a timeout that said
+    // "class-loader unloading probe timed out" and meant "the box is busy".
+    //
+    // What the cap is for is a probe that will NEVER finish, and that is
+    // unbounded, so any generous number separates it. 600 s keeps ~130x margin
+    // on the isolated time and ~3x on the worst contended time seen. The
+    // deadlock this file was originally red for is caught directly, and in
+    // seconds, by `wait_draining_survives_a_child_that_outruns_the_pipe` —
+    // this cap is not what guards it.
+    let timed = common::wait_draining(child, Duration::from_secs(600));
     let output = timed.output;
     let combined = format!(
         "{}\n--- STDERR ---\n{}",

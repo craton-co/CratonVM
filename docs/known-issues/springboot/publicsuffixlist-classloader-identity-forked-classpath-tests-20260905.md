@@ -1,11 +1,16 @@
-# PublicSuffixList fails to cast to itself in every Spring Boot test that forks/modifies the classpath
+# PublicSuffixList fails to cast to itself in every Spring test that forks/modifies the classpath
 
 ## Status
 
 **OPEN.** Symptom confirmed reproducible and GC-independent across all three
-collectors; root cause narrowed to Spring Boot's own classloader-forking test
-infrastructure, but the specific CratonVM classloading gap is not yet pinned
-to a source line.
+collectors, and (2026-09-05) confirmed independently in **Spring Framework**
+as well as Spring Boot — same third-party class, two unrelated forked/child
+`ClassLoader` mechanisms, different codebases. Root cause narrowed to the
+general shape "a forked classloader whose parent delegation chain excludes
+the loader that already resolved the class" — see
+`CompileWithForkedClassLoaderClassLoader`'s exact mechanism below — but the
+specific CratonVM classloading gap that lets the class get loaded under the
+"wrong" loader in the first place is still not pinned to a source line.
 
 ## The symptom
 
@@ -106,3 +111,105 @@ grep -c 'PublicSuffixList$' <output>/logs/*.out.log
 
 Reproduces on all three collectors; not GC-specific, so a single-collector
 run is sufficient to confirm.
+
+## Cross-project evidence, 2026-09-05: the identical failure, a different Spring project, a different fork mechanism
+
+The **Spring Framework** suite (`apps/spring-suite-runner`, not Spring Boot —
+a separate codebase, separate test infrastructure), 2026-09-05 rerun, shows
+the **exact same class** failing to cast to itself, in **all three** GC arms
+(gen `out/jit-real-custom-20260905-182523`, G1 `...-182527`, ZGC
+`...-182530`):
+
+```
+FAILCAUSE org.springframework.web.service.registry.HttpServiceProxyRegistrationAotProcessorTests :: processHttpServiceProxyWhenSameClientTypeInDifferentGroups() :: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'httpServiceProxyRegistry': class org.apache.hc.client5.http.psl.PublicSuffixList cannot be cast to class org.apache.hc.client5.http.psl.PublicSuffixList
+FAILCAUSE org.springframework.web.service.registry.ImportHttpServiceRegistrarTests :: basicListingWithAot() :: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'httpServiceProxyRegistry': class org.apache.hc.client5.http.psl.PublicSuffixList cannot be cast to class org.apache.hc.client5.http.psl.PublicSuffixList
+```
+
+Both classes' sources
+(`spring-web/src/test/java/org/springframework/web/service/registry/HttpServiceProxyRegistrationAotProcessorTests.java`
+and `ImportHttpServiceRegistrarTests.java` in `apps/spring-framework`) import
+and use `org.springframework.core.test.tools.CompileWithForkedClassLoader` /
+`TestCompiler` / `Compiled`, applying `@CompileWithForkedClassLoader` to the
+specific test methods above. This is **Spring Framework's own** forked/child
+classloader mechanism for AOT-generated test code — architecturally the same
+shape as Spring Boot's `ClassPathExclusions`/`ForkedClassPath`
+(`ModifiedClassPathExtension`), but a completely independent implementation in
+a different module. No other mechanism is shared between the two projects'
+test infrastructure here; this is not the same jar, the same test runner, or
+the same annotation class — it is the same *pattern* (compile/load test code
+under a deliberately non-parent-delegating child `ClassLoader`), hit twice,
+independently, by two different Spring codebases, landing on the exact same
+third-party class.
+
+This **broadens** the working hypothesis from "something in Spring Boot's
+`ModifiedClassPathExtension` handling" to "something in how CratonVM handles
+**any** classloader that intentionally skips/narrows its parent's delegation
+for already-resolvable classes" — i.e. the shared ingredient is not a specific
+test-runner API, but the *shape* of a forked classloader whose parent chain
+does not include the classloader that most likely already loaded the class in
+question.
+
+### The mechanism, read from Spring Framework's own forked-loader source
+
+`CompileWithForkedClassLoaderClassLoader`
+(`spring-core-test/src/main/java/org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader.java`)
+is small enough to read in full, and it pins down exactly what "forked" means
+here:
+
+```java
+public CompileWithForkedClassLoaderClassLoader(ClassLoader testClassLoader) {
+    super(testClassLoader.getParent());   // <-- parent is the ORIGINAL
+                                           //     loader's PARENT, skipping it
+    this.testClassLoader = testClassLoader;
+}
+
+@Override
+public Class<?> loadClass(String name) throws ClassNotFoundException {
+    if (name.startsWith("org.junit") || name.startsWith("org.testng")) {
+        return Class.forName(name, false, this.testClassLoader);
+    }
+    return super.loadClass(name);   // standard ClassLoader.loadClass:
+                                     // checks already-loaded, then asks
+                                     // the PARENT (testClassLoader's
+                                     // parent, NOT testClassLoader itself)
+}
+
+@Override
+protected Class<?> findClass(String name) throws ClassNotFoundException {
+    byte[] bytes = findClassBytes(name);   // falls back to reading bytes via
+                                            // testClassLoader.getResourceAsStream(...)
+    return (bytes != null ? defineClass(name, bytes, 0, bytes.length, null)
+                          : super.findClass(name));
+}
+```
+
+For a non-`org.junit`/`org.testng` class like `PublicSuffixList`: `loadClass`
+delegates to the JDK's standard `ClassLoader.loadClass`, whose delegation
+chain is `[this forked loader] -> testClassLoader.getParent()` — **the
+original test classloader itself is deliberately excluded from the chain.**
+If `testClassLoader` had *already* loaded `PublicSuffixList` (e.g. eagerly, or
+via some earlier code path in the same JVM) *before* the forked-loader test
+runs, and the parent classloader above `testClassLoader` does not already
+have that exact `Class` object cached, then `findClass` runs: it reads
+`PublicSuffixList`'s bytes via `testClassLoader.getResourceAsStream(...)` and
+**defines a brand-new `Class` object for the same name under this forked
+loader** — genuinely two distinct `Class` objects named
+`org.apache.hc.client5.http.psl.PublicSuffixList`, exactly reproducing the
+observed `ClassCastException`. This is deliberate, working-as-designed
+behavior for a class the forked loader is *supposed* to isolate (that's the
+point of `@CompileWithForkedClassLoader` at all) — it goes wrong only if
+`testClassLoader` was not supposed to have `PublicSuffixList` loaded yet at
+the point the forked loader starts resolving it, and something loads it there
+anyway.
+
+**This still stops short of a pinned CratonVM source line** (per this doc's
+original scope) — confirming *why* `PublicSuffixList` ends up loaded under
+`testClassLoader` before/independent of the forked loader's own resolution
+(as opposed to only under the forked loader, which is what a correct run
+would produce) needs instrumentation of CratonVM's own class-loading/resolution
+eagerness that this session did not have time to add. But the mechanism above
+is exact, not inferred, and is now confirmed identical in kind (not just
+similar) across two independent Spring codebases and three GC collectors —
+strong evidence this is a general CratonVM classloader-delegation gap under
+"forked, non-parent-delegating loader" test shapes, not a Spring-Boot-specific
+or PublicSuffixList-specific quirk.

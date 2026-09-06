@@ -590,6 +590,82 @@ and matches two existing in-tree precedents (`zgc/census.rs`,
 `collector.rs`). Anyone with a many-core box can turn the bound into a number
 with the probe. That is the only way this one gets measured.
 
+## The field path, finally attributed — after four refuted hypotheses and an instrument that had to be fixed twice
+
+Four structural explanations for the instance-field ratio were proposed from
+reading the code and refuted by measurement: the bitmap probe as a cache miss,
+eliding that probe as a parity restoration, the compact body layout, and the
+`SiteCache`'s hashed table scaling with site count. Four hypotheses, four
+refutations, **zero attribution** — which is the signature of a missing
+instrument, not of a hard problem. No Java-level probe can separate the site
+lookup from the header compares from the read, because every arm of the fast
+path runs on every access.
+
+`vm/src/runtime/interpreter/field_phases.rs` is that instrument, modelled on
+`invoke_phases` (which exists because the same thing happened on the call path;
+its own note says "reading-derived rankings have already cost this workspace
+one withdrawn claim"). `CRATONVM_DBG_FIELD_PHASES=1`.
+
+### It was wrong twice, and its own output said so both times
+
+**`accesses=1 total_cycles=1215177994`.** `count_access()` sat on the compact
+success path, and `FieldBurn`'s receiver is legacy-layout, so every access
+returned through `getfield_legacy` and never reached it. The phases accumulated
+over 8 M accesses against a denominator of one. *That the count is printed at
+all is what made it obvious* — a per-access figure alone would have looked
+merely surprising. All four success exits now route through one
+`charged_hit!()`.
+
+**Then four phases within one cycle of each other** — 50.1 / 49.2 / 49.5 /
+49.9, four equal quarters — for phases that do visibly different work. Four
+equal quarters is what an instrument reports when it is measuring its own
+boundaries. `charge` was a Relaxed `fetch_add`, i.e. a `lock xadd`, four times
+per access on a ~100-cycle path, and `P_CALIB` never measured it because CALIB
+brackets two `rdtsc` reads and nothing else. Accumulation is thread-local now;
+the total fell from **198.8 to 137.4 cyc/access**, which is the diagnosis
+confirming itself.
+
+### The attribution
+
+`probes/FieldBurn.java`, 8 M accesses, corrected for one `rdtsc` latency
+(CALIB = 19.2 cycles):
+
+| phase | corrected cyc | share |
+|---|---:|---:|
+| **gates** (watchpoint load, stack len, receiver peek, tag decode) | **33.0** | **38%** |
+| `field_ptr` (registry probe + class id / slot count / compact flag) | 14.8 | 25% |
+| read + operand stack | 9.6 | 21% |
+| **`site_lookup`** (redefine latch, two epochs, hash, tag compare) | **3.2** | **16%** |
+
+**`site_lookup` is the cheapest phase.** That is a second, independent witness
+against the hashed-table hypothesis — `probes/SiteSpread.java` refuted it by
+varying site count, and this refutes it by direct attribution. Two methods, one
+answer: the `SiteCache` is not where the time goes.
+
+`field_ptr` at 14.8 cycles is also consistent with the registry probe's
+separately measured 1-4 ns, which is a third cross-check landing where it
+should.
+
+### What this points at, and what it does not yet prove
+
+`gates` is the largest phase and contains the least obvious work: an `Acquire`
+load of `FIELD_WATCHPOINTS_ACTIVE`, a length check, a `peek_compact` and a tag
+decode — all four already `#[inline]`. Two candidates remain, and the
+instrument cannot separate them:
+
+* the `Acquire` is a **compiler barrier** at the top of the function, so LLVM
+  cannot reorder the stack reads across it; on x86-64 the load itself is a
+  plain `mov`, so a `Relaxed` load would be identical at runtime and free the
+  optimiser. Whether that is *sound* is a separate question — the ordering
+  presumably pairs with a `Release` store when a watchpoint is registered.
+* `getfield_fast_keyed` is `#[inline]` but large; if LLVM declines it, the call
+  prologue lands in this phase because `t_entry` is taken at function entry.
+
+**Neither should be acted on from this table alone.** The instrument's own
+contract is that it ranks rather than costs, and this page's record is four
+structural proposals from reading code and four refutations. The next step is a
+one-binary A/B of each candidate, not a change justified by a share.
+
 ## Three findings resolved without a change, and why
 
 These were on the original ranked list. Each was read to the point of a verdict

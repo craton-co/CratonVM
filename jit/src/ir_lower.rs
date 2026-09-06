@@ -906,6 +906,11 @@ struct Lowerer<'a> {
     /// finding from "it fired and did not pay".
     phi_copy_reg_reads: usize,
     phi_copy_reg_publishes: usize,
+    /// Publishes DEFERRED to the end of their edge because the phi's register
+    /// is also a source's register on that edge (see `emit_phi_copies`). A
+    /// non-zero here is the wrong-code hazard being taken off the table, not a
+    /// missed optimization: the value is still published, one word-load later.
+    phi_copy_publish_deferred: usize,
     /// The value `lower_data_node` is currently emitting, so `store_rax` can
     /// tell the one store that writes a value's OWN home word from the many
     /// that write an argument stage word, a shadow-stack word, or somebody
@@ -935,6 +940,12 @@ struct Lowerer<'a> {
     carries_read: usize,
     carries_refused: usize,
     carry_stores_dropped: usize,
+    /// Memoised [`Self::graph_cannot_deopt`].
+    graph_trap_free: std::cell::OnceCell<bool>,
+    /// ENGAGEMENT: homes dropped because every frame state naming them is
+    /// unreachable, and deopt points skipped for the same reason.
+    unreachable_homes: usize,
+    unreachable_points_skipped: std::cell::Cell<usize>,
     /// ENGAGEMENT: constant operands folded into their ALU instruction.
     alu_imms_folded: usize,
     /// Why an adjacent pair was not carried, per cause, and how many carried
@@ -1461,6 +1472,7 @@ impl<'a> Lowerer<'a> {
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
+            phi_copy_publish_deferred: 0,
             cur_def: None,
             cur_def_published: false,
             reg_publishes_at_def: 0,
@@ -1471,6 +1483,9 @@ impl<'a> Lowerer<'a> {
             carries_read: 0,
             carries_refused: 0,
             carry_stores_dropped: 0,
+            graph_trap_free: std::cell::OnceCell::new(),
+            unreachable_homes: 0,
+            unreachable_points_skipped: std::cell::Cell::new(0),
             alu_imms_folded: 0,
             carry_skips: [0; 6],
             carry_named: 0,
@@ -1586,6 +1601,36 @@ impl<'a> Lowerer<'a> {
         )
     }
 
+    /// Can NOTHING in this graph transfer to the interpreter?
+    ///
+    /// The PREDICTION half of [`ir_drop_unreachable_homes_enabled`]. Computed
+    /// from the graph because the decision it feeds — which homes to drop — is
+    /// made before a byte is emitted; `lower_inner` checks the answer against
+    /// the emission afterwards.
+    fn graph_cannot_deopt(&self) -> bool {
+        if !ir_drop_unreachable_homes_enabled() {
+            return false;
+        }
+        *self.graph_trap_free.get_or_init(|| {
+            self.graph
+                .nodes
+                .iter()
+                .all(|n| op_cannot_deopt(&n.op))
+        })
+    }
+
+    /// Is this value pinned to its home only by frame states nothing can
+    /// reach?
+    ///
+    /// `deopt_named` says a frame state mentions it. That is a reason to keep
+    /// the home word only if some deopt can consult that frame state.
+    fn deopt_naming_is_reachable(&self, id: NodeId) -> bool {
+        if !self.deopt_named.get(id as usize).copied().unwrap_or(true) {
+            return false;
+        }
+        !self.graph_cannot_deopt()
+    }
+
     /// May this ORDINARY value's home word go unwritten?
     ///
     /// The same conjunction as [`Self::phi_home_droppable`] with the phi's
@@ -1614,7 +1659,13 @@ impl<'a> Lowerer<'a> {
         {
             return false;
         }
-        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+        // `deopt_nameable` asks "can a deopt frame NAME this in a register".
+        // A body nothing can deopt from never asks, so an assigned register is
+        // enough — the readers need it, the frame states do not exist to be
+        // wrong. Verified against the emission in `lower_inner`.
+        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false)
+            && !(self.graph_cannot_deopt() && self.assigned_gpr(id).is_some())
+        {
             return false;
         }
         let Some(node) = self.graph.nodes.get(id as usize) else {
@@ -2518,9 +2569,60 @@ impl<'a> Lowerer<'a> {
         } else {
             (HashMap::new(), HashMap::new())
         };
+        // ── The register layer's OWN interference, which the resolver cannot see
+        //
+        // `resolve_parallel_copy` sequentialises over FRAME WORDS. The register
+        // fast path below then reads a source from its assigned GPR and
+        // publishes a destination into the phi's assigned GPR — and two
+        // DISTINCT frame words can be homed in the SAME register, because the
+        // allocator sees a phi's live range as beginning after the merge and a
+        // dying source's as ending at it, so they do not interfere by its
+        // reckoning. They do interfere across the copy sequence: an earlier
+        // copy's publish then overwrites a register a later copy still has to
+        // read, and the resolver's word-level order says nothing about it.
+        //
+        // Measured on
+        // `vm/tests/jit_ir_phi_copy_register_alias_fixtures/PhiCopyRegisterAliasProbe.java`
+        // (and, in the wild, `java.time.Duration.toNanos()` — 198,356 wrong
+        // answers in 200,000 calls): the else-arm of `if (seconds < 0)` emitted
+        //   `mov rbx,rax`   ; publish phi_seconds, whose GPR is RBX
+        //   `mov rax,rbx`   ; read phi_nanos's SOURCE, whose GPR is also RBX
+        // so `nanos` came back as `seconds` and `toNanos()` returned
+        // `seconds * 1e9 + seconds`. `CRATONVM_JIT_IR_PHI_COPY_REGS=0` and
+        // `CRATONVM_JIT_IR_PHI_RESIDENCY=0` each made it disappear, which is
+        // what named this layer as the owner.
+        //
+        // The fix is per-edge and conservative: a phi whose publish register is
+        // ALSO some source's register on this edge does not publish inline.
+        // Its home store is kept (so there is a word to read) and the trailing
+        // residency loop below publishes it from that word — after every source
+        // on the edge has been read. Everything else keeps the reg-to-reg
+        // publish it had. The cost is one load per deferred phi per edge; the
+        // alternative, ordering the two layers together, would have to model a
+        // copy that writes two locations at once.
+        let mut defer_publish: Vec<NodeId> = Vec::new();
+        if ir_phi_copy_regs_enabled() {
+            let src_regs: Vec<(NodeId, u8)> = gathered
+                .iter()
+                .filter_map(|c| self.assigned_gpr(c.src).map(|r| (c.src, r)))
+                .collect();
+            for c in &gathered {
+                if let Some(dst_reg) = self.assigned_gpr(c.phi) {
+                    if src_regs
+                        .iter()
+                        .any(|(src, r)| *r == dst_reg && *src != c.phi)
+                    {
+                        defer_publish.push(c.phi);
+                        self.phi_copy_publish_deferred += 1;
+                    }
+                }
+            }
+        }
         let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) = self.emit_copy_op(op, &src_node_of, &phi_of_dst, &mut published) {
+            if let Err(bailout) =
+                self.emit_copy_op(op, &src_node_of, &phi_of_dst, &defer_publish, &mut published)
+            {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -2552,6 +2654,19 @@ impl<'a> Lowerer<'a> {
                     self.publish_fp_from_slot(c.phi, c.dst, is_double);
                 }
             }
+        } else {
+            // The publish `emit_copy_op` skipped for an aliasing phi still has
+            // to happen, whatever the residency switch says: it was skipped
+            // because doing it inline would have been WRONG, not because it was
+            // unwanted. The loop above covers this when residency is on; this
+            // arm is the same duty when it is off (the inline publish is gated
+            // on `ir_phi_copy_regs_enabled` alone, so it runs in that
+            // configuration too, and so must its deferral).
+            for c in &gathered {
+                if defer_publish.contains(&c.phi) {
+                    self.publish_gp_from_slot(c.phi, c.dst);
+                }
+            }
         }
     }
 
@@ -2567,6 +2682,7 @@ impl<'a> Lowerer<'a> {
         op: CopyOp,
         src_node_of: &HashMap<i32, NodeId>,
         phi_of_dst: &HashMap<i32, NodeId>,
+        defer_publish: &[NodeId],
         published: &mut Vec<NodeId>,
     ) -> CompileResult<()> {
         let scratch = self.phi_copy_scratch_slot_off;
@@ -2637,9 +2753,13 @@ impl<'a> Lowerer<'a> {
         // value whose register a deopt frame can name, whose every reader takes
         // that register, needs no frame word at all — and this store was the
         // last frame traffic left in the loop after the two reloads went.
-        let drop_home = phi_of_dst
-            .get(&dst)
-            .is_some_and(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false));
+        // A deferred publish (see `emit_phi_copies`) reads this word back at the
+        // end of the edge, so the store it would otherwise have dropped is the
+        // only thing that carries the value — keep it.
+        let drop_home = phi_of_dst.get(&dst).is_some_and(|phi| {
+            !defer_publish.contains(phi)
+                && self.home_dropped.get(*phi as usize).copied().unwrap_or(false)
+        });
         if drop_home {
             self.home_stores_dropped += 1;
         } else {
@@ -2655,10 +2775,12 @@ impl<'a> Lowerer<'a> {
         if ir_phi_copy_regs_enabled() {
             if let Some(&phi) = phi_of_dst.get(&dst) {
                 if let Some(dst_reg) = self.assigned_gpr(phi) {
-                    self.emit_mov_reg_reg64(dst_reg, RAX);
-                    self.mark_gp_reg_live(phi);
-                    published.push(phi);
-                    self.phi_copy_reg_publishes += 1;
+                    if !defer_publish.contains(&phi) {
+                        self.emit_mov_reg_reg64(dst_reg, RAX);
+                        self.mark_gp_reg_live(phi);
+                        published.push(phi);
+                        self.phi_copy_reg_publishes += 1;
+                    }
                 }
             }
         }
@@ -6331,6 +6453,9 @@ impl<'a> Lowerer<'a> {
         //  consumer-arm, wrong-operand-position].
         let mut carry_skips = [0usize; 6];
         let mut carry_named = 0usize;
+        // Values whose only pin was a frame state nothing can reach.
+        let mut carry_unreachable = 0usize;
+        let graph_trap_free = self.graph_cannot_deopt();
         let mut carry_droppable: Vec<NodeId> = Vec::new();
         if ir_carry_single_use_enabled() {
             for block in &self.schedule.blocks {
@@ -6410,10 +6535,22 @@ impl<'a> Lowerer<'a> {
                     // already answers no for those operands (the bci's frame
                     // state lists them), and this clause is what makes that
                     // agreement a rule rather than a coincidence.
+                    //
+                    // `deopt_named` alone is the wrong question: a frame state
+                    // that names this value is a reason to keep its home word
+                    // only if some deopt can consult that frame state. When the
+                    // graph can trap nowhere, none of them can — and
+                    // `lower_inner` checks that prediction against the emission
+                    // before any point is skipped.
                     let consumer_traps = matches!(cn.op, Op::Div | Op::Rem);
-                    if consumer_traps || deopt_named.get(prod as usize).copied().unwrap_or(true) {
+                    let named = deopt_named.get(prod as usize).copied().unwrap_or(true);
+                    let reachable = named && !graph_trap_free;
+                    if consumer_traps || reachable {
                         carry_named += 1;
                     } else {
+                        if named {
+                            carry_unreachable += 1;
+                        }
                         carry_droppable.push(prod);
                     }
                 }
@@ -6434,6 +6571,7 @@ impl<'a> Lowerer<'a> {
         }
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
+        self.unreachable_homes += carry_unreachable;
         self.carry_of = carry_of;
         self.use_count = use_count;
         self.deopt_named = deopt_named;
@@ -6548,8 +6686,20 @@ impl<'a> Lowerer<'a> {
         self.cur_def = Some(id);
         self.cur_def_published = false;
         self.lower_data_node(id);
+        // A CARRIED value satisfies its dropped home the other way: it is left
+        // in RAX or RCX for its one consumer rather than published into a
+        // register of its own, so `cur_def_published` is false for it and
+        // always will be. `live_carry` naming this node as the producer is the
+        // carry having just started — the stale-carry case below is what
+        // catches one that never gets read.
+        //
+        // Found by flipping these switches on together: the probe this was
+        // built on has a frame state naming every intermediate, so no carried
+        // value's home was ever dropped there and the two mechanisms never met.
+        let started_carry = matches!(self.live_carry, Some((prod, _, _, _)) if prod == id);
         if self.home_dropped.get(id as usize).copied().unwrap_or(false)
             && !self.cur_def_published
+            && !started_carry
             && !matches!(
                 self.graph.nodes.get(id as usize).map(|n| &n.op),
                 Some(Op::Phi)
@@ -10111,7 +10261,28 @@ impl<'a> Lowerer<'a> {
     /// keyed by the native offset of its bci. Returns them sorted+deduped by
     /// `native_offset` so [`CompiledMethod::find_deopt_point`] can binary
     /// search. Snapshots whose bci emitted no machine code are skipped.
-    fn build_deopt_points(&self) -> Vec<DeoptimizationPoint> {
+    /// `emission_trap_free` is `lower_inner`'s `osr_sentinel_free`: the body
+    /// emitted no deopt stub and no call-exception stub, so nothing inside it
+    /// can transfer to the interpreter.
+    ///
+    /// **This is the verification, not the prediction.** `graph_cannot_deopt`
+    /// decided which homes to drop before emission; this is the emission
+    /// answering. The two must agree for a point to be skipped, and when they
+    /// do not, every point is built and `frame_value_of` refuses the compile on
+    /// the first dropped home it cannot describe — the behaviour with this
+    /// switch off, unchanged.
+    fn build_deopt_points(&self, emission_trap_free: bool) -> Vec<DeoptimizationPoint> {
+        if ir_drop_unreachable_homes_enabled() && emission_trap_free && self.graph_cannot_deopt() {
+            // Every frame state in this body describes a program point no
+            // deopt can arrive at. `find_deopt_point` is an exact-offset
+            // lookup from a trapping pc and there are no trapping pcs; the
+            // by-bci readers in `deopt_resume` sit on the resume path, which
+            // is reached only after a deopt that cannot happen, and both
+            // return an error rather than a value when they find nothing.
+            self.unreachable_points_skipped
+                .set(self.graph.safepoints.len());
+            return Vec::new();
+        }
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
         for (index, sp) in self.graph.safepoints.iter().enumerate() {
             let native_offset = match self.bci_native.get(&sp.bci) {
@@ -11563,8 +11734,8 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// a register nothing can hand out.
 /// Reserve the 256-byte [`crate::deopt::SavedRegisters`] region in this
 /// backend's frame, spill the register file into it at the deopt stub, and let
-/// a deopt frame NAME a register -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_DEOPT_REGS=1`.
+/// a deopt frame NAME a register -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_DEOPT_REGS=0` is the kill switch.
 ///
 /// Off is the historical arrangement, whose contract `ir_deopt_entry` states:
 /// "the IR lowerer keeps every live value in a frame slot, so no register file
@@ -11572,22 +11743,23 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// and therefore what stops a register-resident value from ever losing it --
 /// see `plan_register_residency`'s `blocked_deopt` census.
 /// Drop the home-word store for a loop-carried value that a deopt frame can
-/// name in its register -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_DROP_PHI_HOME=1`.
+/// name in its register -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_DROP_PHI_HOME=0` is the kill switch.
 ///
 /// This is the payoff the register image exists for, and it is a CONJUNCTION:
 /// see [`Lowerer::phi_home_droppable`], which will not drop a home unless every
 /// reader of that home has somewhere else to read from.
 fn ir_drop_phi_home_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_PHI_HOME") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 /// Publish a resident value into its register AT ITS DEFINITION, out of RAX,
 /// instead of reloading the home word this backend just wrote -- **default
-/// OFF**, opt in with `CRATONVM_JIT_IR_PUBLISH_AT_DEF=1`.
+/// ON** since 2026-09-05; `CRATONVM_JIT_IR_PUBLISH_AT_DEF=0` is the kill switch.
 ///
 /// The generic publish at the end of `lower_data_node` is a LOAD of the word
 /// the arm above it stored, and its own comment has said since it landed that
@@ -11601,14 +11773,15 @@ fn ir_drop_phi_home_enabled() -> bool {
 /// It is also the precondition for dropping the store: with the publish reading
 /// the home, a home that is never written cannot be published from.
 fn ir_publish_at_def_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PUBLISH_AT_DEF") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
-/// Extend the dropped home from phis to ORDINARY VALUES -- **default OFF**, opt
-/// in with `CRATONVM_JIT_IR_DROP_HOME=1`.
+/// Extend the dropped home from phis to ORDINARY VALUES -- **default ON** since
+/// 2026-09-05; `CRATONVM_JIT_IR_DROP_HOME=0` is the kill switch.
 ///
 /// `CRATONVM_JIT_IR_DROP_PHI_HOME` removes one frame store, at the one site
 /// (`emit_copy_op`) where this backend knew both that RAX held the value and
@@ -11619,9 +11792,10 @@ fn ir_publish_at_def_enabled() -> bool {
 /// `Lowerer::cur_def` the second, the same conjunction can be asked of any
 /// value: see [`Lowerer::value_home_droppable`].
 fn ir_drop_home_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_HOME") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11649,8 +11823,8 @@ fn ir_drop_home_enabled() -> bool {
 /// compile when a value whose home was dropped reaches the end of its own
 /// lowering unpublished.
 /// Let a SINGLE-USE intermediate reach its one consumer in a register instead
-/// of through its home word -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_CARRY_SINGLE_USE=1`.
+/// of through its home word -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_CARRY_SINGLE_USE=0` is the kill switch.
 ///
 /// The residency work removed the frame traffic it could and then measured what
 /// was left: the loop's remaining `[rbp-...]` operations are pairs of the shape
@@ -11682,10 +11856,52 @@ fn ir_drop_home_enabled() -> bool {
 /// `ir_osr_sentinel_free`, because such a method emits no deopt stub at all.
 /// Every one of those frame states is unreachable, and they still pin every
 /// intermediate to memory.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_carry_single_use_enabled`], the same shape as `LS_FORCE` and for the
+    /// same reason: a byte-comparison lane has to hold both of its arms equal.
+    static CARRY_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_carry_single_use_enabled`] on this thread.
+#[cfg(test)]
+struct CarryForce;
+
+#[cfg(test)]
+impl CarryForce {
+    fn off() -> CarryForce {
+        CARRY_FORCE.with(|c| c.set(Some(false)));
+        CarryForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for CarryForce {
+    fn drop(&mut self) {
+        CARRY_FORCE.with(|c| c.set(None));
+    }
+}
+
 fn ir_carry_single_use_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = CARRY_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    // OFF under a MIR mode, and not only so the byte-equality lane can compare.
+    // In `MirMode::Emit` a tiled node is emitted by the SELECTOR and its arm
+    // never runs, so a mix would be genuinely broken rather than merely
+    // different: an arm could start a carry that its tiled consumer never
+    // reads, or fold an immediate the tiler then re-materialises. Residency is
+    // switched off under a MIR mode for the same class of reason.
+    if isel_emit_enabled() || isel_verify_enabled() {
+        return false;
+    }
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CARRY_SINGLE_USE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11709,8 +11925,8 @@ fn ir_carry_single_use_enabled() -> bool {
 /// and `Op::Call` are absent because they read their operands in another order
 /// or through another path.
 /// Fold a constant second operand into the ALU instruction instead of
-/// materialising it into RCX first -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_ALU_IMM=1`.
+/// materialising it into RCX first -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_ALU_IMM=0` is the kill switch.
 ///
 /// Every binary arithmetic arm in this file reads its second operand through
 /// `gp_load_value(RCX, ..)` and then works register-to-register. When that
@@ -11733,11 +11949,147 @@ fn ir_carry_single_use_enabled() -> bool {
 /// commutative ops. `gp_load_value(RAX, node.inputs[0])` being unconditional
 /// is what `op_reads_rax_then_rcx` and the carry's RAX contract rest on, and
 /// buying a few more folds is not worth making that conditional.
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`ir_alu_imm_enabled`], the same shape as `LS_FORCE` and for the
+    /// same reason: a byte-comparison lane has to hold both of its arms equal.
+    static ALU_IMM_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only RAII override of [`ir_alu_imm_enabled`] on this thread.
+#[cfg(test)]
+struct AluImmForce;
+
+#[cfg(test)]
+impl AluImmForce {
+    fn off() -> AluImmForce {
+        ALU_IMM_FORCE.with(|c| c.set(Some(false)));
+        AluImmForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for AluImmForce {
+    fn drop(&mut self) {
+        ALU_IMM_FORCE.with(|c| c.set(None));
+    }
+}
+
 fn ir_alu_imm_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = ALU_IMM_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    // OFF under a MIR mode, and not only so the byte-equality lane can compare.
+    // In `MirMode::Emit` a tiled node is emitted by the SELECTOR and its arm
+    // never runs, so a mix would be genuinely broken rather than merely
+    // different: the tiler would re-materialise an immediate this folded.
+    // Residency is switched off under a MIR mode for the same class of reason.
+    if isel_emit_enabled() || isel_verify_enabled() {
+        return false;
+    }
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_ALU_IMM") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// Let a value lose its home word when the only things naming it are frame
+/// states NO DEOPT CAN REACH -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES=1`.
+///
+/// # The problem
+///
+/// `graph.safepoints` records the FULL OPERAND STACK at every bci, so an
+/// intermediate is "deopt-named" from its definition until its consumer pops
+/// it. Both `plan_register_residency` (`blocked_deopt`) and the single-use
+/// carry (`still_deopt_named`) refuse on that. Yet `OsrTierBench.kernel`
+/// reports `sentinel_free=true` — the body emits no deopt stub and no
+/// call-exception stub, so it cannot transfer to the interpreter from anywhere
+/// inside itself. Thirty-three frame states, not one of them reachable, and
+/// they are what pins every intermediate to memory.
+///
+/// # Why this does not remove the fail-closed net
+///
+/// The obvious implementation — stop building the unreachable points — would
+/// make the trap classification LOAD-BEARING: misclassify one and a deopt
+/// reconstructs a confidently wrong value. This does the opposite. It
+/// **predicts** trap-freedom from the graph to decide what to drop, and then
+/// **verifies it against the emission that actually happened**: `lower_inner`
+/// computes `osr_sentinel_free` from `deopt_stub_patches` and
+/// `call_exc_patches` before `build_deopt_points` runs, and the points are
+/// skipped only when that says the body really did emit no trap.
+///
+/// If the prediction was wrong, the points ARE built, `frame_value_of` meets a
+/// dropped home with no register describing it, and refuses the compile —
+/// exactly as it does today. Nothing is taken away; a case is added in which
+/// the net is provably not needed.
+fn ir_drop_unreachable_homes_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
     }
+}
+
+/// Can lowering `op` emit a deopt stub or a call-exception stub — i.e. can a
+/// frame ever transfer to the interpreter from it?
+///
+/// An ALLOWLIST of ops that cannot, so an op this file has never heard of
+/// counts as trapping and the method is treated as reachable. `Op::Div` and
+/// `Op::Rem` are absent because their zero-divisor guard is a deopt point;
+/// every memory, call, allocation, cast and monitor op is absent for the
+/// reasons its own arm gives.
+///
+/// The claim is checked against the emission rather than trusted: see
+/// [`ir_drop_unreachable_homes_enabled`].
+fn op_cannot_deopt(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Start
+            | Op::Proj(_)
+            | Op::Param(_)
+            | Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Phi
+            | Op::Merge
+            | Op::Region
+            | Op::If
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            // A return cannot trap. It was missing from the first cut, which
+            // is why `OsrTierBench.kernel` -- pure arithmetic and a `Return` --
+            // reported `graph_trap_free=false` and the optimization declined
+            // itself. The allowlist failing safe is the intended direction;
+            // this is the cost of that direction, paid once.
+            | Op::Return
+            | Op::Dead
+    )
 }
 
 fn op_reads_rax_then_rcx(op: &Op) -> bool {
@@ -11786,7 +12138,8 @@ fn op_home_is_one_store_rax(op: &Op) -> bool {
 }
 
 /// Emit an OSR entry stub for every bci this body can safely be entered at --
-/// **default OFF**, opt in with `CRATONVM_JIT_IR_OSR_ENTRY=1`.
+/// **default ON** since 2026-09-05; `CRATONVM_JIT_IR_OSR_ENTRY=0` is the kill
+/// switch.
 ///
 /// Nothing in the VM calls these yet: `compile_osr_artifact` reaches
 /// `x64::compile_with_param_slots` directly and knows nothing about this tier.
@@ -11801,9 +12154,10 @@ fn ir_osr_entry_enabled() -> bool {
             return forced;
         }
     }
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_OSR_ENTRY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -11820,6 +12174,13 @@ struct OsrEntryForce;
 
 #[cfg(test)]
 impl OsrEntryForce {
+    /// The stubs are default-ON since 2026-09-05, so the test that checks an
+    /// artifact carries none has to ask for the kill switch.
+    fn off() -> OsrEntryForce {
+        OSR_ENTRY_FORCE.with(|c| c.set(Some(false)));
+        OsrEntryForce
+    }
+
     fn on() -> OsrEntryForce {
         OSR_ENTRY_FORCE.with(|c| c.set(Some(true)));
         OsrEntryForce
@@ -11843,7 +12204,13 @@ fn ir_deopt_regs_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_DEOPT_REGS").is_some()
+        // 2026-09-05: DEFAULT ON. `=0` is the kill switch — which is why
+        // this reads the VALUE now rather than only asking whether the
+        // variable is present.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DEOPT_REGS").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -11862,6 +12229,13 @@ struct DeoptRegsForce;
 
 #[cfg(test)]
 impl DeoptRegsForce {
+    /// The region is default-ON since 2026-09-05, so the test that checks the
+    /// historical two-argument stub shape has to ask for it explicitly.
+    fn off() -> DeoptRegsForce {
+        DEOPT_REGS_FORCE.with(|c| c.set(Some(false)));
+        DeoptRegsForce
+    }
+
     fn on() -> DeoptRegsForce {
         DEOPT_REGS_FORCE.with(|c| c.set(Some(true)));
         DeoptRegsForce
@@ -12598,8 +12972,8 @@ fn ir_residency_loop_weight_enabled() -> bool {
 /// Off is exactly the previous emission: the parameter reaches every use
 /// through its frame slot.
 /// Give every LOOP-CARRIED value a register of its own before the transients
-/// compete for one -- **default OFF**, opt in with
-/// `CRATONVM_JIT_IR_RESERVE_CARRIED=1`.
+/// compete for one -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_RESERVE_CARRIED=0` is the kill switch.
 ///
 /// The census said the residency file accepts ONE of the nineteen values the
 /// scan promotes on a loop kernel, and that two of the four loop-carried values
@@ -12613,7 +12987,13 @@ fn ir_reserve_carried_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_IR_RESERVE_CARRIED").is_some()
+        // 2026-09-05: DEFAULT ON. `=0` is the kill switch — which is why
+        // this reads the VALUE now rather than only asking whether the
+        // variable is present.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_RESERVE_CARRIED").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
 }
 
@@ -14498,7 +14878,7 @@ pub(crate) fn lower_inner_with_scopes(
     // real-frame-deopt (step 2): resolve recorded safepoint snapshots into
     // native-offset-keyed DeoptimizationPoints before the buffer is consumed.
     // Emit-and-discard: nothing reads these yet, so codegen is unchanged.
-    let deopt_points = lowerer.build_deopt_points();
+    let deopt_points = lowerer.build_deopt_points(osr_sentinel_free);
     let deopt_boxes = std::mem::take(&mut lowerer.deopt_boxes);
     // Gap B: a method containing an `Op::Call` takes the VM context pointer as a
     // hidden first arg, so it must be invoked via `try_call_with_context`.
@@ -14628,11 +15008,15 @@ pub(crate) fn lower_inner_with_scopes(
     // both arms had been running identical machine code.
     if ls_active
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
-        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+        && (lowerer.phi_copy_reg_reads > 0
+            || lowerer.phi_copy_reg_publishes > 0
+            || lowerer.phi_copy_publish_deferred > 0)
     {
         eprintln!(
-            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
-            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={} publish_deferred={}",
+            lowerer.phi_copy_reg_reads,
+            lowerer.phi_copy_reg_publishes,
+            lowerer.phi_copy_publish_deferred,
         );
     }
     if ls_active
@@ -14673,6 +15057,12 @@ pub(crate) fn lower_inner_with_scopes(
             s[0], s[1], s[2], s[3], s[4], s[5],
         );
         eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
+        eprintln!(
+            "[ir-ls] unreachable frame states: graph_trap_free={} homes_freed={} points_skipped={}",
+            lowerer.graph_cannot_deopt(),
+            lowerer.unreachable_homes,
+            lowerer.unreachable_points_skipped.get(),
+        );
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to
@@ -14916,26 +15306,30 @@ pub(crate) fn lower_inner_with_scopes(
 /// as they were before 2026-09-02 and the residency census reports them
 /// under `phi=`.
 /// A definition whose value is already live in its register is not published
-/// again -- **default OFF**, opt in with `CRATONVM_JIT_IR_SKIP_REPUBLISH=1`.
+/// again -- **default ON** since 2026-09-05; `CRATONVM_JIT_IR_SKIP_REPUBLISH=0`
+/// is the kill switch.
 ///
 /// Off is the historical unconditional reload of the home word at every
 /// definition site, phis included.
 fn ir_skip_live_republish_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SKIP_REPUBLISH") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 /// An edge's phi copies move register to register where both ends are
-/// resident -- **default OFF**, opt in with `CRATONVM_JIT_IR_PHI_COPY_REGS=1`.
+/// resident -- **default ON** since 2026-09-05;
+/// `CRATONVM_JIT_IR_PHI_COPY_REGS=0` is the kill switch.
 ///
 /// Off is the historical memory-to-memory copy through RAX followed by a
 /// reload of the word just written.
 fn ir_phi_copy_regs_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_COPY_REGS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -18377,9 +18771,16 @@ mod tests {
         );
     }
 
-    /// The stubs are off unless asked for, and an artifact carries none.
+    /// The kill switch really removes them: with `CRATONVM_JIT_IR_OSR_ENTRY=0`
+    /// an artifact carries no entry stub at all.
+    ///
+    /// Until 2026-09-05 this asserted the same thing about the DEFAULT, which
+    /// is what it was. The switch is on now, so the property worth pinning is
+    /// that turning it off still works — a default-on codegen change is only as
+    /// good as its way back.
     #[test]
-    fn no_osr_entry_stub_is_emitted_by_default() {
+    fn the_osr_entry_kill_switch_emits_no_stub() {
+        let _off = OsrEntryForce::off();
         let code = [
             0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
             0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
@@ -18387,7 +18788,7 @@ mod tests {
         let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
         assert!(
             cm.ir_osr_entries.is_empty(),
-            "the entry stubs are opt-in; an artifact must carry none by default",
+            "with the kill switch set an artifact must carry no entry stub",
         );
         assert_eq!(unsafe { cm.try_call(&[10]).expect("call") }, 45);
     }
@@ -19364,7 +19765,15 @@ mod tests {
         // stack-arg reserve, the ABI shadow space and, since the register file
         // went default-on (2026-09-02), the estimate's reservation for the
         // callee-saved GP save area — not spill.
-        assert!(after <= 192, "{after} bytes for a 4-slot working set");
+        // The 2026-09-05 default-on of the deopt register image adds its 256
+        // bytes to the same fixed part. Read from the function the frame is
+        // laid out with rather than folded into the literal, so the bound
+        // still means "no spill" on a configuration that reserves neither.
+        let fixed = 192 + ir_deopt_regs_bytes() as usize;
+        assert!(
+            after <= fixed,
+            "{after} bytes for a 4-slot working set (fixed part is {fixed})",
+        );
     }
 
     /// The node ceiling the frame bound implies, before and after.
@@ -19506,7 +19915,10 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
+                // No `defer_publish`: this fixture drives the memory path only
+                // (`src_node_of`/`phi_of_dst` are empty, so nothing publishes a
+                // register and nothing can alias one).
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &[], &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 
@@ -19761,7 +20173,10 @@ mod tests {
             // literal here would pin this test to one configuration.
             let locals_size = (num_locals as i32) * 8;
             let bookkeeping = 8 * 5;
-            let saved = ir_saved_xmm_bytes() + ir_saved_gpr_bytes();
+            // `ir_deopt_regs_bytes` joined the other two on 2026-09-05, when
+            // the register image went default-on. Read, not spelled, for the
+            // reason the comment above gives.
+            let saved = ir_saved_xmm_bytes() + ir_saved_gpr_bytes() + ir_deopt_regs_bytes();
             let tail = 32 + 16;
             assert_eq!(
                 lowerer.frame_size,
@@ -20483,6 +20898,13 @@ mod tests {
         // selector -- and would report the selector as having changed bytes it
         // never touched.
         let _ls = LsForce::off();
+        // Same argument for the two emission changes that landed 2026-09-05.
+        // Both are ON by default now and neither is known to the tiler, so a
+        // comparison that left them on for the no-mode arm would measure THEM
+        // rather than the selector -- and would report the selector as having
+        // changed bytes it never touched.
+        let _carry = CarryForce::off();
+        let _imm = AluImmForce::off();
         let _force = mode.map(MirForce::set);
         let cm = compile_via_ir(&MIR_ALU_CODE, 6, 2, 2).expect("compiles");
         // SAFETY: the artifact is alive for the duration of this borrow, and
@@ -22132,6 +22554,10 @@ mod tests {
     #[test]
     fn without_the_flag_no_region_is_reserved_and_nothing_is_spilled() {
         let _ls = LsForce::on();
+        // Default-ON since 2026-09-05, so "without the flag" is now something
+        // this has to ask for. That is the point of the test: the way back has
+        // to keep working.
+        let _dr = DeoptRegsForce::off();
         let mut lo = lowerer_with_resident_gpr(16384, 3);
         assert_eq!(
             lo.deopt_regs_base, 0,

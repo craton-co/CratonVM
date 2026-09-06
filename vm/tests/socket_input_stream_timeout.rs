@@ -57,15 +57,36 @@ fn run_probe(binary: &Path, nojit: bool, real_net_sockets: bool) {
         listener
             .set_nonblocking(true)
             .expect("failed to make timeout probe peer nonblocking");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // AN IDLE TIMEOUT, NOT A TOTAL BUDGET.
+        //
+        // This was a 5-second deadline on the WHOLE loop, started here — before
+        // the VM process below has even been spawned. The loop's own mandatory
+        // sleeps are 6 x 600 ms = 3.6 s of that budget, leaving under 1.4 s for
+        // a debug-build VM to boot, load the fixture and make six connections.
+        // On a shared host it does not fit: the peer returned 5 connections and
+        // the test failed `left: 5, right: 6`, saying the fixture "did not
+        // exercise every read overload" — an accusation against the VM for
+        // being slow to start.
+        //
+        // What the bail-out is actually for is a VM that never connects at all,
+        // and that question is answered by time since the LAST connection, not
+        // by a clock that starts before the peer exists. Six slow-but-steady
+        // connections now always complete, however long the boot took, while a
+        // VM that dies or never dials still ends the thread in 30 s.
+        const IDLE_BAILOUT: Duration = Duration::from_secs(30);
+        let mut last_progress = Instant::now();
         let mut connections = 0;
-        while connections < 6 && Instant::now() < deadline {
+        while connections < 6 && last_progress.elapsed() < IDLE_BAILOUT {
             match listener.accept() {
                 Ok((_socket, _peer)) => {
                     connections += 1;
                     // The VM client has a 100 ms SO_TIMEOUT; this must keep
                     // the connection alive substantially longer than that.
                     thread::sleep(Duration::from_millis(600));
+                    // AFTER the sleep: the sleep is work this peer chose to do,
+                    // so charging it to the idle clock would put the deadline
+                    // back in a race with the VM.
+                    last_progress = Instant::now();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));

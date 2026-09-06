@@ -671,9 +671,15 @@ pub(super) fn stw_take_over_and_wait(
         // cursor into a `char[]` or `byte[]`) and its extent test is `addr <
         // end`, so a ONE-PAST-THE-END cursor resolves to no base at all.
         // Either leaves an object nothing pins, and relocation then moves it
-        // out from under the register naming it -- the page-ALIGNED SIGSEGV of
-        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902`, page-
-        // aligned because `compact_low_to` zeroes the span it vacates.
+        // out from under the register naming it -- a use-after-free.
+        //
+        // This comment used to call that the page-ALIGNED SIGSEGV of
+        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` and explain
+        // the alignment as `compact_low_to` zeroing the span it vacates. Both
+        // halves were wrong: the address was page-aligned because it was the
+        // BASE of a decommitted 2 MiB arena granule
+        // (`offset_into_span` 0x0 in every crash) and the access was the
+        // slide's own WRITE, not a read. The hazard below stands on its own.
         //
         // `resolve_interior_for_pin` accepts both. Over-approximating is the
         // SAFE direction here and the asymmetry is stark: a false positive
@@ -710,7 +716,52 @@ pub(super) fn stw_take_over_and_wait(
     // thread that missed its retire before it left the counted mutator set.
     // Cleared by the caller after the collection completes.
     let regions = shared.threads.thread_registry.collect_reserved_tlab_tails();
-    if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+    // UNCONDITIONAL, and that is the fix, not a tidy-up.
+    //
+    // This used to publish only `if taken.count() > 0 || helper_windows > 0 ||
+    // !regions.is_empty()`, on the reasoning that publishing an empty set over
+    // an empty set is pointless. It is not: the set is PROCESS-GLOBAL and
+    // survives the collection that wrote it. The "cleared by the caller after
+    // the collection completes" note above is honoured at seven separate exits,
+    // and a path that misses one leaves the previous collection's spans in
+    // place -- at which point the guard above declines to overwrite them
+    // precisely when `regions` is empty, i.e. exactly when they are stale.
+    //
+    // A stale span is not a conservative degrade. Its owner resumed after the
+    // collection that published it and bump-allocated into `[cursor, end)`, so
+    // the span now covers LIVE objects; and the sweep's contract for a skip
+    // span is that its bytes are not objects. Every linear walk resyncs past
+    // it (`skip_free_blocks`), so those objects are never walked, and
+    // `mark_young`'s anchor oracle -- whose `verified_spans` are built from the
+    // same skip list -- answers "free/gap space, not an object" for any ROOT
+    // pointing into one and drops it without marking. The object is therefore
+    // neither scanned nor swept: it survives, unmarked, while everything it
+    // references is reclaimed underneath it.
+    //
+    // Measured on `io.netty.util.internal.ObjectCleanerTest` under
+    // `-XX:+UseGenerationalGC`: JUnit's static
+    // `NamespacedHierarchicalStore$EvaluatedValue.REVERSE_INSERT_ORDER` is a
+    // `Collections$ReverseComparator2` whose cycle-0 sweep reports
+    // `in_jit_tlab_skip=Some(..)`; its `cmp` lambda is freed and zeroed, and
+    // the next `compare` through the still-live comparator raises
+    // `AbstractMethodError: java/util/Comparator.compare ... has no Code
+    // attribute`. Ignoring the published spans entirely
+    // (`CRATONVM_GC_NO_TLAB_SKIP=1`) takes that arm from 6/8 to 0/8, which is
+    // what identified the span as the carrier; publishing the CURRENT set every
+    // collection is the repair that keeps BUG-03's protection for a genuinely
+    // un-retired tail.
+    // `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` restores the pre-fix guard
+    // for a one-binary A/B. With it set, `io.netty.util.internal
+    // .ObjectCleanerTest` returns to 6/8 non-clean under Generational and 8/8
+    // under G1, and the `cratonvm::gc::guard` "a ROOT points into a published
+    // TLAB skip span" error fires -- which is also what proves that guard is
+    // not vacuous.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH").is_some()
+    {
+        if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+            shared.mem.heap.set_jit_tlab_skip_regions(&regions);
+        }
+    } else {
         shared.mem.heap.set_jit_tlab_skip_regions(&regions);
     }
     if taken.count() > 0 || helper_windows > 0 {
@@ -756,12 +807,18 @@ pub(super) fn stw_take_over_and_wait(
             // `unrewritable_peer_state` exists for one hazard, stated in its own
             // doc and in the comment above: "a frozen peer's registers can hold
             // only a derived/interior pointer whose base would otherwise be
-            // evacuated from under it, then zeroed and re-served". That is the
-            // crash signature of
+            // evacuated from under it, then zeroed and re-served". That
+            // hazard is real on its own terms.
+            //
+            // It was read as the crash signature of
             // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` exactly
-            // -- a page-ALIGNED fault address, because `compact_low_to` zeroes
-            // the vacated span on purpose, so the reader lands on a valid
-            // all-zero header rather than on a wild pointer.
+            // -- a page-ALIGNED fault address, explained as `compact_low_to`
+            // zeroing the vacated span so the reader lands on an all-zero
+            // header. That page RETRACTED the reading on 2026-09-04: the
+            // address was the BASE of a decommitted 2 MiB arena granule and
+            // the access was a WRITE by `relocate_stw` itself. A page-aligned
+            // fault address is not a signature -- two different mechanisms
+            // produce one.
             //
             // The discharge's argument -- an interior-resolving probe pins the
             // BASE, so a derived pointer is covered -- is an argument about the

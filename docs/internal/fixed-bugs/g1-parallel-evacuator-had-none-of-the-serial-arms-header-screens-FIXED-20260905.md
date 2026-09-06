@@ -139,6 +139,98 @@ makes the verifier report the fix as the defect. The screen is alignment ONLY �
 `candidate_header_is_plausible` would make the check vacuous, because that walk
 runs after Phase 5, when every CSet region is already `Free`.
 
+## Carried over from the public page's last revision (`d1347839d`, 2026-09-05)
+
+A parallel session added a second reproducer and a diagnostic to the page this
+one closes, hours before this fix landed. Neither is superseded by the fix —
+the reproducer is the only non-Tomcat witness of the assert, and the refuted
+hypothesis in it is the more useful half — so both are kept verbatim below,
+followed by what this fix measures against them.
+
+## A LOCAL reproducer for the Cluster D assert — and why it stopped reproducing
+
+**2026-09-05, Windows/RTX 2060 box.** The same assert fires outside
+Tomcat, on a GPU fixture that runs in about forty seconds:
+
+```
+panic: forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+  types/src/heap_types.rs:1562        thread="main-vm"
+[PANIC_IN] GpuResidencyGc.main pc=127
+
+bash bench-gpu/residency-gc.sh          # or, one launch:
+cratonvm --gpu --gpu-min-work 64 -Xmx64m -XX:+UseG1GC     -cp test_classes/gpu GpuResidencyGc 0 1024 60
+```
+
+Same assert text, same file, same **G1-only** scope this page reports.
+One difference to keep in view: this fires on `main-vm`, while Cluster D
+panics on an evac worker via `gc/src/evac_pool.rs`. Whether that is the
+same defect on a different thread or a second path to the same assert is
+**not established**.
+
+It was found by accident — `bench-gpu/residency-gc.sh` routes each arm's
+stderr into a temp directory it deletes, so the failure presented as an
+empty arm with two mismatched checksums, not as a panic.
+
+### It is NOT reliably reproducible, and one claim here was retracted
+
+Observed roughly five times inside a single evening window, then **0 in
+about 500 launches** afterwards — across binaries built both before and
+after `587acb50e` (the stale-TLAB-skip-span fix), so that fix is not the
+explanation either.
+
+An intermediate reading that host load amplifies it does **not** hold up.
+It was measured at 3/120 loaded against 0/120 quiet, which looked
+conclusive (p ~ 2e-5). Re-running the *identical binary* under the
+*identical* synthetic load later gave **0/150**. The difference between
+those windows is what else was on the box: the first ran alongside two
+other sessions' real VM workloads, the second alongside twelve CPU
+spinners. So whatever forces it is not CPU occupancy — more likely
+concurrent memory/GC pressure from real workloads, which a spin loop does
+not reproduce. Recorded as a refuted hypothesis rather than deleted,
+because the refutation is the useful part: **do not size a burn-in
+against CPU load.**
+
+That also bears on this page's own suggestion of re-running the Jasper
+`compiler` package alone to test whether the ~45% crash rate was "an
+artifact of this one run's host load/timing". On this evidence an
+isolated re-run may well come back clean without meaning anything.
+
+### The assert now names its provenance
+
+`ObjectHeader::make_forwarded` was `#[track_caller]`-annotated and its
+messages now carry the offending values, so the next firing — here or on
+Azure — reports the **call site** rather than `heap_types.rs`, plus
+`target`, its low bits, and `prev`. That directly separates the two
+candidates this page names as its most useful next step: G1 passes
+`old`/`old_addr` when self-forwarding a CAS loser (`g1.rs:1191`, `:8289`)
+and `new_addr`/`new_ptr` for a copy destination (`g1.rs:1248`, `:8398`) —
+i.e. bad `old_ptr` candidate versus bad `tlab_alloc` result. None of the
+three existing reports could distinguish them, because the message
+printed neither the site nor the value.
+
+The diagnostic is in place but has **not yet caught a firing**, so the
+question that motivated it is still open.
+
+## What's not been attempted
+
+### What this fix does to that reproducer
+
+`#[track_caller]` on `make_forwarded` is the right diagnostic and it answers
+the same question this page answers by reading the two arms: the parallel
+self-forward (`g1.rs:1191` in that revision) passes a caller-supplied `old`,
+the copy destination (`:1248`) passes a `tlab_alloc` result that is 8-aligned
+by construction. It "has not yet caught a firing" there; the Tomcat
+reproduction below caught one, and it is the self-forward arm.
+
+The `GpuResidencyGc` fixture's own conclusion — five firings in one evening,
+then 0 in ~500 launches, and a load hypothesis that measured 3/120 vs 0/120 and
+then refuted itself at 0/150 — is exactly the shape a rare bad CANDIDATE
+produces: what varies is not CPU occupancy but whether some pause happens to
+find a conservative root or a stale slot pointing at a non-object. That is why
+the fix is a screen at the point of use rather than a hunt for the producer,
+and why the burn-in advice in that section stands: **do not size a burn-in
+against CPU load.**
+
 ## The `make_forwarded` census, re-run (the page asked for this)
 
 Seven call sites, none of them the raw-cast defect, and only two of them take a

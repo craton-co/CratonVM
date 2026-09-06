@@ -2590,6 +2590,224 @@ censuses say what a single kernel cannot: the sink fires on 1 optimizing compile
 in 112 across the regression suite. Defaulting these on wants a measurement on a
 real workload, and that is the next thing this file should record.
 
+#### Turning them on, and the two bugs that only appeared when they met
+
+Thirteen switches, every one of them measured on `OsrTierBench.kernel` and
+every one of them shipping OFF:
+
+| switch | what it does |
+|---|---|
+| `CRATONVM_JIT_OSR_OPTIMIZING` | the OSR door reaches the optimizing tier |
+| `CRATONVM_JIT_IR_OSR_ENTRY` | the entry stubs that door needs |
+| `CRATONVM_JIT_IR_DEOPT_REGS` | the register image a deopt frame reads |
+| `CRATONVM_JIT_IR_PHI_COPY_REGS` | edge copies through registers |
+| `CRATONVM_JIT_IR_SKIP_REPUBLISH` | no reload of a live register |
+| `CRATONVM_JIT_IR_PUBLISH_AT_DEF` | publish from RAX at the store |
+| `CRATONVM_JIT_IR_DROP_PHI_HOME` | a phi with no home word |
+| `CRATONVM_JIT_IR_DROP_HOME` | the same for ordinary values |
+| `CRATONVM_JIT_IR_RESERVE_CARRIED` | a register each for the carried set |
+| `CRATONVM_JIT_LS_CARRY_RELIEF` | price a carried value's eviction (0 → 64) |
+| `CRATONVM_JIT_IR_CARRY_SINGLE_USE` | one-instruction live ranges stay in a register |
+| `CRATONVM_JIT_IR_SINK_LATE` | pure work out of loops it is not used in |
+| `CRATONVM_JIT_IR_ALU_IMM` | constant operands folded into the ALU op |
+
+All thirteen are now ON, each keeping `=0` as its kill switch. The three that
+were tested with `runtime_var_os(..).is_some()` now read the VALUE, because
+presence alone cannot express an off word.
+
+**Flipping them found two bugs that no arrangement of them one at a time
+could.** Both were caught by `cargo test -p cratonvm-jit`, and neither was a
+stale expectation:
+
+* **A carried value and a dropped home refused each other.**
+  `lower_data_node_tracked` bailed on any value whose home was dropped and
+  whose lowering published no register — and a carried value never publishes
+  one, because being left in RAX or RCX for its single consumer *is* the
+  contract. The probe this was all built on could not reach it: every
+  intermediate there is named by a frame state, so no carried value's home was
+  ever dropped and the two mechanisms never met. Two hand-built lowering tests
+  with no safepoints at all did meet them, and failed **closed** —
+  `n5's home was dropped but its lowering published no register` — rather than
+  emitting anything wrong.
+* **The level-2 machine list drifted from the arms it is measured against.**
+  `mir_emitted_bytes` already forced residency off for *both* arms of its
+  comparison, with the reason written down: a comparison that left it on for
+  one arm would measure residency rather than the selector. The carry and the
+  folded immediates are two more of exactly that. They also now refuse under a
+  MIR mode outright, and not merely for the lane's convenience — in
+  `MirMode::Emit` a tiled node is emitted by the SELECTOR and its arm never
+  runs, so a mix is genuinely broken rather than different: an arm could start
+  a carry its tiled consumer never reads, or fold an immediate the tiler then
+  re-materialises.
+
+Two tests also had to stop asserting a default and start asserting a property.
+`the_osr_entry_kill_switch_emits_no_stub` and the deopt-region test now reach
+for a force-off, because **a default-on codegen change is only as good as its
+way back**, and the way back is the thing worth pinning.
+
+**Engagement, with nothing set at all** — this is the census on a plain run,
+which is what "default on" has to mean:
+
+```text
+osr optimizing OsrTierBench.kernel pc=7: stub=true entries=[7] sentinel_free=true
+[ir-ls] resident=5 (fp=0 gp=5) scan_promoted=20 peak_live=13
+[ir-ls] carries: planned=4 taken=4 read=4 refused=0 stores_dropped=0 still_deopt_named=4
+[ir-ls] homes: dropped_values=4 stores_skipped=7 read_refusals=0 def_publishes=1
+[ir-ls] alu immediates folded: 5
+[ir-sink] moved=3 reverted_for_safepoints=0
+```
+
+**Verified.** `cargo test -p cratonvm-jit` and `-p cratonvm-vm` in debug, so
+`debug_assert` is live. The regression suite **90/90 with the new defaults and
+90/90 with every kill switch set** — both directions, because a switch nobody
+exercises is not a switch. `AluImmProbe` and `OsrTierBench` agree with HotSpot
+under the defaults, under every kill switch, and under `--nojit`.
+
+**What is still owed, and it has not changed.** Every number in this section
+comes from one six-line kernel. The engagement censuses say what that kernel
+cannot: the sink fires on **1 optimizing compile in 112** across the regression
+suite. These are on now because they are correct, reversible and free where
+they do not fire — not because a real workload has been measured. That
+measurement is the next thing this file should record, and until it does, the
+right reading of the parity result is "on this kernel", not "in general".
+
+#### An inline cache that installed, and then stopped being used
+
+Defaulting the optimizing-tier switches on made
+`test_inline_cache_takes_over_the_sam_call_site` fail intermittently — 3 runs
+in 46, never in 60 with the switches off, always at ~398 000 of 800 000
+dispatches "still going through the Rust arm". The number's tightness across
+occurrences (398568, 398618, 398496, 397002) said race, not latency drift.
+
+**Two theories died before the right one, and both are worth recording because
+each looked conclusive.**
+
+* *The optimizing OSR artifact has no inline-cache slots.*
+  `compile_optimizing_artifact` mentions `ic_slots`, `mic_slots` and
+  `pic_slots` exactly zero times, which reads as a smoking gun. It is not: the
+  function routes through `try_compile_with_invokespecial_resolver` into
+  `try_compile_inner`, and *that* builds `ir_ic_slots`. A grep over one
+  function is not a call graph.
+* *The door rebuilds an optimizing artifact it will refuse, delaying OSR
+  entry.* True, and worth fixing on its own — `ir_osr_sentinel_free` requires
+  no deopt stub and no call-exception stub, so **any method containing a call
+  is refused**, and the door was paying a full optimizing compile per OSR
+  attempt for most of them. But memoizing that refusal **did not change the
+  failure rate** (3 in 40). A real inefficiency, not this bug.
+
+**What it actually was.** Adding the counters *as of the instant of install* to
+the `lambda-adapter installed` line settled it in one run:
+
+```text
+lambda-adapter installed ... at site_direct=0 fast_returns=2962
+lambda-adapter installed ... at site_direct=1 fast_returns=3198
+RESULT: 397002 of 800 000 dispatches still went through the Rust arm
+```
+
+Both thunks installed **immediately** — and the site still served 397 002 calls
+from Rust afterwards. The feature engaged and then stopped working, which is
+why `site_adapters=2` looked healthy the whole time.
+
+`claim_adapter_install` latched a bare `bool` for the life of the process. The
+MIC/PIC slots it fills, though, belong to the **caller's compiled body** — and
+callers get recompiled: C1 then C2, or an OSR body published beside the entry
+one. The new body's slots are fresh and empty, and a site already latched
+`true` can never fill them, so every dispatch after the recompile falls back to
+Rust permanently.
+
+The latch is now the **slot pair** rather than a bool. A repeat of the same
+pair still refuses — that is the 202 000-re-install case the latch was added
+for, and it is unchanged — while a different pair claims once more. Re-installs
+are bounded by the number of distinct compiled bodies, which is small, instead
+of by the number of calls, which is not.
+
+| build | failures |
+|---|---|
+| `dev` with the defaults on | 3 / 46 |
+| + the refusal memo alone | 3 / 40 |
+| **+ the slot-keyed latch** | **0 / 108** |
+
+**The bug predates the defaults.** Nothing in the optimizing tier caused it;
+turning the switches on merely made caller recompilation likely enough to
+expose it, and the test was the only thing in the tree sensitive enough to
+notice. Any workload whose lambda call site sits in a method that tiers up has
+been losing its inline cache at the tier-up boundary.
+
+#### The frame states nothing can reach, and how to drop them without removing the net
+
+The stores this section kept naming as the residual were home writes for values
+pinned by frame states. `graph.safepoints` records the **full operand stack at
+every bci**, so an intermediate is deopt-named from its definition until its
+consumer pops it — which is what `plan_register_residency`'s `blocked_deopt` and
+the carry's `still_deopt_named` refuse on. Meanwhile the OSR door reports
+`sentinel_free=true` for the same method: it emits **no deopt stub and no
+call-exception stub**, so nothing inside it can transfer to the interpreter.
+Thirty-three frame states, not one reachable, all of them pinning intermediates
+to memory.
+
+**The obvious implementation is the dangerous one.** Stop building the
+unreachable points and the trap classification becomes load-bearing: misclassify
+one op and a deopt reconstructs a confidently wrong value — the failure mode
+this area produces, and the reason this was split out of the perf arc rather
+than done inline.
+
+So this does the opposite. It **predicts** trap-freedom from the graph to decide
+what to drop, and then **verifies the prediction against the emission that
+actually happened**. `lower_inner` computes `osr_sentinel_free` from
+`deopt_stub_patches` and `call_exc_patches` *before* `build_deopt_points` runs,
+and a point is skipped only when the graph prediction and the emission agree.
+
+If they disagree, every point is built, `frame_value_of` meets a dropped home it
+cannot describe, and refuses the compile — the behaviour with this switch off,
+unchanged. **Nothing is taken away; a case is added in which the net is provably
+not needed.** `op_cannot_deopt` is an allowlist, so an op this file has never
+heard of counts as trapping.
+
+That direction was not theoretical. The first cut omitted `Op::Return`, so
+`OsrTierBench.kernel` — pure arithmetic and a return — reported
+`graph_trap_free=false` and **declined itself**: `homes_freed=0`, loop unchanged.
+A missing entry costs an optimization, never a value.
+
+With it fixed:
+
+```text
+[ir-ls] unreachable frame states: graph_trap_free=true homes_freed=4 points_skipped=33
+[ir-ls] carries: planned=4 taken=4 read=4 refused=0 stores_dropped=4 still_deopt_named=0
+[ir-ls] homes:   dropped_values=8 stores_skipped=7 read_refusals=0
+```
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| the arc as merged | 40 | 10 | 3 | 7 |
+| **+ unreachable homes dropped** | **37** | **7** | 3 | **4** |
+
+`still_deopt_named` goes 4 → 0 and the seven stores this section has been
+pointing at become four.
+
+**Correctness is shown where the loop kernels cannot show it.** They are
+trap-free, so no deopt is ever taken and a frame state that reconstructed
+garbage would never be consulted — a green run there is agreement about a path
+nobody took. `probes/DeoptLiveProbe.java` is the other half: three hot loops
+that really trap part-way through, with an intermediate live across the trap
+point (a zero divisor, a null receiver, an out-of-bounds index), each folding
+into a checksum that depends on the values live at the deopt. It agrees with
+HotSpot under the default, with the switch on, with the switch on plus the OSR
+door, and under `--nojit`.
+
+**On the clock it is a null result, and that is the right size.** Paired user
+CPU, each arm run twice per round over fifteen rounds at host load 5-8:
+`before` 0.4840 s, `after` 0.4850 s — 0.2% apart, against a same-config control
+floor of **2.2-2.9%**. Three instructions and three frame operations out of 40
+and 10 is roughly 7% of the loop, and this host cannot resolve that. An earlier
+nine-round pass appeared to show a 16% regression; it was small-sample scatter
+in a bimodal distribution and did not survive pairing. The counted change is the
+result here — the stopwatch has nothing to add at this size.
+
+(The first run of that comparison passed **vacuously** — the probe was not yet
+on the remote worktree, HotSpot printed nothing, and empty matched empty. The
+script now refuses to compare against an empty oracle. A differential harness
+that cannot fail is worth less than no harness, because it reports success.)
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

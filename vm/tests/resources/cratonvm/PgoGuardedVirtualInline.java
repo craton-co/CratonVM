@@ -146,6 +146,27 @@ public class PgoGuardedVirtualInline {
         return DIVIDER.tag(x);
     }
 
+    // The stack-trace check's own entry point onto the same receiver, and it
+    // needs one because it cannot share `callDivider`.
+    //
+    // `check_uncaught_from_inlined_frame` runs first, on the same `Vm`, and
+    // leaves `callDivider` compiled and spliced. The stack-trace check's first
+    // measurement is documented as "the SAME call before the method compiled"
+    // and was not: it was a second COMPILED reading, so the check compared the
+    // compiled path against itself. Its own `interpreted == 0` floor is what
+    // caught that -- intermittently, because whether a given call enters the
+    // artifact is timing-dependent, so the same binary alternated between a
+    // 2-frame reading and an empty one.
+    //
+    // A separate caller is a separate call SITE with its own profile and its
+    // own artifact, so this one is genuinely cold when that check starts. The
+    // receiver is deliberately the SAME `DIVIDER`: the callee is what the
+    // check is about, and giving it a second one would change what is
+    // measured.
+    public static int callDividerForTrace(int x) {
+        return DIVIDER.tag(x);
+    }
+
     // How many frames naming `tag` appear in the stack trace of an exception
     // raised inside `callDivider`'s call to `Divider.tag`?
     //

@@ -13,7 +13,7 @@
 //! Gray objects (live but unscanned) are tracked in the mark queue, not in
 //! the bitmap itself.
 
-use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Granularity of the mark bitmap: one bit per 8 bytes of heap.
 /// This matches the minimum object alignment (8-byte aligned headers).
@@ -25,162 +25,145 @@ pub const MARK_GRANULARITY: usize = 8;
 /// atomic CAS operations. The bitmap is allocated once per GC cycle and
 /// cleared between cycles.
 pub struct MarkBitmap {
-    /// Atomic bitmap words. Each word covers 64 * MARK_GRANULARITY = 512 bytes.
-    words: Vec<AtomicU64>,
-    /// Base address of the heap region this bitmap covers.
-    base_addr: usize,
-    /// Total size (bytes) of the covered region.
-    region_size: usize,
+    /// The storage, the atomics, the `alloc_zeroed`, the alignment-exact
+    /// `locate` and the relaxed-store `clear_all` all live in
+    /// [`crate::heap_bitmap::HeapBitmap`] now. This type is the mark-bitmap
+    /// VOCABULARY over it -- `try_mark` / `is_marked` / `clear` -- kept so G1's
+    /// per-region bitmap and `ConcurrentMarker`'s old-gen bitmap read as they
+    /// did.
+    ///
+    /// # What the callers gain from the swap
+    ///
+    /// [`crate::heap_bitmap::HeapBitmap::claim`] is `try_mark`'s exact
+    /// semantics plus a plain load before the read-modify-write. That test is
+    /// asked of every EDGE rather than every object, and most edges point at
+    /// something already marked -- a shared graph is why marking is a traversal
+    /// and not a walk. The unconditional `fetch_or` this replaces made each of
+    /// those an exclusive-state acquisition of a cache line every other marking
+    /// worker is also writing.
+    ///
+    /// It is also alignment-EXACT, which this type was not: `addr` and
+    /// `addr + 4` used to land on the same bit, so an unaligned candidate
+    /// silently marked its neighbour. Mark bitmaps are only ever asked about
+    /// object bases, which are 8-aligned, so no live caller changes behaviour --
+    /// but the direction of the difference is that a bug becomes impossible
+    /// rather than merely unlikely.
+    bits: crate::heap_bitmap::HeapBitmap,
+    /// Has ANY bit been set since the last [`Self::clear`]?
+    ///
+    /// Kept HERE rather than pushed down into `HeapBitmap`, because this is the
+    /// only one of the two whose clear is speculative: G1 calls `clear()` from
+    /// `G1Region::reset()` for every region a cleanup frees, and a young pause
+    /// marks into almost none of them. `HeapBitmap`'s other instances -- ZGC's
+    /// object-start registry and its mark bits -- are cleared only when they are
+    /// known to be populated, so the flag would be pure cost there and one more
+    /// thing for `insert` / `set_range` / `spill` to keep in step.
+    ///
+    /// Set BEFORE the claim, and that order is the safety argument: a bit must
+    /// never be observable without the flag already true, or `clear` would skip
+    /// a populated bitmap and leave a black bit from the previous cycle -- a
+    /// live object reaped.
+    any_marked: AtomicBool,
 }
 
 impl MarkBitmap {
     /// Create a new zeroed bitmap covering a heap region.
     pub fn new(base_addr: usize, region_size: usize) -> Self {
-        let num_bits = region_size.div_ceil(MARK_GRANULARITY);
-        let num_words = num_bits.div_ceil(64);
-        let words = (0..num_words).map(|_| AtomicU64::new(0)).collect();
         Self {
-            words,
-            base_addr,
-            region_size,
+            bits: crate::heap_bitmap::HeapBitmap::labelled(base_addr, region_size, "mark"),
+            any_marked: AtomicBool::new(false),
         }
     }
 
     /// Attempt to mark the bit for the given address. Returns `true` if the
     /// bit was newly set (was 0, now 1). Returns `false` if already marked.
     ///
-    /// This is lock-free and safe to call from multiple threads concurrently.
+    /// Lock-free and safe to call from multiple marker threads concurrently.
     #[inline]
     pub fn try_mark(&self, addr: usize) -> bool {
-        // Explicit bounds check before arithmetic to catch overflow early.
-        let region_end = match self.base_addr.checked_add(self.region_size) {
-            Some(end) => end,
-            None => return false, // region wraps around address space — reject
-        };
-        if addr < self.base_addr || addr >= region_end {
+        // RANGE SCREEN FIRST, and it is not optional.
+        //
+        // `HeapBitmap::claim` SPILLS an address its grid cannot encode into an
+        // overflow set and reports it newly claimed. That is right for an
+        // object-start registry, where a base the grid cannot represent must
+        // still be recorded and losing it would lose an object. It is wrong
+        // here, and dangerously so: a mark bitmap is bounded to ONE region and
+        // G1 asks every region's bitmap about addresses that belong to other
+        // regions as a matter of course. Answering "newly marked" for one of
+        // those puts a foreign address on the mark queue and grows the overflow
+        // set without bound.
+        //
+        // `MarkBitmap`'s contract has always been "not mine -> false", and
+        // `out_of_range_ignored` is the test that says so. It failed the moment
+        // this type started delegating, which is exactly what it is for.
+        if self.bits.locate(addr).is_none() {
             return false;
         }
-        let offset = addr - self.base_addr;
-        let bit_index = offset / MARK_GRANULARITY;
-        let word_index = bit_index / 64;
-        let bit_within_word = bit_index % 64;
-        let mask = 1u64 << bit_within_word;
-
-        if word_index >= self.words.len() {
-            return false;
+        // Sequenced before the claim -- see `any_marked`. The read-first keeps
+        // the line read-shared once the first mark of a cycle has happened.
+        if !self.any_marked.load(Ordering::Relaxed) {
+            self.any_marked.store(true, Ordering::Release);
         }
-
-        // Atomic fetch-or: set the bit and check if it was already set.
-        // Round-5 fix (CRIT — ARM cross-cycle race): pair `clear()`'s
-        // `Release` store with `AcqRel` on the mark-side `fetch_or`. The
-        // Acquire half guarantees the marker observes the zero bits
-        // published by the prior cycle's `clear()`; the Release half
-        // publishes the newly-set bit for downstream `is_marked()`
-        // readers (including the next cycle's `clear()` ordering anchor).
-        // Without this, on ARM/AArch64 a marker can observe a stale
-        // black bit from a previous cycle and skip a live object → UAF.
-        // On x86 `fetch_or` is a single `LOCK BTS`/`LOCK CMPXCHG` so the
-        // upgrade is free; on ARM64 the extra LDAXR/STLXR is required
-        // for correctness.
-        let old = self.words[word_index].fetch_or(mask, Ordering::AcqRel);
-        old & mask == 0 // true if bit was newly set
+        self.bits.claim(addr)
     }
 
     /// Check if the bit for the given address is marked.
     #[inline]
     pub fn is_marked(&self, addr: usize) -> bool {
-        // Explicit bounds check before arithmetic to catch overflow early.
-        let region_end = match self.base_addr.checked_add(self.region_size) {
-            Some(end) => end,
-            None => return false, // region wraps around address space — reject
-        };
-        if addr < self.base_addr || addr >= region_end {
-            return false;
-        }
-        let offset = addr - self.base_addr;
-        let bit_index = offset / MARK_GRANULARITY;
-        let word_index = bit_index / 64;
-        let bit_within_word = bit_index % 64;
-
-        if word_index >= self.words.len() {
-            return false;
-        }
-
-        // Round-5 fix (CRIT — ARM cross-cycle race): pair `clear()`'s
-        // `Release` store and `try_mark`'s AcqRel `fetch_or` with an
-        // `Acquire` load here so the reader observes a coherent view of
-        // the bitmap across cycles on weakly-ordered platforms (ARM64).
-        let word = self.words[word_index].load(Ordering::Acquire);
-        word & (1u64 << bit_within_word) != 0
+        // Screened for the same reason `try_mark` is: `contains` consults the
+        // overflow set, and this type must answer for its own region only.
+        self.bits.locate(addr).is_some() && self.bits.contains(addr)
     }
 
     /// Clear all bits (prepare for next GC cycle).
     ///
-    /// **Ordering contract** (Round-7 audit §4, task #25 hardening): each
-    /// per-word clear is now an `AcqRel` CAS-like RMW (`swap` with
-    /// `AcqRel`), not a plain `Release` store. Why we strengthened it:
+    /// **STOP-THE-WORLD ONLY.** Every caller runs inside a pause:
+    /// `ConcurrentMarker::initial_mark` / `abort_cycle` / the post-sweep reset,
+    /// and `G1Region::reset` from G1's cleanup. A call with the world alive
+    /// would erase marks out from under a running marker, which is a
+    /// use-after-free rather than a torn read -- so the ordering is not what
+    /// protects it, the caller's safepoint is. `HeapBitmap::clear_all` documents
+    /// the same contract and the measurement behind its relaxed stores.
     ///
-    /// - The previous per-word `Release` store paired with `try_mark`'s
-    ///   `AcqRel` `fetch_or` and `is_marked`'s `Acquire` load *on the same
-    ///   word*, but provided no Acquire side on the clearer itself. With
-    ///   `clear()` always invoked inside the initial-mark STW pause
-    ///   (every mutator parked at `gc_barrier`), the barrier's release on
-    ///   STW exit served as a global fence and the missing Acquire was
-    ///   invisible.
-    /// - If `clear()` is ever moved to a background pre-clear thread
-    ///   (already anticipated in the original docstring), that global
-    ///   fence disappears. On ARM/AArch64 the clearer could then observe
-    ///   a stale black bit from the *previous* cycle in its initial load,
-    ///   merge it with its zero-store, and republish a still-set bit —
-    ///   the classic stale-black bit → live object reaped → UAF.
-    /// - `AcqRel` on each per-word RMW closes that hole: the Acquire half
-    ///   forces the clearer to observe the latest value from the prior
-    ///   cycle's marker (sequencing it with marker stores), and the
-    ///   Release half publishes the cleared word for the next cycle's
-    ///   marker (paired with `try_mark`'s Acquire half).
-    ///
-    /// `swap(0, AcqRel)` is the cheapest primitive that gives both halves;
-    /// on x86 it's a `LOCK XCHG`, on ARM64 an `LDAXR`/`STLXR` pair. We
-    /// keep the trailing `SeqCst` fence as belt-and-braces inter-word
-    /// ordering: per-word `AcqRel` does NOT linearize different words
-    /// against each other, and the fence makes that invariant explicit
-    /// for any future caller (e.g. concurrent pre-clear scheduling).
+    /// The early return is the one thing this adds: see [`Self::any_marked`].
     pub fn clear(&self) {
-        for word in &self.words {
-            // AcqRel swap: Acquire side observes the prior cycle's
-            // marker stores on this word; Release side publishes the
-            // cleared word for the next cycle's markers. See module
-            // docstring for the cross-cycle race this prevents.
-            word.swap(0, Ordering::AcqRel);
+        if !self.any_marked.load(Ordering::Acquire) {
+            return;
         }
-        fence(Ordering::SeqCst);
+        self.bits.clear_all();
+        self.any_marked.store(false, Ordering::Relaxed);
+    }
+
+    /// Has anything been marked into this bitmap since the last [`Self::clear`]?
+    #[inline]
+    pub fn any_marked(&self) -> bool {
+        self.any_marked.load(Ordering::Acquire)
     }
 
     /// Count the total number of marked bits (for statistics).
     pub fn marked_count(&self) -> usize {
-        self.words
-            .iter()
-            .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
+        (0..self.bits.word_count())
+            .map(|w| self.bits.word_at(w).count_ones() as usize)
             .sum()
     }
 
     /// The base address of the covered region.
     pub fn base_addr(&self) -> usize {
-        self.base_addr
+        self.bits.base
     }
 
     /// The size of the covered region.
     pub fn region_size(&self) -> usize {
-        self.region_size
+        self.bits.span
     }
 }
 
 impl std::fmt::Debug for MarkBitmap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MarkBitmap")
-            .field("base_addr", &format_args!("{:#x}", self.base_addr))
-            .field("region_size", &self.region_size)
-            .field("num_words", &self.words.len())
+            .field("base_addr", &format_args!("{:#x}", self.base_addr()))
+            .field("region_size", &self.region_size())
+            .field("num_words", &self.bits.word_count())
             .field("marked", &self.marked_count())
             .finish()
     }
@@ -242,17 +225,16 @@ mod tests {
         assert!(!bm.is_marked(0));
     }
 
-    /// Task #25: `clear()` must use `AcqRel` per-word RMW (not a plain
-    /// Release store) so a background pre-clear cannot observe stale
-    /// black bits from the prior cycle on ARM. Verified indirectly: a
-    /// fresh `clear()` followed by `is_marked()` on every word must
-    /// always return false, even after many concurrent mark+clear cycles
-    /// — a `Release`-only store would still expose the prior-cycle bit
-    /// to the Acquire load on weakly-ordered hardware. We can't fake
-    /// ARM ordering on the host, but the test fences with `SeqCst` so
-    /// any latent ordering bug surfaces under TSan / Miri.
+    /// A cleared bitmap must read as empty from another thread.
+    ///
+    /// `clear()` is relaxed stores plus one trailing `Release` fence (it used
+    /// to be an `AcqRel` swap per word; see its doc for the measurement that
+    /// changed it). The property that has to hold is unchanged and is what is
+    /// asserted: after a clear, no reader observes a bit from before it. The
+    /// join below is the happens-before edge in this test, standing in for the
+    /// stop-the-world pause exit that provides it in production.
     #[test]
-    fn clear_acqrel_publishes_zeroes_to_marker() {
+    fn clear_publishes_zeroes_to_marker() {
         use std::sync::Arc;
         let bm = Arc::new(MarkBitmap::new(0x0, 4096));
         // Mark many bits, then clear in a thread, and read in another —
@@ -272,6 +254,85 @@ mod tests {
             assert!(!bm.is_marked(i * 8), "stale mark at {i}");
         }
         assert_eq!(bm.marked_count(), 0);
+    }
+
+    /// `clear()` may skip its sweep ONLY for a bitmap nothing has marked into.
+    ///
+    /// The direction that matters is the unsafe one: a bitmap with a bit set
+    /// must never take the early return, because the bit would survive into the
+    /// next cycle as a stale black mark and the object it names would be
+    /// treated as live-then-reaped. `try_mark` sets `any_marked` BEFORE its
+    /// `fetch_or` precisely so that ordering cannot invert.
+    #[test]
+    fn clear_skips_only_an_untouched_bitmap() {
+        let bm = MarkBitmap::new(0x1000, 4096);
+        assert!(!bm.any_marked(), "a fresh bitmap has nothing to clear");
+        bm.clear();
+        assert!(!bm.any_marked());
+
+        // A mark that LANDED arms the flag...
+        assert!(bm.try_mark(0x1000));
+        assert!(bm.any_marked());
+        bm.clear();
+        assert!(!bm.any_marked(), "clear disarms");
+        assert!(!bm.is_marked(0x1000), "and actually cleared the bit");
+
+        // ...and a re-mark of an ALREADY-set bit must keep it armed, or the
+        // second clear of a cycle would skip a populated bitmap.
+        assert!(bm.try_mark(0x1008));
+        assert!(!bm.try_mark(0x1008), "second mark is a no-op on the bit");
+        assert!(bm.any_marked(), "but must not disarm the flag");
+        bm.clear();
+        assert!(!bm.is_marked(0x1008));
+    }
+
+    /// An out-of-range mark must not arm the flag into claiming work that
+    /// cannot exist -- and, more importantly, must not be reported as newly
+    /// marked.
+    #[test]
+    fn out_of_range_mark_does_not_arm_the_flag() {
+        let bm = MarkBitmap::new(0x1000, 1024);
+        assert!(!bm.try_mark(0x0));
+        assert!(!bm.try_mark(0x9000));
+        assert!(!bm.any_marked());
+    }
+
+    /// The constructor hands back a genuinely zeroed bitmap.
+    ///
+    /// It builds one from `vec![0u64; n]` and reinterprets the allocation as
+    /// `[AtomicU64]` rather than constructing each atomic; this pins the bit
+    /// pattern that conversion assumes.
+    #[test]
+    fn alloc_zeroed_bitmap_reads_as_empty() {
+        let bm = MarkBitmap::new(0x1_0000, 1 << 20);
+        assert_eq!(bm.marked_count(), 0);
+        for i in (0..(1usize << 20)).step_by(4096) {
+            assert!(!bm.is_marked(0x1_0000 + i), "stale bit at +{i:#x}");
+        }
+    }
+
+    /// An address outside this bitmap's region must not be recorded ANYWHERE.
+    ///
+    /// The companion to `out_of_range_ignored`, and the reason it is a separate
+    /// test: that one checks the return value, this one checks that nothing was
+    /// stored. `HeapBitmap::claim` spills an unencodable address into an
+    /// overflow set — correct for an object-start registry, where losing such a
+    /// base loses an object, and wrong for a bounded mark bitmap that G1 asks
+    /// about other regions' addresses as a matter of course. Without the range
+    /// screen in `try_mark` the overflow set would grow without bound and a
+    /// foreign address would be reported newly marked.
+    #[test]
+    fn an_out_of_region_mark_does_not_reach_the_overflow_set() {
+        let bm = MarkBitmap::new(0x1_0000, 4096);
+        assert!(!bm.try_mark(0x0), "below the region");
+        assert!(!bm.try_mark(0x9_0000), "above the region");
+        assert!(!bm.try_mark(0x1_0004), "inside, but not on the 8-byte grid");
+        assert!(
+            !bm.bits.has_spill(),
+            "a mark bitmap is bounded to one region; nothing outside it may be              recorded, and an overflow entry is both a wrong answer and an              unbounded leak"
+        );
+        assert_eq!(bm.marked_count(), 0);
+        assert!(!bm.any_marked());
     }
 
     #[test]
