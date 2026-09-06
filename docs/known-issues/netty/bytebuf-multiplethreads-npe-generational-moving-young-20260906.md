@@ -727,3 +727,63 @@ careful about, one level further down: §10.8 read a zero from a census without
 first asking whether the thing being counted could occur. The check is one
 question — *does this region have a non-empty extent in the frames I am
 measuring?* — and it costs nothing to ask before the count is believed.
+
+### 10.10 §7's "the ledger never accepts" is STALE — and that makes §8 testable for the first time
+
+§7 states, and §10.2 repeated: *"on this workload it never accepts: 0
+`accounted=true` out of 750 decisions"*, from which §10.2 concluded that every
+failure ever measured came from relocating under peers that proved nothing, and
+that "the precise maps are incomplete" had therefore never been tested.
+
+**On current dev the ledger accepts, and it is not close.**
+`CRATONVM_DBG_XT_COVERAGE=1` under the §10.4 repro, six reps:
+
+```
+@@PEERTOTAL proven=144 accounted_true=237 peer_decision_lines=650 crashes=2/6
+```
+
+**237 of 650 peer decisions accept.** And they accept on genuine proofs, not on
+the pin credit this branch closed — every accepting line has `pinned=0` and
+`proven` equal to `peer_depth`:
+
+```
+29 x  [xt-coverage] peer_depth=1 proven=1 pinned=0 pins_honoured=false accounted=true
+ 7 x  [xt-coverage] peer_depth=2 proven=2 pinned=0 pins_honoured=false accounted=true
+ 3 x  [xt-coverage] peer_depth=3 proven=3 pinned=0 pins_honoured=false accounted=true
+ 1 x  [xt-coverage] peer_depth=4 proven=4 pinned=0 pins_honoured=false accounted=true
+```
+
+**And the accepting cycles are the relocating cycles.** Across two four-rep
+arms, `accounted_true` tracks `moving-jit-coverage-proven` almost exactly —
+205 vs 207, and 148 vs 154. The cycles that relocate are the cycles whose peers
+deposited a proof.
+
+So the configuration that crashes is: **peers proved their own frames
+rewritable, the collector relocated on that proof, and the heap was corrupted
+anyway.** That is §8's hypothesis with an arm under it, and it removes the
+confound §10.2 raised. Precise-only under-coverage is now the live reading, and
+for the first time it is being tested rather than bypassed.
+
+**Two readings that are NOT safe to take from the numbers above.**
+
+* `proven=0` on the two crashed reps is an **artifact**, not a zero: a SIGSEGV
+  skips the exit trailer, and those logs contain zero `[GC]` lines at all.
+  Only the four completed reps contribute a `proven` count.
+* Why §7's number was 0 and this one is 237 is **not established**. My
+  hypothesis was the A5 residue filter — it screens a false positive in
+  `refresh_moving_young_coverage_for_current_thread`, which is the very function
+  each peer runs in `publish_peer_jit_coverage_for_stw` before depositing, so
+  fixing the peer's own proof should make peers start depositing. **Refuted on
+  its own kill switch:** `CRATONVM_JIT_A5_RESIDUE_FILTER=0` gives
+  `accounted_true=148/378` against `205/508` with it on — 39 % vs 40 %, no
+  effect. Something else between §7's binary and dev opened the ledger, and this
+  page should not guess at it a second time.
+
+**What this changes about where to look.** The stale reference is held by a
+frame whose peer proof SUCCEEDED. The remap covers the oop-map slots and the
+callee-saved GPR image; §10.8 measured that rewriting the entire remaining
+unverifiable tail changes nothing. So the surviving candidates are not frame-band
+memory at all — they are the channels the proof asserts and the remap does not
+walk: a resumed register that is reloaded from somewhere other than the
+callee-saved image, or the shadow stack. That is the next measurement, and it is
+a different one from §8's screens.
