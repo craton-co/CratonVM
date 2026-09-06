@@ -86,6 +86,7 @@ fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
 /// The trust does **not** extend to the object's KIND — see the refusal at the
 /// top of [`for_each_flat_object_reference_capped`], which both entry points go
 /// through.
+#[track_caller]
 fn for_each_flat_object_reference_trusting_header(
     obj_ptr: *const u8,
     header: &ObjectHeader,
@@ -115,6 +116,7 @@ fn for_each_flat_object_reference_trusting_header(
 /// `record_outgoing_rset_edges` -> `for_each_flat_object_reference_trusting_header`, faulting
 /// on a 4 MiB-aligned address well past the committed arena — came through this
 /// walk.
+#[track_caller]
 fn for_each_flat_object_reference_capped(
     obj_ptr: *const u8,
     header: &ObjectHeader,
@@ -169,6 +171,44 @@ fn for_each_flat_object_reference_capped(
                     .enumerate()
                 {
                     if !is_ref || index < first_index {
+                        continue;
+                    }
+                    // THE COMPACT ARM'S OWN BOUND. The legacy arm below has
+                    // had `max_slots` since 2026-08-26; this one had NOTHING,
+                    // and it is the arm that writes an 8-BYTE POINTER
+                    // (`write_flat_object_reference(.., compact = true)`).
+                    //
+                    // A reference field of an object is inside that object, so
+                    // `offset + 8 <= body_size` is a bound this walk can state
+                    // without trusting the caller — and unlike the legacy arm's
+                    // it is NOT circular: the extent comes from the layout's
+                    // `body_size` while the offsets come from its
+                    // `field_offsets`, so a layout whose offsets leave its own
+                    // body is a mismatch between the layout an object was
+                    // ALLOCATED under and the one being walked with now. That
+                    // is a shape this tree already has a record of
+                    // (`compact-layout-registered-but-object-allocated-legacy`).
+                    //
+                    // Measured 2026-09-06 (`…XmlExternalWarXml`, G1): holders
+                    // whose `class_id`/`shape` dwords recombine to a pointer
+                    // into this arena, with the mark word at +8 INTACT — an
+                    // eight-byte write at a neighbour's base, which is exactly
+                    // what an unbounded compact-arm reference write produces.
+                    // `class_id`(4) + `shape`(4) IS the first word of a header,
+                    // so the victim's mark survives; a 16-byte legacy `Value`
+                    // write would have taken it out too.
+                    let end = HEADER_SIZE + offset as usize + 8;
+                    if end > HEADER_SIZE + layout.body_size as usize {
+                        let n = COMPACT_WALK_OFFSET_PAST_BODY.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 8 || n.is_power_of_two() {
+                            tracing::warn!(
+                                "[g1] compact reference walk REFUSED a field offset past the                                  holder's own body (#{n}): holder=0x{:x} class_id={}                                  field_count={} index={index} offset={offset}                                  body_size={} -- the layout this walk resolved places a                                  reference field outside the body that layout declares, so                                  reading (and rewriting) it would land in the NEXT object.                                  The field is skipped and the walk continues.",
+                                obj_ptr as usize,
+                                header.class_id.as_u32(),
+                                header.num_slots(),
+                                layout.body_size,
+                            );
+                        }
                         continue;
                     }
                     let slot = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) } as *mut u8;
@@ -289,17 +329,37 @@ fn for_each_flat_object_reference_capped(
                 census_before = cratonvm_types::cell_census::decoded();
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
+                    // WHICH WALK, and WHAT the header's first word actually is.
+                    //
+                    // The report used to print `class_id` and `num_slots` as
+                    // two decimal fields, and every reader has had to recombine
+                    // them by hand to see the thing that matters: on the
+                    // measured population they are the two halves of ONE HEAP
+                    // POINTER (`class_id` 163587104 = 0x09C02470 under
+                    // `num_slots` 501 = 0x1F5, in a heap at 0x1f5...).
+                    // `header_word0` is that recombination and
+                    // `word0_plausible_ptr` is the test, so "someone wrote a
+                    // pointer over the class_id/shape dword pair" is a FIELD
+                    // rather than an inference the reader has to redo.
+                    //
+                    // `caller` is the `#[track_caller]` location of whichever of
+                    // this file's fourteen walk sites is running. The holder
+                    // shape alone cannot say whether this is the evacuator, the
+                    // mark scan, the rset recorder or the verifier, and those
+                    // have different producers and different fixes. Measured
+                    // 2026-09-06: the same shape appears with
+                    // `CRATONVM_G1_PARALLEL_EVAC=0`, so the producer is NOT the
+                    // parallel evacuator that produced the 2026-09-05 family.
+                    let word0 = (header.class_id.as_u32() as u64)
+                        | ((header.num_slots() as u64) << 32);
                     tracing::warn!(
-                        "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}): \
-                         holder=0x{:x} class_id={} num_slots={} kind={:?} \
-                         mark=0x{:016x} gc_flags=0x{:x} gc_age={} is_compact={} \
-                         slot_index={index} end={end} -- the cell screen rejected \
-                         this word, so either the holder IS compact and this walk \
-                         chose the wrong arm, or the holder is not an object at all.",
+                        "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}):                          caller={} holder=0x{:x} class_id={} num_slots={} kind={:?}                          header_word0=0x{word0:016x} word0_plausible_ptr={}                          mark=0x{:016x} gc_flags=0x{:x} gc_age={} is_compact={}                          slot_index={index} end={end} -- the cell screen rejected                          this word, so either the holder IS compact and this walk                          chose the wrong arm, or the holder is not an object at all.",
+                        std::panic::Location::caller(),
                         obj_ptr as usize,
                         header.class_id.as_u32(),
                         header.num_slots(),
                         header.kind(),
+                        cratonvm_types::plausible_heap_pointer(word0),
                         header.mark_word.load(Ordering::Relaxed),
                         header.gc_flags(),
                         header.gc_age(),
@@ -313,6 +373,22 @@ fn for_each_flat_object_reference_capped(
 
 /// Rate-limit counter for the corrupt-cell holder report above.
 static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders the parallel reference scan refused because their first
+/// header word is a pointer into the collector's own arena.
+///
+/// Expected to be ZERO. Non-zero means an eight-byte write landed at a live
+/// object's base DURING a pause — the holder was a sound object when
+/// `evacuate` copied it onto this queue.
+pub static PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new(0);
+
+/// How many compact reference-field offsets were skipped because the resolved
+/// layout places them past the body that same layout declares.
+///
+/// Expected to be ZERO. A non-zero count means the layout an object was
+/// allocated under and the layout it is being walked with are not the same,
+/// which for the COMPACT arm is a write of eight bytes into the next object.
+pub static COMPACT_WALK_OFFSET_PAST_BODY: AtomicUsize = AtomicUsize::new(0);
 
 fn write_flat_object_reference(slot: *mut u8, raw: usize, compact: bool) {
     if compact {
@@ -543,6 +619,17 @@ pub fn evacuation_refs_rejected() -> usize {
 /// MILLIONS (`#134217728`), and until this split nothing said which of the two
 /// populations that number was.
 pub static EVAC_REF_REJECTED_TORN: AtomicUsize = AtomicUsize::new(0);
+
+/// How many reference-slot candidates were refused because their legacy header
+/// is IMPLAUSIBLE — a class id in the band no loader mints, or class 0 carrying
+/// thousands of fields — rather than because their tag bytes failed to decode.
+///
+/// Separate from [`EVAC_REF_REJECTED`] because the two name different
+/// producers. A tag-screen refusal is a word that is not a header at all; this
+/// one is a word whose header DECODES and is still not an object, which is the
+/// interior-pointer face `addr_is_followable_object` was written for. Expected
+/// to be ZERO.
+pub static EVAC_REF_REJECTED_IMPLAUSIBLE: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`EVAC_REF_REJECTED_TORN`].
 pub fn evacuation_refs_rejected_torn() -> usize {
@@ -1626,6 +1713,50 @@ impl<'a> SharedEvac<'a> {
         defer_self_forwarded: bool,
     ) {
         let header = &*(obj_ptr as *const ObjectHeader);
+        // THE HOLDER'S OWN FIRST WORD IS A POINTER INTO THIS ARENA.
+        //
+        // `class_id`(4) + `shape`(4) is the object's first word, so this test
+        // asks whether something wrote an eight-byte pointer at the holder's
+        // base — leaving the mark word at +8 intact, which is what the measured
+        // population looks like. It is not the CANDIDATE screen: candidates are
+        // referents, and by the time a holder reaches this queue it was a sound
+        // object when `evacuate` copied it. A corrupt holder here therefore
+        // means the corruption happened AFTER the copy, i.e. inside this pause.
+        //
+        // Measured 2026-09-06, `TestHostConfigAutomaticDeploymentXmlExternalWarXml`
+        // under G1: 19 corrupt-cell holders in one run, `word0_plausible_ptr`
+        // TRUE on 19 of 19, `#[track_caller]` naming THIS walk for 12 of them.
+        // Walking such a holder strides `num_slots` = the pointer's HIGH dword
+        // (752 in that run) of 16-byte cells over its neighbours and rewrites
+        // the ones that decode as references — so refusing here is what stops
+        // one corrupted header from manufacturing the next.
+        //
+        // A cursor-based holder screen (`candidate_header_is_plausible`) cannot
+        // be used at this site: the parallel arm carves TLABs and publishes a
+        // destination region's cursor only at `retire_tlab`, so every fresh
+        // to-space holder is legitimately ABOVE its region's cursor for the
+        // whole dispatch. This test needs no cursor.
+        if gc_flags().g1_parallel_evac_screen {
+            let paired = (header.class_id.as_u32() as u64)
+                | ((header.num_slots() as u64) << 32);
+            let base = self.collector.arena_base;
+            let end = self.collector.arena_end;
+            if end > base && (paired as usize) >= base && (paired as usize) < end {
+                let n = PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] parallel ref-scan REFUSED a HOLDER whose first word is an                          ARENA POINTER (#{n}): holder=0x{:x} class_id={} num_slots={}                          paired=0x{paired:016x} mark=0x{:016x} gc_age={} —                          `class_id`+`shape` IS the header's first word, so something                          wrote an 8-byte pointer at this object's base and left the mark                          word at +8 alone. Walking it would stride {} cells over its                          neighbours and rewrite them. Skipped; the pause continues.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        header.mark_word.load(Ordering::Relaxed),
+                        header.gc_age(),
+                        header.num_slots(),
+                    );
+                }
+                return;
+            }
+        }
         let (kind, etype, alen) = (header.kind(), header.element_type(), header.array_length());
         // PARITY WITH THE SERIAL ARM (2026-09-05). `scan_and_evacuate_refs`
         // clamps its element walk with `holder_walkable_slots` and screens
@@ -8953,8 +9084,44 @@ impl G1Collector {
         const LAMBDA_PROXY_CLASS_ID_BASE: u32 = 0x8000_0000;
         const IMPLAUSIBLE_CLASS0_SLOTS: u32 = 1024;
         let cid = header.class_id.as_u32();
+        // THE THIRD SHAPE, and the one the band above is blind to by
+        // construction: the `class_id` and `shape` dwords, recombined, are a
+        // pointer INTO THIS COLLECTOR'S OWN ARENA.
+        //
+        // That is what a heap pointer written over the pair looks like, and it
+        // is the measured population. 2026-09-06, `TestHostConfigAutomatic-
+        // DeploymentXmlExternalWarXml` under G1:
+        //
+        //   holder=0x2f056b807b0 class_id=2461533248 num_slots=752
+        //                        mark=0x1000000000000000 gc_age=1
+        //
+        // `num_slots` 752 = 0x2F0 over `class_id` 2461533248 = 0x92B80440 is
+        // the single word 0x000002F092B80440, and this run's arena is at
+        // 0x2f0……. The mark word beside it is well-formed — a plausible
+        // quartet and an age the copy incremented — so the header was sound
+        // when it was written and something later put a pointer in the pair.
+        //
+        // **The band cannot see it.** `0x92B80440 >= 0x8000_0000`, so it lands
+        // in the range this screen deliberately exempts for lambda proxies
+        // (`SharedVm::alloc_lambda_proxy_id` counts up from `0x8000_0000`).
+        // A 64-bit heap pointer's LOW dword has bit 31 set about half the
+        // time, so the band screen was blind to half of this population — and
+        // it is not a coincidence which half: the exemption exists precisely
+        // over the values a pointer's low half occupies.
+        //
+        // The arena test does not have that hole and is far more specific than
+        // the band: it needs BOTH dwords to conspire — `shape` to equal the
+        // arena's high dword AND `class_id` to fall inside its low range —
+        // where the band needs only one. It is also the collector's own
+        // geometry rather than an assumption about the class-id space, so it
+        // cannot go stale the way "large class ids are implausible" did.
+        let paired = (cid as u64) | ((header.num_slots() as u64) << 32);
+        let pair_is_arena_pointer = self.arena_end > self.arena_base
+            && (paired as usize) >= self.arena_base
+            && (paired as usize) < self.arena_end;
         let implausible = (cid >= MAX_LOADED_CLASS_ID && cid < LAMBDA_PROXY_CLASS_ID_BASE)
-            || (cid == 0 && header.num_slots() >= IMPLAUSIBLE_CLASS0_SLOTS);
+            || (cid == 0 && header.num_slots() >= IMPLAUSIBLE_CLASS0_SLOTS)
+            || pair_is_arena_pointer;
         if header.kind() != ObjectKind::Object || !implausible {
             return false;
         }
@@ -8993,7 +9160,7 @@ impl G1Collector {
             })
             .unwrap_or_else(|| "r?".to_string());
         tracing::warn!(
-            "[g1] IMPLAUSIBLE legacy header at {site} (#{n}): obj={addr:#x}              class_id={} kind=Object num_slots={} mark={:#018x} claims={:#x} bytes              source={where_from} -- no allocation in this VM produces a class-0 legacy              object with that many fields; a reference array whose kind bit is unset              reads exactly this way, and the walk it authorises is eight times the              array's extent.",
+            "[g1] IMPLAUSIBLE legacy header at {site} (#{n}): obj={addr:#x}              class_id={} kind=Object num_slots={} paired=0x{paired:016x}              pair_is_arena_pointer={pair_is_arena_pointer} mark={:#018x} claims={:#x} bytes              source={where_from} -- no allocation in this VM produces a class-0 legacy              object with that many fields; a reference array whose kind bit is unset              reads exactly this way, and the walk it authorises is eight times the              array's extent. `pair_is_arena_pointer` says the class_id/shape dwords              recombine to an address in THIS arena, i.e. a pointer was written over              the pair -- see the note above the screen.",
             cid,
             header.num_slots(),
             header.mark_word.load(Ordering::Relaxed),
@@ -9075,12 +9242,86 @@ impl G1Collector {
             // SAFETY: the verdict above validated the tag bytes and the
             // address's containment below its region's cursor.
             let cand = unsafe { &*(raw as *const ObjectHeader) };
-            self.note_implausible_legacy_header_view(
+            let implausible = self.note_implausible_legacy_header_view(
                 regions,
                 raw as *mut u8,
                 cand,
                 "ref-slot-candidate",
             );
+            // ACT ON THE SECOND LOOK, do not merely note it.
+            //
+            // The comment above has always said this is "the same second look
+            // as `note_root_object_plausibility`'s", and until 2026-09-06 it
+            // was not: the ROOT route is
+            // `candidate_header_is_plausible && !note_implausible_legacy_header`
+            // (`addr_is_followable_object`), and this route discarded the
+            // second half and returned `true`. `addr_is_followable_object`'s
+            // own doc says why that is not a style difference — "Both screens,
+            // because either alone admits the other's defect… Measured
+            // 2026-09-02: gating on the first alone is what let a conservative
+            // root pointing 0x28 bytes inside a live reference array reach
+            // `evacuate_object`, which sized an object from the array ELEMENT
+            // and copied eight kilobytes of it into a Survivor region." The
+            // 2026-09-02 lesson reached the root supply route and stopped
+            // there; a REFERENCE SLOT holding an interior address satisfies
+            // the tag screen exactly as trivially, because the first eight
+            // bytes of a slot are a heap pointer whose halves read as a class
+            // id and a `num_slots`.
+            //
+            // Not hypothetical, and it is what
+            // `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
+            // left behind: with that page's screens armed, a G1 run still
+            // reports `IMPLAUSIBLE legacy header at ref-slot-candidate` and
+            // still faults, because this site saw the header and followed it
+            // anyway. The band it screens on is one no loader mints (see
+            // `note_implausible_legacy_header`: `1<<24 ..< 0x8000_0000`, or
+            // class 0 carrying >= 1024 slots), narrowed on measurement after
+            // its first version rejected autobox and lambda-proxy ids — so a
+            // refusal here cannot drop a live reference.
+            //
+            // `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE=0` restores the
+            // note-only behaviour, which is the same-binary A/B for the claim.
+            // WHAT THIS DOES AND DOES NOT FIX -- measured 2026-09-06 on
+            // `org.h2.test.store.TestMVStoreTool` (-Xmx256m, G1,
+            // `CRATONVM_G1_JIT_MARK_DRIVER=1`), one binary, ABBA, refusing
+            // against the note-only arm:
+            //
+            //   refusing    ref-slot 9 / 16 refused   evacuate-src 0   dest 0
+            //   note-only   ref-slot 4 accepted       evacuate-src 4   dest 2
+            //
+            // So it closes the chain it is on: candidates refused here stop
+            // reaching `evacuate_object` and the downstream implausible-header
+            // reports go to zero.
+            //
+            // It does NOT stop the `corrupt Value cell` bursts, and expecting it
+            // to was a mistake worth recording. Those are 32 in BOTH arms (32 is
+            // the report cap, so read ">= 32") at 17-62 mixed pauses. They are a
+            // SEPARATE defect that merely co-occurs, and its shape is different
+            // in every respect that matters here: the holders carry PLAUSIBLE
+            // class ids -- 665 with 192 slots, 13079432 with 1024 -- which is
+            // precisely why this screen never fires on them. What is wrong is
+            // their MARK WORD, which holds a heap-address-shaped value with
+            // `gc_flags=0` (0x200001ea4fb17cd0, 0x100001ea4fb14cf0,
+            // 0x300001ea4fb16850: age nibble intact, the rest an address in the
+            // live heap). A zero `gc_flags` makes `is_compact_object` answer
+            // false, so the walk strides 16-byte legacy cells over what is
+            // really a compact object and every slot decodes as garbage.
+            //
+            // Those marks are NOT forwarding pointers -- `make_forwarded` ORs in
+            // MARK_FORWARDED and these have the low two bits clear -- so
+            // `retire_forwards` is excluded as well. What writes a
+            // heap-address-shaped value into a live object's mark word and
+            // clears its `gc_flags` is the open question.
+            if implausible && gc_flags().g1_evac_ref_implausible_refuse {
+                let n = EVAC_REF_REJECTED_IMPLAUSIBLE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] {site}: REFUSED a candidate whose legacy header is                          IMPLAUSIBLE (#{n}): holder=0x{:x} slot={slot} candidate=0x{raw:x}                          — the tag screen passed it, the class-id band screen did not.                          The slot is left unchanged and the pause continues; the report                          one line above names the shape. This is the refusal the ROOT                          route has made since 2026-09-02.",
+                        holder as usize,
+                    );
+                }
+                return false;
+            }
             return true;
         }
         // WHICH refusal, not just THAT one. See [`EVAC_REF_REJECTED_TORN`]:
@@ -9273,8 +9514,38 @@ impl G1Collector {
         }
         let n = EVAC_HOLDER_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
+            // IS THE CLAMPED HOLDER AN OBJECT AT ALL?
+            //
+            // This counter cannot be read without that field. A clamp on a
+            // CORRUPT holder is the guard doing its job; a clamp on a SOUND one
+            // is the guard dropping live references — the walk stops early, the
+            // referents in the slots it skipped are never evacuated, and they
+            // dangle. Those are opposite verdicts and the report used to print
+            // the same line for both.
+            //
+            // `paired` is the `class_id`/`shape` dword pair recombined; the two
+            // dwords ARE the header's first word, so a pair that lands inside
+            // this arena is a pointer written over it and the holder is not an
+            // object. `off` is the holder's offset in its own region: a
+            // legitimately-allocated object cannot start so near the end that
+            // its own declared body does not fit, so a large `off` beside a
+            // small `room` is the corrupt case too.
+            let (paired, off, holder_is_compact) = {
+                // SAFETY: `addr` is inside a live region's span (checked above)
+                // and 8-aligned by the caller's own screen; reading the first
+                // eight bytes is the same access the walk is about to make.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                (
+                    (h.class_id.as_u32() as u64) | ((h.num_slots() as u64) << 32),
+                    addr.wrapping_sub(base),
+                    cratonvm_types::is_compact_object(h),
+                )
+            };
+            let pair_is_arena_pointer = self.arena_end > self.arena_base
+                && (paired as usize) >= self.arena_base
+                && (paired as usize) < self.arena_end;
             tracing::warn!(
-                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} stride={stride} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
+                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} off=0x{off:x} stride={stride} declared={declared} room={room}                  paired=0x{paired:016x} pair_is_arena_pointer={pair_is_arena_pointer}                  holder_is_compact={holder_is_compact} bound={bound:?} — the header claims more reference slots than its region                  holds, so the walk would have read past the region. Walking {room}.                  `pair_is_arena_pointer=true` means the holder is not an object and this                  clamp is a refusal; `false` on a plausible `off` would mean the clamp is                  dropping live references and IS the defect. `holder_is_compact=true` means \n                 this report is NOISE: `for_each_flat_object_reference_capped` ignores \n                 `max_slots` on the compact arm, so the cap computed here with the \n                 LEGACY 16-byte stride never restricted the walk.",
             );
         }
         room

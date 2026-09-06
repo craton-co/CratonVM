@@ -970,7 +970,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-155 tokens.
+156 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1020,6 +1020,7 @@ export inherited from a parent shell.
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
 | `g1-parallel-evac-screen` | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` |
+| `g1-evac-ref-implausible-refuse` | `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
 | `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |
 | `g1-adaptive-tenuring` | `CRATONVM_G1_ADAPTIVE_TENURING` |
