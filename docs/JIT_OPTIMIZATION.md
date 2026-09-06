@@ -2671,6 +2671,143 @@ they do not fire — not because a real workload has been measured. That
 measurement is the next thing this file should record, and until it does, the
 right reading of the parity result is "on this kernel", not "in general".
 
+#### An inline cache that installed, and then stopped being used
+
+Defaulting the optimizing-tier switches on made
+`test_inline_cache_takes_over_the_sam_call_site` fail intermittently — 3 runs
+in 46, never in 60 with the switches off, always at ~398 000 of 800 000
+dispatches "still going through the Rust arm". The number's tightness across
+occurrences (398568, 398618, 398496, 397002) said race, not latency drift.
+
+**Two theories died before the right one, and both are worth recording because
+each looked conclusive.**
+
+* *The optimizing OSR artifact has no inline-cache slots.*
+  `compile_optimizing_artifact` mentions `ic_slots`, `mic_slots` and
+  `pic_slots` exactly zero times, which reads as a smoking gun. It is not: the
+  function routes through `try_compile_with_invokespecial_resolver` into
+  `try_compile_inner`, and *that* builds `ir_ic_slots`. A grep over one
+  function is not a call graph.
+* *The door rebuilds an optimizing artifact it will refuse, delaying OSR
+  entry.* True, and worth fixing on its own — `ir_osr_sentinel_free` requires
+  no deopt stub and no call-exception stub, so **any method containing a call
+  is refused**, and the door was paying a full optimizing compile per OSR
+  attempt for most of them. But memoizing that refusal **did not change the
+  failure rate** (3 in 40). A real inefficiency, not this bug.
+
+**What it actually was.** Adding the counters *as of the instant of install* to
+the `lambda-adapter installed` line settled it in one run:
+
+```text
+lambda-adapter installed ... at site_direct=0 fast_returns=2962
+lambda-adapter installed ... at site_direct=1 fast_returns=3198
+RESULT: 397002 of 800 000 dispatches still went through the Rust arm
+```
+
+Both thunks installed **immediately** — and the site still served 397 002 calls
+from Rust afterwards. The feature engaged and then stopped working, which is
+why `site_adapters=2` looked healthy the whole time.
+
+`claim_adapter_install` latched a bare `bool` for the life of the process. The
+MIC/PIC slots it fills, though, belong to the **caller's compiled body** — and
+callers get recompiled: C1 then C2, or an OSR body published beside the entry
+one. The new body's slots are fresh and empty, and a site already latched
+`true` can never fill them, so every dispatch after the recompile falls back to
+Rust permanently.
+
+The latch is now the **slot pair** rather than a bool. A repeat of the same
+pair still refuses — that is the 202 000-re-install case the latch was added
+for, and it is unchanged — while a different pair claims once more. Re-installs
+are bounded by the number of distinct compiled bodies, which is small, instead
+of by the number of calls, which is not.
+
+| build | failures |
+|---|---|
+| `dev` with the defaults on | 3 / 46 |
+| + the refusal memo alone | 3 / 40 |
+| **+ the slot-keyed latch** | **0 / 108** |
+
+**The bug predates the defaults.** Nothing in the optimizing tier caused it;
+turning the switches on merely made caller recompilation likely enough to
+expose it, and the test was the only thing in the tree sensitive enough to
+notice. Any workload whose lambda call site sits in a method that tiers up has
+been losing its inline cache at the tier-up boundary.
+
+#### The frame states nothing can reach, and how to drop them without removing the net
+
+The stores this section kept naming as the residual were home writes for values
+pinned by frame states. `graph.safepoints` records the **full operand stack at
+every bci**, so an intermediate is deopt-named from its definition until its
+consumer pops it — which is what `plan_register_residency`'s `blocked_deopt` and
+the carry's `still_deopt_named` refuse on. Meanwhile the OSR door reports
+`sentinel_free=true` for the same method: it emits **no deopt stub and no
+call-exception stub**, so nothing inside it can transfer to the interpreter.
+Thirty-three frame states, not one reachable, all of them pinning intermediates
+to memory.
+
+**The obvious implementation is the dangerous one.** Stop building the
+unreachable points and the trap classification becomes load-bearing: misclassify
+one op and a deopt reconstructs a confidently wrong value — the failure mode
+this area produces, and the reason this was split out of the perf arc rather
+than done inline.
+
+So this does the opposite. It **predicts** trap-freedom from the graph to decide
+what to drop, and then **verifies the prediction against the emission that
+actually happened**. `lower_inner` computes `osr_sentinel_free` from
+`deopt_stub_patches` and `call_exc_patches` *before* `build_deopt_points` runs,
+and a point is skipped only when the graph prediction and the emission agree.
+
+If they disagree, every point is built, `frame_value_of` meets a dropped home it
+cannot describe, and refuses the compile — the behaviour with this switch off,
+unchanged. **Nothing is taken away; a case is added in which the net is provably
+not needed.** `op_cannot_deopt` is an allowlist, so an op this file has never
+heard of counts as trapping.
+
+That direction was not theoretical. The first cut omitted `Op::Return`, so
+`OsrTierBench.kernel` — pure arithmetic and a return — reported
+`graph_trap_free=false` and **declined itself**: `homes_freed=0`, loop unchanged.
+A missing entry costs an optimization, never a value.
+
+With it fixed:
+
+```text
+[ir-ls] unreachable frame states: graph_trap_free=true homes_freed=4 points_skipped=33
+[ir-ls] carries: planned=4 taken=4 read=4 refused=0 stores_dropped=4 still_deopt_named=0
+[ir-ls] homes:   dropped_values=8 stores_skipped=7 read_refusals=0
+```
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| the arc as merged | 40 | 10 | 3 | 7 |
+| **+ unreachable homes dropped** | **37** | **7** | 3 | **4** |
+
+`still_deopt_named` goes 4 → 0 and the seven stores this section has been
+pointing at become four.
+
+**Correctness is shown where the loop kernels cannot show it.** They are
+trap-free, so no deopt is ever taken and a frame state that reconstructed
+garbage would never be consulted — a green run there is agreement about a path
+nobody took. `probes/DeoptLiveProbe.java` is the other half: three hot loops
+that really trap part-way through, with an intermediate live across the trap
+point (a zero divisor, a null receiver, an out-of-bounds index), each folding
+into a checksum that depends on the values live at the deopt. It agrees with
+HotSpot under the default, with the switch on, with the switch on plus the OSR
+door, and under `--nojit`.
+
+**On the clock it is a null result, and that is the right size.** Paired user
+CPU, each arm run twice per round over fifteen rounds at host load 5-8:
+`before` 0.4840 s, `after` 0.4850 s — 0.2% apart, against a same-config control
+floor of **2.2-2.9%**. Three instructions and three frame operations out of 40
+and 10 is roughly 7% of the loop, and this host cannot resolve that. An earlier
+nine-round pass appeared to show a 16% regression; it was small-sample scatter
+in a bimodal distribution and did not survive pairing. The counted change is the
+result here — the stopwatch has nothing to add at this size.
+
+(The first run of that comparison passed **vacuously** — the probe was not yet
+on the remote worktree, HotSpot printed nothing, and empty matched empty. The
+script now refuses to compare against an empty oracle. A differential harness
+that cannot fail is worth less than no harness, because it reports success.)
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

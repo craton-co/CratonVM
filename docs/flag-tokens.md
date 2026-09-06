@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-518 tokens.
+521 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -522,6 +522,7 @@ export inherited from a parent shell.
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
+| `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
 | `symbolize` | `CRATONVM_SYMBOLIZE` |
 | `symbolize-dbg` | `CRATONVM_SYMBOLIZE_DBG` |
 | `threadreg-perf` | `CRATONVM_DBG_THREADREG_PERF` |
@@ -564,6 +565,7 @@ export inherited from a parent shell.
 | `watch-cause-self` | `CRATONVM_DBG_WATCH_CAUSE_SELF` |
 | `watch-cell` | `CRATONVM_DBG_WATCH_CELL` |
 | `watchaddr` | `CRATONVM_DBG_WATCHADDR` |
+| `watch-alloc-cid` | `CRATONVM_DBG_WATCH_ALLOC_CID` |
 | `watchref` | `CRATONVM_DBG_WATCHREF` |
 | `weakref` | `CRATONVM_DBG_WEAKREF` |
 | `wf` | `CRATONVM_DBG_WF` |
@@ -577,6 +579,7 @@ export inherited from a parent shell.
 | `invoke-cache-stats` | `CRATONVM_INVOKE_CACHE_STATS` |
 | `ir-string` | `CRATONVM_DBG_IR_STRING` |
 | `invoke-phases` | `CRATONVM_DBG_INVOKE_PHASES` |
+| `field-phases` | `CRATONVM_DBG_FIELD_PHASES` |
 | `interp-frames` | `CRATONVM_DBG_INTERP_FRAMES` |
 | `tierup-decline` | `CRATONVM_DBG_TIERUP_DECLINE` |
 | `direct-binds` | `CRATONVM_DBG_DIRECT_BINDS` |
@@ -584,7 +587,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-367 tokens.
+369 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -700,9 +703,11 @@ export inherited from a parent shell.
 | `ls-carry-relief` | `CRATONVM_JIT_LS_CARRY_RELIEF` |
 | `ir-reserve-carried` | `CRATONVM_JIT_IR_RESERVE_CARRIED` |
 | `osr-optimizing` | `CRATONVM_JIT_OSR_OPTIMIZING` |
+| `osr-optimizing-memo` | `CRATONVM_JIT_OSR_OPTIMIZING_MEMO` |
 | `ir-drop-phi-home` | `CRATONVM_JIT_IR_DROP_PHI_HOME` |
 | `ir-publish-at-def` | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` |
 | `ir-drop-home` | `CRATONVM_JIT_IR_DROP_HOME` |
+| `ir-drop-unreachable-homes` | `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES` |
 | `ir-carry-single-use` | `CRATONVM_JIT_IR_CARRY_SINGLE_USE` |
 | `ir-sink-late` | `CRATONVM_JIT_IR_SINK_LATE` |
 | `ir-alu-imm` | `CRATONVM_JIT_IR_ALU_IMM` |
@@ -958,13 +963,15 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-146 tokens.
+148 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
+| `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
+| `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |

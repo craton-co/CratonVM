@@ -135,6 +135,39 @@ for turning it back on; it does not do the soak. Whoever takes that up has the
 probe and the regression vector as the check, and should expect the same class
 of defect anywhere a natively-shadowed method is declared on a supertype.
 
+### The soak's first task is a POSITIVE CONTROL, not a corpus (2026-09-05)
+
+An attempt at that soak produced three greens in a row that were worth nothing,
+and the reason is worth recording before anyone spends the host time again.
+
+| arm | result | what it was actually worth |
+|---|---|---|
+| `cargo test -p cratonvm-jit`, flag `0` vs `1` | identical, RC=0 both | **nothing.** No test under `jit/tests/` names the flag, so neither arm planned a guarded site. |
+| `cargo test -p cratonvm-vm`, flag `0` vs `1` | no flag-attributable failure | **weak.** The three binaries that differed pass alone; they were parallel-load artefacts at load 17-24. |
+| `pgo02_guarded_virtual_inline` | passes at `0`, at `1`, and unset | **does not discriminate the flag at all** — it is not the engagement test it looks like. |
+
+Then the direct question, with `CRATONVM_DBG_JITC=1` on the real binary:
+
+| workload | JIT active? | `Monomorphic` inline plans |
+|---|---|---|
+| hot monomorphic interface call, 4M invocations | yes — 279 compile/plan lines | **0** |
+| `TreeMap.tailMap(k).entrySet()` iteration, 4000 rounds | yes | **0** |
+| `JitGuardedInlineNativeShadowProbe` (the fixture above) | yes | 0 — and correctly so, this is the case the screen REFUSES |
+
+So on a debug build, with the flag ON, two workloads shaped exactly like the
+feature's target produced **no guarded plan at all**. The `Monomorphic
+{ guard_class_id: 228 }` line quoted earlier in this page came from a release
+build of `TreeTailIterProbe`, which no longer exists in the tree.
+
+**Nobody should read a soak green until a workload is known to make this feature
+fire.** Until then "engaged and found nothing" and "never engaged" are the same
+observation, and only the first licenses the flip. A splice counter was written
+for this and then DROPPED rather than landed: it agreed with `DBG_JITC` at zero
+everywhere, but with no workload to make it fire there was no way to tell a
+working counter from a misplaced one, and a mute instrument that a future soak
+trusts is worse than no instrument. Rebuild it alongside a positive control, not
+before one.
+
 ## The lesson worth keeping
 
 **A screen inherits the question its subject can answer.** "Does this class

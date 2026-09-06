@@ -1890,7 +1890,7 @@ fn throwable_suppressed_sentinel(shared: &SharedVm) -> Option<Value> {
 /// activation that is the SAME activation as one of those frames — an OSR
 /// continuation is always one — must be dropped, or the trace names it twice.
 /// See `stackwalker::dedupe_compiled_snapshot`.
-pub fn attach_snapshotted_npe_frames(
+pub fn attach_snapshotted_trap_frames(
     shared: &SharedVm,
     frames: &[crate::runtime::frame::Frame],
     throwable: ObjectRef,

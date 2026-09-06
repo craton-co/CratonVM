@@ -431,15 +431,27 @@ pub(super) fn getfield_fast_keyed(
     cp_index: u16,
     ret_opcode: u8,
 ) -> bool {
+    // Phase boundaries for `CRATONVM_DBG_FIELD_PHASES=1`. `now()` returns 0 and
+    // `charge` is a no-op when the instrument is off, so an unarmed run pays one
+    // predicted branch per boundary. See `field_phases` for what it can and
+    // cannot claim, and for the four refuted hypotheses that made it necessary.
+    use crate::runtime::interpreter::field_phases as ph;
+    let t_entry = ph::now();
     if crate::runtime::jvmti::any_field_watchpoint_active() {
         return false;
     }
     if stack.len() == 0 {
         return false;
     }
+    // Boundary BEFORE the peek: the prologue and the `Acquire` load are the two
+    // candidates for this phase being the largest, and both land above here.
+    let t_wp = ph::now();
+    ph::charge(ph::P_ENTRY, t_entry, t_wp);
     let Some(ptr) = stack.peek_compact().as_object_ptr() else {
         return false;
     };
+    let t_gates = ph::now();
+    ph::charge(ph::P_PEEK, t_wp, t_gates);
     let site = match sites.get(class_id, cp_index) {
         Some(s) => *s,
         None => {
@@ -447,14 +459,40 @@ pub(super) fn getfield_fast_keyed(
             return false;
         }
     };
+    let t_site = ph::now();
+    ph::charge(ph::P_SITE, t_gates, t_site);
     if ret_opcode != 0 && !return_opcode_agrees(&site, ret_opcode) {
         return false;
     }
     let Some(fp) = field_ptr_for(zgc, ptr, &site) else {
         return false;
     };
+    let t_ptr = ph::now();
+    ph::charge(ph::P_PTR, t_site, t_ptr);
+    // Charged at EVERY success exit, not just the compact tail.
+    //
+    // The first version of this instrument put the count on the compact path
+    // only, and `FieldBurn`'s receiver is legacy-layout — so it returned
+    // through `getfield_legacy`, the phases accumulated over millions of
+    // accesses, and the denominator counted ONE. It printed
+    // `accesses=1 total_cycles=1215177994`. That the count is printed at all
+    // is what made it obvious; a per-access figure alone would have looked
+    // merely surprising.
+    macro_rules! charged_hit {
+        () => {{
+            ph::charge(ph::P_READ, t_ptr, ph::now());
+            // CALIB last, under the conditions the phases above actually ran in.
+            let c0 = ph::now();
+            ph::charge(ph::P_CALIB, c0, ph::now());
+            ph::count_access();
+        }};
+    }
     let Some(storage) = site.storage else {
-        return getfield_legacy(shared, stack, fp, &site);
+        let hit = getfield_legacy(shared, stack, fp, &site);
+        if hit {
+            charged_hit!();
+        }
+        return hit;
     };
     // SAFETY (every raw load below): `fp` addresses the field inside a live,
     // header-validated compact object; the width is the layout's own.
@@ -469,6 +507,7 @@ pub(super) fn getfield_fast_keyed(
             let v = unsafe { load_u64(fp) } as i64;
             stack.pop_compact();
             stack.push_long_unchecked(v);
+            charged_hit!();
             site_stats::bump(site_stats::FAST_GET_HIT);
             return true;
         }
@@ -478,6 +517,7 @@ pub(super) fn getfield_fast_keyed(
             let v = f64::from_bits(unsafe { load_u64(fp) });
             stack.pop_compact();
             stack.push_double_unchecked(v);
+            charged_hit!();
             site_stats::bump(site_stats::FAST_GET_HIT);
             return true;
         }
@@ -524,6 +564,7 @@ pub(super) fn getfield_fast_keyed(
     };
     stack.pop_compact();
     stack.push_compact(pushed);
+    charged_hit!();
     site_stats::bump(site_stats::FAST_GET_HIT);
     true
 }
