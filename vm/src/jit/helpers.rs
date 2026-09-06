@@ -1328,9 +1328,34 @@ pub(crate) fn restash_jit_pending_arithmetic(
     });
 }
 
+/// Put back an AIOOBE that [`take_all_jit_signals`] drained WHOLE — payload
+/// AND compiled-frame snapshot — exactly as it was found.
+///
+/// The third of the family, after [`restash_jit_pending_npe`] and
+/// [`restash_jit_pending_arithmetic`], and the same rule as both: do NOT
+/// re-sample. `active_compiled_frames()` at a restore point describes a
+/// shallower stack than the trap did; the frames belong to the trap, not to the
+/// drain that happened to pass them through.
+pub(crate) fn restash_jit_pending_aioobe(
+    index: i64,
+    length: i64,
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.aioobe.set(Some((index, length)));
+        *s.trap_frames.borrow_mut() = frames;
+    });
+}
+
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
 /// taken pending-AIOOBE payload. See `stash_jit_pending_exception` for the
 /// OSR drain-without-route rationale.
+///
+/// FLAG ONLY, and that is now a distinction that matters: a door which drained
+/// the payload with [`take_jit_pending_aioobe`] left the snapshot where the
+/// helper put it and must use this, while a door which drained everything with
+/// [`take_all_jit_signals`] is holding the snapshot and must use
+/// [`restash_jit_pending_aioobe`] instead.
 pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
 }
@@ -1375,14 +1400,21 @@ pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
 /// it. The deopt flag is deliberately NOT dropped: it describes the compiled
 /// frame's fate, which an exception does not settle.
 fn drain_superseded_implicit_signals() {
-    if take_jit_pending_npe() {
-        // The snapshot was taken for a raise that will never happen; a later
-        // drain would attach frames the raising code has long since left.
+    let npe = take_jit_pending_npe();
+    if npe {
         let _ = take_jit_pending_npe_action();
+    }
+    let aioobe = take_jit_pending_aioobe().is_some();
+    let arithmetic = take_jit_pending_arithmetic();
+    // The snapshot was taken for a raise that will never happen; a later drain
+    // would attach frames the raising code has long since left. All three
+    // signals carry one now (the NPE since 2026-09-02, the div-by-zero and the
+    // AIOOBE since 2026-09-05), so all three have to drop it — dropping it only
+    // for the NPE would leave a superseded array trap's frames in the slot for
+    // whatever raises next.
+    if npe || aioobe || arithmetic {
         let _ = take_jit_pending_trap_frames();
     }
-    let _ = take_jit_pending_aioobe();
-    let _ = take_jit_pending_arithmetic();
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -3240,13 +3272,24 @@ fn materialize_implicit_signal(
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
             let msg = format!("Index {index} out of bounds for length {length}");
-            crate::runtime::exceptions::create_exception_object(
+            let exc = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
                 "java/lang/ArrayIndexOutOfBoundsException",
                 Some(&msg),
             )
-            .ok()
+            .ok()?;
+            // The third arm to need this, and the last. Same defect as the
+            // other two: the bounds-check helper flagged the signal and the
+            // compiled body ran its epilogue, so the trace `fillInStackTrace`
+            // built a moment ago names nothing at all.
+            crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                vm,
+                &thread.frames,
+                exc,
+                trap_frames,
+            );
+            Some(exc)
         }
         ImplicitSignal::Npe => {
             let exc = crate::runtime::exceptions::create_exception_object(
@@ -3754,7 +3797,10 @@ unsafe fn route_implicit_exc_through_callee(
         // `take_jit_pending_trap_frames` says why that is the worse
         // half ("a trace that is confidently wrong is worse than one that is
         // short").
-        let trap_frames = if matches!(implicit, ImplicitSignal::Npe | ImplicitSignal::Arithmetic) {
+        let trap_frames = if matches!(
+            implicit,
+            ImplicitSignal::Npe | ImplicitSignal::Arithmetic | ImplicitSignal::Aioobe { .. }
+        ) {
             take_jit_pending_trap_frames()
         } else {
             None
@@ -4058,22 +4104,34 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     if let Some(exc) = signals.exception {
         set_jit_pending_exception(thread, exc);
     }
-    if let Some((index, length)) = signals.aioobe {
-        stash_jit_pending_aioobe(index, length);
-    }
+    // Restore the snapshot the drain took WITH the flag it belongs to, rather
+    // than letting a setter take a fresh one here: `take_all_jit_signals` moved
+    // it out, and a second `active_compiled_frames()` at this point describes a
+    // shallower stack than the trap did. Without this the caller-side drain
+    // builds the throwable from a bare flag and the trace is EMPTY.
+    // ONE `trap_frames` slot, so exactly ONE of these three may restore it
+    // and the rest come back flag-only. Writing it more than once is not a
+    // tidiness point: every one of these setters ASSIGNS the slot, so a
+    // second call with `None` would wipe the frames the first put back.
+    // JVMS does not let one frame have two of these pending at once, so
+    // the priority never arbitrates anything real -- it is written out so
+    // the next reader does not have to derive that from three `take()`s.
+    let frames = signals.trap_frames.take();
     if signals.npe {
-        // Restore the snapshot the drain took WITH the flag, rather than
-        // letting the setter take a fresh one here: `take_all_jit_signals`
-        // moved it out, and a second `active_compiled_frames()` at this point
-        // describes a shallower stack than the trap did.
-        restash_jit_pending_npe(signals.npe_action, signals.trap_frames.take());
-    }
-    if signals.arithmetic {
-        // Same rule, same reason, and it was missing here: a div-by-zero that
-        // takes a round trip through a door which declines to service it must
-        // come back with its frames, or the caller-side drain builds the
-        // throwable from a bare flag and the trace is empty.
-        restash_jit_pending_arithmetic(signals.trap_frames.take());
+        restash_jit_pending_npe(signals.npe_action, frames);
+        if signals.arithmetic {
+            stash_jit_pending_arithmetic();
+        }
+        if let Some((index, length)) = signals.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if signals.arithmetic {
+        restash_jit_pending_arithmetic(frames);
+        if let Some((index, length)) = signals.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if let Some((index, length)) = signals.aioobe {
+        restash_jit_pending_aioobe(index, length, frames);
     }
     if signals.deopt {
         set_jit_deopt_pending();
@@ -6239,6 +6297,14 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
         // path constructs the real exception and routes it through the method's
         // exception table.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -6310,6 +6376,14 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
         // return; the interpreter's post-JIT drain surfaces the exception at this
         // method (see `take_jit_pending_aioobe` in runtime/interpreter.rs).
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -6351,6 +6425,14 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
         // index (same protocol as `jit_throw_aioobe`). Previously returned 0,
         // silently fabricating a zero element and masking real OOB bugs.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *const i32;
@@ -6388,6 +6470,14 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
         // interpreter's post-JIT drain surfaces the exception (same void-arm protocol
         // as the null case above).
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
@@ -7243,6 +7333,14 @@ pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> 
         // index (same protocol as `jit_throw_aioobe`). Previously returned 0 (null),
         // silently fabricating a null element and masking real OOB bugs.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size());
@@ -7501,6 +7599,14 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         // or written on the OOB path). The void return cannot carry the deopt
         // sentinel, so the interpreter's post-JIT drain surfaces the exception.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return;
     }
     // JVMS §aastore covariance check: a non-null element whose runtime type is
@@ -11435,6 +11541,14 @@ mark_word={mark_word:#x}"
         }
     }
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+    // The frames this bounds check fired in are about to leave: the helper
+    // returns and the compiled body runs its epilogue, so the
+    // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+    // on a stack that no longer has them. Snapshot here, the one moment the
+    // signal and the frames both exist -- the same rung the NPE and
+    // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+    // bci is one the frame walk already has, unlike an inline null check's.
+    snapshot_trap_frames(0);
     // Out-of-band deopt signal: this `i64::MIN` IS the bounds-check stub's
     // method return value, so flag it as a genuine deopt so the interpreter
     // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
@@ -20638,30 +20752,36 @@ fn jit_abi_bits_of(value: Option<Value>) -> i64 {
 /// The direct lambda arm has to DRAIN the signals to tell a deopt sentinel from
 /// a `long` equal to `Long.MIN_VALUE`, and when the answer is "not a deopt" the
 /// signals still belong to the compiled caller's own post-invoke checks.
-fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
+fn restash_jit_signals(thread: &mut JvmThread, mut sig: DrainedJitSignals) {
     if let Some(exc) = sig.exception {
         set_jit_pending_exception(thread, exc);
     }
-    if let Some((index, length)) = sig.aioobe {
-        stash_jit_pending_aioobe(index, length);
-    }
+    // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
+    // frames belong to the trap, not to this drain, so put back the ones that
+    // were taken instead of sampling a fresh (shallower) stack.
+    // ONE `trap_frames` slot, so exactly ONE of these three may restore it
+    // and the rest come back flag-only. Writing it more than once is not a
+    // tidiness point: every one of these setters ASSIGNS the slot, so a
+    // second call with `None` would wipe the frames the first put back.
+    // JVMS does not let one frame have two of these pending at once, so
+    // the priority never arbitrates anything real -- it is written out so
+    // the next reader does not have to derive that from three `take()`s.
+    let frames = sig.trap_frames.take();
     if sig.npe {
-        // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
-        // frames belong to the trap, not to this drain, so put back the ones
-        // that were taken instead of sampling a fresh (shallower) stack.
-        restash_jit_pending_npe(sig.npe_action, sig.trap_frames);
-        // `DrainedJitSignals` owns ONE `trap_frames` and the arm
-        // above has just consumed it, so a co-pending div-by-zero gets its
-        // flag back and no frames. That is the same answer as before this
-        // change and the right one: frames restored under the wrong flag are a
-        // confidently wrong trace, which the drain contract calls worse than a
-        // short one.
+        restash_jit_pending_npe(sig.npe_action, frames);
         if sig.arithmetic {
             stash_jit_pending_arithmetic();
         }
+        if let Some((index, length)) = sig.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
     } else if sig.arithmetic {
-        // The same restore for the other signal that carries a snapshot.
-        restash_jit_pending_arithmetic(sig.trap_frames);
+        restash_jit_pending_arithmetic(frames);
+        if let Some((index, length)) = sig.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if let Some((index, length)) = sig.aioobe {
+        restash_jit_pending_aioobe(index, length, frames);
     }
     if sig.deopt {
         set_jit_deopt_pending();

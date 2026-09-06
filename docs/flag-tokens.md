@@ -963,7 +963,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-148 tokens.
+152 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -972,6 +972,7 @@ export inherited from a parent shell.
 | `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
 | `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
+| `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
@@ -1004,6 +1005,9 @@ export inherited from a parent shell.
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
+| `g1-humongous-marks` | `CRATONVM_G1_HUMONGOUS_MARKS` |
+| `g1-ihop-counts-regions` | `CRATONVM_G1_IHOP_COUNTS_REGIONS` |
+| `g1-verify-holders` | `CRATONVM_G1_VERIFY_HOLDERS` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
