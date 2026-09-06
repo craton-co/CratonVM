@@ -1,8 +1,14 @@
 # 19 netty classes fail on **Generational only** — the moving young cycle corrupts a live object
 
-**Status:** OPEN. Found 2026-09-06 by a per-collector sweep of the full netty
-suite. **This is a correctness defect, not a throughput one**, and it is
-invisible to every run that uses the shipped default collector.
+**Status:** OPEN, **root cause identified** (2026-09-06). Found by a
+per-collector sweep of the full netty suite. **This is a correctness defect,
+not a throughput one**, and it is invisible to every run that uses the shipped
+default collector.
+
+**One line:** a moving young cycle copies an object into to-space and never
+scans it, so every reference slot in that one object keeps pointing into
+from-space. See §6 for the named slots and §7 for the amplifier that reproduces
+it 3/3.
 
 | | |
 |---|---|
@@ -144,22 +150,97 @@ checked against the lever before being ruled out.
   stack is a coincidence of which object happens to be young, small, and
   allocated once per test invocation.
 
-## 6. Where to look next
+## 6. Root cause — a to-space survivor that is copied but never SCANNED
 
-The nine cycles all claim `moving-jit-coverage-proven` under live JIT, so the
-first question is whether that proof is sound for these frames. Prior art says
-to distrust it: `moving-young-corruption-rootcause.md` root-caused an earlier
-instance as *precise-only under-coverage* — the coverage bit was computed from
-locals + operand stack while a compiled frame also holds oops in
-scalar-replacement slots, LICM hoist slots and the blind GPR spill area — and
-this codebase has repeatedly found coverage proofs that certify a frame they
-never actually inspected.
+`CRATONVM_MOVING_YOUNG_VERIFY=1` runs a post-evacuation pass that reports any
+surviving heap reference still pointing at a forwarded young-from object. Its
+own contract splits the diagnosis in two: **non-zero means a heap reference
+rewrite was missed; zero with a wrong result means the stale reference lives
+outside the heap** (an unenumerated root or compiled-frame home).
 
-Not attempted here: naming the corrupted slot. The instrument that would do it
-is a watch on the JUnit object at allocation (`CRATONVM_DBG_WATCH_ALLOC_CID`),
-the same one that closed the 2026-09-06 TLAB-skip-span defect.
+It comes back **non-zero**, and it names the victims. Two reps under the
+amplifier, both failing 3/416 with the NPE:
 
-## 7. Reproducing
+```
+rep 0  forwarded_heap_refs_remaining young=4 old=0
+  MISSED-HEAP-REWRITE YOUNG TestTemplateExtensionContext@0x17590030b60
+      slot=24 -> UnmodifiableSet             old=0x175826b0e78 new=0x175900268c0
+      slot=40 -> DefaultExecutableInvoker    old=0x175826b0568 new=0x1759002 68f0
+      slot=48 -> MutableExtensionRegistry    old=0x175826af9f8 new=0x17590026838
+      slot=64 -> NamespacedHierarchicalStore old=0x175826b0ea8 new=0x17590026910
+
+rep 1  forwarded_heap_refs_remaining young=2 old=0
+  MISSED-HEAP-REWRITE YOUNG ConcurrentHashMap@0x204d5f028b8
+      slot=0 -> Object                       old=0x204e958e088 new=0x204d5ef8d68
+      slot=2 -> ConcurrentHashMap$Node       old=0x204e968ed50 new=0x204d5ef8d98
+```
+
+**So it is not a missed root.** Every referent was found, copied, and given a
+new home — the collector knew about all of them. What was not done is the
+referrer's own slot rewrite, and in each cycle **every missed slot belongs to a
+single object**. An object whose referents all moved and none of whose slots
+were updated was copied into to-space and then **never scanned**.
+
+The addresses agree: in both reps the un-scanned referrer sits at a HIGHER
+address than the new homes of the objects it points at
+(`0x…30b60` vs `0x…268c0-26910`; `0x…f028b8` vs `0x…ef8d68-ef8d98`). Cheney
+scans to-space in address order, so a referrer above the region where its
+referents were placed should have been scanned after them and rewritten. It
+reads as a scan cursor that finished before reaching the object — i.e. the
+object was copied after the scan loop believed it was done.
+
+Only one of the 22-29 moving cycles in a run reports a miss, which is why the
+symptom is 2-3 failures in 416 tests rather than a crash.
+
+**Stated as a hypothesis, not a conclusion:** the address ordering is
+consistent with a late copy that no re-scan followed, but this has not been
+confirmed by instrumenting the scan cursor itself. That is the next
+measurement, and it is a small one — record the final to-space scan cursor
+beside each `MISSED-HEAP-REWRITE` and check the referrer is above it.
+
+## 7. Why the coverage proof does not stop it
+
+`moving-jit-coverage-proven` is emitted on `has_conservative_roots` — "a JIT
+frame was live" — not on any peer proof. The peer ledger that would be a proof
+is `refresh_moving_young_coverage_for_collection`, and on this workload **it
+never accepts**: 0 `accounted=true` out of 750 decisions, minimum
+`peer_depth` 4. Two levers bracket it on one binary:
+
+| arm | failing | moving cycles |
+|---|---:|---:|
+| baseline | 1/3 | 1 |
+| `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` (force refuse) | **0/3** | 0 |
+| `CRATONVM_XT_PINNED_PEER_DEPTH=0` | 1/3 | 0 |
+| `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` (force accept) | **3/3** | **14-24** |
+
+`ASSUME=1` is a **deliberate amplifier**: it turns an intermittent 1-in-3 defect
+into a 3/3 one and is what made the verifier catch the miss. Use it to
+reproduce.
+
+Two candidate doors were tested and **refuted**, so nobody re-runs them:
+
+* **The pin credit is not it.** `pinned=0` in all 750 samples and
+  `XT_PINNED_PEER_DEPTH=0` changes nothing.
+* **`peer_depth` is not torn.** `peer_jit_depth()` reduces a striped counter
+  with `saturating_sub`, whose comment calls zero "the safe reading" — and zero
+  skips the whole ledger, so it looked like an unguarded door. Counters added
+  for this say otherwise: of the `peer_depth == 0` cycles, `global_zero=0` and
+  `torn_global_lt_local=0`, i.e. `global == local` every time — a consistent
+  reading meaning only the initiator was in compiled code.
+
+## 8. Status of the older lead
+
+The pre-root-cause suspicion was *precise-only under-coverage* -- that
+`moving-jit-coverage-proven` certifies a compiled frame whose oops live in
+scalar-replacement slots, LICM hoist slots or the blind GPR spill area, per
+`moving-young-corruption-rootcause.md`. **The verifier rules that out as the
+mechanism here**: a missed compiled-frame home would leave the heap consistent
+and show `forwarded_heap_refs_remaining young=0`, with the stale reference
+outside the heap. It reports non-zero, in the heap, in one object. The coverage
+proof is still the gate that lets the cycle run (§7) -- it is not the thing that
+loses the pointer.
+
+## 9. Reproducing
 
 ```bash
 CV=<cratonvm.exe>

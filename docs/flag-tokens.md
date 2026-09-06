@@ -592,7 +592,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-371 tokens.
+372 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -703,6 +703,7 @@ export inherited from a parent shell.
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-phi-edge-interfere` | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
 | `ir-osr-entry` | `CRATONVM_JIT_IR_OSR_ENTRY` |
@@ -970,7 +971,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-156 tokens.
+157 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1048,6 +1049,7 @@ export inherited from a parent shell.
 | `g1-verify-budget` | `CRATONVM_G1_VERIFY_BUDGET` |
 | `gpu-chunk-streams` | `CRATONVM_GPU_CHUNK_STREAMS` |
 | `gpu-chunks` | `CRATONVM_GPU_CHUNKS` |
+| `gpu-admit-model` | `CRATONVM_GPU_ADMIT_MODEL` |
 | `gpu-dispatch-streams` | `CRATONVM_GPU_DISPATCH_STREAMS` |
 | `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
 | `jit-gpu-array-barrier` | `CRATONVM_JIT_GPU_ARRAY_BARRIER` |

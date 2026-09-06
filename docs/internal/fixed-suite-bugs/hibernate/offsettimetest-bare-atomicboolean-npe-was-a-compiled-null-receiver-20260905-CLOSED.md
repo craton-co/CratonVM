@@ -103,11 +103,36 @@ binary this branch built:
 | G1 | default | **0 / 8** | 0 | 0 |
 | G1 | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` | 0 / 8 | 0 | 0 |
 
-(The G1 row does not match `587acb50e`'s own "6/6 non-clean on both
-collectors". Recorded as measured rather than reconciled: this branch's base
-`a044e1fe1` predates `ec6a2bd6d`, the G1-side twin of the guard, so the two
-arms are not the same code on that collector. It does not affect this page —
-the run being retired was Generational.)
+**CORRECTION, re-measured 2026-09-06 on dev tip `6430e495f`.** The
+reconciliation first written here — that the G1 row differed because this
+branch's base predates `ec6a2bd6d` — was WRONG. `ec6a2bd6d` adds a *reporter*
+that "reports, never repairs"; it cannot change whether a test fails. The real
+picture, 8 reps per arm on one binary:
+
+| arm | Generational | G1 |
+|---|---:|---:|
+| `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` alone | 0/8 | 0/8 |
+| `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE=1` alone | 0/8 | 0/8 |
+| **both levers together** | **3/8** | 0/8 |
+
+Two independent fixes each closed one half of the reclamation: the
+unconditional publish (`587acb50e`) and the ninth exit —
+`stw_publish_frame_traces` publishing skip spans and never retiring them
+(`24238e856`). The reclamation needs a PRODUCER of a stale span *and* a publish
+path that will not overwrite it, so either fix alone is sufficient and either
+lever alone now reads zero. That is why the single-lever arm went inert between
+2026-09-05 and 2026-09-06, and it is the honest reason the G1 row read 0/8 —
+G1 has never reproduced this on `ObjectCleanerTest`, and `24238e856`'s own
+table says the same of its probe ("G1 does not reproduce on this probe and the
+table says so rather than implying coverage it does not have").
+
+None of this weakens what the table is here to show: the reclamation mechanism
+WAS live under Generational in every binary built before 2026-09-05 20:51
+-0300, which is the class of binary that produced the page being retired. It
+does mean anyone re-running this must set **both** levers or get a vacuous
+zero; the stale single-lever recipe in
+`vm/src/runtime/interpreter/gc_and_alloc.rs` was corrected in the same commit
+as this note.
 
 The failing arm's log says exactly what the young sweep did:
 
