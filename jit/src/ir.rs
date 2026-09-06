@@ -8951,7 +8951,7 @@ mod tests {
         // `ir_emit_fp` its admission chain evaluates. With both off (the
         // builder default, and what a hand-built graph gets) they are still
         // refused HERE rather than deeper in the pipeline.
-        for tag in [b'J', b'D', b'F'] {
+        for tag in *b"JDF" {
             let code = [0x2a, 0xb4, 0x00, 0x02, 0xac, 0, 0];
             let mut builder = IrBuilder::new(1, 1);
             let mut fi = HashMap::new();
@@ -8977,7 +8977,7 @@ mod tests {
     /// lower to a raw 16-byte int-cell write with no barrier at all.
     #[test]
     fn test_ir_putfield_builds_a_ref_kinded_store_for_a_reference_field() {
-        for tag in [b'L', b'['] {
+        for tag in *b"L[" {
             // aload_0; aload_1; putfield #2; return
             let code = [0x2a, 0x2b, 0xb5, 0x00, 0x02, 0xb1, 0, 0];
             let mut builder = IrBuilder::new(2, 2);
@@ -9004,9 +9004,7 @@ mod tests {
     #[test]
     fn test_ir_getfield_and_putfield_admit_the_same_field_tags() {
         for &(long_gate, fp_gate) in &[(false, false), (true, false), (false, true), (true, true)] {
-            for tag in [
-                b'I', b'Z', b'B', b'C', b'S', b'L', b'[', b'J', b'F', b'D', b'V',
-            ] {
+            for tag in *b"IZBCSL[JFDV" {
                 // aload_0; getfield #2; return — the read side only needs to
                 // build; leaving the value on the abstract stack at the return
                 // is fine for a straight-line translation.

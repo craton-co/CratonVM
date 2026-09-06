@@ -21765,7 +21765,10 @@ pub(crate) mod tests {
             walk = walk.min(us);
 
             let t = std::time::Instant::now();
-            heap.mark_clear_all();
+            // The bulk-clear's "you must walk instead" answer is deliberately
+            // discarded: this arm is timing the CALL, and a header-arm heap
+            // that returns `false` here still took the time being measured.
+            let _ = heap.mark_clear_all();
             clear = clear.min(t.elapsed().as_micros() as f64);
         }
         println!(
