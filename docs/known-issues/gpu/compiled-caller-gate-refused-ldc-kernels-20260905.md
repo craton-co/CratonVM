@@ -69,9 +69,44 @@ was never the variable; the constant pool was.
 Pass the target class's constant pool:
 `analyze_with_pool(target_method, &target_class.constant_pool)`.
 
-Annotations are deliberately still not passed — hint-loosened kernels
-remain the documented "Known limitation" in the module docs. That one is
-a choice; the pool-free call was not.
+### The annotation half, closed the same day
+
+The first version of this fix passed the pool but **not** annotations,
+on the grounds that hint-loosened kernels were a documented, deliberate
+"Known limitation". Re-reading that limitation after measuring this one
+retired it. It said:
+
+> intentionally conservative in the direction that costs offload
+> throughput, not correctness — the worst case is a JIT-compiled caller
+> that stops offloading
+
+That worst case is the 10.8x above. The same sentence would have
+justified the constant-pool gap right until it was priced, so "costs
+throughput, not correctness" is not a reason to leave a gate asking a
+different question from the dispatcher it models.
+
+The gate now calls `analyze_with_annotations_and_pool` with the target's
+own annotations — the identical call `lookup_or_compile` makes, reusing
+its `decode_method_attrs`. It costs one attribute decode per scanned
+target, beside a full bytecode scan already being paid.
+
+The disagreement ran **both** ways, and only one of them was predictable
+from the docs. Measured on `test_classes/gpu/annotations/GateAnnotationParity.java`,
+two builds differing only by this change:
+
+| kernel | before | after |
+| --- | --- | --- |
+| `hinted` — eligible only via `ALLOW_INTRINSIC_CALLS` | no census at all: never registered, **site went dark** | `cuMemAlloc=3`, `considered=40 offloaded=40` |
+| `excluded` — `@GpuExclude` | `considered=40 offloaded=0`: hook **armed 40 times** for a method the dispatcher always refuses | no census: never registered |
+
+The second row is the one the docs did not predict. An annotation-free
+gate calls a `@GpuExclude` method `Eligible` and registers it, arming the
+offload hook for a target `lookup_or_compile` short-circuits and never
+launches — and under `CallerGateMode::Block` that would deny its caller
+compilation for an offload that cannot happen.
+
+What is still deliberately excluded: forward class references and
+`invokedynamic`-mediated calls, both still listed in the module docs.
 
 ### Found twice, independently, on the same day
 
@@ -201,23 +236,60 @@ no compiled-caller census line at all, because the site was never even
 signal: `gpu_compiled_offload_census::exit_summary` returns early when
 every counter is zero.
 
-## An unrelated flake seen while verifying this
+## An unrelated flake seen while verifying this — and what it turned out to be
 
-`residency-gc.sh` failed once on this binary ("2 CHECK(S) FAILED") and
-then passed **24 consecutive runs** — 1 in 25 overall, across three
-collectors each time. It is **not** this defect and not the gate — that
-script never exercises the compiled-caller registration path this page is
-about.
+`residency-gc.sh` failed intermittently during verification: 1 in 25
+first, then **2 in 40** on a binary that already carried both
+`input_cache` race fixes. It is not this defect and not the gate — that
+script never exercises the compiled-caller registration path.
 
-The likely explanation is that `dev` does not yet carry either fix from
-[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md)
-(branch `fix/gpu-concurrent-dispatch-race-20260905`, pushed and unmerged
-as of this writing). Both of those races live in `input_cache`, which is
-exactly what `residency-gc.sh` hammers across collections, and both
-produce intermittent wrong answers at single-digit rates. Verified by
-inspection that this tree has neither: no `drain_locked`, and `insert`
-still OR's its filter bit outside the mutex.
+**A first guess at the cause was wrong, and the refutation is one line of
+fixture.** This page originally blamed the two races in
+[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md),
+because both live in the cache `residency-gc.sh` hammers. But
+`test_classes/gpu/GpuResidencyGc.java` contains **no `Thread`,
+`Executor`, `parallel` or stream** — `main` is a sequence of direct
+calls — and GC relocation runs with the world stopped. Both races need
+two Java threads racing in the cache, so **neither can fire here**. The
+2-in-40 above, on a binary with both fixes in, says the same thing
+empirically. "Lives in the same module" is not attribution.
 
-Stated as the likely explanation rather than a finding — the failing run
-was not captured in enough detail to name which two checks failed, and a
-rate this low needs the sample sizes that page documents.
+**What it actually is.** The script routes each arm's stderr into a temp
+directory it deletes, so the failure looked like an empty arm. Captured
+directly, it is a VM panic:
+
+```
+panic: forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+  types/src/heap_types.rs:1562
+[PANIC_IN] GpuResidencyGc.main pc=127   thread="main-vm"
+```
+
+Same assert text and same file as **Cluster D** of the OPEN page
+`g1-evac-forwarding-assert-and-three-sigsegv-clusters-20260905.md`
+(recorded there at `heap_types.rs:1529`; the file has moved since that
+binary), and the same G1-only scope. One difference to keep in view: that
+page's cluster panics on an evac worker via `gc/src/evac_pool.rs`, this
+one on `main-vm`.
+
+If it is the same defect, the useful part is the reproducer: that page's
+is a 640-class Tomcat suite run on Azure, and this is a single local
+fixture — though see the rate below before treating it as convenient.
+
+**Rate, corrected.** An earlier draft of this note put it at "~4%",
+reading 3 failures in 66 `residency-gc.sh` runs as a per-run rate. That
+is the wrong denominator: each script run launches the VM about twelve
+times (three collectors x four arms), so the observed events are roughly
+3 in 800 launches — order **0.4% per launch**, ten times rarer than
+stated.
+
+**Not established: whether `--gpu` is required.** An alternating A/B of
+150 launches per arm returned **0/150 on both**. That is not evidence of
+independence — at 0.4% it expects about one event per arm, so it cannot
+tell 0 from 1. It does refute the inflated 4% figure, which would have
+made 0/300 essentially impossible.
+
+Reproducing this wants either a few thousand launches per arm or an
+amplifier. Worth noting the events clustered: three fell within one
+stretch of loaded-host activity and none in 300 launches afterwards, so
+whatever forces it may be load- or timing-dependent rather than uniformly
+random, and a quiet-host zero should not be read as a fix.

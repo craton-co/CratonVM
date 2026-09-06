@@ -114,18 +114,26 @@
 //!   on every class load, or re-running this gate at every promotion
 //!   attempt rather than caching permanently; both are out of scope for
 //!   the conservative first fix.
-//! - **Hint-loosened kernels.** [`compute`] calls
-//!   [`jit_cuda::analyzer::analyze`] (the strict, annotation-free
-//!   verdict — `MethodAnnotations::default()`), matching the task's
-//!   guidance that a plain `Eligible` verdict is sufficient for this
-//!   gate. A kernel that is only eligible because of a
-//!   `@GpuKernel`/`AdmissionHint` annotation (see
-//!   `jit_cuda::analyzer::analyze_with_annotations`) is invisible to
-//!   this scan and will not block its caller's JIT admission. This is
-//!   intentionally conservative in the direction that costs offload
+//! - ~~**Hint-loosened kernels.**~~ **Closed 2026-09-05.** [`compute`]
+//!   now calls [`jit_cuda::analyzer::analyze_with_annotations_and_pool`]
+//!   with the target's own annotations and constant pool — the same call
+//!   the dispatcher makes, which is the only way the two can agree.
+//!
+//!   This bullet used to say the annotation-free verdict was
+//!   "intentionally conservative in the direction that costs offload
 //!   throughput, not correctness — the worst case is a JIT-compiled
-//!   caller that stops offloading, exactly the pre-existing bug this
-//!   module fixes for the common (unannotated) case.
+//!   caller that stops offloading". That worst case was then measured at
+//!   **10.8x** on the constant-pool half of the same disagreement (see
+//!   `docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md`),
+//!   which is what retired the argument: "costs throughput, not
+//!   correctness" is not a reason to keep a gate asking a different
+//!   question from the dispatcher it models.
+//!
+//!   It also ran the other way. A `@GpuExclude` target could be judged
+//!   `Eligible` here and REGISTERED with the offload hook, arming it for
+//!   a method `lookup_or_compile` short-circuits and never launches —
+//!   and under [`CallerGateMode::Block`] denying its caller compilation
+//!   for an offload that could not happen.
 //! - **`invokedynamic`-mediated calls** (method references, lambdas)
 //!   are not scanned — only literal `invokestatic` bytecodes. A caller
 //!   that reaches an eligible kernel through a `MethodHandle` is not
@@ -239,7 +247,8 @@ pub fn caller_blocks_jit_by_name(
 /// The actual analysis behind [`caller_blocks_jit`]'s cache miss path.
 /// See the module docs' "Known limitations" section for what this
 /// deliberately does not handle (forward class references,
-/// annotation-loosened kernels, `invokedynamic`-mediated calls).
+/// `invokedynamic`-mediated calls). Annotation-loosened kernels were on
+/// that list until 2026-09-05 and are now handled.
 fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
     // Mirrors the exact "no device -> Skip" short-circuit
     // `OffloadCache::lookup_or_compile` uses, via the same public
@@ -385,8 +394,40 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         // than merely blocking: a target the gate cannot see is one the
         // compiler binds directly, and the hook is then lost for the life
         // of the process.
-        let sig = match jit_cuda::analyzer::analyze_with_pool(
+        // ANNOTATIONS TOO, for the same reason as the pool: the
+        // dispatcher reads them (`read_method_annotations`, then
+        // `analyze_with_annotations_and_pool`), so a gate that does not
+        // is asking a different question and will disagree.
+        //
+        // AUDIT 2026-09-05, second half. The module docs used to list
+        // "hint-loosened kernels" as a deliberate limitation, argued as
+        // "conservative in the direction that costs offload throughput,
+        // not correctness -- the worst case is a JIT-compiled caller
+        // that stops offloading". That worst case is exactly the defect
+        // the pool half of this call had just been measured at 10.8x, so
+        // the argument does not survive its own example.
+        //
+        // The disagreement ran BOTH ways:
+        //   - a kernel eligible only via `@GpuKernel`/`AdmissionHint`
+        //     was invisible here, so it was never registered and its
+        //     compiled call sites bound directly and went dark;
+        //   - a `@GpuExclude` method could be judged Eligible here and
+        //     REGISTERED, arming the offload hook for a target the
+        //     dispatcher short-circuits and will never launch (and,
+        //     under `CallerGateMode::Block`, denying its caller
+        //     compilation for an offload that cannot happen).
+        //
+        // Decoding costs one attribute pass per scanned target, next to
+        // a full bytecode scan that was already being paid.
+        let target_attrs = crate::runtime::offload::decode_method_attrs(
+            &target_method.attributes,
+            &target_class.constant_pool,
+        );
+        let target_annotations =
+            jit_cuda::annotations::read_method_annotations(&target_attrs, &target_class.constant_pool);
+        let sig = match jit_cuda::analyzer::analyze_with_annotations_and_pool(
             target_method,
+            &target_annotations,
             &target_class.constant_pool,
         ) {
             jit_cuda::OffloadVerdict::Eligible(sig) => sig,

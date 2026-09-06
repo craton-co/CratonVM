@@ -3754,16 +3754,16 @@ pub fn execute(
                                 let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
                                     // Taken BEFORE the construction below, which is
                                     // what re-captures the (now compiled-frame-free)
-                                    // stack. See `attach_snapshotted_npe_frames`.
+                                    // stack. See `attach_snapshotted_trap_frames`.
                                     let snapshot =
-                                        crate::jit::helpers::take_jit_pending_npe_compiled_frames();
+                                        crate::jit::helpers::take_jit_pending_trap_frames();
                                     match crate::runtime::exceptions::throw_runtime_error(
                                         shared,
                                         thread,
                                         RuntimeError::NullPointerException { message: None },
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
-                                            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                                            crate::runtime::exceptions::attach_snapshotted_trap_frames(
                                                 shared, &thread.frames, exc, snapshot,
                                             );
                                             jit_early_exception = Some(exc);
@@ -3816,6 +3816,22 @@ pub fn execute(
                                 // executes side effects preceding the trap).
                                 let arith_routed =
                                     if crate::jit::helpers::take_jit_pending_arithmetic() {
+                                        // Taken BEFORE the construction below, for the
+                                        // same reason as the NPE arm above and with the
+                                        // same consequence when it is not: the
+                                        // zero-divisor stub ran the epilogue, so
+                                        // `fillInStackTrace` walks a stack the compiled
+                                        // frames have already left and the throwable
+                                        // keeps an EMPTY trace.
+                                        //
+                                        // This is the sixth and last door that
+                                        // constructs one of these. Five were found by
+                                        // reading; this one was found by labelling all
+                                        // five, watching the flake reproduce with no
+                                        // label printed, and grepping for the drain
+                                        // again.
+                                        let snapshot =
+                                            crate::jit::helpers::take_jit_pending_trap_frames();
                                         match crate::runtime::exceptions::throw_runtime_error(
                                             shared,
                                             thread,
@@ -3824,6 +3840,9 @@ pub fn execute(
                                             },
                                         ) {
                                             MethodCallFailed::ExceptionThrown(exc) => {
+                                                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                                                    shared, &thread.frames, exc, snapshot,
+                                                );
                                                 jit_early_exception = Some(exc);
                                                 true
                                             }
@@ -9089,6 +9108,7 @@ mod invoke_fast;
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod invoke_phases;
+pub mod field_phases;
 pub mod site_cache;
 pub use site_cache::{
     CastSiteCache, ClassSiteCache, FastFieldSite, FastFieldSiteCache, FieldSiteCache,

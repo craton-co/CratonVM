@@ -80,7 +80,7 @@ use jit_cuda::{analyzer, OffloadVerdict, ParamKind};
 /// consumes eagerly-decoded `&[Attribute]`. Decode each lazy attribute
 /// (cloning so the shared `&method` borrow stays immutable) and drop
 /// any that fail to decode — annotation reading is best-effort.
-fn decode_method_attrs(
+pub(crate) fn decode_method_attrs(
     attrs: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &ConstantPool,
 ) -> Vec<cratonvm_reader::attribute::Attribute> {

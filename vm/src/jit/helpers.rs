@@ -625,7 +625,7 @@ thread_local! {
             arithmetic: Cell::new(false),
             npe: Cell::new(false),
             npe_action: Cell::new(0),
-            npe_compiled_frames: std::cell::RefCell::new(None),
+            trap_frames: std::cell::RefCell::new(None),
             deopt: Cell::new(false),
         }
     };
@@ -1099,7 +1099,8 @@ struct JitSignals {
     /// `RefCell` rather than `Cell` because the payload is not `Copy`; it is
     /// only ever borrowed for the length of a `take`/`replace`, never across a
     /// call, so it cannot be re-entered.
-    npe_compiled_frames: std::cell::RefCell<Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>>,
+    trap_frames:
+        std::cell::RefCell<Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>>,
     deopt: Cell<bool>,
 }
 
@@ -1117,10 +1118,10 @@ pub(crate) struct DrainedJitSignals {
     pub arithmetic: bool,
     pub npe: bool,
     /// The compiled frames that were live when the helper signalled `npe`.
-    /// See `JitSignals::npe_compiled_frames`; drained here so that no path
+    /// See `JitSignals::trap_frames`; drained here so that no path
     /// can construct the NPE without also being handed the frames it is
     /// about to lose.
-    pub npe_compiled_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+    pub trap_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
     /// Drained alongside `npe` for hygiene (a stale action code must not
     /// outlive its NPE). Read by the two restash paths, which put it back with
     /// the flag and the frame snapshot — see [`restash_jit_pending_npe`].
@@ -1148,7 +1149,7 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
         npe: s.npe.take(),
-        npe_compiled_frames: s.npe_compiled_frames.borrow_mut().take(),
+        trap_frames: s.trap_frames.borrow_mut().take(),
         npe_action: s.npe_action.take(),
         deopt: s.deopt.take(),
     })
@@ -1158,7 +1159,7 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
 /// an implicit NPE. Default ON; `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT=1` restores
 /// the historical (frame-losing) trace, so the difference is an A/B inside one
 /// binary rather than a comparison across two builds.
-fn npe_frame_snapshot_enabled() -> bool {
+fn trap_frame_snapshot_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT").is_none()
@@ -1172,8 +1173,8 @@ fn npe_frame_snapshot_enabled() -> bool {
 /// interpreter still on the stack. Cheap by construction: this records the
 /// same small structs the GC root walk already builds, and does no class-store
 /// lookup, no string formatting and takes no lock.
-fn snapshot_npe_compiled_frames(trap_key: u32) {
-    if !npe_frame_snapshot_enabled() {
+fn snapshot_trap_frames(trap_key: u32) {
+    if !trap_frame_snapshot_enabled() {
         return;
     }
     let mut frames = crate::jit::conservative_roots::active_compiled_frames();
@@ -1183,7 +1184,7 @@ fn snapshot_npe_compiled_frames(trap_key: u32) {
     // the frames exist at once.
     crate::jit::conservative_roots::apply_npe_trap_site(&mut frames, trap_key);
     JIT_SIGNALS.with(|s| {
-        *s.npe_compiled_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
+        *s.trap_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
     });
 }
 
@@ -1192,9 +1193,9 @@ fn snapshot_npe_compiled_frames(trap_key: u32) {
 /// The drain calls this beside [`take_jit_pending_npe`]. Always a `take`: a
 /// snapshot that outlived its NPE would be attached to an unrelated throwable,
 /// and a trace that is confidently wrong is worse than one that is short.
-pub fn take_jit_pending_npe_compiled_frames(
+pub fn take_jit_pending_trap_frames(
 ) -> Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>> {
-    JIT_SIGNALS.with(|s| s.npe_compiled_frames.borrow_mut().take())
+    JIT_SIGNALS.with(|s| s.trap_frames.borrow_mut().take())
 }
 
 /// Store a pending Java exception from JIT dispatch. Called when
@@ -1274,7 +1275,7 @@ pub(crate) fn stash_jit_pending_npe() {
 ///
 /// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
 /// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
-/// take leaves `npe_compiled_frames` untouched, so the snapshot from the trap
+/// take leaves `trap_frames` untouched, so the snapshot from the trap
 /// is still there and is still the right one; taking another would overwrite it
 /// with a stack the raising frame has already left.
 pub(crate) fn set_jit_pending_npe_flag_only() {
@@ -1298,7 +1299,32 @@ pub(crate) fn restash_jit_pending_npe(
     JIT_SIGNALS.with(|s| {
         s.npe.set(true);
         s.npe_action.set(action);
-        *s.npe_compiled_frames.borrow_mut() = frames;
+        *s.trap_frames.borrow_mut() = frames;
+    });
+}
+
+/// Put back a div-by-zero that [`take_all_jit_signals`] drained WHOLE — flag
+/// AND compiled-frame snapshot — exactly as it was found.
+///
+/// The sibling of [`restash_jit_pending_npe`], and it did not exist until
+/// 2026-09-05: both whole-drain restores called the bare
+/// [`stash_jit_pending_arithmetic`], which puts the flag back and lets
+/// `DrainedJitSignals` drop the snapshot on the floor. The next door then
+/// constructed the `ArithmeticException` with nothing to attach, and the
+/// throwable kept the empty trace `fillInStackTrace` had just built — the
+/// exact defect `restash_jit_pending_npe`'s own doc describes for its half,
+/// one signal kind over.
+///
+/// Do NOT re-sample here. `active_compiled_frames()` at a restore point
+/// describes a shallower stack than the trap did, which is the mistake
+/// [`restash_implicit_signal`]'s NPE arm is written to avoid; the frames belong
+/// to the trap, not to the drain that happened to pass them through.
+pub(crate) fn restash_jit_pending_arithmetic(
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.arithmetic.set(true);
+        *s.trap_frames.borrow_mut() = frames;
     });
 }
 
@@ -1353,7 +1379,7 @@ fn drain_superseded_implicit_signals() {
         // The snapshot was taken for a raise that will never happen; a later
         // drain would attach frames the raising code has long since left.
         let _ = take_jit_pending_npe_action();
-        let _ = take_jit_pending_npe_compiled_frames();
+        let _ = take_jit_pending_trap_frames();
     }
     let _ = take_jit_pending_aioobe();
     let _ = take_jit_pending_arithmetic();
@@ -1440,7 +1466,7 @@ fn set_jit_pending_npe() {
         s.npe.set(true);
         s.npe_action.set(0);
     });
-    snapshot_npe_compiled_frames(0);
+    snapshot_trap_frames(0);
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -1465,7 +1491,7 @@ fn set_jit_pending_npe_action_at(code: u8, trap_key: u32) {
         s.npe.set(true);
         s.npe_action.set(code);
     });
-    snapshot_npe_compiled_frames(trap_key);
+    snapshot_trap_frames(trap_key);
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
@@ -3209,7 +3235,7 @@ fn materialize_implicit_signal(
     vm: &SharedVm,
     thread: &mut JvmThread,
     signal: ImplicitSignal,
-    npe_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+    trap_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
@@ -3237,21 +3263,37 @@ fn materialize_implicit_signal(
             // snapshot exists to close. Attaching it in the constructor arm
             // rather than at each door is what stops a fourth door from
             // silently reopening it.
-            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+            crate::runtime::exceptions::attach_snapshotted_trap_frames(
                 vm,
                 &thread.frames,
                 exc,
-                npe_frames,
+                trap_frames,
             );
             Some(exc)
         }
-        ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
-            vm,
-            thread,
-            "java/lang/ArithmeticException",
-            Some("/ by zero"),
-        )
-        .ok(),
+        ImplicitSignal::Arithmetic => {
+            let exc = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/ArithmeticException",
+                Some("/ by zero"),
+            )
+            .ok()?;
+            // The NPE arm above has carried this since the compiled-frame
+            // snapshot landed; this arm had the identical defect and no test
+            // that could see it. `pgo02_guarded_virtual_inline`'s stack-trace
+            // check could, and did — as a ~20% flake, because whether a given
+            // `callDivider` call ENTERS the artifact is timing-dependent, so
+            // the same run alternated between a 2-frame interpreted trace and
+            // an empty compiled one.
+            crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                vm,
+                &thread.frames,
+                exc,
+                trap_frames,
+            );
+            Some(exc)
+        }
         ImplicitSignal::None => None,
     }
 }
@@ -3702,12 +3744,22 @@ unsafe fn route_implicit_exc_through_callee(
         // This door drained the FLAG only (`take_jit_pending_npe`), so the
         // snapshot is still in the signal record; take it here so it is
         // consumed by exactly the throwable it belongs to.
-        let npe_frames = if implicit == ImplicitSignal::Npe {
-            take_jit_pending_npe_compiled_frames()
+        //
+        // Taken for `Arithmetic` as well as `Npe` since 2026-09-05: those are
+        // the two signals whose setters record a snapshot, and gating the take
+        // on `Npe` alone left the arithmetic snapshot in the cell — where the
+        // next take, belonging to a different throwable, would have found it.
+        // So this was never only a missing feature; it was also a stale-frames
+        // hazard, and the drain contract in
+        // `take_jit_pending_trap_frames` says why that is the worse
+        // half ("a trace that is confidently wrong is worse than one that is
+        // short").
+        let trap_frames = if matches!(implicit, ImplicitSignal::Npe | ImplicitSignal::Arithmetic) {
+            take_jit_pending_trap_frames()
         } else {
             None
         };
-        let exc = materialize_implicit_signal(vm, thread, implicit, npe_frames);
+        let exc = materialize_implicit_signal(vm, thread, implicit, trap_frames);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3982,7 +4034,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
-                signals.npe_compiled_frames.take(),
+                signals.trap_frames.take(),
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -4014,10 +4066,14 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
         // letting the setter take a fresh one here: `take_all_jit_signals`
         // moved it out, and a second `active_compiled_frames()` at this point
         // describes a shallower stack than the trap did.
-        restash_jit_pending_npe(signals.npe_action, signals.npe_compiled_frames.take());
+        restash_jit_pending_npe(signals.npe_action, signals.trap_frames.take());
     }
     if signals.arithmetic {
-        stash_jit_pending_arithmetic();
+        // Same rule, same reason, and it was missing here: a div-by-zero that
+        // takes a round trip through a door which declines to service it must
+        // come back with its frames, or the caller-side drain builds the
+        // throwable from a bare flag and the trace is empty.
+        restash_jit_pending_arithmetic(signals.trap_frames.take());
     }
     if signals.deopt {
         set_jit_deopt_pending();
@@ -11426,6 +11482,20 @@ pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     JIT_SIGNALS.with(|s| s.arithmetic.set(true));
+    // Same reason as the NPE setters, and it was missing here: the
+    // `ArithmeticException` is not constructed at the trap. The stub flags the
+    // signal, returns the deopt sentinel and runs the method EPILOGUE, so the
+    // `fillInStackTrace` that eventually runs walks a stack the compiled frames
+    // have already left — an empty trace for a throwable that came from four
+    // frames of compiled code. This is the only moment both the signal and the
+    // frames exist, so it is the only place the snapshot can be taken.
+    //
+    // `0` for the trap key: the NPE path carries a per-site id because an
+    // inline null check publishes no safepoint, but a div-by-zero guard is
+    // reached from `idiv`/`irem`/`ldiv`/`lrem`, whose bci the frame walk
+    // already has. Passing a site id it does not have would be worse than
+    // passing none.
+    snapshot_trap_frames(0);
     set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw ArithmeticException
 }
@@ -20202,7 +20272,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// unqualified. Claiming after the attempt instead would trade it for
 /// re-asking (a lock and a layout lookup) on every dispatch a refused site ever
 /// serves, which is the shape of the 202 000 re-installs
-/// `LambdaJitSite::adapter_installed` exists to prevent.
+/// `LambdaJitSite::adapter_slots` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
@@ -20243,7 +20313,7 @@ unsafe fn install_lambda_inline_cache(
         }
         crate::runtime::interpreter::const_probe_note_opaque();
     }
-    if !site.claim_adapter_install() {
+    if !site.claim_adapter_install(mic_ptr, pic_ptr) {
         return;
     }
     // `total_args` is captures plus SAM arguments; the emitter wants them apart,
@@ -20284,9 +20354,16 @@ unsafe fn install_lambda_inline_cache(
     if installed {
         crate::runtime::interpreter::lambda_site_bump_adapter(site.num_captures());
         if mic_prof::enabled() {
+            // The call counts AT THE MOMENT OF INSTALL. `site_adapters`
+            // alone cannot tell "installed early and served" from
+            // "installed after the workload was over", which is exactly
+            // what an intermittent `site_direct` failure asks.
+            let (fast_returns, site_direct, _) =
+                crate::runtime::interpreter::lambda_jit_engagement();
             eprintln!(
                 "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
-                 captures={} sam_args={sam_args} entry={entry:#x} impl={}",
+                 captures={} sam_args={sam_args} entry={entry:#x} impl={} \
+                 at site_direct={site_direct} fast_returns={fast_returns}",
                 site.num_captures(),
                 class_name,
             );
@@ -20572,10 +20649,19 @@ fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
         // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
         // frames belong to the trap, not to this drain, so put back the ones
         // that were taken instead of sampling a fresh (shallower) stack.
-        restash_jit_pending_npe(sig.npe_action, sig.npe_compiled_frames);
-    }
-    if sig.arithmetic {
-        stash_jit_pending_arithmetic();
+        restash_jit_pending_npe(sig.npe_action, sig.trap_frames);
+        // `DrainedJitSignals` owns ONE `trap_frames` and the arm
+        // above has just consumed it, so a co-pending div-by-zero gets its
+        // flag back and no frames. That is the same answer as before this
+        // change and the right one: frames restored under the wrong flag are a
+        // confidently wrong trace, which the drain contract calls worse than a
+        // short one.
+        if sig.arithmetic {
+            stash_jit_pending_arithmetic();
+        }
+    } else if sig.arithmetic {
+        // The same restore for the other signal that carries a snapshot.
+        restash_jit_pending_arithmetic(sig.trap_frames);
     }
     if sig.deopt {
         set_jit_deopt_pending();
