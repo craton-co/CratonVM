@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN. Reproducible on dev `785e777cb`, named by a one-flag probe in one run. |
+| **Status** | OPEN. Reproducible on dev `785e777cb`, named by a one-flag probe, 4 reclaim lines in each of two instrumented runs. |
 | **Scope** | `--XX:UseGc Generational` with the JIT on. HotSpot, CratonVM ZGC (the shipped default) and Generational `--nojit` all pass the same test at the same host load. |
 | **Reproducer** | one test METHOD, 1-10 minutes |
 | **Probe** | `CRATONVM_DBG_SWEEP_ZERO=1` names the victim by class and sweep cycle |
@@ -90,18 +90,23 @@ failure, which is the point of filing it separately.
 `scan_active_jit_frames`'s residue filter decides whether to conservatively MARK
 the band above the JIT entry chain. Standing it down makes the site mark more:
 
-| arm | reclaimed-live lines | test |
-|---|---|---|
-| Generational, default | 4 | FAIL |
-| Generational `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1` | **0** | FAIL |
+| arm | reclaimed-live lines | test | wall |
+|---|---|---|---|
+| Generational, default | 4, 4 | FAIL, FAIL | 194 s, 900 s (cap) |
+| `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1` | **0, 0** | FAIL, FAIL | 146 s, 140 s |
+| `CRATONVM_JIT_NO_RETPC_VALIDATE=1` | 6 | FAIL | 715 s |
 
-So that screen is *a* producer of the reclaim — turning it off removes the
-reclaim entirely — but it is not sufficient for the test, which still fails with
-zero reclaims. Either there is a second cause, or the reclaim is stochastic
-enough that one run proves nothing. That is the next measurement: more reps of
-the accept-residue arm, and a per-victim provenance for the missed root (which
-band, which frame, whether the holder was a JIT register or a native local).
+Both reps agree: standing that screen down takes the reclaim from 4 to 0, and
+leaves it there. So it IS the producer of the premature reclaim — and the
+reclaim is NOT sufficient for the test failure, which happens anyway with zero
+reclaims. The other screen on the same site, return-PC validation, is not
+implicated (it marks LESS, and the reclaim count goes up).
 
-Not attempted here: `CRATONVM_JIT_NO_RETPC_VALIDATE=1` beyond one run, and a
-`CRATONVM_DBG_A5_FALLBACK=1` correlation between the residue hits the filter
-suppresses and the addresses the sweep later zeroes.
+Two things follow. The reclaim is real and worth fixing on its own; and there is
+a second cause of the test failure that none of these arms has touched.
+
+Not attempted here: a per-victim provenance for the missed root (which band,
+which frame, whether the holder was a JIT register or a native local), and a
+`CRATONVM_DBG_A5_FALLBACK=1` correlation between the residue hits the screen
+suppresses and the addresses the sweep later zeroes — the two should name the
+same band if the screen really is the whole producer.
