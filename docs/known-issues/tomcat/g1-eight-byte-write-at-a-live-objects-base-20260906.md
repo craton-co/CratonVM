@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | **OPEN.** The producer is not identified, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
-| **Scope** | G1 only. Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
+| **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
 | **Left behind by** | `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens` (2026-09-05), whose own "What is NOT closed" section names this class. |
 
 ## The faces are one defect
@@ -444,25 +444,72 @@ the top of this page rests on.
 
 ## The next step
 
-**Find the eight-byte write.** Everything above narrows it to: parallel-evacuator
-code, during a pause, at the base of an object already copied into to-space.
+Everything this section used to say has been measured and closed. Kept as a
+list of what NOT to re-run:
 
-**Start inside `SharedEvac`** — the kill switch above says the writer is there.
-The candidates worth instrumenting, in order:
+* ~~"Start inside `SharedEvac`"~~ -- the copy watch clears it on both
+  workloads, 0 rewritten of ~374k/401k (Tomcat) and ~700k (H2) copies at three
+  checkpoints. See the CORRECTION section.
+* ~~`write_flat_object_reference(.., compact = true)`~~ and ~~the array arm's
+  `ptr::write`~~ -- these are in the WALKS, and the walks are readers: screening
+  two of them moves the reports to the other four at an unchanged rate (47 vs
+  48, screens engaging). See the READERS section.
+* ~~a to-space write-watch~~ -- built (`CopyWatch`), run, reported above.
+* ~~the OOM~~ -- closed separately: the parallel evacuator took a whole fresh
+  Old region per worker per pause, so Old grew by the worker count whatever was
+  promoted.
 
-1. `write_flat_object_reference(.., compact = true)` — the only eight-byte
-   reference write in the walk, now bounded by the layout but not by the
-   holder's ALLOCATED extent (a layout resolved for the wrong
-   `(class_id, field_count)` is still free to land anywhere inside its own
-   declared body);
-2. the array arm's `std::ptr::write(slot_ptr as *mut u64, …)` — also eight
-   bytes, and bounded only by the REGION, so an array whose `array_length` or
-   `element_type` is wrong stamps pointers across its neighbours without ever
-   leaving the region;
-3. a to-space write-watch: record `(addr, class_id, num_slots)` for every fresh
-   copy in a small ring, and on the first corrupt holder report whether it was
-   sound when copied. That converts "the corruption happens inside a pause"
-   from an inference into a timestamp.
+### the question that now comes FIRST
+
+**Are the corrupt-cell reports evidence of corruption at all?**
+
+This page has treated every report as a corrupted object. One sample says that
+needs proving, not assuming:
+
+    0xb0530  prev header (cid=689, slots=3, compact, size=0x28)
+    0xb0548  0x00000e800111e5c8   hi=0xe80   <- inside prev's BODY
+    0xb0558  0x00000e8001121d48   hi=0xe80   <- the "holder"'s first word
+    0xb0568  0x00000003000002b1   cid=689 slots=3   <- a NORMAL header
+
+Two 16-byte pairs of the same shape 16 bytes apart, one of them inside a sound
+object's body, both first words sharing the high dword `0xe80` -- which is 3712,
+the very `num_slots` the "holder" reports -- and an ordinary header 16 bytes
+later. That is what Java DATA looks like to a walk that has already lost the
+object boundaries, and `locate_in_object_grid`'s own doc says its verdict cannot
+tell the two apart: it strides each object by the size THAT OBJECT'S header
+declares, so `grid=OBJECT-START` reports where the walk ARRIVED. One wrong size
+upstream misparses every boundary after it and still lands on an "object start"
+each time. The doc even names the shape it has seen -- `class_id=0x65676170`,
+the ASCII bytes `page`, from an H2 MVStore chunk header.
+
+`grid_closes_on_cursor` (added 2026-09-06) settles it per report: it walks the
+region independently and says whether the walk lands EXACTLY on the cursor
+having stepped only whole objects.
+
+* **closes** -- the sizes it strode were consistent, the boundaries are the
+  allocator's, and the holder really is a corrupted object. The producer hunt
+  continues, upstream of every walk.
+* **does not close** -- the grid desynced before reaching the address, the
+  "header" is a neighbour's data, and that report is an artefact. If this is
+  where the population lands, the defect to find is whatever desynced the walk,
+  and much of the evidence on this page needs re-reading rather than extending.
+
+Run it before adding anything further to this page. A verdict quoted without it
+cannot be believed, including the ones already quoted above.
+
+### if the grid DOES close
+
+Then the remaining unmeasured window is the one nothing here has instrumented:
+the object between its allocation and the pause that first walks it. The copy
+path is cleared, the walks are cleared, and the header is stable from walk time
+to end of pause (measured: the walk-time pairing and the drain-time word at the
+holder are bit-identical). What is left is a write that happens while the
+mutator runs, to an object no pause has copied -- which `CopyWatch` cannot see,
+because it only records copies.
+
+`copied_this_pause=` on each corrupt-holder report is the split: YES sends the
+search to the from-space source, `no` says nothing copied that object and the
+evacuator is not involved at all.
 
 ## Reproduction
 
