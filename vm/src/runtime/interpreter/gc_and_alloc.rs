@@ -804,11 +804,28 @@ pub(super) fn stw_take_over_and_wait(
     // collection is the repair that keeps BUG-03's protection for a genuinely
     // un-retired tail.
     // `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` restores the pre-fix guard
-    // for a one-binary A/B. With it set, `io.netty.util.internal
-    // .ObjectCleanerTest` returns to 6/8 non-clean under Generational and 8/8
-    // under G1, and the `cratonvm::gc::guard` "a ROOT points into a published
-    // TLAB skip span" error fires -- which is also what proves that guard is
-    // not vacuous.
+    // for a one-binary A/B.
+    //
+    // **This lever ALONE no longer reproduces anything, and has not since
+    // `24238e856`.** Re-measured 2026-09-06 on `ObjectCleanerTest`, 8 reps per
+    // arm, one binary:
+    //
+    //   lever alone                      gen 0/8   g1 0/8   guard_fired 0/8
+    //   CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE=1 alone
+    //                                    gen 0/8   g1 0/8
+    //   BOTH levers together             gen 3/8   g1 0/8
+    //
+    // The reclamation needs a PRODUCER of a stale span and a publish path that
+    // will not overwrite it, and the two fixes each closed one half: the
+    // unconditional publish here, and the ninth exit (`stw_publish_frame_traces`
+    // never retiring what it published) in `24238e856`. Either fix alone is
+    // sufficient, so either lever alone reads zero. Set BOTH to exercise this
+    // code, or the arm is vacuous and the guard will look dead when it is not.
+    //
+    // The earlier text here promised "6/8 non-clean under Generational and 8/8
+    // under G1" for the lever on its own. That was true when written and is
+    // not true now; the G1 half was never reproduced on this probe by anyone
+    // (see `24238e856`'s own table, which says so about its probe too).
     if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH").is_some()
     {
         if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {

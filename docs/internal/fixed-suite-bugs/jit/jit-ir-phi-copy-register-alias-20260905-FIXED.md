@@ -157,7 +157,45 @@ that in the allocator is the root fix and would make the screen above
 unnecessary; it also lengthens every phi's live range at every incoming edge,
 which changes pressure and allocation across the whole tier. That is a
 measurement project, not a correctness fix, and it is not what a wrong-answer
-bug should wait for. Left for whoever wants the instruction back.
+bug should wait for.
+
+**DONE 2026-09-06, opt-in: `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=1`.** The loop
+in `build_live_model` that attributes a phi's k-th value input to the k-th
+predecessor's outgoing-edge position already extends the SOURCE's interval to
+that position; it never extended the PHI's. One `lo[phi] = lo[phi].min(at)`
+there is the whole change. Only `lo` moves, deliberately: the phi is not USED
+at that position, so pushing a use would distort the spill heuristics, and
+setting `phi_out_bits` would make the phi live-OUT of a block that does not
+define it, which the backward dataflow would then propagate live-IN through
+every predecessor -- turning a one-position extension into a whole-CFG one.
+
+Engagement is the point and it is measured, one binary, the fixture above:
+
+| counter | interfere off | interfere on |
+|---|---:|---:|
+| `phi_copy_publish_deferred` | **3** | **0** |
+| `peak_live` | 152 | 151 |
+| `spilled` | 43 | 45 |
+| `splits` | 34 | 37 |
+| `scan_reloads` | 8 | 11 |
+| compile refusals / bailouts | 0 | 0 |
+| probe verdict | OK | OK |
+
+`publish_deferred` going 3 -> 0 is the proof that the allocator now declines to
+mint the aliasing at all, rather than the emitter cleaning it up afterwards --
+which is exactly what "fixing it at the source" has to mean. regression-suite
+is 91/91 in BOTH arms.
+
+**Left OFF by default on purpose.** Those are the numbers from one small probe
+on a host at load 20-30, and a pressure change cannot be priced that way: +2
+spills and +3 reloads here says nothing about a real workload, and
+`reg_publishes` dropping 19 -> 14 says some phis lost their register entirely.
+Before defaulting it on, price it on something with real register pressure
+(`CoverageBench`, the H2 corpus, netty) and look at `spilled`/`scan_reloads`
+there. Until then the two downstream guards are what carry correctness, and
+this flag is the way to check they are still needed: if `publish_deferred`
+reads 0 with the flag OFF on some workload, that workload never had the
+aliasing to begin with.
 
 The cost is one word load per deferred phi per edge, on edges that alias;
 `phi_copy_publish_deferred` (printed by `CRATONVM_DBG_IR_LINEAR_SCAN`) counts
