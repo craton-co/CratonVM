@@ -120,19 +120,25 @@ Azure host 2. Suite runner: `apps/spring-boot-suite-runner`.
 The HotSpot arm is the cross-check the original page listed as missing: both
 pass on the reference VM, so both rows were genuine CratonVM defects.
 
-## What did NOT retire with this page
+## The row that did not retire with this page — and then did (2026-09-06)
 
 With the two fixes above in place, the ORIGINAL 2026-09-04 symptom of row 2 —
-`"this.resources" is null` out of `NestedUrlConnection.connect` — comes back
-about **1 run in 40 with the JIT on, and only when the host is under load**.
-It is a live, unfixed defect and it has its own page:
-`nestedurlconnection-mock-self-call-intermittent-npe-20260906`, with the
-rate, the load-matched concurrent arms, the five things ruled out, and the
-`SelfCallInfo`-grant-leak hypothesis this VM already has a precedent for.
+`"this.resources" is null` out of `NestedUrlConnection.connect` — came back at
+about 1 run in 40 with the JIT on, under load. It was split out rather than
+held here, because rows 1 and 2 were never one defect.
 
-Recording it separately rather than holding this page open is deliberate: rows
-1 and 2 were never one defect, and row 2's remaining ~2.4% is a different
-question again from the 100% blocker that was sitting on top of it.
+It is now fixed too, and it was a THIRD unrelated defect: a moving collector
+relocated the `Class[]` that `Instrumentation.retransformClasses` was walking,
+the unpinned array read a zero word out of the vacated address, and the rest of
+Mockito's superclass chain was silently never instrumented — so the FIRST call
+on the mock ran the real body. See the retired
+`retransform-class-array-relocated-mid-loop-half-woven-hierarchy-FIXED-20260906`
+write-up, which also corrects this page's reading of the stack: the throwing
+line is the STUBBING call, not the assertion, so it was never a self-call
+problem at all.
+
+Three rows, three unrelated root causes, in one pair of test classes. The
+grouping this page inherited was wrong in every direction it could be.
 
 ## Repro (for a future regression of what IS fixed here)
 
