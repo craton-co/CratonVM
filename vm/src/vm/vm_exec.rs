@@ -5944,6 +5944,43 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             thread: &mut thread,
         }
         .deposit_root_snapshot();
+        // STW-YIELD-ARRIVE (2026-09-05, `vthread-probe-intermittent-hang`).
+        //
+        // The deposit above raised `in_blocked_region`, which excludes this
+        // continuation from every pause requested from now on. It does NOT
+        // retract it from a pause whose census already ran: that census saw the
+        // flag DOWN, counted this `tid` in `expected`, and is waiting for it to
+        // arrive. Once `suspend_runtime` returns, the carrier goes back to
+        // `ForkJoinScheduler::wait_for_task_until` and nothing on this OS thread
+        // will ever arrive for `tid` again -- `arrived` cannot reach `expected`,
+        // the initiator's `wait_for_all` blocks forever, and the whole VM
+        // freezes with no output. That is the `VthreadProbe` hang: bimodal (2
+        // runs in 10), independent of machine load, and invisible to every
+        // counter because nothing is slow -- one pause is simply waiting for a
+        // mutator that has become a heap-resident continuation.
+        //
+        // The window is the stretch between the last per-bytecode safepoint poll
+        // and the deposit: the `Thread.sleep` native plus the unwind that carries
+        // `ContinuationYield` out of `execute_frame`. Narrow, which is why the
+        // hang is intermittent rather than certain.
+        //
+        // Fix: take the blocked-region transition under the barrier lock and, if
+        // a pause was already in progress, arrive for it exactly once -- the same
+        // handshake the TERMINATION path and `NativeContextImpl::park` already
+        // perform. `arrive_and_wait_auto` is the required flavour: whether this
+        // pause counted us depends on whether its census ran before or after the
+        // deposit above, which is not decidable locally (see
+        // `GcBarrierInner::excluded_blocked`). The returned `PointerMap` is
+        // deliberately dropped -- a thread whose `in_blocked_region` is up is
+        // remapped through `fold_pointer_map_into_blocked` into
+        // `gc_block_state.fixup`, which the next mount drains in
+        // `check_post_block_gc`; applying the map here too would move twice.
+        {
+            let blocked = shared.mem.gc_barrier.enter_blocked();
+            if blocked.pre_stw {
+                let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid);
+            }
+        }
         shared.threads.virtual_thread_manager.suspend_runtime(
             vt_id,
             thread,
@@ -15161,6 +15198,43 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     thread: &mut jvm_thread,
                 }
                 .deposit_root_snapshot();
+                // STW-YIELD-ARRIVE (2026-09-05, `vthread-probe-intermittent-hang`).
+                //
+                // The deposit above raised `in_blocked_region`, which excludes this
+                // continuation from every pause requested from now on. It does NOT
+                // retract it from a pause whose census already ran: that census saw the
+                // flag DOWN, counted this `tid` in `expected`, and is waiting for it to
+                // arrive. Once `suspend_runtime` returns, the carrier goes back to
+                // `ForkJoinScheduler::wait_for_task_until` and nothing on this OS thread
+                // will ever arrive for `tid` again -- `arrived` cannot reach `expected`,
+                // the initiator's `wait_for_all` blocks forever, and the whole VM
+                // freezes with no output. That is the `VthreadProbe` hang: bimodal (2
+                // runs in 10), independent of machine load, and invisible to every
+                // counter because nothing is slow -- one pause is simply waiting for a
+                // mutator that has become a heap-resident continuation.
+                //
+                // The window is the stretch between the last per-bytecode safepoint poll
+                // and the deposit: the `Thread.sleep` native plus the unwind that carries
+                // `ContinuationYield` out of `execute_frame`. Narrow, which is why the
+                // hang is intermittent rather than certain.
+                //
+                // Fix: take the blocked-region transition under the barrier lock and, if
+                // a pause was already in progress, arrive for it exactly once -- the same
+                // handshake the TERMINATION path and `NativeContextImpl::park` already
+                // perform. `arrive_and_wait_auto` is the required flavour: whether this
+                // pause counted us depends on whether its census ran before or after the
+                // deposit above, which is not decidable locally (see
+                // `GcBarrierInner::excluded_blocked`). The returned `PointerMap` is
+                // deliberately dropped -- a thread whose `in_blocked_region` is up is
+                // remapped through `fold_pointer_map_into_blocked` into
+                // `gc_block_state.fixup`, which the next mount drains in
+                // `check_post_block_gc`; applying the map here too would move twice.
+                {
+                    let blocked = shared_arc.mem.gc_barrier.enter_blocked();
+                    if blocked.pre_stw {
+                        let _ = shared_arc.mem.gc_barrier.arrive_and_wait_auto(tid);
+                    }
+                }
                 let boxed = Box::new(jvm_thread);
                 shared_arc.threads.thread_registry.set_jvm_thread_addr(
                     tid,
