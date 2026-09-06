@@ -424,6 +424,13 @@ static PENDING_CORRUPT_HOLDERS: Mutex<Vec<(usize, u32, u32, u64)>> = Mutex::new(
 /// `evacuate` copied it onto this queue.
 pub static PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new(0);
 
+/// How many holders the SERIAL reference scan refused for the same reason.
+///
+/// Expected to be ZERO. Split from the parallel counter on purpose: the two
+/// arms are reached by different pauses, and one number for both cannot say
+/// which walk a run's corruption came through.
+pub static SERIAL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new(0);
+
 /// How many compact reference-field offsets were skipped because the resolved
 /// layout places them past the body that same layout declares.
 ///
@@ -2050,11 +2057,7 @@ impl<'a> SharedEvac<'a> {
         // to-space holder is legitimately ABOVE its region's cursor for the
         // whole dispatch. This test needs no cursor.
         if gc_flags().g1_parallel_evac_screen {
-            let paired = (header.class_id.as_u32() as u64)
-                | ((header.num_slots() as u64) << 32);
-            let base = self.collector.arena_base;
-            let end = self.collector.arena_end;
-            if end > base && (paired as usize) >= base && (paired as usize) < end {
+            if let Some(paired) = self.collector.holder_word0_arena_pointer(header) {
                 let n = PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
                     tracing::warn!(
@@ -9383,6 +9386,31 @@ impl G1Collector {
     /// every rejection so far named the holder after it had already been
     /// copied into a Survivor region, so the carve that produced it was two
     /// moves behind.
+    /// The holder's FIRST EIGHT BYTES, when they are a pointer into this
+    /// collector's own arena rather than a `class_id`/`shape` pair.
+    ///
+    /// `ObjectHeader` is `class_id`(4) + `shape`(4) + `mark_word`(8), so the
+    /// two dwords ARE one word at the object's base. Recombined, a real header
+    /// is a small class id beside a small slot count; a corrupted one is a heap
+    /// address. The test needs BOTH dwords to conspire, which is why it cannot
+    /// go stale the way an assumption about the class-id space did.
+    ///
+    /// Shared deliberately. This screen was written for the parallel arm on
+    /// 2026-09-06 and the serial arm did not get it -- the twin-pair divergence
+    /// this file already has defects from. A holder refused by one evacuator and
+    /// walked by the other is not a screen, it is a coin flip on which arm the
+    /// pause happened to take.
+    fn holder_word0_arena_pointer(&self, header: &ObjectHeader) -> Option<u64> {
+        let paired =
+            (header.class_id.as_u32() as u64) | ((header.num_slots() as u64) << 32);
+        let (base, end) = (self.arena_base, self.arena_end);
+        if end > base && (paired as usize) >= base && (paired as usize) < end {
+            Some(paired)
+        } else {
+            None
+        }
+    }
+
     fn note_implausible_legacy_header(
         &self,
         regions: &[G1Region],
@@ -10329,6 +10357,52 @@ impl G1Collector {
                 );
             }
             return;
+        }
+        // THE SAME HOLDER SCREEN THE PARALLEL ARM GOT, on the arm that produced
+        // every corrupt-cell report measured on H2 (2026-09-06,
+        // `org.h2.test.store.TestMVStoreTool` -Xmx256m G1 with the mark driver:
+        // 16/16, 14/22, 13/20, 20/20, 22/24, 19/27 reports named THIS walk).
+        //
+        // The screen above is not this one and cannot stand in for it: it is
+        // cursor-based, it is behind `CRATONVM_G1_VERIFY_HOLDERS`, and with that
+        // flag ON it rejected ZERO holders in 4 of 4 runs while the parallel
+        // arm's word0 test refused 2-10 in the same runs. An ablation on a screen
+        // that never fires is a vacuous arm, which is what that A/B produced.
+        //
+        // Why this walk is a WRITER and not just a reader: the loops below
+        // rewrite the cells they visit with forwarding addresses. The bound they
+        // carry, `holder_walkable_slots`, is the REGION -- so a holder claiming
+        // 448 slots strides 448 16-byte cells (7 KB) over the objects that FOLLOW
+        // it in its own region and rewrites every span that decodes as a CSet
+        // reference. That is one corrupted header manufacturing the next, and it
+        // is why the victims' first two words read as two arena pointers one
+        // object-size apart while their bodies read as a neighbour's payload.
+        //
+        // The comment above argues it is safe to skip a holder screen because
+        // `holder_walkable_slots` stops the walk leaving the REGION. That is one
+        // region too weak: it protects the next region, not the next OBJECT in
+        // this one, and this walk writes.
+        if gc_flags().g1_serial_evac_holder_screen {
+            if let Some(paired) = self.holder_word0_arena_pointer(header) {
+                let n = SERIAL_SCAN_HOLDER_WORD0_IS_POINTER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] serial ref-scan REFUSED a HOLDER whose first word is an \
+                         ARENA POINTER (#{n}): holder=0x{:x} class_id={} num_slots={} \
+                         paired=0x{paired:016x} mark=0x{:016x} gc_age={} -- `class_id`+`shape` \
+                         IS the header's first word, so this is not a header. Walking it \
+                         would stride {} cells over its neighbours and REWRITE them. \
+                         Skipped; the pause continues.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        header.mark_word.load(Ordering::Relaxed),
+                        header.gc_age(),
+                        header.num_slots(),
+                    );
+                }
+                return;
+            }
         }
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
