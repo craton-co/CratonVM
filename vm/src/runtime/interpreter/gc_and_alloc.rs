@@ -5692,6 +5692,12 @@ mod root_snapshot_cache_tests;
 /// then applies the pointer map to update its own frame references.
 pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
+    // Execution profiler, off unless `CRATONVM_PROFILE_SAMPLE_MS` is set: one
+    // relaxed load of a latched `Option<u64>` on the default path. Placed at
+    // the TOP so a sample reflects the frame that was running, not whatever
+    // the safepoint machinery below leaves on the stack. See
+    // `runtime::exec_sampler` for the two biases this sampling point carries.
+    crate::runtime::exec_sampler::maybe_sample(thread);
     // CRATONVM_DBG_BLOCKED_ACCESS: reaching an interpreter safepoint with the
     // thread's own `in_blocked_region` flag still raised means every STW
     // census is excluding a RUNNING mutator — a moving GC can complete under

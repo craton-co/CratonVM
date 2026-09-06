@@ -716,6 +716,12 @@ pub const INVENTORY: &[E] = &[
     // signal. `credits_consumed` is the engagement counter for the netty
     // lost-wakeup fix.
     E { group: Group::DBG, token: "monitor-notify", on_key: Some("CRATONVM_DBG_MONITOR_NOTIFY"), off_key: None, off_word: None, since: "2026-08-24" },
+    // The execution profiler (`runtime::exec_sampler`). A VALUE flag: the
+    // millisecond sampling interval, off when unset or 0. It exists because
+    // there was no way to ask this VM where a workload's time goes --
+    // `jdk.ExecutionSample` is defined in the JFR crate with no caller, and
+    // `wpr -start CPU` needs a privilege this host does not carry.
+    E { group: Group::DBG, token: "profile-sample-ms", on_key: Some("CRATONVM_PROFILE_SAMPLE_MS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "mic-method", on_key: Some("CRATONVM_DBG_MIC_METHOD"), off_key: None, off_word: None, since: "2026-08-11" },
     E { group: Group::DBG, token: "mark-why-class", on_key: Some("CRATONVM_DBG_MARK_WHY_CLASS"), off_key: None, off_word: None, since: "2026-08-10" },
     E { group: Group::DBG, token: "mirrorpin-why", on_key: Some("CRATONVM_DBG_MIRRORPIN_WHY"), off_key: None, off_word: None, since: "2026-08-10" },
