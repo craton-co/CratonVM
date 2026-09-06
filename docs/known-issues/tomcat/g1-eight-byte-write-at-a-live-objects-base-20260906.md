@@ -130,7 +130,22 @@ Same binary, arms interleaved: **16 pool-exhaustion events and 8
 reports with the fallback OFF, 0 and 0 with it ON.** The corruption signal
 tracks the exhaustion, which is the causal chain this page was looking for.
 
-**It does not stop the OOM.** Both arms still OOM on this class, so pool
+The clincher is what the exhaustion report says on each arm. It prints how much
+room the serial arm WOULD have found at that instant, and after the fallback has
+already been tried:
+
+| arm | report |
+|---|---|
+| fallback OFF | `dest_type=Survivor size=32 pool_len=28 — but 23 of 24 non-CSet Survivor regions still have room` |
+| fallback ON | `dest_type=Survivor size=176 pool_len=0 — but 0 of 2 non-CSet Survivor regions still have room` |
+
+**Off, it is failing a 32-byte evacuation with 23 of 24 regions usable and 28
+regions still in its own pool. On, it only reports once the heap is genuinely
+full.** The parallel evacuator is no longer manufacturing to-space exhaustion;
+what is left is real.
+
+**It does not make the class pass.** Neither arm is healthy yet — the remaining
+failures are genuine heap exhaustion at `-Xmx2g` (and one CRASH). Pool
 exhaustion was real, is fixed, and is not the whole story.
 
 ## The corruption happens INSIDE a pause, after the copy
