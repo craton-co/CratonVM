@@ -104,16 +104,47 @@
 //!
 //! # Known limitations (documented, not fixed here)
 //!
-//! - **Forward references.** [`compute`] can only judge a call target
-//!   eligible if the target's declaring class is *already loaded* at
-//!   the moment the caller is scanned. A caller compiled/scanned before
-//!   its callee's class has ever been loaded will not see the callee as
-//!   eligible and will NOT be blocked from JIT admission — offload can
-//!   still be silently dropped for that specific caller. Closing this
-//!   gap needs either a reverse (callee → known callers) index rebuilt
-//!   on every class load, or re-running this gate at every promotion
-//!   attempt rather than caching permanently; both are out of scope for
-//!   the conservative first fix.
+//! - ~~**Forward references.**~~ **Closed 2026-09-06.** [`compute`] can
+//!   only judge a call target if the target's declaring class is
+//!   *already loaded* at the moment the caller is scanned, and it still
+//!   cannot — that half is unchanged, and deliberately so: treating "not
+//!   loaded" as "assume eligible" would ban huge swaths of an ordinary
+//!   VM boot from the JIT.
+//!
+//!   What is closed is what the skip COST. This bullet used to end
+//!   "offload can still be silently dropped for that specific caller",
+//!   and that was an understatement: the drop was PERMANENT and it was
+//!   not limited to that caller. An unjudged target is never registered
+//!   with [`cratonvm_jit::offload_hook`], and
+//!   `helpers.rs::try_compiled_offload` memoized `NotKernel` per call
+//!   site for the life of the process — so the very first execution of
+//!   the site decided, using a registry that could not yet know, and the
+//!   class that same dispatch was about to load could not change the
+//!   answer. A caller that got hot before its kernel branch was first
+//!   taken lost the device for the rest of the run.
+//!
+//!   The registry now learns instead. `try_compiled_offload` asks
+//!   [`target_is_dispatchable_kernel`] on a registry miss — the same
+//!   question [`judge_target`] asks here — screened first by
+//!   [`descriptor_could_ever_dispatch`] so the ~all-of-them sites that
+//!   cannot be kernels never pay for it, and re-asked rather than
+//!   memoized while the class is still unloaded. A kernel it finds is
+//!   `note_kernel`ed, which also repairs every LATER compile: the
+//!   compile-time doors in `jit/src/lib.rs` and
+//!   `jit/src/x64/bytecode_walk.rs` read the same registry to decide
+//!   whether to bind directly or inline, and a stale cached `false` in
+//!   [`GATE_CACHE`] stops mattering once the target is in the registry.
+//!
+//!   Measured on `test_classes/gpu/GpuForwardRef.java`, whose two arms
+//!   differ only in whether the caller gets hot before or after the
+//!   kernel's class is loaded. See
+//!   `internal/gpu/compiled-caller-gate-refused-ldc-kernels-FIXED-20260905.md`.
+//!
+//!   The one case still open is narrower than the old bullet and needs
+//!   the site to be recompiled BETWEEN the first and second execution of
+//!   a forward-referenced site — the window in which the class exists,
+//!   the registry does not yet know, and a fresh compile can bind
+//!   directly.
 //! - ~~**Hint-loosened kernels.**~~ **Closed 2026-09-05.** [`compute`]
 //!   now calls [`jit_cuda::analyzer::analyze_with_annotations_and_pool`]
 //!   with the target's own annotations and constant pool — the same call
@@ -124,7 +155,7 @@
 //!   throughput, not correctness — the worst case is a JIT-compiled
 //!   caller that stops offloading". That worst case was then measured at
 //!   **10.8x** on the constant-pool half of the same disagreement (see
-//!   `docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md`),
+//!   `internal/gpu/compiled-caller-gate-refused-ldc-kernels-FIXED-20260905.md`),
 //!   which is what retired the argument: "costs throughput, not
 //!   correctness" is not a reason to keep a gate asking a different
 //!   question from the dispatcher it models.
@@ -138,6 +169,17 @@
 //!   are not scanned — only literal `invokestatic` bytecodes. A caller
 //!   that reaches an eligible kernel through a `MethodHandle` is not
 //!   covered.
+//!
+//!   AUDIT 2026-09-06: this one is NOT a disagreement, and it is worth
+//!   saying so next to two that were. Both dispatcher doors are
+//!   `invokestatic`-only — `interpreter/dispatch_static.rs` is the
+//!   interpreter's `execute_invokestatic` arm, and
+//!   `jit/helpers.rs::jit_invoke_dispatch` guards its offload attempt on
+//!   `info.invoke_kind == 3`. Neither fires for an `invokedynamic`, so a
+//!   `MethodHandle`-mediated kernel does not offload from the
+//!   interpreter either, and the gate agreeing that it is out of scope
+//!   is the two asking the SAME question. It is a feature the offload
+//!   path does not have, not a gate that models the wrong dispatcher.
 //!
 //! # Integration status
 //!
@@ -260,6 +302,20 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         return false;
     }
 
+    // ARM THE HOOK, without registering anything.
+    //
+    // AUDIT 2026-09-06. `jit_invoke_dispatch` consults the offload hook only
+    // `if any_kernels()`, and that used to become true only when a caller scan
+    // below had already found a kernel. A program whose only kernel is
+    // FORWARD-REFERENCED registers nothing here, so the flag stayed false, so
+    // the compiled dispatch helper never looked, so nothing ever registered it
+    // — the empty case sealed itself shut. Arming on "there is a device"
+    // rather than "we found something" lets the helper's per-site resolution
+    // ask [`target_is_dispatchable_kernel`] about the targets this scan could
+    // not judge. A run without `--gpu` never gets here and still pays one
+    // relaxed bool per compiled static dispatch.
+    cratonvm_jit::offload_hook::arm();
+
     // AUDIT 2026-09-02: with `--nojit` there is nothing to admit, so
     // there is nothing to decide — and nothing to trade away either.
     // This is not merely an optimisation: `compute` is still consulted
@@ -336,146 +392,66 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             continue;
         };
 
-        // Known limitation (documented in the module docs): if the
-        // target's declaring class is not yet loaded we cannot judge
-        // eligibility and simply don't count this call site. We do NOT
-        // treat "not loaded" as "assume eligible" — that would make an
-        // ordinary VM boot (where most classes referenced by a
-        // freshly-loaded caller are not loaded yet) ban huge swaths of
-        // unrelated code from the JIT.
-        let Some(target_class_id) = cm.get_loaded_class_id(target_class_name) else {
-            continue;
-        };
-        let Some(target_class) = cm.get_class(target_class_id) else {
-            continue;
-        };
-        let Some(target_method) = target_class
-            .methods
-            .iter()
-            .find(|m| &*m.name == target_method_name && &*m.descriptor == target_descriptor)
-        else {
-            continue;
-        };
-
-        // Annotation-free, but CONSTANT-POOL AWARE -- and the pool has to
-        // be the TARGET's, not this caller's.
-        //
-        // AUDIT 2026-09-05. This called the CP-free `analyze`, which
-        // rejects `ldc`/`ldc_w`/`ldc2_w` unconditionally because it has
-        // no pool to resolve them against. `lookup_or_compile` -- the
-        // dispatcher this gate exists to serve -- calls
-        // `analyze_with_pool`, which admits a numeric literal (AUDIT
-        // C31). So the two disagreed, silently, about any kernel
-        // containing a constant-pool constant.
-        //
-        // `bench-gpu/GpuFloatDivChain.divChain` is one such kernel: its
-        // `x = x / d + 1.0000001` is an `ldc2_w`, so the gate saw
-        // INELIGIBLE while the interpreter saw `Eligible` and offloaded.
-        // Its int twin's `+ 12345` is a `sipush` with no pool entry, so
-        // that one agreed and worked. Measured at N=2^24: 9,276 ms
-        // against the int twin's 8 ms, and 28 ms with `CRATONVM_JIT_OSR=0`
-        // (which keeps the caller interpreted, where the CP-aware verdict
-        // is the one that runs).
-        //
-        // NOT an FP-only disagreement, though both symptoms that found it
-        // were. The boundary is the CONSTANT POOL, not the type: an
-        // `int[]` kernel whose constant is above `sipush` range needs an
-        // `ldc` and went dark too, while a `long[]` kernel using only
-        // `lconst_1` never touched the pool and offloaded normally. Both
-        // measured on `test_classes/gpu/GpuLdcSplit.java`, which exists
-        // to break that correlation -- the same defect was independently
-        // scoped as "the compiled caller drops long[] and double[]",
-        // because a `long`/`double` literal has no small-immediate form
-        // and so always trips it. See
-        // docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md.
-        //
-        // The disagreement was always wrong, and it became load-bearing
-        // when this scan started ARMING the compiled-tier hook rather
-        // than merely blocking: a target the gate cannot see is one the
-        // compiler binds directly, and the hook is then lost for the life
-        // of the process.
-        // ANNOTATIONS TOO, for the same reason as the pool: the
-        // dispatcher reads them (`read_method_annotations`, then
-        // `analyze_with_annotations_and_pool`), so a gate that does not
-        // is asking a different question and will disagree.
-        //
-        // AUDIT 2026-09-05, second half. The module docs used to list
-        // "hint-loosened kernels" as a deliberate limitation, argued as
-        // "conservative in the direction that costs offload throughput,
-        // not correctness -- the worst case is a JIT-compiled caller
-        // that stops offloading". That worst case is exactly the defect
-        // the pool half of this call had just been measured at 10.8x, so
-        // the argument does not survive its own example.
-        //
-        // The disagreement ran BOTH ways:
-        //   - a kernel eligible only via `@GpuKernel`/`AdmissionHint`
-        //     was invisible here, so it was never registered and its
-        //     compiled call sites bound directly and went dark;
-        //   - a `@GpuExclude` method could be judged Eligible here and
-        //     REGISTERED, arming the offload hook for a target the
-        //     dispatcher short-circuits and will never launch (and,
-        //     under `CallerGateMode::Block`, denying its caller
-        //     compilation for an offload that cannot happen).
-        //
-        // Decoding costs one attribute pass per scanned target, next to
-        // a full bytecode scan that was already being paid.
-        let target_attrs = crate::runtime::offload::decode_method_attrs(
-            &target_method.attributes,
-            &target_class.constant_pool,
-        );
-        let target_annotations =
-            jit_cuda::annotations::read_method_annotations(&target_attrs, &target_class.constant_pool);
-        let sig = match jit_cuda::analyzer::analyze_with_annotations_and_pool(
-            target_method,
-            &target_annotations,
-            &target_class.constant_pool,
+        // The whole judgement -- resolve, analyze, and then the
+        // dispatcher's own gates -- now lives in [`judge_target`], because
+        // the compiled dispatch helper has to ask the IDENTICAL question
+        // at run time about a target this scan could not judge. See that
+        // function for the audit trail this comment used to carry.
+        match judge_target(
+            &cm,
+            shared.config.gpu_min_work,
+            target_class_name,
+            target_method_name,
+            target_descriptor,
         ) {
-            jit_cuda::OffloadVerdict::Eligible(sig) => sig,
-            // Counted, and named. This refusal used to be a bare
-            // `continue`: the two counters below it exist because a
-            // narrowing that shows up only as an ABSENCE cannot be told
-            // from one that never fired, and this one had no counter at
-            // all. That is how the pool-free `analyze` above went
-            // unnoticed -- a run whose kernels had all silently stopped
-            // registering printed a census identical to a healthy one.
-            jit_cuda::OffloadVerdict::Rejected(reason) => {
-                // Split, because a census that folds "never a candidate"
-                // into "refused" is one nobody reads: one run of
-                // `GpuIntensitySweep` walks past ~154 signature-refused
-                // JDK targets, and naming those would bury the handful
-                // that matter.
-                use jit_cuda::analyzer::Reason;
-                let never_a_candidate = matches!(
-                    reason,
-                    Reason::NonStatic
-                        | Reason::Synchronized
-                        | Reason::NativeOrAbstract
-                        | Reason::NoCode
-                        | Reason::BadDescriptor
-                        | Reason::UnsupportedParamType
-                        | Reason::UnsupportedReturnType
-                        | Reason::GpuExcluded
-                );
-                if never_a_candidate {
-                    cratonvm_types::gpu_jit_gate_census::note_target_never_candidate();
-                } else {
-                    cratonvm_types::gpu_jit_gate_census::note_target_body_refused(format!(
-                        "{target_class_name}.{target_method_name}{target_descriptor} — {reason:?}"
-                    ));
-                }
+            // Known limitation, NARROWED 2026-09-06: if the target's
+            // declaring class is not yet loaded we cannot judge
+            // eligibility here. We do NOT treat "not loaded" as "assume
+            // eligible" -- that would make an ordinary VM boot (where most
+            // classes referenced by a freshly-loaded caller are not loaded
+            // yet) ban huge swaths of unrelated code from the JIT.
+            //
+            // What changed is what the skip COSTS. It used to be terminal:
+            // the target was never registered, so the compiled call site
+            // was bound directly or inlined and offload ended for the life
+            // of the process. `try_compiled_offload` now asks
+            // [`target_is_dispatchable_kernel`] once per site, at a moment
+            // when the class does exist, and registers what it finds -- so
+            // this `continue` costs the FIRST call through the site and
+            // nothing after it.
+            TargetVerdict::Unresolved => {
+                cratonvm_types::gpu_jit_gate_census::note_target_unresolved();
                 continue;
             }
-        };
-
-        // ...and then the DISPATCHER's own gates. `Eligible` answers
-        // "could this bytecode be lowered to PTX", which is not the
-        // question this gate is asking. See
-        // [`target_can_ever_dispatch`].
-        if !target_can_ever_dispatch(&sig, target_descriptor, shared.config.gpu_min_work) {
-            cratonvm_types::gpu_jit_gate_census::note_released_undispatchable(format!(
-                "{target_class_name}.{target_method_name}{target_descriptor}"
-            ));
-            continue;
+            // Counted, and named. These refusals used to be a bare
+            // `continue`: the counters exist because a narrowing that shows
+            // up only as an ABSENCE cannot be told from one that never
+            // fired, and this one had no counter at all. That is how the
+            // pool-free `analyze` went unnoticed -- a run whose kernels had
+            // all silently stopped registering printed a census identical
+            // to a healthy one.
+            //
+            // Split, because a census that folds "never a candidate" into
+            // "refused" is one nobody reads: one run of `GpuIntensitySweep`
+            // walks past ~154 signature-refused JDK targets, and naming
+            // those would bury the handful that matter.
+            TargetVerdict::NeverCandidate => {
+                cratonvm_types::gpu_jit_gate_census::note_target_never_candidate();
+                continue;
+            }
+            TargetVerdict::BodyRefused(reason) => {
+                cratonvm_types::gpu_jit_gate_census::note_target_body_refused(format!(
+                    "{target_class_name}.{target_method_name}{target_descriptor} — {reason:?}"
+                ));
+                continue;
+            }
+            TargetVerdict::Undispatchable => {
+                cratonvm_types::gpu_jit_gate_census::note_released_undispatchable(format!(
+                    "{target_class_name}.{target_method_name}{target_descriptor}"
+                ));
+                continue;
+            }
+            TargetVerdict::Kernel => {}
         }
 
         // A kernel the dispatcher really can launch. What that costs
@@ -565,6 +541,191 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
 /// What this does NOT relax: a `)V` kernel taking arrays still blocks its
 /// callers, which is the case the gate was built for and the one the
 /// module comment argues.
+/// What the gate concluded about ONE `invokestatic` target.
+///
+/// Split out 2026-09-06 so `compute` and the compiled dispatch helper ask the
+/// SAME question -- which is the whole lesson of
+/// `internal/gpu/compiled-caller-gate-refused-ldc-kernels-FIXED-20260905.md`,
+/// where a gate calling a different analyzer entry point than the dispatcher
+/// it modelled cost 10.8x on a kernel it silently refused to register.
+#[derive(Debug)]
+enum TargetVerdict {
+    /// The target's declaring class is not loaded, so nothing can be said.
+    /// NOT "ineligible" -- the caller has to decide what an unknown costs.
+    Unresolved,
+    /// Signature-shaped refusal: never a candidate at all.
+    NeverCandidate,
+    /// Kernel-shaped, and the analyzer refused the BODY. The actionable half.
+    BodyRefused(jit_cuda::analyzer::Reason),
+    /// The analyzer says `Eligible`, but the dispatcher could never launch it.
+    Undispatchable,
+    /// A kernel the dispatcher really can launch.
+    Kernel,
+}
+
+/// Judge one call target exactly the way `OffloadCache::lookup_or_compile`
+/// would.
+///
+/// AUDIT 2026-09-05. This used the CP-free `analyze`, which rejects
+/// `ldc`/`ldc_w`/`ldc2_w` unconditionally because it has no pool to resolve
+/// them against, while `lookup_or_compile` calls the CP-aware variant that
+/// admits a numeric literal. So the two disagreed, silently, about any kernel
+/// containing a constant-pool constant.
+///
+/// `bench-gpu/GpuFloatDivChain.divChain` is one such kernel: its
+/// `x = x / d + 1.0000001` is an `ldc2_w`, so the gate saw INELIGIBLE while the
+/// interpreter saw `Eligible` and offloaded. Its int twin's `+ 12345` is a
+/// `sipush` with no pool entry, so that one agreed and worked. Measured at
+/// N=2^24: 9,276 ms against the int twin's 8 ms, and 28 ms with
+/// `CRATONVM_JIT_OSR=0` (which keeps the caller interpreted, where the CP-aware
+/// verdict is the one that runs).
+///
+/// NOT an FP-only disagreement, though both symptoms that found it were. The
+/// boundary is the CONSTANT POOL, not the type: an `int[]` kernel whose
+/// constant is above `sipush` range needs an `ldc` and went dark too, while a
+/// `long[]` kernel using only `lconst_1` never touched the pool and offloaded
+/// normally. Both measured on `test_classes/gpu/GpuLdcSplit.java`, which exists
+/// to break that correlation.
+///
+/// ANNOTATIONS TOO, for the same reason as the pool: the dispatcher reads them
+/// (`read_method_annotations`, then `analyze_with_annotations_and_pool`), so a
+/// gate that does not is asking a different question and will disagree. That
+/// disagreement ran BOTH ways -- a kernel eligible only via
+/// `@GpuKernel`/`AdmissionHint` was invisible here and its compiled sites went
+/// dark, and a `@GpuExclude` method could be judged `Eligible` and REGISTERED,
+/// arming the hook for a target the dispatcher short-circuits and never
+/// launches.
+///
+/// Decoding costs one attribute pass per judged target, next to a full bytecode
+/// scan that was already being paid.
+fn judge_target(
+    cm: &crate::classloading::ClassManager,
+    gpu_min_work: u32,
+    target_class_name: &str,
+    target_method_name: &str,
+    target_descriptor: &str,
+) -> TargetVerdict {
+    let Some(target_class_id) = cm.get_loaded_class_id(target_class_name) else {
+        return TargetVerdict::Unresolved;
+    };
+    let Some(target_class) = cm.get_class(target_class_id) else {
+        return TargetVerdict::Unresolved;
+    };
+    let Some(target_method) = target_class
+        .methods
+        .iter()
+        .find(|m| &*m.name == target_method_name && &*m.descriptor == target_descriptor)
+    else {
+        // The class is loaded and has no such method. That is a resolution
+        // failure the dispatcher would hit too, not a "come back later".
+        return TargetVerdict::NeverCandidate;
+    };
+
+    let target_attrs = crate::runtime::offload::decode_method_attrs(
+        &target_method.attributes,
+        &target_class.constant_pool,
+    );
+    let target_annotations =
+        jit_cuda::annotations::read_method_annotations(&target_attrs, &target_class.constant_pool);
+    let sig = match jit_cuda::analyzer::analyze_with_annotations_and_pool(
+        target_method,
+        &target_annotations,
+        &target_class.constant_pool,
+    ) {
+        jit_cuda::OffloadVerdict::Eligible(sig) => sig,
+        jit_cuda::OffloadVerdict::Rejected(reason) => {
+            use jit_cuda::analyzer::Reason;
+            let never_a_candidate = matches!(
+                reason,
+                Reason::NonStatic
+                    | Reason::Synchronized
+                    | Reason::NativeOrAbstract
+                    | Reason::NoCode
+                    | Reason::BadDescriptor
+                    | Reason::UnsupportedParamType
+                    | Reason::UnsupportedReturnType
+                    | Reason::GpuExcluded
+            );
+            return if never_a_candidate {
+                TargetVerdict::NeverCandidate
+            } else {
+                TargetVerdict::BodyRefused(reason)
+            };
+        }
+    };
+
+    // ...and then the DISPATCHER's own gates. `Eligible` answers "could this
+    // bytecode be lowered to PTX", which is not the question this gate is
+    // asking. See [`target_can_ever_dispatch`].
+    if !target_can_ever_dispatch(&sig, target_descriptor, gpu_min_work) {
+        return TargetVerdict::Undispatchable;
+    }
+    TargetVerdict::Kernel
+}
+
+/// Could a target with THIS descriptor ever be a dispatchable kernel?
+///
+/// A necessary condition, read off the descriptor alone -- no class loading, no
+/// bytecode scan, no allocation. It is the descriptor-only half of
+/// [`target_can_ever_dispatch`]: `try_dispatch` launches only `)V`, or `)I`/`)J`
+/// for a reduction, and with `--gpu-min-work` above zero the work estimate is
+/// structurally zero unless something in the parameter list can be an array.
+///
+/// Exists so `try_compiled_offload` can reject the overwhelming majority of
+/// compiled static call sites -- every `String` returner, every no-array
+/// helper -- before paying for [`target_is_dispatchable_kernel`]'s analyzer
+/// pass. Screening in the WRONG direction here would be a lost offload, so it
+/// tests only conditions the dispatcher itself insists on.
+pub fn descriptor_could_ever_dispatch(descriptor: &str, gpu_min_work: u32) -> bool {
+    let returns_kernel_shape =
+        descriptor.ends_with(")V") || descriptor.ends_with(")I") || descriptor.ends_with(")J");
+    if !returns_kernel_shape {
+        return false;
+    }
+    if gpu_min_work > 0 && !descriptor_has_array_parameter(descriptor) {
+        return false;
+    }
+    true
+}
+
+/// Is this ONE target a kernel the dispatcher can launch? `None` when its
+/// declaring class is not loaded, so the question cannot be answered yet.
+///
+/// The compiled dispatch helper's per-site resolution calls this on a registry
+/// miss. `offload_hook`'s registry is populated as a side effect of scanning
+/// CALLERS, and a caller scanned before its callee's class existed registers
+/// nothing -- the "forward references" limitation in this module's docs. That
+/// limitation used to be terminal, because `helpers.rs::try_compiled_offload`
+/// memoized `NotKernel` per site for the life of the process: the first
+/// execution of the site decided, and the class that same dispatch was about to
+/// load could not change the answer.
+///
+/// Asking here closes it. By the time a site executes a second time the class
+/// the first dispatch resolved is loaded, so this returns a real answer, and
+/// the caller registers what it finds -- which also fixes every LATER compile,
+/// since the compile-time doors in `jit/src/lib.rs` and
+/// `jit/src/x64/bytecode_walk.rs` read the same registry to decide whether to
+/// bind directly or inline.
+pub fn target_is_dispatchable_kernel(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<bool> {
+    let cm = shared.classes.class_manager.read();
+    match judge_target(
+        &cm,
+        shared.config.gpu_min_work,
+        class_name,
+        method_name,
+        descriptor,
+    ) {
+        TargetVerdict::Unresolved => None,
+        TargetVerdict::Kernel => Some(true),
+        _ => Some(false),
+    }
+}
+
 fn target_can_ever_dispatch(
     sig: &jit_cuda::KernelSignature,
     descriptor: &str,
@@ -1024,6 +1185,72 @@ fn resolve_method_ref(cp: &ConstantPool, index: u16) -> Option<(&str, &str, &str
 mod tests {
     use crate::runtime::offload::input_cache;
     use super::*;
+
+    // ------------------------------------------------------------------
+    // `descriptor_could_ever_dispatch` — the screen the compiled dispatch
+    // helper puts in front of the gate query, so that asking about a
+    // forward-referenced target does not cost every compiled static call
+    // site in the program an analyzer pass.
+    //
+    // It is a NECESSARY condition, so the direction that matters is the
+    // false NEGATIVE: a descriptor it rejects never gets asked about, and
+    // a kernel rejected here is a kernel that stays dark. Each case below
+    // is one the dispatcher itself insists on, checked against
+    // `target_can_ever_dispatch`'s two gates.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_descriptor_screen_admits_the_three_shapes_try_dispatch_launches() {
+        // void, the ordinary kernel shape.
+        assert!(descriptor_could_ever_dispatch("([I[I)V", 1));
+        // `)I` and `)J`, the reduction shapes.
+        assert!(descriptor_could_ever_dispatch("([I[I)I", 1));
+        assert!(descriptor_could_ever_dispatch("([J)J", 1));
+    }
+
+    #[test]
+    fn the_descriptor_screen_rejects_a_return_type_try_dispatch_cannot_hand_back() {
+        // `try_dispatch` has an arm for void, `)I` and `)J` and nothing
+        // else, so a `float`/`double`/reference return can never dispatch
+        // however eligible the body is.
+        assert!(!descriptor_could_ever_dispatch("([F[F)F", 1));
+        assert!(!descriptor_could_ever_dispatch("([D)D", 1));
+        assert!(!descriptor_could_ever_dispatch(
+            "([I)Ljava/lang/String;",
+            1
+        ));
+    }
+
+    #[test]
+    fn the_descriptor_screen_needs_an_array_only_while_min_work_is_armed() {
+        // With `--gpu-min-work` above zero the work estimate is
+        // structurally zero unless a parameter can be an array, so a
+        // scalar-only signature can never clear the threshold...
+        assert!(!descriptor_could_ever_dispatch("(II)V", 1));
+        // ...but `--gpu-min-work 0` disables the threshold, and then the
+        // same signature is admissible. Screening it out at zero would
+        // hide a kernel the dispatcher would have launched.
+        assert!(descriptor_could_ever_dispatch("(II)V", 0));
+        // A reference array still counts as an array here: this screen is
+        // a necessary condition, and the element-type refusal belongs to
+        // the analyzer, which the caller asks next.
+        assert!(descriptor_could_ever_dispatch(
+            "([Ljava/lang/Object;)V",
+            1
+        ));
+    }
+
+    #[test]
+    fn the_descriptor_screen_survives_a_descriptor_it_cannot_parse() {
+        // `descriptor_has_array_parameter` returns false rather than
+        // panicking on a malformed descriptor, and the screen must not
+        // turn that into an admission.
+        assert!(!descriptor_could_ever_dispatch("", 1));
+        assert!(!descriptor_could_ever_dispatch("not a descriptor", 1));
+        // No parameter list at all, but the right return shape: still no
+        // array, so still refused while min-work is armed.
+        assert!(!descriptor_could_ever_dispatch("()V", 1));
+    }
 
     // ------------------------------------------------------------------
     // `scan_invokestatic_cp_indices` — the novel logic this module

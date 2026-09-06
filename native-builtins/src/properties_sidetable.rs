@@ -6095,7 +6095,7 @@ mod tests {").next().unwrap_or(src);
              supplementary character sorts FIRST"
         );
         assert!(
-            "\u{10000}".to_string() > "\u{FFFF}".to_string(),
+            "\u{10000}" > "\u{FFFF}",
             "Rust `String` sorts it LAST — the divergence this type removes"
         );
     }

@@ -130,7 +130,11 @@ impl Montgomery {
     }
 
     /// `x * R^-1 mod m` — the conversion *out* of Montgomery form.
-    pub(crate) fn from_mont(&self, a: &[u32]) -> Vec<u32> {
+    ///
+    /// `out_of_mont` rather than `from_mont`: `clippy::wrong_self_convention`
+    /// reserves a `from_*` name for an associated function taking no `self`,
+    /// and this one is a method on the modulus context.
+    pub(crate) fn out_of_mont(&self, a: &[u32]) -> Vec<u32> {
         let n = self.m.len();
         let mut one = vec![0u32; n];
         one[0] = 1;
@@ -304,7 +308,7 @@ pub(crate) fn modpow_odd(
         }
     }
 
-    let mut out = mont.from_mont(&acc);
+    let mut out = mont.out_of_mont(&acc);
     while out.last() == Some(&0) {
         out.pop();
     }
@@ -394,7 +398,7 @@ mod tests {
                 let n = mont.limbs();
                 let (r1, r2) = radix_constants(&m, n);
                 // 1 in Montgomery form really is R mod m.
-                assert_eq!(mont.from_mont(&r1), pad(&[1], n), "r1 is 1*R");
+                assert_eq!(mont.out_of_mont(&r1), pad(&[1], n), "r1 is 1*R");
 
                 for _ in 0..8 {
                     let a: Vec<u32> = (0..n).map(|_| xorshift(&mut state) as u32).collect();
@@ -406,12 +410,12 @@ mod tests {
                     let bmm = mont.mul(&bb, &r2);
                     let prod = mont.mul(&am, &bmm);
                     assert_eq!(
-                        mont.from_mont(&prod),
+                        mont.out_of_mont(&prod),
                         pad(&ref_mulmod(&ba, &bb, &m), n),
                         "montgomery mul, {limbs} limbs"
                     );
                     // Round-tripping through Montgomery form is the identity.
-                    assert_eq!(mont.from_mont(&am), ba, "to/from mont round trip");
+                    assert_eq!(mont.out_of_mont(&am), ba, "to/from mont round trip");
                     // The result is always fully reduced.
                     assert_eq!(
                         cmp_mag(&prod, mont.modulus()),
@@ -428,7 +432,7 @@ mod tests {
                     for b in &cases {
                         let am = mont.mul(a, &r2);
                         let bmn = mont.mul(b, &r2);
-                        let got = mont.from_mont(&mont.mul(&am, &bmn));
+                        let got = mont.out_of_mont(&mont.mul(&am, &bmn));
                         assert_eq!(got, pad(&ref_mulmod(a, b, &m), n), "boundary mul");
                     }
                 }

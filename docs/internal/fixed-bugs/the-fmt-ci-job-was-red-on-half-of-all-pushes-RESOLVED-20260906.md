@@ -1,8 +1,17 @@
-# The `fmt` CI job is red on roughly half of all pushes, and it is not the pushes' fault — OPEN 2026-09-06
+# The `fmt` CI job was red on roughly half of all pushes, and it was not the pushes' fault — RESOLVED 2026-09-06
 
-**Status:** the SYMPTOM is fixed (§5 option 4 landed the same day — the job now
-asks about the lines the diff touched); the DEBT is still open and §1's census
-still describes it. §4 says why paying it down is not this record's to do.
+**Status:** RESOLVED, and retired the day it was written. §5's option 4 landed
+within the hour: the job now asks about the lines the diff touched, and the
+measurement below is what argued for that shape rather than for a tree-wide
+reformat.
+
+**What is NOT resolved, and is deliberately not tracked as an open issue any
+more:** §1's census. 171 of 978 tracked `.rs` files are still not
+rustfmt-clean, 1,883 hunks between them. That is now debt rather than a broken
+gate — nothing is red because of it, every run prints it, and §5's options 1-3
+are still the way to pay it down. It stopped being a defect the moment the gate
+stopped charging it to whoever touched a file next; it will stop being a number
+when someone spends a quiet day on `gc`.
 **Gate:** `.github/workflows/ci.yml`, job `fmt` ("Formatting (changed files)").
 
 ---

@@ -68,6 +68,7 @@
 //! already cost `RJitStackTraceLines` a draft. Using `CRATONVM_DISABLE_JIT=1`
 //! on one binary sidesteps it entirely and cannot go stale on a probe edit.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -229,6 +230,36 @@ fn run_arm(
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("[{TAG}] {arm}: could not spawn cratonvm: {e}"));
+
+    // DRAIN BOTH PIPES WHILE WAITING, on their own threads.
+    //
+    // This used to `try_wait()` in a sleep loop and call `wait_with_output()`
+    // only after the child had exited — which cannot work when the child
+    // outproduces one OS pipe buffer. `CRATONVM_DBG_JITC=1` (set unconditionally
+    // above, because the compile lines are half of what the arms are compared
+    // on) writes ~55 KiB to stderr against a 64 KiB buffer on Linux: 9 KiB of
+    // headroom, or about one bg-compile line per 90. A run that emits a few
+    // more — a loaded host recompiling, or the `NO_NPE_TRAP_LINES` arm taking a
+    // different path — fills the buffer, the child blocks in `write`, and the
+    // loop below waits the full 600 s for an exit that can never come. The
+    // failure reads as "probe timed out", which points at the VM; the VM
+    // finishes this probe in three seconds when its stderr goes anywhere else.
+    //
+    // Reading concurrently is the only fix that keeps the timeout meaningful:
+    // it is now a bound on the probe, not on the probe's chattiness.
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
     let timeout = Duration::from_secs(600);
     let start = std::time::Instant::now();
     loop {
@@ -245,12 +276,17 @@ fn run_arm(
             Err(e) => panic!("[{TAG}] {arm}: wait failed: {e}"),
         }
     }
-    let out = child
-        .wait_with_output()
-        .expect("collect probe output after exit");
+    // Both readers see EOF when the child's ends close, which the exit above
+    // has already caused; joining cannot outlive it.
+    let stdout = stdout_reader
+        .join()
+        .unwrap_or_else(|_| panic!("[{TAG}] {arm}: stdout reader panicked"));
+    let stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| panic!("[{TAG}] {arm}: stderr reader panicked"));
     (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
     )
 }
 

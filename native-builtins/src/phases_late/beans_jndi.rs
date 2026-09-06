@@ -1014,7 +1014,6 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
@@ -1976,7 +1975,6 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // GenericTypeAwarePropertyDescriptor stores read/write in its own fields.
     let _ = pd;
     r.set_category(__prev_cat);
-    ()
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.

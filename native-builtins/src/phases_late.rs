@@ -2753,7 +2753,6 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         p60_empty_optional,
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
@@ -3727,7 +3726,6 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
@@ -8258,7 +8256,6 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let _ = bi_add_str; // keep import alive in case future ops want it
     let _ = bi_cmp_unsigned;
     r.set_category(__prev_cat);
-    ()
 }
 
 /// Divide an unsigned decimal string by 2^32, returning (quotient, remainder).

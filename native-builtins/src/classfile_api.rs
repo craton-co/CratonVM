@@ -418,7 +418,6 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
         let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +497,6 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
         let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +544,6 @@ fn register_code_model(r: &mut NativeMethodRegistry) {
         let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
-    ()
 }
 
 // ---------------------------------------------------------------------------

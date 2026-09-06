@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn element_value_const_tags_all_representable() {
         // Every JVMS §4.7.16.1 tag is expressible via `ElementValue::Const`.
-        for tag in [b'B', b'C', b'D', b'F', b'I', b'J', b'S', b'Z', b's'] {
+        for tag in *b"BCDFIJSZs" {
             let pair = make_pair(
                 1,
                 ElementValue::Const {

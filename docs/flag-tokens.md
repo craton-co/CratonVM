@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-529 tokens.
+530 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -379,6 +379,7 @@ export inherited from a parent shell.
 | `monenter` | `CRATONVM_DBG_MONENTER` |
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
 | `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
+| `jit-remap-all-unverifiable` | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
 | `moving-young-no-band-verify` | `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` |
@@ -977,7 +978,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-163 tokens.
+165 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1044,6 +1045,7 @@ export inherited from a parent shell.
 | `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
 | `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
 | `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `tlab-flag-publish-false` | `CRATONVM_ZGC_TLAB_FLAG_PUBLISH_FALSE` |
 | `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
 | `zgc-mark-pool-persistent` | `CRATONVM_ZGC_MARK_POOL_PERSISTENT` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
@@ -1066,6 +1068,7 @@ export inherited from a parent shell.
 | `gpu-jit-array-writers` | `CRATONVM_GPU_JIT_ARRAY_WRITERS` |
 | `jit-gpu-array-barrier` | `CRATONVM_JIT_GPU_ARRAY_BARRIER` |
 | `gpu-jit-gate-dispatchable` | `CRATONVM_GPU_JIT_GATE_DISPATCHABLE` |
+| `gpu-jit-gate-late-register` | `CRATONVM_GPU_JIT_GATE_LATE_REGISTER` |
 | `gpu-jit-gate-callers` | `CRATONVM_GPU_JIT_GATE_CALLERS` |
 | `gpu-critical-lease-ms` | `CRATONVM_GPU_CRITICAL_LEASE_MS` |
 | `gpu-critical-wait-ms` | `CRATONVM_GPU_CRITICAL_WAIT_MS` |

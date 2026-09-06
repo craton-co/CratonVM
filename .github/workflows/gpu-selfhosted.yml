@@ -57,12 +57,12 @@ jobs:
       # Compile only the fixtures ci-gate.sh actually drives: bench-gpu/ for
       # the warm-timing / checksum / --gpu-info gates, test_classes/gpu/ for
       # the bounds-deopt integrity gate (BoundsDeopt2 + the EligibleVectorAdd
-      # helper it calls).
+      # helper it calls) and the forward-reference gate (GpuForwardRef).
       - name: Compile bench-gpu fixtures
         shell: bash
         run: |
           "$JDK/bin/javac" -d bench-gpu bench-gpu/GpuWarm.java bench-gpu/GpuCompute.java bench-gpu/GpuProbe.java
-          "$JDK/bin/javac" -d test_classes/gpu test_classes/gpu/EligibleVectorAdd.java test_classes/gpu/BoundsDeopt2.java
+          "$JDK/bin/javac" -d test_classes/gpu test_classes/gpu/EligibleVectorAdd.java test_classes/gpu/BoundsDeopt2.java test_classes/gpu/GpuForwardRef.java
 
       - name: Run GPU offload gate
         shell: bash

@@ -68,3 +68,90 @@ Ran the complete 651-class Tomcat suite under all three GC backends in parallel 
 - **This is already mitigated at the product level**: ZGC has been the shipped default since 2026-08-10 specifically because it cannot exhibit this class of fallback. Anyone hitting this is doing so under an explicit `-XX:+UseGenerationalGC`.
 - **A real fix, if ever undertaken, is the same one named throughout Part 2**: precise oop maps or a shadow stack for compiled frames, so `moving_young_coverage_complete()` can actually certify what it currently has to assume. That is a substantially larger undertaking than anything in Part 1, and nothing in this investigation's history suggests a smaller intervention (timeout increases, isolated fallback-reason fixes like `innermost_frame_method`) will clear the DoHead family specifically — the Spring Boot investigation already found that two of its four classes needed a collector switch, not a fix, for exactly this reason.
 - **Not chased further here**: per-fallback-reason attribution specific to the DoHead family (which of the seven reasons dominates *this* class shape, the way the Spring Boot doc did for its four classes) would be the natural next step if someone wants to reduce fallback volume rather than switch collectors — not attempted in this session.
+
+## Part 4 — 2026-09-06: today's full-suite CRASH does not reproduce at small scale, on current dev
+
+A fresh complete 640-class, 3-GC-arm-concurrent Tomcat run on `dev` (worktree
+built at `8d83c7585`, before today's later GC/JIT landings) scored the
+DoHead family at **2 CRASH / 51 FAIL / 5 HANG of 64** under Generational,
+against **0 FAIL / 1 FAIL / 0 FAIL** on G1/ZGC respectively — on its face a
+reconfirmation of this page's mechanism. The two CRASH classes
+(`TestHttpServletDoHeadInvalidWrite1ValidWrite1024`,
+`...InvalidWrite512ValidWrite0`) both scored `rc=137` (SIGKILL) at
+260–290 s, which is this run's harness cap acting on a class that didn't
+finish — the same "throughput, not deadlock" shape as the rest of this page,
+just classified `CRASH` instead of `HANG` by this particular harness's
+rc-to-status mapping.
+
+**But it does not reproduce on the current dev tip (`f45fe11d0`, after
+merging 87 commits including the pin-discharge and moving-young-withdrawal
+work from today) at smaller scale:**
+
+| condition | binary | result |
+|---|---|---|
+| Standalone, 1 process, 3 classes (the 2 CRASH classes + one control) | `f45fe11d0` | **3/3 PASS in 13–15 s each.** `CRATONVM_GC_STATS`-style tracing on a direct repro of one class showed `[GC] decision: no collection has run yet` — the process never even ran a young collection, let alone a moving one. |
+| 3-way concurrent (Generational + G1 + ZGC simultaneously, same 3 classes each — light contention, not the full 640-class scale) | `f45fe11d0` | **9/9 PASS**, 16–20 s each on all three arms, including Generational. |
+
+Both checks used the identical launch path (`run-tomcat-suite-3gc-20260906.sh`
++ `EXTRA_VM_ARGS`) as the original run, so the GC selection itself is not in
+question — a direct repro confirmed `moving_young_requested=true` under
+`-XX:+UseGenerationalGC`. The only things that changed were (a) the dev
+commit and (b) the scale/duration of concurrent host load.
+
+**This does not overturn Parts 1–3.** The architectural mechanism there was
+established with direct instrumentation (`[moving-young] fallback` line
+counts, `CRATONVM_GC_STATS` decision histograms) on classes that were shown
+to *actually enter* a moving cycle and fall back. Nothing here re-examined
+that evidence, and it stands.
+
+**What this does open is a real, unresolved question**: how much of
+*today's* full-640-class 3-arm-concurrent CRASH/FAIL/HANG total for this
+family is the moving-young-fallback mechanism specifically, versus sustained
+multi-hour 3-way host contention (CPU + memory pressure from three complete
+640-class sweeps running in parallel) pushing an otherwise-modest per-class
+GC tax over a ~300 s cap — the same "shard count is part of the measurement"
+effect `nonpassed-class-census.md` already documents for other Tomcat
+classes on this exact suite. At the scale tested here (a 3-class burst,
+either alone or under matching 3-way concurrency), the mechanism did not
+engage at all — no young collection ran even once.
+
+**Not settled, and not chased further today**: a real answer needs a
+full-scale reproduction — the actual 640-class, hours-long, 3-arm-concurrent
+condition, on `f45fe11d0` — with `[moving-young] fallback` line counts
+captured per class, the way Part 3's original 08-10/08-12 sweeps did. That
+was not attempted here (it is the same multi-hour cost as the original
+measurement). Until that is run, treat today's specific 2-CRASH data point
+as **unconfirmed at the current dev tip**, not as a fresh reproduction of
+this page's mechanism.
+
+**Note added while landing the above (same day, later merge)**: `dev` just
+landed
+`moving-young-fallback-was-residue-and-not-the-cost-FIXED-20260906.md`,
+a different workload (Spring Boot's Kafka integration test) but a finding
+that bears directly on this page's central assumption. Two things it
+establishes there:
+
+1. Most `[moving-young]` fallback triggers were a **false positive** in the
+   A5 coverage probe (a stale return address left below a compiled frame's
+   own `entry_sp`), now screened out by default
+   (`CRATONVM_JIT_A5_RESIDUE_FILTER=1`). This page's own fallback-reason
+   tallies (§7 of the netty page this history cites, and the DoHead
+   fallback-reason breakdown in Part 2) predate that screen and may
+   overcount for the same reason.
+2. More importantly: **the non-moving sweep this page calls the "sound,
+   fail-closed response" is not unconditionally safe.** On that workload it
+   reclaimed a live object outright — `CRATONVM_DBG_SWEEP_ZERO=1` caught a
+   `NativeThreadSet` zeroed by the non-moving sweep while still reachable
+   through a register/native-stack root the marker missed — and that, not
+   any throughput cost, was the test's real failure.
+
+**This page's "Not a correctness bug" verdict for the DoHead family is not
+re-examined by that finding** — nobody has run `CRATONVM_DBG_SWEEP_ZERO=1`
+against a DoHead-family class to check for the same live-reclaim signature,
+and the two workloads are different enough (this page's failures are all
+timeouts, not `ClassCastException`/`NullPointerException`-shaped wrong
+answers) that the same mechanism should not be assumed. But the general
+premise this page's verdict leans on — "falling back to non-moving is
+safety-first" — no longer holds unconditionally project-wide, and that is
+worth knowing before treating any future DoHead-family symptom as "just
+throughput" without checking.
