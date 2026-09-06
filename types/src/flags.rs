@@ -1422,6 +1422,32 @@ pub struct GcFlags {
     pub g1_dbg_rset: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
+    /// `CRATONVM_G1_RETIRE_FORWARDS_LATE` — on unless `0`. Retire the pause's
+    /// from-space forwarding tags between Phase 4 and Phase 5 on the PARALLEL
+    /// evacuation drivers, which is where the three serial drivers have always
+    /// retired theirs.
+    ///
+    /// The parallel drivers used to retire at the end of `parallel_evacuate`
+    /// instead, and Phase 3.5 (`resurrect_dead_finalizers`) sits between the
+    /// two points. Since F-02 the serial `evacuate_object` decides "already
+    /// evacuated?" by the forwarding tag alone, so retiring first made Phase
+    /// 3.5 copy every already-evacuated object a SECOND time and overwrite its
+    /// forwarding-map entry with the duplicate — an identity split, silent
+    /// because the duplicate is well-formed. The old placement also left Phase
+    /// 3.5's own forwards installed past the end of the pause.
+    ///
+    /// `=0` restores the old placement, so the defect can be reproduced and the
+    /// fix attributed on one binary.
+    pub g1_retire_forwards_late: bool,
+    /// `CRATONVM_G1_REEVAC_GUARD` — on unless `0`. Let `evacuate_object`
+    /// consult the pause's `pointer_map` when the from-space mark word carries
+    /// no forwarding tag, and answer from it rather than making a second copy.
+    ///
+    /// A fail-closed net under `g1_retire_forwards_late`, not a substitute for
+    /// it: the counter behind it (`reevacuated_after_retire`) is what turns
+    /// "some driver retires too early" from an inference into a number, and it
+    /// counts whether or not this switch is on.
+    pub g1_reevac_guard: bool,
     /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
     /// OFF.** Make G1 refuse to evacuate on any pause whose JIT root set is
     /// recorded as incomplete, by forcing an empty collection set.
@@ -1765,6 +1791,8 @@ impl GcFlags {
             identity_hash_evict: on_unless_zero(src, "CRATONVM_IDENTITY_HASH_EVICT"),
             g1_dbg_rset: present(src, "CRATONVM_G1_DBG_RSET"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
+            g1_retire_forwards_late: on_unless_zero(src, "CRATONVM_G1_RETIRE_FORWARDS_LATE"),
+            g1_reevac_guard: on_unless_zero(src, "CRATONVM_G1_REEVAC_GUARD"),
             g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_pin_empty_publication: present(src, "CRATONVM_G1_PIN_EMPTY_PUBLICATION"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),

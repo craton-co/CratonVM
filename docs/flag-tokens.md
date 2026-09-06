@@ -59,13 +59,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-526 tokens.
+527 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
 | `aastore-barrier-gate-sites` | `CRATONVM_DBG_AASTORE_BARRIER_GATE` |
 | `a5-census` | `CRATONVM_DBG_A5_CENSUS` |
+| `a5-fallback` | `CRATONVM_DBG_A5_FALLBACK` |
 | `ffm` | `CRATONVM_DBG_FFM` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
@@ -592,7 +593,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-371 tokens.
+373 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -613,6 +614,8 @@ export inherited from a parent shell.
 | `frame-bands` | `CRATONVM_JIT_NO_FRAME_BANDS` |
 | `oopmap-coverage-presence-only` | `CRATONVM_JIT_OOPMAP_COVERAGE_PRESENCE_ONLY` |
 | `unreg-accept-residue` | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` |
+| `a5-residue-filter` | `CRATONVM_JIT_A5_RESIDUE_FILTER` |
+| `a5-shape-filter` | `CRATONVM_JIT_A5_SHAPE_FILTER` |
 | `activation-global-mutex` | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` |
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
 | `alloc-spill-sink` | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` |
@@ -970,7 +973,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-156 tokens.
+158 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1008,6 +1011,8 @@ export inherited from a parent shell.
 | `g1-precise-only-roots` | `CRATONVM_G1_PRECISE_ONLY_ROOTS` |
 | `precise-only-roots` | `CRATONVM_GC_PRECISE_ONLY_ROOTS` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
+| `g1-retire-forwards-late` | `CRATONVM_G1_RETIRE_FORWARDS_LATE` |
+| `g1-reevac-guard` | `CRATONVM_G1_REEVAC_GUARD` |
 | `g1-live-region-memo` | `CRATONVM_G1_NO_LIVE_REGION_MEMO` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-eager-humongous` | `CRATONVM_G1_EAGER_HUMONGOUS` |
