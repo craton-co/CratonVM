@@ -806,6 +806,32 @@ pub struct GcFlags {
     /// HALF A/B — the abort it exists to reproduce would not come back, and the
     /// arm would read as evidence that the screens were not the fix.
     pub g1_parallel_evac_screen: bool,
+    /// `CRATONVM_G1_EVAC_COPY_WATCH` — record every to-space copy's first
+    /// header word as it is made, and re-read them at two checkpoints inside
+    /// the pause. **OPT-IN** ([`parse::non_empty_non_zero`]): a push per copy
+    /// under one lock.
+    ///
+    /// It answers one question and it is the question
+    /// `g1-eight-byte-write-at-a-live-objects-base-20260906` could only infer:
+    /// the corrupt holders that walk reports find are to-space copies, and
+    /// whether they were sound WHEN COPIED decides whether the writer is inside
+    /// the pause. Checkpoint 1 closes the parallel closure, checkpoint 2 the
+    /// serial self-forward drain.
+    pub g1_evac_copy_watch: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` — when the parallel evacuator's
+    /// reserved Free pool runs out, place the object in an EXISTING non-CSet
+    /// region of the destination type instead of failing the evacuation.
+    /// Default **ON** ([`parse::on_unless_zero`]); `=0` restores the pool-only
+    /// behaviour.
+    ///
+    /// The serial evacuator has always done this — `alloc_in_type_locked_scan`
+    /// scans every non-CSet region of the target type before claiming a Free
+    /// one — so this is a parity fix, not a new policy. MEASURED 2026-09-06:
+    /// the parallel arm declared to-space exhaustion for a 48-byte promotion
+    /// with 2017 of 2025 non-CSet Old regions still holding room, and every
+    /// such object became a self-forward, a kept CSet region and a
+    /// `retry_after_evacuation_failure` pass.
+    pub g1_parallel_evac_shared_dest: bool,
     /// `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` — a reference-slot candidate
     /// whose legacy header is IMPLAUSIBLE (a class id in the band no loader
     /// mints, class 0 carrying thousands of fields, or — since 2026-09-06 —
@@ -1736,6 +1762,11 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_parallel_evac_screen: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_SCREEN"),
+            g1_evac_copy_watch: non_empty_non_zero(src, "CRATONVM_G1_EVAC_COPY_WATCH"),
+            g1_parallel_evac_shared_dest: on_unless_zero(
+                src,
+                "CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST",
+            ),
             g1_evac_ref_implausible_refuse: non_empty_non_zero(
                 src,
                 "CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE",
