@@ -8819,6 +8819,25 @@ impl GenerationalHeap {
             let mut missed_old = 0usize;
             let mut reported = 0usize;
             let cap = 40usize;
+            // THE SCAN FRONTIER, captured before the walk below borrows the
+            // arena again.
+            //
+            // Cheney's contract is that every object in to-space is eventually
+            // scanned, which holds exactly while `scan_cursor` reaches
+            // `young_to.used()`. It does not hold by construction here: the
+            // main drain runs to the used() of ITS moment, then phase 2.5
+            // resurrects finalizable objects -- copying MORE into to-space --
+            // and the re-drain that follows is guarded by
+            // `if !dead_finalizers.is_empty()`. Any other late copy, on a cycle
+            // with no dead finalizers, leaves a tail nothing scans.
+            //
+            // So report the frontier next to the misses. `unscanned_tail > 0`
+            // with every missed referrer at or above the cursor is the
+            // difference between "the collector lost a pointer somewhere" and
+            // "these exact bytes were never looked at".
+            let final_scan_cursor = scan_cursor;
+            let to_used_at_verify = young_to.used();
+            let to_base_at_verify = young_to.base_ptr() as usize;
             let mut scan_obj = |space: &str, obj: *mut u8, header: &ObjectHeader| -> usize {
                 let mut n = 0usize;
                 // SAFETY: caller passes live objects from young_to/old_gen walks while STW.
@@ -8845,11 +8864,18 @@ impl GenerationalHeap {
                                 .get(&t)
                                 .copied()
                                 .unwrap_or_else(|| th.forwarding_address() as usize);
+                            let off = (obj as usize).saturating_sub(to_base_at_verify);
+                            let unscanned = space == "YOUNG" && off >= final_scan_cursor;
                             eprintln!(
-                                "[moving-young-verify] MISSED-HEAP-REWRITE {} {}@0x{:x} slot={} -> forwarded {} old=0x{:x} new=0x{:x}",
+                                "[moving-young-verify] MISSED-HEAP-REWRITE {} {}@0x{:x} off=0x{:x} \
+                                 scan_cursor=0x{:x} past_cursor={} slot={} -> forwarded {} \
+                                 old=0x{:x} new=0x{:x}",
                                 space,
                                 referrer,
                                 obj as usize,
+                                off,
+                                final_scan_cursor,
+                                unscanned,
                                 slot_id,
                                 target,
                                 t,
@@ -8884,6 +8910,14 @@ impl GenerationalHeap {
                 missed_young,
                 missed_old,
                 pointer_map.len(),
+            );
+            eprintln!(
+                "[moving-young-verify] scan frontier: scan_cursor=0x{:x} to_used=0x{:x} \
+                 unscanned_tail=0x{:x} dead_finalizers={}",
+                final_scan_cursor,
+                to_used_at_verify,
+                to_used_at_verify.saturating_sub(final_scan_cursor),
+                dead_finalizers.len(),
             );
         }
 
