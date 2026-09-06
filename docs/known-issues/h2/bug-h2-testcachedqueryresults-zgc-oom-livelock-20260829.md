@@ -81,18 +81,69 @@ So the residual has changed KIND. It is no longer a GC defect: it is H2's own
 lock timeout firing because the VM is slow enough to trip it. HotSpot runs this
 class in **9 s** with `actual: 100000` and no timeouts; these runs take 442-593 s.
 
-The shortfall tracks wall time, which is what a throughput explanation predicts
-and a correctness one does not:
+The shortfall tracks wall time across runs, which LOOKS like what a throughput
+explanation predicts:
 
 ```text
 442 s -> 31    470 s -> 30    524 s -> 32    524 s -> 34    593 s -> 63
 ```
 
-The slowest run has roughly double the timeouts of the fastest. Suggestive
-rather than proven on five points -- the decisive test is to raise H2's
-`LOCK_TIMEOUT` and see the count go to zero without the VM getting any faster.
-If it does, this class's remaining gap belongs on a throughput page and this one
-can be retired outright rather than merely resolved.
+The slowest run has roughly double the timeouts of the fastest.
+
+**That reading is REFUTED below. Do not act on it.** Two levers were tried and
+the second one settles it.
+
+### The `LOCK_TIMEOUT` test does not exist
+
+The first plan was to raise H2's `LOCK_TIMEOUT` and watch the count fall. It
+would have been INERT, and would have produced a "no change" that read as
+evidence. The statement is
+
+```sql
+SELECT counter FROM Counter WHERE id = 1 FOR UPDATE WAIT 0.5
+```
+
+and a per-statement `WAIT` clause overrides the session and database
+`LOCK_TIMEOUT` in H2. The budget is not configurable from outside the test.
+
+### `--Xmx` does not move this workload's speed, so it tests nothing
+
+Three interleaved pairs, same binary:
+
+| pair | wall | timeouts |
+|---|---|---|
+| 1g -> 4g | 715 -> 629 s | 113 -> 105 |
+| 1g -> 4g | 484 -> 458 s | 31 -> **44** |
+| 1g -> 4g | 435 -> 445 s | 28 -> **47** |
+
+-12%, -5%, +2% on wall. The lever does not manipulate the variable, and
+timeouts rose in two pairs of three.
+
+### `--nojit` does move it, and REFUTES the throughput reading
+
+| arm | wall | timeouts | compaction cycles |
+|---|---|---|---|
+| default | 429 s | 27 | 30 |
+| `--nojit` | 904 s | 40 | 25 |
+
+Wall **2.1x**, timeouts **1.5x**. And against the pooled set that is decisive:
+a load-contended run at **715 s had 113** timeouts, nearly THREE TIMES this
+904 s run. Wall time does not determine the count.
+
+**The mechanism is jitter, not throughput.** `WAIT 0.5` is a budget on ONE lock
+acquisition, not on the run. Uniform slowdown stretches the holder's critical
+section only modestly -- hence 2.1x wall buying 1.5x timeouts. What blows a
+500 ms budget is a SCHEDULING STALL: the lock holder descheduled under host load
+while the others wait. That is why the contended 715 s run tripled a uniformly
+slower one.
+
+**Consequence for anyone using this class as a metric.** `actual` is largely a
+property of the MACHINE, not of the VM. It is not a throughput score and the
+difference between 99937 and 99973 is host noise, not a regression or an
+improvement. The only figures here that survive a loaded host are the ones this
+page was really about: ref-array `OutOfMemoryError` and SIGSEGV, both of which
+are 0 in all 11 runs. Retiring this page needs a quiet-host quorum on those, not
+a better `actual`.
 
 **What this means for anyone reading the `actual` figure.** `99937-99970` is not
 a better or worse version of the `98304` at the top of this page; it is a
