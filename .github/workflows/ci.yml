@@ -51,8 +51,33 @@ jobs:
   #
   # `rustfmt --check --edition 2021` is used directly rather than `cargo fmt`
   # because cargo has no per-file mode. Deleted files are filtered out.
+  # IS THE FORMATTING THIS DIFF IS RESPONSIBLE FOR CORRECT?
+  #
+  # Not "is every changed file formatted?", which is what this job asked until
+  # 2026-09-06 and which it failed on 33 of the 60 preceding non-merge commits.
+  # 171 of the repository's 978 tracked `.rs` files are not rustfmt-clean, and
+  # they are the most-edited ones (`gc/src/lib.rs` 258 hunks, `vm/src/lib.rs`
+  # 177, `vm/src/runtime/interpreter.rs` 81), so the job was red on roughly half
+  # of all pushes for formatting the push did not introduce. A gate that is red
+  # on inherited debt half the time trains readers to ignore it — and this is
+  # the job whose non-zero exit ALSO means "your file no longer parses", which
+  # is precisely what must not be ignored.
+  #
+  # `tools/check_changed_rust_formatting.py` runs the same
+  # `rustfmt --check --edition 2021` over the same changed files and then keeps
+  # only the hunks that overlap lines the diff actually touched. Two `rustfmt`
+  # behaviours make that a script rather than three lines of `bash`, and the
+  # tool's header documents both: it follows `mod` declarations (so a hunk can
+  # be reported in a file the diff never opened), and its non-zero exit has two
+  # unrelated meanings (a parse failure is reported separately and always
+  # fails).
+  #
+  # Inherited hunks are COUNTED AND PRINTED, not dropped: the debt stays visible
+  # in every run, it just stops being charged to whoever touched the file next.
+  # docs/known-issues/the-fmt-ci-job-is-red-on-half-of-all-pushes-20260906.md
+  # has the census and the options for paying it down.
   fmt:
-    name: Formatting (changed files)
+    name: Formatting (changed lines)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +89,7 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Check formatting of changed Rust files
+      - name: Check formatting of the lines this diff touched
         shell: bash
         run: |
           set -euo pipefail
@@ -79,17 +104,7 @@ jobs:
               base="$(git rev-parse "$head^" 2>/dev/null || echo "$head")"
             fi
           fi
-          mapfile -t files < <(
-            git diff --name-only --diff-filter=ACMR "$base" "$head" -- '*.rs' \
-              | grep -v '^native-builtins/vendor/' || true
-          )
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "No Rust files changed; nothing to check."
-            exit 0
-          fi
-          printf 'Checking %d changed Rust file(s):\n' "${#files[@]}"
-          printf '  %s\n' "${files[@]}"
-          rustfmt --check --edition 2021 "${files[@]}"
+          python3 tools/check_changed_rust_formatting.py "$base" "$head"
 
   # DOES EVERY .rs FILE THIS DIFF TOUCHED STILL PARSE?
   #

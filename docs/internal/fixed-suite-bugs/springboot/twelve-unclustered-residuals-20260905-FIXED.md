@@ -13,10 +13,25 @@ run, with a different reflection-metadata exception each time), and
 `KafkaAutoConfigurationIntegrationTests#testEndToEndWithRetryTopics` on the
 generational collector at about one run in two (its `testStreams` — the row
 this page recorded — passes). Neither is a regression of the work here: the
-first reproduces on a pristine-dev binary under the same control. Both are
-re-filed as `known-issues/springboot/two-collector-specific-residuals-after-the-twelve-20260906.md`,
-which also says why the first is probably the G1 crash family's quiet twin
-rather than a Spring Boot problem.
+first reproduces on a pristine-dev binary under the same control. Both were re-filed, and on 2026-09-06 both were
+DIAGNOSED: neither is a Spring Boot residual, and they are two different
+collector defects that happen to need the same precondition (compiled frames on
+the stack while a young pause runs).
+
+* `known-issues/springboot/g1-parallel-evacuator-corrupts-live-references-20260906.md`
+  — G1's parallel evacuator leaves live references unremapped with the JIT warm.
+  5 of 6 runs fail on default; `CRATONVM_G1_PARALLEL_EVAC=0` is clean 8/8
+  across three dev tips. It is the non-crashing half of the family the
+  retired `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
+  write-up closed on a crash A/B — the header screens are on in that binary and
+  `CRATONVM_G1_PARALLEL_EVAC_SCREEN=0` changes nothing either way.
+* `known-issues/springboot/moving-young-jit-frame-fallback-costs-3-10x-20260906.md`
+  — the generational young collector declines to move on
+  `unregistered-jit-frame-on-stack` and runs a non-moving sweep instead, costing
+  3–10x; `--nojit` takes the fallback count 13 → 0 and a 600-second timeout to a
+  62-second pass. Sound behaviour, expensive; the gap is the JIT's root map.
+
+Both classes pass on ZGC, the shipped default, and on HotSpot.
 
 The page opened as "OPEN, shallow pass only" with twelve rows recorded from
 whatever signature the 2026-09-04/05 run's own log carried, and asked three
@@ -327,8 +342,8 @@ JIT on, one full pass of the twelve-class list per collector.
 | `GrpcChannelBuilderCustomizersTests` | 13 | PASS | PASS | PASS |
 | `GrpcClientAutoConfigurationTests` | 33 | PASS | PASS | PASS |
 | `HibernateJpaAutoConfigurationTests` | 71 | PASS | PASS | PASS |
-| `IntegrationAutoConfigurationTests` | 34 | PASS | **FAIL 1** (re-filed) | PASS |
-| `KafkaAutoConfigurationIntegrationTests` | 3 | PASS | PASS | **FAIL 1** (re-filed) |
+| `IntegrationAutoConfigurationTests` | 34 | PASS | **FAIL 1** (G1 parallel evacuator) | PASS |
+| `KafkaAutoConfigurationIntegrationTests` | 3 | PASS | PASS | **FAIL 1** (moving-young fallback) |
 | `KafkaAutoConfigurationTests` | 54 | PASS | PASS | PASS |
 | `KafkaMetricsAutoConfigurationTests` | 4 | PASS | PASS | PASS |
 

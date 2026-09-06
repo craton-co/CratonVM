@@ -1714,7 +1714,9 @@ pub fn try_dispatch(
             //    gets `FallThroughKeepHooked` rather than a permanent
             //    de-offload.
             let runtime_work = largest_primitive_array_len(shared, args);
-            if (runtime_work as u32) < shared.config.gpu_min_work {
+            if !admission_model_admits(&kernel.signature, runtime_work)
+                || (runtime_work as u32) < shared.config.gpu_min_work
+            {
                 if timed {
                     cratonvm_types::gpu_refusal_census::add(
                         2,
@@ -1846,6 +1848,91 @@ pub fn try_dispatch(
 /// Used to gate the transparent offload on real per-element work (the
 /// analyzer's `estimated_work` is a fixed placeholder and cannot).
 #[cfg(feature = "gpu-offload")]
+/// The fitted admission cost model, opt-in behind
+/// `CRATONVM_GPU_ADMIT_MODEL=1`.
+///
+/// `docs/gpu/offload-crossover-and-min-work-20260904.md` measured an 80-cell
+/// grid (4 element types x 3 intensities x 6-8 sizes) and fitted
+///
+/// ```text
+/// admit  iff   n * (L + c*ops)   >   overhead + k * bytes_moved
+///              \____ CPU ____/       \______ GPU _______/
+/// ```
+///
+/// with `bytes_moved = 2*w*n`. On that grid it is right 77/80 (96%)
+/// against 47/80 (59%) for the shipped `n >= 4096`, and it never admits
+/// a LOSS — all three misses are conservative refusals on `double[]`,
+/// whose CPU cost the fit underestimates at high intensity.
+///
+/// # Why this is off by default
+///
+/// The constants below were fitted on ONE device (RTX 2060, sm_75). That
+/// page's own conclusion is that they "want re-fitting on any device this
+/// ships to, which is an argument for measuring them at startup rather
+/// than baking them in". Baking them in and defaulting them on would ship
+/// this box's numbers to every other box. So this is the predicate, gated,
+/// with the measurement work it implies left visible rather than hidden
+/// behind a default.
+///
+/// Returns `true` (admit) when the model is off, so the caller's
+/// `--gpu-min-work` check is unchanged in the default configuration.
+#[cfg(feature = "gpu-offload")]
+fn admission_model_admits(sig: &jit_cuda::KernelSignature, n: usize) -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_ADMIT_MODEL")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if !on || n == 0 {
+        return true;
+    }
+    // Fitted on this box; see the doc comment.
+    const OVERHEAD_NS: f64 = 64_152.0;
+    const K_NS_PER_BYTE: f64 = 0.136;
+    const L_NS: f64 = 1.0;
+    /// Per ARITHMETIC BYTECODE, which is not the unit the page's table
+    /// prints. Its `ops` axis is the fixture's parameter, and each of
+    /// those "ops" is `v = v*a +/- b` — **two** arithmetic bytecodes
+    /// (`javap` on `GpuIntensitySweep`: ops=1/4/16 -> 2/8/32). So the
+    /// fitted 0.9 ns/op is 0.45 ns per bytecode, which is what
+    /// `body_ops` counts.
+    ///
+    /// Using 0.9 against a raw bytecode count doubles the CPU estimate
+    /// and makes the predicate ADMIT LOSSES: replayed over the published
+    /// grid it takes 4 of the 32 cells the wrong way, including
+    /// `int[]` at n=65536 (measured 0.90x) — reproduced on device before
+    /// this constant was corrected.
+    const C_NS_PER_ARITH_BYTECODE: f64 = 0.45;
+
+    // Widest element the kernel moves. `bytes_moved` is in + out, which
+    // is what the fit used.
+    let w = sig
+        .param_kinds
+        .iter()
+        .filter_map(|k| match k {
+            jit_cuda::ParamKind::I64Array | jit_cuda::ParamKind::F64Array => Some(8usize),
+            jit_cuda::ParamKind::I32Array | jit_cuda::ParamKind::F32Array => Some(4),
+            jit_cuda::ParamKind::I16Array => Some(2),
+            jit_cuda::ParamKind::I8Array | jit_cuda::ParamKind::BoolArray => Some(1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    if w == 0 {
+        // No array parameter: `bytes_moved` is not what this model
+        // describes. Defer to the scalar threshold.
+        return true;
+    }
+    let n_f = n as f64;
+    let ops = f64::from(sig.body_ops);
+    let cpu = n_f * (L_NS + C_NS_PER_ARITH_BYTECODE * ops);
+    let gpu = OVERHEAD_NS + K_NS_PER_BYTE * (2.0 * w as f64 * n_f);
+    cpu > gpu
+}
+
 fn largest_primitive_array_len(
     shared: &crate::vm::SharedVm,
     args: &[cratonvm_types::Value],

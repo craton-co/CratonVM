@@ -1839,6 +1839,49 @@ pub fn set_watched_referents(addrs: &[usize]) {
 /// unclassified=0` means "never looked", not "looked and found nothing". Those
 /// two readings point at opposite conclusions, so they must not share an
 /// encoding.
+/// Collections whose peer-JIT accounting was SKIPPED because `peer_depth`
+/// read as zero.
+///
+/// `refresh_moving_young_coverage_for_collection` only runs the peer handshake
+/// inside `if peer_depth > 0`. A zero therefore does not mean "the peers were
+/// accounted for" -- it means nothing was asked. On a workload where peers are
+/// continuously in compiled code that is the one door to the moving arm that
+/// no ledger guards, so it has to be countable separately from an accepted
+/// handshake.
+pub static PEER_DEPTH_ZERO_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// The subset of [`PEER_DEPTH_ZERO_TOTAL`] where the process-wide JIT depth
+/// read back STRICTLY LESS THAN this thread's own chain length.
+///
+/// That is not a quiet moment, it is a **provably inconsistent read**: this
+/// thread's frames are part of the global count, so `global >= local` holds for
+/// any consistent observation. `GLOBAL_JIT_DEPTH` is a striped counter and
+/// `peer_jit_depth()` reduces the difference with `saturating_sub`, whose
+/// source comment calls zero "the safe reading". It is safe for the
+/// subtraction; it is not safe for the CALLER, which reads zero as "no peers to
+/// account for" and takes the unguarded path to relocation. Any non-zero
+/// reading here is a cycle that relocated behind peers it never counted.
+pub static PEER_DEPTH_ZERO_TORN: AtomicU64 = AtomicU64::new(0);
+
+/// The subset of [`PEER_DEPTH_ZERO_TOTAL`] where the global depth was itself
+/// zero -- genuinely nobody in compiled code anywhere, the one legitimate way
+/// to see no peers. Split out so the legitimate case cannot inflate the
+/// suspicious one.
+pub static PEER_DEPTH_ZERO_GLOBAL_ZERO: AtomicU64 = AtomicU64::new(0);
+
+/// Record a `peer_depth == 0` observation, classified by whether it is
+/// explicable. Counters only -- an `eprintln` here perturbs the very timing
+/// that produces the phenomenon (a per-cycle print took moving cycles from 9
+/// to 0 on the netty repro).
+pub fn note_peer_depth_zero(global: usize, local: usize) {
+    PEER_DEPTH_ZERO_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if global == 0 {
+        PEER_DEPTH_ZERO_GLOBAL_ZERO.fetch_add(1, Ordering::Relaxed);
+    } else if global < local {
+        PEER_DEPTH_ZERO_TORN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub static XT_PASSES_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);
 /// Peers frozen and conservatively scanned this cycle.
 pub static XT_TAKEN_OVER_LAST_CYCLE: AtomicU64 = AtomicU64::new(0);

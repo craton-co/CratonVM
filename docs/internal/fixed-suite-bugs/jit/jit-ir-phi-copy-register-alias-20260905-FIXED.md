@@ -157,7 +157,45 @@ that in the allocator is the root fix and would make the screen above
 unnecessary; it also lengthens every phi's live range at every incoming edge,
 which changes pressure and allocation across the whole tier. That is a
 measurement project, not a correctness fix, and it is not what a wrong-answer
-bug should wait for. Left for whoever wants the instruction back.
+bug should wait for.
+
+**DONE 2026-09-06, opt-in: `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=1`.** The loop
+in `build_live_model` that attributes a phi's k-th value input to the k-th
+predecessor's outgoing-edge position already extends the SOURCE's interval to
+that position; it never extended the PHI's. One `lo[phi] = lo[phi].min(at)`
+there is the whole change. Only `lo` moves, deliberately: the phi is not USED
+at that position, so pushing a use would distort the spill heuristics, and
+setting `phi_out_bits` would make the phi live-OUT of a block that does not
+define it, which the backward dataflow would then propagate live-IN through
+every predecessor -- turning a one-position extension into a whole-CFG one.
+
+Engagement is the point and it is measured, one binary, the fixture above:
+
+| counter | interfere off | interfere on |
+|---|---:|---:|
+| `phi_copy_publish_deferred` | **3** | **0** |
+| `peak_live` | 152 | 151 |
+| `spilled` | 43 | 45 |
+| `splits` | 34 | 37 |
+| `scan_reloads` | 8 | 11 |
+| compile refusals / bailouts | 0 | 0 |
+| probe verdict | OK | OK |
+
+`publish_deferred` going 3 -> 0 is the proof that the allocator now declines to
+mint the aliasing at all, rather than the emitter cleaning it up afterwards --
+which is exactly what "fixing it at the source" has to mean. regression-suite
+is 91/91 in BOTH arms.
+
+**Left OFF by default on purpose.** Those are the numbers from one small probe
+on a host at load 20-30, and a pressure change cannot be priced that way: +2
+spills and +3 reloads here says nothing about a real workload, and
+`reg_publishes` dropping 19 -> 14 says some phis lost their register entirely.
+Before defaulting it on, price it on something with real register pressure
+(`CoverageBench`, the H2 corpus, netty) and look at `spilled`/`scan_reloads`
+there. Until then the two downstream guards are what carry correctness, and
+this flag is the way to check they are still needed: if `publish_deferred`
+reads 0 with the flag OFF on some workload, that workload never had the
+aliasing to begin with.
 
 The cost is one word load per deferred phi per edge, on edges that alias;
 `phi_copy_publish_deferred` (printed by `CRATONVM_DBG_IR_LINEAR_SCAN`) counts
@@ -165,6 +203,49 @@ them so a future session can see whether it ever fires. The alternative —
 running the resolver over the union of words and registers — would have to
 model a copy that writes two locations at once, which the `CopyOp` shape does
 not express.
+
+## The other lane that found this, and why both fixes stay
+
+`11abbff47` (`fix/springboot-psl-loaderjar-20260905`, merged hours after this
+one) reaches the identical root cause from a completely different workload and
+fixes it a different way. Its item 4 states the same sentence this page does --
+`emit_copy_op` "argues that `resolve_parallel_copy`'s slot ordering covers
+registers too -- true while each register belongs to one node, false across an
+edge" -- and its victim was ByteBuddy: ASM's `ff ff` forward-branch
+placeholders went unpatched, CratonVM's own verifier rejected the retransformed
+bytes (`branch at offset 89 targets 88`), and every `mock()` of a class failed.
+Two lanes hit it the same morning because `perf/ir-defaults-on-20260905` turned
+the register fast path on by default that day.
+
+Its fix is `gp_reg_owner`: `mark_gp_reg_live` now marks the register's PREVIOUS
+owner unreadable, so `resident_gpr` stops handing back a register the publish
+just overwrote.
+
+**Both are on `dev` and both are load-bearing. Do not delete either as
+redundant.**
+
+* `gp_reg_owner` TOLERATES the clobber and is the broader of the two: it covers
+  every publish, not only a phi edge, and it sends the stale reader back to its
+  home word.
+* The screen in this page PREVENTS the clobber at the phi edge, which is the
+  one case that interlock cannot repair. `emit_copy_op` reads a source whose
+  home was DROPPED through `assigned_gpr`, deliberately **not**
+  `resident_gpr` -- "there is nothing to fall back to". Clearing `gp_reg_live`
+  therefore does not stop that read; not emitting the clobbering publish does.
+  (The comment there argues such a register "is exclusively its own, a clause
+  of `phi_home_droppable`". This screen is what makes that true at an edge
+  rather than assumed.)
+
+Verified together on dev tip `48fff33f7`, 44 commits after this fix landed and
+with both mechanisms in the same file: the probe reads
+`PHI_COPY_REGISTER_ALIAS_OK` on all five arms (default, `--nojit`, HotSpot,
+`CRATONVM_JIT_IR_PHI_COPY_REGS=0`, `CRATONVM_JIT_IR_PHI_RESIDENCY=0`);
+`vm/tests/jit_ir_phi_copy_register_alias.rs` passes in 4.81 s; and the
+hibernate-reactive MySQL 23-class union is 22/23 one-class-per-JVM, the single
+failure being `SoftDeleteCollectionTest` with `checkpointTO=2` -- the 30-second
+budget of the sibling retired page on a load-20 host, not a miscompile --
+while `BasicTypesAndCallbacksForAllDBsTest`, the class this fix repaired, is
+28/28.
 
 ## Blast radius
 

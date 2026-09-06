@@ -169,11 +169,50 @@ this branch with an end-to-end regression test; the full write-up is
 
 ## The residual
 
-CratonVM's hibernate-reactive `SessionFactory` bootstrap is roughly **1.7x**
-HotSpot's on the full per-class wall (and several times HotSpot's once the
-shared container start is subtracted). That gap is the reason a 30-second
-budget is tight, and it is the only thing left here worth spending time on. It
-belongs with the existing cost families, not in a per-class bug page:
+**CORRECTED 2026-09-06.** This section first said the bootstrap is "roughly
+1.7x HotSpot's on the full per-class wall (and several times HotSpot's once the
+shared container start is subtracted)". That number came from comparing the
+per-class medians of two arms run hours apart on a shared host, and it does not
+survive a decomposition. Re-measured on dev tip `6430e495f`, same host, same
+JDK, three reps each, median:
+
+| stage | CratonVM | HotSpot | ratio |
+|---|---:|---:|---:|
+| VM boot floor (trivial `main`) | 400 ms | 206 ms | 1.9x, but 194 ms absolute |
+| `MetadataAccessTest` (no live DB) | 11.7 s | 9.7 s | **1.21x** |
+| `NoEntitiesTest` (+ MySQL container) | 30.5 s | 26.2 s | **1.16x** |
+
+So the real gap on this workload is **1.16-1.21x**, not 1.7x, and the VM boot
+floor is a rounding error against a 30-second budget. The 1.7x was an artifact
+of comparing arms taken at different host loads; the ratio on these workloads
+is dominated by Docker and moves with load, which is exactly why the page's
+own four-arm control had to run its two VMs under the SAME concurrency.
+
+**And the CPU is not where the page assumed.** The execution profiler added on
+2026-09-06 (`CRATONVM_PROFILE_SAMPLE_MS=10`) puts 837 samples against an 11.7 s
+wall for the no-DB stage -- so ~8.4 s of CPU and ~3.3 s of waiting -- and the
+ranking is dominated not by Hibernate but by the harness around it:
+Testcontainers' shaded Jackson annotation introspection
+(`AnnotatedClass.resolveMemberMethods/construct`, `TypeBindings.create`,
+`POJOPropertyBuilder.mergeAnnotations`), docker-java's HTTP parsing
+(`BasicLineParser.parseStatusLine`, `CharArrayBuffer.substringTrimmed`),
+`ServiceLoader` lookup, netty's `InternalThreadLocalMap`/`Recycler`, and
+log4j's `PluginRegistry`. `ArrayList.<init>` is the single hottest method at
+5.73%. Hibernate appears once in the top 25, at 1.55%
+(`AggregatedClassLoader.getResources`).
+
+Read that as a RANKING, not as percentages: the profiler samples at safepoint
+polls, so a thread blocked in a native call or parked contributes nothing and
+interpreted frames are over-represented against compiled ones.
+
+The practical consequence is that "make the hibernate-reactive bootstrap
+faster" is mostly NOT a Hibernate or `SessionFactory` problem on this
+harness.
+
+A 1.16-1.21x VM does not on its own put a class over 30 seconds; the container
+start does, and the VM gap decides which side of the line the sum lands on.
+Whatever is left of it belongs with the existing cost families rather than in a
+per-class bug page:
 
 * `docs/known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`
 * `../hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md` (the
