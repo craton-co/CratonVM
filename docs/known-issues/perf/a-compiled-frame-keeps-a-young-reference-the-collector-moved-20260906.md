@@ -43,6 +43,27 @@ switch. `CRATONVM_GC_RESERVE=0` keeps every granule mapped, so the same stale
 reference reads stale bytes instead of faulting — the fault is the *reporting*,
 not the *bug*. `--nojit` removes it entirely, so the holder is compiled code.
 
+## RELEASE ONLY, and re-confirmed after a dev merge
+
+**The debug binary does not reproduce it.** Four arms of the recipe above on a
+debug build — including `CRATONVM_GEN_UNCOMMIT=1` — all `rc=0`. Read that as a
+statement about codegen, not about the defect: the stale slot is a compiled
+frame's, and the debug tier inlines and spills differently. Every reproduction
+below is a release binary. An arm that "passes" on debug has not tested this.
+
+Re-run on 2026-09-06 against a release build of the branch merged with a dev
+that had gained several root and skip-span fixes in between — among them *"the
+ninth exit: a stack-trace pause published skip spans and never retired them"*,
+which was the most plausible candidate for having closed this by accident:
+
+| arm | reps | rc |
+|---|---|---|
+| `CRATONVM_GEN_UNCOMMIT=1` | 3 | **139, 139, 139** (6 s, 13 s, 7 s) |
+| default (off) | 3 | 0, 0, 0 |
+
+So none of those fixed it, and the reproducer is stable across a week of dev
+movement.
+
 ## Who holds it
 
 `CRATONVM_DBG_STALE_FRAME_WORDS=1`, which scans each compiled frame AFTER

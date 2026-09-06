@@ -38,7 +38,7 @@ that also invalidates two of this page's own numbers.
 | 6a | re-run the +153% four-worker parallel MARKING figure | **confirmed in direction, and it is now small.** The lever engages (`workers_last` 1→4→8, `parallel` 0→23); the drain goes 72 → 76 → 80 ms, monotone. The lock removal took the rest. |
 | 6b | one shared work-stealing GC worker pool | **the throughput case is refuted by 6a**: adding workers to the pool that exists makes it slower, so consolidating pools is a maintenance argument, not a pause one. |
 | 7 | old-generation give-back | **blocked, on a named defect with a reproducer** — see the compiled-frame record. The young give-back's fault window is real and reachable; adding a second one to the old generation before that is fixed would be adding a second way to crash. |
-| 8a | lock-free `needs_gc` | **landed**, with the choke point the page asked for and an oracle: 4550 checks, **0 divergences**. Measured at no difference on 8 threads — it is a shape change, not a throughput claim. |
+| 8a | lock-free `needs_gc` | **landed**, with the choke point the page asked for and an oracle: **63,661 checks, 0 divergences** on multi-threaded H2. Measured at no difference on 8 threads — it is a shape change, not a throughput claim. |
 | 8b | unify the three remembered sets | **already answered in the tree.** `g1_cards.rs` reassessed it on 2026-09-05 — the stated blocker is indeed gone, and the merge is still not worth making for a different and better reason (thirty shared lines, two genuinely different structures around them). |
 | 8c | ~3,000 lines of unwired machinery | **closed as a scope call, once.** The answer now sits in `gc/src/lib.rs` beside the module declarations, so the next reader meets it where they meet the modules instead of re-deriving it in a fourth file. |
 | 8d | volatile striping flat past 4 threads, "cause still unexplained" | **not open — it was fixed on 2026-08-27.** This page read the historical half of `collector.rs`'s own comment as a live finding. The cause was the stripe pool fitting in one cache line; padding each stripe to 128 bytes measured **1.64x at 24 threads** with a 1.00x single-thread control. |
@@ -750,6 +750,27 @@ Nothing is wrong with the bitmap. What was wrong was reading a sequential ABBA
 on a machine that ~20 other agents build on.
 
 ---
+
+## The oracle's first answer was about the oracle
+
+Worth recording because it is the third instrument on this page to have been
+wrong in a way that read as a finding.
+
+`CRATONVM_DBG_GC_TRIGGER_VERIFY=1` reported **0 divergences in 4550 checks** on
+a single-threaded probe, and then **88 in 69,922** the first time it ran on
+multi-threaded H2. Eighty-eight is a small number and it is exactly the shape a
+missing publish would have — `used` low, `free` and `capacity` agreeing.
+
+It was the verifier. It read the published triple and THEN took the lock, so a
+peer thread allocating between the two reads produced a `published` that lagged
+`actual` by one allocation. Acquire first, then read published, then read the
+arena: under the lock nothing can mutate and nothing can republish, so the two
+must be equal and a divergence means what it says. **63,661 checks, 0
+divergences** on the same workload with the order corrected.
+
+The tell that it was the reader and not the writer was there in the first
+report and worth naming: only ONE of the three published values ever diverged,
+always in the same direction, always by about one object.
 
 ## How these were measured, and why two of this page's own numbers do not stand
 

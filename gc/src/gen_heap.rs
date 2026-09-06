@@ -6622,13 +6622,27 @@ impl GenerationalHeap {
         // read-modify-write on a line every allocating thread wants, taken to
         // read three words that only tune a heuristic.
         let (used, free_list_bytes, capacity) = if trigger_lockfree_enabled() {
-            let published = self.young_from_published();
             if trigger_verify_enabled() {
-                // Under the lock the published triple must equal the arena --
-                // see `trigger_verify_enabled`. Taking the lock here is the
-                // whole point of the mode; it is off by default.
+                // THE LOCK FIRST, THEN THE PUBLISHED READ, and the order is the
+                // whole of the oracle's soundness.
+                //
+                // Reading the triple before acquiring lets a peer thread
+                // allocate between the two reads, and the verifier then reports
+                // its own race as a publish gap: `published` lags `actual` by
+                // exactly one allocation, every time, with `free` and
+                // `capacity` agreeing. Measured 2026-09-06 -- 0 divergences in
+                // 4550 checks on a single-threaded probe, then 88 in 69922 on
+                // multi-threaded H2, which is the signature of a racing reader
+                // rather than of a missing publish.
+                //
+                // Acquired first, nothing can mutate the arena and nothing can
+                // republish, so the published triple is the last unlock's state
+                // and the arena is that same state. They must be equal, and a
+                // divergence is what it claims to be: a mutation that reached
+                // the arena without passing through `YoungFromGuard::drop`.
                 let from = self.lock_young_from();
                 let actual = (from.used(), from.free_list_bytes(), from.capacity());
+                let published = self.young_from_published();
                 TRIGGER_VERIFY_CHECKS.fetch_add(1, Ordering::Relaxed);
                 if actual != published {
                     TRIGGER_VERIFY_DIVERGED.fetch_add(1, Ordering::Relaxed);
@@ -6644,7 +6658,7 @@ impl GenerationalHeap {
                 }
                 actual
             } else {
-                published
+                self.young_from_published()
             }
         } else {
             let from = self.lock_young_from();
