@@ -5056,11 +5056,15 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
 /// Called from JIT-emitted code AFTER the inline TLAB bump has already
 /// claimed `HEADER_SIZE + num_fields * SLOT_SIZE` bytes at `obj_ptr`
 /// and written only the `class_id` field at offset 0. This helper
-/// finishes the header (kind = Object, identity_hash_code, num_slots —
-/// the surrounding bytes are TLAB-zeroed so `mark_word`, `forwarding_ptr`,
-/// `gc_age`, `gc_flags`, etc. are already correctly initialized),
-/// installs primitive-field typed-zero defaults, and registers the
+/// finishes the header (the shape word — the rest of a 16-byte header is
+/// TLAB-zeroed, which is `kind = Object`, `element_type = Reference`,
+/// `gc_age = 0`, `gc_flags = 0` and a `MARK_NEUTRAL` mark word with no
+/// hash), installs primitive-field typed-zero defaults, and registers the
 /// object with the finalizer queue when its class overrides `finalize()`.
+/// It does NOT mint an identity hash: that is installed lazily on first
+/// request, into the mark word, and the store that used to do it here was
+/// writing to a header field deleted on 2026-08-07. See the layout comment
+/// in the body.
 ///
 /// Separating this from `jit_new_object` lets the JIT emit the cheap
 /// bump-pointer prologue inline (~5-7 instructions) and pay a single
@@ -5072,6 +5076,25 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
 /// freshly-bumped TLAB allocation of at least `HEADER_SIZE + num_fields
 /// * SLOT_SIZE` zeroed bytes with `class_id` already written at offset 0.
 /// `num_fields` must match the class metadata.
+/// `CRATONVM_JIT_POST_TLAB_HASH_STAMP`: restore the identity-hash store that
+/// [`jit_post_tlab_init`] made into the mark word until 2026-09-06.
+///
+/// A BISECTION LEVER, not a tuning knob — what it restores is the defect, so
+/// that the before and after of its fix are two runs of one binary rather than
+/// two binaries (`docs/` has the general argument; the specific one is that a
+/// crash reachable only on `CRATONVM_ZGC_JIT_TLAB=1` has no cross-binary
+/// control that is otherwise identical).
+///
+/// On: `RArrayStoreLibrary` SIGSEGVs in `displaced_hash_from_mark` and
+/// `ROverlaySystemGcStress` hangs, both about 23 runs in 25. Off: neither, in
+/// 25.
+fn jit_post_tlab_hash_stamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_POST_TLAB_HASH_STAMP").is_some()
+    })
+}
+
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_post_tlab_init(
     vm_ptr: i64,
@@ -5086,39 +5109,46 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     let class_id = ClassId::new(class_id_raw as u32);
     let raw_ptr = obj_ptr as *mut u8;
 
-    // Finish header: identity_hash_code, num_slots.
+    // Finish header: the shape word. Nothing else here is this helper's.
     //
-    // Everything else (kind, element_type, padding, mark_word,
-    // forwarding_ptr, gc_age/flags, array_length) is correctly zero
-    // already from the TLAB refill: `ObjectKind::Object` discriminant
-    // is 0, `ArrayElementType::Reference` is 0, `MARK_NEUTRAL` is 0,
-    // `gc_age=0`/`gc_flags=0`/`array_length=0` match a fresh object.
+    // LAYOUT, and it is 16 bytes (`types/src/heap_types.rs`, `HEADER_SIZE`).
+    // The reminder that stood here described a FORTY-byte header and had
+    // survived all three shrinks that produced this one -- `forwarding_ptr`
+    // folding into the mark word (32 -> 24, 2026-08-06), then
+    // `identity_hash_code`, then the `kind`/`element_type`/`gc_age`/`gc_flags`
+    // quartet into bits 48..63 (24 -> 16, 2026-08-07). A stale layout comment
+    // is not a documentation problem when raw `ptr.add(N)` stores are written
+    // from it; the identity-hash store below was written from this one.
     //
-    // Layout reminder (see `types/src/heap_types.rs`):
-    //   off  0: class_id (4 bytes)       — written inline by JIT
-    //   off  4: kind (1)                 — already zero == Object
-    //   off  5: element_type (1)         — already zero == Reference
-    //   off  6: padding (2)              — already zero
-    //   off  8: identity_hash_code (4)
-    //   off 12: array_length (4)         — already zero
-    //   off 12: shape / full num_slots (4)
-    //   off 20: gc_age + gc_flags + _gc_reserved — already zero
-    //   off 24: forwarding_ptr (8)       — already zero
-    //   off 32: mark_word (8)            — already zero == MARK_NEUTRAL
-    // CRIT (#23, BinTrees-18): the documented assumption "TLAB-refill
-    // leaves everything zeroed" is empirically violated on long runs.
-    // Defensively zero the four header bytes at offset 4 (kind=Object=0,
-    // elem=Reference=0, padding=0) and the array_length at offset 12.
-    // Without this, a kind=Object header can ship with a non-zero
-    // array_length (observed: 0x01010101 from prior byte[] data), which
-    // causes the GC walker to mis-decode the object as an array and step
-    // into the next object's payload — surfacing as ECJ's
-    // HashtableOfInt.put `/by zero` on a zero-length keyTable.
-    *(raw_ptr.add(4) as *mut u32) = 0;
-    // Compact reference-field layout: array_length (off 12) carries the body
-    // size in bytes and gc_flags (off 21) gets GC_FLAG_COMPACT — matching the
-    // inline header the JIT already wrote (idempotent), and required on the
-    // non-skip path so the helper does not clobber them back to legacy.
+    //   off 0..4   class_id                      -- written inline by the JIT
+    //   off 4..8   num_slots / shape             -- `NUM_SLOTS_OFFSET`
+    //   off 8..16  mark_word                     -- `MARK_WORD_OFFSET`
+    //                bits 0..2   lock state tag  -- `MARK_NEUTRAL` == 0
+    //                bits 2..33  identity hash   -- `MARK_HASH_SHIFT`
+    //                bits 48..64 kind / element_type / gc_age / gc_flags
+    //                            (`KIND_TAGS_BYTE_OFFSET` == 14,
+    //                             `GC_FLAGS_BYTE_OFFSET` == 15)
+    //
+    // A fresh TLAB object arrives with all of it zero, which is
+    // `kind=Object`, `element_type=Reference`, `gc_age=0`, `gc_flags=0`,
+    // `MARK_NEUTRAL` and no hash -- and `emit_inline_tlab_new` re-zeroes the
+    // mark word unconditionally rather than trusting that.
+    //
+    // CRIT (#23, BinTrees-18): the documented assumption "TLAB-refill leaves
+    // everything zeroed" is empirically violated on long runs, so the shape
+    // word is written rather than assumed. (It was `array_length` at offset 12
+    // when that was observed as `0x01010101` from prior `byte[]` data, which
+    // made the GC walker read the object as an array and step into the next
+    // object's payload -- ECJ's `HashtableOfInt.put` `/by zero`.) The store is
+    // superseded by the `shape` write a few lines below and kept because that
+    // one is conditional in shape, not in whether it happens.
+    *(raw_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32) = 0;
+    // Compact reference-field layout: `GC_FLAGS_BYTE_OFFSET` (the mark word's
+    // top byte) gets GC_FLAG_COMPACT -- matching the inline header the JIT
+    // already wrote (idempotent), and required on the non-skip path so the
+    // helper does not clobber it back to legacy. A whole-byte store is sound
+    // only because the object is FRESH: `gc_age` shares this byte, and it is
+    // zero exactly here and nowhere else.
     let compact_body = if cratonvm_types::compact_ref_fields_enabled() {
         cratonvm_types::class_layout(class_id_raw as u32)
             .filter(|l| l.field_count() == num_fields as usize)
@@ -5134,8 +5164,39 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         num_fields as u32
     };
     *(raw_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32) = shape;
-    let hash = vm.mem.heap.next_identity_hash();
-    *(raw_ptr.add(8) as *mut i32) = hash;
+    // NO IDENTITY-HASH STAMP HERE, and its absence is the fix.
+    //
+    // Until 2026-09-06 this read
+    //
+    //     let hash = vm.mem.heap.next_identity_hash();
+    //     *(raw_ptr.add(8) as *mut i32) = hash;
+    //
+    // written against a 24-byte header in which offset 8 was a dedicated
+    // `identity_hash_code: i32`. On 2026-08-07 that field was deleted and the
+    // header shrank to 16 bytes: offset 8 is now the MARK WORD
+    // (`cratonvm_types::MARK_WORD_OFFSET`), whose low two bits are the lock
+    // STATE TAG and whose bits 2..32 are the hash -- `MARK_HASH_SHIFT`. The
+    // store was never moved with the field, so it published a raw 31-bit hash
+    // over the tag: three values in four leave `mark_state != MARK_NEUTRAL`,
+    // and the object is then read as thin-locked, INFLATED (a monitor pointer
+    // synthesised out of hash bits -- the SIGSEGV in `displaced_hash_from_mark`)
+    // or FORWARDED (a relocation target synthesised the same way).
+    //
+    // The hash is installed LAZILY on first request, into the mark word and
+    // through the mark word's own accessors (`identity_hash_code` ->
+    // `java_identity_hash`), exactly as the interpreter's TLAB path leaves it:
+    // `init_object_header` writes no hash either. There is nothing for this
+    // helper to do about the hash, and the emitter agrees -- it zeroes both
+    // halves of the mark word (`emit_inline_tlab_new`, at `MARK_WORD_OFFSET`)
+    // immediately before the call.
+    //
+    // `CRATONVM_JIT_POST_TLAB_HASH_STAMP=1` restores the old store so the
+    // before/after is a re-run of ONE binary. It is a bisection lever, not a
+    // tuning knob: what it restores is the defect.
+    if jit_post_tlab_hash_stamp() {
+        let hash = vm.mem.heap.next_identity_hash();
+        *(raw_ptr.add(8) as *mut i32) = hash;
+    }
 
     // Family-A forensics (CRATONVM_DBG_A2, default-inert): record the
     // JIT-inline allocation into the a2dbg breadcrumb ring, exactly like the

@@ -389,3 +389,274 @@ interrupted at 590/538/586 of 657 classes, so 133 classes are missing from at
 least one arm and are excluded from every count above. The 19-class list is
 therefore a **lower bound** — the remaining classes are mostly the known
 long-running/hanging ones, and some of them may add to it.
+
+## 10. 2026-09-06, later still: the mask has a name, §7's amplifier is dead, and there is now a repro that needs no unsafe flag
+
+Added by a second session working this page in parallel. Nothing above is
+deleted; three things in it are corrected, and the corrections are all
+measurements on one binary per arm.
+
+Binaries: dev `6430e495f` (`cvm-gy-20260906`, Linux; and a Windows build of the
+same commit) and the merged tip `c36129c34` / dev `f45fe11d0`
+(`cvm-gy2-20260906`, Linux).
+
+### 10.1 The mask is `unrewritable_conservative_jit_roots`, and it has a kill switch
+
+§0 says relocation stopped and does not say what stopped it. It is a term added
+to `gen_heap::collect_garbage_inner` on 2026-09-06, under the heading *"A CHEENY
+COPY CANNOT HONOUR A PIN"*:
+
+```rust
+let unrewritable_conservative_jit_roots = moving_young
+    && !gen_no_peer_pin_divert()
+    && has_conservative_roots
+    && crate::gc_quiescence::conservative_jit_scans() > 0;
+```
+
+Any cycle handed a conservatively-discovered JIT root while a compiled frame is
+live now diverts, reported as `nonmoving-conservative-jit-roots` — which is
+exactly the reason code §0 saw appear at 15 per run. It was landed against a
+QDox 4-thread SIGSEGV repro (3/3 → clean) and **it ships with a one-binary kill
+switch, `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`.** That switch is the tool this page
+has been missing.
+
+### 10.2 §7's `ASSUME=1` amplifier no longer amplifies — do not build on it
+
+`CRATONVM_XT_JIT_COVERAGE_ASSUME=1`, three reps on the merged tip,
+`DuplicatedByteBufTest`:
+
+| rep | NPE frames | moving cycles |
+|---:|---:|---:|
+| 1 | 0 | **0** |
+| 2 | 0 | **0** |
+| 3 | 0 | **0** |
+
+The divert in §10.1 sits **downstream** of the peer ledger, so forcing the
+ledger to accept changes nothing: the cycle is refused one term later. §7's
+table and §9's "use it to reproduce" are stale, and any future measurement that
+uses `ASSUME` as its amplifier will be vacuous.
+
+Two further readings from the same runs, with `CRATONVM_DBG_XT_COVERAGE=1`:
+
+* **the peer ledger never legitimately accepts.** `proven < peer_depth` on
+  essentially every decision — 13/13, 22/22, 15/16, 19/19, 20/22. §7 already
+  says "0 `accounted=true` out of 750"; this adds *why*, and the consequence
+  matters for §8. **Every failure this page has ever measured came from
+  relocating under peers that proved nothing.** "The precise maps are
+  incomplete" and "we relocated under a peer that never deposited a proof" are
+  different bugs, and no arm to date has separated them.
+
+### 10.3 The pin credit WAS a door — §7 refuted it with the wrong-direction switch
+
+§7 says *"The pin credit is not it. `pinned=0` in all 750 samples and
+`XT_PINNED_PEER_DEPTH=0` changes nothing."* Both observations are correct and
+neither is evidence, because **the credit is already off**: `70c486744` (2026-09-06)
+made `pinned_credit_admissible` require `pins_honoured`, and
+`VmHeap::honours_conservative_pins()` is `false` for Generational. Setting
+`XT_PINNED_PEER_DEPTH=0` turns a zero into a zero.
+
+The switch that moves is the one that commit added for exactly this purpose,
+`CRATONVM_XT_PINNED_PEER_UNPINNABLE=1`. On dev `6430e495f`, one binary per
+platform, three classes × three reps:
+
+| platform | arm | reps failing | moving cycles / rep |
+|---|---|---:|---|
+| Windows | default | **0 / 9** | 0–1 |
+| Windows | `…UNPINNABLE=1` | **9 / 9** | 13–25 |
+| Azure Linux | default | **0 / 9** | 0–2 |
+| Azure Linux | `…UNPINNABLE=1` | **9 / 9** | 6 |
+
+`DuplicatedByteBufTest` returns `ok=413 failed=3` — this page's own numbers — in
+the same four `*MultipleThreads` methods with the same
+`verifyInvokedAtLeastOnce` NPE. Across the full 19-class list, one rep each:
+**0 of 19 classes fail by default, 17 of 19 fail with the switch (52 individual
+tests).** `CRATONVM_DBG_XT_COVERAGE=1` shows the mechanism rather than inferring
+it:
+
+```
+default      [xt-coverage] peer_depth=5 proven=1 pinned=0 pins_honoured=false accounted=false
+UNPINNABLE   [xt-coverage] peer_depth=5 proven=1 pinned=4 pins_honoured=false accounted=true
+```
+
+238 cycles accepted *because of* a pin on the switched arm, 0 on the default.
+
+This also supplies the bisect §0 records as missing ("no arm rebuilt the old
+commit to confirm it"): `70c486744` is one of the two commits §0 names, and this
+is it, isolated on one binary.
+
+### 10.4 The repro this page should use from now on
+
+**`CRATONVM_GC_NO_PEER_PIN_DIVERT=1`, `io.netty.handler.ipfilter.UniqueIpFilterTest`,
+merged tip, plain `-XX:+UseGenerationalGC --Xmx 1g`.** No unsafe flag, ~25 s a
+rep, ~30 relocating cycles per run, and it crashes:
+
+| batch | reps | SIGSEGV | proven relocating cycles on the clean reps |
+|---|---:|---:|---|
+| soak | 5 | **1** | 29–39 |
+| naming probe | 8 | **2** | 21–37 |
+
+**3 of 13, and the pin credit is OFF in all of them.** That is the arm §8 needs
+and did not have: these cycles got through on the coverage proof itself, so this
+is the first measurement on this page that actually exercises the precise maps
+rather than bypassing them. §8's direction survives it.
+
+The Linux face is harder than the Windows NPE, and the crash handler names the
+shape without help:
+
+```
+#  SIGSEGV at pc=0x7407b1afff35, addr=0x7407cabdbc8f
+#  fault addr is inside a RECENTLY DECOMMITTED heap span: base=0x7407c2c00000 len=0xfa00000 site=unbumped-middle
+#  fault pc is inside a LIVE registered code buffer: base=0x7407b1aff000 cap=0x6e40
+```
+
+Compiled code dereferencing a stale pointer into evacuated space — the same
+"stale reference outside the heap" §6 concluded, now with the reader identified.
+
+Adding the pin credit on top (`NO_PEER_PIN_DIVERT=1` **and**
+`XT_PINNED_PEER_UNPINNABLE=1`) takes it to **SIGSEGV 6/6** in 3–39 s across two
+classes; each switch alone is far milder. So the two doors compose, and neither
+is the whole story.
+
+### 10.5 What the stale-word census names, and why its `resumed_from` zero is not an all-clear
+
+`CRATONVM_DBG_JIT_STALE_AFTER_REMAP=1` under the §10.4 repro — the first time
+this instrument has run against a workload that actually relocates, and it is
+the "name the storage class" step §8 asks for. Words still naming a moved-from
+address AFTER the remap, per rep, 8 reps:
+
+| `FrameLayout` region | verifiable=false | verifiable=true |
+|---|---:|---:|
+| `operand-spill` | 779–1400 | 211–703 |
+| `safepoint-gpr-spill-image` | 507–1062 | 0 |
+| `outgoing-args-or-deopt-regs` | 370–796 | 0 |
+| `java-local` | 0 | 24–54 |
+| `callee-saved-gpr-image` | **0** | **0** |
+
+Two things to carry forward, and the second is a caveat on the first:
+
+* **The 2026-08-23 repair holds.** `callee-saved-gpr-image` — the region that
+  bug was about — is zero in all eight reps. And
+  `CRATONVM_MOVING_YOUNG_VERIFY=1` reports 0–1 missed heap rewrites per rep,
+  reproducing §6's result on this configuration.
+* **`resumed_from=0` must NOT be read as "nothing resumes from these words".**
+  That flag is computed as `is_callee_saved_gpr_image(...)` and nothing else, so
+  it is `false` by construction for every row in the table above. It says "not
+  in the region we already fixed", not "harmless". Before this census can be
+  acted on, that classifier has to be widened to the regions something really
+  does resume from — at minimum the safepoint GPR spill image and reloaded
+  operand-spill slots.
+
+A second caveat on the raw counts: the detector reports any word whose value is
+a key of `pointer_map`, and dead stack slop holding an old object address
+matches. Thousands per run is therefore an upper bound on candidates, not a
+count of live stale references. Separating the two is what the widened
+`resumed_from` would buy, and it is the next measurement.
+
+### 10.6 Suite-wide state at the tip, and three corrections to §1's neighbours
+
+The full 733-class netty suite, one binary, Generational; then every class that
+did not PASS re-run on G1 and ZGC. **`NullPointerException` does not appear
+anywhere in the entire Generational arm** (against a working instrument: 2357
+`TestAbortedException`, 716 `NoClassDefFoundError`, 78 `UnsatisfiedLinkError`
+all enumerate normally). Eight classes looked Generational-only; re-run cleanly
+standalone, all eight dissolve:
+
+* five were **my own artifacts** — `process-died rc=143`, SIGTERM with zero
+  output, from killing a sweep-chain parent and from a watchdog whose `ps`
+  column parse read elapsed time as `4123168608s`. A family assembled from those
+  rows would have been fiction, which is the reason they are named here;
+* two (`LittleEndianHeapByteBufTest`, `PooledLittleEndianHeapByteBufTest`) were
+  HANG at the sweep's flat 180 s cap and finish in 71–75 s standalone;
+* `ChannelInitializerTest`'s one failure **also fails on HotSpot** on the
+  identical classpath.
+
+`NioEventLoopTest` (§1's list) is worth a line for the same reason: on the tip
+its 13 tests pass in 17 s and the VM then never exits. **HotSpot does exactly
+the same** — `ok=13 failed=0` in 5.7 s, then killed at its own cap. The non-exit
+is the fixture's non-daemon event loop, not a CratonVM defect.
+
+The three classes §1 lists as *not* covered by this page, one run each per
+collector on the tip:
+
+| class | Generational | G1 | ZGC | §1 said |
+|---|---|---|---|---|
+| `RecyclerTest` | failed=0 | **failed=6** | failed=0 | G1 only — **confirmed**, and the failures are `AssertionFailedError: expected: <3> but was: <4>`, a recycler count |
+| `DefaultPromiseTest` | **failed=1** | failed=0 | failed=0 | Gen **and** G1 — **moved**; the one failure is `TimeoutException: testListenerNotifyOrder() timed out after 120 seconds` |
+| `JdkDelegatingPrivateKeyMethodTest` | failed=0 | failed=0 | failed=0 | Gen **and** G1 — **now green everywhere** |
+
+### 10.7 Where this leaves the page
+
+Still **OPEN**, and §8's direction is now supported by an arm that tests it
+instead of bypassing it. The order of work has changed, though:
+
+1. Widen `resumed_from` (§10.5) so the stale-word census can be read. Until
+   then it names candidate regions and cannot rank them.
+2. Then §8's screens, using `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` as the
+   amplifier — **not** `ASSUME=1`, which no longer moves anything.
+3. Note for whoever repairs moving-young engagement, restating §0's warning with
+   its mechanism attached: the thing standing between a user and this bug is
+   `unrewritable_conservative_jit_roots`, and it is a deliberate correctness
+   term with a QDox repro behind it, not an accident. Removing it re-exposes
+   this at ~25 % per run on `UniqueIpFilterTest`.
+
+### 10.8 §8's blind-spill candidate is eliminated, and the surviving lead is `region=unclassified`
+
+`moving-young-corruption-rootcause.md` nominates three storage classes, and §8
+adopts them: **scalar-replacement slots**, **LICM hoist slots**, and the **blind
+GPR spill area**. One of the three can now be crossed off.
+
+`CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE=1` (added with this section) widens the
+register-image remap from the callee-saved GPR image alone to the entire
+unverifiable tail — so `operand-spill`, `safepoint-gpr-spill-image` and
+`outgoing-args-or-deopt-regs` all get rewritten. On the §10.4 repro:
+
+| arm | crashes / runs | rate |
+|---|---|---|
+| default | **11 / 81** | 13.6 % |
+| widened | **2 / 32** | 6.3 % |
+
+Fisher p ≈ 0.37 — **no difference**. Rewriting every one of those regions does
+not move the crash rate, so none of them holds the reference that faults. That
+eliminates the blind GPR spill area, and it also retires the worry in §10.5 that
+the narrow `resumed_from` classifier was hiding a live stale word in the other
+two: if one were live, writing it would have helped.
+
+**A methodological note, because this nearly went in as a finding.** The first
+batch read narrow 0/14 vs wide 2/14 and I wrote it up as "widening makes it
+worse". The pooled default rate is 13.6 %, so 2/14 *is* the baseline and 0/14
+was the outlier — and the second matched batch came back narrow 2/18 vs wide
+0/18, i.e. the same null with the arms swapped. Neither batch means anything
+alone. The pooled counts are the finding; a 14-rep arm against a ~14 % event is
+not an arm.
+
+**What survives.** The stale-word census (§10.5) has one population small enough
+to be real rather than dead slop: `region=unclassified`, at **0–6 words per
+rep** against thousands for every named region. They sit at fixed frame offsets
+in specific compiled methods —
+
+```
+method=io/netty/channel/DefaultChannelPromise.setSuccess:()Lio/netty/channel/ChannelPromise;      off=448
+method=io/netty/channel/ChannelInitializer.initChannel:(Lio/netty/channel/ChannelHandlerContext;)Z off=528
+method=io/netty/channel/AbstractChannelHandlerContext.findContextInbound:(I)L…;                    off=544
+```
+
+— and `FrameLayout::region_name` cannot place them, which is precisely what a
+**scalar-replacement or LICM hoist slot** would look like to a classifier that
+does not know those regions: §8's other two candidates, and the only ones left.
+Some rows even resolve a class (`io/netty/channel/embedded/…`), so they are not
+all noise.
+
+Stated honestly: the crashing reps carried 5 and 4 such words and two clean reps
+carried 0 — but another clean rep carried 6, so this is a **lead, not a
+correlation**, and it wants the per-cycle pairing (does a crash follow a cycle
+that left one of these behind?) rather than a per-run count.
+
+Next measurement, replacing §8's list:
+
+1. Teach `FrameLayout::region_name` the scalar-replacement and LICM hoist
+   spans, so `unclassified` resolves into one of them or stays genuinely
+   unknown. Right now the census cannot tell those two candidates apart, and
+   they are the last two standing.
+2. Pair the census with the fault per CYCLE rather than per run.
+3. Do **not** re-run the widening arm; §10.8 is 113 VM launches and the answer
+   is null.
