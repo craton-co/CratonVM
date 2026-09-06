@@ -231,7 +231,7 @@ stderr:
 /// already in flight and had already counted it in `expected`. The carrier
 /// went back to `wait_for_task_until`, nothing on that OS thread ever arrived
 /// for that `tid` again, and `wait_for_all` blocked forever. See
-/// `docs/internal/fixed-bugs/vthread-probe-intermittent-hang-FIXED-20260905.md`.
+/// `vthread-probe-intermittent-hang-FIXED-20260905.md`.
 ///
 /// This test remains a one-in-five detector for that defect, which is not a
 /// gate — `vthread_gc_stress_completes` below is the deterministic one.

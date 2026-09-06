@@ -5707,15 +5707,37 @@ impl ClassManager {
         // Every class definition in the process funnels through here, so this
         // is the one place the count can be taken. See `define_census`.
         crate::define_census::note(name);
-        if loader_flags().dbg_define
-            && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
-        {
-            eprintln!(
-                "[DEFINE-DBG] define_class name={} loader_id={:?} bytes_len={}",
-                name,
-                loader_id,
-                bytes.len()
-            );
+        // `CRATONVM_DBG_DEFINE=1` — one line per definition, naming the LOADER.
+        //
+        // The name filter was two hard-coded TestNG strings, which made the
+        // switch useless for every later "who defined this class, and under
+        // which loader?" question — and that is the question a duplicate
+        // class-identity defect always reduces to. It now honours
+        // `CRATONVM_DBG_DUPCLASS_FILTER` (the substring the sibling
+        // `[DBG_DUPCLASS]` trace already keys on, so one filter drives both
+        // halves of the investigation), and falls back to the historical pair
+        // when no filter is set so an existing recipe still works.
+        // `CRATONVM_DBG_DUPCLASS_BT=1` adds the Rust backtrace, which is what
+        // names the delegation path that reached this definition.
+        if loader_flags().dbg_define {
+            let hit = match loader_flags().dbg_dupclass_filter.as_deref() {
+                Some(f) => name.contains(f),
+                None => {
+                    name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass")
+                }
+            };
+            if hit {
+                eprintln!(
+                    "[DEFINE-DBG] define_class name={} loader_id={:?} bytes_len={}",
+                    name,
+                    loader_id,
+                    bytes.len()
+                );
+                if loader_flags().dbg_dupclass_bt {
+                    eprintln!("[DEFINE-DBG-BT] {name}
+{}", std::backtrace::Backtrace::force_capture());
+                }
+            }
         }
         if loader_flags().dbg_fbcglib
             && (name.contains("RepositoryConfiguration") || name.contains("RawFactoryMethod"))

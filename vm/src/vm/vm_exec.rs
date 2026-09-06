@@ -6922,14 +6922,26 @@ impl<'a> NativeContextImpl<'a> {
             // roots must also PIN their regions out of the collection set;
             // the spill slots holding them cannot be rewritten. Replace
             // semantics per thread; entry dropped at thread exit.
-            if self.shared.mem.heap.is_g1() {
+            // 2026-09-06: NOT `is_g1()` any more, and the note above is why —
+            // "the young sweep runs non-moving while any thread is in JIT" has
+            // been false for the generational collector since the cross-thread
+            // JIT coverage handshake landed (2026-08-23), and ZGC has been
+            // compacting since 2026-08-13. Both consume this registry; both
+            // were seeing only the INITIATOR's pins.
+            // `CRATONVM_GC_G1_ONLY_JIT_PINS=1` restores the old gate — see
+            // `runtime::interpreter::gc_and_alloc::g1_only_jit_pins`.
+            if !crate::runtime::interpreter::gc_and_alloc::g1_only_jit_pins()
+                || self.shared.mem.heap.is_g1()
+            {
                 let addrs: Vec<usize> = snapshot[jit_scan_start..]
                     .iter()
                     .map(|r| r.as_ptr() as usize)
                     .collect();
                 cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
             }
-        } else if self.shared.mem.heap.is_g1() {
+        } else if !crate::runtime::interpreter::gc_and_alloc::g1_only_jit_pins()
+            || self.shared.mem.heap.is_g1()
+        {
             cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
         }
         // Shadow-stack precise roots (mirrors the same fold in

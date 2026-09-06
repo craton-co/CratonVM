@@ -1337,13 +1337,33 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // JIT-frame slot is left dangling (the SteadyChurn `-XX:+UseG1GC` + JIT
     // wrong-result: the `live` list head, held only in a callee-saved register
     // and its canonical frame slot, went stale after the young GC moved it).
-    // Publish each conservative JIT-frame root so the G1 collector can pin its
-    // region. Gated on G1 (the generational path doesn't read this set) and on
-    // there actually being JIT roots this cycle.
-    if shared.mem.heap.is_g1() && roots.len() > jit_scan_start {
-        for r in &roots[jit_scan_start..] {
-            cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
-        }
+    // 2026-09-06: THE GATE ABOVE WAS THE INITIATOR'S HALF OF THE SAME STALE
+    // PREMISE the two deposit paths carried (see
+    // `conservative_roots::g1_only_jit_pins`). "The generational path doesn't
+    // read this set" was true when it was written and stopped being true
+    // twice: ZGC has withheld the PAGE of every address in
+    // `pinned_jit_roots_snapshot()` since compaction shipped (2026-08-13), and
+    // the generational moving-young cycle now diverts on a pin that lands in
+    // young-from (`gen_heap::collect_garbage_inner`). Gated on G1, both
+    // consumers saw an EMPTY set on their own collectors -- which for a
+    // pin-by-value consumer does not read as "nothing to pin", it reads as
+    // "relocate everything".
+    //
+    // `publish_pinned_jit_roots` rather than the per-address
+    // `add_pinned_jit_root` this replaces: the add form ACCUMULATES into this
+    // thread's entry and only G1 ever clears the map, so on the other two
+    // backends it would grow a set of pre-move addresses across every cycle of
+    // the run. Replace semantics keep the initiator's pins describing THIS
+    // cycle, exactly as the deposit paths already do for parked peers, and
+    // publishing an empty vector removes the entry rather than leaving the
+    // previous cycle's behind. For G1 the two are equivalent (it clears per
+    // cycle, and this is its only add site).
+    if !crate::runtime::interpreter::gc_and_alloc::g1_only_jit_pins() || shared.mem.heap.is_g1() {
+        let addrs: Vec<usize> = roots[jit_scan_start..]
+            .iter()
+            .map(|r| r.as_ptr() as usize)
+            .collect();
+        cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
     }
     // `CRATONVM_DBG_JIT_ROOTSCAN=1` — one line per COLLECTION naming why this
     // cycle's JIT pin set came out the size it did.
