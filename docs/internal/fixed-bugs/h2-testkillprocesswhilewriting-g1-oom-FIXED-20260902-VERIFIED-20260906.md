@@ -735,9 +735,30 @@ apps/h2database-suite-runner/run-h2-suite.sh:40
 CLASS_TO="${CLASS_TO:-300}"          # per-class timeout seconds
 ```
 
-**300 s is less than half this class's healthy runtime.** A suite run therefore
-reports `TestKillProcessWhileWriting` as HANG/TIMEOUT whether the defects on
-this page are fixed or not: the instrument's cap is below the measurement.
+**The class STRADDLES that cap, so the suite row flaps on host load alone.**
+Re-measured 2026-09-06 on binary `a044e1fe1` (a dev ancestor carrying both
+fixes), five runs interleaved on an idle box, load 4-7:
+
+| arm | rc | seconds |
+|---|---|---:|
+| G1 | 0 | 377 |
+| default | 0 | 224 |
+| G1 | 0 | 266 |
+| default | 0 | 299 |
+| G1 | 0 | 360 |
+
+**G1 3/3 PASS, default 2/2 PASS** — the fix holds, four days and 144+ commits
+after it landed, with the default collector as its control.
+
+Now put those against `CLASS_TO=300`: two of the three G1 runs (377 s, 360 s)
+exceed it and one (266 s) does not. On the LOADED host this page's original
+numbers came from it was 605-716 s and always exceeded it. So the same healthy
+binary reports PASS or TIMEOUT for this class depending on nothing but how busy
+the box is.
+
+That is worse than a cap that always fires. A row that always times out gets
+investigated; a row that flaps gets called flaky and dismissed, and the next
+reader has no reason to suspect the cap at all.
 
 That is not a hypothetical. It is the row
 `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
@@ -791,15 +812,24 @@ fixture losses recorded in `vm/tests/common/mod.rs`'s `require_fixture` doc
 happened. The durable fix is either to track the runner or to carry the cap in
 the invocation, and until one of those happens this note is the record.
 
-### What is NOT re-verified
+### Provenance of the 2026-09-06 re-verification
 
 Both fixes are still on dev (`f1bdfd028`, the finalizable-object humongous
 reclaim gate, and `607a16ea2`, the heap-full auto-box) — confirmed ancestors of
-`b7ca9affa`, so nothing was reverted. But the 3/3 pass is a **2026-09-02**
-measurement and has not been repeated since; dev is 144+ commits on. Re-running
-it needs ~35 min of host time and disk headroom the box did not have on 09-06
-(8.5 GB free, 98% full, three other lanes building). Treat the PASS as
-last-measured-then, not as continuously verified.
+`b7ca9affa`, so nothing was reverted.
+
+The binary was **not** built for this: the box was at 98% disk with three lanes
+building, and a release build would have filled it. `a044e1fe1` was already
+built in another worktree and was checked for the two properties that make it
+usable — it is an ANCESTOR of dev, and both fix commits are ancestors of IT —
+before any run. A binary from a diverged branch (`978d8e343`, also present and
+also freshly built) was rejected for failing the first test.
+
+The default-collector arm is the control, and it earns its place: it says the
+class and the harness work at all on this binary, so a G1 PASS is a statement
+about G1 rather than about the fixture. The first attempt at this table had NO
+control value at all — all four arms exited in `secs=0` on a classpath error of
+mine — and four rows reading `rc=1` looked exactly like four real failures.
 
 ## Why it is a different defect, measured rather than assumed
 
