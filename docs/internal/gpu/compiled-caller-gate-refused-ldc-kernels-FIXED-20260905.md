@@ -488,11 +488,12 @@ defect is not GPU-specific and was never in this subsystem. The 2-in-40
 on a binary carrying both `input_cache` fixes was correct evidence and
 correctly read.
 
-`residency-gc.sh` is nonetheless RED on `dev` as of 2026-09-06, for
-something else entirely and not intermittently: a deterministic SIGSEGV
-in the Generational arm, filed at
-[`known-issues/gpu/residency-gc-generational-sigsegv-20260906.md`](../../known-issues/gpu/residency-gc-generational-sigsegv-20260906.md).
-It reproduces 3/3 on a pristine build of this branch's own parent commit,
-interleaved against the branch binary, so it belongs to neither of these
-pages. Worth reading beside this one for the contrast in shape: that is a
-crash under one collector, this was a silent 7.5x under all of them.
+`residency-gc.sh` was nonetheless RED on `dev` as of 2026-09-06, for
+something else entirely: a deterministic Generational SIGSEGV, fixed the
+same day and written up at
+[native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md](../fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md).
+It reproduced 3/3 on a pristine build of this branch's own parent commit,
+interleaved against the branch binary, and it turned out to need neither
+the GPU nor the JIT gate — `--gpu` only amplified it. Worth reading beside
+this one for the contrast: that was a crash under one collector, this was
+a silent 7.5x under all of them.

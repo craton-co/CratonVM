@@ -8,6 +8,37 @@
 | **Probe** | `CRATONVM_DBG_SWEEP_ZERO=1` names the victim by class and sweep cycle |
 | **Supersedes** | the mechanism half of the retired `moving-young-jit-frame-fallback-costs-3-10x-20260906` page, which attributed this test's failure to `[moving-young]` fallbacks. It is not that — see "What this is not". |
 
+## A mechanism to test first, added 2026-09-06
+
+A defect with THIS PAGE'S EXACT SCOPE — Generational with the JIT on; HotSpot,
+ZGC, G1 and Generational `--nojit` all clean — was root-caused the same day, and
+it is not a collector bug at all:
+
+> a native that re-enters Java holds its argument snapshot across the
+> collection that re-entry can trigger. `safe_native_call_impl` pins every
+> argument, so nothing is collected, but it rebuilds the snapshot from those
+> pins only for a collection it runs ITSELF, before the callback. A young
+> collection inside the callback relocates the object — Cheney copy, or
+> selective promotion even on the non-moving path — and the snapshot keeps
+> naming the old address.
+
+The read through that stale address finds a zeroed header and decodes as
+`ClassId(0)` / `java.lang.Object`, which is exactly the signature this page
+reports.
+
+Why it is worth testing here before more collector work: this page's victims —
+`sun/nio/ch/NativeThreadSet`, `sun/nio/ch/FileChannelImpl` — are precisely the
+objects an `sun/nio/ch` native holds across a re-entrant call, and its
+conclusion that "the live ref was a register/native-stack root the marker
+missed" is what a stale Rust-side snapshot looks like from the marker's side.
+
+It is a DIFFERENT native, so the 2026-09-06 fix does not touch this test. The
+reproducer it came with is the useful part: `GpuResidencyGc 0 1024 800` under
+`-XX:+UseGenerationalGC`, ~20 seconds, no GPU and no Azure. Calibrate against
+that before spending another Kafka broker start.
+
+Full write-up: `native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+
 ## The defect
 
 ```text
