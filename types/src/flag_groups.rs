@@ -894,6 +894,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "refersto", on_key: Some("CRATONVM_DBG_REFERSTO"), off_key: None, off_word: None, since: "2026-07-07" },
     E { group: Group::DBG, token: "reflection-factory", on_key: Some("CRATONVM_DBG_REFLECTION_FACTORY"), off_key: None, off_word: None, since: "2026-07-09" },
     E { group: Group::DBG, token: "refproc", on_key: None, off_key: Some("CRATONVM_DBG_NO_REFPROC"), off_word: None, since: "2026-06-09" },
+    E { group: Group::DBG, token: "refproc-audit", on_key: Some("CRATONVM_DBG_REFPROC_AUDIT"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "refproc-remark", on_key: Some("CRATONVM_DBG_REFPROC_REMARK"), off_key: None, off_word: None, since: "2026-07-10" },
     E { group: Group::DBG, token: "remap-trace", on_key: Some("CRATONVM_DBG_REMAP_TRACE"), off_key: None, off_word: None, since: "2026-07-23" },
     E { group: Group::DBG, token: "replovr", on_key: Some("CRATONVM_DBG_REPLOVR"), off_key: None, off_word: None, since: "2026-07-23" },

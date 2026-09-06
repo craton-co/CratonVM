@@ -384,20 +384,145 @@ fn native_atomic_long_init_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(None)
 }
 
+/// The receiver of an `Atomic{Long,Reference}` instance native, or the
+/// `NullPointerException` the JVM specifies when there is not one.
+///
+/// # Why this exists rather than `unsafe_obj(args, 0).unwrap()`
+///
+/// Every native in this block used to open with that `unwrap()`, on the
+/// reasoning that an instance native cannot be reached without a receiver: a
+/// null-receiver `invokevirtual` is an NPE the interpreter raises before any
+/// native runs, and every JIT dispatch entry point screens `args[0]` (see
+/// `jit_invoke_dispatch`'s `Value::Object(None) => set_jit_pending_npe()` arm
+/// and `jit_invoke_virtual_mic`'s `receiver_raw == 0` arm). The reasoning is
+/// sound and the `unwrap()` was still wrong, because it makes the VM's own
+/// answer to "that invariant was violated" a **panic**.
+///
+/// MEASURED (Tomcat suite, 2026-09-05, Generational shard-0): three
+/// `jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite*` classes hit
+///
+/// ```text
+/// thread 'http-nio-127.0.' panicked at native-builtins/src/util_concurrent_ext.rs:583:36:
+/// called `Option::unwrap()` on a `None` value
+/// ```
+///
+/// from `AtomicReference.getAndSet`. The panic-catching machinery caught all
+/// three, so the process survived — but in two of them the catch rethrew into
+/// Java as
+/// `InternalError: JIT dispatch into ...AtomicReference.getAndSet... failed:
+/// native method panic`, which `Http2AsyncUpgradeHandler.handleAsyncException`
+/// then handled INSTEAD of the state transition the `getAndSet` was there to
+/// perform: the HTTP/2 header write never completed and the client's read
+/// timed out. A panic is thus not a safe way to report a broken invariant on a
+/// request-serving thread — it converts a null dereference (recoverable, and
+/// exactly what the spec asks for) into an unrelated `InternalError` on a path
+/// no application expects one from.
+///
+/// So: raise the NPE JVMS §invokevirtual specifies, and make the *invariant
+/// violation itself* visible through a diagnostic rather than through a stack
+/// unwind. The census below names the offending call site's Java stack, which
+/// is the datum the panic never carried.
+///
+/// This is deliberately NOT a silent null-tolerance shim. The `Err` return is
+/// a real, catchable Java exception and the diagnostic is on by default (rate
+/// limited), because "a live receiver reached a native as `None`" is a VM
+/// defect that must not become quiet.
+fn atomic_receiver(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match unsafe_obj(args, 0) {
+        Some(obj) => Ok(obj),
+        None => Err(report_lost_atomic_receiver(ctx, args, method)),
+    }
+}
+
+/// The cold half of [`atomic_receiver`]: count, report once in a while, and
+/// build the exception.
+///
+/// Rate limit is the house shape (`n < 4 || n.is_power_of_two()`, see
+/// `gc::heap::note_field_coercion_loss`), so a workload that trips this
+/// thousands of times costs a dozen lines rather than a flood — while the FIRST
+/// occurrence, which is the one a bisect needs, always prints.
+#[cold]
+fn report_lost_atomic_receiver(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+) -> MethodCallFailed {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    // What the slot actually held. `Object(None)` and "not an object at all"
+    // (a `Long` in a receiver slot, i.e. an argument-shift miscompile) are
+    // different defects and the message has to tell them apart.
+    let shape = match args.first() {
+        None => "no argument at all (the call passed zero arguments)".to_string(),
+        Some(Value::Object(None)) => "a null reference".to_string(),
+        Some(other) => format!("a non-object value ({other:?})"),
+    };
+    // THE ARITY IS THE DISCRIMINATOR, and it is why this prints the whole
+    // vector rather than just slot 0. An instance native's `args` is
+    // `[receiver, ..declared params]`, so `AtomicReference.getAndSet(Object)`
+    // must arrive with LENGTH 2. Length 1 means the receiver was never laid
+    // down and the DECLARED PARAMETER is sitting in slot 0 — a different
+    // defect entirely (an invoke-kind / argument-shift mismatch at the call
+    // site), and one that Tomcat's `applicationIOE.getAndSet(null)` disguises
+    // perfectly: the argument it passes IS null, so slot 0 reads
+    // `Object(None)` under both hypotheses.
+    let arity = args.len();
+    let all: Vec<String> = args.iter().map(|v| format!("{v:?}")).collect();
+    if n < 4 || n.is_power_of_two() {
+        eprintln!(
+            "[cratonvm] VM DEFECT: {method} reached its native with {shape} as the receiver \
+             (occurrence {n}, args.len()={arity}, args={all:?}). An instance native cannot be \
+             entered without a live receiver: the interpreter and every JIT dispatch entry \
+             point raise NullPointerException for a null one first, and an args.len() short of \
+             `1 + declared params` means the receiver slot was never laid down at all. Raising \
+             NullPointerException here (JVMS invokevirtual) rather than panicking; the Java \
+             call site follows."
+        );
+        // The Rust half names the dispatch path -- which of the several JIT
+        // and interpreter doors built these `args` -- and that is the datum
+        // the panic never carried either, because the panic was CAUGHT and
+        // its backtrace discarded. Opt-in on the standard variable so an
+        // ordinary run pays nothing.
+        if std::env::var_os("RUST_BACKTRACE").is_some() {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+        for entry in ctx.capture_stack_trace(0).iter().rev() {
+            eprintln!(
+                "  at {}.{}({}:{})",
+                entry.class_name,
+                entry.method_name,
+                entry.source_file.as_deref().unwrap_or("?"),
+                entry.line_number
+            );
+        }
+    }
+    RuntimeError::NullPointerException {
+        message: Some(format!(
+            "Cannot invoke \"{method}\" because the receiver is null"
+        )),
+    }
+    .into()
+}
+
 fn native_atomic_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.get()")?;
     Ok(Some(ctx.get_field_volatile(this, 0)))
 }
 
 fn native_atomic_long_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.set(long)")?;
     let val = args.get(1).copied().unwrap_or(Value::Long(0));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
 }
 
 fn native_atomic_long_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndSet(long)")?;
     let new_val = args.get(1).copied().unwrap_or(Value::Long(0));
     loop {
         let current = ctx.get_field_volatile(this, 0);
@@ -408,7 +533,7 @@ fn native_atomic_long_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_atomic_long_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.compareAndSet(long, long)")?;
     let expected = args.get(1).copied().unwrap_or(Value::Long(0));
     let new_val = args.get(2).copied().unwrap_or(Value::Long(0));
     let result = ctx.compare_and_swap_field(this, 0, expected, new_val);
@@ -422,7 +547,7 @@ fn native_atomic_long_get_and_increment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndIncrement()")?;
     let old = ctx.atomic_fetch_add_long(this, 0, 1)?;
     Ok(Some(Value::Long(old)))
 }
@@ -431,13 +556,13 @@ fn native_atomic_long_get_and_decrement(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndDecrement()")?;
     let old = ctx.atomic_fetch_add_long(this, 0, -1)?;
     Ok(Some(Value::Long(old)))
 }
 
 fn native_atomic_long_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.getAndAdd(long)")?;
     let delta = match args.get(1) {
         Some(Value::Long(d)) => *d,
         _ => 0,
@@ -450,7 +575,7 @@ fn native_atomic_long_increment_and_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.incrementAndGet()")?;
     let old = ctx.atomic_fetch_add_long(this, 0, 1)?;
     Ok(Some(Value::Long(old.wrapping_add(1))))
 }
@@ -459,13 +584,13 @@ fn native_atomic_long_decrement_and_get(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.decrementAndGet()")?;
     let old = ctx.atomic_fetch_add_long(this, 0, -1)?;
     Ok(Some(Value::Long(old.wrapping_sub(1))))
 }
 
 fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.addAndGet(long)")?;
     let delta = match args.get(1) {
         Some(Value::Long(d)) => *d,
         _ => 0,
@@ -475,7 +600,7 @@ fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_atomic_long_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicLong.intValue()")?;
     let val = ctx.get_field_volatile(this, 0);
     match val {
         Value::Long(v) => Ok(Some(Value::Int(v as i32))),
@@ -550,7 +675,7 @@ fn native_atomic_ref_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.get()")?;
     let val = ctx.get_field_volatile(this, 0);
     if crate::nbflags().dbg_loader_trace {
         if let Value::Object(Some(o)) = val {
@@ -573,14 +698,14 @@ fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_atomic_ref_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.set(Object)")?;
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field_volatile(this, 0, val);
     Ok(None)
 }
 
 fn native_atomic_ref_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.getAndSet(Object)")?;
     let new_val = args.get(1).copied().unwrap_or(Value::Object(None));
     loop {
         let current = ctx.get_field_volatile(this, 0);
@@ -591,7 +716,7 @@ fn native_atomic_ref_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_atomic_ref_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = unsafe_obj(args, 0).unwrap();
+    let this = atomic_receiver(ctx, args, "java.util.concurrent.atomic.AtomicReference.toString()")?;
     let val = ctx.get_field_volatile(this, 0);
     let text = match val {
         Value::Object(Some(obj)) => crate::lang_string::invoke_to_string(ctx, obj)?,
