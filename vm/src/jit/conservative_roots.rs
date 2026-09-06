@@ -4404,6 +4404,15 @@ pub fn refresh_moving_young_coverage_for_collection(pins_honoured: bool) -> bool
     }
     let mut complete = refresh_moving_young_coverage_for_current_thread();
     let peer_depth = peer_jit_depth();
+    if peer_depth == 0 {
+        // The unguarded door. Everything below is the peer ledger; a zero skips
+        // all of it, so a zero has to be recorded where it happens or it is
+        // indistinguishable from an accounted cycle in every census.
+        cratonvm_gc::gc_quiescence::note_peer_depth_zero(
+            global_jit_depth_raw(),
+            current_thread_jit_depth(),
+        );
+    }
     if peer_depth > 0 {
         let proven = cratonvm_gc::gc_quiescence::peer_proven_jit_depth();
         // Depth belonging to peers this cycle discharged by PINNING instead of
@@ -4528,6 +4537,16 @@ fn peer_jit_depth() -> usize {
     GLOBAL_JIT_DEPTH
         .get()
         .saturating_sub(current_thread_jit_depth())
+}
+
+/// The striped process-wide JIT depth, unreduced.
+///
+/// `peer_jit_depth` folds this into a difference and clamps at zero, which
+/// destroys the evidence for whether the zero was a quiet process or an
+/// inconsistent read. The classifier needs the raw value.
+#[inline]
+fn global_jit_depth_raw() -> usize {
+    GLOBAL_JIT_DEPTH.get()
 }
 
 /// May the cross-thread coverage handshake discharge `CROSS_THREAD_JIT_PEER`?

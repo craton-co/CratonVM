@@ -2141,18 +2141,18 @@ pub const INVENTORY: &[E] = &[
     // rather than one build apart. Statics are the first root class in this VM
     // carried as a SLOT rather than a value -- see `memory::roots::
     // STATIC_REF_SLOTS` for why they are the ones that can be.
-    // Opt-in: hand the evacuated young semi-space back to the OS at the end of
-    // each young collection instead of only zeroing it. The generational
-    // collector was the one backend that never gave memory back at all. Off by
-    // default for the same reason `g1-uncommit` is: it publishes the young
-    // arenas' full reserved range to the JIT, and a decommitted granule faults
-    // on touch rather than reading as zero.
+    // Default-ON opt-out: hand the evacuated young semi-space back to the OS at
+    // the end of each young collection instead of only zeroing it. The
+    // generational collector was the one backend that never gave memory back at
+    // all -- ZGC does it by default and G1 on request.
     //
-    // It WAS default-ON from 2026-09-05 to 2026-09-06, and the flip was
-    // reverted when that fault turned out to be reachable in ten seconds on the
-    // H2 JDBC corpus -- see `Flags::gen_uncommit` for the five-arm attribution
-    // and for why the defect it exposes belongs to a compiled frame rather than
-    // to this switch.
+    // Off for one day (2026-09-06) while the fault it makes loud was open: a
+    // decommitted granule faults on touch, so any stale young reference in a
+    // compiled frame becomes a SIGSEGV rather than a silent stale read, and one
+    // was reachable in ten seconds on the H2 JDBC corpus. That defect is fixed
+    // (`VmHeap::honours_conservative_pins`) and the default is back. `=0`
+    // remains the first thing to set if a compiled frame faults on a young
+    // address -- see `Flags::gen_uncommit` for the whole arc.
     // Opt-in: maintain an EXACT object-start bitmap
     // on the arenas whose owner asks for one (a bit per 8
     // bytes, set in `hand_out`, cleared in `add_free_block` and on reset) and
@@ -2166,7 +2166,7 @@ pub const INVENTORY: &[E] = &[
     // paired arms reproduce no win on either shape -- see
     // `arena::object_starts_enabled` for the two tables.
     E { group: Group::GC, token: "object-starts", on_key: Some("CRATONVM_GC_OBJECT_STARTS"), off_key: None, off_word: None, since: "2026-09-05" },
-    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: None, since: "2026-09-05" },
+    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::GC, token: "static-root-slots", on_key: Some("CRATONVM_GC_STATIC_ROOT_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     // Default-ON opt-out: the young-GC trigger predicate reads `used`,
     // `free_list_bytes` and `capacity` from a triple republished by the
