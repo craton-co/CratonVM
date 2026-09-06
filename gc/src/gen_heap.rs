@@ -44,6 +44,103 @@ use crate::heap::{
     AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
+
+// ---------------------------------------------------------------------------
+// The `young_from` guard, and the trigger predicate's lock-free read
+// ---------------------------------------------------------------------------
+
+/// A `young_from` mutex guard that republishes the GC-trigger triple on drop.
+///
+/// Derefs to [`Arena`], so every existing use reads unchanged. The point is the
+/// `Drop`: it is the one place a mutation of that arena can be observed leaving
+/// the lock, which is what makes
+/// [`GenerationalHeap::needs_gc_with_jit_allocation_frame`]'s lock-free read
+/// complete by construction rather than by having enumerated the writers. See
+/// [`GenerationalHeap::young_from_pub_used`].
+struct YoungFromGuard<'a> {
+    guard: parking_lot::MutexGuard<'a, Arena>,
+    used: &'a AtomicUsize,
+    free: &'a AtomicUsize,
+    capacity: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for YoungFromGuard<'_> {
+    type Target = Arena;
+    #[inline]
+    fn deref(&self) -> &Arena {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for YoungFromGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Arena {
+        &mut self.guard
+    }
+}
+
+impl Drop for YoungFromGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // Three relaxed stores while still holding the lock, so the triple a
+        // reader sees was consistent at SOME unlock. Relaxed is the right
+        // ordering and not a shortcut: the consumer is a heuristic whose wrong
+        // answer costs a collection decided one allocation early or late, and
+        // whose backstop (allocation failure -> collect -> retry) is what makes
+        // the collector correct. Nothing is published THROUGH these values.
+        self.used.store(self.guard.used(), Ordering::Relaxed);
+        self.free
+            .store(self.guard.free_list_bytes(), Ordering::Relaxed);
+        self.capacity
+            .store(self.guard.capacity(), Ordering::Relaxed);
+    }
+}
+
+/// `CRATONVM_GC_TRIGGER_LOCKFREE=0` -- kill switch. With it set, the trigger
+/// predicate takes `young_from.lock()` for its three numbers exactly as it did,
+/// so the change is one binary apart rather than one build apart.
+fn trigger_lockfree_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_GC_TRIGGER_LOCKFREE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// `CRATONVM_DBG_GC_TRIGGER_VERIFY=1` -- the coverage oracle for the published
+/// triple.
+///
+/// Reads the published values, then takes the lock and compares them with the
+/// arena. Under the lock the two MUST be equal: every writer holds this mutex,
+/// and [`YoungFromGuard::drop`] republishes before releasing it, so a reader
+/// holding the lock observes the state of the last unlock -- which is exactly
+/// what was published. A divergence is therefore not a race, it is a mutation
+/// that reached the arena without going through the guard, which is the only
+/// way this design can be wrong.
+fn trigger_verify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_TRIGGER_VERIFY").is_some()
+    })
+}
+
+/// Checks made by the verifier, and the ones that found a divergence.
+///
+/// Printed as a PAIR for the reason every engagement counter here is: a zero
+/// divergence count is equally consistent with "the publish is complete" and
+/// with "the verifier never ran", and only the check count tells them apart.
+static TRIGGER_VERIFY_CHECKS: AtomicUsize = AtomicUsize::new(0);
+static TRIGGER_VERIFY_DIVERGED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(checks, divergences)` -- see [`TRIGGER_VERIFY_CHECKS`].
+pub fn gc_trigger_verify_counts() -> (usize, usize) {
+    (
+        TRIGGER_VERIFY_CHECKS.load(Ordering::Relaxed),
+        TRIGGER_VERIFY_DIVERGED.load(Ordering::Relaxed),
+    )
+}
 // Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
 // instance fields are stored as 8-byte pointers per the per-class oop-map.
 use crate::gc_flags;
@@ -2229,7 +2326,7 @@ impl Drop for GenerationalHeap {
         // the discriminator: `store_region_bounds_locked` writes it to slot 0
         // of both tables, so a table still naming this heap's young-from arena
         // is a table this heap published and nobody has replaced.
-        let owned_base = self.young_from.lock().base_ptr() as usize;
+        let owned_base = self.lock_young_from().base_ptr() as usize;
         let published = JIT_REGION_BOUNDS.words[0].load(Ordering::Acquire);
         if published == owned_base {
             for w in JIT_REGION_BOUNDS.words.iter() {
@@ -2384,6 +2481,42 @@ pub struct GenerationalHeap {
     /// read-modify-writes they perform have no racing writer and a plain
     /// load/store pair is exactly equivalent to what the lock provided.
     young_gc_threshold: AtomicUsize,
+    /// The three numbers [`Self::needs_gc_with_jit_allocation_frame`] needs
+    /// from `young_from`, republished on every unlock of that mutex.
+    ///
+    /// # Why these exist rather than another `from.lock()`
+    ///
+    /// The trigger predicate runs on the ALLOCATION path -- once per
+    /// interpreter allocation slow path and once per JIT refill -- and it took
+    /// `young_from.lock()` for `used()`, `free_list_bytes()` and `capacity()`.
+    /// Even uncontended, that is an atomic read-modify-write on a line every
+    /// allocating thread wants, to read three words that are only a heuristic:
+    /// the alloc-failure backstop, not this predicate, is what makes the
+    /// collector correct. ZGC's equivalent predicate is two relaxed loads.
+    ///
+    /// # Why the choke point is the GUARD and not the mutation sites
+    ///
+    /// `arena.rs` has 83 assignments to `cursor` / `high_cursor` /
+    /// `free_bytes_total`, and the obvious shape -- publish beside each one --
+    /// is 83 chances to miss one, silently, with the symptom being a mistuned
+    /// GC trigger rather than anything that fails a test. Every one of those
+    /// writes happens under this mutex, so the mutex GUARD is a choke point
+    /// that already exists and cannot be bypassed: [`YoungFromGuard`]
+    /// republishes on `Drop`, so a mutation that forgets to publish is not
+    /// expressible.
+    ///
+    /// The reader gets a triple that was consistent at some past unlock, never
+    /// a torn one. Staleness is bounded by one lock hold and costs at worst a
+    /// collection decided one allocation late -- which is what the predicate's
+    /// own anti-livelock floor and the allocation-failure backstop already
+    /// tolerate by construction.
+    ///
+    /// `CRATONVM_GC_TRIGGER_LOCKFREE=0` takes the lock instead, so the two are
+    /// one binary apart; `CRATONVM_DBG_GC_TRIGGER_VERIFY=1` reads the published
+    /// triple, then takes the lock and asserts it agrees with the arena.
+    young_from_pub_used: AtomicUsize,
+    young_from_pub_free: AtomicUsize,
+    young_from_pub_capacity: AtomicUsize,
     // Volatile field access uses `SeqCst` fences inside
     // `get_field_volatile`/`set_field_volatile`; no global lock is
     // needed (and the previous `Mutex<()>` here serialised every
@@ -2854,6 +2987,9 @@ impl GenerationalHeap {
                 a.arm_object_starts();
                 a
             }),
+            young_from_pub_used: AtomicUsize::new(0),
+            young_from_pub_free: AtomicUsize::new(0),
+            young_from_pub_capacity: AtomicUsize::new(young_semi_size),
             young_to: Mutex::new({
                 let mut a = Arena::new(young_semi_size);
                 a.arm_object_starts();
@@ -3047,7 +3183,7 @@ impl GenerationalHeap {
     /// backing can move (swap/grow) or the heap is first sized. Cheap (3 short
     /// lock/read/store), and never on the hot mutator path.
     fn refresh_region_bounds(&self) {
-        let yf = self.young_from.lock();
+        let yf = self.lock_young_from();
         let yt = self.young_to.lock();
         let og = self.old_gen.lock();
         self.store_region_bounds_locked(&yf, &yt, &og);
@@ -3322,7 +3458,7 @@ impl GenerationalHeap {
     /// Bytes currently committed across both young semi-spaces and the old
     /// generation — the quantity [`heap_budget_bytes`] bounds.
     pub fn committed_heap_bytes(&self) -> usize {
-        let from = self.young_from.lock().capacity();
+        let from = self.lock_young_from().capacity();
         let to = self.young_to.lock().capacity();
         let old = self.old_gen.lock().capacity();
         from + to + old
@@ -3730,7 +3866,7 @@ impl GenerationalHeap {
             return;
         }
         let (young_used, young_free, young_cap) = {
-            let from = self.young_from.lock();
+            let from = self.lock_young_from();
             (from.used(), from.free_list_bytes(), from.capacity())
         };
         let (old_used, old_cap, old_free, old_largest, old_blocks) = {
@@ -3900,7 +4036,7 @@ impl GenerationalHeap {
         let end = self.region_bounds[0].1.load(Ordering::Acquire);
         let semi = match end.checked_sub(base) {
             Some(span) if span != 0 => span,
-            _ => self.young_from.lock().capacity(),
+            _ => self.lock_young_from().capacity(),
         };
         // Saturating arithmetic: a tiny semi-space (e.g. 1 KiB test heap)
         // can produce a 0-byte threshold under integer truncation — clamp
@@ -4837,7 +4973,7 @@ impl GenerationalHeap {
             return None;
         }
         let raw = addr as *const u8;
-        let in_region = self.young_from.lock().contains(raw)
+        let in_region = self.lock_young_from().contains(raw)
             || self.young_to.lock().contains(raw)
             || self.old_gen.lock().contains(raw);
         if !in_region {
@@ -6220,7 +6356,7 @@ impl GenerationalHeap {
         if addr & 0x7 != 0 {
             return false;
         }
-        let from = self.young_from.lock();
+        let from = self.lock_young_from();
         let base = from.base_ptr() as usize;
         if addr < base || addr >= base + from.used() {
             return false;
@@ -6296,7 +6432,7 @@ impl GenerationalHeap {
             }
         }
         {
-            let young = self.young_from.lock();
+            let young = self.lock_young_from();
             let base = young.base_ptr() as usize;
             let used = young.used();
             let free = young.free_blocks_sorted();
@@ -6335,7 +6471,7 @@ impl GenerationalHeap {
     /// answers that are a region rather than a block.
     pub fn reclaimed_hole_at(&self, addr: usize) -> Option<(&'static str, usize, usize)> {
         {
-            let from = self.young_from.lock();
+            let from = self.lock_young_from();
             let base = from.base_ptr() as usize;
             let used = from.used();
             let cap = from.capacity();
@@ -6440,6 +6576,31 @@ impl GenerationalHeap {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Lock `young_from`, republishing the trigger triple when the guard drops.
+    ///
+    /// The ONLY way this file takes that mutex. See
+    /// [`Self::young_from_pub_used`] for why the choke point is the guard
+    /// rather than the 83 assignments inside `arena.rs`.
+    #[inline]
+    fn lock_young_from(&self) -> YoungFromGuard<'_> {
+        YoungFromGuard {
+            guard: self.young_from.lock(),
+            used: &self.young_from_pub_used,
+            free: &self.young_from_pub_free,
+            capacity: &self.young_from_pub_capacity,
+        }
+    }
+
+    /// The trigger triple, without the lock: `(used, free_list_bytes, capacity)`.
+    #[inline]
+    fn young_from_published(&self) -> (usize, usize, usize) {
+        (
+            self.young_from_pub_used.load(Ordering::Relaxed),
+            self.young_from_pub_free.load(Ordering::Relaxed),
+            self.young_from_pub_capacity.load(Ordering::Relaxed),
+        )
+    }
+
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
         self.needs_gc_with_jit_allocation_frame(false)
@@ -6455,8 +6616,54 @@ impl GenerationalHeap {
     }
 
     fn needs_gc_with_jit_allocation_frame(&self, jit_allocation_frame: bool) -> bool {
-        let from = self.young_from.lock();
-        let used = from.used();
+        // The three numbers, without the lock. See
+        // [`Self::young_from_pub_used`] -- this predicate is on the allocation
+        // path, and its former `young_from.lock()` was an atomic
+        // read-modify-write on a line every allocating thread wants, taken to
+        // read three words that only tune a heuristic.
+        let (used, free_list_bytes, capacity) = if trigger_lockfree_enabled() {
+            if trigger_verify_enabled() {
+                // THE LOCK FIRST, THEN THE PUBLISHED READ, and the order is the
+                // whole of the oracle's soundness.
+                //
+                // Reading the triple before acquiring lets a peer thread
+                // allocate between the two reads, and the verifier then reports
+                // its own race as a publish gap: `published` lags `actual` by
+                // exactly one allocation, every time, with `free` and
+                // `capacity` agreeing. Measured 2026-09-06 -- 0 divergences in
+                // 4550 checks on a single-threaded probe, then 88 in 69922 on
+                // multi-threaded H2, which is the signature of a racing reader
+                // rather than of a missing publish.
+                //
+                // Acquired first, nothing can mutate the arena and nothing can
+                // republish, so the published triple is the last unlock's state
+                // and the arena is that same state. They must be equal, and a
+                // divergence is what it claims to be: a mutation that reached
+                // the arena without passing through `YoungFromGuard::drop`.
+                let from = self.lock_young_from();
+                let actual = (from.used(), from.free_list_bytes(), from.capacity());
+                let published = self.young_from_published();
+                TRIGGER_VERIFY_CHECKS.fetch_add(1, Ordering::Relaxed);
+                if actual != published {
+                    TRIGGER_VERIFY_DIVERGED.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[gc-trigger-verify] published=(used={pu} free={pf} cap={pc}) actual=(used={au} free={af} cap={ac}) -- a mutation reached the arena without passing through YoungFromGuard::drop",
+                        pu = published.0,
+                        pf = published.1,
+                        pc = published.2,
+                        au = actual.0,
+                        af = actual.1,
+                        ac = actual.2,
+                    );
+                }
+                actual
+            } else {
+                self.young_from_published()
+            }
+        } else {
+            let from = self.lock_young_from();
+            (from.used(), from.free_list_bytes(), from.capacity())
+        };
         // DBG: CRATONVM_DBG_GC_STRESS=<bytes> forces a young GC every <bytes>
         // of allocation, so the non-moving sweep's corruption detection fires
         // right after the corrupting write (the corruptor's interpreted caller
@@ -6480,7 +6687,7 @@ impl GenerationalHeap {
         // genuinely-occupied space; the moving collector resets the cursor
         // itself, so this is a no-op there. The alloc-failure→GC-and-retry path
         // remains the hard backstop against fragmentation under-collection.
-        let live = used.saturating_sub(from.free_list_bytes());
+        let live = used.saturating_sub(free_list_bytes);
         // Cheney copying needs the unused half as worst-case survivor
         // headroom. The opt-out non-moving collector instead sweeps in place,
         // so it can safely use the active semi-space almost to capacity.
@@ -6495,18 +6702,12 @@ impl GenerationalHeap {
             gc_flags().dbg_force_moving,
         );
         let threshold = young_gc_trigger_bytes(
-            from.capacity(),
+            capacity,
             self.young_gc_threshold.load(Ordering::Relaxed),
             non_moving_young,
             young_pause_goal_ms() > 0,
         );
-        young_trigger_debug(
-            used,
-            from.free_list_bytes(),
-            live,
-            threshold,
-            non_moving_young,
-        );
+        young_trigger_debug(used, free_list_bytes, live, threshold, non_moving_young);
         // Anti-livelock floor. Sample `live` once per completed collection (the
         // first `needs_gc` after `minor_gc_count` moves): if a collection just
         // ran and left the live set AT OR ABOVE the trigger, collecting again
@@ -6525,7 +6726,6 @@ impl GenerationalHeap {
         if self.young_trigger_seen_gc_count.load(Ordering::Relaxed) != gc_count {
             self.young_trigger_seen_gc_count
                 .store(gc_count, Ordering::Relaxed);
-            let capacity = from.capacity();
             let floor = if live >= threshold {
                 live.saturating_add(capacity / 16)
                     .min(capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100)
@@ -6539,7 +6739,7 @@ impl GenerationalHeap {
 
     /// Total bytes currently allocated across young and old generations.
     pub fn allocated_bytes(&self) -> usize {
-        self.young_from.lock().used() + self.old_gen.lock().used()
+        self.lock_young_from().used() + self.old_gen.lock().used()
     }
 
     /// Live-bytes estimate for GC-productivity accounting: like
@@ -6553,7 +6753,7 @@ impl GenerationalHeap {
     /// collecting, wedging the heap into the old-gen-spill → abort path).
     /// Same live metric `needs_gc` already uses for its trigger.
     pub fn live_bytes_estimate(&self) -> usize {
-        let from = self.young_from.lock();
+        let from = self.lock_young_from();
         let young_live = from.used().saturating_sub(from.free_list_bytes());
         drop(from);
         young_live + self.old_gen.lock().used()
@@ -6564,7 +6764,7 @@ impl GenerationalHeap {
     /// unaggregated. See [`crate::vm_heap::VmHeap::young_occupancy`] for why
     /// the aggregate alone cannot answer the question it gets asked.
     pub fn young_from_occupancy(&self) -> (usize, usize, usize, usize) {
-        let from = self.young_from.lock();
+        let from = self.lock_young_from();
         (
             from.used(),
             from.free_list_bytes(),
@@ -6602,7 +6802,7 @@ impl GenerationalHeap {
     /// confirming the misalignment mechanism. `field_idx` has bit 0x4000_0000
     /// set for a ref-array element. Locks `young_from`; call only OUTSIDE a GC.
     pub fn dbg_first_young_small_ref(&self) -> Option<(usize, u32, usize, usize, u64)> {
-        let from = self.young_from.lock();
+        let from = self.lock_young_from();
         let base = from.base_ptr();
         let used = from.used();
         let base_a = base as usize;
@@ -6765,7 +6965,7 @@ impl GenerationalHeap {
     /// survivor volume it saw until that volume changes by a factor of two —
     /// which is the signal that the live set, not the nursery, was the pause.
     fn adapt_young_trigger_to_pause(&self, pause_ms: u64, goal_ms: u64, bytes_copied: u64) {
-        let capacity = self.young_from.lock().capacity();
+        let capacity = self.lock_young_from().capacity();
         if capacity == 0 {
             return;
         }
@@ -6865,7 +7065,7 @@ impl GenerationalHeap {
             static CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (used, free_bytes, cap) = {
-                let from = self.young_from.lock();
+                let from = self.lock_young_from();
                 (from.used(), from.free_list_bytes(), from.capacity())
             };
             let (old_used, old_cap) = {
@@ -6939,7 +7139,7 @@ impl GenerationalHeap {
         // state — the bimodal-bt18 discriminator (is young allocatable
         // after this sweep, and from which structure?).
         if gc_flags().dbg_youngstate {
-            let from = self.young_from.lock();
+            let from = self.lock_young_from();
             let og = self.old_gen.lock();
             eprintln!(
                 "[youngstate] post-sweep used={}/{} free_list={} largest_free={} old={}/{}",
@@ -7326,7 +7526,7 @@ impl GenerationalHeap {
         // to-space). Normally long finished: the wipe takes tens of
         // milliseconds and cycles are seconds apart.
         self.join_evacuated_wipe();
-        let mut young_from = self.young_from.lock();
+        let mut young_from = self.lock_young_from();
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
 
@@ -9333,7 +9533,7 @@ impl GenerationalHeap {
         if watchref_dbg() {
             eprintln!("[watchref] sweep_young_non_moving ENTRY (non-moving path taken)");
         }
-        let mut young_from = self.young_from.lock();
+        let mut young_from = self.lock_young_from();
         let mut old_gen = self.old_gen.lock();
 
         // "Zeroed-a-live-object" detector cycle stamp (CRATONVM_DBG_SWEEP_ZERO).
@@ -13984,7 +14184,7 @@ impl GenerationalHeap {
         roots: &[ObjectRef],
         promotions: &cratonvm_types::PointerMap,
     ) -> (usize, cratonvm_types::PointerMap) {
-        let young_from = self.young_from.lock();
+        let young_from = self.lock_young_from();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
         // H2-CID0: the reserved TLAB tails of forcibly-stopped in-JIT peers.
@@ -15430,7 +15630,7 @@ impl GenerationalHeap {
         }
 
         let ptr = {
-            let mut from = self.young_from.lock();
+            let mut from = self.lock_young_from();
             let ptr = from.alloc(size, 8)?;
             // perf/gc-oracle-anchors (2026-07-25): this offset is an object
             // base by definition — record it as a sweep/oracle anchor. See
@@ -15463,7 +15663,7 @@ impl GenerationalHeap {
     /// each reclaiming nothing). Falling back to the free list here lets the
     /// allocation proceed from reclaimed space without a spurious GC.
     pub fn try_alloc_young_probe(&self, size: usize) -> Option<()> {
-        let mut from = self.young_from.lock();
+        let mut from = self.lock_young_from();
         // Bump tail.
         if let Some(aligned) = from.used().checked_add(7).map(|v| v & !7) {
             if let Some(end) = aligned.checked_add(size) {
@@ -15490,7 +15690,7 @@ impl GenerationalHeap {
     /// TLAB-refill gate, where a per-allocation `largest_free_block` scan of a
     /// fragmented young free list is exactly the pathology being avoided.
     pub fn young_bump_headroom(&self, size: usize) -> bool {
-        let from = self.young_from.lock();
+        let from = self.lock_young_from();
         if let Some(aligned) = from.used().checked_add(7).map(|v| v & !7) {
             if let Some(end) = aligned.checked_add(size) {
                 return end <= from.capacity();
@@ -15510,14 +15710,14 @@ impl GenerationalHeap {
     /// a GC — while a genuinely-full young answers `false` in O(1) and the
     /// caller takes the old-gen spill exactly as before.
     pub fn young_has_free_block(&self, size: usize) -> bool {
-        self.young_from.lock().has_free_block_at_least(size)
+        self.lock_young_from().has_free_block_at_least(size)
     }
 
     /// DBG: one-shot young-arena state snapshot `(used, capacity,
     /// free_list_bytes, largest_free_block)` — diagnostics only (full
     /// free-list scans under the lock).
     pub fn young_arena_diag(&self) -> (usize, usize, usize, usize) {
-        let from = self.young_from.lock();
+        let from = self.lock_young_from();
         (
             from.used(),
             from.capacity(),
@@ -15545,7 +15745,7 @@ impl GenerationalHeap {
             );
         }
 
-        let mut from = self.young_from.lock();
+        let mut from = self.lock_young_from();
         let available = from.remaining();
         if available < 256 {
             return None; // Not enough for a useful TLAB
@@ -15654,7 +15854,7 @@ impl GenerationalHeap {
     /// enough for the request.
     fn report_fatal_oom(&self, size: usize) {
         let (yf_used, yf_cap) = {
-            let f = self.young_from.lock();
+            let f = self.lock_young_from();
             (f.used(), f.capacity())
         };
         let (yt_used, yt_cap) = {
@@ -16690,7 +16890,7 @@ impl GenerationalHeap {
 
     /// The capacity of each young semi-space.
     pub fn young_semi_capacity(&self) -> usize {
-        self.young_from.lock().capacity()
+        self.lock_young_from().capacity()
     }
 
     /// The capacity of the old generation.
@@ -16700,7 +16900,7 @@ impl GenerationalHeap {
 
     /// The number of bytes currently used in the young from-space.
     pub fn young_from_used(&self) -> usize {
-        self.young_from.lock().used()
+        self.lock_young_from().used()
     }
 
     /// The number of bytes currently used in the old generation.
@@ -16710,7 +16910,7 @@ impl GenerationalHeap {
 
     /// Check if a pointer is in the young from-space.
     pub fn is_in_young(&self, ptr: *const u8) -> bool {
-        self.young_from.lock().contains(ptr)
+        self.lock_young_from().contains(ptr)
     }
 
     /// Check if a pointer is in EITHER young semispace. A PRE-GC young
@@ -16719,7 +16919,7 @@ impl GenerationalHeap {
     /// processing uses this to detect stale/dead pre-GC Reference addresses
     /// (in young + not in the pointer map ⇒ the object did not survive).
     pub fn is_in_young_either(&self, ptr: *const u8) -> bool {
-        self.young_from.lock().contains(ptr) || self.young_to.lock().contains(ptr)
+        self.lock_young_from().contains(ptr) || self.young_to.lock().contains(ptr)
     }
 
     /// Check if a pointer is in the old generation.
@@ -16768,7 +16968,7 @@ impl GenerationalHeap {
         // `gen_object_total_size` (which flags corrupt headers as size 0) with
         // the same `total_size < HEADER_SIZE` corruption stop.
         {
-            let young = self.young_from.lock();
+            let young = self.lock_young_from();
             let base = young.base_ptr() as usize;
             let used = young.used();
             let free_blocks = young.free_blocks_sorted();
@@ -16941,13 +17141,13 @@ impl GenerationalHeap {
         let target = raw[0] as usize;
         let t = target as *const u8;
         let (yf, yt, og) = (
-            self.young_from.lock().contains(t),
+            self.lock_young_from().contains(t),
             self.young_to.lock().contains(t),
             self.old_gen.lock().contains(t),
         );
         let holder_addr = obj_ref.as_ptr() as usize;
         let (hyf, hog) = (
-            self.young_from.lock().contains(holder_addr as *const u8),
+            self.lock_young_from().contains(holder_addr as *const u8),
             self.old_gen.lock().contains(holder_addr as *const u8),
         );
         // Neighbor window: a misaligned-by-8 tagged Value write (the bc
@@ -17086,7 +17286,7 @@ impl Default for GenerationalHeap {
 
 impl std::fmt::Debug for GenerationalHeap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let yf = self.young_from.lock();
+        let yf = self.lock_young_from();
         let yt = self.young_to.lock();
         let og = self.old_gen.lock();
         f.debug_struct("GenerationalHeap")
@@ -20681,6 +20881,37 @@ mod tests {
     }
 
     #[test]
+    fn the_trigger_triple_is_published_by_the_guard_not_by_its_writers() {
+        // The publish's whole safety argument is that it hangs off the MUTEX
+        // GUARD rather than off the 83 assignments in `arena.rs`, so a mutation
+        // that forgets to publish is not expressible. This pins that: allocate
+        // through the heap -- which mutates the arena through paths this test
+        // names none of -- and then assert the published triple equals what the
+        // lock would have said.
+        //
+        // Deliberately NOT written as "call some publisher and read it back":
+        // that would test the store and not the coupling, and the coupling is
+        // the thing that can rot.
+        let heap = GenerationalHeap::with_sizes(4 * 1024 * 1024, 4 * 1024 * 1024);
+        for _ in 0..64 {
+            let _ = heap.alloc_object(ClassId::new(1), 4);
+        }
+        let published = heap.young_from_published();
+        let actual = {
+            let from = heap.lock_young_from();
+            (from.used(), from.free_list_bytes(), from.capacity())
+        };
+        assert_eq!(
+            published, actual,
+            "the published trigger triple disagrees with the arena under the              lock, so a mutation reached it without passing through              YoungFromGuard::drop"
+        );
+        assert!(
+            actual.0 > 0,
+            "the fixture allocated nothing, so agreement here is vacuous"
+        );
+    }
+
+    #[test]
     fn is_object_address_rejects_invalid_raw_header_tags() {
         let heap = GenerationalHeap::new();
         let invalid_kind = heap.alloc_object(ClassId::new(1), 0);
@@ -20735,7 +20966,7 @@ mod tests {
             heap.alloc_object(ClassId::new(0), (i as usize % 7) + 1);
         }
 
-        let young_from = heap.young_from.lock();
+        let young_from = heap.lock_young_from();
         let base = young_from.base_ptr() as usize;
         let used = young_from.used();
         let skips = young_from.free_blocks_sorted();
@@ -20789,7 +21020,7 @@ mod tests {
         for i in 0..3000u32 {
             heap.alloc_object(ClassId::new(0), (i as usize % 7) + 1);
         }
-        let young_from = heap.young_from.lock();
+        let young_from = heap.lock_young_from();
         let base = young_from.base_ptr() as usize;
         let used = young_from.used();
         let skips = young_from.free_blocks_sorted();
@@ -21456,8 +21687,8 @@ mod tests {
             c.as_ptr() as usize,
         );
 
-        let from_base = heap.young_from.lock().base_ptr() as usize;
-        let used = heap.young_from.lock().used();
+        let from_base = heap.lock_young_from().base_ptr() as usize;
+        let used = heap.lock_young_from().used();
 
         // One candidate AT a base, one strictly inside the same object (a null
         // reference field's address — the commonest conservative false
@@ -22898,7 +23129,7 @@ mod tests {
         let interior = unsafe { ObjectRef::from_raw((live_addr + 40) as *mut u8) };
         let mut major_roots = vec![interior, keeper];
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             // `old_gen_gc(compact = true)` rather than `major_gc`, deliberately.
             // `major_gc` asks `oldgen_compact_enabled()`, which since 2026-08-03
@@ -23841,7 +24072,7 @@ mod tests {
         }
 
         let old_gen = heap.old_gen.lock();
-        let young_from = heap.young_from.lock();
+        let young_from = heap.lock_young_from();
 
         // 1. THE CHECKER CAN FAIL. With nothing seeded, the walk finds the
         //    edge and reports it missing. A verifier that has never been seen
@@ -24220,7 +24451,7 @@ mod tests {
 
         let before = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let mut major_roots = vec![holder, victim];
             let _ = GenerationalHeap::old_gen_gc(
@@ -24750,7 +24981,7 @@ mod tests {
 
         // Manually trigger major GC (mark-compact)
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let old_used_before = old_gen.used();
             let _compact_map =
@@ -24810,7 +25041,7 @@ mod tests {
         let filler = heap.alloc_object(ClassId::new(0), 4);
         heap.set_field(filler, 0, Value::Int(1));
         let tail_start = {
-            let from = heap.young_from.lock();
+            let from = heap.lock_young_from();
             from.base_ptr() as usize + from.used()
         };
         // Reserve a span the way a frozen in-JIT peer's TLAB tail is reserved:
@@ -24820,7 +25051,7 @@ mod tests {
         // does not skip it.
         let tail_obj = heap.alloc_object(ClassId::new(0), 8);
         let tail_end = {
-            let from = heap.young_from.lock();
+            let from = heap.lock_young_from();
             from.base_ptr() as usize + from.used()
         };
         // SAFETY: `tail_obj` is a live young object; overwriting its header's
@@ -24895,7 +25126,7 @@ mod tests {
         // Run major GC (mark-compact) with only A as a root
         let mut major_roots = vec![promoted_a];
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let _compact_map =
                 GenerationalHeap::major_gc(&mut major_roots, &young_from, &mut old_gen, &[]);
@@ -25241,7 +25472,7 @@ mod tests {
             let g = heap.alloc_object(ClassId::new(0), 3);
             heap.set_field(g, 2, Value::Int(i));
         }
-        let used_before = heap.young_from.lock().used();
+        let used_before = heap.lock_young_from().used();
         let mut roots = vec![keep];
         heap.collect_garbage(&stw(), &mut roots, &monitors);
         assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(7));
@@ -25271,7 +25502,7 @@ mod tests {
                 for _ in 0..500 {
                     heap.alloc_object(ClassId::new(0), 3);
                 }
-                let used_before = heap.young_from.lock().used();
+                let used_before = heap.lock_young_from().used();
                 let mut roots = vec![keep];
                 heap.collect_garbage(&stw(), &mut roots, &monitors);
                 assert!(heap.evacuated_wipe.lock().is_none(), "no wipe thread was spawned");
@@ -25455,7 +25686,7 @@ mod tests {
 
         // Before compaction: multiple free blocks (fragmented)
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let free_blocks_before = old_gen.free_block_count();
 
@@ -25528,7 +25759,7 @@ mod tests {
 
         // Run major GC (mark-compact)
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let _compact_map =
                 GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
@@ -25601,7 +25832,7 @@ mod tests {
         // this test specifically exercises `compact()`'s own
         // defragmentation, so call `old_gen_gc` directly with `compact=true`.
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let _compact_map =
                 GenerationalHeap::old_gen_gc(&mut roots, &young_from, &mut old_gen, true, &[]);
@@ -25701,7 +25932,7 @@ mod tests {
         let ptrs_before: Vec<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
 
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let compact_map =
                 GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
@@ -25736,7 +25967,7 @@ mod tests {
         // Free some, then compact
         roots = vec![roots[0], roots[2]];
         {
-            let young_from = heap.young_from.lock();
+            let young_from = heap.lock_young_from();
             let mut old_gen = heap.old_gen.lock();
             let _compact_map =
                 GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
@@ -26495,7 +26726,7 @@ mod tests {
         for (index, object) in roots.iter().copied().enumerate() {
             heap.set_field(object, 0, Value::Int(index as i32));
         }
-        let young_from = heap.young_from.lock();
+        let young_from = heap.lock_young_from();
         let mut old_gen = heap.old_gen.lock();
         let _pointer_map = GenerationalHeap::major_gc(&mut roots, &young_from, &mut old_gen, &[]);
         drop(old_gen);

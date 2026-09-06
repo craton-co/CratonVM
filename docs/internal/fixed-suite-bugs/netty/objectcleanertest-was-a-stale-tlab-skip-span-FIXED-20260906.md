@@ -88,7 +88,38 @@ Two more faces of the same reclamation appear in the same run
 `recv_cid=0`), which is why the class reports `found=3 started=2` — the JUnit
 engine dies mid-class.
 
-ZGC is immune because it does not use this sweep.
+### ZGC, which is immune for a different reason than this page first gave
+
+The first version of this page said *"ZGC is immune because it does not use
+this sweep"*. The first half is the conclusion and it holds — ZGC measured 0/5
+before the fix and 0/10 after. The second half is **wrong**, and worth
+correcting because it is the kind of wrong that licenses a future change.
+
+ZGC does consume the same process-global list. `set_jit_tlab_skip_regions`
+fans out to all three backends (`vm_heap.rs`), and ZGC's complement sweep reads
+it at `zgc/sweep.rs:450`.
+
+What saves ZGC is not that it abstains — it is the **polarity** of its two
+uses, both of which withhold bytes rather than hand them out:
+
+* `withhold_skip_regions` clips published tails **out of the free spans**, so a
+  stale span means some bytes are not offered to anyone; and
+* the bump cursor is raised to `jit_tlab_skip_floor`, so a stale span means the
+  cursor does not retract as far as it could.
+
+A stale span therefore costs ZGC **space, not correctness** — a small leak that
+the next cycle's unconditional publish corrects. Decisively, **nothing on ZGC's
+marking side reads the list at all**: liveness comes from the mark bitmap, so
+no root is ever answered *"gap space, not an object"*. That is precisely the
+mechanism that made the generational and G1 case a use-after-free, and ZGC does
+not have it.
+
+So the invariant is worth stating for ZGC too, even though the guard is not
+wired there: **if ZGC ever consults this list on the marking side, or uses it
+to skip bitmap ranges, it inherits the defect and needs the same check.** The
+guard was left out because a fire would name a real stale span but not a real
+ZGC bug, and a guard that reports things the collector is immune to trains
+people to ignore it.
 
 ## 4. The A/B, and why the page said "unreproduced"
 

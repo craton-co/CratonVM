@@ -97,13 +97,35 @@ worth "fixing" as it stands — see
 [ssl-renegotiation-emulation-limits.md](ssl-renegotiation-emulation-limits.md).
 `TestSsl.testPost` additionally flakes under load, documented there.
 
-### 4. Class-loader leak detection — 2
+### 4. Class-loader leak detection — 2 — **FIXED 2026-09-05**
 
 `catalina.loader.TestWebappClassLoaderMemoryLeak` and
-`TestWebappClassLoaderExecutorMemoryLeak`, 1 of 1 each. Not diagnosed. Both
-assert that a stopped webapp's class loader becomes unreachable, so they are
-sensitive to any reference this VM retains and HotSpot does not — a GC-rooting
-question, not a Tomcat one.
+`TestWebappClassLoaderExecutorMemoryLeak`, 1 of 1 each. **Both now PASS.**
+
+This entry used to read "Not diagnosed … a GC-rooting question, not a Tomcat
+one". That framing was wrong twice over. Neither class asserts anything about
+the loader becoming unreachable — they assert that Tomcat's
+`clearReferencesThreads` actually STOPS a leaked `java.util.Timer` thread (and
+a `ThreadPoolExecutor`), so no GC rooting is involved at all. And both were
+diagnosed: two stacked defects, each hiding the next.
+
+1. `Thread` did not inherit the parent's `contextClassLoader`, so Tomcat's
+   `if (ccl == this)` gate never fired and the stop was never attempted. Fixed
+   2026-06-23 (`CRATONVM_INHERIT_THREAD_CCL`).
+2. With the gate passing, the reflective stop threw
+   `InaccessibleObjectException: module java.base does not "opens java.util" to
+   org.apache.tomcat.catalina` — even though the harness passes
+   `--add-opens java.base/java.util=ALL-UNNAMED`. A modular jar on the CLASS
+   path was being labelled with the module its `module-info.class` declares
+   instead of the unnamed module, which an `ALL-UNNAMED` open cannot reach.
+   Fixed 2026-09-05 (`CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE`).
+
+Defect 2 is why the Linux suite scored these red while the Windows suite scored
+them green on the same commit: the Linux classpath is built from
+`output/build/lib/*.jar` (and `catalina.jar` carries a `module-info.class`),
+the Windows one from the exploded `output/classes` directory, which carries
+none. **A class that passes on one host's classpath and fails on the other's is
+not necessarily a platform difference — check the classpath SHAPE first.**
 
 ### 5. Individually undiagnosed — 4
 
@@ -130,6 +152,30 @@ Worth carrying forward: the handler form is NIO2's main read path, so anything
 driving a concrete `AsynchronousSocketChannel` through a `CompletionHandler` hit
 this. Only the WebSocket classes were measured; **a NIO2-connector sweep has not
 been done.**
+
+## The G1 arm's 15 CRASH classes — **FIXED 2026-09-05**
+
+This page measures the DEFAULT collector, so the 15 CRASH classes a 2026-09-05
+three-collector run found on the **G1** arm (and nowhere else: 0 in the same
+run's Generational and ZGC arms) were never in its scope. They are fixed, and
+the reason is worth carrying forward here because it is not a Tomcat fact at
+all:
+
+> `CRATONVM_G1_PARALLEL_EVAC` is **on by default**, and every header screen the
+> serial evacuator gained in 2026-08/09 — the per-candidate plausibility check,
+> the per-holder element clamp, the "a root that is not an object start is not
+> evacuated" rule — had been added to the SERIAL arm only. The hardening was
+> landing on the code that does not run.
+
+Same-binary A/B on the Azure fixture, six interleaved repetitions of
+`catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml` under
+`-XX:+UseG1GC`, with `CRATONVM_G1_PARALLEL_EVAC_SCREEN=0` as the only
+difference: **3 CRASH / 6 with the screens off, 0 CRASH / 6 with them on.**
+Across all 15 classes at n=1: 4 CRASH → 0.
+
+**Run the suite once per collector.** Two of the three collectors were clean on
+the exact commit where G1 lost 15 classes to a defect that had been introduced
+by a fix landing on one arm of a two-arm path.
 
 ## Reproduction
 

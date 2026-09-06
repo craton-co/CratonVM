@@ -138,23 +138,50 @@ impl DeferredWipe {
 /// arenas whose owner asks for one, and let `is_object_address` answer from it
 /// instead of deducing the answer from header bytes. See [`Arena::starts`].
 ///
-/// **Default-ON opt-out since 2026-09-05**; `=0` restores the header-shaped
-/// deduction exactly, and is the first thing to set if an object is ever
-/// suspected of being accepted at an address it does not start at.
+/// **Opt-in.** It was default-ON from 2026-09-05 to 2026-09-06; the flip is
+/// reverted and the reason is the MEASUREMENT, not the mechanism.
 ///
-/// It shipped opt-in and earned the default on a 90/90 HotSpot-differential
-/// regression suite with it enabled on the generational collector, answering
-/// 1112587 of 1912476 probes on the workload behind that run. The footprint is
-/// capacity/64 of side table and it is charged only to the arenas that consult
-/// it -- the two young semi-spaces -- rather than to every `Arena` in the
-/// process, which is what the first version did (see
+/// # Why the default came back off
+///
+/// The flip cited "median ~7% faster with it on" from a sequential ABBA of
+/// three runs per arm on the shared Azure box. That design does not work here
+/// and this tree already knows it does not: ~20 other agents build on that
+/// machine, so the disturbance is SPIKY rather than a monotone drift, and a
+/// spike parked in an ABBA's two middle slots is arithmetically
+/// indistinguishable from the treatment. The same design once read 1.9x for a
+/// JIT flag that costs nothing.
+///
+/// Re-run 2026-09-06 as CONCURRENT PAIRS -- both arms started within two
+/// seconds of each other so they see the same host in the same seconds, launch
+/// order alternated, only the ratio read, every arm checked for its probe's own
+/// success line:
+///
+/// | workload | pairs | `on/off` ratios | median |
+/// |---|---|---|---|
+/// | single-threaded churn, 96 MiB live | 6 | 0.914 1.006 0.888 1.053 0.742 1.077 | 0.96 |
+/// | 8-thread churn, GROWING young set | 8 | 1.030 1.085 1.001 1.079 1.035 1.059 1.018 0.846 | **1.03** |
+///
+/// Neither reproduces the 7%. The single-threaded shape is scattered either
+/// side of 1.0; the multi-threaded one -- the shape the record that flipped the
+/// default explicitly listed as unmeasured, "a workload whose young arenas GROW
+/// ... and a multi-threaded allocator" -- is SLOWER in 7 of 8 pairs. The bitmap
+/// is rebuilt on every arena growth, which is a mechanism for that and is the
+/// path nothing had run.
+///
+/// So the switch stays, the instrument stays, and the default waits for a
+/// number taken under a design this host does not break. `=0` restores the
+/// header-shaped deduction exactly and remains the first thing to set if an
+/// object is ever suspected of being accepted at an address it does not start
+/// at. The footprint is capacity/64 of side table, charged only to the arenas
+/// that consult it -- the two young semi-spaces -- rather than to every `Arena`
+/// in the process, which is what the first version did (see
 /// [`Arena::arm_object_starts`]).
 fn object_starts_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_GC_OBJECT_STARTS").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            Ok(v) if !v.is_empty() && v != "0" && v != "false" && v != "off" && v != "no"
         )
     })
 }

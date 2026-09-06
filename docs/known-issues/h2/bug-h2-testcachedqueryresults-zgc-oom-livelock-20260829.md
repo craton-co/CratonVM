@@ -196,7 +196,7 @@ separate them, `CRATONVM_ZGC_NO_JIT_READ_BOUNDS=1` removes only the read half
 (no inline loads to fault) while leaving the slides exactly as they are.
 
 Found while auditing what all three collectors share, not while working this
-class — see `perf/gc-cross-collector-common-work-20260905.md` §7.
+class — see §7 of the retired cross-collector common-work write-up.
 
 ## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
 

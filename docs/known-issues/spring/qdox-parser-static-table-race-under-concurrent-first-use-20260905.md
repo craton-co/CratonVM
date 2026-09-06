@@ -2,12 +2,31 @@
 
 ## Status
 
-**OPEN.** Root cause narrowed to a real CratonVM concurrency defect (weaker
-static-field-publication guarantees than HotSpot under concurrent first use of
-a class), demonstrated with a standalone reproducer independent of Spring —
-but not pinned to a specific VM source line, and the exact trigger inside the
-single-threaded Spring test is not confirmed. **Confirmed NOT a regression of
-the 2026-08-06 `native_unmod_get`/`al_state` bug** (see below).
+**PARTLY OPEN, and the headline test is FIXED (2026-09-05, later the same
+day).** This page's own last section already said the concurrency race was
+*not confirmed to be the trigger inside the single-threaded Spring test*, and
+it was not: the Spring test failed on a compiled `checkcast`, and now passes.
+
+* **`TestContextAotGeneratorIntegrationTests` — FIXED.** 4/4 methods on
+  CratonVM with the JIT on, twice in a row, on a binary carrying the
+  `checkcast` fix from the retired
+  `publicsuffixlist-forked-classpath-jit-checkcast-loader-duplication-FIXED-20260905`
+  write-up. Attributed, not merely observed: re-run with
+  `CRATONVM_DBG_TYPECHECK_FILTER=TypeDef`, the run takes the new
+  `recorded-site-loader-duplication-by-name` path exactly once — the site that
+  used to throw `TypeDef cannot be cast to TypeDef`. The `ClassCastException`
+  this page identified as the failure cause was the JIT refusing two loader
+  copies of one class name, which the interpreter has always accepted. So the
+  `TypeDef` shape and the `PublicSuffixList` shape were the same bug after
+  all; this page's "NOT confirmed to share a root cause" caveat was the
+  correct call to make at the time, and the answer turned out to be yes.
+* **STILL OPEN: the static-publication gap the concurrent probe measured.**
+  `QdoxConcProbe` — 7 failures in 6000 concurrent parses on CratonVM against 0
+  in 72000 on HotSpot — is untouched by that fix and has not been re-run
+  against it. That measurement, not the Spring test, is what keeps this page
+  in `known-issues`.
+* **Confirmed NOT a regression of the 2026-08-06 `native_unmod_get`/`al_state`
+  bug** (see below).
 
 ## The symptom
 
@@ -25,7 +44,7 @@ and collector-independent, which rules out a GC-relocation/timing confound.
 
 ## Why this needed care rather than a fresh investigation
 
-`docs/internal/fixed-bugs/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`
+`beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`
 documents the **identical wrapper message** — `IllegalStateException: Unable to
 parse source file content:` thrown by `SourceFile.getClassName()` — for a
 different class, root-caused to `native_unmod_get` (`native-collections/src/lib.rs`)
@@ -84,9 +103,10 @@ it is a genuine, reproducible defect in the same functional area
 (`SourceFile.getClassName()` / QDox), just a different mechanism: a
 `ClassCastException` naming the **same class on both sides**
 (`TypeDef` cannot be cast to `TypeDef`) is the textbook shape of two
-different `Class` objects sharing one name — see the parallel investigation
-in `docs/known-issues/springboot/publicsuffixlist-classloader-identity-forked-classpath-tests-20260905.md`
-for that shape's other occurrence this session. **The two are NOT confirmed
+different `Class` objects sharing one name — see the retired
+`publicsuffixlist-forked-classpath-jit-checkcast-loader-duplication-FIXED-20260905`
+write-up for that shape's other occurrences this session, and for the fix that
+turned out to cover this one too. **The two are NOT confirmed
 to share a root cause** — see "What this is not" below.
 
 ## Isolating it: single-threaded QDox alone does not reproduce it
@@ -163,15 +183,15 @@ racing code itself is not correctly synchronized on either VM.
   first use — plausible (a JIT compiler thread is active on every run,
   unlike the synthetic probe's explicit application threads) but **not
   traced to a specific VM source line**.
-- **Not confirmed to share a root cause with the `PublicSuffixList`
-  classloader-identity bug** (`docs/known-issues/springboot/publicsuffixlist-classloader-identity-forked-classpath-tests-20260905.md`).
-  That bug requires Spring's forked/child-classloader test infrastructure
-  (`@CompileWithForkedClassLoader` / `ClassPathExclusions`); this test uses
-  neither. Both produce a "class X cannot be cast to class X" (or, here, an
-  `ArrayIndexOutOfBoundsException` on a stale-length array) shape, which is
-  suggestive of a broader family (something about CratonVM's handling of
-  concurrent/repeated class initialization or static-state publication), but
-  that is a hypothesis connecting the two, not a demonstrated shared cause.
+- ~~**Not confirmed to share a root cause with the `PublicSuffixList`
+  classloader-identity bug.**~~ **It did** — see the Status section. The
+  suspicion recorded here (both produce a "class X cannot be cast to class X"
+  shape) was right, and the reasoning that argued against it was wrong in one
+  step: this test does NOT use `@CompileWithForkedClassLoader`, but
+  `TestCompiler`/`DynamicClassLoader` gives it a child loader of the same
+  shape anyway, so the compiled `checkcast` had two loader copies to refuse
+  here too. What is genuinely separate is the concurrent static-publication
+  gap below: the fix that closed the cast does not touch it.
 
 ## No fix attempted
 

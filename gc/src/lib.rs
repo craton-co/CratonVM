@@ -99,6 +99,27 @@ pub mod arena;
 pub mod autobox;
 pub mod blocked_access_debug;
 pub mod card_table;
+// THE TWO UNWIRED MODULES, answered here so a reader meets the answer where
+// they meet the modules.
+//
+// `class_unloading` (1,420 lines) and `metaspace` (1,623) have NO CALLER
+// anywhere in the workspace. Both say so in their own headers, and both are
+// deliberately kept. What was not written down is that the question gets asked
+// once per collector: `g1.rs` carries a twenty-line comment existing solely to
+// answer the grep, and a cross-collector review re-derived the same fact a
+// third time.
+//
+// What the VM actually does instead:
+//
+// * class metadata is unloaded by `vm/src/memory/gc.rs::
+//   unload_dead_class_metadata`, which `class_unloading`'s own header names;
+// * "metaspace" as a Java program observes it is an APPROXIMATION computed in
+//   `vm/src/vm/vm_init.rs` (live class count x an estimated per-class
+//   overhead), so `-XX:MaxMetaspaceSize` bounds nothing and there is no
+//   `OutOfMemoryError: Metaspace`.
+//
+// So: unreachable, honestly labelled, kept on purpose, and this is the one
+// place that says it. Do not re-derive it in a fourth file.
 pub mod class_unloading;
 pub mod collector;
 pub mod compact_header;
@@ -146,7 +167,7 @@ pub mod tlab;
 pub mod vm_heap;
 // Parallel young-generation marking (mark bitmap + scoped worker
 // drain). Crate-internal: only `gen_heap` drives it.
-mod young_mark;
+pub mod young_mark;
 pub mod zero_forensics;
 // The Z Garbage Collector backend, gated behind the `zgc` feature.
 //
@@ -185,7 +206,7 @@ pub use compact_header::{
 pub use compressed_oops::{CompressedOop, CompressedOops, CompressedOopsMode, NarrowKlass};
 pub use concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState, ConcurrentMarker};
 pub use cratonvm_types::loader_pin;
-pub use g1::{G1CollectionType, G1Collector, G1CollectorConfig};
+pub use g1::{g1_object_address_census, G1CollectionType, G1Collector, G1CollectorConfig};
 pub use g1_concurrent::{ConcurrentMarkController, ConcurrentMarkState};
 pub use gc::{
     install_class_info_hook, install_gc_finish_hook, install_gc_start_hook, resolve_class_info,

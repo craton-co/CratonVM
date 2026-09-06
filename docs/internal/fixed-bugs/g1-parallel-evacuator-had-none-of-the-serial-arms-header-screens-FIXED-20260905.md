@@ -1,0 +1,381 @@
+# The parallel G1 evacuator had NONE of the serial arm's header screens — and it is the default arm
+
+**Date:** 2026-09-05 **Status:** FIXED (`CRATONVM_G1_PARALLEL_EVAC_SCREEN`, default ON)
+**Closes:** the public page
+`g1-evac-forwarding-assert-and-three-sigsegv-clusters-20260905` (15 CRASH
+classes, G1 arm only, 0 in the same run's Generational or ZGC arms).
+
+## One-line root cause
+
+`SharedEvac::process_object` and `SharedEvac::seed_source_region` decided
+whether to follow a reference by asking `lookup_region_for_addr` + CSet
+membership **and nothing else**, and `parallel_evacuate`'s Phase-1 root seed
+asked only CSet membership. Their SERIAL twins have screened every candidate
+with `evacuation_candidate_is_an_object` since 2026-08-26, clamped every
+element walk with `holder_walkable_slots` since the same day, and refused a
+root that is not an object start since 2026-09-02. **Parallel evacuation is the
+default arm** (`CRATONVM_G1_PARALLEL_EVAC`, on unless `0`), so every one of
+those hardening passes landed on the code that does not run.
+
+An interior or misaligned word therefore reached `SharedEvac::evacuate`, which
+dereferences it as an `ObjectHeader` and — on the evacuation-failure arm —
+hands it straight to `ObjectHeader::make_forwarded`, whose first assert is
+*"forwarding target must have its low 2 bits clear"*. That assert is a panic in
+a `g1-evac-N` worker, which `RetireOnExit` correctly converts into a `main-vm`
+abort. The whole process dies.
+
+## Which of the two candidate targets it was
+
+The public page left this open — "the self-forward candidate `old` … or the
+fresh destination `new_addr` … this investigation did not have the means to
+determine which". It is **`old`**, and the other arm can be excluded by
+reading, not by measuring: `tlab_alloc` returns `(tlab.base + tlab.offset + 7)
+& !7`, so `new_addr` is 8-aligned by construction and can never trip the
+low-2-bits assert. Only the self-forward arm passes a caller-supplied address
+to `make_forwarded`.
+
+That is confirmed directly by the reproduction below, whose log carries the
+producer three lines above the panic:
+
+```
+[g1] IMPLAUSIBLE legacy header at root-pin-scan (#1): obj=0x2485b560900
+  class_id=1532365136 kind=Object num_slots=584 mark=0x000002485bab3b90
+  claims=0x2490 bytes source=r23/Survivor/off=0xc0900/... grid=INTERIOR
+  of=0xc08e0 delta=0x20 size=0x70 cid=1604 kind=Object idx=8588
+  bytes[... >>0xc0900=0x000002485b560950<< ...]
+thread 'g1-evac-3' panicked at types\src\heap_types.rs:1529:9:
+forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+```
+
+`class_id=1532365136` is `0x5B560950` — the low half of the heap pointer
+printed two fields later. This is the 2026-09-02 fabrication pattern verbatim:
+an INTERIOR address read as a header, its class id and `num_slots` cut out of a
+pointer's two halves.
+
+## Reproduction (Windows, ~140 s, no Azure needed)
+
+The public page reported these classes from a 640-class Azure shard. They
+reproduce locally once the classpath is built **jar-first** — the same shape
+the Linux suite uses (`output/build/lib/*.jar`) rather than the Windows
+suite's exploded `output/classes`:
+
+```
+cratonvm.exe --java-home <jdk25> --Xmx 2g -XX:+UseG1GC ... \
+  -c <jars-first classpath> org.junit.runner.JUnitCore \
+  org.apache.jasper.compiler.TestEncodingDetector
+```
+
+Both locally-reproducing classes hit the SAME assert, on different threads —
+`TestEncodingDetector` on `g1-evac-3` (a worker, i.e. `process_object`) and
+`TestJspDocumentParser` on `main-vm` (the driver, i.e. the Phase-1/2 seed).
+That pair is itself the finding: the defect is not "a worker race", it is a
+missing screen absent from **both** the driver and the worker path of one arm.
+
+## Clusters A/B/C — the same defect, silently
+
+The public page hypothesised that the ten SIGSEGVs in `runtime_var_os`,
+`VersionCache::find` and `plan_object_alloc` were "a *silent* variant of the
+same underlying defect that doesn't happen to trip the loud assert", and could
+not establish it. The mechanism is now explicit, and it does not need a race:
+
+* `process_object`'s array arm walked `0..header.array_length()` with **no
+  region clamp**, and its flat arm used
+  `for_each_flat_object_reference_trusting_header` — the entry point whose own
+  doc says *"It trusts its caller"*. A fabricated holder claims a length its
+  region cannot hold, so the walk leaves the object and reads its neighbours;
+* and the walk WRITES. Every arm that evacuates also does
+  `std::ptr::write(slot_ptr, new_ptr)` / `write_flat_object_reference`. So the
+  runaway does not merely read past the holder — it stamps forwarding
+  addresses over whatever follows it in the region.
+
+An address whose bytes happen to decode as a plausible header is copied and
+followed with no assert anywhere; the fault then lands in whichever code next
+reads the corrupted memory, which is exactly why the three faulting symbols are
+an env-var reader, a field-layout cache and an alloc-shape planner — none of
+them GC code, and none of them individually unsafe. `scan_and_evacuate_refs`'s
+own comment already made this argument about the serial arm: *"an unclamped
+walk here does not merely read past the holder, it rewrites `Value` cells past
+the holder with forwarded pointers, i.e. it corrupts whatever objects follow it
+in the region."* The clamp it describes was never applied here.
+
+The page's Jasper-family enrichment (5 of 11 `jasper.compiler` classes, ~19x
+the shard rate) needs no separate explanation: JSP compilation is the
+allocation-heaviest workload in the suite, so it takes the most young pauses
+and gets the most draws at a rare bad candidate.
+
+## The fix
+
+`RegionView` — one enum, two constructors — is what lets a single body of each
+screen serve both arms. The parallel arm cannot form a `&[G1Region]`: the
+driver drops its guard-derived borrow for the whole dispatch and workers reach
+regions through `RegionsBase`, so a whole-table slice there would assert an
+exclusivity the disjointness discipline does not have. Copying the screens
+instead would have been a twin pair, which is the shape this file's history
+already has one defect from (G1-9, a divergence between these very two walks).
+
+Applied, all gated on `CRATONVM_G1_PARALLEL_EVAC_SCREEN` (default ON):
+
+| site | added |
+|---|---|
+| `parallel_evacuate` Phase-1 roots | `note_root_object_plausibility_view` + skip, mirroring `young_collection` / `mixed_collection` |
+| `process_object` array arm | region clamp + `evacuation_candidate_is_an_object_view` |
+| `process_object` flat arm | `for_each_flat_object_reference_capped` + the same candidate screen |
+| `seed_source_region`, both arms | the same two |
+| `SharedEvac::evacuate` | last-ditch refusal of a null/misaligned candidate, counted in `PARALLEL_EVAC_UNALIGNED_CANDIDATE` |
+
+**The clamp uses `HolderBound::RegionEnd`, not `Cursor`, and that is
+load-bearing.** The serial evacuator publishes a destination region's cursor as
+it copies, so a serial to-space holder is always below it. The parallel one
+carves per-worker TLABs and writes the cursor back only in `retire_tlab`, so
+for the whole dispatch a freshly-copied holder sits ABOVE the published cursor.
+Clamping the parallel arm to the cursor would have returned 0 for every object
+it copies — not a hardening, a closure that follows nothing.
+
+`verify_no_dangling_into_cset` also stops counting a **misaligned** word as a
+dangling reference. Every object start here is 8-aligned, so such a word cannot
+be one; it is the primitive or stale slot the evacuator has just declined to
+follow, and counting a deliberate refusal as "incomplete remembered set => UAF"
+makes the verifier report the fix as the defect. The screen is alignment ONLY —
+`candidate_header_is_plausible` would make the check vacuous, because that walk
+runs after Phase 5, when every CSet region is already `Free`.
+
+## Carried over from the public page's last revision (`d1347839d`, 2026-09-05)
+
+A parallel session added a second reproducer and a diagnostic to the page this
+one closes, hours before this fix landed. Neither is superseded by the fix —
+the reproducer is the only non-Tomcat witness of the assert, and the refuted
+hypothesis in it is the more useful half — so both are kept verbatim below,
+followed by what this fix measures against them.
+
+## A LOCAL reproducer for the Cluster D assert — and why it stopped reproducing
+
+**2026-09-05, Windows/RTX 2060 box.** The same assert fires outside
+Tomcat, on a GPU fixture that runs in about forty seconds:
+
+```
+panic: forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+  types/src/heap_types.rs:1562        thread="main-vm"
+[PANIC_IN] GpuResidencyGc.main pc=127
+
+bash bench-gpu/residency-gc.sh          # or, one launch:
+cratonvm --gpu --gpu-min-work 64 -Xmx64m -XX:+UseG1GC     -cp test_classes/gpu GpuResidencyGc 0 1024 60
+```
+
+Same assert text, same file, same **G1-only** scope this page reports.
+One difference to keep in view: this fires on `main-vm`, while Cluster D
+panics on an evac worker via `gc/src/evac_pool.rs`. Whether that is the
+same defect on a different thread or a second path to the same assert is
+**not established**.
+
+It was found by accident — `bench-gpu/residency-gc.sh` routes each arm's
+stderr into a temp directory it deletes, so the failure presented as an
+empty arm with two mismatched checksums, not as a panic.
+
+### It is NOT reliably reproducible, and one claim here was retracted
+
+Observed roughly five times inside a single evening window, then **0 in
+about 500 launches** afterwards — across binaries built both before and
+after `587acb50e` (the stale-TLAB-skip-span fix), so that fix is not the
+explanation either.
+
+An intermediate reading that host load amplifies it does **not** hold up.
+It was measured at 3/120 loaded against 0/120 quiet, which looked
+conclusive (p ~ 2e-5). Re-running the *identical binary* under the
+*identical* synthetic load later gave **0/150**. The difference between
+those windows is what else was on the box: the first ran alongside two
+other sessions' real VM workloads, the second alongside twelve CPU
+spinners. So whatever forces it is not CPU occupancy — more likely
+concurrent memory/GC pressure from real workloads, which a spin loop does
+not reproduce. Recorded as a refuted hypothesis rather than deleted,
+because the refutation is the useful part: **do not size a burn-in
+against CPU load.**
+
+That also bears on this page's own suggestion of re-running the Jasper
+`compiler` package alone to test whether the ~45% crash rate was "an
+artifact of this one run's host load/timing". On this evidence an
+isolated re-run may well come back clean without meaning anything.
+
+### The assert now names its provenance
+
+`ObjectHeader::make_forwarded` was `#[track_caller]`-annotated and its
+messages now carry the offending values, so the next firing — here or on
+Azure — reports the **call site** rather than `heap_types.rs`, plus
+`target`, its low bits, and `prev`. That directly separates the two
+candidates this page names as its most useful next step: G1 passes
+`old`/`old_addr` when self-forwarding a CAS loser (`g1.rs:1191`, `:8289`)
+and `new_addr`/`new_ptr` for a copy destination (`g1.rs:1248`, `:8398`) —
+i.e. bad `old_ptr` candidate versus bad `tlab_alloc` result. None of the
+three existing reports could distinguish them, because the message
+printed neither the site nor the value.
+
+The diagnostic is in place but has **not yet caught a firing**, so the
+question that motivated it is still open.
+
+## What's not been attempted
+
+### What this fix does to that reproducer
+
+`#[track_caller]` on `make_forwarded` is the right diagnostic and it answers
+the same question this page answers by reading the two arms: the parallel
+self-forward (`g1.rs:1191` in that revision) passes a caller-supplied `old`,
+the copy destination (`:1248`) passes a `tlab_alloc` result that is 8-aligned
+by construction. It "has not yet caught a firing" there; the Tomcat
+reproduction below caught one, and it is the self-forward arm.
+
+The `GpuResidencyGc` fixture's own conclusion — five firings in one evening,
+then 0 in ~500 launches, and a load hypothesis that measured 3/120 vs 0/120 and
+then refuted itself at 0/150 — is exactly the shape a rare bad CANDIDATE
+produces: what varies is not CPU occupancy but whether some pause happens to
+find a conservative root or a stale slot pointing at a non-object. That is why
+the fix is a screen at the point of use rather than a hunt for the producer,
+and why the burn-in advice in that section stands: **do not size a burn-in
+against CPU load.**
+
+## The `make_forwarded` census, re-run (the page asked for this)
+
+Seven call sites, none of them the raw-cast defect, and only two of them take a
+caller-supplied address:
+
+| site | target | screened by |
+|---|---|---|
+| `g1.rs:1341` parallel self-forward | `old_ptr` | **the new screens + alignment guard** |
+| `g1.rs:1398` parallel copy | `tlab_alloc` result | 8-aligned by construction |
+| `g1.rs:8501` serial self-forward | `old_addr` | caller contract (root / ref-slot screens) |
+| `g1.rs:8610` serial copy | `alloc_in_type_locked` result | 8-aligned by construction |
+| `gen_evac.rs:1111` | gen allocator result | 8-aligned by construction |
+| `gen_evac.rs:1664` | test fixture | n/a |
+| `zgc.rs:8615` | a slide destination | an allocation base |
+
+So the "exactly two call sites" claim the Aug-7 page closed on is stale in
+count — and it was always the wrong question. The number that matters is **how
+many sites pass an address the collector did not itself allocate**: two, and
+one of them was unguarded.
+
+## Verification
+
+`gc/src/g1.rs::the_parallel_evacuator_refuses_a_misaligned_reference_slot` — a
+reference array whose ninth element holds `good[0] + 3` (inside a live CSet
+region, past its header, not 8-aligned). Pre-fix the pause aborts; post-fix it
+completes, every well-formed element still moves exactly once, and the refusal
+is counted. `cargo test -p cratonvm-gc`: 1876 pass, 0 fail.
+
+Two whole-suite gates, both green on the merged branch:
+
+* `regression-suite/run.sh SUITE=all`: **131 of 131**, including `RJdkModule`
+  and `RServiceLoaderDoubleSource` — the two vectors most exposed to this
+  branch's other change (class-path modular jars becoming unnamed-module).
+* `bench-gpu/residency-gc.sh`, which is the fixture the public page's last
+  revision added: **RESIDENCY SURVIVES RELOCATION ON EVERY COLLECTOR** — ZGC,
+  G1 and Generational, values matching the HotSpot oracle, with the relocation
+  census confirming the arms actually moved objects (G1: cache entries re-keyed
+  across real collections, not a vacuous pass).
+
+### Measurements
+
+#### 1. The kill-switch A/B the public page asked for, at n=6
+
+Azure, ONE binary, arms interleaved per repetition, `-XX:+UseG1GC`, the Linux
+suite's own classpath and flags. The only difference between arms is
+`CRATONVM_G1_PARALLEL_EVAC_SCREEN=0`.
+`org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`:
+
+| arm | CRASH | PASS | HANG |
+|---|---:|---:|---:|
+| `SCREEN=0` (pre-fix walks) | **4** | 8 | 0 |
+| default (screens armed) | **0** | 12 | 1 |
+
+(Twelve pairs in all: six at host load ~15, three more at load ~8, three on the
+shift-fixed binary. Crash walls 92.0-118.2 s.) The single `on` HANG is a 600 s
+cap hit at load 18 on a shared box, not a crash — see the caveat below.
+
+#### 2. The same A/B across all 15 classes the public page names, n=1
+
+Same binary, same arms, 600 s cap:
+
+| arm | CRASH | PASS | HANG |
+|---|---:|---:|---:|
+| `SCREEN=0` | **4** | 10 | 1 |
+| default | **0** | 13 | 2 |
+
+The four that crashed with the screens off — `TestJspDocumentParser`,
+`TestELInterpreterTagSetters`, `TestMapperWebapps`,
+`TestHostConfigAutomaticDeploymentXmlExternalDirXml` — all PASS with them on.
+The two `on` HANGs are `TestGenerator` (HANG on BOTH arms; the census's known
+868 s class against a 600 s cap) and `TestCompiler`, which is answered below.
+
+#### 3. Windows, cross-binary, all 15 classes
+
+dev tip `355659d00` vs this branch, jar-first classpath, 480 s cap:
+
+| binary | CRASH | PASS | HANG | other |
+|---|---:|---:|---:|---|
+| dev tip | **5** | 6 | 4 | — |
+| this branch | **0** | 6 | 7 | 1 OOM, 1 FAIL |
+
+Three of the five crash classes become HANG only because they no longer die
+early and then meet the 480 s cap — Windows runs these Jasper classes 2-3x
+slower than Azure does (`TestHostConfigAutomaticDeploymentXmlExternalWarXml`:
+207 s here, 86 s there), and the census already records that they need up to
+868 s. `TestFormAuthenticatorB` and `TestHostConfigAutomaticDeploymentDeleteB`
+go CRASH → PASS outright.
+
+#### 4. Cost — and the divide that was most of it
+
+The first measurement said the screens were expensive, and it was right.
+`TestHostConfigAutomaticDeploymentXmlExternalWarXml` is the stable member of
+this set (~100 s, PASSes on both arms), so it is the one to time. Azure, same
+binary, arms interleaved, PASS runs only:
+
+| build | `SCREEN=0` walls (s) | default walls (s) | median ratio |
+|---|---|---|---:|
+| before the shift fix | 95.3, 97.1, 111.8 | 108.7, 118.2, 114.3, 131.9 | **1.20** |
+| after | 136.3, 133.8, 152.6, 134.4, 134.0 | 124.7, 143.1, 155.0, 135.4, 132.4 | **1.007** |
+
+(The two rows are not comparable to each other — host load was ~8 for the first
+and ~15 for the second. Only the within-row ratio means anything.)
+
+Twenty percent is not a screen reading two tag bytes. It was
+`classify_candidate_header`'s `(addr - arena_base) / region_size`: `region_size`
+is a runtime value, so that is a real 64-bit `div` — tens of cycles,
+unpipelined — and this function went from "a few conservative roots per pause"
+to "once per CSet-bound reference" the moment the parallel arm started calling
+it. **F-09 removed exactly this divide from `lookup_region_for_addr` and left
+the note explaining why**; the screen was written before that lesson and never
+got it. `holder_walkable_slots` had the same divide and got the same fix.
+
+After the shift the residual is +0.7% median with the arms interleaving on
+individual runs (the fastest of all ten is a screened run), i.e. below what
+this host can resolve. That matches the remaining shape of the work: one
+region-table read and two tag bytes per CSet-bound reference, on a cache line
+`evacuate` is about to touch anyway.
+
+**Do not read a timing arm from this host as a number.** It is shared, it
+carried other sessions' cargo builds throughout, and
+`a-contended-host-hid-a-defect-that-reproduces-9-of-9` is on record about what
+that does. The number that survives that caveat is the RATIO within one
+interleaved run, which is what the table reports.
+
+## What is NOT closed by this
+
+**The classes are still slow, and one of them is still unstable.** Removing the
+crash does not make `TestGenerator` fit in 600 s (it needs ~868 s — the census
+records that, and it HANGS on both arms), and it does not make
+`TestHostConfigAutomaticDeploymentXmlExternalWarXml` deterministic: one of its
+six screened runs hit the 600 s cap at host load 18, and on Windows two of six
+screened runs failed with a heap-corruption-shaped `ClassCastException`
+(`class <unknown> cannot be cast to class java.lang.String`, and `class
+java.lang.Object cannot be cast to class …FrameworkMethod`) where the
+unscreened arm passed twice. That is a REAL residual and it is stated here
+rather than smoothed over: the screens refuse to FOLLOW a bad candidate, they
+do not explain where the bad candidate comes from, and the public page's own
+"silent variant" hypothesis predicts exactly such a remainder. A three-arm run
+(screens off + module fix off / screens on + module fix off / both on) puts it
+on the G1 side, not on this branch's classloading change — it reproduces with
+`CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE=0`.
+
+`org.apache.jasper.compiler.TestCompiler` HANGS on the Windows host on **both**
+arms, at the same point (immediately after
+`ContextConfig.getDefaultWebXmlFragment`), 480 s timeout, while on Azure it
+PASSES on both arms in ~200-260 s. That is a Windows-side throughput residual —
+this fix neither causes nor cures it — and it is not the crash this page is
+about.

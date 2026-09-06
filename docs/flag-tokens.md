@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-521 tokens.
+525 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -217,6 +217,10 @@ export inherited from a parent shell.
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
+| `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
+| `markclear` | `CRATONVM_DBG_MARKCLEAR` |
+| `g1-objaddr` | `CRATONVM_DBG_G1_OBJADDR` |
+| `rootfixup` | `CRATONVM_DBG_ROOTFIXUP` |
 | `gcpart` | `CRATONVM_DBG_GCPART` |
 | `jni-localref` | `CRATONVM_DBG_JNI_LOCALREF` |
 | `gcpause` | `CRATONVM_DBG_GCPAUSE` |
@@ -963,7 +967,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-151 tokens.
+155 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -972,6 +976,7 @@ export inherited from a parent shell.
 | `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
 | `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
+| `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
@@ -1006,10 +1011,12 @@ export inherited from a parent shell.
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-humongous-marks` | `CRATONVM_G1_HUMONGOUS_MARKS` |
 | `g1-ihop-counts-regions` | `CRATONVM_G1_IHOP_COUNTS_REGIONS` |
+| `g1-jit-mark-driver` | `CRATONVM_G1_JIT_MARK_DRIVER` |
 | `g1-verify-holders` | `CRATONVM_G1_VERIFY_HOLDERS` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
+| `g1-parallel-evac-screen` | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
 | `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |
 | `g1-adaptive-tenuring` | `CRATONVM_G1_ADAPTIVE_TENURING` |
@@ -1076,6 +1083,7 @@ export inherited from a parent shell.
 | `object-starts` | `CRATONVM_GC_OBJECT_STARTS` |
 | `gen-uncommit` | `CRATONVM_GEN_UNCOMMIT` |
 | `static-root-slots` | `CRATONVM_GC_STATIC_ROOT_SLOTS` |
+| `trigger-lockfree` | `CRATONVM_GC_TRIGGER_LOCKFREE` |
 | `dbg-compact-tlab` | `CRATONVM_DBG_COMPACT_TLAB` |
 | `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
 | `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
@@ -1157,7 +1165,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-16 tokens.
+17 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1168,6 +1176,7 @@ export inherited from a parent shell.
 | `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
+| `classpath-jar-unnamed-module` | `CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE` |
 | `cl-bootstrap-scoped` | `CRATONVM_CL_BOOTSTRAP_SCOPED` |
 | `fwd-resolve-strict` | `CRATONVM_FWD_RESOLVE_STRICT` |
 | `jar-mmap` | `CRATONVM_DISABLE_JAR_MMAP` |

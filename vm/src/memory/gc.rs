@@ -727,11 +727,72 @@ pub(crate) fn remap_proxy_method_cache<K, S: std::hash::BuildHasher>(
 /// Scans thread frames (locals + operand stacks), static fields, class locks,
 /// and printed values, updating any ObjectRef whose old address appears in
 /// the pointer map.
+// ---------------------------------------------------------------------------
+// `update_all_roots` census -- CRATONVM_DBG_ROOTFIXUP=1
+// ---------------------------------------------------------------------------
+
+/// Calls, pointer-map entries seen, and nanoseconds spent in
+/// [`update_all_roots`].
+///
+/// # The question this exists to answer
+///
+/// Roots are carried as VALUES, so a relocating collector cannot fix one in
+/// place: it builds a `PointerMap` with an entry per moved object and the VM
+/// re-walks the whole root surface afterwards to patch through it -- this
+/// function, plus roughly thirty-five hand-written `gc_update_*` / `remap_*`
+/// companions. The standing proposal is to carry roots as SLOTS so the
+/// collector writes the new address through them and this walk disappears.
+///
+/// That proposal is worth what this walk costs, and until now nobody had the
+/// number. `rootprof` prints a line only when a single call exceeds 20 ms,
+/// which answers "is there a pathological one" and not "what share of the
+/// collector's pause is this" -- a thousand 1 ms fix-ups are a second of pause
+/// and produce no output at all.
+///
+/// The pair with `pointer_map` entries is what separates the two shapes the
+/// cost could have: time proportional to the MAP (the walk is dominated by
+/// hash probes on a large relocation set, which slots would delete) versus
+/// time proportional to the ROOT SURFACE (the walk is dominated by visiting
+/// slots that mostly do not move, which slots would also delete but for a
+/// different reason and with a different fix).
+static ROOTFIXUP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTFIXUP_MAP_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTFIXUP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn rootfixup_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTFIXUP").is_some())
+}
+
+/// `(calls, pointer_map_entries, nanos)` -- see [`ROOTFIXUP_CALLS`].
+pub fn root_fixup_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        ROOTFIXUP_CALLS.load(Ordering::Relaxed),
+        ROOTFIXUP_MAP_ENTRIES.load(Ordering::Relaxed),
+        ROOTFIXUP_NANOS.load(Ordering::Relaxed),
+    )
+}
+
 pub fn update_all_roots(
     shared: &crate::vm::SharedVm,
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
+    let __fx_guard = rootfixup_census_on().then(|| {
+        struct C(std::time::Instant, usize);
+        impl Drop for C {
+            fn drop(&mut self) {
+                use std::sync::atomic::Ordering;
+                ROOTFIXUP_CALLS.fetch_add(1, Ordering::Relaxed);
+                ROOTFIXUP_MAP_ENTRIES.fetch_add(self.1 as u64, Ordering::Relaxed);
+                ROOTFIXUP_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        }
+        C(std::time::Instant::now(), pointer_map.len())
+    });
+    let _ = &__fx_guard;
     let __rp_guard = crate::memory::native_roots::rootprof::on().then(|| {
         struct G(std::time::Instant, usize);
         impl Drop for G {
@@ -1084,6 +1145,13 @@ pub fn update_all_roots(
             // and this runs stop-the-world with every mutator parked -- the same
             // conditions under which the scan read them.
             let covered = slots.len();
+            // Only under the verifier: the recorded addresses, so a slot the
+            // re-walk flags can be classified rather than merely counted. See
+            // the two-way split below.
+            let covered_addrs: Option<std::collections::HashSet<usize>> =
+                cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STATIC_SLOT_VERIFY")
+                    .is_some()
+                    .then(|| slots.iter().copied().collect());
             for addr in slots {
                 // SAFETY: recorded by `collect_roots` earlier in THIS pause as
                 // the address of a `Value` slot inside a leaked `StaticsBlock`.
@@ -1103,23 +1171,53 @@ pub fn update_all_roots(
             // and the only way to know that on a real workload rather than in a
             // unit test is to run both and diff them -- the same shape
             // `CRATONVM_DBG_ROOTSNAP_VERIFY` uses for the frozen-frame cache.
-            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STATIC_SLOT_VERIFY").is_some() {
+            if let Some(covered_addrs) = covered_addrs {
                 let mut missed = 0usize;
+                let mut chained = 0usize;
+                let mut first_unrecorded: Option<(u32, usize)> = None;
                 let mut statics = shared.classes.statics.write();
-                for fields in statics.values_mut() {
-                    for val in fields.iter_mut() {
-                        // Anything the slot walk covered is already remapped, so
-                        // a second `update_value_ref` on it is a no-op (the new
-                        // address is not itself a key). A slot that still
-                        // resolves through the map is one the recorded list
-                        // missed.
+                for (&class_id, fields) in statics.iter_mut() {
+                    for (idx, val) in fields.iter_mut().enumerate() {
+                        // A slot that still resolves through the map after the
+                        // recorded walk is one of TWO things, and they call for
+                        // opposite fixes -- which is why this counts them apart
+                        // rather than reporting a single `missed`.
+                        //
+                        // CHAINED: the slot IS in the recorded list, was already
+                        // patched, and its NEW address is itself a key. The
+                        // premise this arm used to assert -- "the new address is
+                        // not itself a key" -- holds for one Cheney semi-space
+                        // pair and fails for a COMPOSED map, where a young
+                        // object promoted into the old generation can then be
+                        // slid by the same cycle's old-gen compaction, so a
+                        // to-space value is a from-space key. Re-applying the
+                        // map there would move the reference a second time, past
+                        // where the object actually is. Nothing is wrong with
+                        // the recorded list in this case; the VERIFIER was.
+                        //
+                        // UNRECORDED: the slot is not in the list at all. That
+                        // one is the real defect -- a live static field left
+                        // pointing at a vacated address.
                         if let cratonvm_types::Value::Object(Some(o)) = *val {
                             if pointer_map.get(&(o.as_ptr() as usize)).is_some() {
-                                missed += 1;
-                                update_value_ref(val, pointer_map);
+                                let slot_addr = val as *const cratonvm_types::Value as usize;
+                                if covered_addrs.contains(&slot_addr) {
+                                    chained += 1;
+                                } else {
+                                    missed += 1;
+                                    if first_unrecorded.is_none() {
+                                        first_unrecorded = Some((class_id.as_u32(), idx));
+                                    }
+                                    update_value_ref(val, pointer_map);
+                                }
                             }
                         }
                     }
+                }
+                if let Some((cid, idx)) = first_unrecorded {
+                    eprintln!(
+                        "[static-slot-verify] first unrecorded slot: class_id={cid} index={idx}"
+                    );
                 }
                 // The SHAPE, not just the failures. A verifier that prints only
                 // when it finds something cannot distinguish "covered
@@ -1130,7 +1228,7 @@ pub fn update_all_roots(
                 // the covered count alongside the miss count is what makes a
                 // zero mean something.
                 eprintln!(
-                    "[static-slot-verify] covered={covered} missed={missed} moved={moved} (covered = slots the scan recorded; moved = entries in this collection's pointer map)",
+                    "[static-slot-verify] covered={covered} missed={missed} chained={chained} moved={moved} (covered = slots the scan recorded; missed = slots it did NOT record that still resolve; chained = recorded slots whose NEW address is itself a key in a composed map; moved = entries in this collection's pointer map)",
                     moved = pointer_map.len(),
                 );
             }
