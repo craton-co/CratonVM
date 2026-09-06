@@ -186,16 +186,60 @@ mint the aliasing at all, rather than the emitter cleaning it up afterwards --
 which is exactly what "fixing it at the source" has to mean. regression-suite
 is 91/91 in BOTH arms.
 
-**Left OFF by default on purpose.** Those are the numbers from one small probe
-on a host at load 20-30, and a pressure change cannot be priced that way: +2
-spills and +3 reloads here says nothing about a real workload, and
-`reg_publishes` dropping 19 -> 14 says some phis lost their register entirely.
-Before defaulting it on, price it on something with real register pressure
-(`CoverageBench`, the H2 corpus, netty) and look at `spilled`/`scan_reloads`
-there. Until then the two downstream guards are what carry correctness, and
-this flag is the way to check they are still needed: if `publish_deferred`
-reads 0 with the flag OFF on some workload, that workload never had the
-aliasing to begin with.
+### DEFAULT ON, 2026-09-06 — and the probe's own numbers were the wrong ones
+
+It shipped OFF for a day on the strength of the table above (+2 spills, +3
+reloads). That table is from a fixture built to CONTAIN the aliasing, so
+extending intervals there really does add interference. It says nothing about
+code that does not alias, which is almost all code.
+
+**Timing could not answer it.** CratonBench, seven phases, CPU seconds
+(user+sys), arms interleaved, median of 5:
+
+| phase | off | on | on/off |
+|---|---:|---:|---:|
+| arithmetic | 6.21 | 6.33 | 1.019 |
+| fib | 10.87 | 10.83 | 0.996 |
+| sieve | 5.73 | 5.74 | 1.002 |
+| matrix | 4.02 | 3.66 | **0.910** |
+| hashmap | 11.42 | 11.82 | 1.035 |
+| stringregex | 0.58 | 0.56 | 0.966 |
+| bintrees | 11.98 | 12.30 | 1.027 |
+
+`publish_deferred` is **0 on every one of those phases with the flag off** — the
+flag provably cannot have changed anything — so that 0.910-1.035 spread is this
+host's noise floor, not a cost. `matrix` reading 9% FASTER on a workload the
+flag cannot touch is the tell. (The zero is real, not an unprinted line:
+`sieve` reports `reg_reads=1 reg_publishes=4 publish_deferred=0`.)
+
+**The deterministic counters could.** Same phases, allocator counters, which do
+not move with host load:
+
+| phase | off vs on |
+|---|---|
+| arithmetic, fib, sieve, matrix, hashmap, stringregex | **identical** |
+| bintrees | splits 23->21, scan_reloads 10->7, reg_publishes 4->6 |
+
+Six of seven byte-identical; the seventh allocates strictly better. Extending a
+phi's interval by one position changes nothing unless something else wanted
+that register at that position -- which is the aliasing itself.
+
+**And it engages on real code, not just the fixture.** `publish_deferred` on
+netty, flag off -> on: `DefaultPromiseTest` **8 -> 0**, `ByteBufUtilTest`
+**2 -> 0**, `ObjectCleanerTest` 0 -> 0. So the aliasing genuinely occurs in
+shipped code, which is also what says the two downstream guards were
+load-bearing rather than theoretical.
+
+Gate for the flip: probe OK on default / `=0` kill switch / `--nojit` /
+HotSpot; regression-suite **91/91 with the default and 91/91 with the kill
+switch**; `cargo test -p cratonvm-jit` 0 errors; `cargo test -p cratonvm-types`
+green; the regression test green. The kill switch is not vacuous -- setting
+`CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=0` restores `deferred=8` and `deferred=2`
+on those two netty classes.
+
+**Both downstream guards stay.** This removes the CAUSE; they catch anything
+that still mints an aliasing edge, and `phi_copy_publish_deferred` reading
+non-zero on some future workload is the signal that something does.
 
 The cost is one word load per deferred phi per edge, on edges that alias;
 `phi_copy_publish_deferred` (printed by `CRATONVM_DBG_IR_LINEAR_SCAN`) counts
