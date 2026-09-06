@@ -832,6 +832,28 @@ pub struct GcFlags {
     /// such object became a self-forward, a kept CSet region and a
     /// `retry_after_evacuation_failure` pass.
     pub g1_parallel_evac_shared_dest: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST` — a promotion TLAB takes up an
+    /// OLD region a previous pause left partly filled before it consumes a
+    /// fresh Free one. Default **ON** ([`parse::on_unless_zero`]); `=0`
+    /// restores the pool-only claim.
+    ///
+    /// Not a tuning knob: without it the old generation grows by ONE REGION
+    /// PER EVACUATION WORKER PER YOUNG PAUSE however little is promoted,
+    /// because each worker's Old TLAB took a whole fresh Free region every
+    /// pause and abandoned it partly filled. MEASURED 2026-09-06 on the Tomcat
+    /// `TestHostConfigAutomaticDeploymentXmlExternalWarXml` class at `-Xmx2g`,
+    /// 32 CPUs (23 workers), one binary with the arms interleaved: the modal
+    /// per-pause Old growth is +23 on the default arm, +4 under
+    /// `CRATONVM_G1_WORKERS=4`, and +1 with `CRATONVM_G1_PARALLEL_EVAC=0` —
+    /// the quantum IS the worker count. Old peaked at 2026 of 2048 regions
+    /// (OOM) against 297 and 30 (both PASS).
+    ///
+    /// The serial evacuator never had the defect: `alloc_in_type_locked_scan`
+    /// scans every existing non-CSet region of the destination type before
+    /// claiming a Free one. This is that behaviour at TLAB granularity, and
+    /// is a parity fix rather than a new policy — the same relationship
+    /// `g1_parallel_evac_shared_dest` has to the same serial function.
+    pub g1_parallel_evac_resume_dest: bool,
     /// `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` — a reference-slot candidate
     /// whose legacy header is IMPLAUSIBLE (a class id in the band no loader
     /// mints, class 0 carrying thousands of fields, or — since 2026-09-06 —
@@ -1718,9 +1740,14 @@ pub struct GcFlags {
     /// tried: a humongous span's holders are old objects the pause never scans,
     /// which is exactly why the remembered-set walk exists.
     pub g1_humongous_marks: bool,
-    /// `CRATONVM_G1_IHOP_COUNTS_REGIONS=0` — measure old-generation occupancy
-    /// for IHOP by summing live bytes instead of counting the regions the old
-    /// generation has taken.
+    /// `CRATONVM_G1_IHOP_COUNTS_REGIONS` — measure old-generation occupancy for
+    /// IHOP by counting the regions the old generation has TAKEN instead of
+    /// summing the live bytes in them.
+    ///
+    /// **OPT-IN** ([`parse::present`]), and presence is truth: setting
+    /// `CRATONVM_G1_IHOP_COUNTS_REGIONS=0` turns this ON, not off. Unset the
+    /// variable to restore the byte count. (This line used to lead with the
+    /// `=0` spelling, which reads as the off word and is the on word.)
     ///
     /// Default **OFF**, on measurement rather than on principle. The argument
     /// for it is sound -- an Old region is unavailable whether it is 5% or
@@ -1734,6 +1761,15 @@ pub struct GcFlags {
     /// mark cycle that starts is still not a mixed collection that reclaims,
     /// and until the rest of that chain is understood this changes when G1
     /// spends effort without changing what it gets back.
+    ///
+    /// 2026-09-06, Tomcat `TestHostConfigAutomaticDeploymentXmlExternalWarXml`:
+    /// the byte-count reading is wrong there for exactly the reason above --
+    /// the old generation held at most 0.64 GB in 2.03 GB of regions -- but
+    /// turning this on did not start a cycle in the one run measured either,
+    /// because the class finished with Old at 937 of 2048 regions, still under
+    /// the 70% threshold. It is the SECOND brake on that workload; the first,
+    /// and the one that filled the heap, was `g1_parallel_evac_resume_dest`.
+    /// This flag stays un-defaulted on its own H2 evidence, not on that run.
     pub g1_ihop_counts_regions: bool,
     pub g1_verify_holders: bool,
     pub g1_dbg_reach: bool,
@@ -1795,6 +1831,10 @@ impl GcFlags {
             g1_parallel_evac_shared_dest: on_unless_zero(
                 src,
                 "CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST",
+            ),
+            g1_parallel_evac_resume_dest: on_unless_zero(
+                src,
+                "CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST",
             ),
             g1_evac_ref_implausible_refuse: non_empty_non_zero(
                 src,

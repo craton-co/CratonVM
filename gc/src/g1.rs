@@ -379,6 +379,15 @@ fn for_each_flat_object_reference_capped(
 /// pass — while the serial arm would have found the same space.
 pub static PARALLEL_SHARED_DEST_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many times a promotion TLAB took up an Old region a previous pause left
+/// partly filled, instead of consuming a fresh Free one.
+///
+/// Read it against the pause count: with `w` evacuation workers, `w` claims per
+/// pause and a resume count near zero is the pre-2026-09-06 behaviour, in which
+/// the old generation grew by `w` regions every young pause however little was
+/// promoted. See `SharedEvac::resume`.
+pub static PARALLEL_EVAC_RESUMED_DEST_REGIONS: AtomicUsize = AtomicUsize::new(0);
+
 /// How many times the parallel evacuator's TLAB allocator ran out of POOL —
 /// the Free regions reserved before the dispatch — and sent an object down the
 /// evacuation-failure path.
@@ -1424,6 +1433,40 @@ struct SharedEvac<'a> {
     pool_set: &'a RegionSet,
     /// Lock-free claim cursor into `pool`.
     pool_next: &'a AtomicUsize,
+    /// Non-CSet regions of the OLD destination type that still have room --
+    /// the regions a previous pause's promotion TLABs left partly filled.
+    ///
+    /// WHY THIS EXISTS. `tlab_alloc` used to reach only for `pool`, i.e. FREE
+    /// regions, so every worker's Old TLAB consumed a whole fresh region in
+    /// every pause and abandoned it partly filled at `retire_all`. The old
+    /// generation therefore grew by ONE REGION PER WORKER PER YOUNG PAUSE
+    /// whatever the promoted volume was. Measured on the Tomcat
+    /// `TestHostConfigAutomaticDeploymentXmlExternalWarXml` class at
+    /// `-Xmx2g` on a 32-CPU box (23 evacuation workers), one binary,
+    /// arms interleaved:
+    ///
+    /// | arm | modal Old growth per pause | peak Old | verdict |
+    /// |---|---|---|---|
+    /// | default, 23 workers | **+23** | 2026 of 2048 | OOM |
+    /// | `CRATONVM_G1_WORKERS=4` | **+4** | 297 | PASS |
+    /// | `CRATONVM_G1_PARALLEL_EVAC=0` | +1 | **30** | PASS |
+    ///
+    /// The quantum IS the worker count. The serial arm does not have the
+    /// defect because `alloc_in_type_locked_scan` scans every existing
+    /// non-CSet region of the destination type before it claims a Free one --
+    /// which is exactly what this list restores, at TLAB granularity.
+    ///
+    /// Old only. On a young pause every Survivor region is in the CSet, so a
+    /// Survivor resume list would be empty by construction; on a mixed pause
+    /// the CSet filter below removes the Old regions being collected.
+    resume: &'a [usize],
+    /// [`Self::resume`] as a membership test, for the same reason
+    /// [`Self::pool_set`] exists: a resumed region is a worker's exclusively
+    /// owned TLAB and `retire_tlab` STORES its offset as the cursor, so
+    /// [`Self::shared_dest_alloc`] must not bump into it.
+    resume_set: &'a RegionSet,
+    /// Lock-free claim cursor into `resume`.
+    resume_next: &'a AtomicUsize,
     /// Gray-object work queue (to-space addresses awaiting a ref scan).
     queue: &'a Mutex<Vec<usize>>,
     /// Termination counter: queued + in-progress items (see protocol note 4).
@@ -1554,6 +1597,13 @@ impl<'a> SharedEvac<'a> {
                 // fall through to claim a fresh one.
                 self.retire_tlab(tlab);
             }
+            // Take up an OLD region a previous pause left partly filled before
+            // consuming a fresh Free one. Without this the old generation grew
+            // by one region per worker per pause regardless of how much was
+            // promoted -- see `SharedEvac::resume` for the measurement.
+            if self.claim_resume_region(tlab, size) {
+                continue;
+            }
             let i = self.pool_next.fetch_add(1, Ordering::Relaxed);
             if i >= self.pool.len() {
                 // TO-SPACE EXHAUSTION — but exhaustion of WHAT?
@@ -1660,6 +1710,58 @@ impl<'a> SharedEvac<'a> {
         }
     }
 
+    /// Hand `tlab` a partly-filled non-CSet region of its destination type,
+    /// resuming at that region's existing cursor. Returns whether one was
+    /// claimed; the caller then re-enters the TLAB fast path.
+    ///
+    /// The claim is a `fetch_add` into [`Self::resume`], so an index is handed
+    /// to exactly one worker and the `&mut G1Region` formed here never aliases
+    /// another thread -- the same discipline the Free-pool claim below uses.
+    /// A candidate that no longer qualifies (retyped, or filled by a worker
+    /// that got there first) is skipped rather than retried, because the
+    /// cursor only ever moves forward.
+    ///
+    /// SURVIVOR IS DELIBERATELY EXCLUDED, and not as caution: on a young pause
+    /// the CSet takes every Eden and Survivor region, so a Survivor candidate
+    /// would be filtered out by `resume`'s own CSet term and the branch would
+    /// be dead. Old is the destination whose regions outlive the pause.
+    unsafe fn claim_resume_region(&self, tlab: &mut Tlab, size: usize) -> bool {
+        if tlab.dest_type != RegionType::Old || self.resume.is_empty() {
+            return false;
+        }
+        loop {
+            let i = self.resume_next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.resume.len() {
+                return false;
+            }
+            let idx = self.resume[i];
+            // F-16: an in-use region of the destination type is already
+            // committed, but ask rather than assume (as `shared_dest_alloc`
+            // does).
+            if !self.collector.commit_through_region(idx) {
+                continue;
+            }
+            // SAFETY: `idx < regions_len` by construction of `resume`, and the
+            // `fetch_add` above makes this index this worker's alone.
+            let region = &mut *self.regions_base.0.add(idx);
+            let cursor = region.cursor();
+            if region.region_type != RegionType::Old
+                || region.data.len().saturating_sub(cursor) < size
+            {
+                continue;
+            }
+            PARALLEL_EVAC_RESUMED_DEST_REGIONS.fetch_add(1, Ordering::Relaxed);
+            tlab.region_idx = Some(idx);
+            tlab.base = region.data.addr();
+            tlab.len = region.data.len();
+            // The one line that makes this a RESUME rather than a re-claim:
+            // start where the previous pause's TLAB stopped. `retire_tlab`
+            // stores `offset` as the cursor, so this round-trips exactly.
+            tlab.offset = cursor;
+            return true;
+        }
+    }
+
     /// One object's worth of space in an EXISTING non-CSet region of
     /// `dest_type`, for when the Free pool is gone.
     ///
@@ -1671,7 +1773,10 @@ impl<'a> SharedEvac<'a> {
     /// placed there is lost and every reference to it dangles.
     unsafe fn shared_dest_alloc(&self, dest_type: RegionType, size: usize) -> Option<usize> {
         for idx in 0..self.regions_len {
-            if self.pool_set.contains(&idx) || self.cset.contains(&idx) {
+            if self.pool_set.contains(&idx)
+                || self.resume_set.contains(&idx)
+                || self.cset.contains(&idx)
+            {
                 continue;
             }
             // SAFETY: `idx < regions_len`; a shared read, and `bump_alloc`
@@ -7538,6 +7643,19 @@ impl G1Collector {
         // all, which is backwards: a mixed pause is the long one, and it is the
         // only kind whose fix-up and free phases touch the old generation.
         let mut phases = G1PausePhases::default();
+        // PARITY (2026-09-06): the mixed drivers left these three at zero, so a
+        // mixed pause's `[GC-STAT]` line said `cset_regions=0` for a pause that
+        // by definition collected some. See `young_collection_parallel`. The
+        // pin counts are the YOUNG-region ones, which is exactly what this
+        // path's own `record_g1_cycle` already reports -- an old region kept
+        // out of a mixed CSet is not counted by either.
+        {
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            phases.cset_regions = cset.len() as u32;
+            phases.jni_pinned_out = jni_pinned_out as u32;
+            phases.jit_pinned_out = jit_pinned_out as u32;
+        }
         let mut phase_mark = std::time::Instant::now();
 
         // Evacuate roots
@@ -7774,6 +7892,9 @@ impl G1Collector {
         // survivor slot dangles into a freed CSet region. No-op on the
         // release/quiet path; aborts in debug.
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        // The census, while the guard is still held -- see the field docs
+        // and the PARITY note in `young_collection_parallel`.
+        phases.record_region_census(&regions);
         phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_rset_completeness(&regions, "mixed-serial");
@@ -8015,6 +8136,31 @@ impl G1Collector {
         // Membership test for the reserved pool; see `SharedEvac::pool_set`.
         let pool_set: RegionSet = pool.iter().copied().collect();
         let pool_next = AtomicUsize::new(0);
+        // Old regions a previous pause's promotion TLABs left partly filled --
+        // see `SharedEvac::resume` for what taking them up is worth. Built
+        // here rather than in each driver so the young and mixed parallel
+        // paths cannot diverge on it (the shape of defect G1-9), and from the
+        // raw base under the module's SAFETY MODEL, exactly as
+        // `shared_dest_alloc` reads regions.
+        //
+        // The room floor is one legacy cell: below it the region cannot hold
+        // even the smallest object, and claiming it would burn a resume slot
+        // and then fall through to the pool anyway.
+        let resume: Vec<usize> = if gc_flags().g1_parallel_evac_resume_dest {
+            (0..regions_len)
+                .filter(|idx| !pool_set.contains(idx) && !cset_set.contains(idx))
+                .filter(|&idx| {
+                    // SAFETY: `idx < regions_len`; a shared read of one region.
+                    let r = &*regions_base.0.add(idx);
+                    r.region_type == RegionType::Old
+                        && r.data.len().saturating_sub(r.cursor()) >= HEADER_SIZE + SLOT_SIZE
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let resume_set: RegionSet = resume.iter().copied().collect();
+        let resume_next = AtomicUsize::new(0);
         let queue: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let outstanding = AtomicUsize::new(0);
         let shared = SharedEvac {
@@ -8025,6 +8171,9 @@ impl G1Collector {
             pool: &pool,
             pool_set: &pool_set,
             pool_next: &pool_next,
+            resume: &resume,
+            resume_set: &resume_set,
+            resume_next: &resume_next,
             queue: &queue,
             outstanding: &outstanding,
             // F-18: snapshot the ADAPTIVE threshold once per pause, not the
@@ -8474,6 +8623,21 @@ impl G1Collector {
         // that, and keeps the six phases a partition of `pause_us`; splitting
         // one measured interval into three plausible-looking numbers would not.
         let mut phases = G1PausePhases::default();
+        // PARITY (2026-09-06): these four were filled on the SERIAL arm only,
+        // so on the DEFAULT (parallel) arm every `[GC-STAT]` line reported
+        // `free_regions=0 eden_regions=0 surv_regions=0 old_regions=0
+        // hum_regions=0 cset_regions=0 jni_pinned_out=0 jit_pinned_out=0` --
+        // an all-zero census that reads as a fact about the heap and is a fact
+        // about the instrument. The field docs already describe the previous
+        // incarnation of exactly this bug ("An instrument armed where it cannot
+        // fire"); the fix for it landed on one of the two arms.
+        {
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            phases.cset_regions = cset.len() as u32;
+            phases.jni_pinned_out = jni_pinned_out as u32;
+            phases.jit_pinned_out = jit_pinned_out as u32;
+        }
         let mut phase_mark = std::time::Instant::now();
 
         // Take the raw regions base; do NOT deref `regions` again until after
@@ -8552,6 +8716,9 @@ impl G1Collector {
                 &jit_pinned_regions,
             );
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        // The census, while the guard is still held -- see the field docs
+        // and the PARITY note in `young_collection_parallel`.
+        phases.record_region_census(&regions);
         phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_rset_completeness(&regions, "young-parallel");
@@ -8763,6 +8930,19 @@ impl G1Collector {
         // `young_collection_parallel`: the evacuator fuses phases 1-3, so the
         // whole seed+closure is reported as `closure_us`.
         let mut phases = G1PausePhases::default();
+        // PARITY (2026-09-06): the mixed drivers left these three at zero, so a
+        // mixed pause's `[GC-STAT]` line said `cset_regions=0` for a pause that
+        // by definition collected some. See `young_collection_parallel`. The
+        // pin counts are the YOUNG-region ones, which is exactly what this
+        // path's own `record_g1_cycle` already reports -- an old region kept
+        // out of a mixed CSet is not counted by either.
+        {
+            let (jni_pinned_out, jit_pinned_out) =
+                count_young_regions_pinned_out(regions.as_slice(), &jit_pinned_regions);
+            phases.cset_regions = cset.len() as u32;
+            phases.jni_pinned_out = jni_pinned_out as u32;
+            phases.jit_pinned_out = jit_pinned_out as u32;
+        }
         let mut phase_mark = std::time::Instant::now();
 
         let regions_len = regions.len();
@@ -8828,6 +9008,9 @@ impl G1Collector {
                 &jit_pinned_regions,
             );
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
+        // The census, while the guard is still held -- see the field docs
+        // and the PARITY note in `young_collection_parallel`.
+        phases.record_region_census(&regions);
         phase_mark = std::time::Instant::now();
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_rset_completeness(&regions, "mixed-parallel");
@@ -15920,6 +16103,15 @@ impl G1Collector {
             flat_walks_refused_for_array(),
             kept_seeds_rejected(),
         );
+        // NOT here: the promotion-destination counters ride on
+        // `gc_metrics::collector_decision_report` instead. Everything printed
+        // in THIS function is on the normal-return arm only -- `vm-cli`'s
+        // teardown calls it, and `System.exit` never unwinds Rust frames -- so
+        // for every JUnit workload in the suites (`junit.textui.TestRunner`
+        // exits) not one of these lines has ever been emitted. The decision
+        // report is the one shutdown census wired to BOTH arms; see the note
+        // above `maybe_dump_shutdown_reports` in `vm-cli/src/main.rs`, which
+        // records the same discovery for the same reason.
         // F-15 / F-16 / F-18 — the state the three adaptive policies ended the
         // run in. Unconditional and before the early return, for the reason
         // stated above: a policy whose state nothing prints cannot be cited,
@@ -22436,6 +22628,120 @@ mod tests {
             "nothing references the span any more, and its rset entry alone \
              must not keep it"
         );
+    }
+
+    /// A promoting pause must take up the Old region an earlier one left partly
+    /// filled, instead of consuming another Free region.
+    ///
+    /// Without this the old generation grows by one region per evacuation
+    /// WORKER per young pause however little is promoted, which on a 32-CPU
+    /// box (23 workers) consumed 2026 of 2048 regions on the Tomcat
+    /// `TestHostConfigAutomaticDeploymentXmlExternalWarXml` class and OOMed a
+    /// workload HotSpot runs in 20 MB. See `SharedEvac::resume`.
+    ///
+    /// TWO pauses per promotion, and `promotion_age: 1` rather than 0: an
+    /// object has to reach the tenuring threshold in survivor space first, and
+    /// the threshold cannot be driven to zero -- `update_tenuring_threshold`
+    /// floors the configured age at 1, so a config of 0 promotes on the first
+    /// pause and never again, which is how the first draft of this test failed
+    /// while the fix was working.
+    #[test]
+    fn a_promoting_pause_takes_up_the_old_region_an_earlier_one_left_partly_filled() {
+        let gc = G1Collector::new(G1CollectorConfig {
+            heap_size: 64 * 1024 * 1024,
+            initial_heap_size: 64 * 1024 * 1024,
+            promotion_age: 1,
+            ..small_config()
+        });
+        let resumed = || PARALLEL_EVAC_RESUMED_DEST_REGIONS.load(Ordering::Relaxed);
+
+        // Batch one: pause to survivor space, then pause again to promote.
+        let mut roots: Vec<ObjectRef> = (0..8)
+            .map(|i| gc.alloc_object(ClassId::new(1), i % 3))
+            .collect();
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        let old_after_first = gc.count_regions(RegionType::Old);
+        assert!(
+            old_after_first > 0,
+            "the fixture is wrong: nothing was promoted, so there is no              partly-filled Old region for a later pause to take up"
+        );
+
+        // Batch two, the same way. Its promotions have somewhere to go.
+        roots.extend((0..8).map(|i| gc.alloc_object(ClassId::new(1), i % 3)));
+        gc.young_collection_parallel(&mut roots, &NoopMonitors);
+        let before = resumed();
+        let promoting = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        assert!(
+            promoting.stats.objects_copied > 0,
+            "the fixture is wrong: the promoting pause evacuated nothing"
+        );
+        assert_eq!(
+            gc.count_regions(RegionType::Old),
+            old_after_first,
+            "a later promoting pause consumed another Free region for its              promotion TLAB instead of resuming the one an earlier pause left              partly filled"
+        );
+        assert!(
+            resumed() > before,
+            "Old did not grow, but the resume path is not what placed the              promotions -- this assertion exists so the test cannot pass              because the pause promoted nothing. resumed {before}->{}              old={old_after_first} free={} shared_dest={}",
+            resumed(),
+            free_region_count(&gc),
+            PARALLEL_SHARED_DEST_ALLOCS.load(Ordering::Relaxed),
+        );
+    }
+
+    /// PARITY: the per-pause region census is filled on BOTH young arms.
+    ///
+    /// It was filled by `young_collection_serial` only, so a default build --
+    /// which runs the PARALLEL arm -- printed
+    /// `free_regions=0 eden_regions=0 surv_regions=0 old_regions=0
+    /// hum_regions=0 cset_regions=0` on every `[GC-STAT]` line, and an
+    /// operator reading it saw an empty heap rather than a missing
+    /// instrument. Measured on the Tomcat
+    /// `TestHostConfigAutomaticDeploymentXmlExternalWarXml` class: 63 pauses,
+    /// every one of those eight fields zero.
+    ///
+    /// Both arms are driven DIRECTLY rather than through `young_collection`,
+    /// for the reason that dispatcher's own doc comment gives: a test that
+    /// goes through it exercises whichever arm the ambient flags select, and
+    /// this is exactly the defect such a test cannot see.
+    #[test]
+    fn both_young_arms_report_a_region_census() {
+        for parallel in [false, true] {
+            let label = if parallel { "parallel" } else { "serial" };
+            let gc = make_collector();
+            // Something to evacuate, so this is a real pause rather than the
+            // empty-CSet early return (which reports no census by design).
+            let _live = gc.alloc_object(ClassId::new(1), 1);
+            let _churn = gc.alloc_object(ClassId::new(2), 1);
+            let mut roots: Vec<ObjectRef> = vec![];
+            if parallel {
+                gc.young_collection_parallel(&mut roots, &NoopMonitors);
+            } else {
+                gc.young_collection_serial(&mut roots, &NoopMonitors);
+            }
+            let last = gc
+                .pause_history_snapshot()
+                .last()
+                .cloned()
+                .expect("a pause was recorded");
+            let counted = (last.phases.free_regions
+                + last.phases.eden_regions
+                + last.phases.surv_regions
+                + last.phases.old_regions
+                + last.phases.hum_regions) as usize;
+            assert_eq!(
+                counted,
+                gc.num_regions(),
+                "{label}: the census must account for every region; it counted                  {counted} of {}",
+                gc.num_regions()
+            );
+            assert!(
+                last.phases.cset_regions > 0,
+                "{label}: a pause that evacuated must report its collection set"
+            );
+        }
     }
 
     #[test]
