@@ -30,7 +30,7 @@ in isolation gets it directly.
 Index `[73]`, `Europe/Paris`/`offset=-01:00` is the
 `.add( 2, 0, 0, 0, "-01:00", ZONE_PARIS )` row in `OffsetTimeTest.testData()`
 — one of the `HHH-13379` DST-boundary-edge-case rows this class carries. That
-proximity to `docs/internal/fixed-suite-bugs/hibernate/hib-temporal-localdatetime-offsettime-one-hour-skew-FIXED.md`
+proximity to `hib-temporal-localdatetime-offsettime-one-hour-skew-FIXED.md`
 (a real, previously-fixed CratonVM timezone-table bug affecting exactly this
 class) made "another timezone-table gap" the obvious first hypothesis. It is
 not what this is — see below.

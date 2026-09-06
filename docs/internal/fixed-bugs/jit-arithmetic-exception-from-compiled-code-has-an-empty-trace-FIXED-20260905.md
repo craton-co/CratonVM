@@ -1,7 +1,9 @@
 # An `ArithmeticException` raised by compiled code carried an EMPTY stack trace — FIXED 2026-09-05
 
 **Status:** FIXED, verified by a 300-run soak (0 failures, from 20% before) plus
-`cargo test --workspace`.
+`cargo test --workspace`. §7 was reopened and closed on 2026-09-06: the AIOOBE
+gap it predicted DOES reproduce — at ~60% of runs, which three consecutive
+passes had hidden — and is fixed the same way. §8 closes the family.
 **Files:** `vm/src/jit/helpers.rs`, `vm/src/runtime/interpreter.rs`,
 `vm/src/runtime/interpreter/jit_bridge.rs`.
 **Siblings:** `jit-compiled-frame-has-no-line-and-no-inlined-callees-FIXED-20260902.md`
@@ -145,15 +147,85 @@ pass, but note they complete in 0.00s on this host: they are probe-driven and
 the probe is not staged here, so they SKIP. They are not evidence for this
 change.
 
-## 7. Known remaining gap: `ArrayIndexOutOfBoundsException`
+## 7. `ArrayIndexOutOfBoundsException`: the same hole, and the same defect — FIXED 2026-09-06
 
-`ImplicitSignal::Aioobe` has the identical hole and is NOT fixed here: no
-`snapshot_trap_frames` call at any of its eight setters, and no attach in any of
-the six doors. An AIOOBE raised by compiled code should therefore still carry an
-empty trace.
+This section originally said the AIOOBE gap was left out deliberately, and that
+"an AIOOBE raised by compiled code should therefore still carry an empty trace".
+Both halves turned out to be right, but only after this section had been
+rewritten once to say the opposite. That detour is worth recording, because it
+is the same mistake this record's §1 opens with.
 
-It is left out deliberately rather than overlooked. Nothing in the tree witnesses
-it, and this change is already five VM edits deep on a defect that had a witness;
-the recipe is the same five parts and is worth doing with a test that can see it
-fail first. The `restash_jit_signals` arm is written so the AIOOBE case slots in
-without re-deciding who owns the single `trap_frames` slot.
+**What happened.** `vm/tests/stack_trace_compiled_aioobe.rs` was written to fail
+first. It passed. It passed again on a second shape, and on a third. The
+conclusion written here — "the absent machinery is absent because nothing needed
+it" — lasted until the test was run **thirty times instead of three**:
+
+```text
+repeat pass=12 of 30
+```
+
+Roughly 60% failure, on all three shapes, with exactly the reported symptom:
+
+```text
+assertion `left == right` failed: directAtForTrace: … names []; the
+interpreted path names ["cratonvm/CompiledAioobeTrace.directAtForTrace"]
+  left: []
+ right: ["cratonvm/CompiledAioobeTrace.directAtForTrace"]
+```
+
+Whether a given call enters the artifact is timing-dependent — the same reason
+the div-by-zero defect read as a 20% flake — so three consecutive passes are
+about as likely as not. §1 of this record says to measure a flake's noise floor
+before explaining it; the same rule applies to measuring an absence.
+
+**The fix**, the same five parts as §4 plus the four doors §4.4 names:
+
+1. The seven bounds-check helpers that flag the signal (`jit_baload`,
+   `jit_bastore`, `jit_iaload`, `jit_iastore`, `jit_aaload`, `jit_aastore`,
+   `jit_throw_aioobe`) now call `snapshot_trap_frames(0)`.
+   `stash_jit_pending_aioobe` deliberately does not: it is a re-stash, and a
+   fresh sample there describes a shallower stack.
+2. `materialize_implicit_signal`'s `Aioobe` arm attaches the snapshot.
+3. The compiled-callee door drains it for `Aioobe` as well as the other two.
+4. The four drains that construct the throwable themselves — three in
+   `jit_bridge.rs`, one in `interpreter.rs`. As with the div-by-zero, the
+   `interpreter.rs` one is the door the reproduction actually takes, and it was
+   the last to be found.
+5. `restash_jit_pending_aioobe`, the third member of the restore family.
+
+**And one thing the third signal forced that the second had not.** With three
+signals carrying frames and only ONE `trap_frames` slot, both whole-drain
+restore paths could write that slot twice — every one of these setters
+*assigns* it, so a second call with `None` wiped what the first put back. The
+div-by-zero fix had introduced that hazard (npe-then-arithmetic) without a case
+that could show it. Both restores now name one owner in a fixed priority and
+restore the rest flag-only. `drain_superseded_implicit_signals` likewise dropped
+the frames only for a superseded NPE; it drops them for all three now, or a
+superseded array trap's frames would be waiting for whatever raises next.
+
+**Measured.** `stack_trace_compiled_aioobe` — three shapes, one `Vm`, artifact
+asserted present for each:
+
+| | pass |
+|---|---|
+| before | 12/30 |
+| after | **60/60** |
+
+Verified alongside: `cratonvm-vm --lib` (2631), the whole `cratonvm-jit` crate,
+and `stack_trace_compiled_callee`, `stack_trace_across_tiers`,
+`pgo02_guarded_virtual_inline`, `pgo01_call_site_evidence`,
+`exception_edge_tests`, `jit_local_exception_handler_tests`,
+`lambda_capture_adapter_tests`, `lambda_jit_oneshot_tests`, `tier1_tests`,
+`jit_osr_athrow_lift` — all green.
+
+## 8. The three signals, together
+
+| signal | snapshot at the trap | attached at 6 doors | restored with its flag | witnessed by |
+|---|---|---|---|---|
+| `NullPointerException` | 2026-09-02 | 2026-09-02 | 2026-09-02 | `stack_trace_compiled_callee.rs` |
+| `ArithmeticException` | 2026-09-05 | 2026-09-05 | 2026-09-05 | `pgo02_guarded_virtual_inline.rs` |
+| `ArrayIndexOutOfBoundsException` | 2026-09-06 | 2026-09-06 | 2026-09-06 | `stack_trace_compiled_aioobe.rs` |
+
+There is no fourth implicit signal. `ImplicitSignal` has exactly these three
+plus `None`, so the family is closed — which is the useful thing to know when
+the next one of these is filed.
