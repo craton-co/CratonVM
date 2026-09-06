@@ -288,6 +288,17 @@ fn for_each_flat_object_reference_capped(
             if cratonvm_types::cell_census::decoded() != census_before {
                 census_before = cratonvm_types::cell_census::decoded();
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 {
+                    let mut pend = PENDING_CORRUPT_HOLDERS.lock();
+                    if pend.len() < 8 {
+                        pend.push((
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            header.num_slots(),
+                            header.mark_word.load(Ordering::Relaxed),
+                        ));
+                    }
+                }
                 if n <= 8 || n.is_power_of_two() {
                     tracing::warn!(
                         "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}): \
@@ -313,6 +324,20 @@ fn for_each_flat_object_reference_capped(
 
 /// Rate-limit counter for the corrupt-cell holder report above.
 static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
+
+/// Corrupt-cell holders awaiting a GRID VERDICT, drained once per pause by
+/// [`G1Collector::report_pending_corrupt_holders`].
+///
+/// The report in `for_each_flat_object_reference_capped` can name the holder's
+/// header but not whether that address is a REAL OBJECT START, because it is a
+/// free function with no collector and no region table. That one field is the
+/// whole question: `grid=OBJECT-START` says an allocator put an object there
+/// and something later wrote a heap address over its mark word, so there is a
+/// writer to find; `grid=INTERIOR` says the address came from somewhere with no
+/// business naming it, the "mark" is a neighbouring slot, and there is no
+/// mark-word writer at all. Bounded, because the answer does not get truer
+/// after the eighth sample.
+static PENDING_CORRUPT_HOLDERS: Mutex<Vec<(usize, u32, u32, u64)>> = Mutex::new(Vec::new());
 
 fn write_flat_object_reference(slot: *mut u8, raw: usize, compact: bool) {
     if compact {
@@ -6261,6 +6286,7 @@ impl G1Collector {
         // a kept region's stale forward outlive the pause). See
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
+        self.report_pending_corrupt_holders(&regions);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
@@ -6770,6 +6796,7 @@ impl G1Collector {
         // a kept region's stale forward outlive the pause). See
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
+        self.report_pending_corrupt_holders(&regions);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -7333,6 +7360,7 @@ impl G1Collector {
         // a kept region's stale forward outlive the pause). See
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
+        self.report_pending_corrupt_holders(&regions);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -9557,6 +9585,7 @@ impl G1Collector {
     /// span" means the address is in memory no object grid covers; "the walk
     /// desynced before reaching it" means the region's own grid is broken and
     /// the address is a symptom rather than the cause.
+
     fn locate_in_object_grid(&self, region: &G1Region, addr: usize) -> String {
         let base = region.data.as_ptr() as usize;
         if addr < base {
@@ -9642,6 +9671,51 @@ impl G1Collector {
             objects += 1;
         }
         format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x} {prev}")
+    }
+
+    /// Drain [`PENDING_CORRUPT_HOLDERS`] and answer the one question the
+    /// walk-site report cannot: is the holder at a REAL object start?
+    ///
+    /// Called once per pause with the region table still held, so
+    /// `locate_in_object_grid` and `hexdump_around` are available. The two
+    /// verdicts have different fixes and nothing else separates them:
+    ///
+    ///  * `grid=OBJECT-START` -- an allocator really put an object there, so
+    ///    its mark word was overwritten by a heap address after the fact and
+    ///    there is a WRITER to find. The `bytes[...]` dump then shows which
+    ///    neighbouring field it came from.
+    ///  * `grid=INTERIOR` (or any desync verdict) -- the address was never an
+    ///    object start, the word read as a "mark" is a neighbouring slot, and
+    ///    no mark-word writer exists. The bug is then whatever put that address
+    ///    on a walk, which is the family
+    ///    `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
+    ///    already names.
+    fn report_pending_corrupt_holders(&self, regions: &[G1Region]) {
+        let drained: Vec<(usize, u32, u32, u64)> =
+            std::mem::take(&mut *PENDING_CORRUPT_HOLDERS.lock());
+        for (addr, cid, slots, mark) in drained {
+            let where_from = self
+                .lookup_region_for_addr(addr)
+                .and_then(|i| regions.get(i).map(|r| (i, r)))
+                .map(|(i, r)| {
+                    let base = r.data.as_ptr() as usize;
+                    let off = addr.wrapping_sub(base);
+                    format!(
+                        "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={} {} {}",
+                        r.region_type,
+                        r.cursor(),
+                        r.reuse_epoch,
+                        self.locate_in_object_grid(r, addr),
+                        hexdump_around(r.data.as_ptr() as *mut u8, r.cursor(), off),
+                    )
+                })
+                .unwrap_or_else(|| "r?".to_string());
+            tracing::warn!(
+                "[g1] CORRUPT-CELL HOLDER GRID VERDICT: holder={addr:#x} class_id={cid} \
+                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} source={where_from}",
+                (mark >> 56) & 0xF,
+            );
+        }
     }
 
     fn scan_and_evacuate_refs(
