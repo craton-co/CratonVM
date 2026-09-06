@@ -12,7 +12,7 @@ operating rules every lane worked from. Those rules outlived the campaign, and
 leaving them in a handoff meant the handoff could not retire without taking them
 out of circulation. Rehoming them here was the last of that page's three stated
 retirement blockers; **it retired on 2026-09-01** to
-`jdk-only/HANDOFF-20260828-SCOPE.md` in the internal tree, as a campaign record.
+`HANDOFF-20260828-SCOPE.md` in the internal tree, as a campaign record.
 Everything below is durable.
 
 Each rule here was learned by getting it wrong once. The cost is recorded with
@@ -301,7 +301,7 @@ TLS record per call and three arrive in a single read under load. **Read the
 page the vector is documented on before writing a diagnosis of it.**
 
 The known-red list of that campaign is dated material and retired with it, in
-`jdk-only/HANDOFF-20260828-SCOPE.md` §5. **Re-derive rather than trust a list
+`HANDOFF-20260828-SCOPE.md` §5. **Re-derive rather than trust a list
 older than a day** — that is why it is not on this page.
 
 ---

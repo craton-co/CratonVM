@@ -190,11 +190,19 @@ mod census {
         },
         AuditedFile {
             path: "vm/src/runtime/offload.rs",
-            declarations: 3,
+            declarations: 4,
             disposition: "input_cache: REMAPPED + SWEPT — \
                           offload::input_cache::remap_and_sweep, which routes \
                           through this module and is driven from \
-                          vm/src/memory/gc.rs.",
+                          vm/src/memory/gc.rs. Still ONE table: the fourth \
+                          declaration (2026-09-05) is drain_locked's `&mut` \
+                          parameter, the eviction half of \
+                          drain_compiled_writes split out so that the DIRTY \
+                          read-clear and the eviction it authorises happen \
+                          under a single hold of the cache mutex. It borrows \
+                          the same map rather than introducing another, so \
+                          the remap+sweep disposition above covers it \
+                          unchanged.",
         },
         AuditedFile {
             path: "native-builtins/src/net_phase_e.rs",

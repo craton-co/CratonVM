@@ -507,8 +507,16 @@ pub(super) fn find_fp_loop_hoists(
                 }
             };
 
-            // Check if the local is modified in the loop
-            if local_idx < 64 && (modified & (1u64 << local_idx)) == 0 {
+            // Check if the local is modified in the loop.
+            //
+            // A `dload k` READS slots k and k+1, so a loop that writes either
+            // one is a loop this value is not invariant across. Checking only
+            // `local_idx` is the mirror of the store-side hole fixed in
+            // `find_modified_locals` on 2026-09-05, and the two halves have to
+            // agree or the pair still admits an unsound hoist.
+            let overlap_modified =
+                is_double && (local_idx + 1 >= 64 || (modified & (1u64 << (local_idx + 1))) != 0);
+            if local_idx < 64 && !overlap_modified && (modified & (1u64 << local_idx)) == 0 {
                 hoists.push(FpLoopHoist {
                     loop_header: header,
                     load_pc: pc,

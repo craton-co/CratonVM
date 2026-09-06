@@ -9,7 +9,7 @@
 //! prevent `java.util.ServiceLoader.load(Class).iterator()` from running
 //! end-to-end.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
 //!
 //! The two gaps documented in the WP7.1 commit (`245e996`) head comment
 //! of `native-builtins/src/jdbc.rs`:
@@ -62,7 +62,7 @@ fn fixture_compiled() -> bool {
 /// FQN.
 fn make_spi_classpath_dir() -> std::path::PathBuf {
     let dir = tempfile::TempDir::new().expect("create temp dir for SPI fixture");
-    let services_dir = dir.path().join("../../apps/META-INF").join("services");
+    let services_dir = dir.path().join("META-INF").join("services");
     std::fs::create_dir_all(&services_dir).expect("create META-INF/services");
     let descriptor = services_dir.join("java.sql.Driver");
     std::fs::write(&descriptor, "cratonvm.Wp18ServiceLoaderE2E$FakeDriver\n")

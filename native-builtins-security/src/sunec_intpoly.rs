@@ -9,7 +9,7 @@
 //! .<clinit>`) that calls them hundreds of thousands of times, and the JDK
 //! bytecode is a ~2.4 kB fully-unrolled limb routine the interpreter runs slowly
 //! (and which the JIT does not compile beneficially — see
-//! `gaps/ec-nojit-unsignedmultiplyhigh-intrinsic.md`). HotSpot intrinsifies the
+//! `ec-nojit-unsignedmultiplyhigh-intrinsic.md`). HotSpot intrinsifies the
 //! field arithmetic in native code; this mirrors that.
 //!
 //! ## Representation (verified against JDK 25 — `ecprobe_tmp/MontGT2`)

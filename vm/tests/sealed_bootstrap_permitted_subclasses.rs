@@ -28,8 +28,7 @@
 //! `c.getInterfaces(false)` with no null guard — aborting every Mockito
 //! `mock(X509Certificate.class)` with
 //! `NullPointerException: Cannot read field "interfaces" because "rd" is null`
-//! (`fixed-suite-bugs/springboot/`
-//! `sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md`).
+//! (`sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md`).
 //!
 //! The probe reads `getPermittedSubclasses0()` reflectively — the raw native,
 //! before the public wrapper's filter — so a regression shows up as null slots
@@ -238,6 +237,21 @@ fn bootstrap_sealed_class_resolves_every_permitted_subclass() {
     let mut child = match Command::new(&bin)
         .arg("--java-home")
         .arg(&jdk)
+        // The probe reflects on `Class.getPermittedSubclasses0`, a PRIVATE
+        // NATIVE of `java.lang.Class`, and calls `setAccessible(true)` on it.
+        // Since JDK 17's strong encapsulation that needs an explicit open, and
+        // without it the VM answers
+        // `InaccessibleObjectException: module java.base does not "opens
+        // java.lang" to unnamed module` — which is CORRECT, and is what this
+        // test was reading as a VM defect.
+        //
+        // Measured on the same JDK 25 this test runs against, rather than
+        // assumed: `java -cp . Ctl` throws the same exception with the same
+        // wording, and `java --add-opens java.base/java.lang=ALL-UNNAMED`
+        // succeeds. CratonVM was matching HotSpot; the harness was asking for
+        // something no JVM grants by default.
+        .arg("--add-opens")
+        .arg("java.base/java.lang=ALL-UNNAMED")
         .arg("--Xmx")
         .arg("1g")
         .arg("-cp")

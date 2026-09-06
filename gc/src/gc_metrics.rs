@@ -49,7 +49,7 @@
 //! bytes retained, old→young edge count, refinement time. A handful of relaxed
 //! adds per GC pause is unmeasurable against a pause, and gating them would
 //! make the default report empty — which is the failure mode this whole item
-//! exists to prevent. See `audits/tlab-and-card-audit.md`.
+//! exists to prevent. See `tlab-and-card-audit.md`.
 //!
 //! # 2. The collector-decision record
 //!
@@ -1015,7 +1015,7 @@ pub fn last_collector_decision() -> Option<CollectorDecision> {
 ///
 /// This is the ground truth that settles the `docs/GC.md` ↔ `ARCHITECTURE.md`
 /// disagreement about whether young collections move — see
-/// `audits/tlab-and-card-audit.md` §3.
+/// `tlab-and-card-audit.md` §3.
 pub fn collector_decision_report() -> String {
     // Distribution first: the last decision alone has repeatedly misled.
     let (moving, non_moving, rows) = decision_histogram();
@@ -1150,7 +1150,7 @@ pub fn collector_decision_report() -> String {
 /// debug build: an operator watching G1 fail to reclaim old gen had no way to
 /// tell "the mark closure was abandoned this cycle" from "there is no garbage".
 ///
-/// See `audits/g1-audit.md` for which invariant each one protects.
+/// See `g1-audit.md` for which invariant each one protects.
 pub mod g1_degraded {
     /// Nothing unusual happened.
     pub const NONE: u32 = 0;

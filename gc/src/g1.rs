@@ -77,7 +77,7 @@ fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
 /// so — fourteen call sites made that assumption silently.
 ///
 /// The rename is the whole of option **C** in
-/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// `what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4: no runtime cost, no behaviour change, and fourteen silent assumptions
 /// become fourteen readable ones. A caller that *does* hold region geometry
 /// should use [`for_each_flat_object_reference_capped`] with
@@ -143,7 +143,7 @@ fn for_each_flat_object_reference_capped(
                  SLOT_SIZE over {} elements of array payload and decoded each as a `Value`. \
                  Every caller pre-branches on kind, so this is a kind confusion, not an \
                  intended array walk; see \
-                 fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
+                 what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md",
                 obj_ptr as usize,
                 header.class_id.as_u32(),
                 header.element_type(),
@@ -368,6 +368,43 @@ fn use_parallel_evacuator(enabled: bool, in_jit: bool, allowed_in_jit: bool) -> 
 /// reference slot that is inside the heap's address span but is not an object —
 /// which, before the guard, was a SIGSEGV inside `scan_and_evacuate_refs`.
 /// Reported by `G1Collector::print_gc_summary`.
+/// Young collections G1 drove through the PARALLEL evacuator, and through the
+/// serial one.
+///
+/// # Why this did not exist, and why that made a measurement impossible
+///
+/// `EvacPool` is a persistent worker pool with a careful safety argument, and
+/// `use_parallel_evacuator` decides per pause whether to use it — but nothing
+/// anywhere counted the outcome. G1's `[GC-STAT]` line has no `workers=` field,
+/// `evac_pool.rs` has no census, and the dispatcher recorded nothing. So the
+/// question "does adding GC workers still cost more than it saves" could not be
+/// answered on this backend at all: an A/B over `CRATONVM_GC_PAR_THREADS` cannot
+/// be read without knowing whether the lever engaged, and the nearest-looking
+/// counter (`[GC] par_evac`) belongs to the GENERATIONAL evacuator in
+/// `gen_evac.rs` and reads zero under G1 whatever G1 did.
+///
+/// That is how a zero from an instrument armed where it cannot fire gets
+/// mistaken for a finding, which is exactly what nearly happened here.
+///
+/// Both halves, always: `parallel=0` alone cannot distinguish the flag being
+/// off, the in-JIT term declining every pause, and a run that never collected.
+pub static G1_YOUNG_PARALLEL: AtomicUsize = AtomicUsize::new(0);
+pub static G1_YOUNG_SERIAL: AtomicUsize = AtomicUsize::new(0);
+/// Workers the most recent parallel young collection actually asked for.
+///
+/// The count is an ergonomic over `CRATONVM_GC_PAR_THREADS` and the machine,
+/// not the flag value, so reporting the flag would not say what ran.
+pub static G1_EVAC_WORKERS_LAST: AtomicUsize = AtomicUsize::new(0);
+
+/// `(parallel_cycles, serial_cycles, workers_last)` for G1 young evacuation.
+pub fn g1_young_evac_counts() -> (usize, usize, usize) {
+    (
+        G1_YOUNG_PARALLEL.load(Ordering::Relaxed),
+        G1_YOUNG_SERIAL.load(Ordering::Relaxed),
+        G1_EVAC_WORKERS_LAST.load(Ordering::Relaxed),
+    )
+}
+
 pub static EVAC_REF_REJECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`EVAC_REF_REJECTED`].
@@ -484,7 +521,7 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// That is not a hypothetical pairing: the corrupt-`Value`-cell producer closed
 /// on 2026-08-22 was exactly this kind confusion, identified as
 /// `receiver_class=java/lang/String receiver_kind=Array`
-/// (`fixed-bugs/corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
+/// (`corrupt-value-cell-producer-was-a-string-array-FIXED-20260822.md`).
 ///
 /// # Why refusing is safe, and why the census-only form was wrong to hedge
 ///
@@ -509,7 +546,7 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// comparison, on a tag already loaded.
 ///
 /// This is option **D** of
-/// `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
+/// `what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`
 /// §4, paired with option C (the `_trusting_header` rename). **Expected to be
 /// ZERO.** Observed zero on 2026-08-26 across the regression suite run once per
 /// collector (72/72 on each of ZGC, G1 and Generational) and across a G1 arm
@@ -530,7 +567,7 @@ pub fn flat_walks_refused_for_array() -> usize {
 /// [`G1Collector::record_outgoing_rset_edges`] a self-forwarded address that is
 /// region-resident but is not an object start — which, before the guard, was a
 /// SIGSEGV inside that walk (see the internal record
-/// `fixed-suite-bugs/h2-suite-bugs/g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
+/// `g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
 pub static KEPT_SEED_REJECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`KEPT_SEED_REJECTED`].
@@ -3301,7 +3338,7 @@ pub struct G1Collector {
     /// entirely garbage. The generational collector hides the same gap behind
     /// its young→old spill fallback (`gen_heap::alloc_object`); G1 has no
     /// equivalent, so it aborted outright. See
-    /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`.
+    /// `g1-native-alloc-no-safepoint-oom-FIXED.md`.
     native_alloc_pressure: AtomicBool,
 
     /// Per-region `(reuse_epoch, cursor, region_type)` snapshot captured at
@@ -4142,7 +4179,7 @@ impl G1Collector {
         // collector's lifetime and needs no refresh at GC boundaries.
         //
         // Deliberately NOT `JIT_REGION_BOUNDS`: that table is what G1-2
-        // (`audits/g1-audit.md` §8.1) keeps EMPTY under G1 so no inline
+        // (`g1-audit.md` §8.1) keeps EMPTY under G1 so no inline
         // reference-STORE fast path is reachable and a JNI-pinned,
         // CSet-excluded region cannot lose its remembered-set edge. Publishing
         // reads here leaves that gate exactly as it was — see
@@ -4212,6 +4249,24 @@ impl G1Collector {
             0,
             arena_base,
             arena_base + arena.committed_len(),
+        );
+
+        // The capability-free geometry table -- see `heap_geometry`. This is
+        // the one table in the family G1 fills WITHOUT a caveat, because it
+        // grants nothing: `JIT_REGION_BOUNDS` must stay empty here (defect G1-2,
+        // inline reference stores), `JIT_READ_BOUNDS` is bounded by the commit
+        // (a raw load must not reach an unmapped page) and `MOVABLE_BOUNDS`
+        // likewise. None of that constrains "where did this heap reserve its
+        // address space", which is the only thing this one says.
+        //
+        // The RESERVATION, not the committed prefix, and that is the difference
+        // from the two publishes above. A narrow-oop window has to cover every
+        // address the heap can ever produce; deriving it from a prefix that
+        // grows would invalidate every reference already encoded against it.
+        crate::heap_geometry::publish_heap_span(
+            0,
+            arena_base,
+            arena_base + arena.reserved_len(),
         );
 
         // F-08 - publish G1's geometry for the JIT's inline post-write barrier.
@@ -5906,8 +5961,11 @@ impl G1Collector {
             crate::gc_quiescence::is_active(),
             gc_flags().g1_parallel_evac_in_jit,
         ) {
+            G1_YOUNG_PARALLEL.fetch_add(1, Ordering::Relaxed);
+            G1_EVAC_WORKERS_LAST.store(self.parallel_worker_count(), Ordering::Relaxed);
             return self.young_collection_parallel(roots, monitors);
         }
+        G1_YOUNG_SERIAL.fetch_add(1, Ordering::Relaxed);
         self.young_collection_serial(roots, monitors)
     }
 
@@ -6201,7 +6259,7 @@ impl G1Collector {
         // young source (every young region is in this CSet, so the holder is
         // traced) but NOT for a young source held out of the CSet by a JNI
         // pin, which is reached only through its remembered set. Closing it
-        // requires a `jit/` change (see `audits/g1-audit.md`, defect G1-2);
+        // requires a `jit/` change (see `g1-audit.md`, defect G1-2);
         // the debug-only `verify_no_dangling_into_cset` below is the tripwire
         // in the meantime.
         let dbg_phases = gc_flags().g1_dbg_reach;
@@ -6850,7 +6908,7 @@ impl G1Collector {
         // does too; a region it does not walk keeps the entries it had. The
         // rebuild has never been what makes THIS pause sound (a missing
         // barrier entry is a UAF in this pause and repaired for the next —
-        // `audits/g1-audit.md` §2.1); it repairs for later pauses, and it still
+        // `g1-audit.md` §2.1); it repairs for later pauses, and it still
         // does. `CRATONVM_G1_NARROW_FIXUP=0` restores the wide walk for both.
         let narrow = self.phase4_regions_to_walk(&regions, Some(&pre_evac), &narrow_sources);
         let census =
@@ -10393,7 +10451,7 @@ impl G1Collector {
     ///       collection: the smoking gun.
     ///
     /// ROOT CAUSE (full writeup + ruled-out fixes:
-    /// `fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`):
+    /// `g1-parallel-evac-persistent-forwarding-root-remap.md`):
     /// the parallel evacuator dedups via the PERSISTENT `forwarding_ptr` header
     /// field (serial uses the per-cycle `pointer_map`). A fast-path hit returns a
     /// forward — possibly left over from a PRIOR cycle — WITHOUT recording it in
@@ -10719,7 +10777,7 @@ impl G1Collector {
         // `cid=0x41414141 kind=Array len=0x41414141`, and the element loop then
         // read 1094795585 references from it and walked off the end of the
         // arena. That is the SIGSEGV in
-        // fixed-suite-bugs/tomcat/g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md —
+        // g1-sigsegv-chunked-transfer-httpd-proxy-20260811-FIXED.md —
         // produced by this diagnostic, in a run that only crashed because the
         // diagnostic was on.
         //
@@ -12938,7 +12996,7 @@ impl G1Collector {
         // Publish the remembered-set size gauge for G1. Until now
         // `remembered_set_bytes` described only the generational card table, so
         // `rset_bytes_per_live_byte` read as zero under `-XX:+UseG1GC` — the
-        // reconciliation item left open by `audits/tlab-and-card-audit.md`
+        // reconciliation item left open by `tlab-and-card-audit.md`
         // §2.3. Measured here (once per mark cycle, after the prune) rather
         // than per pause: this is the point at which the set is smallest and
         // final, and it costs one lock per region on a path that just walked
@@ -14660,6 +14718,15 @@ impl G1Collector {
             "[GC] g1 non_object_roots_skipped={}",
             non_object_roots_skipped(),
         );
+        // Which evacuator actually ran. See `G1_YOUNG_PARALLEL`: without this
+        // pair, an A/B over `CRATONVM_GC_PAR_THREADS` measures an unknown, and
+        // the nearest-looking counter belongs to a different collector.
+        {
+            let (par, ser, workers) = g1_young_evac_counts();
+            eprintln!(
+                "[GC] g1 young evacuation: parallel={par} serial={ser} workers_last={workers}"
+            );
+        }
         eprintln!(
             "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
             evacuation_implausible_class0_copies(),
@@ -15982,7 +16049,7 @@ impl G1Collector {
     /// `PolynomialTest` failure was (`pin_addrs=0` was the process-wide total),
     /// but it is real, and it is a reason to prefer candidate fix 2 — repairing
     /// the scan — over widening this predicate. See
-    /// `bug-g1-evacuates-live-jit-reference-20260819.md`.
+    /// `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     fn empty_jit_publication(&self) -> bool {
         // "A compiled frame is live." `is_active()` counts only JIT entries
         // that pushed a `JitEntryGuard`; a frame reached without one (the
@@ -16781,7 +16848,7 @@ impl G1Collector {
         // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
         // a non-atomic 16-byte copy that could tear against a concurrent
         // plain `set_field` from another mutator thread -- see
-        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
         // which covered g1::scan_object_refs but not this mutator-side path).
         let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
@@ -17280,7 +17347,13 @@ impl GarbageCollector for G1Collector {
         // Un-box the auto-box wrapper the store side installs for a non-Object
         // value — see `set_array_element`, and `GenerationalHeap::
         // get_array_element` for the same read.
-        if element_type == ArrayElementType::Reference {
+        // Latched for the same reason as the two ZGC sites: `autobox_payload`
+        // opens with `is_object_address`, a region/registry probe, and can only
+        // answer `Some` if a wrapper was ever created — which is what sets the
+        // latch. See `crate::autobox::array_read_may_hold_wrapper`.
+        if element_type == ArrayElementType::Reference
+            && crate::autobox::array_read_may_hold_wrapper()
+        {
             if let Value::Object(Some(boxed)) = value {
                 if let Some(inner) = self.autobox_payload(boxed) {
                     return Ok(inner);
@@ -19821,16 +19894,40 @@ mod tests {
 
         // ONE step, unbounded budget: pre-F-10 this held the lock from the
         // first gray to the last.
+        let batches_before = gc.mark_lock_batches.load(Ordering::Relaxed);
         let done = gc.concurrent_mark_step(usize::MAX);
         let during_the_step = acquisitions.load(Ordering::Relaxed);
+        let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - batches_before;
 
         stop.store(true, Ordering::Relaxed);
         observer.join().expect("observer thread");
 
         assert!(done, "one unbounded step must drain the whole gray set");
+        // THE CLAIM IS ADMISSION, NOT THROUGHPUT. This asserted `>= 8` and
+        // failed 3 runs in 5 ALONE on an idle host (2026-09-05), and again in
+        // `cargo test --workspace`. The observer is a competing OS thread, so
+        // how MANY times it wins the lock inside one sub-second step is the
+        // scheduler's answer, not this collector's. Pre-F-10 the count is 0 and
+        // stays 0 however the threads interleave, which is what makes `> 0` the
+        // whole of the property: the marker let a waiting writer in before the
+        // step ended.
         assert!(
-            during_the_step >= 8,
-            "a competing writer got the region table {during_the_step} time(s) while the marker drained {GRAYS} objects — pre-F-10 that number is 0, because the marker held the lock for the entire step"
+            during_the_step > 0,
+            "a competing writer NEVER got the region table while the marker drained {GRAYS} \
+             objects — that is the pre-F-10 behaviour, the marker holding the guard for the \
+             entire step"
+        );
+        // And the magnitude claim, taken from a counter the scheduler does not
+        // touch: the marker dropped and retook the guard once per batch. This
+        // is deterministic where the thread-race count is not, so a regression
+        // that reduced the drop RATE without reaching zero still fails here —
+        // which is the part `> 0` alone would have given up.
+        assert!(
+            batches >= GRAYS / MARK_LOCK_BATCH,
+            "the marker drained {GRAYS} grays in {batches} regions-lock acquisition(s); at \
+             MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at least {} — a reading of 1 means \
+             the guard is held for the whole step again (F-10)",
+            GRAYS / MARK_LOCK_BATCH
         );
     }
 
@@ -24357,7 +24454,7 @@ mod tests {
     }
 
     // -- Native-allocation pressure latch --
-    // (fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md)
+    // (g1-native-alloc-no-safepoint-oom-FIXED.md)
 
     /// Fill the first `count` regions so they read as fully-consumed Eden,
     /// leaving `num_regions - count` Free. Mirrors what a running mutator
@@ -28036,7 +28133,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // G1 maturation (arch-2026-07-26/g1-maturation.md)
+    // G1 maturation (g1-maturation.md)
     // -----------------------------------------------------------------------
 
     /// Overwrite the mark-start (TAMS) snapshot so a test can place TAMS at an
@@ -28603,7 +28700,7 @@ mod tests {
     }
 
     // =======================================================================
-    // G1 correctness audit (audits/g1-audit.md)
+    // G1 correctness audit (g1-audit.md)
     // =======================================================================
 
     use crate::gc_metrics::{g1_cycle_kind, g1_degraded, last_g1_cycle};
@@ -30406,7 +30503,7 @@ mod tests {
     }
     // -----------------------------------------------------------------------
     // The flat 16-byte-slot walk refuses an ARRAY header (option D of
-    // `fixed-bugs/what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
+    // `what-should-a-walker-do-with-an-unvalidated-header-count-FIXED-20260826.md`).
     // -----------------------------------------------------------------------
 
     /// Build a legacy-layout body of `slots` `Value::Object` cells behind a

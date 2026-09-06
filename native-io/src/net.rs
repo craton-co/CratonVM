@@ -1230,7 +1230,7 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // that says whether the wildcard should be dual-stack. See
     // `bind_wildcard_listener` in `socket_channel.rs` for the channel half of
     // the same defect and
-    // `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`
+    // `ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`
     // for how it presented.
     let prefer_ipv6 = int_arg(args, 1) != 0;
     let inet_addr = match args.get(3) {
@@ -4170,7 +4170,7 @@ fn ext_opt_peer_cred(_args: &[Value]) -> i64 {
 // class and stops, which is what made it look like one.
 //
 // Per-row table:
-// retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
+// l5-native-io-bridge-residuals-RETIRED-20260810.md
 /// Register the `sun/nio/ch/Net` TCP-native surface. Safe to call more than
 /// once — later registrations override earlier ones at the same signature.
 pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
@@ -4316,7 +4316,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `ServerSocket.close()` (via `NioSocketImpl.close()` ->
     // `NativeDispatcher.preClose`). Companion gap to the `FileKey.init`
     // fix, see
-    // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
+    // tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
     r.register_with_kind(
         "sun/nio/ch/UnixDispatcher",
         "close0",

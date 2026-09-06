@@ -3,7 +3,7 @@
 
 //! Differential & correctness tests for the interpreter intrinsic table.
 //!
-//! Feature: `gaps/feature_roadmap_interpreter_intrinsic_table.md`
+//! Feature: `feature_roadmap_interpreter_intrinsic_table.md`
 //! Contract: `intrinsic_table_contract.md`
 //!
 //! ## What this verifies

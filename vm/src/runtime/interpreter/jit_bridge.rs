@@ -820,7 +820,7 @@ pub(super) fn compile_osr_artifact(
             // the OSR'd code) get silently RE-EXECUTED by the interpreter from
             // the stale resume state — e.g. an `ArrayList` ending up with extra
             // duplicate elements with no exception anywhere. See
-            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
@@ -2360,7 +2360,7 @@ pub(super) fn compile_osr_artifact(
             // indy uncommon trap: the bail resumes the pre-OSR interpreter
             // frame at the stale back-edge, silently re-running a loop whose
             // side effects already committed (see
-            // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+            // jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
             // Admit only BRIDGED sites, which emit a direct call and never
             // deopt at the indy bci. `indy_info` drops sites it cannot resolve,
             // so a length mismatch also means "not fully bridged" and is
@@ -2400,7 +2400,7 @@ pub(super) fn compile_osr_artifact(
             // backend may elide only these; a no-arg constructor that is NOT proven empty
             // keeps both its allocation and its call, because eliding it would drop
             // whatever the body writes to global state (see
-            // fixed-suite-bugs/netty/jit-elided-constructor-side-effects-FIXED-20260812.md).
+            // jit-elided-constructor-side-effects-FIXED-20260812.md).
             let mut elidable_init_pcs: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
@@ -3161,7 +3161,7 @@ pub(super) fn compile_osr_artifact(
                 // bail that matters most — this door compiles a `@Test` method's
                 // hot loop, and a method denied here runs its whole life in the
                 // interpreter with no other diagnostic. See
-                // fixed-suite-bugs/jit/osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
+                // osr-refuses-any-method-with-an-exception-table-FIXED-20260817.md,
                 // which took a six-arm shape bisect to find for exactly this reason.
                 crate::jit::mark_jit_bail_listed_with_site(
                     &class_name,
@@ -3418,8 +3418,8 @@ pub(super) fn route_osr_exception_out_of_artifact(
     }
 }
 
-/// Let the OSR door reach the OPTIMIZING tier -- **default OFF**, opt in with
-/// `CRATONVM_JIT_OSR_OPTIMIZING=1`.
+/// Let the OSR door reach the OPTIMIZING tier -- **default ON** since
+/// 2026-09-05; `CRATONVM_JIT_OSR_OPTIMIZING=0` is the kill switch.
 ///
 /// This door has always reached `x64::compile_with_param_slots` directly, so a
 /// method whose only route to compiled code is a back edge -- one big method
@@ -3432,8 +3432,85 @@ fn osr_optimizing_tier_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_OPTIMIZING").is_some()
+        // 2026-09-05: DEFAULT ON. `=0` is the kill switch — which is why
+        // this reads the VALUE now rather than only asking whether the
+        // variable is present.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING").as_deref(),
+            Ok("0") | Ok("false")
+        )
     })
+}
+
+/// `(class, method+descriptor, entry pc)` triples whose optimizing OSR
+/// artifact this door has already built and REFUSED.
+///
+/// # Why a negative cache is the whole point
+///
+/// The door's admission is `ir_osr_entry_addr(entry_pc).is_some() &&
+/// ir_osr_sentinel_free`, and `ir_osr_sentinel_free` means the body emits no
+/// deopt stub AND no call-exception stub — so **any method containing a call
+/// fails it**. That is most methods. Without a memo the door pays a FULL
+/// optimizing compile on every OSR attempt for every one of them, throws the
+/// artifact away, and falls through to the single-pass path it was always
+/// going to take.
+///
+/// Measured on `LambdaJitTierUp.warmChecksum` (`entries=[] sentinel_free=false`,
+/// refused every time): the repeated compiles delay the single-pass OSR entry
+/// the frame actually gets, and while the loop is still interpreted its in-loop
+/// SAM call site has no compiled caller to hang an inline-cache thunk on — so
+/// every dispatch is answered by Rust. That is the intermittent
+/// `test_inline_cache_takes_over_the_sam_call_site` failure, at ~3% on a
+/// contended host and 0 in 60 runs with the door off.
+///
+/// Keyed by name rather than by `CachedBytecodeMethod` identity because the
+/// frame's handle is resolved afresh on some paths, and a memo that missed
+/// would be no memo at all.
+static OSR_OPTIMIZING_REFUSED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(u32, u64, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn osr_optimizing_refusal_key(
+    class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) -> (u32, u64, usize) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    method_name.hash(&mut h);
+    descriptor.hash(&mut h);
+    (class_id.as_u32(), h.finish(), entry_pc)
+}
+
+/// Has this door already built and refused an optimizing artifact here?
+fn osr_optimizing_already_refused(key: (u32, u64, usize)) -> bool {
+    // Kill switch, so the memo can be A/B'd inside ONE binary. Comparing an
+    // intermittent event across two builds is not a comparison.
+    if matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR_OPTIMIZING_MEMO").as_deref(),
+        Ok("0") | Ok("false")
+    ) {
+        return false;
+    }
+    OSR_OPTIMIZING_REFUSED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|s| s.contains(&key))
+        .unwrap_or(false)
+}
+
+/// Record a refusal so the next attempt at this pc skips straight to
+/// single-pass.
+///
+/// Deliberately NOT cleared on class redefinition: `redefine_class` clears the
+/// JIT cache, so the worst a stale entry costs is that a method which would now
+/// be admitted keeps the single-pass OSR body it had before — a missed
+/// optimization on a path that is already the fallback, never a wrong answer.
+fn note_osr_optimizing_refusal(key: (u32, u64, usize)) {
+    if let Ok(mut s) = OSR_OPTIMIZING_REFUSED.get_or_init(Default::default).lock() {
+        s.insert(key);
+    }
 }
 
 pub(super) fn try_osr(
@@ -3511,7 +3588,11 @@ pub(super) fn try_osr(
     // unreachable.
     //
     // Anything else falls through to the single-pass path below, unchanged.
-    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled() {
+    let osr_opt_key =
+        osr_optimizing_refusal_key(class_id, &method_name, &method_descriptor, entry_pc);
+    let ir_osr: Option<Arc<cratonvm_jit::CompiledMethod>> = if osr_optimizing_tier_enabled()
+        && !osr_optimizing_already_refused(osr_opt_key)
+    {
         // The frame's own handle when it has one, and a resolution when it does
         // not. `main` is entered by the launcher rather than through the invoke
         // cache, so its frame carries no `CachedBytecodeMethod` — and a method
@@ -3549,11 +3630,18 @@ pub(super) fn try_osr(
                         ),
                     }
                 }
-                let cm = cm?;
+                let Some(cm) = cm else {
+                    // The compile itself declined. Same conclusion as a refused
+                    // artifact for this door's purposes, and the same waste if
+                    // it is repeated.
+                    note_osr_optimizing_refusal(osr_opt_key);
+                    return None;
+                };
                 // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
                 if cm.ir_osr_entry_addr(entry_pc as u32).is_some() && cm.ir_osr_sentinel_free {
                     Some(Arc::new(cm))
                 } else {
+                    note_osr_optimizing_refusal(osr_opt_key);
                     None
                 }
             })
@@ -3563,6 +3651,27 @@ pub(super) fn try_osr(
     let compiled = match ir_osr {
         Some(c) => {
             cratonvm_jit::metrics::record_osr_event("osr_entered_optimizing");
+            // Dump the body this door is about to ENTER, under a label that
+            // distinguishes it from the single-pass one.
+            //
+            // Without this the optimizing artifact is invisible to
+            // `CRATONVM_DBG_JIT_DISASM`: the only `osr` dump comes from inside
+            // `compile_osr_artifact`, which this arm SKIPS — and the background
+            // tier worker calls that function anyway, so a dump appears, is
+            // labelled `osr`, and is the single-pass body. Reading it while the
+            // door was on showed code that did not change when the residency
+            // flags changed, which is exactly the wrong conclusion and cost
+            // several rounds to catch. The counter said the door had engaged
+            // and the disassembly said it had not; the disassembly was of
+            // another artifact.
+            crate::jit::disasm::maybe_dump(
+                "osr-optimizing",
+                &class_name_arc,
+                &method_name_arc,
+                &descriptor_arc,
+                c.entry_ptr(),
+                c.code_bytes(),
+            );
             c
         }
         None => compile_osr_artifact(
@@ -3928,8 +4037,8 @@ pub(super) fn try_osr(
     }
     if crate::jit::helpers::take_jit_pending_npe() {
         // Taken BEFORE the construction below re-captures a stack the compiled
-        // frames have already left — see `attach_snapshotted_npe_frames`.
-        let npe_snapshot = crate::jit::helpers::take_jit_pending_npe_compiled_frames();
+        // frames have already left — see `attach_snapshotted_trap_frames`.
+        let npe_snapshot = crate::jit::helpers::take_jit_pending_trap_frames();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
         // whose code raised the NPE, so this frame's table is the one to
@@ -3951,7 +4060,7 @@ pub(super) fn try_osr(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -5481,6 +5590,7 @@ pub(super) fn compile_optimizing_artifact(
             // in `invoke::invokevirtual_site_final_owner` — so these three
             // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
+                shared,
                 &cm,
                 class_id,
                 target_class,
@@ -6028,6 +6138,7 @@ pub(super) fn compile_optimizing_artifact(
                 // in `invoke::invokevirtual_site_final_owner` — so these three
                 // per-door copies cannot drift apart on either.
                 return super::invoke::invokevirtual_site_final_owner(
+                    shared,
                     &cm,
                     callee_cid,
                     target_class,
@@ -6801,7 +6912,7 @@ pub(super) fn try_jit_upgrade_with_gate(
 /// `FjpDeepSum$SumTask.compute` from `3 145 652 invocations compile-failed` to
 /// compiled with `hot_but_stuck_in_interpreter=0`). Plus `FjpProbe` at depth 10
 /// and `FjpDeepSum` at depth 17. See
-/// `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
+/// `completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
 ///
 /// Returns `true` only when `CRATONVM_JIT_FJP_SUBCLASS_BLOCKLIST=1` puts the
 /// workaround back AND the named class transitively extends
@@ -7744,6 +7855,7 @@ pub(super) fn try_jit_compile_callee_slow(
             // in `invoke::invokevirtual_site_final_owner` — so these three
             // per-door copies cannot drift apart on either.
             return super::invoke::invokevirtual_site_final_owner(
+                shared,
                 &cm,
                 cid,
                 target_class,
@@ -10952,7 +11064,7 @@ pub(super) fn execute_jit_call(
     //     NaN-tag int space (BC safegcd 0xFFFC_… accumulator) was decoded by
     //     the prior unconditional `to_value()` as `Value::Int`, truncating to
     //     the low 32 bits. `decode_by_descriptor(b'J')` reinterprets the raw
-    //     i64 bit-exact. See gaps/bc-ec-mod-mododdinverse-investigation.md.
+    //     i64 bit-exact. See bc-ec-mod-mododdinverse-investigation.md.
     let is_static = cached.is_static;
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See
@@ -11193,14 +11305,14 @@ pub(super) fn execute_jit_call(
         // i64::MIN deopt sentinel and ran the epilogue, so construction here
         // sees only what the interpreter still holds. `sig` carries the
         // snapshot the helper took while they were live.
-        let npe_snapshot = sig.npe_compiled_frames.take();
+        let npe_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -11287,6 +11399,15 @@ pub(super) fn execute_jit_call(
         // and stops a later drain for the same method claiming it, since the
         // match compares method names only.
         let _ = cratonvm_jit::deopt::take_last_deopt();
+        // The compiled frames this div-by-zero was raised in have already
+        // left the stack, exactly as in the `sig.npe` arm above: the
+        // zero-divisor stub called `jit_throw_arithmetic`, loaded the i64::MIN
+        // deopt sentinel and ran the epilogue. `sig` carries the snapshot that
+        // helper took while they were live; without draining it here the
+        // throwable keeps the frameless trace `fillInStackTrace` just built,
+        // AND the snapshot is left in the cell for the next take — which
+        // belongs to a different throwable.
+        let trap_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -11295,6 +11416,12 @@ pub(super) fn execute_jit_call(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 let exc_locals = synchronized_args.as_deref().map_or_else(
                     || jit_saved_args_to_values(cached, &saved_args, np),
                     |args| args.to_vec(),
@@ -11682,14 +11809,14 @@ pub(super) fn execute_jit_call_decoded(
         // i64::MIN deopt sentinel and ran the epilogue, so construction here
         // sees only what the interpreter still holds. `sig` carries the
         // snapshot the helper took while they were live.
-        let npe_snapshot = sig.npe_compiled_frames.take();
+        let npe_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -11736,6 +11863,7 @@ pub(super) fn execute_jit_call_decoded(
     // the matching block in `execute_jit_call`). Throw `ArithmeticException`
     // through the method's exception table instead of re-running from entry.
     if sig.arithmetic {
+        let trap_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -11744,6 +11872,12 @@ pub(super) fn execute_jit_call_decoded(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -12076,14 +12210,14 @@ pub(super) fn execute_jit_call_oneshot(
         // i64::MIN deopt sentinel and ran the epilogue, so construction here
         // sees only what the interpreter still holds. `sig` carries the
         // snapshot the helper took while they were live.
-        let npe_snapshot = sig.npe_compiled_frames.take();
+        let npe_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
                     shared,
                     &thread.frames,
                     exc,
@@ -12125,6 +12259,7 @@ pub(super) fn execute_jit_call_oneshot(
         }
     }
     if sig.arithmetic {
+        let trap_snapshot = sig.trap_frames.take();
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -12133,6 +12268,12 @@ pub(super) fn execute_jit_call_oneshot(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                    shared,
+                    &thread.frames,
+                    exc,
+                    trap_snapshot,
+                );
                 return oneshot_route_exception(
                     shared,
                     thread,

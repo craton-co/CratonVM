@@ -232,7 +232,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                                                                   // imprecise whole-method re-run that could double-execute that side
                                                                   // effect (the real, once-confirmed Liquibase `Scope` corruption). That
                                                                   // premise is stale: the SAME day, a concurrent fix
-                                                                  // (`fixed-suite-bugs/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
+                                                                  // (`jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
                                                                   // closed FOUR separate bugs in the reason-8 (`UnreachedCode`) precise-resume
                                                                   // machinery this trap already uses UNCONDITIONALLY (`emit_osr_exit_map_at_reason`
                                                                   // below, `emit_deopt_stubs`'s reason-8 routing, not gated behind

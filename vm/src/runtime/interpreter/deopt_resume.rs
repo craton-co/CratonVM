@@ -1319,7 +1319,7 @@ pub(super) fn transfer_osr_exit_into_live_frame_checked(
     // committed side effects (e.g. `ArrayList.add`) — and let the interpreter
     // resume from the STALE pre-OSR pc/locals, silently re-executing (and
     // re-committing) every iteration since OSR entry. See
-    // fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
+    // jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
     let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
     for (i, v) in rframe.locals.iter().enumerate() {
         if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
@@ -1859,7 +1859,7 @@ pub(crate) fn dbg_deopt_sink(
 /// three-byte bounds check raised `InternalError` instead of
 /// `IndexOutOfBoundsException`. Nothing before the invoke commits anything, and
 /// the call itself never completed, so the replay was always safe. See
-/// `fixed-bugs/jit/ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
+/// `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror-FIXED-20260828.md`.
 ///
 /// # The second half
 ///
@@ -3136,7 +3136,7 @@ mod deopt_step3_tests {
     /// rejected the entire transfer — discarding real, already-committed OSR
     /// side effects and forcing the interpreter to silently re-execute them
     /// from stale pre-OSR state (the root cause documented in
-    /// fixed-suite-bugs/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
+    /// jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
     #[test]
     fn osr_exit_transfer_tolerates_unmappable_local() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));

@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! PGO-02 (docs/feature-designs/profile-guided-inlining.md, retired from
-//! feature-designs/c2/pgo-02-guarded-inlining.md): guarded monomorphic
+//! pgo-02-guarded-inlining.md): guarded monomorphic
 //! virtual/interface inlining, end to end through a real single-pass JIT
 //! compile with `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` on.
 //!
@@ -72,8 +72,16 @@ fn invoke_void(vm: &mut Vm, method: &str, args: &[Value]) {
 
 fn method_descriptor(method: &str) -> &'static str {
     match method {
-        "callA" | "callCurrent" | "callThrowerCaught" | "callOverride" | "callIface"
-        | "callDivider" | "dividerTagFrames" | "callFinally" | "callSynchronized"
+        "callA"
+        | "callCurrent"
+        | "callThrowerCaught"
+        | "callOverride"
+        | "callIface"
+        | "callDivider"
+        | "callDividerForTrace"
+        | "dividerTagFrames"
+        | "callFinally"
+        | "callSynchronized"
         | "callMonitor" => "(I)I",
         "callPoly" | "callBimorphic" => "(II)I",
         "setCurrent" | "setDivisor" => "(I)V",
@@ -393,6 +401,16 @@ fn check_interface_site(vm: &mut Vm) -> Result<(), String> {
 /// A spliced body has no frame of its own, and `capture_current_stack_trace`
 /// walks the interpreter's frame list, so the question is whether the callee
 /// still appears. Measured against the SAME call before the method compiled.
+///
+/// 2026-09-05: that last sentence was false, and this check said so itself,
+/// once every five runs. It drove `callDivider`, which
+/// `check_uncaught_from_inlined_frame` has already compiled and spliced by the
+/// time this runs, so the "interpreted" reading was a second COMPILED reading
+/// and the comparison below was the compiled path against itself. Its own
+/// `interpreted == 0` floor is what caught it. The entry point is now
+/// `callDividerForTrace`, which nothing else drives — see the fixture's
+/// comment on it. Two checks sharing one entry point and one `Vm` is the
+/// hazard; the floor is what made it visible rather than vacuous.
 fn check_stack_trace_through_an_inlined_frame(vm: &mut Vm) -> Result<(), String> {
     // Read the trace the VM CAPTURED, not one reconstructed through Java
     // reflection: these in-process tests boot the synthetic JDK, whose
@@ -402,20 +420,20 @@ fn check_stack_trace_through_an_inlined_frame(vm: &mut Vm) -> Result<(), String>
     fn tag_frames(vm: &mut Vm, x: i32) -> Result<usize, String> {
         let err = match vm.invoke(
             "cratonvm/PgoGuardedVirtualInline",
-            "callDivider",
+            "callDividerForTrace",
             "(I)I",
             &[Value::Int(x)],
         ) {
             Err(e) => e,
             Ok(v) => {
                 return Err(format!(
-                    "callDivider({x}) returned {v:?} instead of raising — the fixture is not                      dividing by zero, so this check would be vacuous"
+                    "callDividerForTrace({x}) returned {v:?} instead of raising — the fixture is                      not dividing by zero, so this check would be vacuous"
                 ))
             }
         };
         let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc) = err else {
             return Err(format!(
-                "callDivider({x}) failed without a throwable: {err:?}"
+                "callDividerForTrace({x}) failed without a throwable: {err:?}"
             ));
         };
         let hash = vm.shared.mem.heap.identity_hash_code(exc);
@@ -431,12 +449,12 @@ fn check_stack_trace_through_an_inlined_frame(vm: &mut Vm) -> Result<(), String>
 
     invoke_void(vm, "setDivisor", &[Value::Int(1)]);
     for i in 0..CALLS {
-        let _ = invoke_int(vm, "callDivider", &[Value::Int(i)]);
+        let _ = invoke_int(vm, "callDividerForTrace", &[Value::Int(i)]);
     }
-    let tally = compiled_tally(vm, "callDivider", &[Value::Int(1)])?;
+    let tally = compiled_tally(vm, "callDividerForTrace", &[Value::Int(1)])?;
     if tally.speculative_sites == 0 {
         return Err(format!(
-            "check_stack_trace_through_an_inlined_frame: callDivider was not spliced              ({tally:?}), so this check would compare the dispatch path against itself"
+            "check_stack_trace_through_an_inlined_frame: callDividerForTrace was not spliced              ({tally:?}), so this check would compare the dispatch path against itself"
         ));
     }
 
@@ -515,13 +533,23 @@ fn check_finally_runs_at_a_guard_eligible_site(vm: &mut Vm) -> Result<(), String
             return Err(format!("callFinally({i}) = {got}, want {want}"));
         }
     }
+    // Read the counter HERE, before `compiled_tally`. That helper keeps CALLING
+    // the method while it waits for the background worker — up to 400 rounds of
+    // 50 — and every one of those calls runs the `finally` too, while `expected`
+    // counts only this function's own loop. So the assertion below held exactly
+    // when the artifact happened to be installed by the first poll, and read
+    // "the `finally` ran 900 times for 700 calls" when it took four rounds: a
+    // 5.6%-of-runs failure that accused the VM of double-executing a `finally`
+    // when the extra runs were the test's own calls. (2026-09-05. It surfaced
+    // once the stack-trace check above stopped failing first and aborting the
+    // run before this one; a flake can hide a flake.)
+    let after = invoke_int(vm, "finallySideEffects", &[]);
     let tally = compiled_tally(vm, "callFinally", &[Value::Int(1)])?;
     if tally.speculative_sites != 0 {
         return Err(format!(
             "check_finally_runs_at_a_guard_eligible_site: callFinally spliced a callee              carrying an exception table ({tally:?})"
         ));
     }
-    let after = invoke_int(vm, "finallySideEffects", &[]);
     if after - before != expected {
         return Err(format!(
             "check_finally_runs_at_a_guard_eligible_site: the `finally` ran {} times for              {expected} calls (both escape routes must run it, exactly once each)",

@@ -59,7 +59,7 @@
 //!
 //! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
 //! mean": the [`parse`] module carries five *different* boolean parsers because
-//! five different ones are in use today. `audits/flag-census.md` §10 has
+//! five different ones are in use today. `flag-census.md` §10 has
 //! the full matrix. Unifying them is a behaviour change and is deliberately not
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
@@ -406,7 +406,7 @@ pub mod parse {
     /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
     /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
     /// [`affirmative_word`]. Truth table 8 (see the module docs and
-    /// `audits/flag-census.md` §10). Lifted from
+    /// `flag-census.md` §10). Lifted from
     /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
     #[inline]
     pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {
@@ -600,7 +600,7 @@ pub enum BlockedAccessMode {
 /// correlated). Then run a class-unloading lane, not just the throughput and
 /// differential lanes.
 ///
-/// See `arch-2026-07-26/moving-young-precise-roots.md`.
+/// See `moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
 
 /// Whether the JIT publishes a complete, mechanically-enumerable **relocation
@@ -1032,6 +1032,37 @@ pub struct GcFlags {
     /// switch even though the ordering that makes it safe is written down and
     /// tested.
     pub g1_uncommit: bool,
+    /// `CRATONVM_GEN_UNCOMMIT` — return the EVACUATED young semi-space to the
+    /// OS at the end of each young collection, instead of only zeroing it.
+    ///
+    /// **Default-ON opt-out since 2026-09-05** ([`parse::on_unless_zero`]);
+    /// `=0` restores the zero-only behaviour exactly. It shipped opt-in the same
+    /// day and earned the default on a 90/90 HotSpot-differential regression
+    /// suite with it (and the exact object-start bitmap) enabled on this
+    /// collector, having returned 31457280 bytes of a 96 MB heap on the probe
+    /// workload.
+    ///
+    /// The generational collector was the one backend that never gave memory
+    /// back: ZGC does it by default, G1 on request ([`Self::g1_uncommit`]), and
+    /// `gen_heap.rs` contained no `decommit` call at all. Its old generation
+    /// still cannot — that is a `Vec<u8>`, committed in full at construction,
+    /// with no reservation to shrink — but the two young semi-spaces are
+    /// `HeapStore`-backed and the INACTIVE one is, by construction, entirely
+    /// dead the moment the flip completes.
+    ///
+    /// THE COST, which the default does not make go away and which is why the
+    /// opt-out is the first thing to reach for if a compiled frame ever faults
+    /// on a young address: this collector publishes its young arenas' FULL
+    /// reserved range into `JIT_REGION_BOUNDS` and `JIT_READ_BOUNDS`, and a
+    /// decommitted granule FAULTS on touch rather than reading as zero. That
+    /// window is not created here — the young arenas already commit lazily
+    /// while the published bound covers the whole reservation — but it is
+    /// WIDENED, from "granules never yet allocated into" to "granules that held
+    /// objects one collection ago". A compiled access through a STALE reference
+    /// into the evacuated semi-space therefore moves from reading a stale value
+    /// to a SIGSEGV. That is a louder failure, not a new one, but it is a
+    /// behaviour change and it is stated here rather than buried.
+    pub gen_uncommit: bool,
     /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
     /// source walks against a per-arena CARD TABLE, instead of walking every
     /// byte of every named source region. Default **ON**
@@ -1157,7 +1188,7 @@ pub struct GcFlags {
     /// barrier inline instead of routing every compiled reference store to the
     /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
     ///
-    /// Closing defect G1-2 (`audits/g1-audit.md` §8.1, §10) made every
+    /// Closing defect G1-2 (`g1-audit.md` §8.1, §10) made every
     /// JIT-compiled reference store an out-of-line call, because the inline
     /// fast paths are gated on the `JIT_REGION_BOUNDS` table, which G1
     /// deliberately never publishes. §10 measured the cost as falling on the
@@ -1331,7 +1362,7 @@ pub struct GcFlags {
     /// actually means "the conservative scan found none", which is unknown, not
     /// none. Evacuating against it is what moved a live
     /// `StringLatin1.newString` reference out from under a compiled frame
-    /// (`bug-g1-evacuates-live-jit-reference-20260819.md`).
+    /// (`bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`).
     ///
     /// **It ships OFF because a refusal reclaims nothing**, so it can only buy
     /// time for a publication that later becomes non-empty. Measured before the
@@ -1468,6 +1499,11 @@ pub struct GcFlags {
     pub dbg_sweep_edges: bool,
     /// `CRATONVM_DBG_SWEEP_ZERO`
     pub dbg_sweep_zero: bool,
+    /// `CRATONVM_GC_LATE_RESOLVE_DROPPED` -- also run the late grid-resolution
+    /// pass over the candidates `mark_young` DROPPED as free/gap space inside a
+    /// proved anchor span, not only the ones it left unresolved. Over-retention
+    /// only. Default off; see `gen_heap.rs` for the defect it was opened for.
+    pub late_resolve_dropped: bool,
     /// `CRATONVM_DBG_WATCHREF`
     pub dbg_watchref: bool,
     /// `CRATONVM_DBG_WATCH_CELL` — hex address to watch, `0` when disabled.
@@ -1504,8 +1540,7 @@ pub struct GcFlags {
     /// old/pinned) before and after every `collect_garbage()` call, and a
     /// fuller breakdown (incl. humongous) right before the "out of heap
     /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
-    /// see fixed-suite-bugs/
-    /// g1-native-alloc-no-safepoint-oom-FIXED.md.
+    /// see g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
     /// `CRATONVM_DBG_G1ACCESSOR` — at VM exit, print how many of this
     /// collector's field/array accessor calls had to take the global `regions`
@@ -1620,6 +1655,7 @@ impl GcFlags {
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
+            gen_uncommit: on_unless_zero(src, "CRATONVM_GEN_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
             g1_card_screen_jit_pinned: on_unless_zero(
@@ -1688,6 +1724,7 @@ impl GcFlags {
             dbg_sweep_census: present(src, "CRATONVM_DBG_SWEEP_CENSUS"),
             dbg_sweep_edges: present(src, "CRATONVM_DBG_SWEEP_EDGES"),
             dbg_sweep_zero: present(src, "CRATONVM_DBG_SWEEP_ZERO"),
+            late_resolve_dropped: present(src, "CRATONVM_GC_LATE_RESOLVE_DROPPED"),
             dbg_watchref: present(src, "CRATONVM_DBG_WATCHREF"),
             dbg_watch_cell: hex_addr_or_zero(src, "CRATONVM_DBG_WATCH_CELL"),
             dbg_youngstate: present(src, "CRATONVM_DBG_YOUNGSTATE"),

@@ -168,7 +168,7 @@ fn open_udp_dual_stack_socket(port: u16) -> Result<std::net::UdpSocket, io::Erro
 /// failed with `finishConnect: Connection refused` for EVERY parameterisation of
 /// `testMutualAuthDiffCerts` in four `SSLEngineTest` subclasses, and read as a
 /// TLS defect because `assertTrue` throws the future's cause away. See
-/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+/// `ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
 ///
 /// `backlog <= 0` asks for the same 128 `std::net::TcpListener::bind` uses, and
 /// `SO_REUSEADDR` is set on non-Windows only — again matching `TcpListener::bind`,

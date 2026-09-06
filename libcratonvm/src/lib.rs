@@ -466,7 +466,7 @@ unsafe fn option_to_str<'a>(
 ///   discovery, i.e. a VM with no class library at all.
 ///
 /// Both are hard errors at the launcher; they must be hard errors here too.
-/// See `arch-2026-07-26/jdk-mode-determinism.md` §2.3 and §6.4.
+/// See `jdk-mode-determinism.md` §2.3 and §6.4.
 ///
 /// The resolved root is written back to `java_home` (when not already set) for
 /// the same reason the launcher does it: so the VM's boot-classpath discovery

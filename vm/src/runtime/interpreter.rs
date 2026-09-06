@@ -3754,16 +3754,16 @@ pub fn execute(
                                 let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
                                     // Taken BEFORE the construction below, which is
                                     // what re-captures the (now compiled-frame-free)
-                                    // stack. See `attach_snapshotted_npe_frames`.
+                                    // stack. See `attach_snapshotted_trap_frames`.
                                     let snapshot =
-                                        crate::jit::helpers::take_jit_pending_npe_compiled_frames();
+                                        crate::jit::helpers::take_jit_pending_trap_frames();
                                     match crate::runtime::exceptions::throw_runtime_error(
                                         shared,
                                         thread,
                                         RuntimeError::NullPointerException { message: None },
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
-                                            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                                            crate::runtime::exceptions::attach_snapshotted_trap_frames(
                                                 shared, &thread.frames, exc, snapshot,
                                             );
                                             jit_early_exception = Some(exc);
@@ -3816,6 +3816,22 @@ pub fn execute(
                                 // executes side effects preceding the trap).
                                 let arith_routed =
                                     if crate::jit::helpers::take_jit_pending_arithmetic() {
+                                        // Taken BEFORE the construction below, for the
+                                        // same reason as the NPE arm above and with the
+                                        // same consequence when it is not: the
+                                        // zero-divisor stub ran the epilogue, so
+                                        // `fillInStackTrace` walks a stack the compiled
+                                        // frames have already left and the throwable
+                                        // keeps an EMPTY trace.
+                                        //
+                                        // This is the sixth and last door that
+                                        // constructs one of these. Five were found by
+                                        // reading; this one was found by labelling all
+                                        // five, watching the flake reproduce with no
+                                        // label printed, and grepping for the drain
+                                        // again.
+                                        let snapshot =
+                                            crate::jit::helpers::take_jit_pending_trap_frames();
                                         match crate::runtime::exceptions::throw_runtime_error(
                                             shared,
                                             thread,
@@ -3824,6 +3840,9 @@ pub fn execute(
                                             },
                                         ) {
                                             MethodCallFailed::ExceptionThrown(exc) => {
+                                                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                                                    shared, &thread.frames, exc, snapshot,
+                                                );
                                                 jit_early_exception = Some(exc);
                                                 true
                                             }
@@ -5746,7 +5765,7 @@ fn execute_frame_from_index(
         }
 
         // T19.H7 diag — opcode counter. Removed; documented findings in
-        // history/roadmap-100.md T19.H7 section. Last localization:
+        // roadmap-100.md T19.H7 section. Last localization:
         // `org/jboss/modules/Main.main` pc=1306 dispatched, then a native
         // call from that opcode never returns (interpreter loop never
         // re-entered).
@@ -5960,8 +5979,22 @@ fn execute_frame_from_index(
                             }
                         }
                     }
-                    // iload_X; arraylength → get array length directly
+                    // iload_X; arraylength → get array length directly.
+                    // Pushes the local's raw slot and lets the quickened arm
+                    // read the header, rather than decoding to `Value` and
+                    // paying the `VmHeap` dispatch; on a decline the push is
+                    // undone so the stack is exactly as it was.
                     if b1 == 0xbe {
+                        if fast_field_zgc.is_some() {
+                            frame
+                                .stack
+                                .push_compact(frame.get_local_compact_unchecked(local_idx));
+                            if field_fast::arraylength_fast(&mut frame.stack) {
+                                frame.pc = saved_pc + 2;
+                                continue;
+                            }
+                            frame.stack.pop_compact();
+                        }
                         let arr_val = frame.get_local_unchecked(local_idx);
                         if let Value::Object(Some(arr_ref)) = arr_val {
                             let len = shared.mem.heap.array_length(arr_ref);
@@ -6336,7 +6369,7 @@ fn execute_frame_from_index(
                     // dropping the high bits. Copy the raw CompactValue for
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
-                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+                    // bc-ec-mod-mododdinverse-investigation.md.
                     //
                     // Underflow guard: an empty operand stack at a value
                     // return means earlier execution desynced the stack
@@ -7195,6 +7228,72 @@ fn execute_frame_from_index(
                 }
                 // xaload: iaload..saload (0x2e..=0x35)
                 0x2e..=0x35 => {
+                    // Quickened attempt first, entirely on raw slots.
+                    //
+                    // This arm used to open by decoding BOTH operands into the
+                    // 16-byte `Value` enum and only then offer them to the
+                    // quickened path — so every array element load paid two
+                    // `CompactValue -> Value` conversions before the fast arm
+                    // could decline them, and the fall-through pushed both
+                    // wide values back. The `*astore` arm below already had
+                    // the right shape (peek the raw slots, decode only on the
+                    // decline), and this is that shape.
+                    //
+                    // `index >= 0` is tested here so a negative index still
+                    // reaches the general path, which owns the AIOOBE and its
+                    // message.
+                    if let Some(zgc) = fast_field_zgc {
+                        if frame.stack.len() >= 2 {
+                            let (idx_cv, idx_kind) = frame.stack.peek_with_kind_at(0);
+                            let (arr_cv, arr_kind) = frame.stack.peek_with_kind_at(1);
+                            if let (Some(index), Some(aptr)) =
+                                (idx_cv.as_int(), arr_cv.as_object_ptr())
+                            {
+                                if index >= 0 && aptr != 0 {
+                                    // SAFETY: an `Object`-tagged operand-stack slot holds a
+                                    // heap address; both arms re-validate the header.
+                                    let arr_ref = unsafe { ObjectRef::from_raw(aptr as *mut u8) };
+                                    frame.stack.pop_compact();
+                                    frame.stack.pop_compact();
+                                    if field_fast::array_load_prim(
+                                        zgc,
+                                        &mut frame.stack,
+                                        arr_ref,
+                                        index,
+                                        opcode,
+                                    ) || (opcode == 0x32
+                                        && field_fast::array_load_ref(
+                                            zgc,
+                                            &mut frame.stack,
+                                            arr_ref,
+                                            index,
+                                        ))
+                                    {
+                                        frame.pc = saved_pc + 1;
+                                        continue;
+                                    }
+                                    // Declined. Restore both operand slots
+                                    // bit-for-bit AND kind-for-kind.
+                                    //
+                                    // `push_compact` would have been correct on
+                                    // the verifier's guarantee that an `*aload`
+                                    // sees `(arrayref, int)`, neither of which
+                                    // is category-2 — but it writes
+                                    // `KIND_UNKNOWN`, and the one shape that
+                                    // guarantee excludes is exactly the one the
+                                    // kind array exists for: a collision-shaped
+                                    // `long` is bit-identical to `Value::Int(0)`
+                                    // (see `ValueStack::kinds`), so an unmarked
+                                    // one with reference-looking bits is what a
+                                    // GC root scan would relocate. Restoring a
+                                    // slot is not the place to spend a
+                                    // guarantee.
+                                    frame.stack.push_with_kind_unchecked(arr_cv, arr_kind);
+                                    frame.stack.push_with_kind_unchecked(idx_cv, idx_kind);
+                                }
+                            }
+                        }
+                    }
                     let idx_val = frame.stack.pop_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
                     if let (Value::Object(Some(arr_ref)), Value::Int(index)) = (arr_val, idx_val) {
@@ -7209,13 +7308,8 @@ fn execute_frame_from_index(
                             ));
                             continue;
                         }
-                        // Widening: index conversion
-                        if let Some(zgc) = fast_field_zgc {
-                            if field_fast::array_load_prim(zgc, &mut frame.stack, arr_ref, index, opcode) {
-                                frame.pc = saved_pc + 1;
-                                continue;
-                            }
-                        }
+                        // The quickened attempt already ran above, on the raw
+                        // slots, before either operand was decoded.
                         match shared.mem.heap.get_array_element(arr_ref, index as usize) {
                             Ok(value) => {
                                 frame.stack.push_unchecked(value);
@@ -7480,6 +7574,16 @@ fn execute_frame_from_index(
                 }
                 // arraylength (0xbe) — direct int push on the success path.
                 0xbe => {
+                    // Quickened arm first: reads the length out of the header
+                    // at the address already in the slot, with no `Value`
+                    // round trip and no `VmHeap` dispatch. Declines a null or
+                    // non-array receiver so the general path below keeps the
+                    // NPE and the corrupt-header diagnosis. See
+                    // `field_fast::arraylength_fast`.
+                    if fast_field_zgc.is_some() && field_fast::arraylength_fast(&mut frame.stack) {
+                        frame.pc = saved_pc + 1;
+                        continue;
+                    }
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
                         let len = shared.mem.heap.array_length(arr_ref);
@@ -9004,6 +9108,7 @@ mod invoke_fast;
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod invoke_phases;
+pub mod field_phases;
 pub mod site_cache;
 pub use site_cache::{
     CastSiteCache, ClassSiteCache, FastFieldSite, FastFieldSiteCache, FieldSiteCache,

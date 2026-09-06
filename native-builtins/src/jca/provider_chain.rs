@@ -2482,7 +2482,7 @@ fn seed_direct_native_engine_services() {
         // names — and the class name is the whole difference between this
         // working and not.
         //
-        // `jca-provider-population-gap-20260830.md` §5.2 ran this experiment
+        // `jca-provider-population-gap-20260830-FIXED.md` §5.2 ran this experiment
         // ("add six `put_service` rows, rebuild, ask"), got
         // `NoSuchAlgorithmException` unchanged, and concluded "a service row is
         // not sufficient even for the one engine that walks the chain". The
@@ -4335,7 +4335,7 @@ fn seed_sunjce_pbe_services() {
     // bytecode walking `Provider.getService` — so the row is the whole
     // mechanism, and a misspelt row is the whole defect.
     //
-    // `jca-provider-population-gap-20260830.md` §5 concluded "0 of 84 are
+    // `jca-provider-population-gap-20260830-FIXED.md` §5 concluded "0 of 84 are
     // clerical" from reading two other engines' dispatch. These four were.
     const HASHES: &[(&str, &str)] = &[
         // (algorithm spelling, class-name spelling)
@@ -4373,7 +4373,7 @@ fn seed_sunjce_pbe_services() {
 ///
 /// # Why the class name is the whole difference
 ///
-/// `jca-provider-population-gap-20260830.md` §5.2 ran exactly this experiment
+/// `jca-provider-population-gap-20260830-FIXED.md` §5.2 ran exactly this experiment
 /// on six of these rows, measured `NoSuchAlgorithmException` unchanged, and
 /// concluded that "a service row is not sufficient even for the one engine
 /// that walks the chain" — from which §5.3 drew "0 of 84 are clerical".
@@ -4508,7 +4508,7 @@ fn seed_sunjce_modern_engine_services() {
     }
     // Two services this VM has been SERVING all along and never advertised —
     // the `W7-63` half again. `KeyAgreement.DiffieHellman` is the one
-    // `jca-provider-population-gap-20260830.md` §4 runs a complete 2048-bit
+    // `jca-provider-population-gap-20260830-FIXED.md` §4 runs a complete 2048-bit
     // agreement through while noting its whole type was unlisted, and
     // `Signature.NONEwithRSA` has had a `SIG_NONE_RSA` arm since 2026-08-14.
     put_service(
@@ -6590,7 +6590,7 @@ pub(crate) fn third_party_service_class(
 /// # Why this is worth having at all
 ///
 /// Measured on 2026-09-02, all 84 of the implementation classes behind
-/// `jca-provider-population-gap-20260830.md`'s functional gap LOAD on this VM
+/// `jca-provider-population-gap-20260830-FIXED.md`'s functional gap LOAD on this VM
 /// (`apps/probes/JcaGapSizer --check`: `loads=yes` for every one; the
 /// `instantiates=` column reports the probe's own
 /// `InaccessibleObjectException` from `setAccessible` on a non-exported
@@ -8592,7 +8592,7 @@ mod tests {
             // `.Native` MARKER is not one — it means "a Rust engine answers
             // this" — and a marker row for a name the engine does not compute
             // is exactly the W7-15 defect. It is also why
-            // `jca-provider-population-gap-20260830.md` §5.2 concluded a
+            // `jca-provider-population-gap-20260830-FIXED.md` §5.2 concluded a
             // service row could never be sufficient: the six rows it added
             // carried the marker.
             let routed = get_service_entry("SunJCE", "Cipher", algorithm)

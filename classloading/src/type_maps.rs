@@ -75,7 +75,7 @@
 //! bytes of row data, plus a ~96-byte [`MethodTypeMaps`] header and four
 //! heap allocations. See [`MethodTypeMaps::heap_bytes`] and
 //! [`store_heap_bytes`]; the design doc
-//! `arch-2026-07-26/verifier-type-maps.md` carries the full
+//! `verifier-type-maps.md` carries the full
 //! per-method accounting.
 
 use std::ptr;

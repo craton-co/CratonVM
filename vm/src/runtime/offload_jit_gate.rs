@@ -4,7 +4,7 @@
 //! GPU-offload JIT admission gate.
 //!
 //! Follow-up item 2 in
-//! `fixed-suite-bugs/gpu-offload-followups-20260711.md` ("JIT-compiled
+//! `gpu-offload-followups-20260711.md` ("JIT-compiled
 //! callers bypass the offload hook"): the transparent GPU-offload hook
 //! ([`crate::runtime::offload::try_dispatch`]) only fires from the
 //! *interpreter's* `execute_invokestatic` slow path. If the **caller**
@@ -114,18 +114,26 @@
 //!   on every class load, or re-running this gate at every promotion
 //!   attempt rather than caching permanently; both are out of scope for
 //!   the conservative first fix.
-//! - **Hint-loosened kernels.** [`compute`] calls
-//!   [`jit_cuda::analyzer::analyze`] (the strict, annotation-free
-//!   verdict — `MethodAnnotations::default()`), matching the task's
-//!   guidance that a plain `Eligible` verdict is sufficient for this
-//!   gate. A kernel that is only eligible because of a
-//!   `@GpuKernel`/`AdmissionHint` annotation (see
-//!   `jit_cuda::analyzer::analyze_with_annotations`) is invisible to
-//!   this scan and will not block its caller's JIT admission. This is
-//!   intentionally conservative in the direction that costs offload
+//! - ~~**Hint-loosened kernels.**~~ **Closed 2026-09-05.** [`compute`]
+//!   now calls [`jit_cuda::analyzer::analyze_with_annotations_and_pool`]
+//!   with the target's own annotations and constant pool — the same call
+//!   the dispatcher makes, which is the only way the two can agree.
+//!
+//!   This bullet used to say the annotation-free verdict was
+//!   "intentionally conservative in the direction that costs offload
 //!   throughput, not correctness — the worst case is a JIT-compiled
-//!   caller that stops offloading, exactly the pre-existing bug this
-//!   module fixes for the common (unannotated) case.
+//!   caller that stops offloading". That worst case was then measured at
+//!   **10.8x** on the constant-pool half of the same disagreement (see
+//!   `docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md`),
+//!   which is what retired the argument: "costs throughput, not
+//!   correctness" is not a reason to keep a gate asking a different
+//!   question from the dispatcher it models.
+//!
+//!   It also ran the other way. A `@GpuExclude` target could be judged
+//!   `Eligible` here and REGISTERED with the offload hook, arming it for
+//!   a method `lookup_or_compile` short-circuits and never launches —
+//!   and under [`CallerGateMode::Block`] denying its caller compilation
+//!   for an offload that could not happen.
 //! - **`invokedynamic`-mediated calls** (method references, lambdas)
 //!   are not scanned — only literal `invokestatic` bytecodes. A caller
 //!   that reaches an eligible kernel through a `MethodHandle` is not
@@ -239,7 +247,8 @@ pub fn caller_blocks_jit_by_name(
 /// The actual analysis behind [`caller_blocks_jit`]'s cache miss path.
 /// See the module docs' "Known limitations" section for what this
 /// deliberately does not handle (forward class references,
-/// annotation-loosened kernels, `invokedynamic`-mediated calls).
+/// `invokedynamic`-mediated calls). Annotation-loosened kernels were on
+/// that list until 2026-09-05 and are now handled.
 fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
     // Mirrors the exact "no device -> Skip" short-circuit
     // `OffloadCache::lookup_or_compile` uses, via the same public
@@ -348,12 +357,114 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
             continue;
         };
 
-        // Plain, annotation-free verdict — see "Known limitations" for
-        // why hint-loosened kernels are intentionally not covered.
-        let jit_cuda::OffloadVerdict::Eligible(sig) =
-            jit_cuda::analyzer::analyze(target_method)
-        else {
-            continue;
+        // Annotation-free, but CONSTANT-POOL AWARE -- and the pool has to
+        // be the TARGET's, not this caller's.
+        //
+        // AUDIT 2026-09-05. This called the CP-free `analyze`, which
+        // rejects `ldc`/`ldc_w`/`ldc2_w` unconditionally because it has
+        // no pool to resolve them against. `lookup_or_compile` -- the
+        // dispatcher this gate exists to serve -- calls
+        // `analyze_with_pool`, which admits a numeric literal (AUDIT
+        // C31). So the two disagreed, silently, about any kernel
+        // containing a constant-pool constant.
+        //
+        // `bench-gpu/GpuFloatDivChain.divChain` is one such kernel: its
+        // `x = x / d + 1.0000001` is an `ldc2_w`, so the gate saw
+        // INELIGIBLE while the interpreter saw `Eligible` and offloaded.
+        // Its int twin's `+ 12345` is a `sipush` with no pool entry, so
+        // that one agreed and worked. Measured at N=2^24: 9,276 ms
+        // against the int twin's 8 ms, and 28 ms with `CRATONVM_JIT_OSR=0`
+        // (which keeps the caller interpreted, where the CP-aware verdict
+        // is the one that runs).
+        //
+        // NOT an FP-only disagreement, though both symptoms that found it
+        // were. The boundary is the CONSTANT POOL, not the type: an
+        // `int[]` kernel whose constant is above `sipush` range needs an
+        // `ldc` and went dark too, while a `long[]` kernel using only
+        // `lconst_1` never touched the pool and offloaded normally. Both
+        // measured on `test_classes/gpu/GpuLdcSplit.java`, which exists
+        // to break that correlation -- the same defect was independently
+        // scoped as "the compiled caller drops long[] and double[]",
+        // because a `long`/`double` literal has no small-immediate form
+        // and so always trips it. See
+        // docs/known-issues/gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md.
+        //
+        // The disagreement was always wrong, and it became load-bearing
+        // when this scan started ARMING the compiled-tier hook rather
+        // than merely blocking: a target the gate cannot see is one the
+        // compiler binds directly, and the hook is then lost for the life
+        // of the process.
+        // ANNOTATIONS TOO, for the same reason as the pool: the
+        // dispatcher reads them (`read_method_annotations`, then
+        // `analyze_with_annotations_and_pool`), so a gate that does not
+        // is asking a different question and will disagree.
+        //
+        // AUDIT 2026-09-05, second half. The module docs used to list
+        // "hint-loosened kernels" as a deliberate limitation, argued as
+        // "conservative in the direction that costs offload throughput,
+        // not correctness -- the worst case is a JIT-compiled caller
+        // that stops offloading". That worst case is exactly the defect
+        // the pool half of this call had just been measured at 10.8x, so
+        // the argument does not survive its own example.
+        //
+        // The disagreement ran BOTH ways:
+        //   - a kernel eligible only via `@GpuKernel`/`AdmissionHint`
+        //     was invisible here, so it was never registered and its
+        //     compiled call sites bound directly and went dark;
+        //   - a `@GpuExclude` method could be judged Eligible here and
+        //     REGISTERED, arming the offload hook for a target the
+        //     dispatcher short-circuits and will never launch (and,
+        //     under `CallerGateMode::Block`, denying its caller
+        //     compilation for an offload that cannot happen).
+        //
+        // Decoding costs one attribute pass per scanned target, next to
+        // a full bytecode scan that was already being paid.
+        let target_attrs = crate::runtime::offload::decode_method_attrs(
+            &target_method.attributes,
+            &target_class.constant_pool,
+        );
+        let target_annotations =
+            jit_cuda::annotations::read_method_annotations(&target_attrs, &target_class.constant_pool);
+        let sig = match jit_cuda::analyzer::analyze_with_annotations_and_pool(
+            target_method,
+            &target_annotations,
+            &target_class.constant_pool,
+        ) {
+            jit_cuda::OffloadVerdict::Eligible(sig) => sig,
+            // Counted, and named. This refusal used to be a bare
+            // `continue`: the two counters below it exist because a
+            // narrowing that shows up only as an ABSENCE cannot be told
+            // from one that never fired, and this one had no counter at
+            // all. That is how the pool-free `analyze` above went
+            // unnoticed -- a run whose kernels had all silently stopped
+            // registering printed a census identical to a healthy one.
+            jit_cuda::OffloadVerdict::Rejected(reason) => {
+                // Split, because a census that folds "never a candidate"
+                // into "refused" is one nobody reads: one run of
+                // `GpuIntensitySweep` walks past ~154 signature-refused
+                // JDK targets, and naming those would bury the handful
+                // that matter.
+                use jit_cuda::analyzer::Reason;
+                let never_a_candidate = matches!(
+                    reason,
+                    Reason::NonStatic
+                        | Reason::Synchronized
+                        | Reason::NativeOrAbstract
+                        | Reason::NoCode
+                        | Reason::BadDescriptor
+                        | Reason::UnsupportedParamType
+                        | Reason::UnsupportedReturnType
+                        | Reason::GpuExcluded
+                );
+                if never_a_candidate {
+                    cratonvm_types::gpu_jit_gate_census::note_target_never_candidate();
+                } else {
+                    cratonvm_types::gpu_jit_gate_census::note_target_body_refused(format!(
+                        "{target_class_name}.{target_method_name}{target_descriptor} — {reason:?}"
+                    ));
+                }
+                continue;
+            }
         };
 
         // ...and then the DISPATCHER's own gates. `Eligible` answers
@@ -798,8 +909,9 @@ enum CallerGateMode {
     /// hoisted a loop's induction variable -- and this mode was simply
     /// the first thing that ever compiled the method, because
     /// [`CallerGateMode::Block`] had kept every scenario in that file
-    /// interpreted. Fixed 2026-09-05; see
-    /// `docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md`.
+    /// interpreted. Fixed 2026-09-05; see the retired
+    /// `osr-miscompiles-cachecoherence-20260904` write-up, named rather
+    /// than linked because it retired to the internal tree.
     ///
     /// With it fixed, all seven `runtime-stress.sh` scenarios pass under
     /// this mode, as do `jit-writer-stale.sh` and the rest.
@@ -952,16 +1064,21 @@ mod tests {
         const FILTER: usize = 0x0000_7FF0_0020_0000;
         const DIRTY: usize = 0x0000_7FF0_0020_0040;
 
-        // Arming is process-global; save and restore so this test does
-        // not change what the rest of this binary would emit.
-        let armed_before = cratonvm_jit::gpu_barrier::is_armed();
-        assert!(
-            !armed_before,
-            "no test in this binary should have armed the barrier"
-        );
-        cratonvm_jit::gpu_barrier::arm(FILTER, DIRTY);
-        let bytes = cratonvm_jit::gpu_barrier::barrier_bytes().expect("armed");
-        cratonvm_jit::gpu_barrier::arm(0, 0);
+        // Encode from an explicit pair. This used to arm the process
+        // globals and restore them, with a comment saying save-and-restore
+        // kept the rest of the binary safe. It does not: cargo runs these
+        // tests as parallel THREADS, so this and `the_barrier_never_writes_rax`
+        // interleave -- and `armed_before` was itself the race, asserting
+        // "no test in this binary should have armed the barrier" while the
+        // sibling test had. Meanwhile `array_writer_policy` below reads
+        // `is_armed()` in PRODUCTION, so an arming window here silently
+        // moves the policy any concurrent test observes.
+        //
+        // `barrier_bytes_for` is the same encoder without the globals; see
+        // `gpu_barrier::arm`'s doc, and `jit/tests/gpu_barrier_arming.rs`
+        // for what covers the publishing itself.
+        let bytes =
+            cratonvm_jit::gpu_barrier::barrier_bytes_for(FILTER, DIRTY).expect("armed pair");
 
         let mut decoder = Decoder::with_ip(64, &bytes, BASE, DecoderOptions::NONE);
         let decoded: Vec<_> = decoder.iter().collect();
@@ -1057,9 +1174,10 @@ mod tests {
     fn the_barrier_never_writes_rax() {
         use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
 
-        cratonvm_jit::gpu_barrier::arm(0x1000, 0x2000);
-        let bytes = cratonvm_jit::gpu_barrier::barrier_bytes().expect("armed");
-        cratonvm_jit::gpu_barrier::arm(0, 0);
+        // No arming: see the sibling test above for why this binary must
+        // not publish to the process globals.
+        let bytes =
+            cratonvm_jit::gpu_barrier::barrier_bytes_for(0x1000, 0x2000).expect("armed pair");
 
         let mut decoder = Decoder::with_ip(64, &bytes, 0x1_0000, DecoderOptions::NONE);
         for insn in decoder.iter() {

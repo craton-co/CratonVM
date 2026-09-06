@@ -700,7 +700,7 @@ fn build_cfg_with_leaders(
         // `jit/src/lib.rs::local_handler_reads_unsafe_local`, so the method is
         // refused before it can be miscompiled — this fix removes the reliance
         // on that coincidence and is a prerequisite for relaxing it (see
-        // `arch-2026-07-26/jit-regalloc-and-deopt.md`).
+        // `jit-regalloc-and-deopt.md`).
         //
         // Direction of the change is monotone-safe: more block starts ⇒ more
         // blocks ⇒ strictly MORE code covered by gen/kill and interference.
@@ -1569,7 +1569,7 @@ impl SafepointPublishPlan {
     /// This is the exact predicate the x64 backend's
     /// `can_elide_self_call_register_spill` should test instead of
     /// `local_assignments.iter().any(Option::is_some)`; see the cross-owner
-    /// request in `arch-2026-07-26/jit-regalloc-and-deopt.md`.
+    /// request in `jit-regalloc-and-deopt.md`.
     pub fn no_reference_in_registers(&self) -> bool {
         self.register_homed_reference_locals == 0
     }
@@ -1714,7 +1714,7 @@ pub fn allocate_registers_with_handlers(
 /// rejected OSR-exit snapshot falls back to "continue interpreting the
 /// pre-OSR-entry frame", which re-runs every loop iteration the OSR-compiled
 /// code already executed — silently duplicating side effects (see
-/// `fixed-suite-bugs/testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
+/// `testoutputbuffer-writespeed-content-length-mismatch-FIXED.md`).
 /// Knowing a local is dead at the snapshot bci lets the caller substitute a
 /// safe placeholder instead of rejecting outright.
 ///
@@ -5166,8 +5166,9 @@ impl Allocation {
 const SPILL_DISTANCE_SCALE: u64 = 1024;
 
 /// How much a LOOP-CARRIED value's next-use distance is discounted when
-/// choosing a spill victim -- **default 0, i.e. OFF**; opt in with
-/// `CRATONVM_JIT_LS_CARRY_RELIEF=64`.
+/// choosing a spill victim -- **default 64, i.e. ON** since 2026-09-05;
+/// `CRATONVM_JIT_LS_CARRY_RELIEF=0` restores the distance-only rule and is the
+/// kill switch.
 ///
 /// Off by default because it is not shown to PAY, not because it is wrong. It
 /// moves the residency census deterministically (`resident=1` to `2`,
@@ -5188,9 +5189,11 @@ fn ls_carry_relief() -> u64 {
     use std::sync::OnceLock;
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
+        // 2026-09-05: DEFAULT 64, i.e. ON. `=0` restores the old
+        // distance-only rule and is the kill switch.
         match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LS_CARRY_RELIEF") {
-            Ok(v) => v.trim().parse::<u64>().unwrap_or(0),
-            Err(_) => 0,
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(64),
+            Err(_) => 64,
         }
     })
 }

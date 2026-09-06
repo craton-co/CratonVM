@@ -20,7 +20,8 @@
 #                      scenario that writes an array or calls a kernel --
 #                      which is all of them. An OSR miscompilation of
 #                      `cacheCoherence` sat behind that hole; see
-#                      docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md.
+#                      the retired osr-miscompiles-cachecoherence-20260904
+#                      write-up (fixed 2026-09-05).
 #   cratonvm --nojit   the CONTROL. "The GPU disagrees with HotSpot" is
 #                      also what a host-side defect looks like; without
 #                      the control a difference cannot be attributed.
@@ -98,7 +99,7 @@ if [ -s "$TMP/jit" ]; then
     if [ "$got" != "$want" ]; then
       echo "FAIL(jit) $key: control=${want#*=} jit=${got#*=}"
       echo "       no --gpu in this arm -- this is a JIT miscompilation, not offload."
-      echo "       known: docs/known-issues/jit/osr-miscompiles-cachecoherence-20260904.md"
+      echo "       known: the retired osr-miscompiles-cachecoherence-20260904 write-up"
       FAILS=$((FAILS + 1))
     fi
   done < <(grep '=' "$TMP/cpu")
@@ -118,6 +119,45 @@ while IFS= read -r line; do
     FAILS=$((FAILS + 1))
   fi
 done < <(grep '=' "$TMP/cpu")
+
+# ── the concurrent scenario, REPEATED ────────────────────────────────
+#
+# Every scenario above runs ONCE. That is enough for a deterministic
+# defect and useless against a racy one, and on 2026-09-05 this script
+# found a racy one: `concurrent` returned a wrong answer about 10% of
+# runs, so a single-shot gate passed it nine times in ten. It was caught
+# because the very first run of the day happened to be an unlucky one,
+# which is not a property to rely on.
+#
+# So the concurrency-sensitive scenario is re-run, and under
+# `CRATONVM_GPU_DEVICE_POOL=0`. That flag is not a workaround: buffer
+# reuse SERIALISES dispatches and masks the race, and turning the pool
+# off took the observed rate from 10% to 53%. A gate wants the sensitive
+# configuration, not the comfortable one.
+#
+# At 53% per run, REPEATS=5 misses a regression of that size about 2% of
+# the time; a single run missed it 47% of the time.
+REPEATS="${REPEATS:-5}"
+want_conc=$(grep '^concurrent=' "$TMP/cpu" | head -1)
+if [ -z "$want_conc" ]; then
+  echo "FAIL: no concurrent= line in the control arm to repeat against"
+  FAILS=$((FAILS + 1))
+else
+  conc_bad=0
+  for r in $(seq 1 "$REPEATS"); do
+    got_conc=$(CRATONVM_GPU_DEVICE_POOL=0 "$CV" --java-home "$JDK" -cp "$TG" \
+        --gpu GpuRuntimeStress 1 "$N" 2>/dev/null | grep '^concurrent=' | tr -d '\r')
+    if [ "$got_conc" != "$want_conc" ]; then
+      echo "FAIL concurrent[repeat $r/$REPEATS, pool off]: control=${want_conc#*=} gpu=${got_conc#*=}"
+      conc_bad=$((conc_bad + 1))
+    fi
+  done
+  if [ "$conc_bad" = "0" ]; then
+    echo "PASS concurrent x$REPEATS (pool off, the sensitive configuration)"
+  else
+    FAILS=$((FAILS + conc_bad))
+  fi
+fi
 
 echo "=== summary ==="
 if [ "$FAILS" = "0" ]; then

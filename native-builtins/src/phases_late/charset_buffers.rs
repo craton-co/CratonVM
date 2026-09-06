@@ -1106,7 +1106,7 @@ pub(crate) fn read_wrapped_char_sequence_units(
 /// EMPTY string through `ctx.invoke_virtual` / `Method.invoke` while a direct
 /// bytecode `cb.toString()` was correct. That defect is FIXED — a duplicate
 /// `java/nio/CharBuffer.toString()` registration was shadowing the correct one
-/// (fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md)
+/// (stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md)
 /// — and the `invoke_to_string_opt` caller that needed the workaround is gone.
 ///
 /// It stays because it is still the right primitive for a caller that must read
@@ -1986,7 +1986,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     // `invoke_on_class_shared`, which resolves the inherited declaration on
     // `java/nio/CharBuffer` -- so `Method.invoke(CharBuffer.toString(), scb)`
     // answered `""` while `scb.toString()` answered the text.
-    // See fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md.
+    // See stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md.
 
     // Also register under Buffer parent
     let buf = "java/nio/Buffer";

@@ -712,7 +712,7 @@ pub fn offset_seconds_at_local(
 /// historical offset `java.time.zone.ZoneRules` would report. Mirrored so the
 /// legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's legacy
 /// behaviour bug-for-bug — see
-/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
+/// `bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
 pub const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
 
 /// `(total_offset_ms, dst_offset_ms)` for `zone_id` at `date_millis`, under the
@@ -1988,7 +1988,7 @@ mod tests {
         // + fixed_offset_rules are the pure, ctx-free half of the fix that
         // `get_zone_rules` delegates to once the tzdb catalog lookup misses);
         // the full ctx-driven path is covered by the Java-level repro in
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md.
+        // bug-h2-suite-residual-fail-triage-FIXED.md.
         let rules = parse_fixed_gmt_offset_seconds("GMT+01:00")
             .map(fixed_offset_rules)
             .expect("GMT+01:00 must resolve to a fixed-offset rule set");

@@ -1334,7 +1334,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // later native then operated on an object with none of the expected
     // slots — `Path.register` reported "service is closed or unknown" and
     // `WatchService.close` wrote past the receiver's layout. See
-    // `springboot/filewatcher-watchservice-surface-FIXED-20260801.md`.
+    // `filewatcher-watchservice-surface-FIXED-20260801.md`.
 
     r.register(
         fs_class,
@@ -7035,7 +7035,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `char[]` the JDK owns — and left the six BufferedWriter natives below to
     // recognise their own object by asking whether that slot held an `Int`.
     // That is kind 3 in
-    // `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`:
+    // `jdk-only-fabricated-object-layouts-FIXED-20260810.md`:
     // a VM value with no real field to live in.
     //
     // It was already default-OFF (real bytecode has been the default since
@@ -8775,10 +8775,10 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // This fallback's `invoke_virtual(path_obj, "toString", ...)` was written
     // assuming dispatch lands somewhere OTHER than back here — either the
     // (separate) dead-dispatch-to-Object.toString() bug fixed the same day in
-    // `fixed-suite-bugs/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+    // `path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
     // or a genuine delegating wrapper's own real bytecode `toString()`. A
     // THIRD same-day fix
-    // (`fixed-suite-bugs/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
+    // (`path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
     // `vm_exec.rs`'s `invoke_on_class_shared_inner`) made dispatch correctly
     // receiver-aware: ANY Path-subtype receiver's `toString()` now routes
     // straight back to this exact native (`p57_path_display_string` ->
@@ -8788,7 +8788,7 @@ pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     // EXCEPTION_STACK_OVERFLOW, not a Java StackOverflowError (native
     // recursion via `ctx.invoke_virtual` is invisible to every one of the
     // interpreter's counted recursion guards; see
-    // `fixed-suite-bugs/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`).
+    // `ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`).
     //
     // A thread-local re-entrancy flag breaks the cycle: the first call takes
     // the real dispatch as before (the common, legitimate delegating-wrapper
@@ -8906,7 +8906,7 @@ pub(crate) fn p57_trim_path_trailing_separator(path: &str) -> String {
 /// directory-shaped path — `Files.writeString(root.resolve("one/two/three/"), ...)`
 /// failed with `EISDIR` ("Is a directory", errno 21) instead of creating the
 /// file (Windows reported the same defect as `ERROR_DIRECTORY`/267). See
-/// `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
+/// `resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
 ///
 /// Virtual (jar/jrt) filesystem paths are excluded, exactly as in the Windows
 /// twin: their sentinel-encoded string carries an entry whose trailing `/` is
@@ -9418,7 +9418,7 @@ pub(crate) mod p57_posix_path_tests {
     //! POSIX (`sun.nio.fs.UnixPath`) construction / root / parent semantics.
     //! Pure-function tests (no VM); every expectation was cross-checked against
     //! the host JDK on Linux (`PathMatrix` repro) — see
-    //! `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
+    //! `resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`.
     //! The Windows twin lives in `p57_win_path_tests`.
     use super::{
         jarfs_encode, p57_alloc_path, p57_parse_root, p57_posix_parent_of, p57_read_path,
@@ -10327,7 +10327,7 @@ pub(crate) fn files_write_string_impl(
 ///
 /// Routing through the same gated open `newOutputStream` already used fixes all
 /// three at once. See
-/// fixed-suite-bugs/springboot/nio-write-ignores-nofollow-links-symlink-20260804-FIXED.md.
+/// nio-write-ignores-nofollow-links-symlink-20260804-FIXED.md.
 pub(crate) fn p57_files_write_bytes(
     ctx: &mut dyn NativeContext,
     path_obj: ObjectRef,
@@ -14961,8 +14961,7 @@ pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
 //
 //     UnsatisfiedLinkError: java/io/UnixFileSystem.getBooleanAttributes0(Ljava/io/File;)I
 //
-// (fixed-suite-bugs/springboot/
-// unixfilesystem-getbooleanattributes0-missing-native-20260804-FIXED.md).
+// (unixfilesystem-getbooleanattributes0-missing-native-20260804-FIXED.md).
 // The `java/io/File` natives normally hide this, because `File.exists` /
 // `isFile` / `isDirectory` ARE forced overrides — but only until some test
 // redefines `java.io.File` (Mockito's inline mock maker does that
@@ -19412,7 +19411,7 @@ fn basic_file_attributes_syn_mode(ctx: &dyn NativeContext, attrs: ObjectRef) -> 
 /// even though `setTimes` had written them to the inode correctly. The
 /// Windows carrier's names (`creationTime`/`lastAccessTime`/`lastWriteTime`)
 /// happen to be genuine, which is why this only ever showed up on Linux.
-/// See fixed-suite-bugs/springboot/jarmode-tools-extract-timestamp-preservation-FIXED.md.
+/// See jarmode-tools-extract-timestamp-preservation-FIXED.md.
 fn unix_attr_time_fields(which: &str) -> (&'static str, &'static str, &'static str) {
     match which {
         "creation" => ("st_birthtime_sec", "st_birthtime_nsec", "st_birthtime"),
@@ -21836,7 +21835,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
     // instead of going through `p57_alloc_path`, so they skipped the
     // normalize-at-construction step that `sun.nio.fs.UnixPath`/`WindowsPath`
     // perform — which is exactly the trailing-separator defect
-    // `fixed-suite-bugs/springboot/resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`
+    // `resourcestests-trailing-slash-path-normalization-FIXED-20260804.md`
     // was filed for, re-introduced one phase later. `getFileName` used
     // `jarfs_decode` (missing jrt) and dropped the root/null contract;
     // `getNameCount` and `getParent` had already been hand-synced to their

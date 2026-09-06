@@ -4,7 +4,7 @@
 //! WP1.8-finish — exercise the **real JAR-classpath path** of
 //! `ServiceLoader.load(java.sql.Driver.class).iterator()`.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
 //!
 //! The companion `wp1_8_serviceloader_e2e.rs` covers the iterator chain
 //! end-to-end but stages its `META-INF/services/java.sql.Driver`
@@ -107,6 +107,36 @@ fn make_spi_classpath_jar(outer_class: &[u8], inner_class: &[u8]) -> std::path::
     jar_path
 }
 
+/// Can this build run the JAR probe at all?
+///
+/// `VmConfig::new()` is deliberately `JdkMode::Synthetic` on the embedding/test
+/// path, and synthetic mode is only usable in a build carrying the
+/// `synthetic-jdk` Cargo feature. Without it the VM boots a shim class library
+/// and the fixture's very first statement — `ServiceLoader.load(Driver.class)`
+/// — cannot resolve, so the probe reports `-99` and its panic message sends the
+/// reader to `Class.forName` / `BufferedReader` resolution, neither of which
+/// ever ran.
+///
+/// Same guard, and the same reason, as
+/// `wp7_2_jdbc_core_types_reachable::synthetic_library_available`.
+///
+/// Observed while diagnosing this, NOT filed as a defect because it has only
+/// been seen in this unsupported configuration: the `NoSuchMethodError` for the
+/// unresolvable static named `java.lang.Class` as the owner —
+/// `'java.util.ServiceLoader java.lang.Class.load(java.lang.Class)'` — where
+/// the bytecode's owner is `java/util/ServiceLoader` and `java.lang.Class` is
+/// the PARAMETER's type. Worth re-checking against a `--features synthetic-jdk`
+/// build before treating it as real.
+fn synthetic_library_available() -> bool {
+    if !cratonvm_vm::config::SYNTHETIC_JDK_COMPILED_IN {
+        eprintln!(
+            "Skipping WP1.8 JAR probe: this build has no `synthetic-jdk`              feature, and `VmConfig::new()` boots JdkMode::Synthetic — the              probe would measure a shim class library, not the JAR walk"
+        );
+        return false;
+    }
+    true
+}
+
 fn vm_with_jar(jar: &std::path::Path) -> Vm {
     // Note: NO directory classpath entries — the JAR is the entire
     // classpath surface for the fixture and its SPI descriptor. This
@@ -133,6 +163,9 @@ fn vm_with_jar(jar: &std::path::Path) -> Vm {
 /// `wp1_8_serviceloader_e2e.rs` does not exercise that path.
 #[test]
 fn driver_discovered_from_jar_on_classpath() {
+    if !synthetic_library_available() {
+        return;
+    }
     let (outer, inner) = match fixture_class_bytes() {
         Some(v) => v,
         None => {

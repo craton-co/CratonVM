@@ -1059,7 +1059,7 @@ mod tests {
     ///
     /// The transform is OFF by default -- it is a measured loss on the one
     /// kernel it was built for (see
-    /// `gpu/raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass) --
+    /// `raytracer-vs-tornadovm-RESOLVED-20260821.md`'s residual pass) --
     /// so a test that asserts on it has to ask for it. Asking here rather
     /// than setting an environment variable also keeps the tests
     /// order-independent: the flag is latched in a `OnceLock`, so a process

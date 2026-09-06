@@ -799,7 +799,7 @@ fn charseq_char_at_null_receiver_deopts() {
 // `HashMap` key, so hashed) has `hashCode() == -1924094359`, low five bits 9:
 // `6 >> 9 == 0`. H2 persisted `CREATE SEQUENCE ""."SEQ1"` and could not reopen
 // the database — see
-// `fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`.
+// `h2-jitban-schema-not-found-on-reconnect-FIXED.md`.
 
 /// Dense-registry-safe class id for the compact tests. `register_class_layout`
 /// indexes a dense `Vec` by class id, so this must stay small — unlike

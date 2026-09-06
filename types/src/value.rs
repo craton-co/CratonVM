@@ -1080,7 +1080,7 @@ pub fn jlong_bits_as_aligned_object_ptr(bits: u64) -> Option<usize> {
 // table (`Int32 | Int64 | Float32 | Float64`, references already covered by the
 // oop bit). That is a `classloading` change, is not required by any consumer
 // listed above, and is deliberately not attempted here — see
-// `arch-2026-07-26/value-repr-and-compressed-oops.md`.
+// `value-repr-and-compressed-oops.md`.
 
 /// What an untagged [`RawSlot`] holds, supplied by the caller's type source
 /// (a verifier oop map, an opcode, or a descriptor) rather than by the slot.
@@ -1727,7 +1727,7 @@ pub unsafe fn read_value_checked(ptr: *const Value) -> Option<Value> {
 /// library code legally relies on exactly this being tear-free (e.g.
 /// `ReentrantReadWriteLock$Sync`'s plain `firstReader`/`firstReaderHoldCount`
 /// fields, published via a nearby `volatile`/CAS write to `state` — see
-/// fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+/// elasticsearch-lucene-binary-docvalues-range-hangs.md
 /// #3). This combines [`read_value_atomic`]'s tear-free two-word read with
 /// `read_value_checked`'s discriminant validation, so a corrupted slot still
 /// safely returns `None` instead of risking a wild jump-table match.

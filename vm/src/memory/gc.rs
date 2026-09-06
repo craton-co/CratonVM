@@ -141,7 +141,7 @@ pub fn unload_dead_class_metadata(
     // target not represented in its key.
     //
     // ARCH-2026-07-26 (request CR-LR-1 of
-    // `arch-2026-07-26/stackwalk-and-vtable.md`): this used to
+    // `stackwalk-and-vtable.md`): this used to
     // call `invalidate_all()`, which takes THREE write locks — but two of them
     // guard `SharedResolutionState::global_methods` / `global_fields`, whose
     // only writers (`cache_method` / `cache_field`) have no production callers,
@@ -156,7 +156,7 @@ pub fn unload_dead_class_metadata(
     let mut jit_entries_retired = 0;
     {
         // PERF (ARCH-2026-07-26, request CR-VT-1 of
-        // `arch-2026-07-26/stackwalk-and-vtable.md`).
+        // `stackwalk-and-vtable.md`).
         // `unload_class` calls `invalidate_class`, which sweeps EVERY slot of
         // EVERY vtable in the VM — so a per-class loop here costs
         // O(unloaded x all_classes x slots_per_class) under the manager write
@@ -649,7 +649,7 @@ pub(crate) fn remap_handle_slots(
 /// spent its life as a `Cell<Option<ObjectRef>>` inside the `JIT_SIGNALS`
 /// `thread_local!` in `jit/helpers.rs`, where neither half could reach it — TLS
 /// belongs to the mutator, and every `VM_ROOT_SOURCES` callback runs on the
-/// collector. See `fixed-bugs/jit-signals-root-gap.md`.
+/// collector. See `jit-signals-root-gap.md`.
 pub(crate) fn remap_thread_object_slots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
@@ -979,7 +979,7 @@ pub fn update_all_roots(
     // this thread, the JIT analogue of the interpreter-frame remap above. Inert
     // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
     // it is the piece that lets a moving collector run while JIT frames are live
-    // (see fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md, Stage 3).
+    // (see precise-jit-stack-maps-design.md, Stage 3).
     crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
     crate::jit::conservative_roots::remap_register_image_words(pointer_map, Some(shared));
     crate::jit::conservative_roots::report_stale_after_remap(pointer_map, Some(shared));
@@ -1058,11 +1058,90 @@ pub fn update_all_roots(
     }
 
     // 2. Static fields
-    {
-        let mut statics = shared.classes.statics.write();
-        for fields in statics.values_mut() {
-            for val in fields.iter_mut() {
+    //
+    // SLOTS FIRST. `collect_roots` already visited every static of every class
+    // a few microseconds ago and knows exactly which slots hold an object; a
+    // `StaticsBlock` is a leaked `Box<[Value]>` whose base is stable for the
+    // life of the VM, so those slot addresses are still valid here even if the
+    // owning map has rehashed. Walking them is the same work this loop did,
+    // minus a second sweep of every primitive slot in the process and minus
+    // taking the `statics` WRITE lock across all of it.
+    //
+    // See `memory::roots::STATIC_REF_SLOTS` for why this exists beyond the
+    // saving: it is the first place in this VM where a root is carried as a
+    // SLOT rather than a value, which is the shape that would let a relocating
+    // collector fix roots in place and retire the `PointerMap` and its ~35
+    // hand-written remap companions.
+    //
+    // The take is what makes it safe: an `update_all_roots` not preceded by a
+    // scan on this thread gets `None` and falls through to the full walk below,
+    // so a stale list cannot be applied. `CRATONVM_GC_STATIC_ROOT_SLOTS=0`
+    // forces that path in one binary.
+    match crate::memory::roots::take_static_ref_slots() {
+        Some(slots) => {
+            // The `statics` lock is deliberately NOT taken. These are raw
+            // addresses into leaked blocks the map does not own the storage of,
+            // and this runs stop-the-world with every mutator parked -- the same
+            // conditions under which the scan read them.
+            let covered = slots.len();
+            for addr in slots {
+                // SAFETY: recorded by `collect_roots` earlier in THIS pause as
+                // the address of a `Value` slot inside a leaked `StaticsBlock`.
+                // Such a block is never freed (`grow_to` leaves the old one
+                // allocated on purpose), so the pointer cannot dangle, and no
+                // mutator is running to write it concurrently.
+                let val = unsafe { &mut *(addr as *mut cratonvm_types::Value) };
                 update_value_ref(val, pointer_map);
+            }
+            // `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` -- re-walk every static the
+            // slow way and report any slot the recorded list did not cover.
+            //
+            // A missed slot here is not a wrong number, it is a live static
+            // field left pointing at a vacated address: a use-after-free that
+            // surfaces arbitrarily far from this function. The set the scan
+            // records and the set this loop would have visited must be equal,
+            // and the only way to know that on a real workload rather than in a
+            // unit test is to run both and diff them -- the same shape
+            // `CRATONVM_DBG_ROOTSNAP_VERIFY` uses for the frozen-frame cache.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STATIC_SLOT_VERIFY").is_some() {
+                let mut missed = 0usize;
+                let mut statics = shared.classes.statics.write();
+                for fields in statics.values_mut() {
+                    for val in fields.iter_mut() {
+                        // Anything the slot walk covered is already remapped, so
+                        // a second `update_value_ref` on it is a no-op (the new
+                        // address is not itself a key). A slot that still
+                        // resolves through the map is one the recorded list
+                        // missed.
+                        if let cratonvm_types::Value::Object(Some(o)) = *val {
+                            if pointer_map.get(&(o.as_ptr() as usize)).is_some() {
+                                missed += 1;
+                                update_value_ref(val, pointer_map);
+                            }
+                        }
+                    }
+                }
+                // The SHAPE, not just the failures. A verifier that prints only
+                // when it finds something cannot distinguish "covered
+                // everything" from "the fast path never ran" -- and on this
+                // path the second one is the likelier way to get a silent zero,
+                // because `take_static_ref_slots` returns `None` whenever the
+                // scan recorded nothing and this whole arm is skipped. Printing
+                // the covered count alongside the miss count is what makes a
+                // zero mean something.
+                eprintln!(
+                    "[static-slot-verify] covered={covered} missed={missed} moved={moved} (covered = slots the scan recorded; moved = entries in this collection's pointer map)",
+                    moved = pointer_map.len(),
+                );
+            }
+        }
+        None => {
+            crate::memory::roots::note_static_slot_fallback();
+            let mut statics = shared.classes.statics.write();
+            for fields in statics.values_mut() {
+                for val in fields.iter_mut() {
+                    update_value_ref(val, pointer_map);
+                }
             }
         }
     }
@@ -2104,7 +2183,7 @@ mod tests {
     /// collection inside a hook reclaimed it — the render then read a zeroed
     /// header as `ClassId(0)` and printed `Exception in thread "main"
     /// java/lang/Object`. See
-    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md`.
+    /// `bug-h2-testopenclose-throwable-is-java-lang-object-FIXED-20260830.md`.
     ///
     /// The count below is the point of the test: a new slot added to
     /// `remap_thread_object_slots` without being added here leaves the guard

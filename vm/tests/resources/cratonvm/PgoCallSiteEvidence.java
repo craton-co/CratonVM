@@ -1,6 +1,6 @@
 package cratonvm;
 
-// Fixture for PGO-01 (feature-designs/c2/pgo-01-call-site-evidence-gap.md):
+// Fixture for PGO-01 (pgo-01-call-site-evidence-gap.md):
 // each entry point below has exactly ONE invoke kind in its own loop body, so
 // its MethodProfile.call_sites can be asserted on without another call kind's
 // evidence polluting the count.

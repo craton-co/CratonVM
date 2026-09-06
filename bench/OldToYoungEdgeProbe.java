@@ -29,7 +29,7 @@
  *   CRATONVM_GC_VERIFY_RSET=1 cratonvm --java-home "$JDK" \
  *       -XX:+UseGenerationalGC -Xmx512m -c bench OldToYoungEdgeProbe
  *
- * See performance/gen-gc-minor-pause-20260902.md.
+ * See gen-gc-minor-pause-20260902.md.
  */
 public final class OldToYoungEdgeProbe {
     static final class Node {

@@ -3,7 +3,7 @@
 
 //! WP7.1 — `DriverManager` + ServiceLoader-based JDBC driver discovery.
 //!
-//! Pins the WP7.1 acceptance criterion from `gaps/wildfly-ejbca-roadmap.md`
+//! Pins the WP7.1 acceptance criterion from `wildfly-ejbca-roadmap.md`
 //! §10: given a `META-INF/services/java.sql.Driver` on the classpath,
 //! the JVM surface must enumerate the listed driver class names.
 //!
@@ -61,7 +61,7 @@ fn class_files_available() -> bool {
 /// VM can read from it after this helper returns.
 fn make_spi_classpath_dir() -> std::path::PathBuf {
     let dir = tempfile::TempDir::new().expect("create temp dir for SPI fixture");
-    let services_dir = dir.path().join("../../apps/META-INF").join("services");
+    let services_dir = dir.path().join("META-INF").join("services");
     std::fs::create_dir_all(&services_dir).expect("create META-INF/services");
     let descriptor = services_dir.join("java.sql.Driver");
     // The SPI-spec line is the binary class name. The driver's enclosing
@@ -185,13 +185,21 @@ fn first_discovered_provider_matches_descriptor() {
 fn jdbc_driver_natives_export_service_loader() {
     use cratonvm_native_api::NativeMethodRegistry;
     let mut r = NativeMethodRegistry::new();
+    // A bare registry is SYNTHETIC by default, and the retirement below is a
+    // real-JDK one. Say which mode this test is asking about; without this line
+    // the rows are registered and the assertions read as a regression.
+    r.set_drop_real_layout_synthetic(true);
     cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
     // INVERTED 2026-08-30, same reason as the sibling assertions in
     // `wp7_3_sql_types_datetime` and `wp8_11_ejbca_bootstrap_smoke`:
-    // `register_service_loader_natives`' body is
-    // `#[cfg(feature = "synthetic-jdk")]` because in a real-JDK build these
-    // natives shadowed correct bytecode with a WRONG iterator
+    // `register_service_loader_natives` does not register these in a real-JDK
+    // run, because there they shadowed correct bytecode with a WRONG iterator
     // (`ArrayList$Itr` for HotSpot's `ServiceLoader$2`, losing laziness).
+    // (2026-09-05: that gate was a `#[cfg(feature = "synthetic-jdk")]` until
+    // it was found to be answering about the BUILD — a default build running
+    // synthetic mode has no `ServiceLoader` bytecode for the retirement to
+    // defer to. It now reads `drops_real_layout_synthetic`, which is why this
+    // test has to set it.)
     //
     // What this test still guards is real and unchanged: the registrar must
     // wire its OWN fixture helper. That is the regression the doc comment

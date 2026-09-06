@@ -36,7 +36,7 @@ const TLS12_CIPHERS: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
     // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-    // fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md
+    // rustls-cbc-cipher-suites-not-supported.md
     "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
@@ -2645,7 +2645,7 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
             // doc comment) -- this bare allocation skips real `Socket.<init>`,
             // and a real-bytecode `synchronized (socketLock)` method (e.g.
             // `getImpl()`) would otherwise NPE. Same bug family as
-            // jndirealmintegration-ldap-connection-npe.md.
+            // jndirealmintegration-ldap-connection-npe-FIXED.md.
             let sock = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 2)?;
             let sock = crate::net_phase_e::re1_init_socket_locks(ctx, sock)?;
             Ok(Some(Value::Object(Some(sock))))

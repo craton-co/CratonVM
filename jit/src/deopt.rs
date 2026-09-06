@@ -5958,7 +5958,7 @@ mod deopt_metadata_tests {
 }
 
 /// The soundness lanes added by the deopt-metadata audit
-/// (`audits/deopt-metadata-audit.md`). Each test fails against the verifier
+/// (`deopt-metadata-audit.md`). Each test fails against the verifier
 /// as it stood before that audit: every construct below passed verification.
 #[cfg(test)]
 mod deopt_metadata_soundness_tests {
@@ -6807,7 +6807,7 @@ mod tests {
     // slot may therefore hold a stale copy — which is exactly what happens if
     // a call site is allowed to skip publishing a primitive register-homed
     // local. See `regalloc::SafepointPublishPlan` and
-    // `arch-2026-07-26/jit-regalloc-and-deopt.md`.
+    // `jit-regalloc-and-deopt.md`.
 
     /// Every register-homed local reconstructs from `SavedRegisters`, and the
     /// frame slot that would be its canonical home is filled with a *wrong*

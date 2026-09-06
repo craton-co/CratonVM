@@ -1305,7 +1305,7 @@ fn option_value_as_bool(ctx: &dyn NativeContext, value: &OptionValue) -> Option<
 /// int (e.g. a `60000`ms timeout option) becomes a bogus "object reference"
 /// that segfaults the next time anything dereferences it (confirmed root
 /// cause of the `ElytronRemoteOutboundConnectionTestCase` SIGSEGV, see
-/// `fixed-suite-bugs/wildfly/wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`).
+/// `wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`).
 fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 

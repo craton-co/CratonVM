@@ -626,7 +626,7 @@ fn char_buffer_to_string_is_not_shadowed() {
          cannot read a `StringCharBuffer` (no `hb`, text in `str`), every \
          declaring-class route answers an empty string while a direct \
          `cb.toString()` stays correct — see \
-         fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md.",
+         stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md.",
         offenders.join("\n  ")
     );
 }

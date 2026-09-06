@@ -7,7 +7,7 @@
 
 //! WP2.1-field — `java.lang.reflect.Field` surface end-to-end probes.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1
 //! hot list: "`Field.get/set` (volatile aware, final check)").
 //!
 //! # What this suite anchors

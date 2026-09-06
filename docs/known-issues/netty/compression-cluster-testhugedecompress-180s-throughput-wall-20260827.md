@@ -293,8 +293,8 @@ what every number on this page was measured with.
 
 ## Related
 
-* `fixed-suite-bugs/netty/compression-testhugedecompress-shared-timeout-20260816.md`
-* `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
-* `fixed-suite-bugs/netty/longlonghashmaptest-npe-spliced-ctor-this-not-a-gc-root-FIXED-20260828.md`
+* `compression-testhugedecompress-shared-timeout-20260816.md`
+* `varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`
+* `longlonghashmaptest-npe-spliced-ctor-this-not-a-gc-root-FIXED-20260828.md`
 * The per-call native-dispatch floor, priced independently elsewhere: the
   `HashedWheelTimerTest` page and the KFusion FFM-segment page.

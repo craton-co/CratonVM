@@ -1071,7 +1071,7 @@ pub fn thread_state_roster() -> Vec<(u64, ThreadExecState)> {
 /// change, every rung on the board moved — `current_state()` went 3.6 ns to
 /// 1.1 ns without being touched at all — so a cross-run delta prices the box,
 /// not the code. (The A4b measurement in
-/// `arch-2026-08-04/architecture-review-a1-a9.md` records the
+/// `architecture-review-a1-a9.md` records the
 /// same hazard and the same remedy: interleave, and quote minima.)
 ///
 /// Both arms here run in the same process, alternating on every pass, against

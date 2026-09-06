@@ -3,7 +3,7 @@
 
 //! WP7.2 — `java.sql.*` core types reachable under reflection.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` §10 (Wave 7 — JDBC +
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` §10 (Wave 7 — JDBC +
 //! ServiceLoader-based SPI).
 //!
 //! Surface audited (per WP7.2):
@@ -86,6 +86,37 @@ fn fixture_compiled() -> bool {
         let path = format!("{dir}/cratonvm/Wp72JdbcCoreTypes.class");
         std::path::Path::new(&path).exists()
     })
+}
+
+/// Can the reflection probes run AT ALL in this build?
+///
+/// `VmConfig::default()` — which `fresh_vm` uses — is deliberately
+/// `JdkMode::Synthetic`: the embedding/test path picks the class library
+/// deterministically rather than from whatever JDK the build machine has, and
+/// `detect_real_jdk` is validation only, never selection. And synthetic mode is
+/// "only usable when the crate was built with the `synthetic-jdk` Cargo
+/// feature".
+///
+/// So in a DEFAULT build these probes boot against a shim, and what they
+/// measure is the shim. `connection_methods_have_signatures` failed with
+/// `NoSuchMethodError: 'int java.lang.String.length()'` — the shim's
+/// `java.lang.String` has no `length()`, and a literal `"abc".length()` fails
+/// in the same VM. Nothing about `getDeclaredMethods` or
+/// `synthetic_jdk_method_decls` was wrong; the class library was not there.
+///
+/// The sibling probe `resultSet_next_is_boolean` PASSED in that same build, for
+/// the sole reason that it never calls `String.length()` — a pass with no
+/// meaning behind it, which is the worse half of this. Both are skipped
+/// together, and both run for real in CI's
+/// `Feature gate (--features synthetic-jdk)` job.
+fn synthetic_library_available() -> bool {
+    if !cratonvm_vm::config::SYNTHETIC_JDK_COMPILED_IN {
+        eprintln!(
+            "Skipping WP7.2 reflection probe: this build has no `synthetic-jdk`              feature, and `VmConfig::default()` boots JdkMode::Synthetic — the              probe would measure a shim class library, not the VM"
+        );
+        return false;
+    }
+    true
 }
 
 fn fresh_vm() -> Vm {
@@ -592,7 +623,7 @@ const PER_CLASS_PROBES: &[(&str, &str)] = &[
 
 #[test]
 fn jdbc_core_types_load_and_reflect() {
-    if !fixture_compiled() {
+    if !fixture_compiled() || !synthetic_library_available() {
         eprintln!("Skipping wp7_2: Wp72JdbcCoreTypes.class not staged (javac unavailable?)");
         return;
     }
@@ -634,7 +665,7 @@ fn jdbc_core_types_load_and_reflect() {
 /// native through the synthetic Connection stub.
 #[test]
 fn connection_methods_carry_signatures() {
-    if !fixture_compiled() {
+    if !fixture_compiled() || !synthetic_library_available() {
         eprintln!("Skipping connection_methods_carry_signatures: fixture not staged");
         return;
     }
@@ -656,7 +687,7 @@ fn connection_methods_carry_signatures() {
 /// reflective return type round-trips through Method.getReturnType().
 #[test]
 fn result_set_next_reflects_with_boolean_return() {
-    if !fixture_compiled() {
+    if !fixture_compiled() || !synthetic_library_available() {
         eprintln!("Skipping result_set_next_reflects_with_boolean_return: fixture not staged");
         return;
     }
@@ -679,7 +710,7 @@ fn result_set_next_reflects_with_boolean_return() {
 /// the JDK; this probe pins runtime LDC dispatch in the VM.
 #[test]
 fn jdbc_core_class_literals_resolve_at_runtime() {
-    if !fixture_compiled() {
+    if !fixture_compiled() || !synthetic_library_available() {
         eprintln!("Skipping jdbc_core_class_literals_resolve_at_runtime: fixture not staged");
         return;
     }

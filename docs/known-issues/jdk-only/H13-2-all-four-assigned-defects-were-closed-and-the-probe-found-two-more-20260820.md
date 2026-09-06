@@ -203,10 +203,10 @@ page.
 
 | # | defect | record | state |
 |---|---|---|---|
-| 1 | `getInstance` ignores the requested provider | `fixed-suite-bugs/springboot/core-spring-boot-keystore-provider-name-swallowed-20260723-FIXED.md` | **FIXED, re-measured today** |
+| 1 | `getInstance` ignores the requested provider | `core-spring-boot-keystore-provider-name-swallowed-20260723-FIXED.md` | **FIXED, re-measured today** |
 | 2 | a third-party SPI registration recorded but never instantiated | `docs/known-issues/netty/openssl-key-material-and-engine-residuals-20260813.md` §A′ | **closed 2026-08-17**; residual in §4 |
-| 3 | a base-class native shadowing overloads a provider subclass does not override | `fixed-suite-bugs/bug-bcjava-jca-provider-alias-lookup-and-attribution-20260816.md` | **FIXED 2026-08-16**; residual in §4 |
-| 4 | EC server identity rejected on JDK PKCS#8 v1 keys | `fixed-suite-bugs/netty/ec-server-identity-rejected-jdk-pkcs8-v1-20260812-FIXED.md` | **FIXED 2026-08-12**, in `t27_tls.rs` — **not a path this lane owns** |
+| 3 | a base-class native shadowing overloads a provider subclass does not override | `bug-bcjava-jca-provider-alias-lookup-and-attribution-20260816.md` | **FIXED 2026-08-16**; residual in §4 |
+| 4 | EC server identity rejected on JDK PKCS#8 v1 keys | `ec-server-identity-rejected-jdk-pkcs8-v1-20260812-FIXED.md` | **FIXED 2026-08-12**, in `t27_tls.rs` — **not a path this lane owns** |
 
 **#1 is measured, not read.** The repo carries the probe the fix was closed with
 (`fixed-suite-bugs/repros/jca-provider-lookup-parity/ProviderLookupProbe.java`,

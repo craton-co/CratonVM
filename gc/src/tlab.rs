@@ -291,7 +291,7 @@ impl Tlab {
         if c == 0 || e == 0 || c >= e {
             return None;
         }
-        // TLAB AUDIT (audits/tlab-and-card-audit.md): the consumer of this
+        // TLAB AUDIT (tlab-and-card-audit.md): the consumer of this
         // pair, `GenerationalHeap::jit_tlab_skip_offsets`, SILENTLY DROPS any
         // region whose start is not 8-aligned. A dropped region is not a
         // conservative degrade — the sweep then walks the un-retired tail as if
@@ -533,7 +533,7 @@ impl Tlab {
     /// (`unsafe impl Send`, never shared). For TLABs that are already
     /// empty (start/cursor/end null), the filler call short-circuits via
     /// the leading null check inside `install_tail_filler`.
-    /// # Idempotence (TLAB audit, `audits/tlab-and-card-audit.md`)
+    /// # Idempotence (TLAB audit, `tlab-and-card-audit.md`)
     ///
     /// `retire` is idempotent and **must stay so**. Several transition paths can
     /// retire the same TLAB twice with no synchronisation between them — a
@@ -808,7 +808,7 @@ impl Tlab {
     /// tracker distinguish "nobody allocated" from "the JIT allocated and did
     /// not tell you".
     pub fn next_refill_size(&mut self) -> usize {
-        // TLAB AUDIT (audits/tlab-and-card-audit.md): "size first, THEN retire"
+        // TLAB AUDIT (tlab-and-card-audit.md): "size first, THEN retire"
         // is a prose contract with a silent failure mode. `consumed_bytes()` is
         // `cursor - start`, and `retire()` nulls both — so a caller that
         // retires first gets `consumed == 0`, which is exactly the input that
@@ -1641,7 +1641,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // TLAB audit (audits/tlab-and-card-audit.md) — retire / publish
+    // TLAB audit (tlab-and-card-audit.md) — retire / publish
     // ---------------------------------------------------------------
 
     /// Helper: an 8-aligned span of exactly `bytes` usable bytes, plus the

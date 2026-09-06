@@ -19,9 +19,8 @@
 #   HS              path to HotSpot java.exe (defaults to $JDK/bin/java.exe)
 #   GO              classpath dir holding the bench-gpu/*.java fixtures
 #   TG              classpath dir holding test_classes/gpu/*.java fixtures
-#   GATE_REDUCTION  1 to also run the dot-reduction gate (off by default —
-#                   reduction dispatch hasn't shipped yet, see followups
-#                   item 1)
+#   GATE_REDUCTION  1 (default) to run the dot-reduction gate; 0 to skip
+#                   it. On by default since 2026-09-05 — see gate e.
 #
 # Usage: bash bench-gpu/ci-gate.sh
 # Exit: 0 if every enabled gate PASSes, 1 if any gate FAILs or a
@@ -42,7 +41,7 @@ JDK="${JDK:-C:/Program Files/Java/jdk-25}"
 HS="${HS:-$JDK/bin/java.exe}"
 GO="${GO:-$ROOT/bench-gpu}"
 TG="${TG:-$ROOT/test_classes/gpu}"
-GATE_REDUCTION="${GATE_REDUCTION:-0}"
+GATE_REDUCTION="${GATE_REDUCTION:-1}"
 TIMEOUT_S="${TIMEOUT_S:-180}"
 
 FAILS=0
@@ -164,34 +163,69 @@ else
 fi
 echo
 
-# ── gate e (optional): dot-reduction checksum ──────────────────────────
-# Off by default: reduction kernels are analyzed/lowered but never actually
-# dispatched yet (the void-return gate in try_dispatch falls through to CPU
-# for any non-void kernel — see followups item 1). Flip GATE_REDUCTION=1
-# once dispatch-side reduction read-back ships, so this gate starts
-# meaning something instead of trivially passing on a CPU fallback.
-echo "--- gate e (optional, GATE_REDUCTION=$GATE_REDUCTION): GpuProbe DOT_CHECKSUM ---"
+# ── gate e: dot-reduction checksum + engagement ────────────────────────
+# ON by default since 2026-09-05. It was off for ~2 months on the premise
+# that "reduction dispatch hasn't shipped yet" — that premise was stale:
+# `)I`/`)J` reductions have dispatched through
+# `DispatchOutcome::HandledWithValue` since 2026-07-11. Confirmed on real
+# hardware (RTX 2060, sm_75) on 2026-09-05.
+#
+# THE CHECKSUM ALONE CANNOT GATE THIS. `dotReduce` computes the same
+# answer on the CPU, so a run that never offloaded still prints the right
+# DOT_CHECKSUM — the exact vacuity the old comment warned about. Measured,
+# same binary, one flag apart:
+#
+#   --gpu                       DOT_CHECKSUM correct, witness line present
+#   --gpu --gpu-min-work 1e9    DOT_CHECKSUM correct, witness line ABSENT
+#
+# So the gate also requires a per-kernel engagement witness: the
+# `H2D=... (GpuProbe.dotReduce([I[I)` line that
+# `CRATONVM_GPU_TRACE_BYTES=1` emits at info level from
+# `cratonvm_vm::runtime::offload`. Both halves are needed — RUST_LOG alone
+# prints nothing without the flag, and the flag alone is a `tracing::info!`
+# with no subscriber.
+#
+# The witness is the PRESENCE of the line, never a positive byte count.
+# `GpuProbe` runs `vaddMap` over the same two arrays first, so the
+# residency cache legitimately suppresses the re-upload and `dotReduce`
+# reports `H2D=0 bytes`. Asserting `H2D > 0` here would fail on correct
+# behaviour.
+#
+# A process-wide launch census would NOT do: `vaddMap` offloads in the
+# same run, so any whole-process counter is non-zero whether or not the
+# reduction dispatched. The witness has to name the kernel.
+echo "--- gate e (GATE_REDUCTION=$GATE_REDUCTION): GpuProbe DOT_CHECKSUM + engagement ---"
 if [ "$GATE_REDUCTION" = "1" ]; then
   if [ -f "$GO/GpuProbe.class" ]; then
-    probe_gpu_out=$(timeout "$TIMEOUT_S" "$CV_GPU" --gpu --java-home "$JDK" --Xmx 8g -cp "$GO" GpuProbe 2>&1)
+    probe_gpu_out=$(RUST_LOG="cratonvm_vm::runtime::offload=info" \
+      CRATONVM_GPU_TRACE_BYTES=1 \
+      timeout "$TIMEOUT_S" "$CV_GPU" --gpu --java-home "$JDK" --Xmx 8g -cp "$GO" GpuProbe 2>&1)
     probe_hs_out=$(timeout "$TIMEOUT_S" "$HS" -Xmx8g -cp "$GO" GpuProbe 2>&1)
-    echo "cv-gpu: $probe_gpu_out"
-    echo "hotspot: $probe_hs_out"
+    # The trace lines go to the same capture, so print only the answers.
+    answers() { echo "$1" | grep -E '^(n|MAP_CHECKSUM|DOT_CHECKSUM|MAX|OUT0)=' | tr '\n' ' '; }
+    echo "cv-gpu: $(answers "$probe_gpu_out")"
+    echo "hotspot: $(answers "$probe_hs_out")"
 
     gpu_dot=$(extract DOT_CHECKSUM "$probe_gpu_out")
     hs_dot=$(extract DOT_CHECKSUM "$probe_hs_out")
+    # The engagement witness: this kernel, this run, actually dispatched.
+    dot_witness=$(echo "$probe_gpu_out" | grep -cE "H2D=[0-9]+ bytes \(GpuProbe\.dotReduce")
+    echo "engagement: dotReduce dispatch witness lines=$dot_witness"
+
     if [ -z "$gpu_dot" ] || [ -z "$hs_dot" ]; then
       fail "GpuProbe: could not parse DOT_CHECKSUM from one or both runs"
     elif [ "$gpu_dot" != "$hs_dot" ]; then
       fail "GpuProbe: DOT_CHECKSUM mismatch (cv-gpu=$gpu_dot hotspot=$hs_dot)"
+    elif [ "$dot_witness" -eq 0 ]; then
+      fail "GpuProbe: DOT_CHECKSUM matches ($gpu_dot) but dotReduce never dispatched — the reduction fell back to CPU and the checksum proves nothing. This is the gate's anti-vacuity clause, not a checksum failure."
     else
-      pass "GpuProbe: DOT_CHECKSUM matches HotSpot ($gpu_dot)"
+      pass "GpuProbe: DOT_CHECKSUM matches HotSpot ($gpu_dot), dotReduce really dispatched"
     fi
   else
-    fail "GpuProbe.class missing — compile bench-gpu fixtures first (GATE_REDUCTION=1 requires it)"
+    fail "GpuProbe.class missing — compile bench-gpu fixtures first (gate e requires it)"
   fi
 else
-  skip "dot-reduction gate (set GATE_REDUCTION=1 to enable)"
+  skip "dot-reduction gate (GATE_REDUCTION=0 — it is on by default; something turned it off)"
 fi
 echo
 

@@ -120,7 +120,7 @@ pub fn enable(base: u64, shift: usize) -> bool {
 ///
 /// That is not hypothetical. It is the root cause of the long-standing
 /// `g1::tests::parallel_matches_serial_no_loss_or_dup` flake — which read as a
-/// race in G1's parallel evacuator for months (`audits/g1-audit.md` G1-9, in
+/// race in G1's parallel evacuator for months (`g1-audit.md` G1-9, in
 /// the internal record tree) and is not one — and of the sibling
 /// `compressed_oops::assert_region_encodable` flake in the `gen_heap` tests,
 /// whose reported window `0x20000000..0x81ffffff8` is exactly the `BASE`/`SHIFT`

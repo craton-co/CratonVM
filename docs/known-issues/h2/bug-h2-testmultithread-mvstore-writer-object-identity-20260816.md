@@ -13,7 +13,7 @@
 > reclaimed only by dropping the bump cursor, so a vacated span under a pinned
 > cursor was zeroed-or-stale memory that no allocator could hand out again. That
 > leak was also the `OutOfMemoryError` behind
-> `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, and it is
+> `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`, and it is
 > fixed: the span is now zeroed and returned to the free list
 > (`CRATONVM_ZGC_PUBLISH_VACATED=0` reverts).
 >

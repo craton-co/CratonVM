@@ -1088,7 +1088,7 @@ Marked explicitly rather than guessed.
 ## The getfield residual this blocks
 
 Recorded here 2026-08-20, when
-`fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md`
+`every-jit-getfield-takes-the-helper-FIXED-20260820.md`
 was retired. Everything on that page that could be fixed without this barrier
 was fixed; what is left is this, and it is a property of the slot
 representation rather than of the getfield arms:

@@ -539,7 +539,40 @@ pub mod site_stats {
     pub const INSTALL_EMPLACE: usize = 38;
     pub const INSTALL_BYVALUE: usize = 39;
 
-    const N: usize = 40;
+    /// The two array-shaped quickened arms added 2026-09-05. Both answer a
+    /// question no clock could: whether the arm ran at all. `arraylength`'s
+    /// expected win is around one nanosecond, which is below what this host
+    /// resolves, so without these a null A/B cannot be told apart from an arm
+    /// that never fired — the failure mode the invoke page records twice.
+    pub const ARRLEN_HIT: usize = 40;
+    pub const ARRLEN_MISS: usize = 41;
+    /// `aaload` served by `field_fast::array_load_ref` against declined to
+    /// `VmHeap::get_array_element`. A decline is expected and correct for an
+    /// armed load barrier, a process that has boxed, and any element word that
+    /// is neither zero nor a plausible heap pointer.
+    pub const REFARR_HIT: usize = 42;
+    /// A decline the arm could never have served: the load barrier is armed or
+    /// the process has boxed (`autobox::wrapper_exists`). Split out from the
+    /// other two because it is a PROCESS-WIDE latch, not a property of this
+    /// access — folding it in produced a census reading `miss=2000146` with no
+    /// way to tell "declined 2 M times for 2 M different reasons" from
+    /// "declined because a global says never".
+    pub const REFARR_MISS_SCREEN: usize = 43;
+    /// The two halves of the screen, separated because the first census said
+    /// `miss_screen=2000146` and could not say WHICH process-wide latch was
+    /// closed — the same fold-two-causes-into-one-counter defect the split
+    /// above was meant to fix, one level down. Both are latches, but they are
+    /// armed by completely different things and the fix differs accordingly.
+    pub const REFARR_MISS_BARRIER: usize = 46;
+    pub const REFARR_MISS_WRAPPER: usize = 47;
+    /// A decline on this receiver's shape: not a reference array, or the index
+    /// is out of bounds. The general path raises the AIOOBE.
+    pub const REFARR_MISS_SHAPE: usize = 44;
+    /// The element word is neither zero nor a plausible heap pointer, so the
+    /// three-way cold decode owns it.
+    pub const REFARR_MISS_WORD: usize = 45;
+
+    const N: usize = 48;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -565,7 +598,7 @@ pub mod site_stats {
 
     fn report(when: &str) {
         eprintln!(
-            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={} | install: reuse={} emplace={} byvalue={}",
+            "[site-cache] {when} slots={} field: hit={} miss={} fill={} reject_loader={} | method: hit={} miss={} fill={} | new: hit={} miss={} fill={} reject_loader={} | cast: hit={} miss={} fill={} reject_loader={} unusable={} | ldc: hit={} miss={} fill={} | jit-ldc: hit={} miss={} fill={} | iface-select: hit={} miss={} fill={} trivial={} | fast-field: get hit={} miss={} fill={} put hit={} miss={} fill={} unusable={} | door: static hit={} miss={} special hit={} miss={} | install: reuse={} emplace={} byvalue={} | arraylength: hit={} miss={} | aaload: hit={} miss_barrier={} miss_wrapper={} miss_shape={} miss_word={}",
             super::field_site_slots(),
             COUNTS[FIELD_HIT].load(Ordering::Relaxed),
             COUNTS[FIELD_MISS].load(Ordering::Relaxed),
@@ -607,6 +640,13 @@ pub mod site_stats {
             COUNTS[INSTALL_REUSE].load(Ordering::Relaxed),
             COUNTS[INSTALL_EMPLACE].load(Ordering::Relaxed),
             COUNTS[INSTALL_BYVALUE].load(Ordering::Relaxed),
+            COUNTS[ARRLEN_HIT].load(Ordering::Relaxed),
+            COUNTS[ARRLEN_MISS].load(Ordering::Relaxed),
+            COUNTS[REFARR_HIT].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_BARRIER].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_WRAPPER].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_SHAPE].load(Ordering::Relaxed),
+            COUNTS[REFARR_MISS_WORD].load(Ordering::Relaxed),
         );
     }
 

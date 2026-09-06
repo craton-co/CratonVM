@@ -167,7 +167,7 @@ file can run at the same time by different agents.
 |---|---|---|---|---|
 | **0a** | CI must build the *binary*, not just the libs, under `--features zgc` | `.github/workflows/ci.yml` | — | **DONE** |
 | **0b** | Pause/phase/GC-count instrumentation for `ZgcRealHeap` | `gc/src/zgc/metrics.rs` (new) | — | in progress |
-| **0c** | De-stale the ZGC docs | `docs/GC.md`, `docs/gc-tuning.md`, `audits/gc-crate-audit.md` | — | **DONE** |
+| **0c** | De-stale the ZGC docs | `docs/GC.md`, `docs/gc-tuning.md`, `gc-crate-audit.md` | — | **DONE** |
 
 **0a is already landed and is the precedent that motivates the rest.**
 `ZgcRealHeap::with_capacity()` was left out of the change that gave the
@@ -411,7 +411,7 @@ anything that adds a `VmHeap` method. Serialize them or hold the file.
 * **G1 maturation** — owned by [`concurrent-gc-maturation.md`](concurrent-gc-maturation.md),
   which picks G1 as its target and explicitly defers production ZGC to its §8.
 * **The regression record** —
-  `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`
+  `zgc-real-fullsuite-regression-RETIRED-20260808.md`
   is a run record. It is history. Phase 5 adds new records beside it rather than
   editing it.
 * **`gc/src/zgc.rs`'s address-keyed state has never been reviewed.** The

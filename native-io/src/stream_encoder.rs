@@ -27,11 +27,11 @@
 //! there silently corrupted those three REAL fields (`lock` ending up holding
 //! the charset name; `closed` reading `true` from construction, since the id
 //! counter starts at 1) — see
-//! `fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md`.
+//! `spring-web-flow-outputstreamwriter-close-corruption-FIXED.md`.
 //! Fixed by resolving fields **by name** (`get_field_by_name`/
 //! `set_field_by_name`, which walk the real class's field metadata rather
 //! than trusting a hand-counted index — see
-//! `audits/native-hardcoded-inherited-field-slots.md`'s fix
+//! `native-hardcoded-inherited-field-slots.md`'s fix
 //! recipe) for the two real fields this shim legitimately owns semantically
 //! (`out`, `closed`), and keeping everything else (the canonical charset
 //! name, the pending-bytes buffer) in the Rust-side table below, keyed by
@@ -66,7 +66,7 @@
 //! real HotSpot's batched flush, decoupling CratonVM's commit timing from
 //! upstream Tomcat's carefully-tuned `bufferSize` adjustment formula in
 //! `HttpServletDoHeadBaseTest` (see
-//! `fixed-suite-bugs/tomcat/dohead-streamencoder-eager-flush-commit-threshold-FIXED.md`).
+//! `dohead-streamencoder-eager-flush-commit-threshold-FIXED.md`).
 //!
 //! The Rust-side `SeState.pending` buffer below reproduces the real
 //! 512-byte-initial / 8192-byte-max growable-buffer behaviour so the

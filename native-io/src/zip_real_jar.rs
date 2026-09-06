@@ -474,7 +474,7 @@ fn ensure_name_index(state: &mut JarState) -> &HashMap<String, usize> {
 /// `--dump-native-registry`), so for a `JarFile` receiver everything here is
 /// dead. The jar-scan cost that prompted the look was in that other
 /// registrar — a `std::fs::metadata` per accessor call, ~20-54 us on Windows;
-/// see `fixed-bugs/jarfile-accessors-stat-the-file-on-every-call-FIXED-20260811.md`.
+/// see `jarfile-accessors-stat-the-file-on-every-call-FIXED-20260811.md`.
 ///
 /// This is kept because it is strictly less work on the plain
 /// `java.util.zip.ZipFile` path, which this file does still own, not because

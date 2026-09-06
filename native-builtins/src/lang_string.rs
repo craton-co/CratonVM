@@ -3067,7 +3067,7 @@ fn invoke_to_string_units_opt(
     // the correct one (see `phases_late::charset_buffers`), and a workaround
     // that keeps a fixed route unexercised is how the next regression there
     // goes unnoticed. `probes/CharBufferUsersProbe` and the route matrix in
-    // fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md
+    // stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md
     // are byte-identical to HotSpot with
     // this gone.
 
@@ -9065,7 +9065,7 @@ fn format_impl(ctx: &mut dyn NativeContext, args: &[Value], locale: FmtLocale) -
     // all-zero header at the argument's address -- `ClassId(0)`, which the class
     // manager names `java.lang.Object` -- and the formatter refused it as
     // `IllegalFormatConversionException: d != java.lang.Object`. See
-    // `bug-generational-ntru-unpinned-jit-reference-20260821.md`: the signature
+    // `bug-generational-ntru-unpinned-jit-reference-20260821-FIXED.md`: the signature
     // reads like a lost JIT root and is neither JIT- nor relocation-related.
     //
     // Pin both for the duration, and re-derive the array from its handle before
@@ -13666,7 +13666,7 @@ fn bounds_off_count_violation(offset: i32, count: i32, length: i32) -> Option<i3
 // blow past an unrelated 3-second Tomcat connector read-timeout in
 // `org.apache.catalina.core.TestSwallowAbortedUploads`'s `AbortedPOSTClient`
 // tests — see
-// `fixed-suite-bugs/tomcat/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
+// `swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
 // ("AbortedPOSTClient empty-response bug root-caused") for the full
 // investigation.
 //

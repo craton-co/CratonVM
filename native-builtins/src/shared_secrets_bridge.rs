@@ -3161,8 +3161,7 @@ pub(crate) fn register_buffer_pool_mxbean(r: &mut NativeMethodRegistry) {
         // The second row is the standard JMX route — the one JConsole and
         // every exporter use — and it is exactly the "reports a perfect cache
         // no matter what the VM is doing" that
-        // `bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-
-        // server-20260822.md` argues a pool bean must never do. Only the
+        // `bug-the-bufferpool-refusal-takes-out-the-whole-platform-mbean-server-20260822-FIXED-20260901.md` argues a pool bean must never do. Only the
         // three COUNTERS are forced (`native_override.rs`); `getName()` is two
         // instructions returning `"direct"` and the JDK's own bytecode keeps
         // it.

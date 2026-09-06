@@ -751,7 +751,7 @@ fn ir_vs_singlepass_long_ldc2w_constant() {
 // ── cov-01: `ldc` / `ldc_w` (0x12 / 0x13) ────────────────────────────────
 //
 // `ldc` + `ldc_w` + `getstatic` was 189 of the 273 opcode-gap events measured
-// on 2026-08-03 (`feature-designs/c2/ir-coverage-survey-20260803.md`) — 69%
+// on 2026-08-03 (`ir-coverage-survey-20260803.md`) — 69%
 // of every opcode `IrBuilder::build` had no arm for. Increment 1 is the
 // IMMEDIATE case: an `int` or `float` constant the caller's `cp_ldc_resolver`
 // already reduced to bits.
@@ -5410,7 +5410,7 @@ fn ir_vs_singlepass_arraylength_null_faults() {
 // because `<clinit>` is a side effect the constant owes on first touch.
 //
 // `getstatic` alone was 92 of the 273 opcode-gap events measured on 2026-08-03
-// (`feature-designs/c2/ir-coverage-survey-20260803.md`) — the largest single
+// (`ir-coverage-survey-20260803.md`) — the largest single
 // opcode in the survey.
 
 /// `jit_ldc_string_cp(vm, holder_class_id, cp_idx)` stand-in. Returns a value

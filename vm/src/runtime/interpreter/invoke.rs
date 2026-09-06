@@ -336,6 +336,7 @@ pub(crate) fn invokevirtual_site_targets_private(
 /// `CRATONVM_JIT_FINAL_DEVIRT=0` turns this off; the counter is
 /// [`cratonvm_jit::FINAL_INVOKEVIRTUAL_PINNED`].
 pub(crate) fn invokevirtual_site_final_owner(
+    shared: &SharedVm,
     cm: &crate::classloading::ClassManager,
     current_class_id: ClassId,
     target_class: &str,
@@ -349,8 +350,8 @@ pub(crate) fn invokevirtual_site_final_owner(
     let store = cm.class_store();
     // The selection rule itself lives beside its two siblings in
     // `classloading` — see `invokevirtual_final_declaring_class`. What stays
-    // here is this door's POLICY: the kill switch above and the engagement
-    // counter below.
+    // here is this door's POLICY: the kill switch above, the native screen
+    // below, and the engagement counter.
     let declaring_id = crate::classloading::invokevirtual_final_declaring_class(
         cp_class_id,
         method_name,
@@ -358,8 +359,130 @@ pub(crate) fn invokevirtual_site_final_owner(
         store,
     )?;
     let owner = store.get(declaring_id).map(|c| c.name.to_string())?;
+    if final_devirt_native_shadow(shared, cm, cp_class_id, declaring_id, method_name, descriptor) {
+        cratonvm_jit::FINAL_DEVIRT_NATIVE_SHADOW_REFUSED
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] final-devirt REFUSED {target_class}.{method_name}{descriptor} \
+                 (declared on {owner}): a registered native shadows it for some receiver"
+            );
+        }
+        return None;
+    }
     cratonvm_jit::FINAL_INVOKEVIRTUAL_PINNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(owner)
+}
+
+/// Would a registered native shadow the body this `final` site is about to be
+/// bound to, for some receiver the site can see?
+///
+/// `final` is a promise about BYTECODE: no subclass may declare another body.
+/// It says nothing about CratonVM's native registry, which shadows a JDK method
+/// by registering on a class name — very often a SUBCLASS of the one that
+/// declares the body. `invoke_or_native` honours that by walking the RECEIVER's
+/// superclass chain; a devirtualised site has thrown the receiver away and
+/// calls the classfile body directly. So the interpreter and compiled code
+/// answer the same call differently, and only after tier-up.
+///
+/// Measured 2026-09-05, `probes/ChanStateCensus3.java` and
+/// `probes/CloseDevirtProbe.java`, both in netty's own shape (a small
+/// delegating method: `AbstractNioChannel.isOpen()` is `return ch.isOpen()`,
+/// `NioDatagramChannel.doClose()` is `javaChannel().close()`), against
+/// `sun.nio.ch.SocketChannelImpl` / `DatagramChannelImpl` receivers whose
+/// `isOpen`/`close` natives are registered on
+/// `java/nio/channels/{Socket,ServerSocket,Datagram}Channel`:
+///
+///  * `isOpen()Z` — declared `public final` on
+///    `java/nio/channels/spi/AbstractInterruptibleChannel` as `return !closed`.
+///    Compiled callers read the raw field and answered OPEN on a closed
+///    channel from the tier-up call onward: 397,739 of 400,000, first wrong at
+///    call 2,261.
+///  * `close()V` — declared `public final` on the same class, opening with
+///    `synchronized (closeLock)`. CratonVM's datagram factory never runs the
+///    JDK constructor that assigns `closeLock`, so the compiled body threw
+///    `NullPointerException` and left the socket open: 3,487 of 4,000 closes,
+///    first at call 512, against 0 of 20,000 on HotSpot.
+///
+/// Together those are the netty
+/// `channeloutboundbuffer-close-ordering-three-classes` page: netty's
+/// `AbstractChannel.close()` runs `doClose0()` and then, in the same `finally`,
+/// `outboundBuffer.close(cause)`, which throws
+/// `IllegalStateException: close() must be invoked after the channel is closed.`
+/// on a channel still reading open. `DnsNameResolverTest` logged it 384 times
+/// with the JIT on and **0** times under `--nojit`.
+///
+/// # The question this asks
+///
+/// Not "does the declaring class have a native" — that is the screen the
+/// guarded-inline resolver already learned was too weak
+/// (`resolve_inline_site_from`'s `native-shadow-on-receiver-chain`, 2026-09-04)
+/// — but "is a native registered on ANY class a receiver at this site could
+/// have". A devirtualised site has no receiver, so the walk runs the other way:
+/// ask the registry which classes own a native for this `(name, descriptor)`,
+/// and refuse if any of them is the declaring class, the constant-pool class,
+/// or a subclass of the declaring class.
+///
+/// # The one case it cannot see
+///
+/// A native-carrying subclass that is **not loaded yet** when the site
+/// compiles. It is skipped deliberately: an unloaded class cannot be a
+/// receiver, and treating every unloaded owner as a hazard would refuse every
+/// `close()V` / `equals` / `hashCode` site in the tree, since those names are
+/// registered on dozens of classes most runs never load. The residual is the
+/// same one the guarded-inline screen carries — that one keys on the receiver
+/// it has SEEN — and it is named here rather than left implicit.
+fn final_devirt_native_shadow(
+    shared: &SharedVm,
+    cm: &crate::classloading::ClassManager,
+    cp_class_id: ClassId,
+    declaring_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if !crate::runtime::env_cache::jit_final_devirt_native_screen() {
+        return false;
+    }
+    let registry = &shared.natives.native_methods;
+    let store = cm.class_store();
+    // The exact-name half, which is also the WHOLE answer whenever the class is
+    // `final`: no subclass can exist, so the constant-pool class and the
+    // declaring class are the only receivers there are.
+    for id in [cp_class_id, declaring_id] {
+        if let Some(class) = store.get(id) {
+            if registry.find(&class.name, method_name, descriptor).is_some() {
+                return true;
+            }
+        }
+    }
+    // The subclass half. `owner_classes_for_method` is the inverted index; the
+    // list is normally empty (no native anywhere for this name/descriptor) and
+    // is at most a handful of names when it is not.
+    let owners = registry.owner_classes_for_method(method_name, descriptor);
+    owners.iter().any(|owner| {
+        cm.get_loaded_class_id(owner)
+            .is_some_and(|owner_id| is_subclass_of(store, owner_id, declaring_id))
+    })
+}
+
+/// Is `candidate` `declaring_id` itself, or a subclass of it?
+///
+/// The superclass chain only, matching `invoke_or_native`'s own walk: a native
+/// registered on an INTERFACE never shadows a `final` class method, because
+/// native resolution for a virtual call never walks interfaces.
+fn is_subclass_of(
+    store: &crate::classloading::ClassStore,
+    candidate: ClassId,
+    declaring_id: ClassId,
+) -> bool {
+    let mut cur = Some(candidate);
+    while let Some(id) = cur {
+        if id == declaring_id {
+            return true;
+        }
+        cur = store.get(id).and_then(|c| c.superclass);
+    }
+    false
 }
 
 /// Resolve a Java 11+ private-method call encoded as `invokevirtual`.
@@ -389,7 +512,7 @@ pub(super) fn resolved_private_invokevirtual_target(
     // loader's copy — pinning a private call's dispatch to the wrong
     // class's bytecode/constant pool while the receiver stays the caller's
     // own (correct-loader) object. See
-    // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md
+    // bug-h2-suite-residual-fail-triage-FIXED.md
     // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
     let self_match = {
         let cm = shared.classes.class_manager.read();
@@ -486,7 +609,7 @@ pub(super) fn stale_mirror_recovery_applies(
 /// This narrows the recovery. The case it exists for —
 /// `Thread.currentThread().getThreadGroup()` in Tomcat's
 /// `TaskThreadFactory.<init>`, see
-/// `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`
+/// `gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`
 /// — names `java/lang/Thread` and is unaffected. An `Object`-typed use of a
 /// stale mirror now reads the zeroed object instead of being repaired; that
 /// degrades a `toString`, where admitting it risks corrupting a live object's
@@ -548,7 +671,7 @@ pub(super) fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    // PGO-01 (feature-designs/c2/pgo-01-call-site-evidence-gap.md):
+    // PGO-01 (pgo-01-call-site-evidence-gap.md):
     // call-site evidence for invokespecial. invokevirtual/invokeinterface are
     // NOT recorded here — they are covered by the receiver-type profile
     // instead (see MethodProfile's doc comment on `receivers` vs
@@ -633,7 +756,7 @@ pub(super) fn execute_invoke_kind(
     // such a long as `Value::Int`, which `coerce_invoke_arg_for_descriptor`
     // then widened — corrupting `J` args to invokevirtual/special callees.
     // Mirrors `pop_coerced_invoke_args_virtual`. See
-    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+    // bc-ec-mod-mododdinverse-investigation.md.
     let mut tmp_cv: Vec<(CompactValue, u8)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
         tmp_cv.push(thread.frames[frame_idx].stack.pop_with_kind()?);
@@ -925,7 +1048,7 @@ pub(super) fn execute_invoke_kind(
     // `java.lang.Thread` mirror while a *stale copy* of its old address still
     // sits in a running or blocked frame's operand stack / local — the
     // frame/operand remap-coverage gap documented in
-    // `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`. The
+    // `gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`. The
     // registry and the per-thread `java_thread_obj` field are remapped, but
     // the frame copy is not, so an invoke whose receiver is that copy (the
     // classic `Thread.currentThread().getThreadGroup()` in
@@ -963,8 +1086,7 @@ pub(super) fn execute_invoke_kind(
     // `java/lang/Thread`, `jdk/internal/misc/InnocuousThread` and
     // `org/h2/mvstore/FileStore$BackgroundWriterThread` on different runs —
     // whichever mirror had previously occupied the address.
-    // See `fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+    // See `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
     //
     // The all-zero test is exactly what the recovery was written for — the
     // Tomcat `TestDigestAuthenticator` case dispatches on a *zeroed* object —
@@ -2104,7 +2226,7 @@ pub(super) fn execute_invoke_kind(
     //
     // Costs nothing on a healthy run: the whole check is two string compares
     // that fail, and it is only reached at a dispatch terminal. See
-    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`,
+    // `bug-h2-classid0-stale-address-family-FIXED.md`,
     // whose "what to try next" asked for exactly this — the two
     // `CloneNotSupportedException` occurrences it recorded produced no verdict
     // because nothing on the clone path consulted the heap.
@@ -3842,7 +3964,7 @@ pub(super) fn try_stackless_invoke(
         // (e.g. `org/h2/command/ParserBase.read()V`) onto a receiver whose
         // own, unrelated class of the same name declares that method
         // itself and doesn't extend that ancestor at all. See
-        // fixed-suite-bugs/h2-suite-bugs/bug-h2-suite-residual-fail-triage-FIXED.md
+        // bug-h2-suite-residual-fail-triage-FIXED.md
         // (TestUpgrade's `ParserBase.getSyntaxError`/`Token.start()` NPE).
         let start_cid = |cm: &crate::classloading::ClassManager| {
             dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name))

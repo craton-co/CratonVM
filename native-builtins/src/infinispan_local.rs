@@ -893,7 +893,7 @@ fn native_dcm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// `SecurityActions.getCache(EmbeddedCacheManager, String)` →
 /// `EmbeddedCacheManager.getCache(String)` — this exact native) then NPEs on
 /// `cache.config.clustering()` in `AbstractCacheBackedSet.<init>`. See
-/// fixed-suite-bugs/keycloak/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md.
+/// keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md.
 fn native_dcm_get_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_arg(args, 0) {
         Some(o) => o,
@@ -1149,7 +1149,7 @@ fn native_real_dcm_cache_exists(
 /// slot index. That shim caused a `ClassCastException` one call site up
 /// (real Infinispan code casting the "Configuration" back to its real type)
 /// once other code started reaching this path — see
-/// fixed-suite-bugs/keycloak/keycloak-model-infinispan-configurationbuilder-classcastexception.md.
+/// keycloak-model-infinispan-configurationbuilder-classcastexception.md.
 /// The fix: let real `ConfigurationBuilder.build()` bytecode construct a
 /// genuine `Configuration` (real field layout, ~18 nested config-section
 /// fields with no relation to size/ttl by position), and read size/ttl back
@@ -1498,7 +1498,7 @@ fn real_cache_invocation_context(ctx: &mut dyn NativeContext, this: ObjectRef) -
 /// this function's *own* subsequent `ctx.invoke_virtual`/`ctx.invoke` calls.
 /// Mirrors the identical hazard fixed in
 /// `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs) —
-/// see fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md.
+/// see gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md.
 /// Re-read both with `read_this_and_key` after the risky call, then
 /// `ctx.unpin_native_roots(this_handle)` once `this`/`key` are no longer
 /// needed (releases the whole batch, `key`'s slot included).
@@ -2082,7 +2082,7 @@ pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
     // hit a real `ClassCastException` naming `ConfigurationBuilder`, reached
     // once the sibling `GlobalConfigurationBuilder.build()` fix (below) let
     // Keycloak's cache bootstrap get this far. See
-    // fixed-suite-bugs/keycloak/keycloak-model-infinispan-configurationbuilder-classcastexception.md
+    // keycloak-model-infinispan-configurationbuilder-classcastexception.md
     // (now fixed) and `native_dcm_define_configuration`'s doc comment for how
     // its raw synthetic-slot-index reads of `Configuration`'s size/ttl were
     // reworked to use `Configuration`'s real accessor API instead, which is
@@ -2485,7 +2485,7 @@ mod tests {
 
     /// Regression test for the `ConfigurationBuilder.build()`
     /// `ClassCastException` fix
-    /// (fixed-suite-bugs/keycloak/keycloak-model-infinispan-configurationbuilder-classcastexception.md,
+    /// (keycloak-model-infinispan-configurationbuilder-classcastexception.md,
     /// now fixed): `native_dcm_define_configuration` must read size/ttl off
     /// a `Configuration` object through its real accessor API
     /// (`memory().maxCount()` / `expiration().lifespan()`, both via

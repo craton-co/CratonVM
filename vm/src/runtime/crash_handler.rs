@@ -107,7 +107,7 @@ pub fn savebase_watch_caught() -> bool {
 //   * **JDK mode.** CratonVM ships two complete, materially different Java
 //     class libraries (~5,200 Rust stubs vs ~300 natives over real JDK
 //     bytecode). They have different semantics and different bugs. Until
-//     `arch-2026-07-26/jdk-mode-determinism.md` the mode was
+//     `jdk-mode-determinism.md` the mode was
 //     host-detected and printed nowhere; the launcher now prints it, but the
 //     hardware-fault path below does NOT go through the launcher's panic hook,
 //     so without this snapshot a SIGSEGV/access-violation report still carries
@@ -117,7 +117,7 @@ pub fn savebase_watch_caught() -> bool {
 //     prove a complete rewritable root map. A heap-corruption report that does
 //     not say whether the last cycles compacted is nearly undiagnosable, and
 //     the degrade was invisible for a long time (see
-//     `arch-2026-07-26/moving-young-precise-roots.md`).
+//     `moving-young-precise-roots.md`).
 //   * **JIT state.** Whether the faulting thread was inside compiled code,
 //     and whether an unregistered JIT frame was on the stack, separates a
 //     codegen bug from an interpreter/GC bug on the first read.
@@ -258,7 +258,7 @@ pub fn gc_state_lines() -> Vec<String> {
 /// cannot make.
 ///
 /// That is not hypothetical: it is how
-/// fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md got
+/// g1-sigsegv-unguarded-callee-jit-frame-FIXED.md got
 /// its title. Four G1 crash dumps carried `young-gen policy: moving (Cheney
 /// young copy)` beside `last incomplete-coverage reason:
 /// innermost-rbp-belongs-to-unguarded-callee`, and the page concluded G1's
@@ -375,7 +375,7 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
 /// thread crashing in the middle of a hot bytecode loop it is the last known
 /// good position. The report says so rather than implying it is live.
 ///
-/// CR-VXC-1 (`arch-2026-07-26/vm-exec-closeout.md` §5.1): the
+/// CR-VXC-1 (`vm-exec-closeout.md` §5.1): the
 /// body below reads one process-wide `OnceLock` published from `Vm::new`, so a
 /// fault on a spawned worker or on a virtual-thread carrier used to render the
 /// *primordial* thread's frames — never the faulting thread's. The two crash
@@ -2783,13 +2783,32 @@ not an address\n",
                 } else {
                     async_signal_safe::write_all(
                         async_signal_safe::STDERR_FD,
-                        b"#    *** and NOT re-committed since. This IS a use-after-free of heap memory: something held a pointer into a span the collector proved dead. ***\n",
+                        b"#    *** and NOT re-committed since. Something TOUCHED a span the collector proved dead: either a stale pointer read it, or a writer wrote into it. ***
+",
                     );
-                    // WHICH proof was wrong is the fork an investigation
-                    // otherwise cannot resolve from a register dump.
+                    // WHAT touched it is the fork an investigation otherwise cannot
+                    // resolve from a register dump. NOT "which liveness proof was
+                    // wrong": the span is usually dead and correctly free-listed,
+                    // and the defect is a WRITER. ZGC-RELOC-DECOMMIT.1 was a
+                    // compaction slide memmoving into a free-list-high span with no
+                    // missing root anywhere -- and this legend used to assert one,
+                    // which sent that investigation hunting an unrooted reference
+                    // that does not exist.
                     async_signal_safe::write_all(
                         async_signal_safe::STDERR_FD,
-                        b"#    site=free-list-* means the span was SWEPT and free-listed while still reachable -- a missing root.\n#    site=*-retract or unbumped-middle means a CURSOR passed over live bytes -- a sweep that mis-sized the live set.\n#    CRATONVM_GC_RESERVE=0 keeps the granules mapped, so the same defect reads stale bytes instead of faulting.\n",
+                        b"#    A dead span is a NORMAL state; REACHING it is the defect. Two shapes:
+#      (a) a WRITER put something there. The compaction slides pick a destination
+#          inside free space arithmetically, so they must go through
+#          Arena::commit_for_relocation first -- see ZGC-RELOC-DECOMMIT.1.
+#      (b) a READER held a stale pointer. Only THEN was the span reachable when it
+#          was freed, i.e. a missing root, or a sweep that mis-sized the live set
+#          (site=*-retract / unbumped-middle mean a cursor passed over live bytes).
+#    The faulting operand does NOT separate these: a memmove whose ranges overlap
+#    can fault at an address lying inside BOTH src and dst. Ask whether a slide was
+#    in progress before concluding a root is missing.
+#    CRATONVM_GC_RESERVE=0 keeps the granules mapped, so the same defect reads or
+#    writes stale bytes instead of faulting.
+",
                     );
                 }
             } else {
@@ -4201,7 +4220,7 @@ mod tests {
     /// incremented only by `gen_heap.rs`, so under any other collector they are
     /// zero by construction. Printing them there reads as a measurement of that
     /// collector and is how the Tomcat G1 SIGSEGV page
-    /// (fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md)
+    /// (g1-sigsegv-unguarded-callee-jit-frame-FIXED.md)
     /// came to blame a moving young collector that was never running.
     #[test]
     fn gc_state_lines_omit_generational_only_counters_under_another_collector() {

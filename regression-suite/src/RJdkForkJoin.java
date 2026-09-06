@@ -154,7 +154,7 @@ public class RJdkForkJoin {
      *     {@code right.compute()} call, which is the operand-stack shape the
      *     original note describes.
      *
-     * See `performance/completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
+     * See `completablefuture-composition-force-interpreted-by-a-stale-forkjointask-blocklist-FIXED-20260827.md`.
      */
     static final class DeepSumTask extends RecursiveTask<Long> {
         private static final long serialVersionUID = 1L;

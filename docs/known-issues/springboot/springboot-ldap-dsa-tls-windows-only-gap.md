@@ -159,7 +159,7 @@ Other routes were considered and ruled out:
 - **Substituting a different key** — would stop testing the fixture's identity.
 
 This matches the posture already taken for the other legacy-crypto gaps in the
-rustls backend (`fixed-suite-bugs/rustls-cbc-cipher-suites-not-supported.md`,
+rustls backend (`rustls-cbc-cipher-suites-not-supported.md`,
 `rustls-tls11-protocol-not-supported.md`), with the added note that on Unix the
 gap *is* covered by the OpenSSL fallback.
 
