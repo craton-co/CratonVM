@@ -69,7 +69,7 @@ Ran the complete 651-class Tomcat suite under all three GC backends in parallel 
 - **A real fix, if ever undertaken, is the same one named throughout Part 2**: precise oop maps or a shadow stack for compiled frames, so `moving_young_coverage_complete()` can actually certify what it currently has to assume. That is a substantially larger undertaking than anything in Part 1, and nothing in this investigation's history suggests a smaller intervention (timeout increases, isolated fallback-reason fixes like `innermost_frame_method`) will clear the DoHead family specifically — the Spring Boot investigation already found that two of its four classes needed a collector switch, not a fix, for exactly this reason.
 - **Not chased further here**: per-fallback-reason attribution specific to the DoHead family (which of the seven reasons dominates *this* class shape, the way the Spring Boot doc did for its four classes) would be the natural next step if someone wants to reduce fallback volume rather than switch collectors — not attempted in this session.
 
-### 2026-09-06 (later the same day): the residual is MASKED, not shown fixed
+### 2026-09-06 (later the same day): the residual is GONE per moving cycle, and the masking scare is answered
 
 Interleaved control -- one box, the same minutes, 4-way parallelism, arms
 alternated round by round, 900 s cap on both so a hang cannot pass as a pass:
@@ -140,3 +140,38 @@ DEEPEST Java frame; `CRATONVM_DBG_STTRACE=1` recovers the compiled frames that
 already left the stack, whose deepest is `ReentrantLock.unlock`; and
 `ReentrantLock.unlock()` is `sync.release(1)`. Without the STTRACE snapshot the
 six JDK frames holding the answer are invisible.
+
+#### Resolved by normalising on relocation exposure
+
+The masking caveat above was the right question and the wrong answer. Current
+dev *does* relocate less — but that does not account for the green, and the way
+to show it is to stop counting runs and count the gated event.
+
+The defect fires only on a MOVING young collection, so failures per moving
+cycle is the rate that means anything. `CRATONVM_GC_STATS=1` in both arms,
+interleaved, 3 rounds, 8 classes:
+
+| arm | runs | non-OK | moving cycles | failures per 100 moving cycles |
+|---|---:|---:|---:|---:|
+| the binary that showed the defect | 24 | **5** | 73 | **6.85** |
+| current `dev` | 24 | **0** | 44 | **0.00** |
+
+Current dev relocates at 0.60x the old binary's rate over identical runs — the
+masking effect is REAL and is why the raw run counts could not settle this. But
+pooling every measured current-dev moving cycle from this and the amplifier run
+gives **0 failures in 137 moving cycles**, where the old binary's rate predicts
+**9.4**. P(observing zero | rate unchanged) ≈ **8.4e-5**.
+
+So the improvement is not explained by reduced relocation. Both things are true:
+dev relocates less, AND its failure rate per relocation is genuinely lower.
+
+**Still not a root cause, and still no commit credited.** The mechanism was
+never found; dev took many GC commits in the window, including a moving-young
+root cause that landed and was WITHDRAWN. This says the defect no longer fires
+at a measurable rate per unit of the exposure it needs — nothing about why.
+
+**The amplifier does not work on this workload**, which is worth recording so
+nobody re-runs it: `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` is the netty page's lever
+for forcing relocation (1 -> 14-24 cycles there), and here it measured 43 moving
+cycles against a plain arm's 50. Exposure on these classes cannot be forced
+level, only measured and divided out.
