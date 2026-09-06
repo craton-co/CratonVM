@@ -18300,6 +18300,25 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
 /// for the condition it is retrying on.
 struct DeferredNewRetry {
     state: u8,
+    /// How many times the re-offer sweep has asked this memo's sites to resolve
+    /// and been told no.
+    ///
+    /// The sweep runs on every class definition, so an armed memo whose class
+    /// never loads is re-resolved once per definition for the life of the
+    /// process. Measured on the H2 JDBC workload: **8,131 site resolutions over
+    /// 101 distinct sites in one run**, one of them 3,905 times -- a
+    /// `new java/nio/charset/MalformedInputException` on a decoding error path
+    /// inside `java/lang/String`, for a class the program never loads *because*
+    /// that path never runs. Each of those took the class-manager read lock.
+    ///
+    /// A memo that has been asked [`MAX_DEFERRED_NEW_LOOKS`] times and answered
+    /// no every time is retired, which returns [`DEFERRED_NEW_ARMED`] toward
+    /// zero and with it the sweep's own fast path. Bounding the LOOKS rather
+    /// than the wall-clock or the definition count is deliberate: it is a
+    /// budget on the thing that costs, and it cannot silence a memo whose class
+    /// loads promptly, because such a memo is granted on its first or second
+    /// look and never spends the budget at all.
+    looks: u32,
     sites: Vec<(u32, u16)>,
     /// The method this memo belongs to, so a HELD retry can be re-offered.
     ///
@@ -18320,6 +18339,40 @@ fn deferred_new_retries(
 
 /// How many methods may be remembered for a deferred-`new` retry at once.
 const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
+
+/// How many times the re-offer sweep may ask one held memo's sites to resolve
+/// before retiring it. See [`DeferredNewRetry::looks`].
+///
+/// Sixteen, because the event the memo waits for is a class DEFINITION and the
+/// classes that resolve at all resolve within a handful of them -- the fixture
+/// this path was built on (`bench/DeferredNewReoffer.java`) re-offers on the
+/// first definition after the `touch()`. Sixteen leaves an order of magnitude
+/// of headroom over that and still bounds the pathological case at 16 rather
+/// than at the number of classes the program loads, which is unbounded.
+///
+/// `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` is the kill switch: it means UNBOUNDED
+/// and restores the pre-2026-09-06 behaviour exactly. Any other number sets the
+/// budget, which is what a bisect wants when the question is "how many looks
+/// did this method need", not merely "is the budget the cause".
+///
+/// Declared as a JIT inventory row rather than a `SCALARS` entry: the scalar
+/// list is the surface a USER has to learn (a path, a heap size, an encoding),
+/// and `flag_surface.rs` guards its size on purpose. This is a compiler tuning
+/// knob reached during a bisect, so it belongs in the group where the rest of
+/// the JIT's levers are.
+const MAX_DEFERRED_NEW_LOOKS: u32 = 16;
+
+/// The look budget in force, cached. `0` => unbounded.
+fn deferred_new_look_budget() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEFERRED_NEW_LOOKS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(MAX_DEFERRED_NEW_LOOKS)
+    })
+}
 
 /// Record that this method's IR build bailed on a `new` site whose class was
 /// not loaded at the time — a TRANSIENT refusal, not a property of the class
@@ -18367,6 +18420,7 @@ pub fn note_deferred_new_bail(
         let armed = !set.contains_key(&h);
         set.entry(h).or_insert_with(|| DeferredNewRetry {
             state: 0,
+            looks: 0,
             sites: deferred_sites.to_vec(),
             key: (
                 std::sync::Arc::from(class_name),
@@ -18445,9 +18499,32 @@ pub fn take_deferred_new_retry(
             .iter()
             .all(|&(holder, cp_idx)| site_resolves_now(holder, cp_idx));
     if !ready {
+        // Charge the look, and retire the memo once the budget is gone. A memo
+        // that is retired here is one whose class has failed to load across
+        // sixteen class definitions; leaving it armed costs a class-manager
+        // read lock per site on EVERY later definition and buys a retry the
+        // evidence says will not be granted. `state = 2` rather than a removal
+        // so `note_deferred_new_bail`'s `or_insert` still refuses to re-arm it
+        // -- a retired memo must not come back through the compile door and
+        // start the budget over.
+        entry.looks = entry.looks.saturating_add(1);
+        let budget = deferred_new_look_budget();
+        if budget != 0 && entry.looks >= budget {
+            entry.state = 2;
+            DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            DEFERRED_NEW_RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new RETIRED {class_name}.{method_name}{descriptor} -- {} looks, class never loaded",
+                    entry.looks,
+                );
+            }
+            return false;
+        }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
             eprintln!(
-                "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept"
+                "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept (look {}/{budget})",
+                entry.looks,
             );
         }
         DEFERRED_NEW_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18468,12 +18545,20 @@ pub fn take_deferred_new_retry(
 static DEFERRED_NEW_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DEFERRED_NEW_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `(held, spent)` deferred-`new` retry decisions for this process.
-pub fn deferred_new_retry_census() -> (u64, u64) {
+/// Memos abandoned because their class did not load within the look budget.
+///
+/// Printed beside `held` and `spent` always, including as a zero: a zero here
+/// cannot be told from "the budget is unbounded" or "nothing was ever armed"
+/// unless it is on the line.
+static DEFERRED_NEW_RETIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(held, spent, retired)` deferred-`new` retry decisions for this process.
+pub fn deferred_new_retry_census() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         DEFERRED_NEW_HELD.load(Relaxed),
         DEFERRED_NEW_SPENT.load(Relaxed),
+        DEFERRED_NEW_RETIRED.load(Relaxed),
     )
 }
 
@@ -40285,5 +40370,95 @@ mod deferred_new_retry_gate_tests {
         let now = |_: u32, _: u16| true;
         assert!(take_deferred_new_retry(c, m, d, &now));
         assert_eq!(super::held_deferred_new_count(), before);
+    }
+
+    /// A class that never loads must stop costing a resolution per class
+    /// definition. Before the budget, the sweep re-resolved one such memo 3,905
+    /// times in a single H2 run, each time under the class-manager read lock.
+    ///
+    /// The assertion is on the HELD COUNT rather than on the return value,
+    /// because both a held and a retired memo return `false` — what separates
+    /// them is that a retired one stops the sweep's fast path from firing at
+    /// all, and that is the property worth pinning.
+    #[test]
+    fn a_class_that_never_loads_retires_its_memo_within_the_look_budget() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Forever", "run", "()V");
+        let before = super::held_deferred_new_count();
+        super::note_deferred_new_bail(c, m, d, &[(9, 9)]);
+        assert_eq!(super::held_deferred_new_count(), before + 1);
+        let never = |_: u32, _: u16| false;
+        for _ in 0..super::MAX_DEFERRED_NEW_LOOKS {
+            assert!(!take_deferred_new_retry(c, m, d, &never));
+        }
+        assert_eq!(
+            super::held_deferred_new_count(),
+            before,
+            "a memo asked {} times and refused every time must be retired, or the \
+             class-definition sweep keeps paying for it forever",
+            super::MAX_DEFERRED_NEW_LOOKS,
+        );
+        // And it stays retired: `note_deferred_new_bail`'s `or_insert` must not
+        // re-arm it, or the compile door restarts the budget.
+        super::note_deferred_new_bail(c, m, d, &[(9, 9)]);
+        assert_eq!(super::held_deferred_new_count(), before);
+        // A retired memo is also invisible to the sweep's work list.
+        assert!(
+            !super::held_deferred_new_methods()
+                .iter()
+                .any(|(hc, hm, hd)| &**hc == c && &**hm == m && &**hd == d),
+            "a retired memo must not appear in the sweep's work list",
+        );
+    }
+
+    /// The budget must not touch a class that loads promptly, which is every
+    /// case the mechanism exists for. One look short of the budget still holds,
+    /// and the grant still lands.
+    #[test]
+    fn a_memo_within_budget_still_gets_its_retry() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Late", "run", "()V");
+        super::note_deferred_new_bail(c, m, d, &[(4, 4)]);
+        let never = |_: u32, _: u16| false;
+        for _ in 0..(super::MAX_DEFERRED_NEW_LOOKS - 1) {
+            assert!(!take_deferred_new_retry(c, m, d, &never));
+        }
+        let now = |_: u32, _: u16| true;
+        assert!(
+            take_deferred_new_retry(c, m, d, &now),
+            "a memo one look inside the budget must still be grantable",
+        );
+    }
+
+    /// `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` is the kill switch, and a kill
+    /// switch nobody exercises is not a kill switch. Unbounded means the memo
+    /// survives well past the default budget.
+    #[test]
+    fn the_zero_budget_restores_the_unbounded_behaviour() {
+        let _serial = serial();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_DEFERRED_NEW_LOOKS", Some("0"))],
+            || {
+                // The budget is read through a process-wide `OnceLock`, so this
+                // override only bites when this test wins the race to
+                // initialise it. Assert the PARSE, which is what the override
+                // controls, and the behaviour only when it took effect.
+                if super::deferred_new_look_budget() != 0 {
+                    return;
+                }
+                let (c, m, d) = ("T$Unbounded", "run", "()V");
+                let before = super::held_deferred_new_count();
+                super::note_deferred_new_bail(c, m, d, &[(2, 2)]);
+                let never = |_: u32, _: u16| false;
+                for _ in 0..(super::MAX_DEFERRED_NEW_LOOKS * 4) {
+                    assert!(!take_deferred_new_retry(c, m, d, &never));
+                }
+                assert_eq!(
+                    super::held_deferred_new_count(),
+                    before + 1,
+                    "an unbounded budget must never retire a memo",
+                );
+            },
+        );
     }
 }

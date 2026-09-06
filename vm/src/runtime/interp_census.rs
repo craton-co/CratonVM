@@ -182,9 +182,9 @@ pub fn report_at_exit() {
         for (why, n) in cratonvm_jit::runtime_lowering::inline_tlab_declines() {
             eprintln!("[c2-supersede]   inline-TLAB declined {n}x: {why}");
         }
-        let (held, spent) = cratonvm_jit::deferred_new_retry_census();
+        let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
-            "[c2-supersede] deferred-new retries: held={held} spent={spent} re_offered={}",
+            "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",
             crate::runtime::interpreter::jit_bridge::deferred_new_reoffered(),
         );
     }
