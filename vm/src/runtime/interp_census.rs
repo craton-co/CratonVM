@@ -232,6 +232,13 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] ir array guards: null_elided={ne} null_emitted={nm} bounds_elided={be} bounds_emitted={bm}"
         );
+        // Split the elisions by which pass proved them. Dominating redundancy
+        // can only ever remove a SECOND access; the range pass is the only one
+        // that removes a first. A single total moves for either reason.
+        eprintln!(
+            "[c2-supersede] ir bounds elisions by range proof: {} (rest are dominating-redundancy)",
+            cratonvm_jit::ir_check_elim::range_census(),
+        );
         eprintln!(
             "[c2-supersede] ir aastore sites lowered: {}",
             cratonvm_jit::ir_lower::ir_aastore_census(),

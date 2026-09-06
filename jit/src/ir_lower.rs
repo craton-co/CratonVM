@@ -9641,6 +9641,9 @@ impl<'a> Lowerer<'a> {
         let elide_bounds = node != NO_NODE && self.check_elision.bounds_elided(node);
         crate::ir_check_elim::note_check(0, elide_null);
         crate::ir_check_elim::note_check(1, elide_bounds);
+        if elide_bounds && self.check_elision.bounds_range_proved(node) {
+            crate::ir_check_elim::note_range_proved();
+        }
         if !elide_null {
             // Null check: TEST RAX,RAX → ZF=1 iff array == null. Continue on JNZ.
             self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX

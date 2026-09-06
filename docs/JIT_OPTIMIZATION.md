@@ -3338,3 +3338,151 @@ exactly like a control that has found an effect.
 One run was discarded outright rather than reported: host load reached 76 and
 the control pair disagreed with ITSELF by 3.7%, larger than the effect being
 measured. This file has recorded that rule several times and it applied again.
+
+### The unresolved-class trap: the blocker was named wrong, and the reach is smaller than claimed
+
+The previous section left this: *"What would make the other three safe is
+`DeoptAction::RecompileAndReinterpret` instead of `Reinterpret`, so the first
+trap triggers the recompile that resolves the class. `Op::Guard`'s lowering
+hard-codes the action; parameterising it is the work that switch is waiting
+on."*
+
+**That names the wrong field.** `Op::Guard` does bake an action into its
+`DeoptimizationPoint`, but nothing reads it. The runtime recomputes the action
+from the REASON on every deopt — `record_deoptimization` calls
+`DeoptimizationLog::recommend_action_at_bci(method, reason, bci)` and returns
+that. The baked `action` is dead metadata on this path.
+
+And the reason it does bake, `DeoptReason::UncommonTrap`, already escalates.
+`UncommonTrap` takes the count-based policy: `Reinterpret` on the first deopt,
+then `RecompileAndReinterpret`. So the self-healing the switch was said to be
+waiting for is already there, one deopt later than ideal. Planting
+`DeoptReason::ClassLoading` instead would reach it on the FIRST deopt and would
+additionally clear the method's assumptions — but that is a one-deopt saving on
+a path measured below, not the unblocking the note described.
+
+#### The measurement, which is what should have been taken first
+
+| H2, `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` | off | on |
+|---|---:|---:|
+| traps planted (typecheck / new) | 0 / 0 | **39 / 9** |
+| bodies accepted | 579 | 586 |
+| bodies lowered | 118 | 124 |
+| fell through to single-pass | 19 | 15 |
+| deferred-new retries `spent` / `re_offered` | 2 / 1 | **0 / 0** |
+| eager re-queues (`RecompileAndReinterpret`) | 0 | **0** |
+| `DOD RESULT` | OK | OK |
+
+**All 48 traps plant and not one fires.** On this workload the coldness argument
+holds exactly as written: no path that executes reaches a site whose class was
+unloaded at compile time.
+
+Which cuts both ways, and the second reading is the one worth keeping. Zero
+fires means there is no evidence the trap is harmful — and equally none that
+the escalation path works, because it never ran. "I read the policy function
+and it returns `RecompileAndReinterpret` at count 1" is a claim about source,
+not a measurement. The switch stays OFF until something fires it.
+
+`ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir` cannot supply that.
+It was read earlier as proving the body "returns the deopt sentinel instead of
+the object — forever, on every call". It proves the first half only:
+`call_with_dummy_context` invokes the compiled body directly, with no VM, no
+deopt entry, no `record_deoptimization` and no recompiler. A unit test with no
+runtime cannot tell "traps once and heals" from "traps forever", and this one
+was cited for the second.
+
+So the honest state of this item: reach is +7 accepted bodies and +6 lowered on
+H2, the danger is unobserved rather than absent, and what it actually needs is
+a VM-level test that FIRES a trap and shows the recompile come back without it.
+That test is the work; the action parameter never was.
+
+### Range-based bounds-check elimination
+
+`bounds_elided=8` against `bounds_emitted=174` was the largest number left on
+the board, and it has a structural cause: the dominance pass removes the SECOND
+check on an SSA `(base, index)` pair and can never remove the FIRST. Almost all
+Java array traffic has no second access to remove.
+
+The new pass proves the check dead outright. A check at `(base, idx)` goes when
+both halves hold:
+
+* `idx < base.length` — a dominating `If` on `Cmp(Lt)[idx, ArrayLength(base)]`,
+  taken on its true edge, matched on the array's SSA node so two arrays of
+  equal length stay two arrays.
+* `idx >= 0` — a non-negative constant, another array length, or a unit-stride
+  induction variable.
+
+Both, always. The emitted check is an UNSIGNED compare, which is exactly the
+conjunction `0 <= idx < len`; the source-level test it is being proven from is
+SIGNED, and a negative index passes that. Eliding on the upper bound alone
+indexes behind the object.
+
+Two restrictions are proofs rather than conservatism, and the tests say so in
+their names:
+
+**Unit stride only.** For `i = [region, init, i + s]` guarded by `i < len`, the
+guard gives `i <= len - 1`, so after the increment `i <= len - 1 + s`. An array
+length reaches `i32::MAX`, so any `s > 1` overflows at the top of the range; the
+wrapped `i` is negative, passes the signed test, and indexes out of bounds with
+the check gone. At `s == 1` the bound is `i <= len <= i32::MAX` and the proof
+closes without knowing `len`. A "small constant" stride bound would not — it is
+still unsound against a near-maximal array.
+
+**The guard must dominate the BACK EDGE, not just the access.**
+`for (int i = 0; ; i++) if (c) if (i < a.length) a[i] = 1;` has a bounds test
+dominating every access and still lets `i` reach `i32::MAX` and wrap, after
+which that same test passes on a negative index. Requiring every back edge into
+the loop header to pass through the guard is what rules it out.
+
+The census splits the two mechanisms — `ir bounds elisions by range proof` —
+because a single total moves for either reason and they have opposite reach.
+
+#### Two ways it nearly shipped inert, and how each was caught
+
+Both were found by asking what shape the BUILDER actually emits, not by any
+test -- every unit test in the module passed through both.
+
+**Loop headers are `Op::Merge`, never `Op::Region`.** `IrBuilder::ensure_merge`
+creates every merge point as an `Op::Merge`; `activate_loop_header` then fills
+in its inputs and phis and never rewrites the op. `Op::Region` appears only in
+hand-built graphs -- including this module's own tests. A first version
+required `Op::Region` and would have eliminated exactly zero bounds checks in a
+compiled method while showing twelve green tests.
+
+**javac puts the loop body on the FALSE edge.** The builder preserves bytecode
+branch polarity: `if_icmpge exit` becomes `Cmp(Ge)` with `Proj(0)` going to the
+BRANCH TARGET, so for a top-tested loop the useful fact is `not (i >= len)` on
+`Proj(1)`. Matching only `Lt`-on-true finds the bottom-tested shape and misses
+the other one silently. Both edges are read now, with the four
+`(edge, comparison)` pairs tabulated at `upper_bounds`.
+
+Each has a test named for the failure rather than the feature --
+`the_header_op_the_builder_actually_emits_is_recognised`,
+`the_bound_is_read_off_the_false_edge_of_a_negated_test` -- because the thing
+that needs catching is a silent zero, and a zero is what a workload with no
+such loops also produces.
+
+#### Measured
+
+`probes/BceProbe.java` is the behavioural half: the unit tests assert what the
+ANALYSIS decides, the probe asserts what the EMITTED CODE does. It sums, fills
+and walks a jagged array on the proven shape, and demands
+`ArrayIndexOutOfBoundsException` from four shapes the pass must refuse -- an
+inclusive bound, a negative start, a second shorter array, and an empty array
+-- all after 20,000 warm-up calls, so it is the compiled body under test and
+not the interpreter.
+
+| | range pass on | off |
+|---|---:|---:|
+| `BceProbe` bounds elided / emitted | **6 / 4** | 0 / 10 |
+| `BceProbe` verdict | OK | OK |
+| H2 bounds elided (of which by range) | **18 (10)** | 8 (0) |
+| H2 `DOD RESULT` | OK | OK |
+
+Six of the probe's ten checks go, and every refusal still traps. On H2 the
+range pass adds ten elisions on top of the eight redundancy already found --
+purely additive, since the two prove disjoint things. Ten of ~166 is a modest
+share, and expected: H2's hot code is collections and MVStore rather than raw
+array loops, which is the same reason the seven-item pass measured flat there.
+
+Regression suite 91/91 on ZGC.

@@ -89,7 +89,7 @@
 //! dereference or an out-of-bounds read in compiled code; the cost of a wrong
 //! `false` is two instructions.
 
-use crate::ir::{Graph, MemKind, NodeId, Op};
+use crate::ir::{CmpOp, Graph, MemKind, NodeId, Op};
 use crate::ir_schedule::Schedule;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -101,6 +101,12 @@ pub struct CheckElision {
     /// `true` for a node whose `(base, index)` bounds check is provably
     /// redundant.
     bounds_check_unneeded: Vec<bool>,
+    /// `true` for a node the RANGE pass proved, as opposed to the
+    /// dominating-redundancy pass. Per-node rather than a running total
+    /// because the process census is taken at EMISSION: `analyze` also runs
+    /// for compiles whose body the acceptance gate later discards, and those
+    /// must not show up as work that reached the workload.
+    bounds_by_range: Vec<bool>,
 }
 
 impl CheckElision {
@@ -117,6 +123,17 @@ impl CheckElision {
     #[inline]
     pub fn bounds_elided(&self, node: NodeId) -> bool {
         self.bounds_check_unneeded
+            .get(node as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Was the bounds check at `node` proven by the RANGE pass rather than by
+    /// dominating redundancy? Only meaningful when [`Self::bounds_elided`] is
+    /// also true.
+    #[inline]
+    pub fn bounds_range_proved(&self, node: NodeId) -> bool {
+        self.bounds_by_range
             .get(node as usize)
             .copied()
             .unwrap_or(false)
@@ -181,6 +198,7 @@ pub fn analyze(graph: &Graph, schedule: &Schedule) -> CheckElision {
     let mut out = CheckElision {
         null_check_unneeded: vec![false; n],
         bounds_check_unneeded: vec![false; n],
+        bounds_by_range: vec![false; n],
     };
     if !enabled() {
         return out;
@@ -216,6 +234,21 @@ pub fn analyze(graph: &Graph, schedule: &Schedule) -> CheckElision {
             }
         }
     }
+
+    // The range facts, computed once over the whole graph. Independent of the
+    // block walk below: a bounds check is proven by a DOMINATING branch, so
+    // the order the walk reaches blocks in does not matter.
+    //
+    // Empty when the range pass alone is switched off, which leaves the
+    // dominating-redundancy pass running. The two get separate switches
+    // because they remove DIFFERENT checks -- redundancy only ever a second
+    // access, range only ever a first -- and one switch covering both cannot
+    // attribute a regression to either.
+    let ranges = if range_enabled() {
+        upper_bounds(graph, schedule)
+    } else {
+        Vec::new()
+    };
 
     // One pass over the blocks in index order. Within a block, facts
     // accumulated by earlier nodes apply to later ones directly; across blocks
@@ -257,6 +290,21 @@ pub fn analyze(graph: &Graph, schedule: &Schedule) -> CheckElision {
                         .is_some_and(|bs| bs.iter().any(|&d| dominates(schedule, b, d)));
                 if known {
                     out.bounds_check_unneeded[id as usize] = true;
+                } else {
+                    // Not redundant. Try to prove it dead outright: a
+                    // dominating `idx < base.length` for the SAME array, plus
+                    // `idx >= 0`. Both halves, always -- see the range notes.
+                    let (base, idx) = pair;
+                    let proved = ranges.iter().any(|ub| {
+                        ub.idx == idx
+                            && ub.base == base
+                            && dominates_reflexive(schedule, b, ub.true_block)
+                            && proven_non_negative(graph, schedule, idx, ub.true_block)
+                    });
+                    if proved {
+                        out.bounds_check_unneeded[id as usize] = true;
+                        out.bounds_by_range[id as usize] = true;
+                    }
                 }
                 local_checked.insert(pair);
                 checked_blocks.entry(pair).or_default().push(b);
@@ -284,6 +332,300 @@ fn dominates(schedule: &Schedule, b: usize, d: usize) -> bool {
         .and_then(|row| row.get(d))
         .copied()
         .unwrap_or(false)
+}
+
+// ── Range-based bounds-check elimination ─────────────────────────────
+//
+// The dominance pass above removes the SECOND check on a pair; it can never
+// remove the FIRST, which is why `bounds_elided=8` sat against
+// `bounds_emitted=174` on H2. The overwhelming majority of Java array traffic
+// is `for (int i = 0; i < a.length; i++) … a[i] …`, where NO check is needed
+// at all — and that is what this recognises.
+//
+// A check at `(base, idx)` is dead when BOTH halves are proven:
+//
+//   * `idx <  base.length` — a dominating `If` on `idx < ArrayLength(base)`,
+//     taken on its true edge. Pure dominance, sound on its own.
+//   * `idx >= 0`           — a constant, another array length, or a counted
+//     induction variable (below).
+//
+// BOTH are required because the source-level test is SIGNED. A negative `idx`
+// satisfies `idx < len` and would index behind the object; eliding on the
+// upper bound alone is a memory-safety bug, not a missed corner case.
+//
+// # Why the stride must be exactly 1
+//
+// For an induction phi `i = [region, init, i + s]` the non-negativity argument
+// is: `init >= 0`, `s > 0`, so `i` only increases and never wraps. The "never
+// wraps" half is the load-bearing one and it is NOT free.
+//
+// If the increment is guarded by `i < len`, then before it `i <= len - 1`, so
+// after it `i <= len - 1 + s`. An array length can be as large as `i32::MAX`,
+// so `len - 1 + s` overflows for any `s > 1` at the top of the range. A wrapped
+// `i` is negative, a negative `i` PASSES the signed `i < len` test, and the
+// loop then indexes with it — with the check eliminated. So the stride bound is
+// not a heuristic here, it is the proof.
+//
+// With `s == 1`: `i <= len - 1` before, `i <= len <= i32::MAX` after. No
+// overflow, for any array length the JVM can produce. That is the whole reason
+// this is restricted to unit stride rather than to "a small constant" — a
+// bound like `s <= 1024` would still be unsound against a near-`i32::MAX`
+// array, and unit stride is the shape essentially every Java array loop has.
+//
+// # Why the guard must dominate the BACK EDGE
+//
+// It is not enough that the test dominates the ACCESS. `for (int i = 0; ; i++)`
+// with an inner `if (i < a.length) a[i] = …` also has a test dominating the
+// access, but nothing stops `i` running to `i32::MAX` and wrapping — after
+// which the access's own test passes on a negative index. Requiring the test to
+// dominate every back edge into the loop header is what rules that out: then no
+// iteration happens without `i < len` having held, so `i` never gets past `len`
+// in the first place.
+
+/// An `idx < ArrayLength(base)` fact and the block it holds in.
+struct UpperBound {
+    idx: NodeId,
+    base: NodeId,
+    /// Block entered on the edge where `idx < base.length` holds -- the
+    /// branch's TRUE edge for `Lt`/`Gt`, its FALSE edge for `Ge`/`Le`.
+    true_block: usize,
+}
+
+/// `dom[b][d]`, but reflexive — a block dominates itself.
+///
+/// The redundancy pass deliberately answers `false` for `b == d` so a check
+/// cannot prove itself; the range pass needs the opposite, because an access
+/// sitting in the very block a branch guards IS covered by it (the test runs in
+/// the predecessor's terminator, before any node of the true block).
+#[inline]
+fn dominates_reflexive(schedule: &Schedule, b: usize, d: usize) -> bool {
+    b == d
+        || schedule
+            .dom
+            .get(b)
+            .and_then(|row| row.get(d))
+            .copied()
+            .unwrap_or(false)
+}
+
+/// Collect every branch that proves `idx < ArrayLength(base)` on one of its
+/// edges.
+///
+/// BOTH edges are examined, and that is not thoroughness -- it is the
+/// difference between working and not. `IrBuilder` keeps the bytecode's own
+/// branch polarity: `if_icmpge` becomes `Cmp(Ge)` with `Proj(0)` going to the
+/// BRANCH TARGET, so for the top-tested loop javac emits as
+/// `if_icmpge exit` the body hangs off the FALSE edge and the comparison reads
+/// `Ge`, not `Lt`. Matching only `Lt`-on-true finds the bottom-tested shape
+/// and silently misses the other one.
+///
+/// Per edge, the facts that give `idx < len`:
+///
+/// | edge  | comparison        | why |
+/// |-------|-------------------|-----|
+/// | true  | `Lt[idx, len]`    | directly |
+/// | true  | `Gt[len, idx]`    | the same fact written backwards |
+/// | false | `Ge[idx, len]`    | negation of `idx >= len` |
+/// | false | `Le[len, idx]`    | negation of `len <= idx` |
+///
+/// `Eq`/`Ne` prove nothing about ordering, and a non-strict bound on the
+/// TAKEN side (`Le[idx, len]`) still admits `idx == len`.
+fn upper_bounds(graph: &Graph, schedule: &Schedule) -> Vec<UpperBound> {
+    // Which block does each edge of each `If` open? `Block::ctrl` is the
+    // control node starting the block, and for a branch successor that is the
+    // `Proj`. When an edge lands straight on a `Merge` instead (an empty arm),
+    // no block is found and that edge contributes no fact.
+    let mut edge_block: FxHashMap<(NodeId, u8), usize> = FxHashMap::default();
+    for (b, block) in schedule.blocks.iter().enumerate() {
+        let Some(ctrl) = graph.nodes.get(block.ctrl as usize) else {
+            continue;
+        };
+        let Op::Proj(which) = ctrl.op else { continue };
+        if which > 1 {
+            continue;
+        }
+        let Some(&owner) = ctrl.inputs.first() else {
+            continue;
+        };
+        if matches!(graph.nodes.get(owner as usize).map(|n| &n.op), Some(Op::If)) {
+            edge_block.insert((owner, which), b);
+        }
+    }
+
+    let mut out = Vec::new();
+    for (id, node) in graph.nodes.iter().enumerate() {
+        if !matches!(node.op, Op::If) {
+            continue;
+        }
+        let Some(&cond_id) = node.inputs.get(1) else {
+            continue;
+        };
+        let Some(cond) = graph.nodes.get(cond_id as usize) else {
+            continue;
+        };
+        // `Op::Cmp` is `[a, b]` with no control input. See the table above for
+        // which (edge, comparison) pairs prove `idx < len`; a non-strict bound
+        // on the taken side would leave `idx == len`, which is precisely the
+        // off-by-one the check exists to catch.
+        let (idx, len_id, edge) = match (&cond.op, cond.inputs.as_slice()) {
+            (Op::Cmp(CmpOp::Lt), [a, b]) => (*a, *b, 0u8),
+            (Op::Cmp(CmpOp::Gt), [a, b]) => (*b, *a, 0u8),
+            (Op::Cmp(CmpOp::Ge), [a, b]) => (*a, *b, 1u8),
+            (Op::Cmp(CmpOp::Le), [a, b]) => (*b, *a, 1u8),
+            _ => continue,
+        };
+        let Some(len) = graph.nodes.get(len_id as usize) else {
+            continue;
+        };
+        if !matches!(len.op, Op::ArrayLength) {
+            continue;
+        }
+        // `Op::ArrayLength` is `[ctrl, mem, array_ref]`.
+        let Some(&base) = len.inputs.get(2) else {
+            continue;
+        };
+        let Some(&true_block) = edge_block.get(&(id as NodeId, edge)) else {
+            continue;
+        };
+        out.push(UpperBound {
+            idx,
+            base,
+            true_block,
+        });
+    }
+    out
+}
+
+/// Is `v` provably `>= 0` at every point the guard at `guard_block` covers?
+///
+/// `guard_block` is the true edge of the branch that established the upper
+/// bound: an induction variable's non-negativity is proven THROUGH that same
+/// branch (see the module notes above), so the two halves cannot be decided
+/// independently.
+fn proven_non_negative(
+    graph: &Graph,
+    schedule: &Schedule,
+    v: NodeId,
+    guard_block: usize,
+) -> bool {
+    let Some(node) = graph.nodes.get(v as usize) else {
+        return false;
+    };
+    match &node.op {
+        Op::Const(c) => *c >= 0,
+        // A JVM array length is non-negative by construction: `newarray` with a
+        // negative count throws before the length can ever be read.
+        Op::ArrayLength => true,
+        Op::Phi => is_unit_stride_induction(graph, schedule, v, node, guard_block),
+        _ => false,
+    }
+}
+
+/// `[region, const_init, phi + 1]`, with the increment guarded by `guard_block`.
+fn is_unit_stride_induction(
+    graph: &Graph,
+    schedule: &Schedule,
+    phi_id: NodeId,
+    phi: &crate::ir::Node,
+    guard_block: usize,
+) -> bool {
+    // `Op::Phi` is `[merge, val_0, val_1, …]`. A loop phi has exactly two
+    // values: the entry value and the back-edge value.
+    let (region_id, init_id, back_id) = match phi.inputs.as_slice() {
+        [r, i, b] => (*r, *i, *b),
+        _ => return false,
+    };
+    // BOTH ops, and `Op::Merge` is the one that matters. `IrBuilder` creates
+    // every merge point through `ensure_merge`, which builds an `Op::Merge`;
+    // `activate_loop_header` then fills in its inputs and phis but never
+    // rewrites the op. So a loop header from real bytecode is a `Merge`, and
+    // `Op::Region` appears only in hand-built graphs -- including this
+    // module's own tests, which is exactly how a version of this pass that
+    // accepted only `Region` passed every unit test while doing nothing
+    // whatsoever to a compiled method.
+    //
+    // Accepting both costs no soundness: what makes this a loop is the
+    // BACK EDGE found in the CFG below, not the op. A forward `Merge` has no
+    // predecessor it dominates, so `saw_back_edge` stays false and it is
+    // refused.
+    if !matches!(
+        graph.nodes.get(region_id as usize).map(|n| &n.op),
+        Some(Op::Merge) | Some(Op::Region)
+    ) {
+        return false;
+    }
+    // The entry value must itself be non-negative. Only the CONSTANT case is
+    // accepted: anything else would recurse, and a phi whose entry value is
+    // another phi is not a shape this pass claims to understand.
+    let init_ok = matches!(
+        graph.nodes.get(init_id as usize).map(|n| &n.op),
+        Some(Op::Const(c)) if *c >= 0
+    );
+    if !init_ok {
+        return false;
+    }
+    // The back-edge value must be exactly `phi + 1`. See the module notes for
+    // why the stride is pinned to one rather than bounded by a constant.
+    let Some(back) = graph.nodes.get(back_id as usize) else {
+        return false;
+    };
+    if !matches!(back.op, Op::Add) {
+        return false;
+    }
+    let is_one = |n: NodeId| {
+        matches!(
+            graph.nodes.get(n as usize).map(|x| &x.op),
+            Some(Op::Const(1))
+        )
+    };
+    let unit_step = match back.inputs.as_slice() {
+        [a, b] => (*a == phi_id && is_one(*b)) || (*b == phi_id && is_one(*a)),
+        _ => false,
+    };
+    if !unit_step {
+        return false;
+    }
+
+    // Every back edge into the header must pass through the guard. Without
+    // this the loop can iterate — and increment — on a path where the test
+    // never ran, which is how an induction variable reaches `i32::MAX` and
+    // wraps negative.
+    let Some(&header_block) = schedule.node_to_block.get(region_id as usize) else {
+        return false;
+    };
+    let Some(header) = schedule.blocks.get(header_block) else {
+        return false;
+    };
+    let mut saw_back_edge = false;
+    for &p in &header.predecessors {
+        // A back edge comes from inside the loop, which is exactly the set of
+        // blocks the header dominates.
+        if !dominates_reflexive(schedule, p, header_block) {
+            continue;
+        }
+        saw_back_edge = true;
+        if !dominates_reflexive(schedule, p, guard_block) {
+            return false;
+        }
+    }
+    // Fail closed: a "loop" with no back edge is not a loop, and a phi that
+    // references itself without one is a graph this pass should not reason
+    // about.
+    saw_back_edge
+}
+
+/// **Default ON** since 2026-09-06. `CRATONVM_JIT_IR_BCE_RANGE=0` keeps the
+/// dominating-redundancy pass and drops only the range proof, so a bisect can
+/// separate the two; `CRATONVM_JIT_IR_CHECK_ELIM=0` drops both.
+pub fn range_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_BCE_RANGE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// **Default ON** since 2026-09-06. `CRATONVM_JIT_IR_CHECK_ELIM=0` restores the
@@ -317,6 +659,20 @@ static EMITTED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Record one guard-pair decision. `which` is 0 for the null check, 1 for the
 /// bounds check.
+/// Bounds checks the RANGE pass proved, counted at emission.
+static RANGE_PROVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one range-proved elision. Called from the emitter, alongside
+/// [`note_check`], so a discarded compile contributes nothing.
+pub fn note_range_proved() {
+    RANGE_PROVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many elided bounds checks the range pass proved, of `census().2`.
+pub fn range_census() -> u64 {
+    RANGE_PROVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn note_check(which: usize, elided: bool) {
     let table = if elided { &ELIDED } else { &EMITTED };
     table[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -526,6 +882,245 @@ mod tests {
     /// Asserting it on the source is the cheapest way to keep the coupling
     /// visible: a behavioural test cannot distinguish "the orders agree" from
     /// "this graph happens not to care".
+
+    /// Build `for (int i = 0; i CMP a.length; i += stride) a[i] = 1;` and
+    /// return `(graph, schedule, the ArrayStore)`.
+    ///
+    /// `guard_back_edge` chooses between the two loop shapes the range proof
+    /// distinguishes. `true` is the ordinary `for` loop, where the bounds test
+    /// IS the loop test and nothing re-enters the header without passing it.
+    /// `false` wraps the test in an inner `if` under an unconditional loop --
+    /// `for (int i = 0; ; i++) if (c) if (i < a.length) a[i] = 1;` -- where the
+    /// test still dominates the ACCESS but the increment runs on a path that
+    /// never took it.
+    fn counted_loop(
+        cmp_op: CmpOp,
+        stride: i64,
+        guard_back_edge: bool,
+        bound_is_same_array: bool,
+        init_is_const: bool,
+    ) -> (Graph, crate::ir_schedule::Schedule, NodeId) {
+        counted_loop_with_header(
+            Op::Region,
+            cmp_op,
+            0,
+            stride,
+            guard_back_edge,
+            bound_is_same_array,
+            init_is_const,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn counted_loop_with_header(
+        header: Op,
+        cmp_op: CmpOp,
+        // Which `Proj` of the bounds branch opens the loop BODY. `0` is the
+        // bottom-tested `if_icmplt body` shape; `1` is the top-tested
+        // `if_icmpge exit` shape, where the body is the fall-through.
+        body_edge: u8,
+        stride: i64,
+        guard_back_edge: bool,
+        bound_is_same_array: bool,
+        init_is_const: bool,
+    ) -> (Graph, crate::ir_schedule::Schedule, NodeId) {
+        let mut g = empty_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let c0 = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let m0 = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let other = g.add(Op::Param(1), IrType::Ref, vec![start], None);
+
+        // Header, back edge patched in once the body exists.
+        let region = g.add(header, IrType::Control, vec![c0], None);
+        let init = if init_is_const {
+            g.add(Op::Const(0), IrType::Int, vec![], None)
+        } else {
+            g.add(Op::Param(2), IrType::Int, vec![start], None)
+        };
+        let iv = g.add(Op::Phi, IrType::Int, vec![region, init], None);
+        let step = g.add(Op::Const(stride), IrType::Int, vec![], None);
+        let iv_next = g.add(Op::Add, IrType::Int, vec![iv, step], None);
+        g.nodes[iv as usize].inputs.push(iv_next);
+
+        // The array whose length bounds the loop -- the one being indexed, or
+        // a different one.
+        let bound_arr = if bound_is_same_array { arr } else { other };
+        // `Op::ArrayLength` is [ctrl, mem, array_ref].
+        let len = g.add(
+            Op::ArrayLength,
+            IrType::Int,
+            vec![region, m0, bound_arr],
+            None,
+        );
+
+        let (body_ctrl, back_ctrl) = if guard_back_edge {
+            // region -> If(i < len) -> true = body, and the body IS the back
+            // edge. Nothing reaches the header without the test.
+            let cmp = g.add(Op::Cmp(cmp_op), IrType::Int, vec![iv, len], None);
+            let iff = g.add(Op::If, IrType::Control, vec![region, cmp], None);
+            let t = g.add(Op::Proj(0), IrType::Control, vec![iff], None);
+            let f = g.add(Op::Proj(1), IrType::Control, vec![iff], None);
+            let body = if body_edge == 0 { t } else { f };
+            (body, body)
+        } else {
+            // region -> If(c) -> true -> If(i < len) -> true = body.
+            // The BACK EDGE is the outer false edge, which the bounds test
+            // does not dominate.
+            let c = g.add(Op::Param(3), IrType::Int, vec![start], None);
+            let zero = g.add(Op::Const(0), IrType::Int, vec![], None);
+            let outer_cmp = g.add(Op::Cmp(CmpOp::Ne), IrType::Int, vec![c, zero], None);
+            let outer = g.add(Op::If, IrType::Control, vec![region, outer_cmp], None);
+            let ot = g.add(Op::Proj(0), IrType::Control, vec![outer], None);
+            let of = g.add(Op::Proj(1), IrType::Control, vec![outer], None);
+            let cmp = g.add(Op::Cmp(cmp_op), IrType::Int, vec![iv, len], None);
+            let iff = g.add(Op::If, IrType::Control, vec![ot, cmp], None);
+            let t = g.add(Op::Proj(0), IrType::Control, vec![iff], None);
+            let _tf = g.add(Op::Proj(1), IrType::Control, vec![iff], None);
+            (t, of)
+        };
+        g.nodes[region as usize].inputs.push(back_ctrl);
+
+        // `a[i] = 1` -- a STORE, so nothing can treat it as dead.
+        let one = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let st = g.add(
+            Op::ArrayStore(MemKind::Int),
+            IrType::Void,
+            vec![body_ctrl, m0, arr, iv, one],
+            Some(0),
+        );
+        g.exit = g.add(Op::Return, IrType::Void, vec![body_ctrl, iv], Some(1));
+
+        let sched = ir_schedule::schedule(&g);
+        (g, sched, st)
+    }
+
+    /// The shape this pass exists for: `for (int i = 0; i < a.length; i++)`.
+    /// No check is needed at all, and no earlier access proves it -- which is
+    /// exactly what the dominating-redundancy pass could never do.
+    #[test]
+    fn the_classic_counted_loop_needs_no_bounds_check() {
+        let (g, sched, st) = counted_loop(CmpOp::Lt, 1, true, true, true);
+        let e = analyze(&g, &sched);
+        assert!(
+            e.bounds_elided(st),
+            "i is a unit-stride induction variable from 0 and the loop test is \
+             i < a.length for the SAME array, so 0 <= i < a.length holds",
+        );
+        assert!(
+            e.bounds_range_proved(st),
+            "and it was the RANGE pass that proved it, not redundancy -- there \
+             is no earlier access to be redundant with",
+        );
+    }
+
+    /// The SAME loop with the header op `IrBuilder` actually produces.
+    ///
+    /// `ensure_merge` builds every merge point -- loop headers included -- as
+    /// `Op::Merge`; `activate_loop_header` fills in its inputs and never
+    /// rewrites the op, so `Op::Region` never appears in a graph built from
+    /// bytecode. A version of this pass that matched only `Op::Region` passed
+    /// the test above and every other test in this module, and would have
+    /// eliminated exactly zero bounds checks in a compiled method. This is the
+    /// test that fails in that case.
+    #[test]
+    fn the_header_op_the_builder_actually_emits_is_recognised() {
+        let (g, sched, st) =
+            counted_loop_with_header(Op::Merge, CmpOp::Lt, 0, 1, true, true, true);
+        let e = analyze(&g, &sched);
+        assert!(
+            e.bounds_elided(st) && e.bounds_range_proved(st),
+            "a loop header is an Op::Merge in every graph the IR builder              produces; matching only Op::Region makes this pass inert on real              code while its hand-built tests stay green",
+        );
+    }
+
+    /// The top-tested shape, where the useful fact is on the FALSE edge.
+    ///
+    /// javac compiles a `while`/`for` head as `if_icmpge exit`: branch OUT when
+    /// the index has reached the length, fall through into the body. The
+    /// builder keeps that polarity, so the comparison is `Ge` and the body is
+    /// `Proj(1)`. A pass that looked only for `Lt` on `Proj(0)` would find
+    /// nothing here while every other test in this module stayed green.
+    #[test]
+    fn the_bound_is_read_off_the_false_edge_of_a_negated_test() {
+        let (g, sched, st) =
+            counted_loop_with_header(Op::Merge, CmpOp::Ge, 1, 1, true, true, true);
+        let e = analyze(&g, &sched);
+        assert!(
+            e.bounds_elided(st) && e.bounds_range_proved(st),
+            "not (i >= a.length) is i < a.length, and that is the edge the loop              body actually hangs off in javac output",
+        );
+    }
+
+    /// A stride of two is REFUSED, and not because two is unusual.
+    ///
+    /// The non-negativity proof runs: the guard gives `i <= len - 1`, so after
+    /// the increment `i <= len - 1 + stride`. `len` can be `i32::MAX`, so any
+    /// stride above one overflows there, and a wrapped `i` is negative -- which
+    /// passes the SIGNED `i < len` test and then indexes behind the object with
+    /// the check removed. Unit stride is the largest step for which the proof
+    /// closes without knowing `len`.
+    #[test]
+    fn a_stride_the_proof_cannot_close_keeps_its_check() {
+        let (g, sched, st) = counted_loop(CmpOp::Lt, 2, true, true, true);
+        let e = analyze(&g, &sched);
+        assert!(
+            !e.bounds_elided(st),
+            "a non-unit stride can carry the induction variable past len and \
+             into overflow; the check stays",
+        );
+    }
+
+    /// The test dominating the ACCESS is not enough: the increment must be
+    /// dominated too. `for (int i = 0; ; i++) if (c) if (i < a.length) a[i]=1;`
+    /// has a bounds test on every access and still lets `i` run to `i32::MAX`
+    /// and wrap, after which that same test passes on a negative index.
+    #[test]
+    fn a_back_edge_that_skips_the_test_keeps_its_check() {
+        let (g, sched, st) = counted_loop(CmpOp::Lt, 1, false, true, true);
+        let e = analyze(&g, &sched);
+        assert!(
+            !e.bounds_elided(st),
+            "the increment is reachable without the bounds test having held, \
+             so nothing bounds the induction variable",
+        );
+    }
+
+    /// `i < b.length` says nothing about `a[i]`. The pass matches the array
+    /// SSA node, so two arrays that happen to be the same length are still two
+    /// arrays.
+    #[test]
+    fn a_bound_taken_from_a_different_array_proves_nothing() {
+        let (g, sched, st) = counted_loop(CmpOp::Lt, 1, true, false, true);
+        let e = analyze(&g, &sched);
+        assert!(
+            !e.bounds_elided(st),
+            "the loop is bounded by another array's length",
+        );
+    }
+
+    /// `i <= a.length` leaves `i == a.length` reachable, which is the exact
+    /// off-by-one the check exists to catch.
+    #[test]
+    fn a_non_strict_bound_is_not_a_bound() {
+        let (g, sched, st) = counted_loop(CmpOp::Le, 1, true, true, true);
+        let e = analyze(&g, &sched);
+        assert!(!e.bounds_elided(st), "i <= len still admits i == len");
+    }
+
+    /// A parameter start could be negative, and a negative index PASSES the
+    /// signed loop test. The upper bound alone is never enough.
+    #[test]
+    fn an_induction_variable_from_an_unknown_start_keeps_its_check() {
+        let (g, sched, st) = counted_loop(CmpOp::Lt, 1, true, true, false);
+        let e = analyze(&g, &sched);
+        assert!(
+            !e.bounds_elided(st),
+            "nothing proves the start is non-negative, and i < len does not",
+        );
+    }
+
     #[test]
     fn the_block_node_order_is_the_emission_order() {
         let src = include_str!("ir_lower.rs");

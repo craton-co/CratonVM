@@ -1468,6 +1468,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-scalar-intrinsics", on_key: Some("CRATONVM_JIT_IR_SCALAR_INTRINSICS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-aastore", on_key: Some("CRATONVM_JIT_IR_AASTORE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-check-elim", on_key: Some("CRATONVM_JIT_IR_CHECK_ELIM"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-bce-range", on_key: Some("CRATONVM_JIT_IR_BCE_RANGE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-hot-layout", on_key: Some("CRATONVM_JIT_IR_HOT_LAYOUT"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-list-sched", on_key: Some("CRATONVM_JIT_IR_LIST_SCHED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-unroll-unreachable-frames", on_key: Some("CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES"), off_key: None, off_word: None, since: "2026-09-06" },
