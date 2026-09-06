@@ -7461,6 +7461,113 @@ impl<'a> Lowerer<'a> {
                         self.buf.emit(&[0x48, 0x31, 0xD0]); // XOR RAX, RDX
                         self.buf.emit(&[0x48, 0x29, 0xD0]); // SUB RAX, RDX
                     }
+                    // -- Bit-scan families ------------------------------
+                    //
+                    // BSR and BSF leave the DESTINATION UNDEFINED when the
+                    // source is zero, and set ZF. So each sequence below reads
+                    // ZF before anything clobbers the flags; the `MOV` that
+                    // sits between the scan and the `CMOVZ`/`SETZ` is chosen
+                    // because MOV does not touch flags, and swapping it for
+                    // anything that does is a wrong answer on zero only.
+                    ScalarOp::NlzI | ScalarOp::NlzL => {
+                        // BSR gives the index of the highest set bit, so
+                        // nlz = (width-1) - index. The zero case is folded in
+                        // by moving the index to -1 first, which makes
+                        // (width-1) - (-1) = width without a branch.
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xBD, 0xC8]); // BSR RCX, RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xBD, 0xC8]); // BSR ECX, EAX
+                        }
+                        self.buf.emit(&[0xBA]); // MOV EDX, imm32 (flags untouched)
+                        self.buf.emit(&(-1i32).to_le_bytes());
+                        self.buf.emit(&[0x0F, 0x44, 0xCA]); // CMOVZ ECX, EDX
+                        self.buf.emit(&[0xB8]); // MOV EAX, imm32
+                        self.buf
+                            .emit(&(if w { 63i32 } else { 31i32 }).to_le_bytes());
+                        self.buf.emit(&[0x29, 0xC8]); // SUB EAX, ECX
+                    }
+                    ScalarOp::NtzI | ScalarOp::NtzL => {
+                        // BSF gives the index of the lowest set bit, which IS
+                        // the answer; only the zero case needs the width.
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xBC, 0xC8]); // BSF RCX, RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xBC, 0xC8]); // BSF ECX, EAX
+                        }
+                        self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                        self.buf
+                            .emit(&(if w { 64i32 } else { 32i32 }).to_le_bytes());
+                        self.buf.emit(&[0x0F, 0x44, 0xCA]); // CMOVZ ECX, EDX
+                        self.buf.emit(&[0x89, 0xC8]); // MOV EAX, ECX
+                    }
+                    ScalarOp::ReverseBytesI | ScalarOp::ReverseBytesL => {
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xC8]); // BSWAP RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xC8]); // BSWAP EAX
+                        }
+                    }
+                    ScalarOp::LowestOneBitI | ScalarOp::LowestOneBitL => {
+                        // x & -x. No scan, so no undefined register and no
+                        // zero edge: -0 is 0 and 0 & 0 is 0.
+                        if w {
+                            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+                            self.buf.emit(&[0x48, 0xF7, 0xD9]); // NEG RCX
+                            self.buf.emit(&[0x48, 0x21, 0xC8]); // AND RAX, RCX
+                        } else {
+                            self.buf.emit(&[0x89, 0xC1]); // MOV ECX, EAX
+                            self.buf.emit(&[0xF7, 0xD9]); // NEG ECX
+                            self.buf.emit(&[0x21, 0xC8]); // AND EAX, ECX
+                        }
+                    }
+                    ScalarOp::HighestOneBitI | ScalarOp::HighestOneBitL => {
+                        // 1 << bsr(x), and 0 when x is 0. The shift CLOBBERS
+                        // the flags, so ZF is captured into DL by SETZ first
+                        // and turned into an all-ones/all-zero mask; the shift
+                        // itself runs on an undefined count in the zero case
+                        // and its garbage is masked away.
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xBD, 0xC8]); // BSR RCX, RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xBD, 0xC8]); // BSR ECX, EAX
+                        }
+                        self.buf.emit(&[0x0F, 0x94, 0xC2]); // SETZ DL
+                        self.buf.emit(&[0xB8]); // MOV EAX, 1
+                        self.buf.emit(&1i32.to_le_bytes());
+                        if w {
+                            self.buf.emit(&[0x48, 0xD3, 0xE0]); // SHL RAX, CL
+                        } else {
+                            self.buf.emit(&[0xD3, 0xE0]); // SHL EAX, CL
+                        }
+                        self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                        self.buf.emit(&[0xFF, 0xCA]); // DEC EDX  (0 -> -1, 1 -> 0)
+                        if w {
+                            self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX, EDX
+                            self.buf.emit(&[0x48, 0x21, 0xD0]); // AND RAX, RDX
+                        } else {
+                            self.buf.emit(&[0x21, 0xD0]); // AND EAX, EDX
+                        }
+                    }
+                    ScalarOp::RotateLeftI
+                    | ScalarOp::RotateLeftL
+                    | ScalarOp::RotateRightI
+                    | ScalarOp::RotateRightL => {
+                        // The DISTANCE is an `int` at both widths -- see
+                        // `ScalarOp::input_ty`. x86 masks CL to 5 bits for a
+                        // 32-bit rotate and 6 for a 64-bit one, which is
+                        // exactly the `distance & 31` / `& 63` the JLS
+                        // specifies, negative distances included.
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        let left =
+                            matches!(sop, ScalarOp::RotateLeftI | ScalarOp::RotateLeftL);
+                        let modrm = if left { 0xC0 } else { 0xC8 };
+                        if w {
+                            self.buf.emit(&[0x48, 0xD3, modrm]); // ROL/ROR RAX, CL
+                        } else {
+                            self.buf.emit(&[0xD3, modrm]); // ROL/ROR EAX, CL
+                        }
+                    }
                     ScalarOp::CompareI | ScalarOp::CompareL => {
                         // Byte for byte the `Op::LCmp` sequence below, which is
                         // `Long.compare`'s specification already: SETG minus
@@ -18925,10 +19032,13 @@ mod tests {
         let start = graph.add(Op::Start, IrType::Control, vec![], None);
         graph.entry = start;
         let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
-        let a = graph.add(Op::Param(0), sop_input_ty(sop), vec![start], None);
+        let a = graph.add(Op::Param(0), sop.input_ty(0), vec![start], None);
         let mut inputs = vec![a];
         if n == 2 {
-            let b = graph.add(Op::Param(1), sop_input_ty(sop), vec![start], None);
+            // `input_ty(1)`, not `input_ty(0)`: a rotate takes a `long` value
+            // and an `int` distance, and typing the distance as a `long` here
+            // would make this harness disagree with the builder.
+            let b = graph.add(Op::Param(1), sop.input_ty(1), vec![start], None);
             inputs.push(b);
         }
         let v = graph.add(Op::ScalarIntrinsic(sop), sop.result_type(), inputs, Some(0));
@@ -18937,13 +19047,7 @@ mod tests {
         lower(&graph, &schedule, n, n, &no_helpers()).expect("the intrinsic body must lower")
     }
 
-    fn sop_input_ty(sop: ScalarOp) -> IrType {
-        if sop.operands_are_long() {
-            IrType::Long
-        } else {
-            IrType::Int
-        }
-    }
+
 
     /// The emitted sequences, EXECUTED, against the answers the JLS specifies.
     ///
@@ -19044,6 +19148,130 @@ mod tests {
             // SAFETY: as above.
             let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
             assert_eq!(got, want, "Math.abs({x}L)");
+        }
+    }
+
+    /// The bit-scan sequences, EXECUTED, against the answers `java.lang.Integer`
+    /// and `java.lang.Long` specify.
+    ///
+    /// ZERO is the case every one of these has and the one a reader is most
+    /// likely to break: `BSR`/`BSF` leave their destination UNDEFINED on a zero
+    /// source, so a sequence that reads the destination without first
+    /// consulting ZF returns whatever the register happened to hold. Each
+    /// family is therefore tested at zero, and `highestOneBit` — whose shift
+    /// runs on that undefined count and is masked away afterwards — is tested
+    /// at zero on both widths.
+    ///
+    /// The other trap is width. `Long.numberOfLeadingZeros` takes a `long` and
+    /// returns an `int`, so a sequence that sized its scan from the RESULT type
+    /// would scan the low half and answer 32 for every value above 2^32; the
+    /// `1 << 40` cases catch exactly that.
+    #[test]
+    fn the_bit_scan_sequences_execute_to_the_specified_answers() {
+        // (op, input, expected) — 32-bit families, compared on the low half.
+        let unary_i: &[(ScalarOp, i64, i64)] = &[
+            (ScalarOp::NlzI, 0, 32),
+            (ScalarOp::NlzI, 1, 31),
+            (ScalarOp::NlzI, -1, 0),
+            (ScalarOp::NlzI, i32::MIN as i64, 0),
+            (ScalarOp::NlzI, 0x0000_FFFF, 16),
+            (ScalarOp::NtzI, 0, 32),
+            (ScalarOp::NtzI, 1, 0),
+            (ScalarOp::NtzI, -1, 0),
+            (ScalarOp::NtzI, i32::MIN as i64, 31),
+            (ScalarOp::NtzI, 0x0001_0000, 16),
+            (ScalarOp::ReverseBytesI, 0x0102_0304, 0x0403_0201),
+            (ScalarOp::ReverseBytesI, 0, 0),
+            (ScalarOp::LowestOneBitI, 0, 0),
+            (ScalarOp::LowestOneBitI, 0x0000_00FF, 1),
+            (ScalarOp::LowestOneBitI, i32::MIN as i64, i32::MIN as i64),
+            (ScalarOp::HighestOneBitI, 0, 0),
+            (ScalarOp::HighestOneBitI, 0x0000_00FF, 0x80),
+            (ScalarOp::HighestOneBitI, -1, i32::MIN as i64),
+            (ScalarOp::HighestOneBitI, 1, 1),
+        ];
+        for &(sop, x, want) in unary_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: one integer argument; the body builds and tears down its
+            // own frame and calls nothing.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "{}({x})", sop.as_str());
+        }
+
+        // 64-bit input families whose ANSWER is an `int`.
+        let unary_l_to_i: &[(ScalarOp, i64, i64)] = &[
+            (ScalarOp::NlzL, 0, 64),
+            (ScalarOp::NlzL, 1, 63),
+            (ScalarOp::NlzL, -1, 0),
+            (ScalarOp::NlzL, i64::MIN, 0),
+            // The case that separates a 64-bit scan from a 32-bit one.
+            (ScalarOp::NlzL, 1i64 << 40, 23),
+            (ScalarOp::NtzL, 0, 64),
+            (ScalarOp::NtzL, 1, 0),
+            (ScalarOp::NtzL, i64::MIN, 63),
+            (ScalarOp::NtzL, 1i64 << 40, 40),
+        ];
+        for &(sop, x, want) in unary_l_to_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "{}({x})", sop.as_str());
+        }
+
+        // 64-bit input AND answer.
+        let unary_l: &[(ScalarOp, i64, i64)] = &[
+            (ScalarOp::ReverseBytesL, 0x0102_0304_0506_0708, 0x0807_0605_0403_0201),
+            (ScalarOp::ReverseBytesL, 0, 0),
+            (ScalarOp::LowestOneBitL, 0, 0),
+            (ScalarOp::LowestOneBitL, 0x00FF_0000_0000_0000, 1i64 << 48),
+            (ScalarOp::LowestOneBitL, i64::MIN, i64::MIN),
+            (ScalarOp::HighestOneBitL, 0, 0),
+            (ScalarOp::HighestOneBitL, 0x0000_00FF, 0x80),
+            (ScalarOp::HighestOneBitL, -1, i64::MIN),
+            (ScalarOp::HighestOneBitL, 1i64 << 40, 1i64 << 40),
+        ];
+        for &(sop, x, want) in unary_l {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got, want, "{}({x})", sop.as_str());
+        }
+
+        // Rotates. A NEGATIVE distance is the case the JLS defines by masking
+        // and x86 implements by masking, so it is the one that proves the two
+        // agree rather than merely both being plausible.
+        let rot_i: &[(ScalarOp, i64, i64, i64)] = &[
+            (ScalarOp::RotateLeftI, 1, 1, 2),
+            (ScalarOp::RotateLeftI, i32::MIN as i64, 1, 1),
+            (ScalarOp::RotateLeftI, 1, 32, 1),
+            (ScalarOp::RotateLeftI, 1, -1, i32::MIN as i64),
+            (ScalarOp::RotateRightI, 1, 1, i32::MIN as i64),
+            (ScalarOp::RotateRightI, 1, -1, 2),
+            (ScalarOp::RotateRightI, 0x0000_00FF, 4, 0xF000_000F_u32 as i32 as i64),
+        ];
+        for &(sop, x, d, want) in rot_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: two integer arguments; as above.
+            let got = unsafe { cm.try_call(&[x, d]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "{}({x}, {d})", sop.as_str());
+        }
+
+        let rot_l: &[(ScalarOp, i64, i64, i64)] = &[
+            (ScalarOp::RotateLeftL, 1, 1, 2),
+            (ScalarOp::RotateLeftL, i64::MIN, 1, 1),
+            (ScalarOp::RotateLeftL, 1, 64, 1),
+            (ScalarOp::RotateLeftL, 1, -1, i64::MIN),
+            (ScalarOp::RotateRightL, 1, 1, i64::MIN),
+            (ScalarOp::RotateRightL, 1, -1, 2),
+            // Distances 32 and 40 separate a 64-bit rotate from a 32-bit one.
+            (ScalarOp::RotateLeftL, 1, 40, 1i64 << 40),
+            (ScalarOp::RotateLeftL, 1, 32, 1i64 << 32),
+        ];
+        for &(sop, x, d, want) in rot_l {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, d]) }.expect("the body runs");
+            assert_eq!(got, want, "{}({x}, {d})", sop.as_str());
         }
     }
 

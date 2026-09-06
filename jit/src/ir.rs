@@ -8522,6 +8522,52 @@ pub enum ScalarOp {
     CompareI,
     /// `Long.compare(long,long)` -> `-1`/`0`/`1`, SIGNED.
     CompareL,
+
+    // -- Bit-scan families, 2026-09-06 -------------------------------
+    //
+    // `refused_method=59` on H2 was the work list these come off. Every one
+    // uses BSR / BSF / BSWAP / ROL / ROR, which are BASELINE x86-64 -- no
+    // POPCNT, LZCNT or TZCNT, and so no CPU feature probe and no fallback.
+    // `Integer.bitCount` is deliberately still absent for exactly that reason:
+    // it wants POPCNT or a twelve-instruction SWAR, and a family that is
+    // *sometimes* an intrinsic makes its own A/B a measurement of the host.
+    //
+    // The ZERO input is the edge every one of these has, and each answers it
+    // BRANCHLESSLY. BSR and BSF leave the destination UNDEFINED on a zero
+    // source and set ZF -- so the sequences read ZF with CMOVZ or SETZ before
+    // anything clobbers the flags, which is why the MOV sitting between the
+    // scan and the conditional is load-bearing rather than sloppy.
+    /// `Integer.numberOfLeadingZeros(int)` -> `int`; 32 for zero.
+    NlzI,
+    /// `Long.numberOfLeadingZeros(long)` -> `int`; 64 for zero.
+    NlzL,
+    /// `Integer.numberOfTrailingZeros(int)` -> `int`; 32 for zero.
+    NtzI,
+    /// `Long.numberOfTrailingZeros(long)` -> `int`; 64 for zero.
+    NtzL,
+    /// `Integer.reverseBytes(int)`.
+    ReverseBytesI,
+    /// `Long.reverseBytes(long)`.
+    ReverseBytesL,
+    /// `Integer.lowestOneBit(int)`, the `x AND -x` identity; 0 for zero, and
+    /// the only member of this group with no undefined-register edge at all.
+    LowestOneBitI,
+    /// `Long.lowestOneBit(long)`.
+    LowestOneBitL,
+    /// `Integer.highestOneBit(int)`; 0 for zero.
+    HighestOneBitI,
+    /// `Long.highestOneBit(long)`; 0 for zero.
+    HighestOneBitL,
+    /// `Integer.rotateLeft(int, int)`. x86 masks the count to 5 bits, which is
+    /// exactly the `distance AND 31` the JLS specifies -- including for a
+    /// NEGATIVE distance, where `rotateLeft(i, -1) == rotateRight(i, 1)`.
+    RotateLeftI,
+    /// `Long.rotateLeft(long, int)`; masked to 6 bits.
+    RotateLeftL,
+    /// `Integer.rotateRight(int, int)`.
+    RotateRightI,
+    /// `Long.rotateRight(long, int)`.
+    RotateRightL,
 }
 
 impl ScalarOp {
@@ -8529,16 +8575,60 @@ impl ScalarOp {
     /// carrying a second copy of the table.
     pub fn arity(self) -> usize {
         match self {
-            ScalarOp::AbsI | ScalarOp::AbsL => 1,
+            ScalarOp::AbsI
+            | ScalarOp::AbsL
+            | ScalarOp::NlzI
+            | ScalarOp::NlzL
+            | ScalarOp::NtzI
+            | ScalarOp::NtzL
+            | ScalarOp::ReverseBytesI
+            | ScalarOp::ReverseBytesL
+            | ScalarOp::LowestOneBitI
+            | ScalarOp::LowestOneBitL
+            | ScalarOp::HighestOneBitI
+            | ScalarOp::HighestOneBitL => 1,
             _ => 2,
+        }
+    }
+
+    /// The type of data input `idx`.
+    ///
+    /// A per-input answer rather than a per-op one, because the ROTATES are
+    /// mixed: `Long.rotateLeft` takes a `long` VALUE and an `int` DISTANCE.
+    /// Reading [`Self::operands_are_long`] for both would type the distance as
+    /// a `long`, and a mistyped stack entry is joined against a real one at the
+    /// next merge.
+    pub fn input_ty(self, idx: usize) -> IrType {
+        match self {
+            ScalarOp::RotateLeftI
+            | ScalarOp::RotateLeftL
+            | ScalarOp::RotateRightI
+            | ScalarOp::RotateRightL
+                if idx == 1 =>
+            {
+                IrType::Int
+            }
+            _ if self.operands_are_long() => IrType::Long,
+            _ => IrType::Int,
         }
     }
 
     /// The node's result type.
     pub fn result_type(self) -> IrType {
         match self {
-            ScalarOp::MinL | ScalarOp::MaxL | ScalarOp::AbsL => IrType::Long,
-            // `Integer.compare` and `Long.compare` both return `int`.
+            ScalarOp::MinL
+            | ScalarOp::MaxL
+            | ScalarOp::AbsL
+            | ScalarOp::ReverseBytesL
+            | ScalarOp::LowestOneBitL
+            | ScalarOp::HighestOneBitL
+            | ScalarOp::RotateLeftL
+            | ScalarOp::RotateRightL => IrType::Long,
+            // `Integer.compare`, `Long.compare` and BOTH widths of
+            // `numberOfLeading/TrailingZeros` return `int` --
+            // `Long.numberOfLeadingZeros` takes a `long` and answers an `int`,
+            // which is why this table and `operands_are_long` are two tables
+            // and not one.
             _ => IrType::Int,
         }
     }
@@ -8550,7 +8640,17 @@ impl ScalarOp {
     pub fn operands_are_long(self) -> bool {
         matches!(
             self,
-            ScalarOp::MinL | ScalarOp::MaxL | ScalarOp::AbsL | ScalarOp::CompareL
+            ScalarOp::MinL
+                | ScalarOp::MaxL
+                | ScalarOp::AbsL
+                | ScalarOp::CompareL
+                | ScalarOp::NlzL
+                | ScalarOp::NtzL
+                | ScalarOp::ReverseBytesL
+                | ScalarOp::LowestOneBitL
+                | ScalarOp::HighestOneBitL
+                | ScalarOp::RotateLeftL
+                | ScalarOp::RotateRightL
         )
     }
 
@@ -8564,6 +8664,20 @@ impl ScalarOp {
             ScalarOp::AbsL => "Math.abs(J)",
             ScalarOp::CompareI => "Integer.compare(II)",
             ScalarOp::CompareL => "Long.compare(JJ)",
+            ScalarOp::NlzI => "Integer.numberOfLeadingZeros(I)",
+            ScalarOp::NlzL => "Long.numberOfLeadingZeros(J)",
+            ScalarOp::NtzI => "Integer.numberOfTrailingZeros(I)",
+            ScalarOp::NtzL => "Long.numberOfTrailingZeros(J)",
+            ScalarOp::ReverseBytesI => "Integer.reverseBytes(I)",
+            ScalarOp::ReverseBytesL => "Long.reverseBytes(J)",
+            ScalarOp::LowestOneBitI => "Integer.lowestOneBit(I)",
+            ScalarOp::LowestOneBitL => "Long.lowestOneBit(J)",
+            ScalarOp::HighestOneBitI => "Integer.highestOneBit(I)",
+            ScalarOp::HighestOneBitL => "Long.highestOneBit(J)",
+            ScalarOp::RotateLeftI => "Integer.rotateLeft(II)",
+            ScalarOp::RotateLeftL => "Long.rotateLeft(JI)",
+            ScalarOp::RotateRightI => "Integer.rotateRight(II)",
+            ScalarOp::RotateRightL => "Long.rotateRight(JI)",
         }
     }
 }
@@ -8592,7 +8706,62 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
         ("java/lang/Math" | "java/lang/StrictMath", "abs", "(J)J") => Some(ScalarOp::AbsL),
         ("java/lang/Integer", "compare", "(II)I") => Some(ScalarOp::CompareI),
         ("java/lang/Long", "compare", "(JJ)I") => Some(ScalarOp::CompareL),
+        ("java/lang/Integer", "numberOfLeadingZeros", "(I)I") => Some(ScalarOp::NlzI),
+        ("java/lang/Long", "numberOfLeadingZeros", "(J)I") => Some(ScalarOp::NlzL),
+        ("java/lang/Integer", "numberOfTrailingZeros", "(I)I") => Some(ScalarOp::NtzI),
+        ("java/lang/Long", "numberOfTrailingZeros", "(J)I") => Some(ScalarOp::NtzL),
+        ("java/lang/Integer", "reverseBytes", "(I)I") => Some(ScalarOp::ReverseBytesI),
+        ("java/lang/Long", "reverseBytes", "(J)J") => Some(ScalarOp::ReverseBytesL),
+        ("java/lang/Integer", "lowestOneBit", "(I)I") => Some(ScalarOp::LowestOneBitI),
+        ("java/lang/Long", "lowestOneBit", "(J)J") => Some(ScalarOp::LowestOneBitL),
+        ("java/lang/Integer", "highestOneBit", "(I)I") => Some(ScalarOp::HighestOneBitI),
+        ("java/lang/Long", "highestOneBit", "(J)J") => Some(ScalarOp::HighestOneBitL),
+        ("java/lang/Integer", "rotateLeft", "(II)I") => Some(ScalarOp::RotateLeftI),
+        ("java/lang/Long", "rotateLeft", "(JI)J") => Some(ScalarOp::RotateLeftL),
+        ("java/lang/Integer", "rotateRight", "(II)I") => Some(ScalarOp::RotateRightI),
+        ("java/lang/Long", "rotateRight", "(JI)J") => Some(ScalarOp::RotateRightL),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod scalar_intrinsic_recognizer_tests {
+    use super::*;
+
+    /// Every family the recognizer claims must actually be recognised.
+    ///
+    /// A table rather than a spot check, because the failure this catches is a
+    /// family added to `ScalarOp` and its lowering but forgotten in the match —
+    /// which reads, from the outside, exactly like a workload that has no such
+    /// call site.
+    #[test]
+    fn every_declared_family_is_recognised() {
+        let cases: &[(&str, &str, &str, ScalarOp)] = &[
+            ("java/lang/Math", "min", "(II)I", ScalarOp::MinI),
+            ("java/lang/Math", "max", "(II)I", ScalarOp::MaxI),
+            ("java/lang/Long", "compare", "(JJ)I", ScalarOp::CompareL),
+            ("java/lang/Integer", "numberOfLeadingZeros", "(I)I", ScalarOp::NlzI),
+            ("java/lang/Long", "numberOfLeadingZeros", "(J)I", ScalarOp::NlzL),
+            ("java/lang/Integer", "numberOfTrailingZeros", "(I)I", ScalarOp::NtzI),
+            ("java/lang/Long", "numberOfTrailingZeros", "(J)I", ScalarOp::NtzL),
+            ("java/lang/Integer", "reverseBytes", "(I)I", ScalarOp::ReverseBytesI),
+            ("java/lang/Long", "reverseBytes", "(J)J", ScalarOp::ReverseBytesL),
+            ("java/lang/Integer", "lowestOneBit", "(I)I", ScalarOp::LowestOneBitI),
+            ("java/lang/Long", "lowestOneBit", "(J)J", ScalarOp::LowestOneBitL),
+            ("java/lang/Integer", "highestOneBit", "(I)I", ScalarOp::HighestOneBitI),
+            ("java/lang/Long", "highestOneBit", "(J)J", ScalarOp::HighestOneBitL),
+            ("java/lang/Integer", "rotateLeft", "(II)I", ScalarOp::RotateLeftI),
+            ("java/lang/Long", "rotateLeft", "(JI)J", ScalarOp::RotateLeftL),
+            ("java/lang/Integer", "rotateRight", "(II)I", ScalarOp::RotateRightI),
+            ("java/lang/Long", "rotateRight", "(JI)J", ScalarOp::RotateRightL),
+        ];
+        for &(c, m, d, want) in cases {
+            assert_eq!(
+                try_ir_scalar_intrinsic(c, m, d),
+                Some(want),
+                "{c}.{m}{d} is declared as a scalar-intrinsic family and was not recognised",
+            );
+        }
     }
 }
 
