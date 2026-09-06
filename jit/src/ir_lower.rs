@@ -1509,7 +1509,6 @@ impl<'a> Lowerer<'a> {
             gp_reg_of: Vec::new(),
             gp_reg_owner: [None; 16],
             gp_reg_live: Vec::new(),
-            gp_reg_owner: [None; 16],
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
             phi_copy_publish_deferred: 0,
@@ -1561,7 +1560,6 @@ impl<'a> Lowerer<'a> {
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
         self.gp_reg_owner = [None; 16];
         self.gp_reg_of = residency.gp_reg_of;
-        self.gp_reg_owner = [None; 16];
         // Exclusive ownership, computed once: how many values share each
         // register, and a value is nameable only if the answer for its own is
         // one. See the field comment for why "resident" is not enough.
