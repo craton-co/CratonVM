@@ -75,11 +75,35 @@ The old binary now behaves like the new one. So:
   convergence is an artifact of which step happened to catch a high reading.
   Only `e24ff3173`'s 31 and the first A/B's 64 were ever unambiguous.
 
-**What drives engagement is still unidentified.** It is not shard concurrency
-(both A/Bs ran two VMs), not the verifier, and not any flag tested here. The
-runs that reproduced were interleaved with heavy build/suite activity; the
-quiet ones were not — but that is a correlation across a day, not a controlled
-variable.
+### 0.3 What drives engagement — FIVE hypotheses tested, all refuted
+
+A deliberate hunt for a reliable trigger, each arm reporting the moving-cycle
+count. Every one came back empty:
+
+| hypothesis | test | moving cycles |
+|---|---|---:|
+| workload concurrency | 4 concurrent netty VMs | 0 |
+| the post-evacuation verifier | `MOVING_YOUNG_VERIFY=1` on/off | 0 vs 0 |
+| machine state from compiling | measured DURING a `cargo build --release -j 8` | **0** |
+| …and its control | quiet before / quiet after the same build | 1 / 0 |
+| heap size (the suite uses 1500m, probes used 1g) | `--Xmx 1500m`, `--Xmx 2g` | 0 / 0 |
+
+The build-load arm is the one that hurts, because it was the best hypothesis:
+every run that reproduced today was interleaved with heavy build or suite
+activity, and every quiet run was not. Tested directly, that correlation is
+worth nothing — nine runs across quiet/under-build/quiet-again produced one
+moving cycle between them.
+
+**So the variance is UNEXPLAINED.** The same binary, same class, same heap, same
+two-VM interleaved design gave 64 moving cycles at 16:21 and 4 at 17:30 on one
+evening. Nothing tested since reproduces the high state.
+
+**Do not test another lever against this family until that is solved.** Five
+hypotheses and three published claims have already died to it. The next useful
+step is not another A/B — it is instrumenting the moving/non-moving decision to
+record, per cycle, every input it consulted, so a run that relocates can be
+diffed against one that does not. Until then a green arm here means "the
+collector did not relocate", which is not the same as "the defect is gone".
 
 **Consequence for anyone picking this up: you cannot currently reproduce this
 family on demand, and until you can, no lever tested against it means
