@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-519 tokens.
+521 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -522,6 +522,7 @@ export inherited from a parent shell.
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
+| `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
 | `symbolize` | `CRATONVM_SYMBOLIZE` |
 | `symbolize-dbg` | `CRATONVM_SYMBOLIZE_DBG` |
 | `threadreg-perf` | `CRATONVM_DBG_THREADREG_PERF` |
@@ -564,6 +565,7 @@ export inherited from a parent shell.
 | `watch-cause-self` | `CRATONVM_DBG_WATCH_CAUSE_SELF` |
 | `watch-cell` | `CRATONVM_DBG_WATCH_CELL` |
 | `watchaddr` | `CRATONVM_DBG_WATCHADDR` |
+| `watch-alloc-cid` | `CRATONVM_DBG_WATCH_ALLOC_CID` |
 | `watchref` | `CRATONVM_DBG_WATCHREF` |
 | `weakref` | `CRATONVM_DBG_WEAKREF` |
 | `wf` | `CRATONVM_DBG_WF` |
@@ -960,13 +962,15 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-146 tokens.
+148 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `g1-late-header-write` | `CRATONVM_G1_LATE_HEADER_WRITE` |
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
+| `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
+| `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
