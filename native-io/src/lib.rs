@@ -9643,17 +9643,28 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     // points reads or writes `bigEndian`/`nativeByteOrder` (`buf_set_mark`
     // saves and restores `address` only).
     let obj = alloc_bb_object(ctx);
+    // GC: nothing in Java refers to this object yet, so this Rust local is
+    // its ONLY reference — and the allocation below can collect. Under the
+    // moving collector that leaves the local stale; under the Generational
+    // collector's NON-MOVING young sweep the object is unreachable and gets
+    // ZEROED in place. Pin across the allocation and read the live address
+    // back (`unpinned-native-locals` family; `native-io` was outside the
+    // 2026-08-25 audit's scope, which covered `native-builtins/src`).
+    let __pin = ctx.pin_native_root(obj);
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
+    let obj = ctx.read_native_pin(__pin, obj);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
     // Real JDK Heap*Buffer backing array is named `hb`.
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    let obj = ctx.read_native_pin(__pin, obj);
     // Real HeapByteBuffer.address is ARRAY_BYTE_BASE_OFFSET + offset. Bulk
     // copy bytecode relies on this value when ScopedMemoryAccess hands the
     // backing byte[] and offset to Unsafe.copyMemory. A fresh allocation's
     // array-base offset is 0, so this is `ARRAY_BYTE_BASE_OFFSET` — spelled
     // through [`heap_buffer_address`] so the literal `16` lives in one place.
     ctx.set_field_by_name(obj, "address", Value::Long(heap_buffer_address(0)));
+    ctx.unpin_native_roots(__pin);
     // W7-76's `bigEndian`/`nativeByteOrder` parity seed used to be transcribed
     // here in full. It moved to [`seed_buffer_byte_order`] (called by
     // `alloc_bb_object` at the top of this function), which carries the whole
@@ -15573,10 +15584,20 @@ fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
         }
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
+    // GC: nothing in Java refers to this object yet, so this Rust local is
+    // its ONLY reference — and the allocation below can collect. Under the
+    // moving collector that leaves the local stale; under the Generational
+    // collector's NON-MOVING young sweep the object is unreachable and gets
+    // ZEROED in place. Pin across the allocation and read the live address
+    // back (`unpinned-native-locals` family; `native-io` was outside the
+    // 2026-08-25 audit's scope, which covered `native-builtins/src`).
+    let __pin = ctx.pin_native_root(path);
     let s = ctx.create_string(path_str);
+    let path = ctx.read_native_pin(__pin, path);
     ctx.set_field(path, PATH_FIELD_STR, Value::Object(Some(s)));
     // Dual-write — no-ops if class has no such field.
     ctx.set_field_by_name(path, "path", Value::Object(Some(s)));
+    ctx.unpin_native_roots(__pin);
     path
 }
 
@@ -16167,8 +16188,18 @@ fn native_path_to_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Ok(cid) => ctx.alloc_object(cid, 1),
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
+    // GC: nothing in Java refers to this object yet, so this Rust local is
+    // its ONLY reference — and the allocation below can collect. Under the
+    // moving collector that leaves the local stale; under the Generational
+    // collector's NON-MOVING young sweep the object is unreachable and gets
+    // ZEROED in place. Pin across the allocation and read the live address
+    // back (`unpinned-native-locals` family; `native-io` was outside the
+    // 2026-08-25 audit's scope, which covered `native-builtins/src`).
+    let __pin = ctx.pin_native_root(file);
     let path_str = ctx.create_string(&s);
+    let file = ctx.read_native_pin(__pin, file);
     ctx.set_field(file, 0, Value::Object(Some(path_str)));
+    ctx.unpin_native_roots(__pin);
     Ok(Some(Value::Object(Some(file))))
 }
 
@@ -18945,7 +18976,16 @@ fn alloc_typed_buffer(
     // constructors share; the dead `let _ = n;` that used to sit here went
     // with it.)
     let obj = alloc_typed_object(ctx, class_name);
+    // GC: nothing in Java refers to this object yet, so this Rust local is
+    // its ONLY reference — and the allocation below can collect. Under the
+    // moving collector that leaves the local stale; under the Generational
+    // collector's NON-MOVING young sweep the object is unreachable and gets
+    // ZEROED in place. Pin across the allocation and read the live address
+    // back (`unpinned-native-locals` family; `native-io` was outside the
+    // 2026-08-25 audit's scope, which covered `native-builtins/src`).
+    let __pin = ctx.pin_native_root(obj);
     let array = ctx.new_array(elem_type, capacity);
+    let obj = ctx.read_native_pin(__pin, obj);
     // Synthetic slot
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
     // Real JDK Heap*Buffer backing array is named `hb`
@@ -18958,7 +18998,9 @@ fn alloc_typed_buffer(
     // did this; the typed families (Short/Int/Long/Float/Double/Char) never
     // did, which left `address` reading as the mark (-1) and made every bulk
     // `put(<same-kind>Buffer)` throw AIOOBE out of `Unsafe.copyMemory`.
+    let obj = ctx.read_native_pin(__pin, obj);
     ctx.set_field_by_name(obj, "address", Value::Long(16));
+    ctx.unpin_native_roots(__pin);
     obj
 }
 
@@ -20749,10 +20791,20 @@ fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> Obj
             mbb_base + MBB_PRIVATE_WIDTH,
         ),
     };
+    // GC: nothing in Java refers to this object yet, so this Rust local is
+    // its ONLY reference — and the allocation below can collect. Under the
+    // moving collector that leaves the local stale; under the Generational
+    // collector's NON-MOVING young sweep the object is unreachable and gets
+    // ZEROED in place. Pin across the allocation and read the live address
+    // back (`unpinned-native-locals` family; `native-io` was outside the
+    // 2026-08-25 audit's scope, which covered `native-builtins/src`).
+    let __pin = ctx.pin_native_root(obj);
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
+    let obj = ctx.read_native_pin(__pin, obj);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    let obj = ctx.read_native_pin(__pin, obj);
     // Same as `alloc_byte_buffer`: this stand-in is heap-backed (`hb` is a real
     // byte[]), so `Buffer.address` must be the array base offset, not the mark
     // that the indexed slot-4 write would otherwise leave behind. The separate
@@ -20760,6 +20812,7 @@ fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> Obj
     // NOT the JDK's `address` field.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
     ctx.set_field(obj, mbb_base + MBB_PRIVATE_MAPPED_ADDR, Value::Long(0));
+    ctx.unpin_native_roots(__pin);
     obj
 }
 
