@@ -1782,10 +1782,7 @@ impl GcFlags {
             gen_uncommit: on_unless_zero(src, "CRATONVM_GEN_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
-            g1_card_screen_jit_pinned: on_unless_zero(
-                src,
-                "CRATONVM_G1_CARD_SCREEN_JIT_PINNED",
-            ),
+            g1_card_screen_jit_pinned: on_unless_zero(src, "CRATONVM_G1_CARD_SCREEN_JIT_PINNED"),
             g1_inline_barrier: on_unless_zero(src, "CRATONVM_G1_INLINE_BARRIER"),
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),
