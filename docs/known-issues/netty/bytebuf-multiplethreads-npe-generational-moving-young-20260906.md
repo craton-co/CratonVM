@@ -22,7 +22,18 @@ frame home. §7 has the amplifier that reproduces it 3/3.
 
 ---
 
-## 0. It no longer reproduces — attribution RETRACTED, and the root cause is elsewhere
+## 0. SUPERSEDED BY §10 — read that first
+
+> **Everything in §0 was written before §10, and §10.4 has since found a
+> reproducer that needs no unsafe flag.** Specifically, §0.3's conclusion that
+> engagement is uncontrolled and that no lever should be tested against this
+> family is **WRONG AS OF §10.4**: `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` on
+> `io.netty.handler.ipfilter.UniqueIpFilterTest` gives ~30 relocating cycles a
+> run and SIGSEGV 3/13 on the merged tip. §0.1's pointer to the independent fix
+> and §0.2's retraction of my bisect both still stand; §0.3 does not. Use
+> §10.4's repro, and read §10.10 before trusting §7.
+
+## 0. It no longer reproduces (AS MEASURED THEN) — attribution RETRACTED
 
 Two things happened after this page was first written, and they point opposite
 ways.
@@ -98,12 +109,19 @@ moving cycle between them.
 two-VM interleaved design gave 64 moving cycles at 16:21 and 4 at 17:30 on one
 evening. Nothing tested since reproduces the high state.
 
-**Do not test another lever against this family until that is solved.** Five
-hypotheses and three published claims have already died to it. The next useful
-step is not another A/B — it is instrumenting the moving/non-moving decision to
-record, per cycle, every input it consulted, so a run that relocates can be
-diffed against one that does not. Until then a green arm here means "the
-collector did not relocate", which is not the same as "the defect is gone".
+**SUPERSEDED — §10.4 solved this.** The conclusion drawn here was "do not test
+another lever until engagement is controllable", and the reasoning still holds
+for every arm in §0-§9: a green arm on a run that never relocated means "the
+collector did not relocate", not "the defect is gone". But the premise is no
+longer true. §10.1 identified the mask (`unrewritable_conservative_jit_roots`)
+and its kill switch, and §10.4 turned that into a repro needing no unsafe flag.
+
+Two things are worth keeping from the failed hunt anyway. The five refuted
+hypotheses above are still refuted, so nobody need re-run them. And the reason
+they all failed is instructive: I was varying the MACHINE, while the thing that
+gates relocation turned out to be a **flag-reachable divert inside the
+collector**. A trigger hunt that never reads the code it is trying to trigger
+searches the wrong space.
 
 **Consequence for anyone picking this up: you cannot currently reproduce this
 family on demand, and until you can, no lever tested against it means
