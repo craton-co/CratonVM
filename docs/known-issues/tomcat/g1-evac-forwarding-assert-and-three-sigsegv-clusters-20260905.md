@@ -218,6 +218,70 @@ whether it's explained by "more GC pressure → more chances at a rare silent
 evac defect" or by something entirely unrelated to evacuation was not
 determined in this pass.
 
+## A LOCAL reproducer for the Cluster D assert — and why it stopped reproducing
+
+**2026-09-05, Windows/RTX 2060 box.** The same assert fires outside
+Tomcat, on a GPU fixture that runs in about forty seconds:
+
+```
+panic: forwarding target must have its low 2 bits clear (>= 4-byte aligned)
+  types/src/heap_types.rs:1562        thread="main-vm"
+[PANIC_IN] GpuResidencyGc.main pc=127
+
+bash bench-gpu/residency-gc.sh          # or, one launch:
+cratonvm --gpu --gpu-min-work 64 -Xmx64m -XX:+UseG1GC     -cp test_classes/gpu GpuResidencyGc 0 1024 60
+```
+
+Same assert text, same file, same **G1-only** scope this page reports.
+One difference to keep in view: this fires on `main-vm`, while Cluster D
+panics on an evac worker via `gc/src/evac_pool.rs`. Whether that is the
+same defect on a different thread or a second path to the same assert is
+**not established**.
+
+It was found by accident — `bench-gpu/residency-gc.sh` routes each arm's
+stderr into a temp directory it deletes, so the failure presented as an
+empty arm with two mismatched checksums, not as a panic.
+
+### It is NOT reliably reproducible, and one claim here was retracted
+
+Observed roughly five times inside a single evening window, then **0 in
+about 500 launches** afterwards — across binaries built both before and
+after `587acb50e` (the stale-TLAB-skip-span fix), so that fix is not the
+explanation either.
+
+An intermediate reading that host load amplifies it does **not** hold up.
+It was measured at 3/120 loaded against 0/120 quiet, which looked
+conclusive (p ~ 2e-5). Re-running the *identical binary* under the
+*identical* synthetic load later gave **0/150**. The difference between
+those windows is what else was on the box: the first ran alongside two
+other sessions' real VM workloads, the second alongside twelve CPU
+spinners. So whatever forces it is not CPU occupancy — more likely
+concurrent memory/GC pressure from real workloads, which a spin loop does
+not reproduce. Recorded as a refuted hypothesis rather than deleted,
+because the refutation is the useful part: **do not size a burn-in
+against CPU load.**
+
+That also bears on this page's own suggestion of re-running the Jasper
+`compiler` package alone to test whether the ~45% crash rate was "an
+artifact of this one run's host load/timing". On this evidence an
+isolated re-run may well come back clean without meaning anything.
+
+### The assert now names its provenance
+
+`ObjectHeader::make_forwarded` was `#[track_caller]`-annotated and its
+messages now carry the offending values, so the next firing — here or on
+Azure — reports the **call site** rather than `heap_types.rs`, plus
+`target`, its low bits, and `prev`. That directly separates the two
+candidates this page names as its most useful next step: G1 passes
+`old`/`old_addr` when self-forwarding a CAS loser (`g1.rs:1191`, `:8289`)
+and `new_addr`/`new_ptr` for a copy destination (`g1.rs:1248`, `:8398`) —
+i.e. bad `old_ptr` candidate versus bad `tlab_alloc` result. None of the
+three existing reports could distinguish them, because the message
+printed neither the site nor the value.
+
+The diagnostic is in place but has **not yet caught a firing**, so the
+question that motivated it is still open.
+
 ## What's not been attempted
 
 No kill-switch A/B (e.g. disabling G1's parallel evacuation) was run — this
