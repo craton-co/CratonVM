@@ -109,7 +109,7 @@ Three classes were run in that shape (`DuplicatedByteBufTest`,
 `BigEndianHeapByteBufTest`, `SimpleLeakAwareByteBufTest`): **9/9 failing on
 Generational, 0/9 with the lever, 0/9 on ZGC.**
 
-## 4. Engagement census — the moving cycle is real, and rare
+## 4. Engagement census — relocation is real, and necessary
 
 A lever that removes a failure also changes timing, so "it went away" is not by
 itself an attribution. `CRATONVM_GC_STATS=1` on the failing arm:
@@ -120,10 +120,16 @@ itself an attribution. `CRATONVM_GC_STATS=1` on the failing arm:
 [GC] decision history: moving_cycles_under_live_jit=9 coverage_fallbacks=366
 ```
 
-**Nine cycles genuinely relocate**, every one of them under live JIT and every
-one self-certified `moving-jit-coverage-proven`. Two or three tests of 416 then
-fail. A defect that needs one of nine rare cycles to hit a live object is
-exactly the shape of an intermittent, shape-shifting corruption.
+**Cycles genuinely relocate** — nine in that run, and between 1 and 24 across
+every run measured since — every one of them under live JIT and every one
+self-certified `moving-jit-coverage-proven`. Two to four tests of 416 then fail.
+
+The count is reported as a range on purpose. Relocation is **necessary** for the
+failure: remove it (`NO_MOVING_YOUNG`, `HANDSHAKE=0`) and the family goes clean,
+force more of it (`ASSUME=1`) and the failures go to 3/3. What has NOT been
+established is a per-cycle link — no measurement here says which relocating
+cycle corrupted which object, and an earlier revision of this page overreached
+by writing as though the count and the failures tracked each other one-to-one.
 
 The other 366 cycles fall back (`unregistered` 338, `innermost` 28,
 `nonmoving` 1). **Those fallbacks are a different story** — see §5.
@@ -139,9 +145,9 @@ checked against the lever before being ruled out.
   correctness bug"* and *"No action needed on the correctness front."* That
   conclusion is sound for the mechanism it describes: falling back to the
   non-moving sweep is safety-first and costs throughput. **It does not cover
-  this.** Here the failures track the **9 cycles that did NOT fall back**, and
-  the result is a wrong answer rather than a slow one, with HotSpot clean on the
-  identical classpath.
+  this.** Here the failure REQUIRES the cycles that did NOT fall back — kill
+  relocation and it goes away — and the result is a wrong answer rather than a
+  slow one, with HotSpot clean on the identical classpath.
 
 * **Not HIB-CV-22.** That page
   (`HIB-CV-22-junit-timeoutextension-double-invoke-is-gc-corruption.md`) has the *same victim class* —
