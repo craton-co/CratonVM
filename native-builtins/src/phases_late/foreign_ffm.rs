@@ -3021,7 +3021,7 @@ pub(crate) fn lucene_buffered_checksum_index_input_get_checksum(
     // for every other caller shape — e.g. a caller that reads the entire
     // file through openChecksumInput() got CRC(file[0..len-8]) instead of
     // CRC(everything read), diverging from HotSpot on identical bytes
-    // (fixed-suite-bugs/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md
+    // (s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md
     // item 4, ProbeNIOFS2: 170114997 vs 2329538857) — and silently re-read
     // the whole file on every near-EOF getChecksum() call. The digest path
     // (BufferedChecksum over java.util.zip.CRC32) is verified correct, so

@@ -19,8 +19,40 @@
 any lingering app-spawned thread escapes `clearReferencesThreads` because its CCL
 never matches the webapp loader; correctness gap that can leak threads/loaders on
 real undeploy, not just a test assertion).
-**Status on CratonVM:** FAIL. **HotSpot:** PASS.
+**Status on CratonVM:** **FIXED 2026-09-05** (was FAIL). **HotSpot:** PASS.
 **Run date:** 2026-06-23
+
+> ## 2026-09-05 — closed, in two parts
+>
+> **Part 1, the defect this page diagnosed, is fixed and the fix works.** The
+> recommendation's option 1 landed the same day as this page:
+> `native_thread_start0` (`native-builtins/src/lang_system.rs`) copies the
+> parent's `contextClassLoader` into the child, behind
+> `CRATONVM_INHERIT_THREAD_CCL` (default ON). Re-measured at dev tip
+> `355659d00` with this page's own minimal probe: `timer_CCL == cl` is now
+> **true**, and the Azure suite log shows
+> `clearReferencesStopTimerThread` being **entered** — which it can only be
+> when `thread.getContextClassLoader() == webappLoader`. The `if (ccl == this)`
+> gate this page is about now passes.
+>
+> **Part 2 was a second defect hidden behind the first, and is why both classes
+> stayed red for ten weeks after the fix.** Once the gate passes, the
+> reflective stop throws
+> `InaccessibleObjectException: module java.base does not "opens java.util" to
+> org.apache.tomcat.catalina` — despite `--add-opens
+> java.base/java.util=ALL-UNNAMED` being on the command line. Cause: a modular
+> jar reached through the CLASS path was being given its declared module name
+> instead of the unnamed module, so an `ALL-UNNAMED`-qualified open could not
+> reach it. Fixed the same day; see
+> `modular-jar-on-the-class-path-was-given-its-declared-module-name-FIXED-20260905`
+> for the full write-up, the classpath-shape reason this reproduced on Azure
+> and not on Windows, and the A/B (both classes FAIL → PASS).
+>
+> One residual is left open there and is NOT this page's defect: this VM
+> inherits the CCL at `start()`, HotSpot at CONSTRUCTION. Nothing measured
+> depends on the difference. The preferred long-term shape remains this page's
+> **option 2** — stop shadowing the multi-arg `Thread` constructors.
+
 **Binary:** dev `df11ac00` (worktree `C:\craton\CratonVM-tctest`, exe
 `cratonvm-tcfull-0622.exe`).
 

@@ -25,7 +25,6 @@
 //! So the TLS client handshake, which is a bare `read_tls`/`write_tls` pair on
 //! a socket carrying `SO_RCVTIMEO`, sees `EINTR` whenever a JIT root scan lands
 //! while it is parked. That is the defect recorded in
-//! `fixed-suite-bugs/springboot/`
 //! `jdk-httpclient-sslbundle-tls-handshake-eintr-FIXED-20260806.md` (a path
 //! relative to the internal tree's own root — see `doc_citation_paths`).
 //!

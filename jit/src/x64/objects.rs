@@ -138,7 +138,16 @@ impl Compiler {
 
         self.emit_mov_r64_r64(RCX, source_reg);
         self.emit_sub_r64_r64(RCX, R10);
-        self.emit_shr_r64_imm8(RCX, 9); // CARD_SIZE = 512
+        // NOT a literal `9`. This shift is baked into machine code, and it has
+        // to equal the card size every card table in the VM is indexed by --
+        // `gc::card_table::CARD_SIZE` and `gc::g1_cards::G1_CARD_SHIFT`, both of
+        // which now derive from the same constant. It was `9` with a
+        // `// CARD_SIZE = 512` comment beside it, which is a binding a compiler
+        // cannot check: a divergence would not read as a mismatch between two
+        // Rust constants, it would be a barrier that dirties the WRONG card, and
+        // a missed dirty card is a reachable young object the next collection
+        // reclaims.
+        self.emit_shr_r64_imm8(RCX, cratonvm_types::CARD_SHIFT as u8);
         self.emit_mov_imm64_full(R11, self.helpers.jit_card_table_addr as i64);
         self.emit_mov_mem8_indexed_imm8(R11, RCX, 1); // CARD_DIRTY
 
@@ -477,7 +486,7 @@ impl Compiler {
     ///   under G1/ZGC is load-bearing: it is what stops an inline store from
     ///   skipping `post_write_barrier_rset` and losing the remembered-set edge
     ///   a JNI-pinned, CSet-excluded region is reachable only through
-    ///   (`audits/g1-audit.md` 8.1). Those callers additionally gate on
+    ///   (`g1-audit.md` 8.1). Those callers additionally gate on
     ///   [`region_bounds_are_live`], which reads that table's CONTENT.
     ///
     /// Handing the read table to a store caller would silently unblock exactly
@@ -922,7 +931,7 @@ impl Compiler {
         // its geometry AND the opt-in flag is set; it emits a REAL G1
         // post-write barrier after the store instead of borrowing the
         // generational arm's "a young receiver needs no barrier" premise,
-        // which is false under G1 (see G1-2 below and `audits/g1-audit.md`
+        // which is false under G1 (see G1-2 below and `g1-audit.md`
         // §10). `region_bounds_are_live` is deliberately NOT consulted for it
         // and stays false under G1 — the store-side table is untouched.
         let g1 = self.g1_inline_barrier_available();
@@ -1024,7 +1033,7 @@ impl Compiler {
     /// checks retained are the per-object compact flag (synthetic allocations
     /// can still use legacy cells) and old-generation bit (allocation spill).
     ///
-    /// G1-2 (`audits/g1-audit.md` §8.1): "a young compact receiver needs no
+    /// G1-2 (`g1-audit.md` §8.1): "a young compact receiver needs no
     /// barrier" is a GENERATIONAL claim. This emitter used to state it with no
     /// receiver guard whatsoever — not even the null test its two sibling
     /// emitters have — so on a backend that publishes no region bounds it wrote
@@ -1403,7 +1412,7 @@ impl Compiler {
         // `KIND_TAGS_BYTE_OFFSET` (4) names the dword that packs
         // kind/element_type/gc_age/gc_flags. It was a bare literal until the
         // 2026-07-26 header-offset audit — see
-        // `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
+        // `x64-flag-skew-and-contracts.md` §5.
         let mut compact_flag_pending = false;
         // NO separate quartet store any more, and removing it is a fix rather
         // than a tidy-up. `kind` / `element_type` / `gc_age` / `gc_flags` used

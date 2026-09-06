@@ -403,6 +403,40 @@ struct DrainState {
     done: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Drain engagement census
+// ---------------------------------------------------------------------------
+
+/// Calls to [`drain_parallel`], calls that actually spawned workers, the worker
+/// count of the LAST call, and the total time inside the drain.
+///
+/// # Why this is not optional instrumentation
+///
+/// The `+153 %`-at-four-workers reading that started the parallel-marking
+/// question is a worker-count A/B, and a worker-count A/B is a measurement of
+/// the collector only if the lever engages. On G1 the same question turned out
+/// to be TWO INERT LEVERS (`CRATONVM_GC_PAR_THREADS` and
+/// `-XX:ParallelGCThreads` both left `workers_last` at 23) and one live one, so
+/// every prior A/B on either of the first two compared a binary against itself
+/// and produced a number about nothing. `workers_last` is the line that makes
+/// that visible on the generational side before anyone reads a pause figure.
+///
+/// Always on: four relaxed counter updates per COLLECTION, not per object.
+static DRAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DRAIN_PARALLEL_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DRAIN_WORKERS_LAST: AtomicUsize = AtomicUsize::new(0);
+static DRAIN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(calls, parallel_calls, workers_last, nanos)` -- see [`DRAIN_CALLS`].
+pub fn drain_census() -> (usize, usize, usize, u64) {
+    (
+        DRAIN_CALLS.load(Ordering::Relaxed),
+        DRAIN_PARALLEL_CALLS.load(Ordering::Relaxed),
+        DRAIN_WORKERS_LAST.load(Ordering::Relaxed),
+        DRAIN_NANOS.load(Ordering::Relaxed),
+    )
+}
+
 /// Batch size handed to a worker per global-stack acquisition.
 const ACQUIRE_CHUNK: usize = 256;
 /// Local stack depth at which a worker publishes surplus work.
@@ -421,6 +455,27 @@ pub(crate) fn drain_parallel<F>(seed: Vec<usize>, threads: usize, scan: F)
 where
     F: Fn(usize, &mut Vec<usize>) + Sync,
 {
+    // ENGAGEMENT, before anything else. The standing question about this
+    // function is a worker-count A/B ("four workers cost +153% pause against
+    // zero"), and a worker-count A/B is only a measurement of the collector if
+    // the lever reaches the collector. The sibling question on G1 turned out
+    // to be two INERT levers and one live one, so every prior A/B on the first
+    // two had compared a binary against itself. Recording what this call
+    // actually ran with is what makes that mistake visible instead of silent.
+    DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+    DRAIN_WORKERS_LAST.store(threads, Ordering::Relaxed);
+    if threads > 1 {
+        DRAIN_PARALLEL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    let __t0 = std::time::Instant::now();
+    let __done = DrainTimer(__t0);
+    struct DrainTimer(std::time::Instant);
+    impl Drop for DrainTimer {
+        fn drop(&mut self) {
+            DRAIN_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    let _ = &__done;
     if threads <= 1 {
         let mut local = seed;
         while let Some(addr) = local.pop() {

@@ -4,8 +4,7 @@
 //! ES-SEGALLOC regression -- `java.lang.foreign.SegmentAllocator.allocate(long,
 //! long)` interface dispatch on a CratonVM synthetic `Arena` receiver.
 //!
-//! Pre-fix symptom (fixed-suite-bugs/elasticsearch-suite/
-//! ES-FAIL-20260711-foreign-segmentallocator-dispatch-FIXED.md): any call that
+//! Pre-fix symptom (ES-FAIL-20260711-foreign-segmentallocator-dispatch-FIXED.md): any call that
 //! routes through a `SegmentAllocator` default method inherited by `Arena`
 //! (`allocate(long)` or `allocate(MemoryLayout)`, both real-JDK bytecode)
 //! threw

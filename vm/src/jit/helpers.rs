@@ -591,7 +591,7 @@ thread_local! {
     /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
     /// unreachable from a collecting thread and the throwable was therefore
     /// neither scanned nor remapped for the whole stash→drain window (see
-    /// `fixed-bugs/jit-signals-root-gap.md`). Every remaining field is a
+    /// `jit-signals-root-gap.md`). Every remaining field is a
     /// plain scalar the collector has no interest in, which is why they may
     /// stay here and keep the one-TLS-access drain. **Do not add an
     /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
@@ -625,7 +625,7 @@ thread_local! {
             arithmetic: Cell::new(false),
             npe: Cell::new(false),
             npe_action: Cell::new(0),
-            npe_compiled_frames: std::cell::RefCell::new(None),
+            trap_frames: std::cell::RefCell::new(None),
             deopt: Cell::new(false),
         }
     };
@@ -1059,7 +1059,7 @@ pub fn clear_jit_thread() {
 ///
 /// Scalars only — the pending throwable lives on
 /// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
-/// it (`fixed-bugs/jit-signals-root-gap.md`).
+/// it (`jit-signals-root-gap.md`).
 struct JitSignals {
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
     /// the thread's `jit_pending_exception`, when statically known at
@@ -1099,7 +1099,8 @@ struct JitSignals {
     /// `RefCell` rather than `Cell` because the payload is not `Copy`; it is
     /// only ever borrowed for the length of a `take`/`replace`, never across a
     /// call, so it cannot be re-entered.
-    npe_compiled_frames: std::cell::RefCell<Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>>,
+    trap_frames:
+        std::cell::RefCell<Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>>,
     deopt: Cell<bool>,
 }
 
@@ -1117,10 +1118,10 @@ pub(crate) struct DrainedJitSignals {
     pub arithmetic: bool,
     pub npe: bool,
     /// The compiled frames that were live when the helper signalled `npe`.
-    /// See `JitSignals::npe_compiled_frames`; drained here so that no path
+    /// See `JitSignals::trap_frames`; drained here so that no path
     /// can construct the NPE without also being handed the frames it is
     /// about to lose.
-    pub npe_compiled_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+    pub trap_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
     /// Drained alongside `npe` for hygiene (a stale action code must not
     /// outlive its NPE). Read by the two restash paths, which put it back with
     /// the flag and the frame snapshot — see [`restash_jit_pending_npe`].
@@ -1148,7 +1149,7 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
         npe: s.npe.take(),
-        npe_compiled_frames: s.npe_compiled_frames.borrow_mut().take(),
+        trap_frames: s.trap_frames.borrow_mut().take(),
         npe_action: s.npe_action.take(),
         deopt: s.deopt.take(),
     })
@@ -1158,7 +1159,7 @@ pub(crate) fn take_all_jit_signals(thread: &mut JvmThread) -> DrainedJitSignals 
 /// an implicit NPE. Default ON; `CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT=1` restores
 /// the historical (frame-losing) trace, so the difference is an A/B inside one
 /// binary rather than a comparison across two builds.
-fn npe_frame_snapshot_enabled() -> bool {
+fn trap_frame_snapshot_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_NPE_FRAME_SNAPSHOT").is_none()
@@ -1172,8 +1173,8 @@ fn npe_frame_snapshot_enabled() -> bool {
 /// interpreter still on the stack. Cheap by construction: this records the
 /// same small structs the GC root walk already builds, and does no class-store
 /// lookup, no string formatting and takes no lock.
-fn snapshot_npe_compiled_frames(trap_key: u32) {
-    if !npe_frame_snapshot_enabled() {
+fn snapshot_trap_frames(trap_key: u32) {
+    if !trap_frame_snapshot_enabled() {
         return;
     }
     let mut frames = crate::jit::conservative_roots::active_compiled_frames();
@@ -1183,7 +1184,7 @@ fn snapshot_npe_compiled_frames(trap_key: u32) {
     // the frames exist at once.
     crate::jit::conservative_roots::apply_npe_trap_site(&mut frames, trap_key);
     JIT_SIGNALS.with(|s| {
-        *s.npe_compiled_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
+        *s.trap_frames.borrow_mut() = (!frames.is_empty()).then_some(frames);
     });
 }
 
@@ -1192,9 +1193,9 @@ fn snapshot_npe_compiled_frames(trap_key: u32) {
 /// The drain calls this beside [`take_jit_pending_npe`]. Always a `take`: a
 /// snapshot that outlived its NPE would be attached to an unrelated throwable,
 /// and a trace that is confidently wrong is worse than one that is short.
-pub fn take_jit_pending_npe_compiled_frames(
+pub fn take_jit_pending_trap_frames(
 ) -> Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>> {
-    JIT_SIGNALS.with(|s| s.npe_compiled_frames.borrow_mut().take())
+    JIT_SIGNALS.with(|s| s.trap_frames.borrow_mut().take())
 }
 
 /// Store a pending Java exception from JIT dispatch. Called when
@@ -1274,7 +1275,7 @@ pub(crate) fn stash_jit_pending_npe() {
 ///
 /// For the one shape [`stash_jit_pending_npe`] is wrong for: a door that
 /// drained the flag with [`take_jit_pending_npe`] and is putting it back. That
-/// take leaves `npe_compiled_frames` untouched, so the snapshot from the trap
+/// take leaves `trap_frames` untouched, so the snapshot from the trap
 /// is still there and is still the right one; taking another would overwrite it
 /// with a stack the raising frame has already left.
 pub(crate) fn set_jit_pending_npe_flag_only() {
@@ -1298,13 +1299,63 @@ pub(crate) fn restash_jit_pending_npe(
     JIT_SIGNALS.with(|s| {
         s.npe.set(true);
         s.npe_action.set(action);
-        *s.npe_compiled_frames.borrow_mut() = frames;
+        *s.trap_frames.borrow_mut() = frames;
+    });
+}
+
+/// Put back a div-by-zero that [`take_all_jit_signals`] drained WHOLE — flag
+/// AND compiled-frame snapshot — exactly as it was found.
+///
+/// The sibling of [`restash_jit_pending_npe`], and it did not exist until
+/// 2026-09-05: both whole-drain restores called the bare
+/// [`stash_jit_pending_arithmetic`], which puts the flag back and lets
+/// `DrainedJitSignals` drop the snapshot on the floor. The next door then
+/// constructed the `ArithmeticException` with nothing to attach, and the
+/// throwable kept the empty trace `fillInStackTrace` had just built — the
+/// exact defect `restash_jit_pending_npe`'s own doc describes for its half,
+/// one signal kind over.
+///
+/// Do NOT re-sample here. `active_compiled_frames()` at a restore point
+/// describes a shallower stack than the trap did, which is the mistake
+/// [`restash_implicit_signal`]'s NPE arm is written to avoid; the frames belong
+/// to the trap, not to the drain that happened to pass them through.
+pub(crate) fn restash_jit_pending_arithmetic(
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.arithmetic.set(true);
+        *s.trap_frames.borrow_mut() = frames;
+    });
+}
+
+/// Put back an AIOOBE that [`take_all_jit_signals`] drained WHOLE — payload
+/// AND compiled-frame snapshot — exactly as it was found.
+///
+/// The third of the family, after [`restash_jit_pending_npe`] and
+/// [`restash_jit_pending_arithmetic`], and the same rule as both: do NOT
+/// re-sample. `active_compiled_frames()` at a restore point describes a
+/// shallower stack than the trap did; the frames belong to the trap, not to the
+/// drain that happened to pass them through.
+pub(crate) fn restash_jit_pending_aioobe(
+    index: i64,
+    length: i64,
+    frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+) {
+    JIT_SIGNALS.with(|s| {
+        s.aioobe.set(Some((index, length)));
+        *s.trap_frames.borrow_mut() = frames;
     });
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
 /// taken pending-AIOOBE payload. See `stash_jit_pending_exception` for the
 /// OSR drain-without-route rationale.
+///
+/// FLAG ONLY, and that is now a distinction that matters: a door which drained
+/// the payload with [`take_jit_pending_aioobe`] left the snapshot where the
+/// helper put it and must use this, while a door which drained everything with
+/// [`take_all_jit_signals`] is holding the snapshot and must use
+/// [`restash_jit_pending_aioobe`] instead.
 pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
 }
@@ -1349,14 +1400,21 @@ pub fn take_jit_pending_exception(thread: &mut JvmThread) -> Option<ObjectRef> {
 /// it. The deopt flag is deliberately NOT dropped: it describes the compiled
 /// frame's fate, which an exception does not settle.
 fn drain_superseded_implicit_signals() {
-    if take_jit_pending_npe() {
-        // The snapshot was taken for a raise that will never happen; a later
-        // drain would attach frames the raising code has long since left.
+    let npe = take_jit_pending_npe();
+    if npe {
         let _ = take_jit_pending_npe_action();
-        let _ = take_jit_pending_npe_compiled_frames();
     }
-    let _ = take_jit_pending_aioobe();
-    let _ = take_jit_pending_arithmetic();
+    let aioobe = take_jit_pending_aioobe().is_some();
+    let arithmetic = take_jit_pending_arithmetic();
+    // The snapshot was taken for a raise that will never happen; a later drain
+    // would attach frames the raising code has long since left. All three
+    // signals carry one now (the NPE since 2026-09-02, the div-by-zero and the
+    // AIOOBE since 2026-09-05), so all three have to drop it — dropping it only
+    // for the NPE would leave a superseded array trap's frames in the slot for
+    // whatever raises next.
+    if npe || aioobe || arithmetic {
+        let _ = take_jit_pending_trap_frames();
+    }
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -1440,7 +1498,7 @@ fn set_jit_pending_npe() {
         s.npe.set(true);
         s.npe_action.set(0);
     });
-    snapshot_npe_compiled_frames(0);
+    snapshot_trap_frames(0);
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -1465,7 +1523,7 @@ fn set_jit_pending_npe_action_at(code: u8, trap_key: u32) {
         s.npe.set(true);
         s.npe_action.set(code);
     });
-    snapshot_npe_compiled_frames(trap_key);
+    snapshot_trap_frames(trap_key);
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
@@ -2240,8 +2298,7 @@ unsafe fn bail_to_interpreter(
 /// surface it, as `NoSuchMethodError: <sub-initializer>.add(Ljava/lang/Object;)Z`,
 /// three failures in every full-class run of `ASTParserLoadingTest`.
 /// `apps/hib-suite-runner/FunctionalInterfaceHijackProbe.java` is the reduced
-/// witness for all four interfaces; `fixed-suite-bugs/hibernate/
-/// hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
+/// witness for all four interfaces; `hql-ordinal-parameter-dropped-under-jit-20260731-FIXED.md` is the writeup.
 ///
 /// Kept as one helper rather than repeated at each bail so a third by-name
 /// dispatch path added later inherits the guard instead of re-opening the hole.
@@ -2448,7 +2505,7 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 /// cross-VM hit therefore does not degrade to a slow path — it CALLs another
 /// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
 /// class happens to hold that id in this VM. See
-/// `audits/vm-jit-cache-keying.md`.
+/// `vm-jit-cache-keying.md`.
 ///
 /// `vm_identity` is a monotonically issued counter (`vm_init.rs`
 /// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
@@ -2930,7 +2987,7 @@ fn publish_mic_rust_cached_entry(
 /// VM: reader-reader `parking_lot` contention on one cache line, ~13% of all
 /// CPU in `lock_shared_slow` alone, with every workload converging on the same
 /// per-op cost regardless of what it actually did
-/// (fixed-suite-bugs/tomcat/23-charsetcache-pathological-slowdown.md).
+/// (23-charsetcache-pathological-slowdown.md).
 ///
 /// Callers MUST have run [`flush_class_identity_dispatch_memos`] on this
 /// thread first — that is what makes a hit as fresh as a locked resolution.
@@ -3210,18 +3267,29 @@ fn materialize_implicit_signal(
     vm: &SharedVm,
     thread: &mut JvmThread,
     signal: ImplicitSignal,
-    npe_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
+    trap_frames: Option<Vec<crate::jit::conservative_roots::ActiveCompiledFrame>>,
 ) -> Option<ObjectRef> {
     match signal {
         ImplicitSignal::Aioobe { index, length } => {
             let msg = format!("Index {index} out of bounds for length {length}");
-            crate::runtime::exceptions::create_exception_object(
+            let exc = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
                 "java/lang/ArrayIndexOutOfBoundsException",
                 Some(&msg),
             )
-            .ok()
+            .ok()?;
+            // The third arm to need this, and the last. Same defect as the
+            // other two: the bounds-check helper flagged the signal and the
+            // compiled body ran its epilogue, so the trace `fillInStackTrace`
+            // built a moment ago names nothing at all.
+            crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                vm,
+                &thread.frames,
+                exc,
+                trap_frames,
+            );
+            Some(exc)
         }
         ImplicitSignal::Npe => {
             let exc = crate::runtime::exceptions::create_exception_object(
@@ -3238,21 +3306,37 @@ fn materialize_implicit_signal(
             // snapshot exists to close. Attaching it in the constructor arm
             // rather than at each door is what stops a fourth door from
             // silently reopening it.
-            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+            crate::runtime::exceptions::attach_snapshotted_trap_frames(
                 vm,
                 &thread.frames,
                 exc,
-                npe_frames,
+                trap_frames,
             );
             Some(exc)
         }
-        ImplicitSignal::Arithmetic => crate::runtime::exceptions::create_exception_object(
-            vm,
-            thread,
-            "java/lang/ArithmeticException",
-            Some("/ by zero"),
-        )
-        .ok(),
+        ImplicitSignal::Arithmetic => {
+            let exc = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/ArithmeticException",
+                Some("/ by zero"),
+            )
+            .ok()?;
+            // The NPE arm above has carried this since the compiled-frame
+            // snapshot landed; this arm had the identical defect and no test
+            // that could see it. `pgo02_guarded_virtual_inline`'s stack-trace
+            // check could, and did — as a ~20% flake, because whether a given
+            // `callDivider` call ENTERS the artifact is timing-dependent, so
+            // the same run alternated between a 2-frame interpreted trace and
+            // an empty compiled one.
+            crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                vm,
+                &thread.frames,
+                exc,
+                trap_frames,
+            );
+            Some(exc)
+        }
         ImplicitSignal::None => None,
     }
 }
@@ -3703,12 +3787,25 @@ unsafe fn route_implicit_exc_through_callee(
         // This door drained the FLAG only (`take_jit_pending_npe`), so the
         // snapshot is still in the signal record; take it here so it is
         // consumed by exactly the throwable it belongs to.
-        let npe_frames = if implicit == ImplicitSignal::Npe {
-            take_jit_pending_npe_compiled_frames()
+        //
+        // Taken for `Arithmetic` as well as `Npe` since 2026-09-05: those are
+        // the two signals whose setters record a snapshot, and gating the take
+        // on `Npe` alone left the arithmetic snapshot in the cell — where the
+        // next take, belonging to a different throwable, would have found it.
+        // So this was never only a missing feature; it was also a stale-frames
+        // hazard, and the drain contract in
+        // `take_jit_pending_trap_frames` says why that is the worse
+        // half ("a trace that is confidently wrong is worse than one that is
+        // short").
+        let trap_frames = if matches!(
+            implicit,
+            ImplicitSignal::Npe | ImplicitSignal::Arithmetic | ImplicitSignal::Aioobe { .. }
+        ) {
+            take_jit_pending_trap_frames()
         } else {
             None
         };
-        let exc = materialize_implicit_signal(vm, thread, implicit, npe_frames);
+        let exc = materialize_implicit_signal(vm, thread, implicit, trap_frames);
         if let Some(exc) = exc {
             if let Ok(v) = try_run_callee_handler(
                 vm,
@@ -3983,7 +4080,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
                 vm,
                 thread,
                 implicit_signal_of(signals.aioobe, signals.npe, signals.arithmetic),
-                signals.npe_compiled_frames.take(),
+                signals.trap_frames.take(),
             );
             if let Some(exc) = implicit {
                 if let Ok(v) = try_run_callee_handler(
@@ -4007,18 +4104,34 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     if let Some(exc) = signals.exception {
         set_jit_pending_exception(thread, exc);
     }
-    if let Some((index, length)) = signals.aioobe {
-        stash_jit_pending_aioobe(index, length);
-    }
+    // Restore the snapshot the drain took WITH the flag it belongs to, rather
+    // than letting a setter take a fresh one here: `take_all_jit_signals` moved
+    // it out, and a second `active_compiled_frames()` at this point describes a
+    // shallower stack than the trap did. Without this the caller-side drain
+    // builds the throwable from a bare flag and the trace is EMPTY.
+    // ONE `trap_frames` slot, so exactly ONE of these three may restore it
+    // and the rest come back flag-only. Writing it more than once is not a
+    // tidiness point: every one of these setters ASSIGNS the slot, so a
+    // second call with `None` would wipe the frames the first put back.
+    // JVMS does not let one frame have two of these pending at once, so
+    // the priority never arbitrates anything real -- it is written out so
+    // the next reader does not have to derive that from three `take()`s.
+    let frames = signals.trap_frames.take();
     if signals.npe {
-        // Restore the snapshot the drain took WITH the flag, rather than
-        // letting the setter take a fresh one here: `take_all_jit_signals`
-        // moved it out, and a second `active_compiled_frames()` at this point
-        // describes a shallower stack than the trap did.
-        restash_jit_pending_npe(signals.npe_action, signals.npe_compiled_frames.take());
-    }
-    if signals.arithmetic {
-        stash_jit_pending_arithmetic();
+        restash_jit_pending_npe(signals.npe_action, frames);
+        if signals.arithmetic {
+            stash_jit_pending_arithmetic();
+        }
+        if let Some((index, length)) = signals.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if signals.arithmetic {
+        restash_jit_pending_arithmetic(frames);
+        if let Some((index, length)) = signals.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if let Some((index, length)) = signals.aioobe {
+        restash_jit_pending_aioobe(index, length, frames);
     }
     if signals.deopt {
         set_jit_deopt_pending();
@@ -4382,7 +4495,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
 // references stay invisible to the marker. The next mixed evacuation
 // then turns the classic SATB lost-object scenario into a use-after-
-// free (audit: history/round7-gc.md §3).
+// free (audit: round7-gc.md §3).
 //
 // `flush_thread_satb` itself is a cheap inline call when `is_active() ==
 // false`: a single Acquire load and an early return. We invoke it
@@ -4433,6 +4546,98 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
 ///
 /// Cost on the other two backends and on a ZGC run with the feature off: one
 /// `match` and one load of a plain `usize` field that is `0`.
+/// G1's concurrent-mark lifecycle, on the path a compiled workload takes.
+///
+/// The G1 twin of the ZGC hook below, and for a defect one step worse than the
+/// one that hook was written for: ZGC's trigger merely engaged rarely on a JIT
+/// workload, while G1's is unreachable in BOTH directions -- nothing starts a
+/// cycle and, more importantly, nothing finishes one. See
+/// `g1_drive_concurrent_mark_pub` for the measurements.
+///
+/// Cost when G1 is not the collector, or has nothing to do: an `is_g1()` match
+/// and two relaxed loads, the same budget the ZGC arm spends.
+#[inline]
+unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
+    if !g1_jit_mark_driver_enabled() || !vm.mem.heap.is_g1() {
+        return;
+    }
+    // DECIDE BEFORE TOUCHING THE THREAD.
+    //
+    // `thread.tlab.retire()` costs the allocation fast path, so it must happen
+    // only when this call is really going to take a pause. The first version
+    // asked only "is a cycle active?", which is true for the WHOLE of a mark
+    // cycle -- so every JIT allocation in that window retired its TLAB and the
+    // H2 workload stopped finishing at all (rc=124 at 600 s against ~60 s).
+    // The mixed collections it unblocked were real (9 pauses, 516 MB freed);
+    // the cost of getting there was not.
+    let work = if vm.mem.heap.g1_is_marking_active() {
+        // Only a DRAINED cycle has anything to do here.
+        vm.mem.heap.g1_concurrent_mark_finished()
+    } else {
+        vm.mem.heap.g1_should_start_marking()
+    };
+    if !work {
+        return;
+    }
+    // Needs a `JvmThread`: both halves take a real STW pause, and only a
+    // registered thread can request one.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.retire();
+        crate::runtime::interpreter::g1_drive_concurrent_mark_pub(vm, thread);
+    }
+}
+
+/// OPT-IN, and the reason is measured, not cautious.
+///
+/// Driving the lifecycle works exactly as designed. On
+/// `org.h2.test.store.TestMVStoreTool` at `-Xmx256m`, one binary, driver on
+/// against driver off:
+///
+///   on   16-47 mixed pauses, 680-1382 MB reclaimed by them
+///   off  0-8 mixed pauses, `OutOfMemoryError: Java heap space` 3/3 in 46-102 s
+///
+/// Without it the collector never gets that memory back at all: this hook is
+/// the only caller of either half that a compiled workload reaches.
+///
+/// # Why it is still not the default
+///
+/// Two separate defects were measured behind this switch. The first is FIXED
+/// and is no longer a reason:
+///
+/// 1. CORRUPT CELLS -- GONE. Runs on 2026-09-05 reported >=32 `corrupt Value
+///    cell` errors each, always after the first mixed pause, one in three
+///    ending in a fatal `forwarding target must have its low 2 bits clear`.
+///    That was `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
+///    (fixed the same day, `CRATONVM_G1_PARALLEL_EVAC_SCREEN`), not something
+///    new here: the holder report this branch added printed `class_id`
+///    163587104 = 0x09C02470, the low half of the heap pointer 0x1f509c02470,
+///    which is that page's fabrication pattern verbatim. Re-measured on the
+///    merged tip: 0 corrupt cells in 3/3 driver-on runs.
+///
+/// 2. A SIGSEGV THAT SURVIVED IT -- still open, and the actual blocker. On the
+///    fixed tip, 2 of 3 driver-on runs still die with SIGSEGV, and the count of
+///    `IMPLAUSIBLE legacy header` refusals tracks it exactly: 13 and 8 in the
+///    two that crashed, 0 in the one that did not. The screens now REFUSE the
+///    bad candidates instead of fabricating headers from them, so the crash has
+///    moved rather than gone. The refusals split
+///    `evacuate-src` / `evacuate-dest` / `ref-slot-candidate`, i.e. the source
+///    header, the copy, and a reference slot all reach the screen implausible.
+///
+/// The driver-off arm is NOT a clean negative for (2): it never segfaults, but
+/// it also dies of OOM in 46-102 s and so never reaches the depth where the
+/// fault happens. What the control does establish is that the corrupt-cell
+/// family is gone from both arms.
+///
+/// So this switch is how you REACH the remaining defect, not a tuning knob.
+/// Default it on once a driver-on run survives without implausible-header
+/// refusals.
+fn g1_jit_mark_driver_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_JIT_MARK_DRIVER").is_some()
+    })
+}
+
 #[inline]
 unsafe fn jit_maybe_start_zgc_concurrent_mark(vm: &SharedVm) {
     if !vm.mem.heap.zgc_should_start_concurrent_mark() {
@@ -4459,6 +4664,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     if vm_ptr != 0 {
         // SAFETY: same provenance as the `&*(vm_ptr as *const SharedVm)` below.
         jit_maybe_start_zgc_concurrent_mark(&*(vm_ptr as *const SharedVm));
+        jit_drive_g1_concurrent_mark(&*(vm_ptr as *const SharedVm));
     }
     let elem_type = match atype as u8 {
         4 => ArrayElementType::Boolean,
@@ -5076,6 +5282,9 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     let class_id = ClassId::new(class_id_raw as u32);
     // ZGC: the concurrent-start check the interpreter does in `maybe_gc`.
     jit_maybe_start_zgc_concurrent_mark(vm);
+    // G1: the concurrent-mark lifecycle the interpreter drives from the same
+    // place. See `jit_drive_g1_concurrent_mark`.
+    jit_drive_g1_concurrent_mark(vm);
 
     // JVMS §5.5 / §new: `new` must initialize its class before the object
     // is allocated -- same missing check, same shape of bug as the
@@ -5123,8 +5332,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // site needs a `jit_thread_mut()` acquire merely to have a thread to hand
     // it. The memo skips BOTH. `is_class_initialized_via_manager` +
     // `ensure_class_initialized_shared` were 12.2% of a whole-process profile
-    // of an allocation loop -- see `fixed-suite-bugs/netty/`
-    // `osr-door-binds-ctor-and-the-inline-new-lever-is-inert-FIXED-20260817.md`.
+    // of an allocation loop -- see `osr-door-binds-ctor-and-the-inline-new-lever-is-inert-FIXED-20260817.md`.
     if new_class_init_memo_enabled() {
         if !class_init_memo::is_initialized(vm.vm_identity, class_id_raw as u32) {
             if let Some((thread, _guard)) = jit_thread_mut() {
@@ -6185,6 +6393,14 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
         // path constructs the real exception and routes it through the method's
         // exception table.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -6256,6 +6472,14 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
         // return; the interpreter's post-JIT drain surfaces the exception at this
         // method (see `take_jit_pending_aioobe` in runtime/interpreter.rs).
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -6297,6 +6521,14 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
         // index (same protocol as `jit_throw_aioobe`). Previously returned 0,
         // silently fabricating a zero element and masking real OOB bugs.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *const i32;
@@ -6334,6 +6566,14 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
         // interpreter's post-JIT drain surfaces the exception (same void-arm protocol
         // as the null case above).
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
@@ -7189,6 +7429,14 @@ pub unsafe extern "C" fn jit_aaload(vm_ptr: i64, array_ptr: i64, index: i64) -> 
         // index (same protocol as `jit_throw_aioobe`). Previously returned 0 (null),
         // silently fabricating a null element and masking real OOB bugs.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size());
@@ -7447,6 +7695,14 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         // or written on the OOB path). The void return cannot carry the deopt
         // sentinel, so the interpreter's post-JIT drain surfaces the exception.
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+        // The frames this bounds check fired in are about to leave: the helper
+        // returns and the compiled body runs its epilogue, so the
+        // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+        // on a stack that no longer has them. Snapshot here, the one moment the
+        // signal and the frames both exist -- the same rung the NPE and
+        // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+        // bci is one the frame walk already has, unlike an inline null check's.
+        snapshot_trap_frames(0);
         return;
     }
     // JVMS §aastore covariance check: a non-null element whose runtime type is
@@ -8041,7 +8297,7 @@ pub fn jit_getfield_receiver_shapes() -> Vec<(&'static str, u64)> {
 /// This is the fork that decides whether anything further is reachable on ZGC
 /// and G1. Those two collectors publish no region bounds by design — the empty
 /// `JIT_REGION_BOUNDS` is the interlock that keeps inline reference STORES
-/// unreachable there (`audits/g1-audit.md` §8.1) — so containment can only be
+/// unreachable there (`g1-audit.md` §8.1) — so containment can only be
 /// bypassed by a receiver check that does not need it. The IR tier now has one
 /// (`emit_trusted_oop_receiver_check`, primitives only), and the single-pass
 /// arm has always had one.
@@ -8513,7 +8769,7 @@ unsafe fn jit_getfield_impl(
     // that follows it) fell through: every compiled `getfield` either takes its
     // inline branch or lands here, so this count IS the fast path's miss count.
     //
-    // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md
+    // every-jit-getfield-takes-the-helper-FIXED-20260820.md
     // asks for exactly this as its step 1 — "a fix priced on anything but that
     // counter is a guess" — because three separate signals (the gates are
     // default-on, 35 sites were emitted, the codegen arm has unit tests) all
@@ -8635,7 +8891,7 @@ unsafe fn jit_getfield_impl(
         // on a plain field read/write being tear-free (e.g.
         // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
         // `firstReaderHoldCount`) -- see
-        // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
         let val: Value =
             cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
@@ -9510,7 +9766,7 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// the `OWNER` latch, and every other VM answers `is_initialized == false` and
 /// takes the authoritative `ensure_class_initialized_shared` path forever. That
 /// is a correct-but-slower outcome for VM #2, and no shared mutable state can
-/// give a wrong answer. See `audits/vm-jit-cache-keying.md`.
+/// give a wrong answer. See `vm-jit-cache-keying.md`.
 mod class_init_memo {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -10812,6 +11068,51 @@ unsafe fn jit_typecheck_resolve(
             ) {
                 return true;
             }
+            // Loader-duplication fallback -- the TWIN of the one at the bottom
+            // of this function, which this branch's early `return false` was
+            // hiding from every site that had an id to record.
+            //
+            // The interpreter accepts a same-named class from another loader:
+            // `op_checkcast`/`op_instanceof` both end their assignability
+            // chain in `loader_aware_name_assignable`, and
+            // `CRATONVM_LOADER_AWARE_RESOLUTION` defaults ON. So refusing here
+            // is not "stricter", it is a JIT/interpreter DIVERGENCE -- the same
+            // one the by-name fallback below was already written to close for
+            // `SpringBootContextLoaderAotTests` (Residual 6). That fix landed
+            // on the by-name path only, and a site whose target class WAS
+            // loaded at compile time never reaches it.
+            //
+            // Spring Boot's forked-classpath tests are where the gap shows.
+            // `ModifiedClassPathClassLoader` re-defines a framework jar's
+            // classes in a child loader, and CratonVM's flat store can hand
+            // one CONSTANT_Class reference the app copy while the compiler
+            // resolved this site to the child copy through the compiling
+            // class's own loader. Under `-Jit on` that surfaced as
+            //
+            //   ClassCastException: class org.apache.hc.client5.http.psl.PublicSuffixList
+            //     cannot be cast to class org.apache.hc.client5.http.psl.PublicSuffixList
+            //
+            // out of `PublicSuffixMatcher.<init>`, in four Spring Boot classes
+            // that all pass under `--nojit`. `[DBG_TYPECHECK]` named it
+            // exactly: `recv=(id=3125 loader=Application)` against
+            // `resolved_target=(id=3126 loader=UserDefined(3))`, same binary
+            // name on both sides.
+            if vm
+                .classes
+                .class_manager
+                .read()
+                .is_assignable_to_name(obj_class_id, class_name)
+            {
+                jit_typecheck_trace(
+                    vm,
+                    obj_class_id,
+                    class_name,
+                    lenient,
+                    "recorded-site-loader-duplication-by-name",
+                    Some(target_class_id),
+                );
+                return true;
+            }
             jit_typecheck_trace(
                 vm,
                 obj_class_id,
@@ -11162,7 +11463,7 @@ pub unsafe extern "C" fn jit_checkcast(
         // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
         // which is also the all-zero header the collector leaves over a
         // reclaimed span; free-list membership tells the two apart.
-        // See audits/old-sweep-liveness.md section 7.
+        // See old-sweep-liveness.md section 7.
         //
         // 2026-08-02: moved into `memory::reclaim_guard` so the three faces of
         // this defect — interpreted `checkcast`, compiled `checkcast`, and an
@@ -11278,7 +11579,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // next would then read through a dangling pointer — observed live as
     // a SIGSEGV inside this function under concurrent executor load
     // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
-    // fixed-suite-bugs/wildfly/wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
+    // wildfly-domain-heap-corrupt-value-timeout-RESOLVED.md).
     // `is_object_address` additionally validates the address falls inside
     // a live heap region (and looks like a real header) before ever
     // dereferencing it, degrading a dangling reference to "not an
@@ -11381,6 +11682,14 @@ mark_word={mark_word:#x}"
         }
     }
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
+    // The frames this bounds check fired in are about to leave: the helper
+    // returns and the compiled body runs its epilogue, so the
+    // `ArrayIndexOutOfBoundsException` is built later, from the interpreter,
+    // on a stack that no longer has them. Snapshot here, the one moment the
+    // signal and the frames both exist -- the same rung the NPE and
+    // div-by-zero setters stand on. `0` for the trap key: an array opcode's
+    // bci is one the frame walk already has, unlike an inline null check's.
+    snapshot_trap_frames(0);
     // Out-of-band deopt signal: this `i64::MIN` IS the bounds-check stub's
     // method return value, so flag it as a genuine deopt so the interpreter
     // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
@@ -11428,6 +11737,20 @@ pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     JIT_SIGNALS.with(|s| s.arithmetic.set(true));
+    // Same reason as the NPE setters, and it was missing here: the
+    // `ArithmeticException` is not constructed at the trap. The stub flags the
+    // signal, returns the deopt sentinel and runs the method EPILOGUE, so the
+    // `fillInStackTrace` that eventually runs walks a stack the compiled frames
+    // have already left — an empty trace for a throwable that came from four
+    // frames of compiled code. This is the only moment both the signal and the
+    // frames exist, so it is the only place the snapshot can be taken.
+    //
+    // `0` for the trap key: the NPE path carries a per-site id because an
+    // inline null check publishes no safepoint, but a div-by-zero guard is
+    // reached from `idiv`/`irem`/`ldiv`/`lrem`, whose bci the frame walk
+    // already has. Passing a site id it does not have would be worse than
+    // passing none.
+    snapshot_trap_frames(0);
     set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw ArithmeticException
 }
@@ -11495,7 +11818,7 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     } else if let Some((thread, _guard)) = jit_thread_mut() {
         // The throwable is stashed on the `JvmThread` so the collector can
         // both keep it alive and relocate it before the interpreter's drain
-        // reads it back (`fixed-bugs/jit-signals-root-gap.md`).
+        // reads it back (`jit-signals-root-gap.md`).
         set_jit_pending_exception_with_bci(
             thread,
             ObjectRef::from_raw(exc_ptr as usize as *mut u8),
@@ -12133,7 +12456,7 @@ static SITE_CACHED_NATIVE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// removable from a run in one flag.
 ///
 /// See
-/// `fixed-suite-bugs/springboot/batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
+/// `batch-data-mongodb-mongocustomconversions-noclassdeffounderror-RESOLVED-20260805.md`.
 pub(crate) fn native_site_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -12271,7 +12594,7 @@ pub fn leaf_native_refusals() -> Vec<(&'static str, u64)> {
 /// JIT and 0 times under `--nojit`, `StreamSupport.stream(spliterator, false)`
 /// handing back the spliterator, `Proxy$Dispatch.invokeProxy` reached with a
 /// null `Method`. See
-/// `fixed-suite-bugs/springboot/cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
+/// `cacheautoconfigurationtests-configclass-parse-nosuchmethod-FIXED.md`.
 ///
 /// So `all` is restored. Gating it would cost 836631dcc's win to work around a
 /// defect that no longer exists. **A perf change that makes a latent defect
@@ -12701,7 +13024,7 @@ fn resolve_native_site(
 /// field read, and, through `AbstractByteBuf.ensureAccessible()` ->
 /// `RefCnt.isLiveNonVolatile` -> `VH.get`, made every netty `ByteBuf`
 /// accessor cost ~2.6 µs. See
-/// `fixed-suite-bugs/netty/varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
+/// `varhandle-signature-polymorphic-dispatch-FIXED-20260817.md`.
 ///
 /// [`vm_exec::invoke_on_class_shared_inner`] already handles the shape, in the
 /// `None` arm of its hierarchy resolution — i.e. exactly where rules 1-3
@@ -20204,7 +20527,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
 /// unqualified. Claiming after the attempt instead would trade it for
 /// re-asking (a lock and a layout lookup) on every dispatch a refused site ever
 /// serves, which is the shape of the 202 000 re-installs
-/// `LambdaJitSite::adapter_installed` exists to prevent.
+/// `LambdaJitSite::adapter_slots` exists to prevent.
 ///
 /// Both slots are written, because the emitted cascade prefers the PIC when the
 /// codegen allocated one and never consults the MIC in that case.
@@ -20245,7 +20568,7 @@ unsafe fn install_lambda_inline_cache(
         }
         crate::runtime::interpreter::const_probe_note_opaque();
     }
-    if !site.claim_adapter_install() {
+    if !site.claim_adapter_install(mic_ptr, pic_ptr) {
         return;
     }
     // `total_args` is captures plus SAM arguments; the emitter wants them apart,
@@ -20286,9 +20609,16 @@ unsafe fn install_lambda_inline_cache(
     if installed {
         crate::runtime::interpreter::lambda_site_bump_adapter(site.num_captures());
         if mic_prof::enabled() {
+            // The call counts AT THE MOMENT OF INSTALL. `site_adapters`
+            // alone cannot tell "installed early and served" from
+            // "installed after the workload was over", which is exactly
+            // what an intermittent `site_direct` failure asks.
+            let (fast_returns, site_direct, _) =
+                crate::runtime::interpreter::lambda_jit_engagement();
             eprintln!(
                 "[cratonvm-jitc] lambda-adapter installed class_id={class_id} \
-                 captures={} sam_args={sam_args} entry={entry:#x} impl={}",
+                 captures={} sam_args={sam_args} entry={entry:#x} impl={} \
+                 at site_direct={site_direct} fast_returns={fast_returns}",
                 site.num_captures(),
                 class_name,
             );
@@ -20563,21 +20893,36 @@ fn jit_abi_bits_of(value: Option<Value>) -> i64 {
 /// The direct lambda arm has to DRAIN the signals to tell a deopt sentinel from
 /// a `long` equal to `Long.MIN_VALUE`, and when the answer is "not a deopt" the
 /// signals still belong to the compiled caller's own post-invoke checks.
-fn restash_jit_signals(thread: &mut JvmThread, sig: DrainedJitSignals) {
+fn restash_jit_signals(thread: &mut JvmThread, mut sig: DrainedJitSignals) {
     if let Some(exc) = sig.exception {
         set_jit_pending_exception(thread, exc);
     }
-    if let Some((index, length)) = sig.aioobe {
-        stash_jit_pending_aioobe(index, length);
-    }
+    // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
+    // frames belong to the trap, not to this drain, so put back the ones that
+    // were taken instead of sampling a fresh (shallower) stack.
+    // ONE `trap_frames` slot, so exactly ONE of these three may restore it
+    // and the rest come back flag-only. Writing it more than once is not a
+    // tidiness point: every one of these setters ASSIGNS the slot, so a
+    // second call with `None` would wipe the frames the first put back.
+    // JVMS does not let one frame have two of these pending at once, so
+    // the priority never arbitrates anything real -- it is written out so
+    // the next reader does not have to derive that from three `take()`s.
+    let frames = sig.trap_frames.take();
     if sig.npe {
-        // Same rule as `handle_compiled_callee_deopt_sentinel`'s restore: the
-        // frames belong to the trap, not to this drain, so put back the ones
-        // that were taken instead of sampling a fresh (shallower) stack.
-        restash_jit_pending_npe(sig.npe_action, sig.npe_compiled_frames);
-    }
-    if sig.arithmetic {
-        stash_jit_pending_arithmetic();
+        restash_jit_pending_npe(sig.npe_action, frames);
+        if sig.arithmetic {
+            stash_jit_pending_arithmetic();
+        }
+        if let Some((index, length)) = sig.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if sig.arithmetic {
+        restash_jit_pending_arithmetic(frames);
+        if let Some((index, length)) = sig.aioobe {
+            stash_jit_pending_aioobe(index, length);
+        }
+    } else if let Some((index, length)) = sig.aioobe {
+        restash_jit_pending_aioobe(index, length, frames);
     }
     if sig.deopt {
         set_jit_deopt_pending();
@@ -22895,7 +23240,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
-    // (audits/vm-jit-cache-keying.md)
+    // (vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     /// Serializes the tests that reset the two process-global, VM-owned
@@ -22911,7 +23256,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The pending JIT exception is thread-resident, not TLS-resident
-    // (fixed-bugs/jit-signals-root-gap.md)
+    // (jit-signals-root-gap.md)
     // -----------------------------------------------------------------------
 
     fn scratch_thread(id: u64) -> JvmThread {
@@ -24474,7 +24819,7 @@ mod tests {
     }
 
     // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
-    // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // elasticsearch-lucene-binary-docvalues-range-hangs.md
     // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
     // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
     // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
@@ -25385,7 +25730,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `feature-designs/vm-process-global-state.md`.
+/// `vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.
@@ -25711,7 +26056,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
         // The READ-side sibling. Same six-word shape, DIFFERENT table on
         // purpose: `JIT_REGION_BOUNDS` above is what gates inline reference
         // STORES, and G1/ZGC keep it empty so an inline store can never skip
-        // `post_write_barrier_rset` (`audits/g1-audit.md` 8.1). This one
+        // `post_write_barrier_rset` (`g1-audit.md` 8.1). This one
         // answers only the read question -- is the receiver inside mapped
         // arena memory, so a raw load cannot fault -- and G1 does publish its
         // single contiguous arena span into it. ZGC publishes nothing, which

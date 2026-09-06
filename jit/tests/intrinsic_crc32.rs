@@ -37,7 +37,7 @@
 //!
 //! `java.util.zip.CRC32` and `CRC32C` each declare exactly one instance
 //! field — `private int crc` at slot 0 — holding the running (uncomplemented)
-//! CRC state (see gaps/crc_layout_contract.md). The instance field
+//! CRC state (see crc_layout_contract.md). The instance field
 //! cell is the 16-byte `Value` enum at `HEADER_SIZE + 0*SLOT_SIZE`; the `Int`
 //! tag word sits at `FIELD_CELL_TAG_OFFSET`, the 32-bit payload at
 //! `FIELD_CELL_PAYLOAD32_OFFSET`. We synthesize exactly that layout and hand

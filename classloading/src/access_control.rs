@@ -60,8 +60,8 @@
 //! Wiring this up requires edits in `vm/src/runtime/interpreter.rs`, which this
 //! module's owner does not own; the exact insertion points are recorded under
 //! "cross-owner requests" in
-//! `arch-2026-07-26/classloading-verify-and-resolve.md` and in
-//! `arch-2026-07-26/access-control-and-map-coverage.md`.
+//! `classloading-verify-and-resolve.md` and in
+//! `access-control-and-map-coverage.md`.
 //!
 //! # 2026-07-26: the two false-denial defects are FIXED; the checks are safe
 //! to wire

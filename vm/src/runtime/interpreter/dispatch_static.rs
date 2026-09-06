@@ -109,8 +109,7 @@ pub(super) fn execute_invokestatic(
             method_class_name, method_name, method_descriptor, is_native, direct_native
         );
     }
-    // Self-call identity fix (2026-07-06 — see hib-proxyclassreuse-loader-
-    // blind-class-resolution.md Residual B): when the invokestatic's
+    // Self-call identity fix (2026-07-06 — see hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md Residual B): when the invokestatic's
     // constant-pool owner class NAME textually equals the CURRENTLY
     // EXECUTING class's own name, that class is by definition already
     // loaded/linked/initialized — it is literally running this bytecode
@@ -567,7 +566,7 @@ pub(super) fn execute_invokestatic(
 
 // ───────────────────────── Interpreter intrinsic table ─────────────────────
 //
-// See `gaps/feature_roadmap_interpreter_intrinsic_table.md`. An intrinsic is a
+// See `feature_roadmap_interpreter_intrinsic_table.md`. An intrinsic is a
 // hot JDK method (`String.length`, `Object.getClass`, `System.arraycopy`, …)
 // resolved ONCE at inline-cache fill time into a `CachedInvokeTarget::Intrinsic`
 // entry. The steady-state hit pops args and calls the stored callback with no
@@ -1837,7 +1836,7 @@ pub(super) fn execute_invokestatic_cached(
             // (e.g. `0xFFFC_…`, a BC safegcd accumulator) as `Value::Int`,
             // dropping the high bits before it reached the callee's locals.
             // The non-cached `execute_invokestatic` path already decodes this
-            // way. See gaps/bc-ec-mod-mododdinverse-investigation.md.
+            // way. See bc-ec-mod-mododdinverse-investigation.md.
             // 8, not 16. `args_buf` is `[Value; MAX_INLINE_ARGS]` and `Value`
             // is 16 bytes, so at 16 this initialised 256 BYTES on every call
             // regardless of how many arguments the callee actually takes. The

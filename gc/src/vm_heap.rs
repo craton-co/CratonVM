@@ -854,9 +854,9 @@ impl VmHeap {
             // 8-byte stack word instead calls `ZgcRealHeap::is_object_address`
             // (`zgc.rs:1892`), whose first act is `self.registry.lock()`: one
             // mutex acquire PER STACK WORD, per root-gathering pass, per
-            // thread. `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
+            // thread. `zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
             // as a competing explanation for the 35 PASS→HANG classes in
-            // `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`,
+            // `zgc-real-fullsuite-regression-RETIRED-20260807.md`,
             // whose ApplicationContext boot/teardown shape is exactly deep
             // stacks × many threads. `zgc.rs:1467-1474` records that the same
             // shape already "read as a hang at scale" once — that fix covered
@@ -1005,9 +1005,9 @@ impl VmHeap {
             // `interpreter/gc_and_alloc.rs:4260`), whose dominant population
             // is zeros, small integers and long bit patterns — every one of
             // which currently buys a full walk of the heap.
-            // `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
+            // `zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
             // instrument-separable hypotheses for the 35 PASS→HANG classes in
-            // `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+            // `zgc-real-fullsuite-regression-RETIRED-20260807.md`.
             //
             // Why it cannot lose a root. The guard only ever returns `None`
             // sooner; it can never turn a `None` into a `Some`, so no interior
@@ -2088,7 +2088,7 @@ impl VmHeap {
     /// (`G1Collector::native_alloc_pressure`) — without it, a workload that
     /// allocates only from inside natives never reaches ANY safepoint and G1's
     /// infallible allocator aborts the process on a heap full of garbage (see
-    /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
+    /// `g1-native-alloc-no-safepoint-oom-FIXED.md`).
     ///
     /// ZGC: the same defect was live here, verbatim. `ZgcRealHeap` is an
     /// infallible allocator too — `alloc_object` and `alloc_array` end in
@@ -2622,7 +2622,7 @@ impl VmHeap {
     /// `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
     /// holds a live JIT frame — the steady state at a 500-invocation JIT
     /// threshold; compaction's correctness blocker closed 2026-07-26
-    /// (`fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+    /// (`moving-young-gen-drops-jit-held-oops-FIXED.md`),
     /// and moving-young is now the default. Under a
     /// non-moving, fragmenting heap "unused bytes" and "bytes an
     /// allocation can actually obtain" diverge without bound: a heap can be 60%
@@ -2657,7 +2657,7 @@ impl VmHeap {
     /// `last_observed_clock_ms` field doc there.) Until that lands, the soft-ref
     /// policy runs on a constant 64 MB of assumed headroom and therefore does
     /// not respond to memory pressure at all. Tracked in
-    /// `arch-2026-07-26/refs-metaspace-unloading.md`.
+    /// `refs-metaspace-unloading.md`.
     pub fn soft_ref_policy_free_mb(&self) -> usize {
         const MB: usize = 1024 * 1024;
         let (young_used, young_cap) = self.young_gen_stats();
@@ -3333,12 +3333,12 @@ impl VmHeap {
                         let (att, ok, total) =
                             cratonvm_types::gc_entry_census::refill_totals();
                         eprintln!(
-                            "[GC] zgc-entry:   tlab refills attempted={att} succeeded={ok};                              bytes_allocated_total={total} (the wedge break's re-arm,                              one break per 64 MB)"
+                            "[GC] zgc-entry:   tlab refills attempted={att} refill_succeeded={ok};                              bytes_allocated_total={total} (the wedge break's re-arm,                              one break per 64 MB)"
                         );
                         let (rt, rok) =
                             cratonvm_types::gc_entry_census::refill_retry_totals();
                         eprintln!(
-                            "[GC] zgc-entry:   post-break refill retries={rt}                              succeeded={rok} (a success seeds the TLAB, whose                              allocations re-arm the breaker)"
+                            "[GC] zgc-entry:   post-break refill retries={rt}                              retry_succeeded={rok} (a success seeds the TLAB, whose                              allocations re-arm the breaker)"
                         );
                     }
                     for (site, n) in cratonvm_types::gc_entry_census::forced_sites() {
@@ -3477,7 +3477,22 @@ impl VmHeap {
             // `vacated_bytes` is the measure of what that cost.
             let (vac_spans, vac_bytes) = h.vacated_publication();
             eprintln!(
-                "[GC] zgc-high-compaction: cycles={hi_cycles} declined={hi_declined}                  objects_relocated={hi_moved} bytes_copied={hi_bytes}                  vacated_spans={vac_spans} vacated_bytes={vac_bytes}"
+                // KEYS PREFIXED `high_`, and that is not cosmetic. This line
+                // used to print `cycles=` and `objects_relocated=`, which are
+                // the SAME KEYS the whole-heap compaction line above emits for
+                // an unrelated population -- the large-object end, whose counts
+                // are tiny beside it (12 against 601233 on a measured H2 run).
+                // A reader grepping the summary for `objects_relocated=` gets
+                // two matches with no way to tell which is which, and the
+                // obvious `| tail -1` picks THIS one. That is not a
+                // hypothetical: it produced a wrong figure in an H2 analysis on
+                // 2026-09-05, and the sibling collision on `cycles=` made a GC
+                // control read a vacuous zero in the same session.
+                //
+                // A summary is an interface. Its keys have to be unique across
+                // the whole summary or it is not greppable, which is the only
+                // way anyone consumes it.
+                "[GC] zgc-high-compaction: high_cycles={hi_cycles} high_declined={hi_declined}                  high_objects_relocated={hi_moved} high_bytes_copied={hi_bytes}                  high_vacated_spans={vac_spans} high_vacated_bytes={vac_bytes}"
             );
             // CONCURRENT marking, on its own line and with five fields rather
             // than one, because four different runs look identical in any
@@ -3661,7 +3676,7 @@ impl VmHeap {
             );
             let l = &crate::gen_heap::LATE_WALK_ZERO_RUNS;
             eprintln!(
-                "[GC] late_walk_zero_runs: mark_y2o={} fixup_yo={} walk_young={}",
+                "[GC] late_walk_zero_runs: zr_mark_y2o={} zr_fixup_yo={} zr_walk_young={}",
                 l[0].load(O::Relaxed),
                 l[1].load(O::Relaxed),
                 l[2].load(O::Relaxed),
@@ -3715,8 +3730,8 @@ impl VmHeap {
             // …and when the evacuation pre-pass DID run, what stopped it.
             let e = &crate::gen_heap::EVAC_UNWIND_REASONS;
             eprintln!(
-                "[GC] evac_unwind: overshoot={} zero_span={} bad_size={} \
-                 hole_crossing={} candidates_dropped={}",
+                "[GC] evac_unwind: unwind_overshoot={} unwind_zero_span={} unwind_bad_size={} \
+                 unwind_hole_crossing={} candidates_dropped={}",
                 e[0].load(O::Relaxed),
                 e[1].load(O::Relaxed),
                 e[2].load(O::Relaxed),
@@ -3831,7 +3846,7 @@ impl VmHeap {
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
         // ("per-cycle coverage proof, moving is possible") disagreement for
-        // THIS run — see `audits/tlab-and-card-audit.md` §3.
+        // THIS run — see `tlab-and-card-audit.md` §3.
         //
         // Under G1 this used to be uninformative by construction:
         // `G1Collector::collect_garbage` passed the constant
@@ -3859,8 +3874,8 @@ impl VmHeap {
         {
             let c = crate::gen_evac::par_evac_census();
             eprintln!(
-                "[GC] par_evac: cycles={} helper_scans={} cas_losses={} \
-                 declined_for_slack={} filler_bytes={} promotions={} \
+                "[GC] par_evac: par_evac_cycles={} helper_scans={} cas_losses={} \
+                 declined_for_slack={} filler_bytes={} par_evac_promotions={} \
                  deferred_cards={}",
                 c.cycles,
                 c.helper_scans,
@@ -3877,7 +3892,7 @@ impl VmHeap {
             // the young generation never actually copied anything, which is the
             // exact way the 2026-07-01 validation declared moving-young working
             // while it was inert (see
-            // `arch-2026-07-26/moving-young-corruption-rootcause.md`
+            // `moving-young-corruption-rootcause.md`
             // section 6). The histogram then names what stopped it.
             let cycles = crate::gc_quiescence::moving_young_cycle_count();
             eprintln!("[GC] moving_young: cycles={cycles} coverage_fallbacks={fallbacks}");
@@ -3954,7 +3969,7 @@ impl VmHeap {
             // frame blocks the moving young collector — so a freed block kept
             // answering "live" and no consumer of this predicate ever pruned a
             // dangling old-gen entry. See
-            // `fixed-suite-bugs/gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
+            // `gc-old-gen-mark-accepts-unvalidated-addresses-FIXED.md`.
             //
             // Young-GC live-reclaim ROOT FIX (2026-07-07): also recognize
             // kept-in-place young survivors of the NON-MOVING sweep (which
@@ -4031,7 +4046,7 @@ impl VmHeap {
     /// victim was the zeroed tail, and a silent dangling-pointer store into a
     /// live object otherwise (`SIGSEGV` /
     /// `gen_heap::read_slot: corrupt Value cell`, the HIB-CV-32 family; see
-    /// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
+    /// `bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`).
     ///
     /// Both old-gen paths now emit an identity `pointer_map` entry for every
     /// watched address that survived without moving, so once
@@ -4174,7 +4189,7 @@ impl VmHeap {
     /// class-lock/condy object with no other reference), it is silently
     /// reclaimed and its memory reused by the very next allocation —
     /// producing a live object that reads back as a DIFFERENT, unrelated
-    /// type. See `fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`'s
+    /// type. See `spb1-springframework-util-investigation-FIXED.md`'s
     /// repro-3 follow-up for the observed corruption shape (a `ClassUtils`
     /// static field, loaded via a user-defined `ClassLoader`, read back as
     /// an unrelated live object from later in the same `<clinit>`).
@@ -4611,6 +4626,98 @@ mod gpu_coordination_tests {
 // joins it, that the SATB barrier is captured during the concurrent
 // phase, and that the edge cases (re-entry, defensive no-op, repeated
 // cycles) behave as documented.
+
+#[cfg(test)]
+mod gc_summary_key_tests {
+    /// Every `key=` in the `[GC]` summary must be unique across the WHOLE
+    /// summary, not merely within its own line.
+    ///
+    /// # Why this is a test and not a style note
+    ///
+    /// The summary is an interface, and the only way anyone consumes it is
+    /// `grep`. A key that appears on two lines therefore has no answer: the
+    /// reader gets two matches for unrelated quantities and the obvious
+    /// `| tail -1` silently picks whichever comes last.
+    ///
+    /// That is not hypothetical. Both of these cost real analysis time on
+    /// 2026-09-05:
+    ///
+    /// * `objects_relocated=` was printed by whole-heap compaction AND by
+    ///   `zgc-high-compaction`, whose large-object counts are tiny beside it.
+    ///   An H2 measurement read **12** where the run had relocated **601233**.
+    /// * `cycles=` was printed by `par_evac` and `moving_young`. A GC control
+    ///   in the same session matched `par_evac`'s — which is the GENERATIONAL
+    ///   evacuator and reads zero under ZGC whatever ZGC did — and reported a
+    ///   vacuous zero as if the heap had never collected.
+    ///
+    /// Ten keys collided when this test was written. The fix is a per-line
+    /// prefix (`high_`, `unwind_`, `zr_`, `par_evac_`, `refill_`/`retry_`);
+    /// the rule is that a new summary field may not reuse a name another line
+    /// already owns.
+    #[test]
+    fn every_gc_summary_key_is_unique_across_the_whole_summary() {
+        let src = include_str!("vm_heap.rs");
+
+        // Establish the corpus before concluding anything from it: a file that
+        // stopped carrying the summary would make this pass vacuously.
+        let lines: Vec<&str> = src
+            .match_indices("\"[GC]")
+            .filter_map(|(i, _)| {
+                let rest = &src[i + 1..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect();
+        assert!(
+            lines.len() > 20,
+            "expected the [GC] summary to have many lines, found {} -- this scan              is reading the wrong text and its verdict means nothing",
+            lines.len()
+        );
+
+        // `key={` is the format-string form; that is what a reader greps for.
+        let keys_of = |line: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            let b = line.as_bytes();
+            for (i, _) in line.match_indices("={") {
+                let mut s = i;
+                while s > 0 {
+                    let c = b[s - 1];
+                    if c.is_ascii_alphanumeric() || c == b'_' {
+                        s -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if s < i {
+                    let k = &line[s..i];
+                    if !k.chars().next().unwrap_or('0').is_ascii_digit() && !out.contains(&k.to_string()) {
+                        out.push(k.to_string());
+                    }
+                }
+            }
+            out
+        };
+
+        let mut owner: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut collisions: Vec<String> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            for k in keys_of(line) {
+                match owner.get(&k) {
+                    Some(&first) if first != idx => collisions.push(k),
+                    _ => {
+                        owner.entry(k).or_insert(idx);
+                    }
+                }
+            }
+        }
+        collisions.sort();
+        collisions.dedup();
+        assert!(
+            collisions.is_empty(),
+            "these [GC] summary keys appear on more than one line, so grepping              the summary for them returns unrelated quantities and `| tail -1`              picks an arbitrary one: {collisions:?}. Give the newer line's field              a prefix of its own."
+        );
+    }
+}
 
 #[cfg(test)]
 mod concurrent_mark_controller_tests {

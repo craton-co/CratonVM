@@ -59,6 +59,25 @@ fn ipc_dbg(msg: impl AsRef<str>) {
     }
 }
 
+/// Phase tracer for the blocking connect, answering to EITHER
+/// `CRATONVM_SUREFIRE_IPC_DBG` or `CRATONVM_DBG_NET`.
+///
+/// Two flags on purpose. The connect path's existing traces are `ipc_dbg`,
+/// gated on `CRATONVM_SUREFIRE_IPC_DBG` — a name nobody reaches for when
+/// investigating a socket stall. `CRATONVM_DBG_NET=1` on a hung connect
+/// therefore printed NOTHING, and the silence read as "this path has no
+/// tracing" rather than "you picked the wrong flag"; that cost most of the
+/// localisation effort in
+/// `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+/// A separate function rather than widening `ipc_dbg` itself, so the ~50
+/// existing IPC sites keep their current gate and only the connect phases
+/// gain the second one.
+fn connect_dbg(msg: impl AsRef<str>) {
+    if ipc_dbg_enabled() || crate::io_flags().dbg_net {
+        eprintln!("[CONNECT-DBG] {}", msg.as_ref());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry of real OS sockets — keyed by integer id stashed in the synthetic
 // SocketChannelImpl / ServerSocketChannelImpl Java object.
@@ -728,7 +747,7 @@ fn alloc_channel_as_impl(
 /// Returns the channel ref, which the caller MUST use from here on: seeding
 /// `interruptor` allocates, and an allocation can move `ch`.
 #[must_use]
-fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
+pub(crate) fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
     // Seed each monitor field with the channel object ITSELF rather than a fresh
     // `new Object()`. The fields only need to be a non-null, stable monitor; the
     // channel is one, and using it avoids the allocation entirely — which matters
@@ -1056,6 +1075,55 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
     }
 }
 
+/// Mark a real-JDK channel object CLOSED **where the JDK itself reads it**.
+///
+/// `java.nio.channels.spi.AbstractInterruptibleChannel` keeps one `volatile
+/// boolean closed`, and the whole close protocol is written against it:
+///
+/// ```text
+///   public final boolean isOpen()  { return !closed; }
+///   public final void    close()   { synchronized (closeLock) {
+///                                        if (closed) return; closed = true; }
+///                                    implCloseChannel(); }
+///   protected final void end(boolean completed) { ... if (!completed && !isOpen())
+///                                        throw new AsynchronousCloseException(); }
+/// ```
+///
+/// CratonVM answers `isOpen()` from its own `chan_fields` side table
+/// ([`sc_is_open`]) and `sc_close` drops that row, so the two views agreed for
+/// as long as every reader went through the native. They do not. The JIT
+/// devirtualises `final` methods, so a compiled caller of
+/// `SelectableChannel.isOpen()` runs the JDK's own two-instruction body against
+/// the `closed` field this VM never wrote — and read `true` for the rest of the
+/// process.
+///
+/// That is the whole of
+/// `channeloutboundbuffer-close-ordering-three-classes-20260905`: netty's
+/// `AbstractChannel.close()` calls `doClose0()` and then, in the same `finally`,
+/// `outboundBuffer.close(cause)`, which throws
+/// `IllegalStateException: close() must be invoked after the channel is closed.`
+/// when `channel.isOpen()` is still true. `AbstractNioChannel.isOpen()` is
+/// `return ch.isOpen()` on a `SelectableChannel`-typed field — the exact shape
+/// the devirtualiser takes. The page called it an ordering gap and cleared
+/// `sc_close`, which really does clear its state synchronously; the state it
+/// cleared was simply not the state the reader read.
+///
+/// Writing the JDK's own flag makes both views agree, so it no longer matters
+/// which of them answers. It also restores `close()`'s specified idempotence:
+/// without it, a second `close()` through the real bytecode re-runs
+/// `implCloseChannel()` every time.
+///
+/// Guarded on the slot actually being an `int`-shaped field: `get_field_by_name`
+/// answers `Object(None)` when the name does not resolve, which is what a
+/// synthetic-JDK stub class (no `closed` field at all) gives. Writing blind
+/// would be the `synthetic_file_channel` corruption family in reverse — a
+/// boolean pushed into whatever slot a fabricated class happens to have.
+pub(crate) fn mark_jdk_channel_closed(ctx: &dyn NativeContext, obj: ObjectRef) {
+    if matches!(ctx.get_field_by_name(obj, "closed"), Value::Int(_)) {
+        ctx.set_field_by_name(obj, "closed", Value::Int(1));
+    }
+}
+
 /// Drop a channel object's synthetic state (called on close) so the table
 /// does not grow without bound across short-lived connections.
 fn cf_clear(ctx: &dyn NativeContext, obj: ObjectRef) {
@@ -1376,14 +1444,41 @@ enum BufferAccess {
 
 /// Inspect a `ByteBuffer` and return how to access its writable/readable
 /// region. Returns None if `bb` is null or unrecognizable.
+///
+/// Field access goes through [`crate::socket_fast_io::bb_slots`], which
+/// memoizes the slot indices per receiver `ClassId`. The by-name route this
+/// replaced is `resolve_field_index_in_hierarchy` under the class-manager read
+/// lock — a string hash and a hierarchy walk — and it ran four to five times
+/// here, plus twice more in [`buffer_advance`], on EVERY socket transfer, all
+/// of them re-deriving a constant. Same defect and same fix as the
+/// `al_slots_for` per-call re-derivation in `native-collections`.
+///
+/// A class whose layout does not resolve falls back to the by-name route
+/// rather than failing: `get_field_by_name` also serves the synthetic buffer
+/// layouts that `resolve_field_index_by_class_id` does not model, so a refusal
+/// here must degrade to the old path and not to an error.
 fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAccess> {
-    let position = match ctx.get_field_by_name(bb, "position") {
+    use crate::socket_fast_io::slot_int;
+    let slots = crate::socket_fast_io::bb_slots(ctx, bb);
+    let (s_pos, s_lim, s_cap, s_hb, s_off, s_addr) = match slots {
+        Some(s) => (
+            Some(s.position),
+            Some(s.limit),
+            s.capacity,
+            s.hb,
+            s.offset,
+            s.address,
+        ),
+        None => (None, None, None, None, None, None),
+    };
+
+    let position = match slot_int(ctx, bb, s_pos, "position") {
         Value::Int(v) if v >= 0 => v,
         _ => 0,
     };
-    let limit = match ctx.get_field_by_name(bb, "limit") {
+    let limit = match slot_int(ctx, bb, s_lim, "limit") {
         Value::Int(v) if v >= 0 => v,
-        _ => match ctx.get_field_by_name(bb, "capacity") {
+        _ => match slot_int(ctx, bb, s_cap, "capacity") {
             Value::Int(v) if v >= 0 => v,
             _ => 0,
         },
@@ -1393,8 +1488,23 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
     // Heap: `hb` is the byte[]. Try this first; loading the `address`
     // field on a HeapByteBuffer can transitively trigger class loads
     // (java.lang.foreign.MemorySegment) we don't fully support.
-    if let Value::Object(Some(arr)) = ctx.get_field_by_name(bb, "hb") {
-        let base_off = match ctx.get_field_by_name(bb, "offset") {
+    //
+    // NOTE the asymmetry with the direct arm below: when the layout cache
+    // resolved but this class has no `hb` slot at all, `s_hb` is `None` and
+    // `slot_int` would fall back to the by-name lookup, which is exactly the
+    // cost being removed. Ask by name only when the whole layout refused.
+    let hb = match (slots.is_some(), s_hb) {
+        (true, Some(i)) => ctx.get_field(bb, i),
+        (true, None) => Value::Object(None),
+        (false, _) => ctx.get_field_by_name(bb, "hb"),
+    };
+    if let Value::Object(Some(arr)) = hb {
+        let base_off = match (slots.is_some(), s_off) {
+            (true, Some(i)) => ctx.get_field(bb, i),
+            (true, None) => Value::Int(0),
+            (false, _) => ctx.get_field_by_name(bb, "offset"),
+        };
+        let base_off = match base_off {
             Value::Int(v) if v >= 0 => v,
             _ => 0,
         };
@@ -1407,7 +1517,12 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
 
     // Direct: `address` is a non-zero long. Only consult it when the
     // heap-array fast path didn't match.
-    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
+    let address = match (slots.is_some(), s_addr) {
+        (true, Some(i)) => ctx.get_field(bb, i),
+        (true, None) => Value::Object(None),
+        (false, _) => ctx.get_field_by_name(bb, "address"),
+    };
+    if let Value::Long(addr) = address {
         if addr != 0 {
             return Some(BufferAccess::Direct {
                 addr: addr.wrapping_add(position as i64),
@@ -1419,49 +1534,127 @@ fn buffer_access(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<BufferAcc
     None
 }
 
+/// Record which buffer population a transfer served, once per transfer.
+///
+/// Called from the transfer ENTRY points rather than from [`buffer_access`],
+/// which runs twice per read (once for the length, once inside
+/// [`buffer_write_bytes`] after the blocking region, where the access must be
+/// re-derived because a moving collection may have relocated the backing
+/// array). Counting inside it would double every row.
+fn note_buffer_kind(ctx: &dyn NativeContext, access: &BufferAccess) {
+    match access {
+        BufferAccess::Heap { .. } => {
+            crate::socket_fast_io::stats::bump(&crate::socket_fast_io::stats::HEAP_BUF)
+        }
+        BufferAccess::Direct { addr, .. } => crate::socket_fast_io::note_direct_kind(ctx, *addr),
+    }
+}
+
 /// Bump a buffer's position by `n` bytes after a successful read or write.
 fn buffer_advance(ctx: &mut dyn NativeContext, bb: ObjectRef, n: i32) {
-    let cur = match ctx.get_field_by_name(bb, "position") {
+    let slot = crate::socket_fast_io::bb_slots(ctx, bb).map(|s| s.position);
+    let cur = match crate::socket_fast_io::slot_int(ctx, bb, slot, "position") {
         Value::Int(v) => v,
         _ => 0,
     };
-    ctx.set_field_by_name(bb, "position", Value::Int(cur.saturating_add(n)));
+    let next = Value::Int(cur.saturating_add(n));
+    match slot {
+        Some(i) => ctx.set_field(bb, i, next),
+        None => ctx.set_field_by_name(bb, "position", next),
+    }
 }
 
-/// Materialize an owned byte vector representing the writable/readable
-/// region of a buffer. Used for write paths (read from buffer → kernel).
-fn buffer_read_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<Vec<u8>> {
-    match buffer_access(ctx, bb)? {
+/// How many bytes the buffer's readable region holds, clamped exactly the way
+/// [`buffer_read_into`] will clamp when it copies them.
+///
+/// Split out of the old `buffer_read_bytes` so a caller can size ONE
+/// destination for several buffers before copying any of them — which is what
+/// turned the gathering write from `N + 1` allocations and two full copy passes
+/// into one buffer and one pass.
+fn buffer_readable_len(ctx: &mut dyn NativeContext, bb: ObjectRef) -> usize {
+    match buffer_access(ctx, bb) {
+        Some(a) => access_readable_len(ctx, &a),
+        None => 0,
+    }
+}
+
+/// [`buffer_readable_len`] for an access the caller has already decoded.
+///
+/// Exists so a transfer that must ALSO classify the buffer for the census does
+/// not decode it twice — the whole point of the layout cache is that decoding
+/// got cheap, not free.
+fn access_readable_len(ctx: &mut dyn NativeContext, access: &BufferAccess) -> usize {
+    match *access {
+        BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => length as usize,
+        BufferAccess::Heap {
+            arr,
+            offset,
+            length,
+        } if length > 0 => {
+            // The old element-by-element loop stopped at the end of the backing
+            // array; preserve that clamp, or a sliced buffer whose `offset`
+            // reaches past `arr.length` would report bytes that cannot be read.
+            let arr_len = ctx.array_length(arr);
+            let avail = arr_len.saturating_sub(offset as usize);
+            (length as usize).min(avail)
+        }
+        _ => 0,
+    }
+}
+
+/// Copy the buffer's readable region into `dst`, returning the byte count.
+///
+/// Writes into a caller-owned slice rather than returning a fresh `Vec`: the
+/// write paths hand it a region of the thread's reusable
+/// [`crate::socket_fast_io::Scratch`], so a steady-state write allocates
+/// nothing. `dst` may be shorter than the readable region, in which case the
+/// copy is truncated — the caller sized it and the kernel is told the truth
+/// about how many bytes it is being given.
+fn buffer_read_into(ctx: &mut dyn NativeContext, bb: ObjectRef, dst: &mut [u8]) -> usize {
+    match buffer_access(ctx, bb) {
+        Some(a) => buffer_read_into_access(ctx, &a, dst),
+        None => 0,
+    }
+}
+
+/// [`buffer_read_into`] for an access the caller has already decoded.
+fn buffer_read_into_access(
+    ctx: &mut dyn NativeContext,
+    access: &BufferAccess,
+    dst: &mut [u8],
+) -> usize {
+    match *access {
         BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => {
-            let mut v = vec![0u8; length as usize];
+            let n = (length as usize).min(dst.len());
+            if n == 0 {
+                return 0;
+            }
             // `addr` is normally a real `allocateDirect` pointer, but a
             // temp-direct buffer from `Util.getTemporaryDirectBuffer` is an
             // `Unsafe.allocateMemory` arena handle (not dereferenceable).
             // Route through the context so a handle reads from the off-heap
             // store instead of a raw memcpy that would SIGSEGV; for a real
             // pointer this is the same `copy_nonoverlapping`.
-            if !ctx.copy_from_native_memory(addr, &mut v) {
-                return Some(Vec::new());
+            if !ctx.copy_from_native_memory(addr, &mut dst[..n]) {
+                return 0;
             }
-            Some(v)
+            n
         }
         BufferAccess::Heap {
             arr,
             offset,
             length,
         } if length > 0 => {
-            // Bulk read via NativeContext intrinsic. The old element-by-element
-            // loop clamped `length` to whatever fit before `arr_len`; preserve
-            // that by clamping the effective length here.
             let arr_len = ctx.array_length(arr);
             let off = offset as usize;
             let avail = arr_len.saturating_sub(off);
-            let eff_len = (length as usize).min(avail);
-            let mut v = vec![0u8; eff_len];
-            ctx.read_byte_array_into(arr, off, &mut v);
-            Some(v)
+            let n = (length as usize).min(avail).min(dst.len());
+            if n == 0 {
+                return 0;
+            }
+            ctx.read_byte_array_into(arr, off, &mut dst[..n])
         }
-        _ => Some(Vec::new()),
+        _ => 0,
     }
 }
 
@@ -2215,6 +2408,12 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // then reads the default Int(0) (== closed/not-connected), and the
         // side-table does not grow across many short-lived connections.
         cf_clear(ctx, this);
+        // ... and the JDK's OWN `closed` flag, which is what every reader that
+        // does not go through `sc_is_open` consults — including any compiled
+        // caller, because the JIT devirtualises `final` methods and
+        // `AbstractInterruptibleChannel.isOpen()` is one. See
+        // `mark_jdk_channel_closed`.
+        mark_jdk_channel_closed(ctx, this);
         // Same for the `ServerSocketChannel.socket()` adaptor row. It holds two
         // GC roots, so leaving it behind would keep a closed listener and its
         // `java.net.ServerSocket` view alive for the life of the process.
@@ -2510,7 +2709,9 @@ fn sc_connect_bound(
     let local = stream
         .local_addr()
         .map_err(|e| map_err("bound local address", e))?;
-    let remote = resolve_and_vet(&target)?
+    // No `InetSocketAddress` in scope here (this path re-dials an already-bound
+    // socket from a host string), so there is nothing pre-resolved to reuse.
+    let remote = resolve_and_vet(&target, None)?
         .into_iter()
         .find(|addr| addr.is_ipv4() == local.is_ipv4())
         .ok_or_else(|| {
@@ -2604,6 +2805,68 @@ fn sc_connect_bound(
 // SocketChannel.connect / finishConnect
 // ---------------------------------------------------------------------------
 
+/// Is the caller's already-resolved destination reused instead of re-resolved?
+/// `CRATONVM_SC_PRERESOLVED=0` restores the re-resolution.
+fn preresolved_engaged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_SC_PRERESOLVED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+/// The literal IP an `InetSocketAddress` ALREADY holds, if it holds one.
+///
+/// `decode_socket_address` answers with `getHostString()`, which is the
+/// HOSTNAME whenever one is attached — so the resolved `InetAddress` the caller
+/// built the address from is discarded and the connect path re-resolves the
+/// name on every dial. This reads that address back instead.
+///
+/// `None` means "no reusable address": an unresolved `InetSocketAddress` (the
+/// `createUnresolved` shape, which genuinely must be resolved at dial time), a
+/// synthetic layout with no such accessors, or the switch being off. Every
+/// `None` falls back to exactly the previous behaviour, so this can only remove
+/// a lookup, never add one.
+///
+/// Uses the public accessors rather than reading fields, matching
+/// `decode_socket_address`'s own preferred path: whatever state the JDK
+/// constructor populated is what the JDK's own getters report.
+fn decode_resolved_literal(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option<String> {
+    if !preresolved_engaged() {
+        return None;
+    }
+    // An unresolved address has no InetAddress to reuse, and resolving it at
+    // dial time is its defined behaviour — not something to optimise away.
+    if let Ok(Some(Value::Int(1))) = ctx.invoke_virtual(sa, "isUnresolved", "()Z", &[]) {
+        return None;
+    }
+    let ia = match ctx.invoke_virtual(sa, "getAddress", "()Ljava/net/InetAddress;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(ia, "getHostAddress", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(str_obj)))) => ctx.read_string(str_obj),
+        _ => None,
+    }
+}
+
+/// Build the `SocketAddr` to dial from a resolved literal, or `None`.
+///
+/// `connect_target_host` is applied to the literal for the same reason it is
+/// applied to the name: a wildcard destination is a valid bind target and not a
+/// valid connect one, and Windows refuses it outright.
+fn preresolved_socket_addr(literal: Option<String>, port: u16) -> Option<SocketAddr> {
+    let literal = connect_target_host(literal?);
+    let spelled = if literal.contains(':') {
+        format!("[{literal}]:{port}")
+    } else {
+        format!("{literal}:{port}")
+    };
+    spelled.parse::<SocketAddr>().ok()
+}
+
 /// H3b: resolve a `host:port` target to one or more `SocketAddr`s and
 /// vet every resolved address against the outbound-host policy, mirroring
 /// `outbound_policy::policy_connect`'s resolution loop. The blocking path
@@ -2618,7 +2881,10 @@ fn sc_connect_bound(
 /// fires), reusing the public policy API rather than duplicating the
 /// link-local range logic. A denial maps to the same IOException the
 /// rest of the connect path uses.
-fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
+fn resolve_and_vet(
+    target: &str,
+    preresolved: Option<SocketAddr>,
+) -> Result<Vec<SocketAddr>, MethodCallFailed> {
     // First-pass policy check on the literal target — cheap, and rejects
     // a direct link-local IP before we even resolve.
     if let Err(reason) = crate::outbound_policy::check_outbound(target) {
@@ -2630,11 +2896,17 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
     // one (WSAEADDRNOTAVAIL), and real JDK never produces such a destination
     // because `InetAddress` collapses the literal to an `Inet4Address`. See
     // `outbound_policy::normalize_connect_addr`.
-    let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {
-        Ok(it) => it
-            .map(crate::outbound_policy::normalize_connect_addr)
-            .collect(),
-        Err(e) => return Err(map_err(target, e)),
+    // Reuse the caller's already-resolved address when there is one. The NAME
+    // policy above has already run, so an embedder's name-based rule still
+    // fires; only the lookup is skipped. See `policy_connect_with`.
+    let addrs: Vec<SocketAddr> = match preresolved {
+        Some(addr) => vec![crate::outbound_policy::normalize_connect_addr(addr)],
+        None => match target.to_socket_addrs() {
+            Ok(it) => it
+                .map(crate::outbound_policy::normalize_connect_addr)
+                .collect(),
+            Err(e) => return Err(map_err(target, e)),
+        },
     };
     if addrs.is_empty() {
         return Err(ioex(format!("no addresses resolved for {target}")));
@@ -2741,6 +3013,12 @@ fn sc_connect_inner(
     let (host, port) = decode_socket_address(ctx, sa)?;
     let host = connect_target_host(host);
     let target = format!("{host}:{port}");
+    // The address the caller ALREADY resolved, if any. `decode_socket_address`
+    // answers with the hostname, so without this every dial re-runs
+    // `getaddrinfo` on a name the JDK had already turned into an address —
+    // a lookup HotSpot never performs, and on Windows one that wedges the
+    // resolver after a few dozen rapid calls.
+    let preresolved = preresolved_socket_addr(decode_resolved_literal(ctx, sa), port);
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
 
     if let Some(id) = read_reg_id(ctx, this) {
@@ -2786,9 +3064,40 @@ fn sc_connect_inner(
         // while keeping `policy_connect`'s SSRF vetting and timeout. That is a
         // rewrite of the VM's busiest connect path and belongs behind its own
         // build + full-vector run, not a drive-by.
+        // PHASE TRACE. These four checkpoints exist to answer one question
+        // that no coarser instrument can: when a blocking connect stops
+        // returning, WHICH part stopped. The pair that used to bracket this
+        // branch (`connect target=` above, `connect success(blocking)` below)
+        // spans the dial, a registry write lock AND a string allocation, so a
+        // stall anywhere in it produced the identical evidence.
+        //
+        //   dial-enter  ... no dial-return  -> inside `policy_connect`, whose
+        //                                      own timeout is documented finite
+        //                                      (30 s), so an indefinite stall
+        //                                      here contradicts that and the
+        //                                      timeout is the thing to doubt
+        //   dial-return ... no registered   -> `tcp_register` /
+        //                                      `tcp_blocking_state`, i.e. the
+        //                                      `tcp_registry()` write lock; a
+        //                                      writer starved by readers looks
+        //                                      exactly like a hung syscall
+        //   registered  ... no success      -> the `cf_set` run or
+        //                                      `create_string`, which
+        //                                      ALLOCATES and can therefore
+        //                                      reach a collection
+        connect_dbg(format!(
+            "dial-enter target={target} preresolved={}",
+            preresolved
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none".into())
+        ));
         ctx.begin_blocking_region();
-        let connect_result = crate::outbound_policy::policy_connect(&target);
+        let connect_result = crate::outbound_policy::policy_connect_with(&target, preresolved);
         ctx.end_blocking_region();
+        connect_dbg(format!(
+            "dial-return target={target} ok={}",
+            connect_result.is_ok()
+        ));
         let stream = match connect_result {
             Ok(s) => s,
             Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
@@ -2809,6 +3118,7 @@ fn sc_connect_inner(
         let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
         let id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
         tcp_blocking_state().write().insert(id, blocking);
+        connect_dbg(format!("registered id={id} local_port={local_port}"));
         cf_set(ctx, this, F_REG_ID, Value::Int(id));
         cf_set(ctx, this, F_CONNECTED, Value::Int(1));
         cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
@@ -2831,7 +3141,13 @@ fn sc_connect_inner(
     // through (DNS-rebind SSRF). So we resolve here, vet every resolved
     // IP against the outbound policy, and dial the *vetted* SocketAddr(s)
     // directly — never re-resolving the original hostname downstream.
-    let mut vetted = resolve_and_vet(&target)?;
+    connect_dbg(format!(
+        "dial-enter(nonblocking) target={target} preresolved={}",
+        preresolved
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "none".into())
+    ));
+    let mut vetted = resolve_and_vet(&target, preresolved)?;
     // Prefer IPv4 addresses first — this matches HotSpot's default resolution
     // order (`java.net.preferIPv4Stack` semantics) and, critically, the
     // address CratonVM's `InetAddress.getLoopbackAddress()` hands out for the
@@ -3529,11 +3845,12 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return Err(close_by_interrupt(ctx, this));
     }
 
-    // Determine the writable region. We materialize into a heap buffer here
+    // Determine the writable region. We materialize into a native buffer here
     // and copy into the buffer slot afterwards so we don't hold a registry
     // lock across `set_array_element`.
     let access =
         buffer_access(ctx, bb).ok_or_else(|| ioex("read: ByteBuffer has no decodable layout"))?;
+    note_buffer_kind(ctx, &access);
     let len = match access {
         BufferAccess::Direct { length, .. } => length,
         BufferAccess::Heap { length, .. } => length,
@@ -3541,7 +3858,20 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if len <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let mut buf = vec![0u8; len as usize];
+    // The thread's reusable transfer buffer, NOT a fresh `vec![0u8; len]`.
+    //
+    // `len` is the destination's REMAINING CAPACITY, not the traffic: an event
+    // loop reading a 120-byte request into netty's 64 KiB receive buffer used
+    // to allocate and zero 64 KiB per call. `Scratch` holds the buffer at its
+    // high-water mark, so in steady state this allocates nothing and zeroes
+    // nothing, and returns itself to the thread on drop — including down every
+    // early-return arm below, of which there are seven.
+    //
+    // Its contents are the PREVIOUS transfer's bytes, not zeroes. That is safe
+    // here for the same reason it is safe in the JDK: only the first `n` bytes
+    // the kernel reports are ever read, and `Scratch::prefix` is the only way
+    // this function looks at them.
+    let mut scratch = crate::socket_fast_io::Scratch::new(len as usize);
     // The OS read below may enter a GC-blocking region. Keep the Java buffer
     // rooted and reload it before writing the received bytes back.
     let bb_pin = ctx.pin_native_root(bb);
@@ -3579,9 +3909,9 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 // reborrow ends with the `if` expression, before
                 // `end_blocking_region` takes `&mut` again.
                 let probe: &dyn NativeContext = &*ctx;
-                read_close_aware(id, &s, &mut buf, &|| probe.is_interrupted(false))
+                read_close_aware(id, &s, scratch.as_mut(), &|| probe.is_interrupted(false))
             } else {
-                try_read_nb(&s, &mut buf)
+                try_read_nb(&s, scratch.as_mut())
             };
             ctx.end_blocking_region();
             r
@@ -3641,7 +3971,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
     };
     if n > 0 {
-        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        crate::net::socket_capture('r', id, scratch.prefix(n as usize));
         // Reload `bb` through the pin BEFORE touching it again: the blocking
         // read above may have crossed a GC pause that relocated the object,
         // so the original `bb` reference could be stale here (see
@@ -3680,9 +4010,13 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let hash = fnv1a64(&buf[..n as usize]);
+            let hash = fnv1a64(scratch.prefix(n as usize));
             let dump_len = (n as usize).min(64);
-            let hex: String = buf[..dump_len].iter().map(|b| format!("{b:02x}")).collect();
+            let hex: String = scratch
+                .prefix(dump_len)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             eprintln!(
                 "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
             );
@@ -3726,7 +4060,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 }
             }
         }
-        let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
+        let written = buffer_write_bytes(ctx, bb, scratch.prefix(n as usize));
         buffer_advance(ctx, bb, written);
     }
     ctx.unpin_native_roots(bb_pin);
@@ -3756,7 +4090,24 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             Err(ioex("write: channel not connected"))
         };
     };
-    let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
+    // Copy the source region into the thread's reusable transfer buffer rather
+    // than into a fresh `Vec` sized to `limit - position`. The buffer is
+    // decoded ONCE here and the decoded access is reused for the census and the
+    // copy, instead of being re-derived by each helper in turn.
+    let src_access = buffer_access(ctx, bb);
+    if let Some(a) = &src_access {
+        note_buffer_kind(ctx, a);
+    }
+    let src_len = match &src_access {
+        Some(a) => access_readable_len(ctx, a),
+        None => 0,
+    };
+    let mut scratch = crate::socket_fast_io::Scratch::new(src_len);
+    let copied = match &src_access {
+        Some(a) => buffer_read_into_access(ctx, a, scratch.as_mut()),
+        None => 0,
+    };
+    let data = scratch.prefix(copied);
     if io_flags().dbg_sc_write {
         let position = ctx.get_field_by_name(bb, "position");
         let limit = ctx.get_field_by_name(bb, "limit");
@@ -3948,14 +4299,22 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so we can advance its position by the bytes actually consumed.
     let arr_len = ctx.array_length(srcs) as i32;
     let (start, end) = vec_window(args, arr_len);
-    let mut chunks = Vec::new();
+
+    // PASS 1 — measure and pin, without copying anything.
+    //
+    // The old shape allocated one `Vec` per source buffer here and then
+    // concatenated all of them into one more `Vec` below: `N + 1` allocations
+    // and two full passes over the payload for what the kernel receives as a
+    // single `send`. Netty emits a header buffer plus a body buffer for every
+    // HTTP response, so this is its normal write path, not a corner.
+    let mut chunks: Vec<(usize, ObjectRef, usize)> = Vec::new();
     let mut total: usize = 0;
     for i in start..end {
         if let Value::Object(Some(bb)) = ctx.get_array_element(srcs, i as usize) {
-            let bytes = buffer_read_bytes(ctx, bb).unwrap_or_default();
-            total += bytes.len();
+            let len = buffer_readable_len(ctx, bb);
             let pin = ctx.pin_native_root(bb);
-            chunks.push((pin, bb, bytes));
+            chunks.push((pin, bb, len));
+            total += len;
         }
     }
     if total == 0 {
@@ -3968,9 +4327,41 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         return Ok(Some(Value::Long(0)));
     }
-    let mut data = Vec::with_capacity(total);
-    for (_, _, bytes) in &chunks {
-        data.extend_from_slice(bytes);
+
+    // PASS 2 — copy every source into ONE reusable buffer, back to back.
+    //
+    // Each buffer is re-read through its pin: `pin_native_root` above may have
+    // crossed a collection that relocated an earlier source, and a stale
+    // `ObjectRef` here would copy from a dead address rather than fail.
+    //
+    // `copied` is the running cursor and is what the payload length becomes —
+    // NOT `total`. A source that yields fewer bytes than it measured (a
+    // concurrent `position` change, an unreadable direct handle) must shorten
+    // the payload, not leave a hole of stale scratch bytes in the middle of it
+    // for the peer to parse as protocol.
+    let mut scratch = crate::socket_fast_io::Scratch::new(total);
+    let mut copied: usize = 0;
+    for (pin, bb, len) in chunks.iter_mut() {
+        if *len == 0 {
+            continue;
+        }
+        let live = ctx.read_native_pin(*pin, *bb);
+        let end_off = (copied + *len).min(total);
+        let got = buffer_read_into(ctx, live, &mut scratch.as_mut()[copied..end_off]);
+        *len = got;
+        copied += got;
+    }
+    crate::socket_fast_io::stats::bump(&crate::socket_fast_io::stats::GATHER_FAST);
+    crate::socket_fast_io::stats::add(
+        &crate::socket_fast_io::stats::GATHER_BUFFERS,
+        chunks.len() as u64,
+    );
+    let data = scratch.prefix(copied);
+    if data.is_empty() {
+        for (pin, _, _) in chunks {
+            ctx.unpin_native_roots(pin);
+        }
+        return Ok(Some(Value::Long(0)));
     }
 
     // The channel object itself, pinned LAST so every `unpin_native_roots` on
@@ -4055,11 +4446,11 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Distribute the written count across the source buffers, advancing
         // each position by the portion of its bytes that made it out.
         let mut remaining = n;
-        for (pin, bb, bytes) in &chunks {
+        for (pin, bb, len) in &chunks {
             if remaining <= 0 {
                 break;
             }
-            let consume = (bytes.len() as i32).min(remaining);
+            let consume = (*len as i32).min(remaining);
             let bb = ctx.read_native_pin(*pin, *bb);
             buffer_advance(ctx, bb, consume);
             remaining -= consume;
@@ -4125,7 +4516,13 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(Some(Value::Long(0)));
     }
     let cap = total.min(i32::MAX as i64) as usize;
-    let mut buf = vec![0u8; cap];
+    // Reusable transfer buffer, sized to the COMBINED remaining capacity of
+    // every destination — which is why a per-call `vec![0u8; cap]` hurt more
+    // here than anywhere else on the path: a reactor doing a header+body
+    // scattering read into two 64 KiB buffers allocated and zeroed 128 KiB per
+    // call. See `Scratch`: the contents are the previous transfer's bytes, and
+    // only the `n` the kernel reports are ever scattered out.
+    let mut scratch = crate::socket_fast_io::Scratch::new(cap);
 
     // AUDIT 2026-07-26 (native-io-audit): this path used to call `try_read_nb`
     // with NO `begin_blocking_region`/`end_blocking_region` bracket, unlike
@@ -4157,9 +4554,9 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // interruptible on the same terms.
             let r = if blocking {
                 let probe: &dyn NativeContext = &*ctx;
-                read_close_aware(id, &s, &mut buf, &|| probe.is_interrupted(false))
+                read_close_aware(id, &s, scratch.as_mut(), &|| probe.is_interrupted(false))
             } else {
-                try_read_nb(&s, &mut buf)
+                try_read_nb(&s, scratch.as_mut())
             };
             ctx.end_blocking_region();
             r
@@ -4223,7 +4620,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Ok(Some(Value::Long(-1))); // EOF
     }
     if n > 0 {
-        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        crate::net::socket_capture('r', id, scratch.prefix(n as usize));
         // Scatter the bytes into the destination buffers in order; each call
         // fills one buffer up to its remaining room, then we move to the next.
         let mut consumed = 0usize;
@@ -4232,7 +4629,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 break;
             }
             let bb = ctx.read_native_pin(*pin, *bb);
-            let written = buffer_write_bytes(ctx, bb, &buf[consumed..n as usize]);
+            let written = buffer_write_bytes(ctx, bb, &scratch.prefix(n as usize)[consumed..]);
             if written <= 0 {
                 break;
             }
@@ -4540,7 +4937,7 @@ pub(crate) fn standard_socket_option(
 /// `channel.supportedOptions().contains(TCP_NODELAY)` before setting it —
 /// does NOT catch it: the `AbstractMethodError` propagates uncaught out of
 /// the calling thread, silently killing it. See
-/// fixed-suite-bugs/spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
+/// spring-web-flow-outputstreamwriter-close-corruption-FIXED.md
 /// root cause #3 — this silently killed HttpClient5's I/O reactor worker
 /// thread mid-connection-setup, before it ever reached `SocketChannel
 /// .connect()`, hanging every request through
@@ -4877,7 +5274,7 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// `AnnotatedConnectException: finishConnect: Connection refused: /[0:0:0:0:0:0:0:1]:P`
 /// against a `serverLocal=/0.0.0.0:P`, on a run where HotSpot binds `[::]` and
 /// connects. Full record:
-/// `fixed-suite-bugs/netty/ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
+/// `ssl-parameterized-classes-exceed-180s-timeout-masking-real-failures-20260826.md`.
 ///
 /// `FAMILY_INET` — an explicit `ServerSocketChannel.open(StandardProtocolFamily.INET)`
 /// — keeps the v4 wildcard, because that channel IS AF_INET on HotSpot.
@@ -6575,12 +6972,15 @@ fn sc_blocking_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let deadline =
         (nanos > 0).then(|| std::time::Instant::now() + Duration::from_nanos(nanos as u64));
 
-    let mut buf = vec![0u8; len];
+    // Reusable transfer buffer — this is the `socket.getInputStream()` adapter
+    // path, so it is per-`read()` on every stream-oriented HTTP client and
+    // server in the corpus, not only on the channel API.
+    let mut scratch = crate::socket_fast_io::Scratch::new(len);
     let arr_pin = ctx.pin_native_root(arr);
     ctx.begin_blocking_region();
     let outcome = loop {
         match resolve_stream(id) {
-            StreamTarget::Ready(stream) => match try_read_nb(&stream, &mut buf) {
+            StreamTarget::Ready(stream) => match try_read_nb(&stream, scratch.as_mut()) {
                 Ok(Some(n)) => break Ok(n),
                 Ok(None) => {}
                 Err(error) => break Err(map_err("blockingRead", error)),
@@ -6609,11 +7009,11 @@ fn sc_blocking_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     if n > 0 {
-        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        crate::net::socket_capture('r', id, scratch.prefix(n as usize));
         // Reload through the pin: the wait above may have crossed a GC pause
         // that relocated the array.
         let arr = ctx.read_native_pin(arr_pin, arr);
-        ctx.write_byte_array_from(arr, off, &buf[..n as usize]);
+        ctx.write_byte_array_from(arr, off, scratch.prefix(n as usize));
     }
     ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Int(n)))
@@ -6632,9 +7032,12 @@ fn sc_blocking_write_fully(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     let id =
         read_reg_id(ctx, this).ok_or_else(|| ioex("blockingWriteFully: channel not connected"))?;
-    let mut data = vec![0u8; len];
-    let copied = ctx.read_byte_array_into(arr, off, &mut data);
-    data.truncate(copied);
+    // Reusable transfer buffer; `copied` (not `len`) is the payload length,
+    // because a short read from the source array must shorten the write rather
+    // than send the buffer's stale tail.
+    let mut scratch = crate::socket_fast_io::Scratch::new(len);
+    let copied = ctx.read_byte_array_into(arr, off, scratch.as_mut());
+    let data = scratch.prefix(copied);
     if data.is_empty() {
         return Ok(None);
     }
@@ -6888,8 +7291,7 @@ mod tests {
 
     /// Regression guard for the Jetty `givenAnInflightRequestWhenTheServerIs
     /// StoppedThenGracefulShutdownCallbackIsCalledWithRequestsActive` hang
-    /// (`jetty-webserver-factory-poststartup-timeout-and-reflective-
-    /// supertype-residuals.md`): `AbstractReactiveWebServerFactoryTests`
+    /// (`jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals-FIXED.md`): `AbstractReactiveWebServerFactoryTests`
     /// builds its client target via `new InetSocketAddress(port)`, which
     /// produces a wildcard host. Connecting to that host verbatim throws
     /// WSAEADDRNOTAVAIL on Windows instead of reaching the server, leaving
@@ -7215,15 +7617,15 @@ mod tests {
         // Direct link-local IP must be denied before any dial.
         crate::outbound_policy::reset_policy();
         assert!(
-            resolve_and_vet("169.254.169.254:80").is_err(),
+            resolve_and_vet("169.254.169.254:80", None).is_err(),
             "expected AWS IMDS literal to be denied"
         );
         assert!(
-            resolve_and_vet("169.254.170.2:80").is_err(),
+            resolve_and_vet("169.254.170.2:80", None).is_err(),
             "expected 169.254.0.0/16 neighbour to be denied"
         );
         assert!(
-            resolve_and_vet("[fd00:ec2::254]:80").is_err(),
+            resolve_and_vet("[fd00:ec2::254]:80", None).is_err(),
             "expected IPv6 AWS metadata to be denied"
         );
     }
@@ -7233,7 +7635,7 @@ mod tests {
         // Loopback resolves and passes the policy; the returned addrs are
         // concrete literals (no hostname left to re-resolve downstream).
         crate::outbound_policy::reset_policy();
-        let addrs = resolve_and_vet("127.0.0.1:9").expect("loopback should be allowed");
+        let addrs = resolve_and_vet("127.0.0.1:9", None).expect("loopback should be allowed");
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|a| a.ip().is_loopback()));
     }

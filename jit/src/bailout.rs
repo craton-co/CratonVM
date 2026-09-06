@@ -6,7 +6,7 @@
 //! ## Why this exists
 //!
 //! The P0 "JIT correctness" lane of the C2 review
-//! (`feature-designs/c2/deep-research-vm-c2.md`) requires that *"invalid IR or
+//! (`deep-research-vm-c2.md`) requires that *"invalid IR or
 //! ABI state causes a deterministic compilation bailout, never silent wrong
 //! code, panic, or native crash"*. Today the compiler signals "I cannot
 //! compile this" in three incompatible ways:

@@ -1150,8 +1150,8 @@ fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 // bucket: under `--synthetic-jdk` the VM mints a stand-in for this class on
 // demand and these registrations are its only implementation.
 //
-// Per-row table: retired/l5-native-io-bridge-residuals-RETIRED-20260810.md
-// Disposition: fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md
+// Per-row table: l5-native-io-bridge-residuals-RETIRED-20260810.md
+// Disposition: jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md
 /// The leaf dispatcher class, present on every JDK 25 image.
 pub(crate) const FD_LEAF: &str = "sun/nio/ch/FileDispatcherImpl";
 /// The Unix-image declarer. Absent from a Windows image.
@@ -1772,7 +1772,7 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     // DatagramChannel (SYNTHETIC, synthetic-jdk only).
     //
     // FLAGGED SyntheticStub: the `t16_dc_*` family fabricates datagram/connect
-    // state (per `S1` in reviews/fable-2026-06-10/native-io.md). Per the
+    // state (per `S1` in native-io.md). Per the
     // no-synthetic-stubs policy these overrides are compiled in only under
     // `synthetic-jdk` and tagged `NativeKind::SyntheticStub`. In the default
     // build they are absent, so the real JDK `DatagramChannel`/`sun.nio.ch`

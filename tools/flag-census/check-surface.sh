@@ -5,7 +5,7 @@
 # Fail if the CRATONVM_* environment surface has grown behind the config.
 #
 # The surface reached 692 identifiers by growing roughly one per fixed bug with
-# no retirement path (audits/flag-census.md). It is now ten grouped
+# no retirement path (flag-census.md). It is now ten grouped
 # variables plus five scalars, and every knob is a token in
 # `types/src/flag_groups.rs::INVENTORY`.
 #

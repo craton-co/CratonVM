@@ -71,7 +71,7 @@ pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
 /// `mapped_safepoint_pcs`, which turns `CompiledMethod::fully_oop_covered`
 /// false for the whole method, which the runtime reports as one
 /// `map_coverage=N` counter on the `[jitroots]` line. That aggregate is where
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` ran out of
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` ran out of
 /// road: it names the field, never the reason, and the six ways to get there
 /// want six different repairs.
 ///
@@ -709,7 +709,7 @@ impl Compiler {
     /// it false for **every method the fast tier ever compiled**, which through
     /// the OSR fallback refused relocation on 725 of 759 collections of
     /// `TestKillProcessWhileWriting` — the
-    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`
+    /// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
     /// residual. Measured with `CRATONVM_DBG_OOPCOV=1`: every uncovered method
     /// reported exactly `shadow_missing_pcs=[4294967295]`.
     ///
@@ -1638,7 +1638,7 @@ impl Compiler {
         // the never-mapped operand-spill slots those runs report. Those are
         // staged invoke-arguments, which were never in this vocabulary to be
         // dropped from. See
-        // `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`. Every `continue`/failed-`if let` below is
+        // `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`. Every `continue`/failed-`if let` below is
         // a silent omission, and until this existed none of them reached
         // `fully_oop_covered`, which tests only that each safepoint produced AN
         // entry (`safepoint_pcs ⊆ mapped_safepoint_pcs`). A safepoint whose map
@@ -1753,23 +1753,32 @@ impl Compiler {
                 // naming none of its live reference locals.
                 //
                 // That is the same asymmetry `LOCAL_MASK_UNSUPPORTED` was
-                // fixed for -- "one half of the machinery knew and the half
-                // that publishes the claim did not" -- and it is the unnamed
-                // root of `bug-box-unbox-intrinsic-segv-under-relocation-
-                // 20260902`: relocation rewrites the slots the map names, the
-                // unnamed live locals keep pointing into the vacated page, and
-                // reading one is the page-aligned SIGSEGV.
+                // fixed for: one half of the machinery knew and the half that
+                // publishes the claim did not. A safepoint that ships
+                // `fully_oop_covered` while naming none of its live reference
+                // locals is a use-after-free the moment relocation trusts it.
+                //
+                // NOT the root of `bug-box-unbox-intrinsic-segv-under-
+                // relocation-20260902`, which is what this comment claimed
+                // until 2026-09-05. That crash was a WRITE by `relocate_stw`'s
+                // own `ptr::copy` into a decommitted arena granule, fixed by
+                // `Arena::commit_for_relocation`; failing closed here was
+                // measured against it at 3 of 4, i.e. no effect. The hole is
+                // real on its own evidence and is fixed on its own merits.
                 //
                 // The counter reads ZERO on `probes/SafepointMapResidue.java`,
                 // which is why this was filed as a ruled-out hypothesis. It was
                 // ruled out on the wrong workload.
                 //
-                // Behind a flag because it is a REFUSAL: each such safepoint
-                // now diverts its cycle to the non-moving sweep. That is
-                // per-safepoint rather than the blanket
-                // `CRATONVM_ZGC_JIT_BLANKET_REFUSAL`, which costs ~9700
-                // fragmentation OOMs on this class, so the cost should be far
-                // smaller -- but it is a cost, and it is measured, not assumed.
+                // It is a REFUSAL -- each such safepoint diverts its cycle to
+                // the non-moving sweep -- so it was opt-in until the cost was
+                // measured rather than assumed. Measured 2026-09-05 on
+                // `TestCachedQueryResults`: ZERO fragmentation OOM in either
+                // arm, and no throughput difference (concurrent-pair ratios
+                // 0.97/0.99/1.00/1.00). Per-safepoint, not the blanket
+                // `CRATONVM_ZGC_JIT_BLANKET_REFUSAL`, which costs ~9700 OOMs on
+                // this class and never completes. Default ON on that evidence;
+                // `=0` restores the old claim.
                 if crate::x64::licm::local_mask_unreached_fail_closed_enabled() {
                     map_incomplete = true;
                 }

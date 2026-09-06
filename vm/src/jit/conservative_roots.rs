@@ -18,7 +18,7 @@
 //!
 //! ## What this module guarantees
 //!
-//! 1. **Per-thread active JIT entry chain.** [`push_jit_entry`] is called
+//! 1. **Per-thread active JIT entry chain.** [`push_jit_entry_at`] is called
 //!    immediately before transferring control to JIT-compiled code; it captures
 //!    the current native stack pointer (an upper bound on the spill region) and
 //!    pushes it onto a thread-local stack. [`pop_jit_entry`] restores the prior
@@ -749,7 +749,7 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
 /// Per-disjunct breakdown of why [`moving_young_osr_method_needs_fallback`]
 /// returned true, so the single `osr-shadow-coverage-unproven` reason code the
 /// collector sees can be split apart without a debugger. Filed 2026-08-21:
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s own
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`'s own
 /// measurement found this reason blocking 234/263 collections and could not
 /// say which of the (then three) disjuncts was responsible, only that "H2's
 /// MVStore loops are OSR-compiled constantly." Attribution is by the same
@@ -835,7 +835,7 @@ fn moving_young_osr_method_needs_fallback(
     // Measured on `TestKillProcessWhileWriting` with `CRATONVM_DBG_OOPCOV=1`:
     // 439 of 449 coverage failures are that one shape, and through this term
     // they refused relocation on 725 of 759 collections. That is the
-    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual,
+    // `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` residual,
     // and the page's own guess (a cross-thread peer) was measured at 0 of 759.
     //
     // The staged argument is not the caller's live value any more — it is the
@@ -1094,6 +1094,14 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
 /// chain. **Must be inlined** so the captured SP belongs to the caller's
 /// frame; calling this from a function that immediately returns would record
 /// a stale SP pointing into freed stack memory.
+///
+/// `#[cfg(test)]`: every production entry now captures its own SP and calls
+/// `push_jit_entry_at` directly, because the SP that matters is the one at
+/// the transfer site and not this wrapper's. Only the tests still want the
+/// convenience form, and `no_test_only_public_api` counts a `pub` item whose
+/// sole real caller is a test -- the ratchet was one over its 299 baseline on
+/// pristine dev because of this one.
+#[cfg(test)]
 #[inline(always)]
 pub fn push_jit_entry() -> usize {
     let sp = current_stack_pointer();
@@ -1491,7 +1499,7 @@ struct JitScanCache {
     /// `(filled_gen, chain_len, collection_count)` happen to match on the
     /// other side, hands VM A's object addresses to VM B's collector as
     /// roots — the `oscache` failure mode from
-    /// `feature-designs/vm-process-global-state.md`, but pointed at the mark
+    /// `vm-process-global-state.md`, but pointed at the mark
     /// phase. `collection_count` cannot stand in for this: it is
     /// `heap.collection_count()`, a *different* counter per heap, so two young
     /// heaps trivially agree on it.
@@ -1776,7 +1784,7 @@ fn jit_scan_cache_enabled() -> bool {
         // real bug is a register-resident JIT root that conservative scanning —
         // cached, fresh, or even whole-stack (`CRATONVM_DBG_FULLSTACK_SCAN`) —
         // cannot see; it needs precise oop maps / the shadow stack. See
-        // `fixed-suite-bugs/wildfly/bug-06b-jit-scan-cache-unsound.md`.) So the
+        // `bug-06b-jit-scan-cache-unsound.md`.) So the
         // cache stays enabled for its perf benefit; `collection_count` keying
         // (see `JitScanCache`) keeps it from republishing freed addresses across
         // a GC. `CRATONVM_NO_JIT_SCAN_CACHE` force-disables it for bisection.
@@ -2752,7 +2760,7 @@ fn returned_from_direct_self_call(ret_addr: usize, entry_ptr: usize) -> bool {
 /// misaligned slot, a stored id no map matches, and a matched map that does
 /// not claim coverage. They are four different repairs, and after the
 /// 2026-08-23 OSR fix these two codes are what
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`'s remaining
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`'s remaining
 /// classes (`TestMVStoreTool`, 5 of 8 collections) refuse on, so the split is
 /// the next question rather than a nicety.
 pub mod frame_coverage_reason {
@@ -2831,7 +2839,7 @@ fn moving_young_frame_coverage_complete_at(
         frame_coverage_reason::NO_MAP_FOR_STORED_ID.fetch_add(1, Relaxed);
         // WHICH frame, and what id was standing in its slot. This is the last
         // obligation blocking `TestMVStoreTool`
-        // (`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`):
+        // (`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`):
         // `no_map=9 incomplete=0 ok=46`, so no map ever refuses on its own
         // claim — nine frames simply cannot be located. A count cannot say
         // whether that is a frame that has not reached a safepoint yet, a call
@@ -4371,7 +4379,7 @@ const fn peer_jit_frames_present(global_depth: usize, local_depth: usize) -> boo
 /// Until 2026-08-23 neither mechanism gave the *initiator* a positive proof at
 /// the moment it decides whether to relocate, so the rule was: **any** peer in
 /// JIT makes the cycle unproven. That is the
-/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md` residual —
+/// `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md` residual —
 /// on a many-threaded workload it fires on nearly every cycle, and on ZGC,
 /// where relocation is the only defragmentation there is, the consequence is an
 /// `OutOfMemoryError` on a heap that is 97 % free.
@@ -5724,7 +5732,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                     // per-call cost climbing from ~13us to ~64us over a
                     // 400k-call `LockTest` run, vs. a flat ~2us with `--nojit`
                     // or with compilation never completing). See
-                    // fixed-suite-bugs/hibernate/hib-misc-residuals-20260716-FIXED.md's
+                    // hib-misc-residuals-20260716-FIXED.md's
                     // `LockTest` section for the full investigation.
                     //
                     // Falls back to the original full-range `[search_lo, high)`
@@ -6234,9 +6242,17 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
 /// crash it answers `verifier_oop=0` for all 2.8 M candidates -- it cannot see
 /// the root. This asks "did we move the object this word points at and leave
 /// the word pointing at the old address", which is the defect itself: a stale
-/// reference in a live compiled frame is exactly what
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` concluded the fault
-/// is, and what its page-aligned faulting `rdi` looks like.
+/// reference in a live compiled frame is a use-after-free in its own right.
+///
+/// It was built for the SIGSEGV of the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`, on that page's
+/// conclusion that the fault was such a reference being read. That conclusion
+/// was RETRACTED on 2026-09-04: the fault was a WRITE, by `relocate_stw`'s own
+/// `ptr::copy`, into an arena granule the give-back had decommitted -- see
+/// `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904`.
+/// This detector is kept because what it FOUND is real and independent of that
+/// crash (see `remap_unmapped_frame_dupes_enabled`), not because the crash is
+/// still open.
 ///
 /// A hit is only a candidate, not proof: a DEAD copy of a moved pointer left in
 /// a spill slot is stale and harmless. What makes it actionable is the slot
@@ -6439,9 +6455,15 @@ fn remap_one_jit_frame(
 /// oop map names only the canonical home. `TestCachedQueryResults.queryCounter`
 /// held one object at four slots -- a GPR safepoint spill, an operand spill and
 /// two below the locals boundary -- and the remap rewrote one. The rest keep
-/// pointing into the vacated page, which is the page-aligned SIGSEGV of
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`. Confirmed at
-/// scale: `duplicate_of_mapped=47946355`.
+/// pointing at the old address. Confirmed at scale:
+/// `duplicate_of_mapped=47946355`.
+///
+/// That is a use-after-free waiting to be read, and it is NOT the SIGSEGV it
+/// was found while hunting: the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902` turned out to be a
+/// decommitted-granule WRITE inside `relocate_stw` itself. Its own numbers
+/// said so before the retraction did -- rewriting these duplicates left the
+/// crash at 3 of 4. Real, enormous, and a different defect.
 ///
 /// PINNING those objects was tried first and does not work: pins only withhold
 /// PAGES in the low compaction region (`relocate_stw`'s
@@ -8092,7 +8114,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // INTO. The narrowing rests on "their roots are published by their own
     // mechanisms", which does not hold for an object that has been allocated
     // and not yet stored anywhere tracked — see
-    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     if !frame_bands_enabled() || !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
         scan_one_frame(scanner_sp, info.frame_base, heap, out);
     }
@@ -8212,8 +8234,11 @@ fn scan_compiled_frame_bands(
 /// spill, an operand spill and two below the locals boundary all held
 /// `0x1fef6b70878` -- while the map names only the canonical home. Relocation
 /// rewrites that home and every duplicate keeps pointing at the vacated page.
-/// Reading one is the page-aligned SIGSEGV of
-/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`.
+/// Reading one is a use-after-free. It is not, as this comment said until
+/// 2026-09-05, the SIGSEGV of the retired
+/// `bug-box-unbox-intrinsic-segv-under-relocation-20260902`: that one was a
+/// WRITE by the slide's own `ptr::copy` into a decommitted granule, and
+/// rewriting these duplicates did not move it.
 ///
 /// Map SELECTION is not the problem and was ruled out first: `NO_MAP_FOR_SP_ID`
 /// and `NO_SP_ID_SLOT` are both zero on that workload, and dev's
@@ -9355,7 +9380,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // JIT-scan cache keying (audits/vm-jit-cache-keying.md)
+    // JIT-scan cache keying (vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     fn filled_scan_cache(heap_id: usize) -> JitScanCache {

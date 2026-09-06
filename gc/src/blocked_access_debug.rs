@@ -17,7 +17,7 @@
 //!
 //! * a heap READ can observe an address the collector already evacuated or
 //!   reclaimed (the `via_pin=true` stale-read family in
-//!   fixed-suite-bugs/wildfly/wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md);
+//!   wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md);
 //! * a heap WRITE or allocation mutates arenas the collector considers
 //!   quiesced;
 //! * a freshly pushed `native_pin_roots` entry is invisible to BOTH the root
@@ -139,7 +139,7 @@ fn violation(what: &str, addr: usize) {
          to both the root scan and fold_pointer_map_into_blocked. Audit the enclosing \
          blocking-region window: no heap access, allocation, pin push, or bytecode may run \
          between deposit_root_snapshot() raising the flag and check_post_block_gc() \
-         clearing it. See fixed-suite-bugs/wildfly/\
+         clearing it. See \
          wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md."
     );
     if mode() == Mode::Panic {

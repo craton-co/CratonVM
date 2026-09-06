@@ -22,7 +22,7 @@
 //!   `[Ljava.lang.Object;` (HotSpot: `[LTag;`).
 //!
 //! Found while reducing the `OffsetDateTimeTest` JUnit-discovery crash
-//! (`fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md`):
+//! (`offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md`):
 //! JUnit's `AnnotationUtils.findRepeatableAnnotations` walks exactly these
 //! arrays, and a dispatch that landed on one reported
 //! `NoSuchMethodError: java.lang.Object.annotationType()` — the array's

@@ -561,7 +561,7 @@ pub(super) fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 /// 14 @GC_STRESS=4096` → `3222190` clean, and the Fork6 GC_STRESS outcome A/B is
 /// 14/15 ALL-OK on == off (the higher young-mark marker count under precise-on is
 /// benign guard-contained over-retention, not worse outcomes). See BUG-01 doc:
-/// `fixed-suite-bugs/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+/// `bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
 ///
 /// History: default-OFF (d53c0e96) for BUG-01: the per-invocation
 /// `frame_record` + per-safepoint sp-id/flush codegen was a ~6× throughput tax on
@@ -749,7 +749,7 @@ pub fn zgc_codegen_honours_read_barrier() -> bool {
 /// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
 /// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
 ///
-/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`audits/g1-audit.md`
+/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`g1-audit.md`
 /// §8.1, 2026-07-31). The previous wording claimed the guarded-getfield
 /// receiver check was prepended by "both inline arms"; three emitters did not
 /// have it, and the `region_bounds_addr != 0` test it named is not a backend
@@ -762,7 +762,7 @@ pub fn zgc_codegen_honours_read_barrier() -> bool {
 /// scanned wholesale — but a region held OUT of the CSet by a JNI pin is
 /// reachable only through its remembered set, so an inline store that skips
 /// `post_write_barrier_rset` loses that edge and the next pause frees a live
-/// referent (`audits/g1-audit.md` §2, §5).
+/// referent (`g1-audit.md` §2, §5).
 ///
 /// **What actually gates the backend.** NOT `helpers.region_bounds_addr != 0`:
 /// that field is the ADDRESS of the process-global `JIT_REGION_BOUNDS` static
@@ -804,7 +804,7 @@ pub fn inline_putfield_enabled() -> bool {
 
 /// Does the GC backend have LIVE heap-region bounds published right now?
 ///
-/// G1-2 (`audits/g1-audit.md` §8.1). This is the predicate the inline
+/// G1-2 (`g1-audit.md` §8.1). This is the predicate the inline
 /// reference-store emitters need and `helpers.region_bounds_addr != 0` is not.
 /// That field holds the address of the process-global `JIT_REGION_BOUNDS`
 /// static (`gc/src/gen_heap.rs`), which `vm/src/jit/helpers.rs` assigns from
@@ -1095,7 +1095,7 @@ pub fn inline_getfield_enabled() -> bool {
 ///
 /// The READ table, not `JIT_REGION_BOUNDS`, since 2026-08-18: that table's
 /// emptiness under G1/ZGC is what keeps inline reference STORES unreachable
-/// (`audits/g1-audit.md` 8.1), so it could never be filled to make inline
+/// (`g1-audit.md` 8.1), so it could never be filled to make inline
 /// READS reachable. `JIT_READ_BOUNDS` answers only the read question -- is
 /// this address mapped -- and G1 fills it with its single contiguous arena
 /// span. ZGC still publishes nothing, which keeps this path unreachable
@@ -1122,7 +1122,7 @@ pub fn inline_getfield_enabled() -> bool {
 /// `is_ref=false` fell into the int-category match arm and got a 32-bit
 /// `MOVSXD` load of half a `Value` cell, producing exactly this "small-int
 /// garbage used as a pointer" shape. See
-/// fixed-suite-bugs/wildfly/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
+/// wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md
 /// for the full chain. Re-verified clean with
 /// `CRATONVM_JIT_GUARDED_GETFIELD=1` against the exact IVF-KNN repro (no
 /// SIGSEGV, no dmesg segfault entry — only the separate, still-OPEN,
@@ -2176,7 +2176,7 @@ pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
 /// VM B's statics would bake the address of an unrelated class's slot into VM
 /// A's code — the same cross-VM aliasing that made the process-global
 /// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
-/// `audits/vm-jit-cache-keying.md`). There is no correct answer to give once two
+/// `vm-jit-cache-keying.md`). There is no correct answer to give once two
 /// VMs share the process, so the mechanism turns itself off for BOTH and every
 /// static read goes back to the helper: slower, never wrong.
 static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =
@@ -2324,7 +2324,7 @@ pub(super) fn sp_tailcall_enabled() -> bool {
 /// Unlike [`sp_tailcall_enabled`], which governs the SIBLING tail-call (a `JMP`
 /// into ANOTHER method's entry), this one governs a method jumping back into
 /// itself. See
-/// `fixed-suite-bugs/jit/jit-eliminates-self-tail-call-frames-FIXED-20260820.md`.
+/// `jit-eliminates-self-tail-call-frames-FIXED-20260820.md`.
 pub(super) fn self_tailcall_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2743,21 +2743,62 @@ pub(super) fn inline_oop_coverage_enabled() -> bool {
 /// alone -- publishing a map that named none of its reference locals while
 /// `fully_oop_covered` read TRUE. See
 /// `map_incomplete_cause::LOCAL_MASK_UNSUPPORTED` for the measurement.
-/// `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=1` -- a safepoint whose
-/// local-oop dataflow was never REACHED must not ship a map claiming complete
-/// frame-slot coverage.
+/// A safepoint whose local-oop dataflow was never REACHED must not ship a map
+/// claiming complete frame-slot coverage.
 ///
 /// Sibling of [`local_mask_fail_closed_enabled`], which covers the case where
 /// the dataflow never ran for the METHOD. This one covers a pc inside a method
-/// it did run on. Default OFF (that one defaults ON) because this population is
-/// larger and its refusal cost is still being priced -- see the call site in
-/// `x64::safepoint` for the measurement that motivated it.
+/// it did run on, and **defaults ON since 2026-09-05**, like that one.
+/// `CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED=0` restores the old
+/// optimistic claim.
+///
+/// It was opt-in from 2026-09-03 for a stated reason -- "this population is
+/// larger and its refusal cost is still being priced" -- and the pricing is
+/// done. On `org.h2.test.jdbc.TestCachedQueryResults` at `--Xmx 1g`, which is
+/// where the population was found (`local_mask_unreached` 117 and climbing to
+/// 147 in one run):
+///
+/// * fragmentation `OutOfMemoryError`: **0**, in every run of both arms, 8
+///   sequential runs plus 4 concurrent pairs. That was the cost worth fearing
+///   -- the blanket refusal one flag over costs ~9700 and never completes.
+/// * throughput: **no difference**. Ratios of 0.97, 0.99, 1.00 and 1.00 from
+///   arms run CONCURRENTLY, which is the only design that works on this host;
+///   a sequential ABBA read 1.9x and was measuring other agents' load. See the
+///   retired `bug-box-unbox-intrinsic-segv-under-relocation-20260902`.
+///
+/// AND IT IS NOT INERT, which those two zeros on their own would not tell you
+/// -- `relocation_skipped_jit` (28 vs 30), `relocation_on_proven_jit` (191 vs
+/// 191) and `compaction_cycles` (190 vs 190) are the same either way, so the
+/// collector's decisions do not move. What moves is the CLAIM, which is the
+/// point. `CRATONVM_DBG_OOPCOV=1`, 90 s each:
+///
+/// | | `frameslot=false` | `frameslot=true` |
+/// |---|---:|---:|
+/// | default (ON) | **101** | 12 |
+/// | `=0` | 50 | 65 |
+///
+/// Fifty-one methods stop advertising complete frame-slot coverage they did
+/// not have. Relocation barely notices because the per-cycle proof only
+/// consults a method while one of its frames is LIVE, and these rarely are on
+/// this workload -- which is why the honesty costs nothing here, and equally
+/// why it is worth having before a workload arrives where they are.
+///
+/// What it does NOT buy is that page's SIGSEGV, which was a decommitted-granule
+/// write inside `relocate_stw` and is fixed elsewhere. This closes a soundness
+/// hole on its own evidence: the SHADOW half of the same machinery already
+/// refuses this exact population, so until now the two halves disagreed and the
+/// half that publishes the claim was the optimistic one.
 pub(super) fn local_mask_unreached_fail_closed_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED")
-            .is_some()
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
     })
 }
 

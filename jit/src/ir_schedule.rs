@@ -171,6 +171,287 @@ pub struct ScheduleOptions {
     /// move a block out of its protected range" is a property worth pinning
     /// before there is a range to violate.
     pub protected_regions: Vec<Vec<usize>>,
+    /// Sink a pure data node to the shallowest loop nesting that still
+    /// dominates every use of it. See [`sink_pure_nodes`]; ORed with
+    /// `CRATONVM_JIT_IR_SINK_LATE` so the production path, which calls
+    /// [`schedule`] with no options at all, can reach it.
+    pub sink_pure_late: bool,
+}
+
+/// Sink pure nodes out of loops they are only used outside of -- **default ON**
+/// since 2026-09-05; `CRATONVM_JIT_IR_SINK_LATE=0` is the kill switch.
+///
+/// This module's own header says a data node is "placed as late as possible
+/// (to minimize register pressure)". It is not: [`find_best_block`] picks the
+/// deepest block that all its INPUTS dominate, which is schedule-EARLY. For a
+/// value whose inputs are a loop phi and a constant, that is inside the loop —
+/// whatever its uses do.
+///
+/// `probes/OsrTierBench.java` is the case that named it. `return sum * 1000003L
+/// + acc` compiles to three nodes whose only consumer is the `Return` in the
+/// exit block, and all three were scheduled into the loop body: eleven of the
+/// loop's fifty-five instructions, computed and discarded on every iteration.
+fn sink_late_enabled() -> bool {
+    // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SINK_LATE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
+/// May `op` be moved to a different block without changing what the method
+/// does?
+///
+/// Pure arithmetic only: no memory edge, no control edge, and nothing that can
+/// trap. `Op::Div` and `Op::Rem` are absent because their zero guard is a
+/// deopt point, and moving a trap changes where the exception is raised;
+/// `Op::Const` is absent because it is already in the entry block (it has no
+/// inputs); `Op::Phi` is pinned to its merge.
+fn op_is_sinkable(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Cmp(_)
+            | Op::LCmp
+    )
+}
+
+/// Loop nesting depth per block, from the back edges the dominator relation
+/// already knows about.
+///
+/// A back edge is an edge `u -> v` whose target dominates its source; its
+/// natural loop is `v` plus everything that reaches `u` without passing
+/// through `v`. Same definition `ir_lower`'s poll placement rests on, computed
+/// here from `dom` rather than re-derived.
+fn loop_depths(blocks: &[Block], dom: &[Vec<bool>]) -> Vec<u32> {
+    let n = blocks.len();
+    let mut depth = vec![0u32; n];
+    for u in 0..n {
+        for &v in &blocks[u].successors {
+            if v >= n || !dominates(dom, v, u) {
+                continue;
+            }
+            if u == v {
+                depth[v] += 1;
+                continue;
+            }
+            let mut in_loop = vec![false; n];
+            in_loop[v] = true;
+            in_loop[u] = true;
+            let mut stack = vec![u];
+            while let Some(b) = stack.pop() {
+                for &p in &blocks[b].predecessors {
+                    if p < n && !in_loop[p] {
+                        in_loop[p] = true;
+                        stack.push(p);
+                    }
+                }
+            }
+            for (b, inside) in in_loop.iter().enumerate() {
+                if *inside {
+                    depth[b] += 1;
+                }
+            }
+        }
+    }
+    depth
+}
+
+/// The deepest block that dominates every block in `of`, or `None`.
+fn deepest_common_dominator(dom: &[Vec<bool>], of: &[usize], nb: usize) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for cand in 0..nb {
+        if !of.iter().all(|&b| dominates(dom, cand, b)) {
+            continue;
+        }
+        best = Some(match best {
+            // Deeper means dominated by the other.
+            Some(cur) if dominates(dom, cur, cand) => cand,
+            Some(cur) => cur,
+            None => cand,
+        });
+    }
+    best
+}
+
+/// Move each pure node to the shallowest loop nesting on the dominator path
+/// between where its inputs put it and where its uses need it.
+///
+/// **Only when the depth strictly decreases.** The classic schedule-late also
+/// prefers the latest block at equal depth, to shorten live ranges; that is a
+/// different trade with a different risk, and leaving it out keeps this pass's
+/// effect attributable to the one thing it claims — taking work out of loops.
+///
+/// # The safepoint obligation, and why a failure reverts everything
+///
+/// A frame state resolves a value it names from that value's HOME WORD, and the
+/// home is written wherever the node is emitted. So a node this pass moves must
+/// still dominate every block that could anchor a safepoint naming it —
+/// otherwise a deopt inside the loop reads a word nothing has written yet,
+/// which is the "confidently wrong value" failure this area produces.
+///
+/// The check is made against the FINAL placement, and a violation reverts the
+/// whole method rather than the offending node: reverting one node can break
+/// another's dominance (a use pulled back above a def that sank), so undoing
+/// the lot is the only revert that is obviously correct. `reverted` counts it.
+fn sink_pure_nodes(
+    graph: &Graph,
+    blocks: &mut [Block],
+    node_to_block: &mut [usize],
+    dom: &[Vec<bool>],
+) -> (usize, usize) {
+    let nb = blocks.len();
+    if nb < 2 {
+        return (0, 0);
+    }
+    let depth = loop_depths(blocks, dom);
+    let original: Vec<usize> = node_to_block.to_vec();
+    let mut moved = 0usize;
+
+    // Iterated, because a node can only follow its uses: the `Add` feeding the
+    // `Return` has to reach the exit block before the `Mul` feeding the `Add`
+    // can see a reason to. Three rounds settle the shape above; the bound is a
+    // guard against a graph that does not converge, not a tuning choice.
+    for _ in 0..8 {
+        let mut use_blocks: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
+        for (uid, un) in graph.nodes.iter().enumerate() {
+            let ub = node_to_block[uid];
+            if ub == usize::MAX || ub >= nb {
+                continue;
+            }
+            for &inp in &un.inputs {
+                if inp == NO_NODE {
+                    continue;
+                }
+                if let Some(v) = use_blocks.get_mut(inp as usize) {
+                    if !v.contains(&ub) {
+                        v.push(ub);
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for id in 0..graph.nodes.len() {
+            let early = node_to_block[id];
+            if early == usize::MAX || early >= nb {
+                continue;
+            }
+            if !op_is_sinkable(&graph.nodes[id].op) {
+                continue;
+            }
+            let uses = &use_blocks[id];
+            if uses.is_empty() {
+                continue;
+            }
+            let Some(late) = deepest_common_dominator(dom, uses, nb) else {
+                continue;
+            };
+            // A node is only ever moved DOWN its own dominator path. When a use
+            // sits in `early` itself this makes `late == early` and nothing
+            // moves, which is the right answer: the value is needed here.
+            if !dominates(dom, early, late) {
+                continue;
+            }
+            let mut best = early;
+            for cand in 0..nb {
+                if dominates(dom, early, cand)
+                    && dominates(dom, cand, late)
+                    && depth[cand] < depth[best]
+                {
+                    best = cand;
+                }
+            }
+            if best != early {
+                node_to_block[id] = best;
+                changed = true;
+                moved += 1;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if moved == 0 {
+        return (0, 0);
+    }
+
+    // The safepoint obligation, against the final placement.
+    let mut anchors: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (nid, n) in graph.nodes.iter().enumerate() {
+        if let Some(pc) = n.bytecode_pc {
+            let b = node_to_block[nid];
+            if b != usize::MAX && b < nb {
+                anchors.entry(pc).or_default().push(b);
+            }
+        }
+    }
+    let mut ok = true;
+    'check: for sp in &graph.safepoints {
+        let Some(anchor_blocks) = anchors.get(&sp.bci) else {
+            // No node carries this bci, so `build_deopt_points` finds no
+            // native anchor for it and emits no point at all.
+            continue;
+        };
+        for &v in sp.locals.iter().chain(sp.stack.iter()) {
+            if v == NO_NODE {
+                continue;
+            }
+            let vb = match node_to_block.get(v as usize) {
+                Some(&b) if b != usize::MAX && b < nb => b,
+                _ => continue,
+            };
+            if original.get(v as usize) == Some(&vb) {
+                continue; // not moved by this pass
+            }
+            if !anchor_blocks.iter().all(|&ab| dominates(dom, vb, ab)) {
+                ok = false;
+                break 'check;
+            }
+        }
+    }
+    if !ok {
+        node_to_block.copy_from_slice(&original);
+        return (0, moved);
+    }
+
+    // Rebuild each block's data-node list from the placement. `topo_sort_block`
+    // runs after this and restores dependence order within every block.
+    let placed: Vec<NodeId> = blocks
+        .iter()
+        .flat_map(|b| b.nodes.iter().copied())
+        .collect();
+    for b in blocks.iter_mut() {
+        b.nodes.clear();
+    }
+    for id in placed {
+        let b = node_to_block[id as usize];
+        if b != usize::MAX && b < nb {
+            blocks[b].nodes.push(id);
+        }
+    }
+    (moved, 0)
 }
 
 /// Where a block's frequency estimate came from, and what it is.
@@ -516,6 +797,19 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
         let block = find_best_block(graph, id as NodeId, &node_to_block, &blocks, &dom);
         node_to_block[id] = block;
         blocks[block].nodes.push(id as NodeId);
+    }
+
+    // Step 4b: Sink pure nodes out of loops they are only used outside of.
+    //
+    // Placed here — after every node has a block, before the intra-block
+    // ordering — because it changes which block a node is in and nothing else.
+    // `topo_sort_block` below then repairs the order inside every block it
+    // touched.
+    if opts.sink_pure_late || sink_late_enabled() {
+        let (moved, reverted) = sink_pure_nodes(graph, &mut blocks, &mut node_to_block, &dom);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
+            eprintln!("[ir-sink] moved={moved} reverted_for_safepoints={reverted}");
+        }
     }
 
     // Step 5: Order the data nodes within each block.

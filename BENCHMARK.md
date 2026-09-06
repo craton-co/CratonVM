@@ -275,7 +275,30 @@ enforced budget.
 | Integer div-chain (48 divs/elem)                       | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
 | Double div-chain (64 divs/elem)                        | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
 | 128 multiply-adds/elem (data-dependent multiplier)     | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
-| Dot-product reduction (int·int → long, x300/elem)      | 1,172 ms   | unimplemented | **12 ms**    | **98x**    | n/a          |
+| Dot-product reduction (int·int → long, x300/elem)      | 1,172 ms   | unimplemented | **2 ms**     | **586x**    | n/a          |
+
+Re-verified 2026-09-05 on the same box (RTX 2060, TornadoVM 4.0.1 PTX,
+N = 2²⁴). The four non-ray-tracer rows still hold and TornadoVM's integer
+div-chain reproduced exactly at 26 ms. Two things that run did change:
+
+- The **dot-product row is now 2 ms**, not 12 — the warp-shuffle reduction
+  (one `red.global.add` per warp rather than per thread) landed after the
+  original measurement.
+- The **double div-chain row had silently stopped reproducing**: it measured
+  9,276 ms, slower than HotSpot, because `runtime::offload_jit_gate` asked the
+  constant-pool-*free* analyzer, which rejects `ldc2_w` unconditionally, while
+  the dispatcher it gates for asks the pool-aware one. That kernel's
+  `+ 1.0000001` is an `ldc2_w`; its integer twin's `+ 12345` is a `sipush`
+  with no pool entry, which is why one row worked and the other did not.
+  Fixed the same day; the row now measures 81 ms against TornadoVM's 135.
+
+The CPU columns above are the original idle-box measurements and were **not**
+re-taken — that re-run shared the host with an unrelated build, which makes a
+CPU baseline pessimistic and every ratio derived from it flattering. The GPU
+figures quoted in this note were measured under that same load, so they are
+conservative rather than optimistic. The ray-tracer row was not re-run: it
+needs `craton-gpu-0.2.0.jar` and a `cratonvm-gpuray` binary that are not
+present in this tree.
 
 Notes:
 
@@ -320,7 +343,8 @@ Notes:
   per-element array (`m = b[i]`, the same trick `GpuDivChain` already uses
   for its divisor) removes the closed form: HotSpot now does genuine work
   and the row flips from "GPU loses" (0.7x) to another 163x GPU win. The
-  dot-product row's swing (0.4x → 98x) is different in kind: `sum += p` was
+  dot-product row's swing (0.4x → 98x, and 586x since the warp-shuffle
+  reduction) is different in kind: `sum += p` was
   never foldable (both operands are runtime array reads), so scaling its
   per-element repeat count from 1x to 300x — needed to push HotSpot over 1
   second — genuinely shifts the kernel from launch/PCIe-overhead-bound (GPU

@@ -4,7 +4,7 @@
 //! Phase I — Smoke tests per app family (roadmap items RI.1 .. RI.10).
 //!
 //! This file is the Phase-I harness described in
-//! `history/roadmap-any-java-app.md`. It covers ten representative subphases,
+//! `roadmap-any-java-app.md`. It covers ten representative subphases,
 //! each with a clear pass/fail signal:
 //!
 //! | Subphase | Roadmap target             | Sealed stand-in used here                |

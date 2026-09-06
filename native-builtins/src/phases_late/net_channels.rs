@@ -2090,7 +2090,7 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             // the peer reads or the connection resets) instead of the
             // caller's own timeout ever firing — a separate, out-of-scope-
             // for-this-fix architectural gap. Filed as a residual; see
-            // fixed-suite-bugs/stw-crossthread-jit-takeover-hang-cluster.md.
+            // stw-crossthread-jit-takeover-hang-cluster.md.
             let bytes_written = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {

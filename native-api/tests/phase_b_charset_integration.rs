@@ -3,7 +3,7 @@
 
 //! Phase B integration tests for the shared charset engine
 //! (`cratonvm_native_api::charset`). These tests correspond to the
-//! success criteria listed in `history/roadmap-any-java-app.md`:
+//! success criteria listed in `roadmap-any-java-app.md`:
 //!
 //! * RB.1 — UTF-8 / US-ASCII / ISO-8859-1 / UTF-16LE/BE round-trip
 //!   a 256-byte fixture.

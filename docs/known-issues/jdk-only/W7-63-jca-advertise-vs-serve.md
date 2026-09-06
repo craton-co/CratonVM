@@ -67,7 +67,7 @@ actually refuse** — 93 resolve through a path the service map does not
 advertise, and a full 2048-bit Diffie-Hellman runs 0-diff against HotSpot on a
 `KeyAgreement` type that is not enumerated at all. That is exactly this page's
 thesis, arrived at the expensive way; that record is
-`jca-provider-population-gap-20260830.md`, retired to `internal/` on
+`jca-provider-population-gap-20260830-FIXED.md`, retired to `internal/` on
 2026-09-02.
 
 > **Both halves of this page's title were closed on 2026-09-02**, and the

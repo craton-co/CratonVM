@@ -3,8 +3,7 @@
 ## Status
 
 **FIXED 2026-09-04.** Retired from
-`known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`,
-which named it "the box/unbox intrinsic SIGSEGVs under a relocating
+`bug-box-unbox-intrinsic-segv-under-relocation-20260902`, which named it "the box/unbox intrinsic SIGSEGVs under a relocating
 collector". It is neither the intrinsic's fault nor relocation's, and the
 intrinsic is default-ON again.
 
@@ -203,6 +202,16 @@ all five are gone:
 | `unit.TestPerfectHash` | CRASH | **PASS** |
 | `synth.TestPowerOffFs2` | CRASH | FAIL |
 | `store.TestKillProcessWhileWriting` | CRASH | HANG |
+
+**`TestKillProcessWhileWriting`'s HANG is the SUITE'S CAP, not a failure**
+(established 2026-09-06). That class's healthy runtime is 605-716 s under G1 and
+811 s under the default collector, and `run-h2-suite.sh` caps a class at
+`CLASS_TO=300`. It reports HANG whatever the VM does. See
+`h2-testkillprocesswhilewriting-g1-oom-FIXED-20260902-VERIFIED-20260906.md`, which
+carries the cap finding and the `CLASS_TO=1800` invocation. The suspicion below
+that these are "300 s class timeouts on a shared box" was right about the number
+and one step short of the cause: the cap is below the measurement even on an
+idle host.
 
 The last two still do not pass, but they no longer crash — a different failure,
 to be taken on its own terms rather than as this one.

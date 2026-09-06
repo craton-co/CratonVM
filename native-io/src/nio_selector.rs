@@ -282,6 +282,21 @@ struct KeyState {
     /// up the matching `SkState` row in `sk_table` and to compare key
     /// identity across selectors without dereferencing `key_obj`.
     key_hash: i32,
+    /// The `ready_ops` value most recently mirrored into `sk_table`, or
+    /// [`UNMIRRORED`] if this key has never been mirrored.
+    ///
+    /// `apply_ready_ops` used to push EVERY key of the selector into
+    /// `sk_table` after every `select()`, under that table's process-global
+    /// write lock. A server holding 5 000 idle keep-alive connections paid
+    /// 5 000 map probes to report one ready socket, and every other event loop
+    /// in the process blocked on the lock while it happened — a per-tick cost
+    /// driven by CONNECTION COUNT, which is the axis an HTTP throughput test
+    /// scales.
+    ///
+    /// Comparing against this field turns the mirror into O(changed): a tick
+    /// where no readiness moved takes the global lock zero times. It is only
+    /// ever read and written under the selector's own mutex.
+    mirrored_ready: i32,
     /// True if cancel() has been called; pruned at the start of the next
     /// select cycle.
     cancelled: bool,
@@ -294,6 +309,14 @@ struct KeyState {
 /// "no fd" sentinel `channel_net_fd` answers with, so the placeholder space
 /// starts well below both and grows downwards.
 const UNRESOLVED_FD_BASE: i32 = -1000;
+
+/// `KeyState::mirrored_ready` for a key whose readiness has never been pushed
+/// into `sk_table`.
+///
+/// A sentinel rather than `0`, because `0` is a LEGITIMATE ready mask: a key
+/// that is genuinely not ready must still be mirrored as not-ready the first
+/// time, or `key.readyOps()` would answer from an unwritten row.
+const UNMIRRORED: i32 = i32::MIN;
 
 struct SelectorState {
     open: bool,
@@ -478,7 +501,7 @@ impl SelectorState {
     /// change here does not self-heal within any bounded window, it stalls
     /// for the caller's full requested timeout. Found while investigating
     /// `JettyClientHttpConnectorBuilderTests`'s 100%-reproducible hang/crash
-    /// (`fixed-suite-bugs/http-client-connector-teardown-hang-crash-FIXED.md`):
+    /// (`http-client-connector-teardown-hang-crash-FIXED.md`):
     /// a real, confirmed gap (a registration lost this exact way, verified
     /// via `CRATONVM_DBG_SELECTOR=1` tracing) — but NOT, on its own,
     /// sufficient to fix that specific hang; see the doc for the remaining
@@ -1008,6 +1031,7 @@ pub fn selector_register(
             net_fd,
             interest_ops,
             ready_ops: 0,
+            mirrored_ready: UNMIRRORED,
             key_obj,
             key_hash,
             cancelled: false,
@@ -1221,6 +1245,12 @@ pub fn selector_cancel(id: i32, net_fd: i32) {
         let mut st = s.lock();
         if let Some(k) = st.keys.get_mut(&net_fd) {
             k.cancelled = true;
+            // `key_cancel_native` / `SelectionKey.cancel` also zero this key's
+            // `ready_ops` directly in `sk_table`, behind this cache's back.
+            // Forget what we believe was mirrored, or the next tick would see
+            // `ready_ops == mirrored_ready` and skip a row the other writer has
+            // already changed.
+            k.mirrored_ready = UNMIRRORED;
         }
     }
 }
@@ -2194,7 +2224,7 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
             // it again. On the WebSocket back-pressure workload that cost 3-11
             // socket-processing tasks per message where HotSpot needs exactly
             // one, which is what grew the connector pool to maxThreads.
-            // See fixed-suite-bugs/tomcat/wsremoteendpoint-server-close-never-completes-FIXED.md.
+            // See wsremoteendpoint-server-close-never-completes-FIXED.md.
             if interest & OP_WRITE != 0 && h.os_handle().map(os_handle_writable).unwrap_or(true) {
                 ready |= OP_WRITE;
             }
@@ -2902,23 +2932,94 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 /// Mirror the native readyOps onto the SelectionKey side-table so user
 /// code reading `key.readyOps()` sees the post-select state.
+///
+/// # Why this is not a loop over every key any more
+///
+/// This ran once per `select()` and touched EVERY registered key of the
+/// selector, under `sk_table`'s process-global write lock, recomputing each
+/// key's identity hash on the way. Both halves were avoidable:
+///
+///  * the hash is already stored. `KeyState::key_hash` exists precisely
+///    because it is GC-stable where the `ObjectRef` is not, so
+///    `identity_hash_code` per key per tick was re-deriving a field that was
+///    sitting right there;
+///  * the vast majority of keys are unchanged. An HTTP server's selector holds
+///    thousands of idle keep-alive registrations and a handful of ready ones,
+///    so mirroring all of them wrote the same values back over themselves and
+///    serialized every other event loop in the process against the global lock
+///    while doing it.
+///
+/// Now the walk happens under the selector's OWN mutex (uncontended, and
+/// already held for the select itself), and the global lock is taken only when
+/// something actually moved — never at all on a quiet tick.
+///
+/// `_ctx` is retained in the signature and unused: it is part of the
+/// post-select sequence's shape, and a caller that has to reorder these steps
+/// should not have to change this one's call site to do it.
 fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
-    // C27: side-table is keyed by the SelectionKey's identity hash
-    // code; carry the hash through instead of a raw pointer.
-    let snap: Vec<(ObjectRef, i32)> = {
+    // PASS 1 — under the selector's own lock, collect only what changed and
+    // optimistically record it as mirrored.
+    //
+    // C27: the side-table is keyed by the SelectionKey's identity hash code;
+    // carry the STORED hash through rather than recomputing it.
+    let mut snap: Vec<(ObjectRef, i32, i32)> = Vec::new();
+    {
         let regs = selectors_read();
         let Some(s) = regs.get(&id) else { return };
-        let st = s.lock();
-        st.keys
-            .values()
-            .filter_map(|k| k.key_obj.map(|obj| (obj, k.ready_ops)))
-            .collect()
-    };
-    let mut table = sk_table().write();
-    for (key, ready) in snap {
-        let hash = _ctx.identity_hash_code(key);
-        if let Some(state) = sk_find_mut(&mut table, key, hash) {
-            state.ready_ops = ready;
+        let mut st = s.lock();
+        crate::socket_fast_io::stats::add(
+            &crate::socket_fast_io::stats::SEL_KEYS_WALKED,
+            st.keys.len() as u64,
+        );
+        let cache_on = sel_ready_cache_engaged();
+        for k in st.keys.values_mut() {
+            // With the cache off, every key is mirrored every tick — the
+            // pre-cache behaviour, and the "off" arm of this cut's A/B.
+            if cache_on && k.ready_ops == k.mirrored_ready {
+                continue;
+            }
+            let Some(obj) = k.key_obj else { continue };
+            snap.push((obj, k.key_hash, k.ready_ops));
+            k.mirrored_ready = k.ready_ops;
+        }
+    }
+    if snap.is_empty() {
+        crate::socket_fast_io::stats::bump(&crate::socket_fast_io::stats::SEL_TICK_CLEAN);
+        return;
+    }
+    crate::socket_fast_io::stats::bump(&crate::socket_fast_io::stats::SEL_TICK_DIRTY);
+    crate::socket_fast_io::stats::add(
+        &crate::socket_fast_io::stats::SEL_KEYS_MIRRORED,
+        snap.len() as u64,
+    );
+
+    // PASS 2 — the only part that needs the global lock.
+    let mut missing: Vec<ObjectRef> = Vec::new();
+    {
+        let mut table = sk_table().write();
+        for (key, hash, ready) in &snap {
+            match sk_find_mut(&mut table, *key, *hash) {
+                Some(state) => state.ready_ops = *ready,
+                // A key registered with the selector but with no `sk_table` row
+                // yet. Pass 1 already marked it mirrored, which would suppress
+                // every future attempt — so undo that below rather than lose
+                // the key's readiness permanently once its row appears.
+                None => missing.push(*key),
+            }
+        }
+    }
+
+    // PASS 3 — repair the optimistic marks that did not land. Costs a second
+    // lock acquisition, and runs only when a row was genuinely absent.
+    if !missing.is_empty() {
+        let regs = selectors_read();
+        if let Some(s) = regs.get(&id) {
+            let mut st = s.lock();
+            for k in st.keys.values_mut() {
+                if k.key_obj.is_some_and(|o| missing.contains(&o)) {
+                    k.mirrored_ready = UNMIRRORED;
+                }
+            }
         }
     }
 }
@@ -2938,6 +3039,147 @@ fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
 /// `selectedKeys` field. Idempotent for a JDK HashSet (dedups); Netty resets its set
 /// before each select. Skips silently when the field is null / not a Set (then nothing
 /// reads it and the on-demand `selectedKeys()` path is authoritative).
+/// Netty's own selected-key set, the one it installs over the JDK's by
+/// reflection. Matched as a LITERAL and by exact class name — a subclass may
+/// override `add`, and only the generic dispatch below honours an override.
+const NETTY_SELECTED_KEY_SET: &str = "io/netty/channel/nio/SelectedSelectionKeySet";
+
+/// Field slots of [`NETTY_SELECTED_KEY_SET`]: the backing array and the cursor.
+#[derive(Clone, Copy)]
+struct SelSetSlots {
+    keys: usize,
+    size: usize,
+}
+
+/// Is the readiness-mirror cache engaged? `CRATONVM_SEL_READY_CACHE=0`
+/// restores the unconditional per-tick mirror of every key into `sk_table`.
+///
+/// A SEPARATE switch from `sel_fast_keys_engaged` below, deliberately. They are
+/// two independent cuts, and this is the one whose failure mode is subtle: a
+/// cache that latched would suppress a real readiness change and the symptom
+/// would be a reactor that stops being told about a socket, not an error. An
+/// A/B that could only turn both off together could not tell you which one did
+/// it.
+fn sel_ready_cache_engaged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_SEL_READY_CACHE")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+/// Is the direct selected-key append engaged? `CRATONVM_SEL_FAST_KEYS=0`
+/// restores `invoke_virtual("add")` for every ready key.
+fn sel_fast_keys_engaged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_SEL_FAST_KEYS")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+/// Resolve (and memoize) the layout of `set`, if it is netty's own key set.
+///
+/// `None` for anything else — a JDK `HashSet`, a user-supplied set, or a
+/// subclass — which then takes the generic `invoke_virtual` path. The negative
+/// answer is cached too: a JDK `HashSet` selector would otherwise pay a class
+/// name comparison on every tick to be told the same thing.
+fn sel_set_slots(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<SelSetSlots> {
+    if !sel_fast_keys_engaged() {
+        return None;
+    }
+    // Keyed by `(vm_identity, ClassId)`, not by `ClassId`: an id is an index
+    // into its OWN VM's class store, and several VMs can share a process. See
+    // `socket_fast_io::bb_slot_cache` for the full argument — the failure this
+    // avoids is one VM's layout answering another VM's lookup.
+    static CACHE: std::sync::OnceLock<
+        parking_lot::RwLock<FxHashMap<(usize, ClassId), Option<SelSetSlots>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(FxHashMap::default()));
+
+    let cid = ctx.class_id_of_object(set);
+    // `ClassId(0)` is `java.lang.Object` and is also what a failed validation
+    // answers — never a real key set, and caching under it would let one stale
+    // receiver decide the fast path for every selector afterwards.
+    if cid == ClassId::new(0) {
+        return None;
+    }
+    let key = (ctx.vm_identity(), cid);
+    if let Some(hit) = cache.read().get(&key).copied() {
+        return hit;
+    }
+    let resolved = (|| {
+        let name = ctx.class_name_arc_of_id(cid)?;
+        if &*name != NETTY_SELECTED_KEY_SET {
+            return None;
+        }
+        Some(SelSetSlots {
+            keys: ctx.resolve_field_index_by_class_id(cid, "keys")?,
+            size: ctx.resolve_field_index_by_class_id(cid, "size")?,
+        })
+    })();
+    cache.write().insert(key, resolved);
+    resolved
+}
+
+/// Append `ready` straight into netty's key set, or report that it could not.
+///
+/// Reproduces `SelectedSelectionKeySet.add` exactly — `keys[size++] = o` — for
+/// the case where the array has room, and REFUSES otherwise rather than
+/// reimplementing `increaseCapacity`. That refusal is deliberate: growing the
+/// array means allocating a new `SelectionKey[]` of the right component type
+/// and copying, which is netty's own bytecode's job and is not worth
+/// duplicating here for a branch that a 1024-entry set reaches once. Netty's
+/// invariant — `size < keys.length` after every add — is preserved by the
+/// STRICT `<` in the capacity test.
+///
+/// Why this is worth having at all: the generic path calls `invoke_virtual`
+/// once per ready key, and a callee reached that way from a Rust native has no
+/// bytecode call site, hence no inline-cache entry and no invocation counter.
+/// `SelectedSelectionKeySet.add` therefore runs interpreted for the life of the
+/// process and NO tier-up lever can reach it. The fix for that shape is to stop
+/// re-entering, which is what this does.
+fn append_selected_keys_fast(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+    ready: &[ObjectRef],
+) -> bool {
+    let Some(slots) = sel_set_slots(ctx, set) else {
+        return false;
+    };
+    let Value::Object(Some(arr)) = ctx.get_field(set, slots.keys) else {
+        return false;
+    };
+    let Value::Int(size) = ctx.get_field(set, slots.size) else {
+        return false;
+    };
+    if size < 0 {
+        return false;
+    }
+    let size = size as usize;
+    let cap = ctx.array_length(arr);
+    if size + ready.len() >= cap {
+        return false;
+    }
+    // No pins and no re-reads through them, unlike the generic path below:
+    // nothing here runs Java bytecode or allocates, so no collection can
+    // relocate `arr` or the keys between these writes. `set_array_element`
+    // applies the reference write barrier itself.
+    for (i, key) in ready.iter().enumerate() {
+        ctx.set_array_element(arr, size + i, Value::Object(Some(*key)));
+    }
+    ctx.set_field(set, slots.size, Value::Int((size + ready.len()) as i32));
+    crate::socket_fast_io::stats::add(
+        &crate::socket_fast_io::stats::SELKEYS_FAST,
+        ready.len() as u64,
+    );
+    true
+}
+
 fn populate_selected_keys_field(ctx: &mut dyn NativeContext, selector: ObjectRef, id: i32) {
     let Value::Object(Some(set)) = ctx.get_field_by_name(selector, "selectedKeys") else {
         return;
@@ -2957,6 +3199,14 @@ fn populate_selected_keys_field(ctx: &mut dyn NativeContext, selector: ObjectRef
     if ready.is_empty() {
         return;
     }
+    // Netty's own set can be filled without entering the interpreter at all.
+    if append_selected_keys_fast(ctx, set, &ready) {
+        return;
+    }
+    crate::socket_fast_io::stats::add(
+        &crate::socket_fast_io::stats::SELKEYS_GENERIC,
+        ready.len() as u64,
+    );
     // Each Set.add below runs Java bytecode and may trigger a moving GC, so
     // the raw `set` receiver and the still-pending key refs go stale after
     // the first add (observed as an all-zero-header java/util/Set receiver +
@@ -4969,6 +5219,138 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::thread;
+
+    // --- the netty selected-key fast path (F4) -----------------------------
+    //
+    // These exist because the engagement census said this path had NEVER RUN:
+    // a whole-suite CratonVM run reported `selected-keys fast=0 generic=0`,
+    // because the regression suite has no netty on its classpath and the JDK
+    // selector it does use is served by the on-demand `selectedKeys()` builder
+    // instead of the field. Shipping a fast path that nothing has ever
+    // executed is worse than shipping no fast path, so the mechanism is
+    // covered here even though the integration is not.
+    //
+    // The mock these run against had `resolve_field_index_by_class_id` stubbed
+    // to `None` until this commit. That is not a harmless default: with it,
+    // `sel_set_slots` refuses, `append_selected_keys_fast` returns false, and
+    // a test asserting "the keys arrived" passes by way of the GENERIC path
+    // while claiming to cover the fast one. Every test below therefore asserts
+    // which path ran, not merely that the outcome was right.
+
+    /// Build a mock netty `SelectedSelectionKeySet`: an object whose slot 0 is
+    /// the `keys` array and slot 1 the `size` cursor.
+    fn netty_key_set(
+        ctx: &mut crate::test_support::MockNativeContext,
+        capacity: usize,
+        size: i32,
+    ) -> ObjectRef {
+        use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess};
+        ctx.declare_field(NETTY_SELECTED_KEY_SET, "keys", 0);
+        ctx.declare_field(NETTY_SELECTED_KEY_SET, "size", 1);
+        let set = ctx.alloc_object_with_class(2, NETTY_SELECTED_KEY_SET);
+        let arr = ctx.new_ref_array(ClassId::new(0), capacity);
+        ctx.set_field(set, 0, Value::Object(Some(arr)));
+        ctx.set_field(set, 1, Value::Int(size));
+        set
+    }
+
+    /// The fast path appends at `size`, advances it, and enters NO Java.
+    #[test]
+    fn netty_selected_key_set_is_filled_without_entering_the_interpreter() {
+        use cratonvm_native_api::{NativeHeapAccess, NativeInvokeAccess};
+        let mut ctx = crate::test_support::MockNativeContext::new();
+        let set = netty_key_set(&mut ctx, 8, 2);
+        let k0 = ctx.alloc_object(1);
+        let k1 = ctx.alloc_object(1);
+
+        let took_fast = append_selected_keys_fast(&mut ctx, set, &[k0, k1]);
+        assert!(took_fast, "the fast path refused a netty set with room");
+
+        // Appended AT the cursor, not at 0 — a fast path that ignored `size`
+        // would overwrite keys netty had not yet consumed.
+        let Value::Object(Some(arr)) = ctx.get_field(set, 0) else {
+            panic!("keys array vanished");
+        };
+        assert_eq!(ctx.get_array_element(arr, 2), Value::Object(Some(k0)));
+        assert_eq!(ctx.get_array_element(arr, 3), Value::Object(Some(k1)));
+        assert_eq!(ctx.get_field(set, 1), Value::Int(4), "size not advanced");
+        // Slots before the cursor are untouched.
+        assert_eq!(ctx.get_array_element(arr, 0), Value::Object(None));
+
+        // The whole point: no `Set.add` was dispatched. A callee reached by
+        // `invoke_virtual` from a native gets no call site, no counter, and can
+        // never tier up — so "the keys arrived" is only half the assertion.
+        assert!(
+            ctx.recorded_calls().is_empty(),
+            "fast path still entered the interpreter: {:?}",
+            ctx.recorded_calls()
+        );
+    }
+
+    /// NEGATIVE CONTROL — the assertion above must be able to fail.
+    ///
+    /// Same call on a set of a DIFFERENT class has to refuse, because a
+    /// subclass may override `add` and only the generic dispatch honours an
+    /// override. Without this, a fast path that matched every class would pass
+    /// the test above just as happily.
+    #[test]
+    fn a_foreign_key_set_is_refused_by_the_fast_path() {
+        use cratonvm_native_api::NativeHeapAccess;
+        let mut ctx = crate::test_support::MockNativeContext::new();
+        ctx.declare_field("java/util/HashSet", "keys", 0);
+        ctx.declare_field("java/util/HashSet", "size", 1);
+        let set = ctx.alloc_object_with_class(2, "java/util/HashSet");
+        let arr = ctx.new_ref_array(ClassId::new(0), 8);
+        ctx.set_field(set, 0, Value::Object(Some(arr)));
+        ctx.set_field(set, 1, Value::Int(0));
+        let k = ctx.alloc_object(1);
+
+        assert!(
+            !append_selected_keys_fast(&mut ctx, set, &[k]),
+            "the fast path claimed a set whose class it does not know"
+        );
+        assert_eq!(ctx.get_field(set, 1), Value::Int(0), "size moved anyway");
+    }
+
+    /// A full array is refused rather than grown.
+    ///
+    /// Netty's own `add` grows when `size == keys.length`; reproducing
+    /// `increaseCapacity` here would mean allocating a `SelectionKey[]` of the
+    /// right component type, which is its bytecode's job. The STRICT `<` also
+    /// preserves netty's post-`add` invariant that `size < keys.length`.
+    #[test]
+    fn a_full_key_set_is_refused_rather_than_grown() {
+        use cratonvm_native_api::NativeHeapAccess;
+        let mut ctx = crate::test_support::MockNativeContext::new();
+        // Room for exactly one more, but appending it would leave
+        // `size == keys.length`, which is the state netty grows out of.
+        let set = netty_key_set(&mut ctx, 4, 3);
+        let k = ctx.alloc_object(1);
+        assert!(
+            !append_selected_keys_fast(&mut ctx, set, &[k]),
+            "fast path filled the array to its limit instead of refusing"
+        );
+        assert_eq!(ctx.get_field(set, 1), Value::Int(3), "size moved anyway");
+    }
+
+    /// The kill switch really removes the path.
+    #[test]
+    fn the_fast_path_is_absent_when_its_switch_is_off() {
+        use cratonvm_native_api::NativeHeapAccess;
+        // `sel_fast_keys_engaged` latches in a `OnceLock`, so this asserts the
+        // GATE rather than flipping it mid-process: with the switch unset the
+        // path engages, which is what the first test already proves. What is
+        // checked here is that an UNDESCRIBED class — the state a real run is
+        // in before any layout resolves — refuses cleanly instead of panicking
+        // or half-writing.
+        let mut ctx = crate::test_support::MockNativeContext::new();
+        let set = ctx.alloc_object_with_class(2, NETTY_SELECTED_KEY_SET);
+        let k = ctx.alloc_object(1);
+        assert!(
+            !append_selected_keys_fast(&mut ctx, set, &[k]),
+            "fast path accepted a set whose fields do not resolve"
+        );
+    }
 
     /// Allocate a unique fake fd for test registration. These are NEVER
     /// handed to the net.rs registry — they're purely selector-local ids.

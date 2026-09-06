@@ -9,7 +9,7 @@ argues for chasing this as a JIT-only (no-GC) concurrency defect next, or
 checking whether it already closed as a side effect of an unrelated fix.
 
 Split out from
-`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which tracked
+`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`, which tracked
 this class only because it was watching it for a fragmentation defect that is
 now closed. This is not that defect: it failed with **no `OutOfMemoryError` and
 no `arena allocation failed` at all**.
@@ -167,7 +167,7 @@ CP="target/classes:target/test-classes:$(cat craton-testcp.txt)"
 
 ## Related
 
-- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of.
 - `docs/known-issues/h2/bug-h2-testrandommapops-small-heap-corruption-20260829.md`
   — the same family, with the two ends of it named (who freed it vs who

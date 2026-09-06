@@ -8,7 +8,7 @@ import java.lang.invoke.VarHandle;
  * to answer instead — {@code null} for a reference read, {@code 0} for a
  * primitive read, and a silent no-op for a write, which is a lost store with no
  * signal anywhere. See
- * fixed-bugs/varhandle-null-coordinate-answers-instead-of-throwing-FIXED-20260902.md (internal).
+ * varhandle-null-coordinate-answers-instead-of-throwing-FIXED-20260902.md (internal).
  *
  * <p>The matrix is generated rather than hand-typed: each row is a
  * signature-polymorphic call site whose exact static types decide which access

@@ -3809,16 +3809,16 @@ pub fn execute(
                                 let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
                                     // Taken BEFORE the construction below, which is
                                     // what re-captures the (now compiled-frame-free)
-                                    // stack. See `attach_snapshotted_npe_frames`.
+                                    // stack. See `attach_snapshotted_trap_frames`.
                                     let snapshot =
-                                        crate::jit::helpers::take_jit_pending_npe_compiled_frames();
+                                        crate::jit::helpers::take_jit_pending_trap_frames();
                                     match crate::runtime::exceptions::throw_runtime_error(
                                         shared,
                                         thread,
                                         RuntimeError::NullPointerException { message: None },
                                     ) {
                                         MethodCallFailed::ExceptionThrown(exc) => {
-                                            crate::runtime::exceptions::attach_snapshotted_npe_frames(
+                                            crate::runtime::exceptions::attach_snapshotted_trap_frames(
                                                 shared, &thread.frames, exc, snapshot,
                                             );
                                             jit_early_exception = Some(exc);
@@ -3845,6 +3845,21 @@ pub fn execute(
                                 let aioobe_routed = if let Some((index, length)) =
                                     crate::jit::helpers::take_jit_pending_aioobe()
                                 {
+                                    // Taken BEFORE the construction below, for
+                                    // the same reason as the NPE arm above and
+                                    // with the same consequence when it is not:
+                                    // the bounds-check helper ran the epilogue,
+                                    // so `fillInStackTrace` walks a stack the
+                                    // compiled frames have already left and the
+                                    // throwable keeps an EMPTY trace.
+                                    //
+                                    // This is the door the reproduction in
+                                    // `stack_trace_compiled_aioobe.rs` actually
+                                    // takes, and it was the last of the four to
+                                    // be found — the same order the div-by-zero
+                                    // family was found in, for the same reason.
+                                    let snapshot =
+                                        crate::jit::helpers::take_jit_pending_trap_frames();
                                     let msg =
                                         format!("Index {index} out of bounds for length {length}");
                                     match crate::runtime::exceptions::create_exception_object(
@@ -3854,6 +3869,9 @@ pub fn execute(
                                         Some(&msg),
                                     ) {
                                         Ok(exc) => {
+                                            crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                                                shared, &thread.frames, exc, snapshot,
+                                            );
                                             jit_early_exception = Some(exc);
                                             true
                                         }
@@ -3871,6 +3889,22 @@ pub fn execute(
                                 // executes side effects preceding the trap).
                                 let arith_routed =
                                     if crate::jit::helpers::take_jit_pending_arithmetic() {
+                                        // Taken BEFORE the construction below, for the
+                                        // same reason as the NPE arm above and with the
+                                        // same consequence when it is not: the
+                                        // zero-divisor stub ran the epilogue, so
+                                        // `fillInStackTrace` walks a stack the compiled
+                                        // frames have already left and the throwable
+                                        // keeps an EMPTY trace.
+                                        //
+                                        // This is the sixth and last door that
+                                        // constructs one of these. Five were found by
+                                        // reading; this one was found by labelling all
+                                        // five, watching the flake reproduce with no
+                                        // label printed, and grepping for the drain
+                                        // again.
+                                        let snapshot =
+                                            crate::jit::helpers::take_jit_pending_trap_frames();
                                         match crate::runtime::exceptions::throw_runtime_error(
                                             shared,
                                             thread,
@@ -3879,6 +3913,9 @@ pub fn execute(
                                             },
                                         ) {
                                             MethodCallFailed::ExceptionThrown(exc) => {
+                                                crate::runtime::exceptions::attach_snapshotted_trap_frames(
+                                                    shared, &thread.frames, exc, snapshot,
+                                                );
                                                 jit_early_exception = Some(exc);
                                                 true
                                             }
@@ -5801,7 +5838,7 @@ fn execute_frame_from_index(
         }
 
         // T19.H7 diag — opcode counter. Removed; documented findings in
-        // history/roadmap-100.md T19.H7 section. Last localization:
+        // roadmap-100.md T19.H7 section. Last localization:
         // `org/jboss/modules/Main.main` pc=1306 dispatched, then a native
         // call from that opcode never returns (interpreter loop never
         // re-entered).
@@ -6405,7 +6442,7 @@ fn execute_frame_from_index(
                     // dropping the high bits. Copy the raw CompactValue for
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
-                    // gaps/bc-ec-mod-mododdinverse-investigation.md.
+                    // bc-ec-mod-mododdinverse-investigation.md.
                     //
                     // Underflow guard: an empty operand stack at a value
                     // return means earlier execution desynced the stack
@@ -9144,6 +9181,7 @@ mod invoke_fast;
 // for field and method constant-pool references. `pub` so `vm-cli` can print
 // the `CRATONVM_DBG=field-site` tally at exit.
 pub mod invoke_phases;
+pub mod field_phases;
 pub mod site_cache;
 pub use site_cache::{
     CastSiteCache, ClassSiteCache, FastFieldSite, FastFieldSiteCache, FieldSiteCache,

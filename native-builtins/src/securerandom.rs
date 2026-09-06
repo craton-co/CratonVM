@@ -217,7 +217,7 @@ static SEED_TABLE: RwLock<Option<FxHashMap<i32, u64>>> = RwLock::new(None);
 /// life of the process: MEASURED at ~39 bytes retained per `java.util.Random`
 /// ever constructed, against a Java heap that stays flat to the kilobyte
 /// because the objects themselves are collected perfectly well. See
-/// `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`.
+/// `jpalargeblob-random-state-side-table-FIXED-20260830.md`.
 ///
 /// # Why this is one function and not three registrations
 ///
@@ -1849,7 +1849,7 @@ pub(crate) fn native_secure_random_get_instance_strong(
 /// real JDK and let the JDK's own bytecode serve the class.
 ///
 /// **OFF by default, because it is SLOWER.** The idea is in
-/// `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`'s "not yet done": the real
+/// `jpalargeblob-random-state-side-table-FIXED-20260830.md`'s "not yet done": the real
 /// `java.util.Random` is pure Java, keeps its state in its own field, and is
 /// JIT-compilable, so the shadow looks like pure overhead. It is not. The real
 /// implementation's state is a `private final AtomicLong seed` driven by a
@@ -1908,7 +1908,7 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     //     new Random(i).nextInt()    native 3415.1 ns/op   java 500.0 ns/op
     //     shared Random.nextInt()    native  179.4 ns/op   java  52.1 ns/op
     //
-    // 6.8x and 3.4x. `fixed-suite-bugs/hibernate/jpalargeblob-random-state-side-table-FIXED-20260830.md`'s
+    // 6.8x and 3.4x. `jpalargeblob-random-state-side-table-FIXED-20260830.md`'s
     // mechanism 2 is five native calls per byte, two of which are these.
     //
     // Retiring it also deletes the leak this module's `SEED_TABLE` eviction

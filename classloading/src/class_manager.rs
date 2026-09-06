@@ -544,8 +544,8 @@ mod loader_lookup_tests {
 /// linking, verifier hierarchy lookup) by default even though the
 /// interpreter half of the same fix was live — a production desync between
 /// three independently-read env-var copies. See
-/// `fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
-/// and `fixed-suite-bugs/loader-identity.md` for the consolidation. Flip on
+/// `hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`
+/// and `loader-identity.md` for the consolidation. Flip on
 /// links an enhanced subclass to its same-loader (enhanced) supertype copy
 /// rather than the un-enhanced global one returned by `get_loaded_class_id`.
 ///
@@ -2014,7 +2014,7 @@ pub struct DefineClassOptions {
     /// by the application loader), so the resulting `$ProxyN` type-checks
     /// (`interfaceClass.isInstance(proxy)`) and `Method.invoke` against the
     /// requested interface both fail — see "Residual issue B" in
-    /// `fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
+    /// `mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
     /// (found via annotation-proxy work but is a general `CRATONVM_REAL_PROXY`
     /// bug, reproducible with a plain `Proxy.newProxyInstance` + custom
     /// `ClassLoader`, independent of annotations).
@@ -6341,7 +6341,7 @@ impl ClassManager {
                 // exposed via reflection. `RuntimeInvisibleAnnotations` carry
                 // @Retention(CLASS) types which JVMS requires NOT be visible
                 // through Class.getAnnotation / isAnnotationPresent — see
-                // gaps/gap-annotation-retention-policy.md.
+                // gap-annotation-retention-policy.md.
                 Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
@@ -6501,12 +6501,27 @@ impl ClassManager {
 
         // Determine this class's module membership from the package registry
         // (N4: unnamed-module baseline + named-module assignment).
+        //
+        // `named_module_for_package`, NOT `module_for_package`: a modular jar
+        // reached through the CLASS path keeps its descriptor in the registry
+        // (service discovery and labelling want it) but a real JVM puts its
+        // classes in the UNNAMED module, and MEMBERSHIP is the surface where
+        // that difference is observable — `--add-opens java.base/…=ALL-UNNAMED`
+        // is qualified to the unnamed module, so a class wrongly labelled with
+        // its jar's declared module name cannot be granted by it. Measured on
+        // Tomcat's `catalina.jar` (which declares `org.apache.tomcat.catalina`);
+        // see the note on `named_module_for_package`. `ClassManager::new`'s own
+        // comment has said "the real JDK puts them in the unnamed module" since
+        // the eager scan was written — this is the half of that sentence the
+        // scan could not implement on its own.
         let pkg = package_of(&class_file.this_class);
-        let module_name = self
-            .module_registry
-            .module_for_package(pkg)
-            .map(|s| s.to_string())
-            .or(module_name_from_attr);
+        let module_name = if loader_flags().classpath_jar_unnamed_module {
+            self.module_registry.named_module_for_package(pkg)
+        } else {
+            self.module_registry.module_for_package(pkg)
+        }
+        .map(|s| s.to_string())
+        .or(module_name_from_attr);
 
         // NEW-8 + WP2.3: hidden classes register under a mangled name
         // (e.g. `Foo/0x1`) distinct from their class file's `this_class`.
@@ -9082,7 +9097,7 @@ impl ClassManager {
     /// advisory only (no `deny(warnings)` anywhere in the workspace, so this
     /// cannot break the centrally-run build) — it exists to surface the ~50
     /// remaining external call sites for follow-up migration. See
-    /// `fixed-suite-bugs/loader-identity.md` for the current per-file tally.
+    /// `loader-identity.md` for the current per-file tally.
     ///
     /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
     /// entry in `loaded_classes` linearly for each key (O(n · keys)).
@@ -9232,7 +9247,7 @@ impl ClassManager {
     /// falls through to `ClassLoader.loadClass` via
     /// `native-builtins::classloader::defining_loader_for` when this kind
     /// of lookup misses) rather than expecting this crate to resolve it.
-    /// See `fixed-suite-bugs/loader-identity.md`.
+    /// See `loader-identity.md`.
     pub fn find_class_by_name_for_loader(
         &self,
         name: &str,
@@ -10771,7 +10786,7 @@ impl ClassManager {
         // report a duplicate-define `LinkageError` where it currently mints a
         // second copy. That is arguably the JVMS-correct outcome, but it is a
         // behaviour change on the hottest path in the VM and is out of scope
-        // here — see `feature-designs/classloading-identity-audit.md`.
+        // here — see `classloading-identity-audit.md`.
         if let (Some(previous_loader_id), Some(registered_name)) =
             (previous_loader_id, registered_name)
         {
@@ -13784,7 +13799,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // one way no value-tag census can see: a `ThreadGroup` reference over a
         // `String` reference and an `int` over an `int` both type-check. The
         // L4 shadow-layout diff reported all four
-        // (`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
+        // (`jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
         //
         // The natives in `native-builtins/src/phases_late/concurrent.rs`
         // resolve these by NAME first and only fall back to a hard-coded index,

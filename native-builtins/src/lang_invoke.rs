@@ -7193,7 +7193,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // this exact bug) — `ctx.initialize_class` can run `<clinit>`
             // and trigger a moving GC, so `target_class` must be rooted
             // across the call and re-read before reuse. See
-            // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
+            // wildfly-parallel-boot-stale-objectref-residual.md.
             let target_class_pin = ctx.pin_native_root(target_class);
             // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>`
             // failure instead of re-wrapping it as an unrecoverable
@@ -10848,7 +10848,7 @@ pub(crate) fn string_concat_render_value(ctx: &mut dyn NativeContext, v: Value) 
             // `Object.toString()` for `"literal" + aPath` string
             // concatenation, printing `java.nio.file.Path@<hash>` instead of
             // the real path text. Same family as
-            // `fixed-suite-bugs/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+            // `path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
             // a third, distinct call site (this is the actual live
             // `MH_KIND_STRING_CONCAT` dispatch path — `vm/src/runtime/invokedynamic.rs`'s
             // own `execute_string_concat`/`value_to_string` has the identical

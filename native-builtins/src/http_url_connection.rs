@@ -748,7 +748,7 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
 // `getResponseCode`/`getInputStream` natives below misread it (`HUC_CONNECTED`
 // lands on an unrelated real field that reads 1 → `ensure_connected`
 // early-returns making NO request → `-1`; confirmed by tracing, see
-// fixed-suite-bugs/tomcat/10-pagecontext-npe-contains-null-FAIL.md). Detect that
+// 10-pagecontext-npe-contains-null-FAIL.md). Detect that
 // case via the URL object at field 0, perform the request from the *real* URL,
 // and cache the result keyed by the connection object's identity hash so a
 // follow-up `getInputStream` returns the same body. The synthetic resource-URL
@@ -2222,7 +2222,7 @@ pub(crate) type ClientTlsRestrictions = (Vec<String>, Vec<String>);
 /// NO handshake, so the re-entrant `invoke_virtual` can no longer reach the
 /// class-loading/vtable-install lock-ordering deadlock that a nested
 /// blocking connect once exposed (see this function's history in
-/// `fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+/// `tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
 /// The old gate — "only up-call when the factory has a private `ciphers`
 /// field holding at least one rustls-mappable suite name" — was both
 /// test-helper-specific and, since the factory was never published to
@@ -2329,7 +2329,7 @@ fn huc_client_tls_restrictions(
 // Plain-HTTP keep-alive connection pool
 // ---------------------------------------------------------------------------
 //
-// fixed-suite-bugs/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md
+// bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md
 // — real JDK's `sun.net.www.http.HttpClient` pools/reuses a TCP connection to
 // the same `(host, port)` across separate `HttpURLConnection` instances once
 // a response is fully drained; `perform` previously always opened a brand
@@ -3455,7 +3455,7 @@ fn perform(
         // post-handshake `HelloRequest` is answered with a `no_renegotiation`
         // alert and never processed (`rustls/src/common_state.rs::process_msg`;
         // root-caused from the dependency's own source in `
-        // fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
+        // tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
         // "Residual #2 follow-up"). So no Java callback can fire from inside
         // `read_response`; keeping the window open there would buy nothing and
         // would be the one thing that makes the post-handshake region unsound.
@@ -3642,8 +3642,7 @@ fn perform(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`fixed-suite-bugs/h2-suite-bugs/
-/// bug-h2-testweb-logout-connectexception-mismatch-FIXED.md`): the server reads
+/// pattern (`bug-h2-testweb-logout-connectexception-mismatch-FIXED.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of
 /// tearing itself down, before ever writing a response. That is NOT a
@@ -3720,7 +3719,7 @@ fn perform_with_retry(
 // `TcpStream`. That's not just a performance gap: some servers key
 // connection-scoped state off the TCP connection itself (H2's `WebServer`
 // per-`WebThread` session-locale persistence is one confirmed case — see
-// `fixed-suite-bugs/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md`
+// `bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md`
 // for the full root-cause writeup with a `tcpdump`-confirmed repro).
 //
 // Deliberately scoped conservative for this first implementation:
@@ -3992,8 +3991,7 @@ fn perform_pooled(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`fixed-suite-bugs/h2-suite-bugs/
-/// bug-h2-testweb-logout-connectexception-mismatch-FIXED.md`): the server reads
+/// pattern (`bug-h2-testweb-logout-connectexception-mismatch-FIXED.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of
 /// tearing itself down, before ever writing a response. That is NOT a

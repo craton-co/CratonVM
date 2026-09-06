@@ -9,7 +9,7 @@
 //! prevent `java.util.ServiceLoader.load(Class).iterator()` from running
 //! end-to-end.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
 //!
 //! The two gaps documented in the WP7.1 commit (`245e996`) head comment
 //! of `native-builtins/src/jdbc.rs`:

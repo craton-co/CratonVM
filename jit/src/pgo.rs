@@ -24,7 +24,7 @@
 //! see "not monomorphic" for every call site in the VM, and its effect will be
 //! indistinguishable from being turned off. That failure mode — a capability
 //! that reads as landed but never runs — is exactly what
-//! `audits/flag-census.md` tracks.
+//! `flag-census.md` tracks.
 //!
 //! # There is exactly ONE inlining policy, and it is not here
 //!

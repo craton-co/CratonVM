@@ -793,8 +793,7 @@ fn live_monitor_ops_execute_direct_runtime_stubs() {
 }
 
 // -----------------------------------------------------------------------
-// Regression: fixed-suite-bugs/app-jvm-bugs/
-//             moving-young-gen-drops-jit-held-oops-FIXED.md
+// Regression: moving-young-gen-drops-jit-held-oops-FIXED.md
 // -----------------------------------------------------------------------
 //
 // `BinTreesClassic.bottomUpTree` holds the result of its FIRST recursive
@@ -4873,7 +4872,7 @@ fn osr_exit_maps_are_emitted_at_loop_headers_only() {
 // -----------------------------------------------------------------------
 // G1-2 — the inline reference-store fast paths must not elide the
 // collector's post-write barrier on a backend that publishes no region
-// bounds. `audits/g1-audit.md` §8.1: under G1 a young region held out of
+// bounds. `g1-audit.md` §8.1: under G1 a young region held out of
 // the collection set by a JNI pin is reachable ONLY through its remembered
 // set, so an inline store that skips `post_write_barrier_rset` loses the
 // edge and the next pause frees a live referent.
@@ -12755,8 +12754,7 @@ fn compile_with_direct_call(
 }
 
 // -----------------------------------------------------------------------
-// Regression: fixed-suite-bugs/
-//             ecj-operandstack-corruption-jsp-compilation-500s-FIXED-20260821.md
+// Regression: ecj-operandstack-corruption-jsp-compilation-500s-FIXED-20260821.md
 // -----------------------------------------------------------------------
 //
 // A direct-call site that ALSO carries `invoke_info` reserves a cold-deopt
@@ -16410,7 +16408,7 @@ fn test_branch_target_mid_instruction_bails() {
 // from the first day both existed, so every method containing one reached the
 // dispatch loop's `_ =>` catch-all and stayed interpreted for the life of the
 // process — the refusal attributed to an arm that names nothing. See
-// fixed-suite-bugs/jit/dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
+// dup2_x2-is-scan-admitted-but-lowered-by-neither-x64-backend-20260817-FIXED.md.
 //
 // Each case below RUNS the compiled body and checks a value that a
 // wrong-width shuffle cannot produce, because the failure mode this opcode

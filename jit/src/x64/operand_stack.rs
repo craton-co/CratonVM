@@ -199,8 +199,8 @@ impl Compiler {
     /// register/XMM-resident value: a bare `self.stack.push(slot)` desyncs
     /// the two vectors (marks shorter than stack), which historically shifted
     /// every later slot's oop bit and produced false-positive / false-negative
-    /// precise oop map entries (see `fixed-suite-bugs/app-jvm-bugs/jit-safepoint-revert.md` and
-    /// `fixed-suite-bugs/app-jvm-bugs/precise-jit-stack-maps-design.md`). The desync was previously
+    /// precise oop map entries (see `jit-safepoint-revert.md` and
+    /// `precise-jit-stack-maps-design.md`). The desync was previously
     /// papered over by a lazy `false`-pad in `emit_oop_map_for_safepoint`;
     /// with this helper the lockstep invariant `stack.len() == marks.len()`
     /// holds continuously, which is the load-bearing prerequisite for a
@@ -614,7 +614,7 @@ impl Compiler {
     /// computed boolean there and clobbered `this`. The subsequent `putfield`
     /// read the receiver as `0x1` (the boolean) and wrote to
     /// `0x1 + HEADER + field*SLOT` → SIGSEGV (the real-bytecode RAF avrora crash:
-    /// `obj_ptr=0x1`, see fixed-bugs/real-raf-segv-root-cause.md).
+    /// `obj_ptr=0x1`, see real-raf-segv-root-cause.md).
     pub(super) fn reset_spills(&mut self) {
         // Reclaim scratch slots ABOVE the live operand stack, but never hand
         // back a slot a live stack value still occupies. The next free spill

@@ -65,7 +65,7 @@ fell into `parseCompilationUnit`'s error-recovery loop, and Spring's
 `AotIntegrationTests` chunk 4 — which compiles its generated sources with the
 in-process javac after Mockito has mocked something — never finished. It looked
 like a hang; it was a correctness bug two layers down. See
-`fixed-suite-bugs/spring/spring-aot-cluster.md`.
+`spring-aot-cluster.md`.
 
 ## Related
 

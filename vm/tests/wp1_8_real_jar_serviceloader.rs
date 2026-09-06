@@ -4,7 +4,7 @@
 //! WP1.8-finish — exercise the **real JAR-classpath path** of
 //! `ServiceLoader.load(java.sql.Driver.class).iterator()`.
 //!
-//! Roadmap reference: `gaps/wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
+//! Roadmap reference: `wildfly-ejbca-roadmap.md` Wave 1 §4 (WP1.8).
 //!
 //! The companion `wp1_8_serviceloader_e2e.rs` covers the iterator chain
 //! end-to-end but stages its `META-INF/services/java.sql.Driver`

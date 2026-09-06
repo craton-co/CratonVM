@@ -204,6 +204,67 @@ measurements. What is retired is the claim that they *explain these classes* —
 `residual-seven-after-the-afc-fix-20260817.md` §5 records that prediction being
 A/B'd and failing to convert.
 
+### `ProxyPreservingFiltersOutsideInitialSessionTest` — a `ConstraintViolationException`, confirmed harness/test-fragility, not a CratonVM defect (2026-09-05)
+
+The 2026-09-05 Generational-GC hib-orm rerun
+(`nonpassed-rerun-gen-20260905/run-20260905-182403-passed/on-real/shard-0/`)
+showed:
+
+```
+MethodSource [className = 'org.hibernate.orm.test.filter.proxy.ProxyPreservingFiltersOutsideInitialSessionTest', methodName = 'testChangeFilterBeforeInitializeInSameSession', ...]
+=> org.hibernate.exception.ConstraintViolationException: could not execute batch [Unique index or primary key violation: "PUBLIC.CONSTRAINT_C PRIMARY KEY ON PUBLIC.ACCOUNTGROUP(ID) ( /* key:1 */ CAST(1 AS BIGINT))"; ...]
+```
+
+That run's own startup line read `db-reset=off (--no-db-reset)` with a
+`could not compile DbReset.java: worker-DB reset disabled` warning, raising
+the obvious hypothesis: stale rows from an earlier run of the same class,
+never cleaned up because the harness's worker-DB reset was disabled.
+
+**Checked before writing anything, per this doc's own standard, and the
+hypothesis does not hold, for two independent reasons:**
+
+1. **`run-hib.sh`'s `db_reset`/`DbReset.java` mechanism only ever applies to
+   MySQL/Postgres worker databases** (`WORKER_URL="jdbc:postgresql://..."` /
+   `"jdbc:mysql://..."`, `run-hib.sh` lines ~515/522). This run used H2
+   in-memory (`jdbc:h2:mem:db1;...;DB_CLOSE_ON_EXIT=FALSE`) — the reset
+   machinery was never in the loop for this class regardless of the
+   `--no-db-reset` flag. (`DbReset.java` itself was missing from
+   `apps/hib-suite-runner/` entirely — recovered from an old worktree,
+   `/data/cvm-devcheck/apps/hib-suite-runner/DbReset.java`, and copied back so
+   the harness can compile it — but it would not have helped this failure
+   even so.)
+2. **It reproduces in full isolation**: single class, single shard, single
+   fresh JVM, brand-new in-memory H2 database
+   (`CV_BIN=<gen-wrapper> ./run-hib.sh --list <(echo ProxyPreservingFiltersOutsideInitialSessionTest) --shards 1`)
+   — `found=4 started=2 ok=1 failed=1 skipped=2`, same
+   `ConstraintViolationException`. There is no earlier run to have left stale
+   rows.
+3. **It reproduces identically on real HotSpot JDK 25**, same isolated
+   single-class invocation
+   (`java @common.args -Dcraton.batch=1 CratonRunner ...ProxyPreservingFiltersOutsideInitialSessionTest`):
+   `found=4 started=2 ok=1 failed=1 aborted=0 skipped=2`, byte-for-byte the
+   same counts and the same `ConstraintViolationException` on
+   `AccountGroup(id=1)`.
+
+**Mechanism (read from the test source, not further chased):** all four
+`@Test` methods in this class hard-code `accountGroup.setId(1L)` and rely on
+the schema being fresh per test method. `@SessionFactory` is declared at
+class level; `SessionFactoryExtension` only implements
+`TestInstancePostProcessor` + `BeforeEachCallback` (the latter is a no-op for
+a class-level `@SessionFactory`) + `TestExecutionExceptionHandler` — no
+`AfterEachCallback`, and `SessionFactoryScopeImpl` does not implement JUnit's
+`Store.CloseableResource`, so nothing ever closes/drops one test method's
+`SessionFactory` before the next method's `postProcessTestInstance` builds a
+new one against the same underlying database. Whichever two of the four
+`@Test` methods JUnit happens to execute first (no `@TestMethodOrder` is
+declared, so method order is unspecified) collide if both insert
+`AccountGroup(id=1)` without an intervening drop — exactly what `found=4
+started=2 ok=1 failed=1` shows happening. This is a pre-existing fragility in
+the test/harness combination (a single-class-per-JVM launcher without
+Gradle's usual per-class isolation, paired with a Hibernate test class that
+assumes but does not enforce inter-method schema isolation), reproducible on
+both engines. **Not a CratonVM defect; no page needed beyond this entry.**
+
 ## Azure host note
 
 The Azure host's own `hibernate-reactive-suite-runner/runs/` directory's most

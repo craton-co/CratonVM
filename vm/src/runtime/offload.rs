@@ -80,7 +80,7 @@ use jit_cuda::{analyzer, OffloadVerdict, ParamKind};
 /// consumes eagerly-decoded `&[Attribute]`. Decode each lazy attribute
 /// (cloning so the shared `&method` borrow stays immutable) and drop
 /// any that fail to decode — annotation reading is best-effort.
-fn decode_method_attrs(
+pub(crate) fn decode_method_attrs(
     attrs: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &ConstantPool,
 ) -> Vec<cratonvm_reader::attribute::Attribute> {
@@ -2208,7 +2208,7 @@ mod tests {
     // (`ensure_completion_reaper_started` + the host callback calling
     // `enqueue_completion`) needs a live CUDA context to reach its
     // success path at all and is validated on GPU hardware instead
-    // (see `fixed-suite-bugs/gpu-offload-followups-20260711.md`).
+    // (see `gpu-offload-followups-20260711.md`).
 
     #[test]
     fn reaper_finalizes_submission_without_any_poll_call() {
@@ -6520,17 +6520,60 @@ pub(crate) mod input_cache {
     /// single cache line of bytes, no lock.
     pub(crate) fn drain_compiled_writes() {
         use std::sync::atomic::AtomicU8;
-        let any = DIRTY.iter().any(|b: &AtomicU8| b.load(Ordering::Acquire) != 0);
-        if !any {
+        // Unlocked pre-filter only. Cheap when nothing is dirty, which
+        // is every call in a run whose compiled code never stored into a
+        // cached array. A false negative here is impossible: the barrier
+        // sets its byte before the store it guards is observable.
+        if !DIRTY.iter().any(|b: &AtomicU8| b.load(Ordering::Acquire) != 0) {
             return;
         }
+        let mut tables = map().lock();
+        drain_locked(&mut tables);
+    }
+
+    /// The read-clear-and-evict half of [`drain_compiled_writes`], with
+    /// the cache mutex ALREADY HELD.
+    ///
+    /// # Why the clear must happen under the lock
+    ///
+    /// Until 2026-09-05 the caller cleared `DIRTY` with `swap(0)` and
+    /// only then took the lock to evict. That clears the flags BEFORE
+    /// performing the eviction they authorise, so a second thread
+    /// entering the drain in that window saw a clean table, returned on
+    /// the fast path, took the lock first and read an entry the first
+    /// thread had not evicted yet:
+    ///
+    ///   thread A: drain            thread B: get_i32(X)
+    ///     swap DIRTY[b] -> 0
+    ///                                drain: DIRTY all clear, returns
+    ///                                lock; reads X  <- STALE, the
+    ///                                  eviction A owes has not happened
+    ///     lock; evict bucket b
+    ///
+    /// Doing both under one hold makes the clear and the eviction atomic
+    /// with respect to every other reader of the cache.
+    ///
+    /// The getters compound it a second way, which is why they call THIS
+    /// rather than [`drain_compiled_writes`]: they used to drain (taking
+    /// and releasing the lock) and then re-acquire it for the lookup, so
+    /// even a correct drain left a gap a compiled store could land in.
+    /// One acquisition now covers drain-then-lookup.
+    ///
+    /// Measured on an RTX 2060: `GpuRuntimeStress` scenario 1 under
+    /// `-XX:+UseGenerationalGC` failed 12/300 with the barrier armed and
+    /// 0/300 with `CRATONVM_JIT_GPU_ARRAY_BARRIER=0`, alternating arms
+    /// in one binary. See
+    /// docs/known-issues/gpu/concurrent-dispatch-wrong-answer-20260905.md.
+    fn drain_locked(tables: &mut FxHashMap<usize, FxHashMap<ObjectRef, Entry>>) {
         let mut buckets = 0u64;
         for (i, b) in DIRTY.iter().enumerate() {
             if b.swap(0, Ordering::AcqRel) != 0 {
                 buckets |= 1u64 << i;
             }
         }
-        let mut tables = map().lock();
+        if buckets == 0 {
+            return;
+        }
         let mut removed = false;
         for table in tables.values_mut() {
             let before = table.len();
@@ -6538,7 +6581,7 @@ pub(crate) mod input_cache {
             removed |= table.len() != before;
         }
         if removed {
-            rebuild_filter(&tables);
+            rebuild_filter(tables);
         }
         cratonvm_types::gpu_jit_gate_census::note_compiled_write_drain(
             buckets.count_ones() as u64,
@@ -6575,8 +6618,8 @@ pub(crate) mod input_cache {
     /// different array kind across a GC; we treat that as a miss
     /// and the caller re-uploads).
     pub(crate) fn get_i32(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i32>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Int || e.len != len {
             return None;
@@ -6599,8 +6642,8 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_i64(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i64>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Long || e.len != len {
             return None;
@@ -6623,8 +6666,8 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_f32(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f32>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Float || e.len != len {
             return None;
@@ -6647,8 +6690,8 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_f64(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f64>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Double || e.len != len {
             return None;
@@ -6671,8 +6714,8 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_i16(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i16>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Short || e.len != len {
             return None;
@@ -6695,8 +6738,8 @@ pub(crate) mod input_cache {
         );
     }
     pub(crate) fn get_i8(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i8>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Byte || e.len != len {
             return None;
@@ -6708,8 +6751,8 @@ pub(crate) mod input_cache {
         }
     }
     pub(crate) fn get_u16(vm: usize, obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<u16>>> {
-        drain_compiled_writes();
-        let g = map().lock();
+        let mut g = map().lock();
+        drain_locked(&mut g);
         let e = g.get(&vm)?.get(&obj)?;
         if e.element_type != ArrayElementType::Char || e.len != len {
             return None;
@@ -6863,8 +6906,43 @@ pub(crate) mod input_cache {
         if !is_enabled() {
             return;
         }
+        // BOTH steps under ONE hold of the cache mutex, in this order.
+        //
+        // The ORDER (bit, then map) is what makes the lock-free fast
+        // path in `invalidate` sound: a reader must never see the entry
+        // while its bit is still clear.
+        //
+        // Holding the LOCK across both is what makes it sound under
+        // concurrency, and until 2026-09-05 the `fetch_or` sat outside
+        // it. `rebuild_filter` STORES a mask recomputed from the table,
+        // so an inserting thread that had OR'd its bit but not yet
+        // reached the map could have that bit erased by any concurrent
+        // remover:
+        //
+        //   thread A: insert(X)        thread B: invalidate(Y)
+        //     ADDR_FILTER |= bit(X)
+        //                                lock
+        //                                table.remove(Y)
+        //                                rebuild_filter()  <- X is not
+        //                                  in the table yet, so this
+        //                                  STORES a mask with bit(X)
+        //                                  CLEARED
+        //                                unlock
+        //     lock
+        //     table.insert(X, entry)    <- X is now cached with its
+        //     unlock                       filter bit clear
+        //
+        // From then on every `invalidate(X)` takes the fast path and
+        // returns, so the host's writes to X never evict the device
+        // mirror and the next dispatch computes from a stale copy. A
+        // wrong answer, not a slow one — and it needs no GC: it was
+        // reproduced with zero collections in the run, which is why the
+        // remap/sweep path above is not the one at fault.
+        //
+        // See docs/known-issues/gpu/concurrent-dispatch-wrong-answer-20260905.md.
+        let mut tables = map().lock();
         ADDR_FILTER.fetch_or(addr_bit(obj), Ordering::AcqRel);
-        map().lock().entry(vm).or_default().insert(obj, entry);
+        tables.entry(vm).or_default().insert(obj, entry);
     }
 
     /// Drop the device-buffer cache entry for `obj` because the host
@@ -6942,8 +7020,8 @@ pub(crate) mod input_cache {
         // longer matches any key and silently keep a stale entry.
         // Mutators are stopped here, so nothing can dirty a bucket
         // between the drain and the re-key.
-        drain_compiled_writes();
         let mut tables = map().lock();
+        drain_locked(&mut tables);
         // Only this VM's table: `heap` belongs to `vm`, and asking it
         // about another VM's addresses would report every one of them
         // dead and silently flush that VM's cache.

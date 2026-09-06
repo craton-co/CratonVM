@@ -23,9 +23,12 @@ Against this page's opening state: `98304` with **1497** ref-array
 2. **The SIGSEGV** that discharge exposed is a separate, older collector bug and
    has nothing to do with JIT roots: `relocate_stw`'s slide writes into a
    granule the arena DECOMMITTED, because the destination search screens by page
-   and liveness and never by commit state. `Arena::ensure_committed_span` fixes
-   it. Full evidence on
-   `known-issues/jit/bug-box-unbox-intrinsic-segv-under-relocation-20260902.md`.
+   and liveness and never by commit state. `Arena::commit_for_relocation`
+   fixes it (dev's name for what this branch called
+   `ensure_committed_span`). Full evidence on the retired
+   `bug-box-unbox-intrinsic-segv-under-relocation-20260902` write-up and the
+   `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904`
+   record it points at.
 
 The credit never corrupted anything. It raises compaction, compaction runs
 slides, and slides are what land in a decommitted granule -- which is why the
@@ -34,6 +37,166 @@ references in compiled frames all changed nothing.
 
 **Neither fix alone retires this page.** Without the arena fix the class
 crashes; without the credit it logs 6264 OOMs and never finishes.
+
+## ADDENDUM 2026-09-05 (b): re-verified on dev, and the RESIDUAL IS NOW LOCK TIMEOUTS, accounted to the unit
+
+Five runs, release binary built from `091754fbd`, local box, `--Xmx 1g`, the
+invocation this page specifies. This is the first run of this class on a tree
+carrying the cross-collector GC work (`eaea9a588`), whose ZGC changes sit
+directly adjacent to the give-back this page's fix depends on -- so it is both a
+re-verification of the resolution and a regression check on that merge.
+
+| run | wall | `actual` | ref-array OOM | SIGSEGV | `relocation_on_proven_jit` | `relocation_skipped_jit` |
+|---|---|---|---|---|---|---|
+| 1 | 524 s | 99966 | 0 | 0 | 33 | 1 |
+| 2 | 593 s | 99937 | 0 | 0 | 42 | 1 |
+| 3 | 524 s | 99968 | 0 | 0 | 43 | 4 |
+| 4 | 442 s | 99969 | 0 | 0 | 22 | 2 |
+| 5 | 470 s | 99970 | 0 | 0 | 24 | 0 |
+
+**The resolution holds.** 0 OOM and 0 SIGSEGV in 5, matching the `0 / 0 of 5`
+above, and the merge did not disturb the class.
+
+**And the run is not vacuous**, which is the number to check before believing
+any of the rest: `relocation_on_proven_jit` is 22-43, at or above the 22-24 this
+page recorded. Compaction under live JIT frames genuinely ran. A zero there
+would have made a clean result meaningless.
+
+### The remaining shortfall is not this defect, and it accounts exactly
+
+| run | missing | `Timeout trying to lock table "COUNTER"` |
+|---|---|---|
+| 1 | 34 | 34 |
+| 2 | 63 | 63 |
+| 3 | 32 | 32 |
+| 4 | 31 | 31 |
+| 5 | 30 | 30 |
+
+Exact, in every run, the same way `1696 = 1691 OOM + 5 SQLException` accounted
+for the OOM era. With the OOM at zero, **every** missing entry is now a lock
+timeout -- an `SQLException`, which the callable DOES catch and print, unlike the
+`OutOfMemoryError` that sailed past it into an ungot `FutureTask`.
+
+So the residual has changed KIND. It is no longer a GC defect: it is H2's own
+lock timeout firing because the VM is slow enough to trip it. HotSpot runs this
+class in **9 s** with `actual: 100000` and no timeouts; these runs take 442-593 s.
+
+The shortfall tracks wall time across runs, which LOOKS like what a throughput
+explanation predicts:
+
+```text
+442 s -> 31    470 s -> 30    524 s -> 32    524 s -> 34    593 s -> 63
+```
+
+The slowest run has roughly double the timeouts of the fastest.
+
+**That reading is REFUTED below. Do not act on it.** Two levers were tried and
+the second one settles it.
+
+### The `LOCK_TIMEOUT` test does not exist
+
+The first plan was to raise H2's `LOCK_TIMEOUT` and watch the count fall. It
+would have been INERT, and would have produced a "no change" that read as
+evidence. The statement is
+
+```sql
+SELECT counter FROM Counter WHERE id = 1 FOR UPDATE WAIT 0.5
+```
+
+and a per-statement `WAIT` clause overrides the session and database
+`LOCK_TIMEOUT` in H2. The budget is not configurable from outside the test.
+
+### `--Xmx` does not move this workload's speed, so it tests nothing
+
+Three interleaved pairs, same binary:
+
+| pair | wall | timeouts |
+|---|---|---|
+| 1g -> 4g | 715 -> 629 s | 113 -> 105 |
+| 1g -> 4g | 484 -> 458 s | 31 -> **44** |
+| 1g -> 4g | 435 -> 445 s | 28 -> **47** |
+
+-12%, -5%, +2% on wall. The lever does not manipulate the variable, and
+timeouts rose in two pairs of three.
+
+### `--nojit` does move it, and REFUTES the throughput reading
+
+| arm | wall | timeouts | compaction cycles |
+|---|---|---|---|
+| default | 429 s | 27 | 30 |
+| `--nojit` | 904 s | 40 | 25 |
+
+Wall **2.1x**, timeouts **1.5x**. And against the pooled set that is decisive:
+a load-contended run at **715 s had 113** timeouts, nearly THREE TIMES this
+904 s run. Wall time does not determine the count.
+
+**The mechanism is jitter, not throughput.** `WAIT 0.5` is a budget on ONE lock
+acquisition, not on the run. Uniform slowdown stretches the holder's critical
+section only modestly -- hence 2.1x wall buying 1.5x timeouts. What blows a
+500 ms budget is a SCHEDULING STALL: the lock holder descheduled under host load
+while the others wait. That is why the contended 715 s run tripled a uniformly
+slower one.
+
+**Consequence for anyone using this class as a metric.** `actual` is largely a
+property of the MACHINE, not of the VM. It is not a throughput score and the
+difference between 99937 and 99973 is host noise, not a regression or an
+improvement. The only figures here that survive a loaded host are the ones this
+page was really about: ref-array `OutOfMemoryError` and SIGSEGV, both of which
+are 0 in all 11 runs. Retiring this page needs a quiet-host quorum on those, not
+a better `actual`.
+
+**What this means for anyone reading the `actual` figure.** `99937-99970` is not
+a better or worse version of the `98304` at the top of this page; it is a
+different quantity. `98304` was tasks dying silently to `OutOfMemoryError`.
+These are tasks that ran, hit a lock timeout, and reported it. Comparing the two
+numbers as if they measured the same thing is the mistake this section exists to
+prevent.
+
+## ADDENDUM 2026-09-05: the SIGSEGV had a READ half, and it was open through every run above
+
+The fix this page closed on is the WRITE half of a two-sided defect, and the
+other side was still live in all five of the runs that produced `0 of 5`.
+
+`ZgcRealHeap::with_capacity` publishes `[arena_base, arena_end)` into
+`JIT_READ_BOUNDS` slot 0, and the JIT's guarded `getfield` emits a RAW load of
+the receiver's class-id word for any address inside that range. The give-back at
+the top of every collection then decommits whole granules in the MIDDLE of that
+same range. A released granule faults on touch — `Arena::decommit_free_blocks`
+says so, and records that believing otherwise is exactly how the slides came to
+write into released granules in the first place.
+
+So the two are one defect wearing two faces, and this page only ever named one:
+
+| | who touches a released granule | fix | landed |
+|---|---|---|---|
+| WRITE | `relocate_stw`'s slide `memmove`s into it | `Arena::commit_for_relocation`, gating both slide sites | 2026-09-04 |
+| READ | a compiled `getfield` loads through it | withdraw `JIT_READ_BOUNDS` when the give-back releases anything | 2026-09-05 |
+
+The read half is a one-way latch: the first collection that returns granules
+withdraws the bound, every guarded site falls through to the checked helper
+afterwards (what an unpublished collector already gets), and it costs one relaxed
+load per collection that released anything. G1 gets the same pair right by
+construction and says why — publish the narrower bound BEFORE unmapping — but G1
+only ever shrinks a PREFIX, so it has a narrower bound to publish. ZGC's holes
+are interior, so withdrawal is the only sound move.
+
+**What this does and does not change for this page.** It does not reopen it: the
+write fix is intact on dev (`commit_for_relocation` gates `zgc.rs:5520` and
+`:6283`), and the `0 of 5` stands as measured. What it changes is how much that
+zero is worth. Five runs is not proof against a rarer fault, and the read half
+was reachable in every one of them — a compiled load through a stale receiver
+landing in a hole would have presented as the same SIGSEGV, attributed to the
+same slide. Anyone who sees this class fault again on a tree BEFORE
+`eaea9a588` should suspect the read half rather than assume the write fix
+regressed.
+
+The cheapest discriminator is unchanged and still `CRATONVM_GC_RESERVE=0`: with
+no reservation nothing decommits, and both halves disappear together. To
+separate them, `CRATONVM_ZGC_NO_JIT_READ_BOUNDS=1` removes only the read half
+(no inline loads to fault) while leaving the slides exactly as they are.
+
+Found while auditing what all three collectors share, not while working this
+class — see §7 of the retired cross-collector common-work write-up.
 
 ## ADDENDUM 2026-08-30 (L7 corpus lane): the shortfall accounts EXACTLY, and three alternatives are eliminated
 
@@ -849,7 +1012,7 @@ The discriminator then split THAT into two defects: **10 of 13 such frames have
 pointer sitting in the reserved slot.** It is not a shifted `rbp`.
 
 Split out 2026-08-29 from
-`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821.md`, which is
+`bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`, which is
 retired: that page's own class passes 2/2 and the four fragmentation defects it
 ended on are fixed. **This class is not fixed by them.**
 
@@ -1243,7 +1406,7 @@ It still SIGSEGVs 2 of 3, and the cause is very likely NOT this accounting.
 > relocation slides were copying into arena granules
 > `Arena::decommit_free_blocks` had already returned to the OS, and both slides
 > now commit their destination first. See
-> `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
+> `zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`.
 >
 > This section's own evidence points the same way and is worth re-reading with
 > that in hand: the fault signature recorded below is `rdi` page-aligned at the
@@ -1354,7 +1517,7 @@ the identification, the three failed repairs, and what remains.
 | discharge only (control) | 0 / 3 |
 
 Relocation is REQUIRED -- the same 0/3 that
-`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
+`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md` measured on that
 switch. And the fault signature matches that page's: `rdi` page-aligned at the
 fault (`0x232ECD30000`, `0x28DEA7B0000`, `0x1CA01BB0000`), which that page reads
 as "a read through a reference into a page the collector has already vacated".
@@ -1395,7 +1558,7 @@ Two traps this cost, worth not repeating:
 The conclusion below is withdrawn. It is not known to be wrong; it is not
 supported by the evidence that was offered for it.
 
-`fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+`zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
 landed on dev the same day: the box/unbox intrinsic SIGSEGVs under a relocating
 collector, **11 of 11 runs, 25-183 s**, and it takes BOTH relocation and that
 intrinsic -- neither alone. Dev flipped the intrinsic to opt-in as the
@@ -1518,7 +1681,7 @@ style of depth accounting that produced a false positive earlier on this page.
 
 ## Related
 
-- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of: the whole fragmentation diagnosis, the four
   repairs, and the counters to read.
 - `docs/known-issues/gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md`

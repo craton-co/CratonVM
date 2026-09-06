@@ -305,7 +305,23 @@ pub(crate) fn stw_publish_frame_traces(shared: &SharedVm, initiator: crate::Thre
     let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
     // Nothing to do in the pause itself: the work is what the ARRIVING threads
     // did on their way in. Nothing moves, so there is no pointer map.
-    crate::jit::xt_root_scan::resume(taken);
+    //
+    // This pause still PUBLISHES skip spans -- `stw_take_over_and_wait` does so
+    // unconditionally, for every alive thread's reserved tail -- so it has to
+    // retire them like any other. It did not, and nothing here moves or sweeps,
+    // so the leak was invisible from this function: the set simply outlived the
+    // pause and waited for a collection that does not republish.
+    //
+    // `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE=1` restores that leak in one
+    // binary, which is the only way to show the repair is not vacuous: the
+    // symptom needs a stale span to be CONSUMED, and the consumer is a later
+    // collection on a path that does not republish, not anything this function
+    // does.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE").is_some() {
+        crate::jit::xt_root_scan::resume(taken);
+    } else {
+        retire_skip_spans_and_resume(shared, taken);
+    }
     shared
         .mem
         .gc_barrier
@@ -370,6 +386,43 @@ mod frame_trace_request_tests {
             );
         }
     }
+}
+
+/// End a takeover: retire the published TLAB skip spans, then resume the
+/// frozen peers they describe.
+///
+/// **These are one operation, and they were spelled as two adjacent lines at
+/// eight call sites.** `stw_take_over_and_wait` is the only publisher, and it
+/// publishes unconditionally; the spans describe reserved TLAB tails belonging
+/// to the very threads `taken` is about to release. The instant those threads
+/// resume they bump-allocate into those tails, so a span that outlives its
+/// `resume` no longer describes un-allocated memory -- it covers LIVE objects,
+/// and every sweep walk skips it while `mark_young`'s anchor oracle answers
+/// "free/gap space, not an object" for any root pointing into it. That is the
+/// `ObjectCleanerTest` use-after-free, and it is why the publish was made
+/// unconditional.
+///
+/// The unconditional publish makes a missed clear survivable on the paths that
+/// republish, which is exactly what let a NINTH exit hide: of the nine callers
+/// of `stw_take_over_and_wait`, eight cleared and `stw_publish_frame_traces`
+/// -- reachable from ordinary Java, via `Thread.getStackTrace` -- did not. It
+/// published every alive thread's reserved tail and left the set behind. Any
+/// later collection that does not republish then reads it, and `maybe_gc`'s
+/// single-threaded fast path (`alive_count <= 1`) is precisely such a path: it
+/// sweeps without ever calling `stw_take_over_and_wait`.
+///
+/// So the pairing is a function, not a convention. A tenth exit gets it right
+/// by construction, and `xt_root_scan::resume` should not be called directly
+/// from a GC path.
+///
+/// ORDER, and it is load-bearing: clear BEFORE resume, and both before
+/// `complete_gc` reopens the world. A mutator released early could otherwise
+/// win the next STW, re-freeze the still-suspended peers, publish fresh spans,
+/// and have this initiator's late clear wipe them -- handing the next sweep
+/// the frozen peers' reserved tails to walk and free-list.
+fn retire_skip_spans_and_resume(shared: &SharedVm, taken: crate::jit::xt_root_scan::TakenOver) {
+    shared.mem.heap.clear_jit_tlab_skip_regions();
+    crate::jit::xt_root_scan::resume(taken);
 }
 
 pub(super) fn stw_take_over_and_wait(
@@ -530,7 +583,7 @@ pub(super) fn stw_take_over_and_wait(
     // the whole frozen window, and the non-moving sweep zeroed the still-live
     // object in place (WildFly parallel-extension-add: fresh
     // StringBuilder/Reader receivers reading back all-zero — see
-    // fixed-suite-bugs/wildfly/wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
+    // wildfly-interpreter-operand-stack-slot-stale-after-nested-alloc-FIXED.md).
     // Walk each frozen peer's interpreter frames directly into `xt_roots`.
     //
     // SAFETY: each address was published by its owning thread with the
@@ -671,9 +724,15 @@ pub(super) fn stw_take_over_and_wait(
         // cursor into a `char[]` or `byte[]`) and its extent test is `addr <
         // end`, so a ONE-PAST-THE-END cursor resolves to no base at all.
         // Either leaves an object nothing pins, and relocation then moves it
-        // out from under the register naming it -- the page-ALIGNED SIGSEGV of
-        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902`, page-
-        // aligned because `compact_low_to` zeroes the span it vacates.
+        // out from under the register naming it -- a use-after-free.
+        //
+        // This comment used to call that the page-ALIGNED SIGSEGV of
+        // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` and explain
+        // the alignment as `compact_low_to` zeroing the span it vacates. Both
+        // halves were wrong: the address was page-aligned because it was the
+        // BASE of a decommitted 2 MiB arena granule
+        // (`offset_into_span` 0x0 in every crash) and the access was the
+        // slide's own WRITE, not a read. The hazard below stands on its own.
         //
         // `resolve_interior_for_pin` accepts both. Over-approximating is the
         // SAFE direction here and the asymmetry is stark: a false positive
@@ -710,7 +769,52 @@ pub(super) fn stw_take_over_and_wait(
     // thread that missed its retire before it left the counted mutator set.
     // Cleared by the caller after the collection completes.
     let regions = shared.threads.thread_registry.collect_reserved_tlab_tails();
-    if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+    // UNCONDITIONAL, and that is the fix, not a tidy-up.
+    //
+    // This used to publish only `if taken.count() > 0 || helper_windows > 0 ||
+    // !regions.is_empty()`, on the reasoning that publishing an empty set over
+    // an empty set is pointless. It is not: the set is PROCESS-GLOBAL and
+    // survives the collection that wrote it. The "cleared by the caller after
+    // the collection completes" note above is honoured at seven separate exits,
+    // and a path that misses one leaves the previous collection's spans in
+    // place -- at which point the guard above declines to overwrite them
+    // precisely when `regions` is empty, i.e. exactly when they are stale.
+    //
+    // A stale span is not a conservative degrade. Its owner resumed after the
+    // collection that published it and bump-allocated into `[cursor, end)`, so
+    // the span now covers LIVE objects; and the sweep's contract for a skip
+    // span is that its bytes are not objects. Every linear walk resyncs past
+    // it (`skip_free_blocks`), so those objects are never walked, and
+    // `mark_young`'s anchor oracle -- whose `verified_spans` are built from the
+    // same skip list -- answers "free/gap space, not an object" for any ROOT
+    // pointing into one and drops it without marking. The object is therefore
+    // neither scanned nor swept: it survives, unmarked, while everything it
+    // references is reclaimed underneath it.
+    //
+    // Measured on `io.netty.util.internal.ObjectCleanerTest` under
+    // `-XX:+UseGenerationalGC`: JUnit's static
+    // `NamespacedHierarchicalStore$EvaluatedValue.REVERSE_INSERT_ORDER` is a
+    // `Collections$ReverseComparator2` whose cycle-0 sweep reports
+    // `in_jit_tlab_skip=Some(..)`; its `cmp` lambda is freed and zeroed, and
+    // the next `compare` through the still-live comparator raises
+    // `AbstractMethodError: java/util/Comparator.compare ... has no Code
+    // attribute`. Ignoring the published spans entirely
+    // (`CRATONVM_GC_NO_TLAB_SKIP=1`) takes that arm from 6/8 to 0/8, which is
+    // what identified the span as the carrier; publishing the CURRENT set every
+    // collection is the repair that keeps BUG-03's protection for a genuinely
+    // un-retired tail.
+    // `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` restores the pre-fix guard
+    // for a one-binary A/B. With it set, `io.netty.util.internal
+    // .ObjectCleanerTest` returns to 6/8 non-clean under Generational and 8/8
+    // under G1, and the `cratonvm::gc::guard` "a ROOT points into a published
+    // TLAB skip span" error fires -- which is also what proves that guard is
+    // not vacuous.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH").is_some()
+    {
+        if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+            shared.mem.heap.set_jit_tlab_skip_regions(&regions);
+        }
+    } else {
         shared.mem.heap.set_jit_tlab_skip_regions(&regions);
     }
     if taken.count() > 0 || helper_windows > 0 {
@@ -756,12 +860,18 @@ pub(super) fn stw_take_over_and_wait(
             // `unrewritable_peer_state` exists for one hazard, stated in its own
             // doc and in the comment above: "a frozen peer's registers can hold
             // only a derived/interior pointer whose base would otherwise be
-            // evacuated from under it, then zeroed and re-served". That is the
-            // crash signature of
+            // evacuated from under it, then zeroed and re-served". That
+            // hazard is real on its own terms.
+            //
+            // It was read as the crash signature of
             // `bug-box-unbox-intrinsic-segv-under-relocation-20260902` exactly
-            // -- a page-ALIGNED fault address, because `compact_low_to` zeroes
-            // the vacated span on purpose, so the reader lands on a valid
-            // all-zero header rather than on a wild pointer.
+            // -- a page-ALIGNED fault address, explained as `compact_low_to`
+            // zeroing the vacated span so the reader lands on an all-zero
+            // header. That page RETRACTED the reading on 2026-09-04: the
+            // address was the BASE of a decommitted 2 MiB arena granule and
+            // the access was a WRITE by `relocate_stw` itself. A page-aligned
+            // fault address is not a signature -- two different mechanisms
+            // produce one.
             //
             // The discharge's argument -- an interior-resolving probe pins the
             // BASE, so a derived pointer is covered -- is an argument about the
@@ -1451,8 +1561,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // tails. A resumed peer that immediately requests the next
                 // GC blocks until `complete_gc` anyway (the barrier is still
                 // closed here), so the reorder introduces no new window.
-                shared.mem.heap.clear_jit_tlab_skip_regions();
-                crate::jit::xt_root_scan::resume(taken);
+                retire_skip_spans_and_resume(shared, taken);
                 // Signal all threads with the pointer map
                 shared.mem.gc_barrier.complete_gc(result.pointer_map);
 
@@ -1518,6 +1627,42 @@ pub fn maybe_gc_forced_pub_at(shared: &SharedVm, thread: &mut JvmThread, site: &
 /// site at all -- a fully compiled allocation loop reaches `maybe_gc` never.
 pub fn zgc_concurrent_mark_cycle_pub(shared: &SharedVm, thread: &mut JvmThread) {
     zgc_concurrent_mark_cycle(shared, thread);
+}
+
+/// Drive G1's concurrent-mark lifecycle from a path compiled code reaches.
+///
+/// BOTH HALVES, in `maybe_concurrent_gc`'s order and for its reasons: finish
+/// first, so an active cycle whose background marker has drained gets its STW
+/// remark + cleanup from the thread that already has the barrier context;
+/// start second, so the two cannot race within one call.
+///
+/// Why it exists at all: `maybe_concurrent_gc` is the only caller of either
+/// half, and it lives inside `maybe_gc`, which a JIT-compiled workload reaches
+/// ZERO times (instrumented on `org.h2.test.store.TestMVStoreTool`, -Xmx256m,
+/// 2026-09-05: zero calls across a run with 65 young pauses). `needs_gc()` is
+/// false for G1 because the collector triggers its own young pauses from inside
+/// the allocator, so `maybe_gc` returns at its gate and the body never runs.
+///
+/// The consequence measured on that workload: `marking_complete` is never set,
+/// so `needs_mixed_gc()` is never true, so `mixed_phase_has_work()` is not
+/// called ONCE and no mixed collection ever runs. Old grew to 245 of 256
+/// regions, `free` reached 0, and the pause census reported 18-54 to-space
+/// exhaustions and 17 evacuation failures per run. Only `g1_force_full_cycle`,
+/// the last-ditch pre-OOM path, drove either half.
+///
+/// The FINISH half is the one with no substitute: a cycle that path starts is
+/// otherwise never remarked or cleaned up, so even the marking that does happen
+/// yields no `live_bytes` and no mixed candidates.
+pub fn g1_drive_concurrent_mark_pub(shared: &SharedVm, thread: &mut JvmThread) {
+    if shared.mem.heap.g1_is_marking_active() {
+        if shared.mem.heap.g1_concurrent_mark_finished() {
+            g1_final_remark_cleanup(shared, thread);
+        }
+        return;
+    }
+    if shared.mem.heap.g1_should_start_marking() {
+        g1_concurrent_mark_cycle(shared, thread);
+    }
 }
 
 /// Allocate a dynamically-produced `java.lang.String` under the SAME
@@ -1628,8 +1773,7 @@ pub(super) fn maybe_gc_forced_at(
     // `OutOfMemoryError` on a heap that is almost entirely garbage. Restores
     // part 3 of a9c580aff, which d8092acba ("fix-tests-real-jdk-contracts")
     // reverted in this file while leaving both accessors in place and
-    // caller-less; see fixed-suite-bugs/tomcat/
-    // 24-stringcache-oom-under-load-FIXED.md.
+    // caller-less; see 24-stringcache-oom-under-load-FIXED.md.
     let before_live = shared.mem.heap.live_bytes_estimate();
     let before_promoted = shared.mem.heap.bytes_promoted_total();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
@@ -1732,8 +1876,7 @@ pub(super) fn maybe_gc_forced_at(
             crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
-            shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
-            crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
+            retire_skip_spans_and_resume(shared, taken);
             shared.mem.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
@@ -2034,8 +2177,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
-            shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
-            crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
+            retire_skip_spans_and_resume(shared, taken);
             shared.mem.gc_barrier.complete_gc(result.pointer_map);
         } else {
             safepoint_check(shared, thread);
@@ -2421,7 +2563,7 @@ fn run_finalizers_impl(shared: &SharedVm, thread: &mut JvmThread, forced: bool) 
 /// `WeakCache`'s `WeakHashMap.get()` permanently stuck inside
 /// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
 /// `createLayoutFromConfigClass` test). See
-/// fixed-suite-bugs/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
+/// thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md.
 pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
     let cm = shared.classes.class_manager.read();
     cm.find_bootstrap_class_by_name("java/lang/ref/Reference")
@@ -2516,7 +2658,7 @@ pub(super) fn process_references_after_gc(
         // collections `is_marked` already agrees are dead.
         //
         // NOTE: this does NOT fully close
-        // `fixed-suite-bugs/tomcat/defaultinstancemanager-classunloading-count-mismatch-FIXED.md`.
+        // `defaultinstancemanager-classunloading-count-mismatch-FIXED.md`.
         // `roots.rs` step 17 itself has a separate, deeper bug this session
         // found but did not fix: `gc_scan_collection_overlay_roots` roots
         // EVERY element of EVERY overlay-backed collection unconditionally,
@@ -2629,7 +2771,7 @@ pub(super) fn process_references_after_gc(
     // obtainable bytes diverge. Read *before* taking the reference-processor
     // lock: the accessor reaches into the heap's own generation stats, and
     // there is no reason to nest those acquisitions.
-    // See `arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
+    // See `refs-metaspace-unloading.md` §2/§R1.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     // ClassManager is rank L10 and the reference processor is L7, so resolve
     // the JDK field before acquiring the lower-ranked processor lock.
@@ -2682,7 +2824,7 @@ pub(super) fn process_references_after_gc(
     // whatever now occupies the memory: the measured corruption was THIS
     // loop's `Object(None)` referent-clear landing mis-gridded — victim
     // payload = 0x4 (the Object discriminant), next word nulled (hexdump in
-    // gaps/h2-testscript-segv-findings.md). The earlier
+    // h2-testscript-segv-findings.md). The earlier
     // `num_fields < 2` guard was too weak (a phantom header at the stale
     // address can read num_slots >= 2). PRECISE criterion: a pre-GC address
     // in EITHER young semispace that is NOT a pointer-map key did not
@@ -3895,7 +4037,7 @@ const NEEDSGC_MIN_REFILL_BYTES_BETWEEN_FIRES: u64 = 4 * 1024 * 1024;
 /// unaligned TLAB sizes whose free-list split remnants sat off the 8-byte
 /// object grid (plus an untracked `Tlab::new` round-down sliver), derailing
 /// the non-moving walk and truncating the mark oracle. See
-/// fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
+/// tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
 /// now enforces grid alignment end-to-end and the mark oracle fails safe
 /// above a truncated walk's frontier.
 fn tlab_gc_trigger_enabled() -> bool {
@@ -4504,7 +4646,7 @@ pub(super) fn tlab_alloc_shaped_inner(
 /// only report that names legacy allocations — which is exactly what happened
 /// to `org/bouncycastle/crypto/digests/SHA256Digest`, 100% of `jit_getfield`'s
 /// receivers on Generational and nowhere in the census. See
-/// fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+/// every-jit-getfield-takes-the-helper-FIXED-20260820.md.
 ///
 /// Sixteen slots, linear scan, first-come, and only touched under
 /// `CRATONVM_DBG_COMPACT_LEGACY`: the registry lookup it performs is far too
@@ -5509,7 +5651,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // SEGV — that crash was experimentally shown to be NOT a GC reclamation /
     // relocation bug (it reproduces with the young sweep capturing these JIT
     // roots and with the concurrent old-gen collector disabled). See
-    // fixed-bugs/real-raf-segv-root-cause.md.
+    // real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
         // `update_root_snapshot` is also called at ordinary native-call
         // boundaries, not only immediately before a safepoint.  Its JIT-root
@@ -6287,8 +6429,7 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         }
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6360,8 +6501,7 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         }
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6475,8 +6615,7 @@ pub(super) fn zgc_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThrea
 
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening the
         // world — same race rationale as `maybe_gc`'s epilogue.
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6570,8 +6709,7 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
         tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier
@@ -6689,8 +6827,7 @@ pub(super) fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread)
         );
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.mem.heap.clear_jit_tlab_skip_regions();
-        crate::jit::xt_root_scan::resume(taken);
+        retire_skip_spans_and_resume(shared, taken);
         shared
             .mem
             .gc_barrier

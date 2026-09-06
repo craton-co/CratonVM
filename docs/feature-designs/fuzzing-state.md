@@ -39,7 +39,7 @@ posture — it *is* executed and blocking. See
 
 Every API every target calls was resolved against the crate that defines
 it; there are no dangling references and nothing here is dead the way
-`fuzz_classfile` once was (`reviews/fuzz-review.md` records
+`fuzz_classfile` once was (`fuzz-review.md` records
 that historical break — `ClassFile::parse` never existed).
 
 "Vacuous" below means: does the target exercise the parser, or something
@@ -114,7 +114,7 @@ seeds. There is no gap against that list.
 
 ### The gaps that remain are elsewhere
 
-From `reviews/fuzz-review.md`, which predates the current
+From `fuzz-review.md`, which predates the current
 seventeen targets and whose other findings are closed:
 
 * **`parse_http_request_head` (`native-builtins/src/wildfly_undertow.rs:451`)

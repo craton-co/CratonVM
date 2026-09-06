@@ -4856,7 +4856,7 @@ pub(crate) fn define_or_get_proxy_class(
         // `interfaceClass.isInstance(proxy)` and `Method.invoke` both reject
         // — reproduced with a plain `Proxy.newProxyInstance` + custom
         // `ClassLoader`, independent of annotations. See "Residual issue B" in
-        // fixed-suite-bugs/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md.
+        // mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md.
         force_loader_faithful_linking: true,
         // …and, for the interfaces, do not even ask the loader-faithful
         // *search* to find them: hand over the exact `ClassId`s.

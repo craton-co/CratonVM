@@ -444,7 +444,7 @@ pub(crate) fn native_constructor_can_access(
 /// preferring the SAME defining loader as `class_id` before falling back to
 /// the global (loader-blind) store.
 ///
-/// hib-proxyclassreuse-loader-blind-class-resolution.md follow-up
+/// hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md follow-up
 /// (2026-07-06): `getEnclosingClass`'s two lookups (`EnclosingMethod` ->
 /// enclosing class, `InnerClasses` -> outer class) previously went straight
 /// to `ctx.class_id_by_name(name)` / `ctx.ensure_class_initialized(name)` --

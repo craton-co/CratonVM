@@ -20,7 +20,7 @@
 //!   compiles. End-to-end execution is gated through main-invoke when the
 //!   compiled fixture is staged.
 //!
-//! Background (`gaps/wildfly-ejbca-roadmap.md` WP2.9):
+//! Background (`wildfly-ejbca-roadmap.md` WP2.9):
 //! `Lookup.findSpecial(refc, name, type, specialCaller)` returns a method
 //! handle that, when invoked, runs the resolved method exactly on `refc`
 //! with no virtual dispatch. The default-method super-call pattern

@@ -185,7 +185,7 @@ fn dbg_jit_rootscan() -> bool {
 /// cycles the bit is spent, the oracle is not looking.
 ///
 /// This switch exists so the difference costs one binary to measure, not two.
-/// See `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`.
+/// See `bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`.
 fn dbg_precise_only_roots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -203,7 +203,7 @@ fn dbg_precise_only_roots() -> bool {
 /// output, so skipping the scan leaves the pause with no protection at all
 /// rather than with a different one". That is still a true description of the
 /// mechanism, but it was not the defect. The defect
-/// (`bug-g1-evacuates-live-jit-reference-20260819.md`) was that G1's coverage
+/// (`bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`) was that G1's coverage
 /// proof was VACUOUS: the frame-band verifier classifies a spill-band word with
 /// `gen_heap::addr_is_movable`, G1 published neither table it reads, so every
 /// word answered "not movable" and the verifier reported a frame clean without
@@ -222,7 +222,7 @@ fn dbg_precise_only_roots() -> bool {
 /// rests on `CompiledMethod::fully_oop_covered`, a PRESENCE test rather than a
 /// completeness one, and that the runtime oracle which would settle it does not
 /// run on the cycles the bit is spent
-/// (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820.md`). That
+/// (`bug-oop-map-coverage-bit-is-presence-not-completeness-20260820-FIXED.md`). That
 /// is a JIT-wide question, not a collector one, and it is what a soak would
 /// have to answer before either default moves. Kept as an opt-in so the
 /// difference can be A/B'd in one binary — and note that this switch alone does
@@ -235,12 +235,224 @@ fn dbg_g1_precise_only_roots() -> bool {
     })
 }
 
+/// High-water mark of the last few root sets, in entries.
+///
+/// # Why `collect_roots` cannot just start at `Vec::new()`
+///
+/// It did, for a root set that on a real application runs to tens or hundreds
+/// of thousands of entries appended across ~41 sections. `Vec`'s growth is
+/// doubling, so that is a dozen-plus reallocations per collection — each one a
+/// fresh allocation plus a `memcpy` of everything gathered so far — and every
+/// one of them lands INSIDE the pause, on the initiating thread, before any
+/// marking has started.
+///
+/// A single relaxed load and one right-sized allocation replace all of them.
+/// The hint is monotone rather than an average on purpose: undershooting costs
+/// a reallocation, which is the thing being removed, while overshooting costs
+/// one `ObjectRef`-sized slot per unused entry of a vector that is dropped at
+/// the end of the collection. It is a hint and nothing reads it for
+/// correctness, so a torn or stale value cannot do worse than the `Vec::new()`
+/// this replaces.
+static ROOT_COUNT_HINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// Addresses of the static-field SLOTS this thread's last root scan found
+    /// holding an object, for the post-collection fix-up to write through.
+    ///
+    /// # The design this is the first instance of
+    ///
+    /// `GarbageCollector::collect_garbage` takes `roots: &mut [ObjectRef]` --
+    /// object ADDRESSES, not the addresses of the slots holding them. A moving
+    /// collector therefore cannot fix a root in place, and everything
+    /// downstream follows from that: it must build a `PointerMap` with one
+    /// entry per moved object, and the VM must then re-walk the whole root
+    /// surface to patch through it. `update_all_roots` plus roughly
+    /// thirty-five hand-written `gc_update_*` companions is that re-walk, and
+    /// `pointer_map` appears in over five hundred places across `vm/` and the
+    /// native crates. Forgetting one is a silent use-after-free, and the
+    /// hundred-line comment block at the end of `collect_roots` is a list of
+    /// the subsystems where that already happened.
+    ///
+    /// Statics are where that design can be tested cheaply and safely, because
+    /// their slots have a property almost nothing else in the root set has:
+    /// **a stable address**. A `StaticsBlock` is a leaked `Box<[Value]>` whose
+    /// base is "stable for the life of the VM", and `grow_to` deliberately
+    /// leaves the old block allocated precisely so a lock-free reader's pointer
+    /// stays valid. The map that owns the blocks may rehash; the slots do not
+    /// move.
+    ///
+    /// What this buys today is narrow and real: `update_all_roots` re-walked
+    /// EVERY slot of EVERY class's statics, under the `statics` WRITE lock, to
+    /// patch the handful that hold references. It now walks the ones the scan
+    /// already found. Same slots, same `PointerMap` lookups, no second sweep of
+    /// the primitive ones.
+    ///
+    /// What it demonstrates is the larger claim: with the slot in hand the
+    /// `PointerMap` lookup is not needed either -- a relocating collector could
+    /// store the new address straight through the slot. That step is not taken
+    /// here, because it belongs with a collector-side change, not a VM-side one.
+    ///
+    /// TAKE-ONCE. `update_all_roots` drains this; a call that is not preceded
+    /// by a scan on the same thread finds it empty and does the full walk. That
+    /// is what makes a stale list impossible rather than merely unlikely: every
+    /// `collect_roots` / `update_all_roots` pair in the tree runs on one thread
+    /// (the collection initiator), and anything that breaks that pairing
+    /// degrades to the old behaviour instead of patching a list from a
+    /// different scan.
+    static STATIC_REF_SLOTS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `CRATONVM_GC_STATIC_ROOT_SLOTS=0` -- kill switch. With it set, the scan
+/// records nothing and `update_all_roots` takes the full-walk path exactly as
+/// before, so the two are one binary apart rather than one build apart.
+pub fn static_root_slots_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_GC_STATIC_ROOT_SLOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// Static ref slots recorded across the process, and the fix-ups that had to
+/// fall back to the full walk because there were none to take.
+///
+/// # Why the pair, and why it is not enough on its own
+///
+/// `slots=0` has two meanings that call for opposite next steps: the kill
+/// switch is set (or something broke the scan/fix-up pairing, and every
+/// collection is doing the old full walk), or this workload simply has no
+/// static reference fields. `fallbacks` separates them — a run with
+/// `slots=0 fallbacks=N` did N collections the old way, and a run with
+/// `slots=0 fallbacks=0` never collected at all.
+///
+/// Neither number says whether the recorded slots were COMPLETE. That is the
+/// verifier's job (`CRATONVM_DBG_STATIC_SLOT_VERIFY=1`), and no counter can
+/// stand in for it: a list that is missing a slot is indistinguishable here
+/// from one that is not.
+static STATIC_SLOTS_RECORDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static STATIC_SLOT_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(slots_recorded, full_walk_fallbacks)` — see [`STATIC_SLOTS_RECORDED`].
+pub fn static_root_slot_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        STATIC_SLOTS_RECORDED.load(Ordering::Relaxed),
+        STATIC_SLOT_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The statics scan's own cost
+// ---------------------------------------------------------------------------
+
+/// Slots visited, slots that held an object, and nanoseconds, summed over every
+/// collection's section 2.
+///
+/// # The residual this is the number for
+///
+/// Section 2 walks EVERY static field of EVERY loaded class on every
+/// collection, young ones included, and the standing proposal is to narrow it
+/// by declared type -- an `int`-declared slot cannot hold an object, so per the
+/// JVM spec it need not be visited. That proposal was parked on the grounds
+/// that this tree has a history of lost-tag values and long-smuggled
+/// `jobject`s and the scan's tolerance for them may be load-bearing.
+///
+/// It is worth what the walk COSTS, and nobody had that. The pair says which
+/// half of it is even addressable: `slots` is what a declared-type filter would
+/// shrink, `objects` is the part that has to be visited whatever the filter
+/// says, and the ratio bounds the saving before anyone reasons about whether
+/// the filter is safe.
+///
+/// Always on: three counter updates per COLLECTION, not per slot.
+static STATICS_SCAN_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_SCAN_OBJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_SCAN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATICS_SCAN_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_statics_scan(slots: u64, objects: u64, nanos: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    STATICS_SCAN_SLOTS.fetch_add(slots, Relaxed);
+    STATICS_SCAN_OBJECTS.fetch_add(objects, Relaxed);
+    STATICS_SCAN_NANOS.fetch_add(nanos, Relaxed);
+    STATICS_SCAN_PASSES.fetch_add(1, Relaxed);
+}
+
+/// `(passes, slots, objects, nanos)` -- see [`STATICS_SCAN_SLOTS`].
+pub fn statics_scan_counts() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        STATICS_SCAN_PASSES.load(Relaxed),
+        STATICS_SCAN_SLOTS.load(Relaxed),
+        STATICS_SCAN_OBJECTS.load(Relaxed),
+        STATICS_SCAN_NANOS.load(Relaxed),
+    )
+}
+
+/// Count a fix-up that found no recorded list and re-walked every static.
+pub fn note_static_slot_fallback() {
+    STATIC_SLOT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Begin recording static ref slots for a fresh scan.
+fn reset_static_ref_slots() {
+    STATIC_REF_SLOTS.with(|c| {
+        if let Ok(mut v) = c.try_borrow_mut() {
+            v.clear();
+        }
+    });
+}
+
+/// Record the address of a static slot found holding an object.
+#[inline]
+fn note_static_ref_slot(addr: usize) {
+    STATIC_REF_SLOTS.with(|c| {
+        if let Ok(mut v) = c.try_borrow_mut() {
+            v.push(addr);
+        }
+    });
+}
+
+/// Take this thread's recorded static ref slots, leaving the store empty.
+///
+/// `None` when nothing was recorded -- either the kill switch is set, or no
+/// scan ran on this thread since the last take. Both mean "do the full walk".
+pub fn take_static_ref_slots() -> Option<Vec<usize>> {
+    STATIC_REF_SLOTS.with(|c| {
+        let mut v = c.try_borrow_mut().ok()?;
+        if v.is_empty() {
+            return None;
+        }
+        STATIC_SLOTS_RECORDED.fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Some(std::mem::take(&mut *v))
+    })
+}
+
+/// The capacity to start a root set at, and the ceiling that keeps a single
+/// pathological collection from pinning a large reservation for the life of the
+/// process.
+const ROOT_HINT_CEILING: usize = 1 << 20;
+
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     if scan_marks_enabled() {
         SCAN_MARKS.lock().clear();
     }
     let __rp_t0 = crate::memory::native_roots::rootprof::on().then(std::time::Instant::now);
-    let mut roots = Vec::new();
+    // See `ROOT_COUNT_HINT`. The `+ 64` covers a set that grew by a handful of
+    // entries since the last collection without forcing a double.
+    let hint = ROOT_COUNT_HINT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(64)
+        .min(ROOT_HINT_CEILING);
+    let mut roots = Vec::with_capacity(hint);
+    // See `STATIC_REF_SLOTS`. Reset per scan so the list `update_all_roots`
+    // takes can only ever describe THIS collection.
+    let record_static_slots = static_root_slots_enabled();
+    reset_static_ref_slots();
 
     // Stage B (precise oop maps, B-K fix): reset the movable precise-JIT-root
     // set so it reflects only THIS collection's stack. `scan_active_jit_frames`
@@ -392,10 +604,24 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // anything and could be reclaimed mid-`<clinit>`. Same reasoning applies
     // to the class-lock (`3.`) and CONSTANT_Dynamic (`13.`) sections below.
     {
+        let __st_t0 = std::time::Instant::now();
         let statics = shared.classes.statics.read();
+        let mut __st_slots = 0u64;
+        let mut __st_objects = 0u64;
         for (&class_id, fields) in statics.iter() {
             for val in fields.iter() {
+                __st_slots += 1;
                 if let Value::Object(Some(obj_ref)) = *val {
+                    __st_objects += 1;
+                    // BEFORE the deferral branch below, deliberately. The
+                    // post-collection fix-up remaps every static slot that holds
+                    // an object, whether or not this scan ROOTED it -- a value
+                    // deferred to `metadata_pin` still moves, and its slot still
+                    // has to be corrected. Recording only the rooted ones would
+                    // drop exactly the slots the deferral was invented for.
+                    if record_static_slots {
+                        note_static_ref_slot(val as *const Value as usize);
+                    }
                     if conditional_metadata
                         && shared
                             .mem
@@ -417,6 +643,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 }
             }
         }
+        note_statics_scan(
+            __st_slots,
+            __st_objects,
+            __st_t0.elapsed().as_nanos() as u64,
+        );
     }
 
     mark_scan_section(
@@ -1068,7 +1299,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // so likewise gets a vacuous coverage proof (see the fail-closed guard in
     // `conservative_roots::moving_young_unpublished_frame_oop_present`).
     //
-    // `bug-g1-evacuates-live-jit-reference-20260819.md`
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`
     // states this restriction as though it were already implemented ("requires
     // `is_generational()`, so under G1 it is false"). It was true of the
     // siblings and false here; this is the line that makes the record true.
@@ -1088,7 +1319,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // the conservative JIT-frame scan? That one stays generational-only. G1
     // needs the scan for its pin set and ZGC needs it as the backstop for
     // everything the precise map does not name; the restriction is what
-    // `bug-g1-evacuates-live-jit-reference-20260819.md` asked for.
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` asked for.
     //
     // The two were computed by one short-circuiting chain, so on a G1 or ZGC
     // cycle `refresh_moving_young_coverage_for_collection()` was NEVER CALLED
@@ -1181,7 +1412,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // every candidate failed `is_object_address` (`chain>0 added=0`). Those are
     // three different defects and the collector-side line reads identically for
     // all three. See
-    // `bug-g1-evacuates-live-jit-reference-20260819.md`.
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`.
     if dbg_jit_rootscan() {
         let frames = crate::jit::conservative_roots::active_compiled_frames();
         let labels: Vec<&str> = frames.iter().map(|f| f.label.as_str()).collect();
@@ -1233,7 +1464,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             // never described" from "a peer thread happened to be in compiled
             // code at this safepoint", and those want completely different
             // work: the first is a codegen gap, the second is the cross-thread
-            // coverage handshake `arch-2026-07-26/moving-young-precise-roots.md`
+            // coverage handshake `moving-young-precise-roots.md`
             // specifies and nobody has built.
             reason = cratonvm_gc::gc_quiescence::incomplete_reason::label(
                 cratonvm_gc::gc_quiescence::moving_young_incomplete_reason(),
@@ -1613,6 +1844,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             }
         }
     }
+    // Feed the next collection's pre-size. Monotone: see `ROOT_COUNT_HINT`.
+    let seen = roots.len().min(ROOT_HINT_CEILING);
+    if seen > ROOT_COUNT_HINT.load(std::sync::atomic::Ordering::Relaxed) {
+        ROOT_COUNT_HINT.store(seen, std::sync::atomic::Ordering::Relaxed);
+    }
     roots
 }
 
@@ -1771,6 +2007,57 @@ mod tests {
         let thread = JvmThread::new(ThreadId(0), "test");
         let roots = collect_roots(&shared, &thread);
         assert!(roots.contains(&obj));
+    }
+
+    /// The scan records the ADDRESS of every static slot holding an object, and
+    /// `update_all_roots` takes that list exactly once.
+    ///
+    /// Both halves matter and they fail differently. If the list omits a slot,
+    /// the post-collection fix-up leaves a live static pointing at a vacated
+    /// address -- a use-after-free that surfaces arbitrarily far away. If the
+    /// list can be taken twice, a collection with no scan of its own applies a
+    /// list from an earlier one, which misses every slot that became
+    /// object-valued in between -- the same failure by a different route. The
+    /// take is what rules the second one out: an `update_all_roots` with no
+    /// preceding scan gets `None` and does the full walk.
+    #[test]
+    fn the_scan_records_static_ref_slots_and_the_take_is_once() {
+        if !static_root_slots_enabled() {
+            return; // kill switch set in this environment; nothing to assert
+        }
+        let shared = test_shared_vm();
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+
+        // Two object slots and two primitives, so a list that simply recorded
+        // every slot would be distinguishable from one that recorded the
+        // reference-holding ones.
+        let (slot0, slot2) = {
+            let mut statics = shared.classes.statics.write();
+            let block = crate::vm::realms::class_realm::StaticsBlock::from_values(vec![
+                Value::Object(Some(obj)),
+                Value::Int(7),
+                Value::Object(Some(obj)),
+                Value::Long(9),
+            ]);
+            let base = block.base_ptr();
+            statics.insert(ClassId::new(1), block);
+            // SAFETY: `base` is the start of a leaked `[Value; 4]`.
+            (base as usize, unsafe { base.add(2) } as usize)
+        };
+
+        let thread = JvmThread::new(ThreadId(0), "test");
+        let _ = collect_roots(&shared, &thread);
+
+        let slots = take_static_ref_slots().expect("the scan must record the two object slots");
+        assert!(
+            slots.contains(&slot0) && slots.contains(&slot2),
+            "both object-valued slots must be recorded; got {slots:?} want {slot0:#x} and {slot2:#x}"
+        );
+
+        assert!(
+            take_static_ref_slots().is_none(),
+            "the take must be once -- a second consumer would be applying a list              from a scan that is not its own"
+        );
     }
 
     #[test]

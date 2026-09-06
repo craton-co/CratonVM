@@ -1529,7 +1529,7 @@ mod tests {
     /// Silently is the point: a stale handle does not error, it DROPS the
     /// records. Dropped receiver records are exactly the biased profile that
     /// made the door return wrong answers
-    /// (`fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`),
+    /// (`testrandommapops-deterministic-1810-null-FIXED-20260904.md`),
     /// so this is pinned by a test rather than by the comment that says slots
     /// are insert-only.
     #[test]
@@ -2289,7 +2289,7 @@ mod tests {
 /// `Arc` clone. That is right once per method and far too much once per CALL —
 /// and the monomorphic invoke fast door records once per call, where it
 /// measured **+44% CPU** on interpreted dispatch
-/// (`fixed-bugs/testrandommapops-deterministic-1810-null-FIXED-20260904.md`).
+/// (`testrandommapops-deterministic-1810-null-FIXED-20260904.md`).
 ///
 /// The profile key is the CALLER's method, which cannot change while its frame
 /// is live, so one handle serves the whole frame.

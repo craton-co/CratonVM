@@ -57,7 +57,7 @@
 //!  * **`UNATTRIBUTED_VM` (`0`) is a migration seam, not a scope.** Call sites
 //!    that cannot supply a `vm_identity` land there, and per-VM lookups fall
 //!    back to it. Prefer the `*_for_vm` entry points; see
-//!    `audits/jvmti-vm-scoping.md` for what is still unattributed
+//!    `jvmti-vm-scoping.md` for what is still unattributed
 //!    and why.
 //!
 //! What IS live in this file on a default build:
@@ -923,7 +923,7 @@ pub struct JvmtiEventManager {
     /// owned by VM B can never deliver into VM A's `shared.debug.jvmti_env`.
     /// An unattributed manager falls back to [`sole_live_bridge`], which
     /// answers `None` unless exactly one VM is live — fail-closed, never a
-    /// guess. See `audits/jvmti-vm-scoping.md`.
+    /// guess. See `jvmti-vm-scoping.md`.
     vm: usize,
     /// Global event enable/disable state.
     global_events: RwLock<HashSet<JvmtiEventKind>>,
@@ -2816,7 +2816,7 @@ impl fmt::Debug for JvmtiEnv {
 //     `any_*_listener` fast-path flag. Event *delivery* was process-global,
 //     so re-keying any one downstream table (the field-watchpoint map, say)
 //     produced a subsystem that looked isolated in review and was not. See
-//     `feature-designs/vm-process-global-state-round-2.md` § "Still open".
+//     `vm-process-global-state-round-2.md` § "Still open".
 //   * `REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<SharedVm>>` — a single `Weak`,
 //     first-writer-wins. Exactly the shape that made `RedefineClasses`
 //     silently do nothing in a second VM. Verified failure modes:
@@ -3206,7 +3206,7 @@ fn bridge_for_vm(vm: usize) -> Option<Arc<crate::vm::SharedVm>> {
 /// an interface a debugger treats as authoritative.
 ///
 /// The fix that removes the ambiguity is at the call site, not here — see
-/// `audits/jvmti-vm-scoping.md`.
+/// `jvmti-vm-scoping.md`.
 fn sole_live_bridge() -> Option<Arc<crate::vm::SharedVm>> {
     let guard = environments_read();
     let map = guard.as_ref()?;
@@ -3358,7 +3358,7 @@ pub fn fire_exception_catch(thread: ThreadId, method: MethodId, location: i64) {
 // ---------------------------------------------------------------------------
 //
 // The interpreter dispatch loop and opcode handlers call these at the sites
-// listed in history/roadmap-100.md §T17.Δ. The hot-path contract for each of
+// listed in roadmap-100.md §T17.Δ. The hot-path contract for each of
 // these is:
 //
 //   1. A single `AtomicBool::Acquire` load on the per-event **union** mirror
@@ -3744,6 +3744,31 @@ pub fn field_watchpoint_for(class_id: u64, field_index: usize) -> Option<FieldWa
 #[inline]
 pub fn any_field_watchpoint_active() -> bool {
     // Lock-free: read the atomic mirror maintained by set/clear_field_watchpoint.
+    //
+    // `Acquire` is kept, and it was tried the other way. 2026-09-05 measured
+    // the phase bracketing this load at 20.6 corrected cycles — 48% of the
+    // real work in a quickened `getfield` — and the suspicion was that
+    // `Acquire` is a compiler barrier on the FIRST statement of
+    // `field_fast::getfield_fast_keyed`, fencing the whole arm behind itself.
+    //
+    // `Relaxed` is SOUND here: this flag publishes no data, and every consumer
+    // that acts on `true` then calls `field_watchpoint_for_vm`, which takes
+    // `environments_read()` — that lock is what synchronises-with the writer's
+    // `environments_write()` release and publishes the watchpoint set. Nor
+    // would relaxing delay an agent: `Acquire` on a LOAD orders what follows
+    // it, it does not make the value fresher.
+    //
+    // It measured NOTHING. Three runs relaxed against the acquire build:
+    // entry 20.3 / 23.2 / 22.7 against 20.6 corrected, with every other phase
+    // and every phase SHARE identical to three significant figures. The effect
+    // is below ~3 cycles, which is this instrument's resolution on that phase.
+    //
+    // So the barrier is not the cost, and the ordering is left alone: relaxing
+    // a JVMTI mechanism's memory ordering buys nothing measurable, and an
+    // unmeasurable change to correctness-adjacent code is not worth carrying.
+    // What `entry` actually spends 20 cycles on is unresolved — the prologue
+    // is excluded by construction (the first timestamp is taken after it) and
+    // the `stack.len()` beside the load is a struct field read.
     FIELD_WATCHPOINTS_ACTIVE.load(Ordering::Acquire)
 }
 

@@ -71,7 +71,7 @@ fn maybe_dump_shutdown_reports() {
     // `gc_metrics::collector_decision_report` had no production caller at all
     // until 2026-09-01 — `grep` returned its own unit tests — which quietly
     // voided a claim.
-    // `bug-g1-evacuates-live-jit-reference-20260819.md` keeps
+    // `bug-g1-evacuates-live-jit-reference-20260819-FIXED.md` keeps
     // `G1Collector::empty_jit_publication` as a detector rather than a fix, on
     // the grounds that with the conservative scan always running under G1 an
     // empty publication under a live compiled frame is once again a genuine
@@ -141,6 +141,7 @@ fn maybe_dump_shutdown_reports() {
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
     cratonvm_vm::runtime::interpreter::invoke_phases::dump();
+    cratonvm_vm::runtime::interpreter::field_phases::dump();
 
     // The G1 live-region memo's tally, self-gated on
     // `CRATONVM_DBG_G1_LIVE_MEMO`. Same argument as the line above, and it is
@@ -166,7 +167,7 @@ fn maybe_dump_shutdown_reports() {
 
     // How many native-registry probes one invoke cost, self-gated on
     // `CRATONVM_DBG_NATIVE_LOOKUPS=1`. This is the number
-    // `performance/vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
+    // `vm-per-call-dispatch-cost-RETIRED-20260817.md` §2 asks for
     // before anyone restructures the dispatch entry points: a profile share can
     // say `slot_for_exact` is 8.5%, but only this says whether a "one lookup
     // per invoke" rewrite would divide it by 1 or by 10.
@@ -226,6 +227,164 @@ fn maybe_dump_shutdown_reports() {
     // `CRATONVM_DBG_TIERUP_DECLINE`). Each prints nothing when unarmed.
     cratonvm_vm::runtime::interp_census::report_at_exit();
 
+    // -----------------------------------------------------------------
+    // THE COLLECTOR'S ENGAGEMENT NUMBERS
+    // -----------------------------------------------------------------
+    //
+    // Outside `jit.method_stats`, deliberately. Every one of these was written
+    // to make a ZERO readable -- `slots=0` cannot distinguish a kill switch
+    // from a workload with no static reference fields; `hits=0` cannot
+    // distinguish an off bitmap from one that is never consulted; a give-back
+    // that returns nothing looks exactly like a give-back that is disabled.
+    // Gating them behind `CRATONVM_JIT_METHOD_STATS` reintroduced the failure
+    // they exist to prevent, one level up: a reader who sets the GC switch the
+    // record names and gets no line reads that as "the switch did nothing", and
+    // the flag that would have shown otherwise is about the JIT and is named in
+    // none of those records.
+    //
+    // Each still prints only when its own counter is non-zero, which is a
+    // different rule and the right one: these are opt-in instruments, so an
+    // unarmed one has nothing to say and should stay quiet.
+    // EXACT OBJECT-START answers (`CRATONVM_GC_OBJECT_STARTS`). The
+    // pair, because a hit count alone cannot say whether the bitmap is
+    // carrying the predicate or being consulted and ignored: a miss
+    // falls through to the header-shaped deduction that was there
+    // before, and on a conservative scan over zeroes, small integers
+    // and long bit patterns most candidates SHOULD miss. What the ratio
+    // cannot separate -- a genuine non-object from a real object the
+    // bitmap never saw because a TLAB bump-allocated it -- needs a
+    // workload, not another counter.
+    {
+        let (hits, misses, missed_objects) = cratonvm_vm::object_start_counts();
+        if hits != 0 || misses != 0 {
+            eprintln!(
+                "[cratonvm] exact object-start answers: hits={hits} misses={misses} (of which real objects: {missed_objects})"
+            );
+        }
+    }
+    // MEMORY RETURNED TO THE OS by the generational young collector
+    // (`CRATONVM_GEN_UNCOMMIT`). Printed whenever a collection ran,
+    // zero included: a zero with the switch ON means every collection
+    // found the evacuated semi-space had no whole granule to give back,
+    // which is a real finding about the workload, and it is
+    // indistinguishable from the switch being off unless it is printed.
+    {
+        let bytes = cratonvm_vm::young_bytes_uncommitted();
+        if bytes != 0 {
+            eprintln!("[cratonvm] generational young uncommit: {bytes} bytes returned to the OS");
+        }
+    }
+    // STATIC ROOT SLOTS -- the engagement number for the slot-carrying
+    // root path (`CRATONVM_GC_STATIC_ROOT_SLOTS`). Both halves, for the
+    // usual reason: `slots=0` alone cannot distinguish the kill switch
+    // being set, the scan/fix-up pairing being broken so every
+    // collection re-walks every static the old way, and a workload that
+    // simply has no static reference fields. `fallbacks` tells the
+    // first two from the third.
+    //
+    // Neither number says the recorded list was COMPLETE. Only
+    // `CRATONVM_DBG_STATIC_SLOT_VERIFY=1` answers that, and no counter
+    // can stand in for it -- a list missing a slot looks identical here.
+    {
+        let (slots, fallbacks) = cratonvm_vm::memory::roots::static_root_slot_counts();
+        if slots != 0 || fallbacks != 0 {
+            eprintln!(
+                "[cratonvm] static root slots: patched={slots} full-walk-fallbacks={fallbacks}"
+            );
+        }
+    }
+    // THE STATICS SCAN, always on. Section 2 of `collect_roots` walks
+    // every static field of every loaded class on every collection, and
+    // the standing proposal is to narrow it by declared type. `slots` is
+    // what such a filter would shrink and `objects` is what has to be
+    // visited whatever it says, so the pair bounds the saving before
+    // anyone argues about whether the filter is safe on a tree with a
+    // history of smuggled `jobject`s.
+    {
+        let (passes, slots, objects, ns) = cratonvm_vm::memory::roots::statics_scan_counts();
+        if passes != 0 {
+            eprintln!(
+                "[cratonvm] statics scan: passes={passes} slots={slots} \
+objects={objects} total={ms}ms mean={mean}us",
+                ms = ns / 1_000_000,
+                mean = ns / 1_000 / passes.max(1),
+            );
+        }
+    }
+    // POST-COLLECTION ROOT FIX-UP (`CRATONVM_DBG_ROOTFIXUP=1`) -- what
+    // the value-carrying root ABI costs per run. The standing proposal
+    // is to carry roots as SLOTS so a relocating collector writes the
+    // new address through them and this walk disappears; the proposal is
+    // worth what the walk costs, and this is that number. Printed with
+    // the pointer-map total because the two shapes the cost could have
+    // -- proportional to the relocation set, or to the root surface --
+    // call for different fixes.
+    {
+        let (calls, entries, ns) = cratonvm_vm::memory::gc::root_fixup_census();
+        if calls != 0 {
+            eprintln!(
+                "[cratonvm] root fix-up: calls={calls} \
+pointer-map-entries={entries} total={ms}ms mean={mean}us",
+                ms = ns / 1_000_000,
+                mean = ns / 1_000 / calls.max(1),
+            );
+        }
+    }
+    // MARK-BITMAP CLEAR (`CRATONVM_DBG_MARKCLEAR=1`). `worked` is the
+    // engagement half: the change being measured is the `any_marked`
+    // early return, so `worked == calls` says it never fired on this
+    // workload and the reading is about the clear loop rather than about
+    // the change.
+    {
+        let (calls, worked, words, ns) = cratonvm_vm::mark_bitmap_clear_census();
+        if calls != 0 {
+            eprintln!(
+                "[cratonvm] mark-bitmap clear: calls={calls} worked={worked} \
+words={words} total={us}us",
+                us = ns / 1_000,
+            );
+        }
+    }
+    // The GC-TRIGGER publish (`CRATONVM_DBG_GC_TRIGGER_VERIFY=1`). The
+    // pair, because a zero divergence count is equally consistent with
+    // "every mutation went through the guard" and with "the verifier
+    // never ran", and only the check count tells them apart.
+    {
+        let (checks, diverged) = cratonvm_vm::gc_trigger_verify_counts();
+        if checks != 0 {
+            eprintln!("[cratonvm] gc-trigger publish: checks={checks} divergences={diverged}");
+        }
+    }
+    // THE YOUNG-MARK DRAIN, always on. `workers_last` is the line that
+    // says whether a worker-count A/B reached this collector at all: the
+    // sibling question on G1 turned out to be two INERT levers and one
+    // live one, so every earlier A/B on either of the first two had
+    // compared a binary against itself.
+    {
+        let (calls, par, workers, ns) = cratonvm_vm::young_mark_drain_census();
+        if calls != 0 {
+            eprintln!(
+                "[cratonvm] young-mark drain: calls={calls} parallel={par} \
+workers_last={workers} total={ms}ms",
+                ms = ns / 1_000_000,
+            );
+        }
+    }
+    // G1's `is_object_address` (`CRATONVM_DBG_G1_OBJADDR=1`). The
+    // question is whether G1 should get the exact object-start bitmap
+    // the generational predicate got, and the answer is a share of a run
+    // rather than a per-call cost -- see the census's own doc.
+    {
+        let (calls, accepted, ns) = cratonvm_vm::g1_object_address_census();
+        if calls != 0 {
+            eprintln!(
+                "[cratonvm] g1 is_object_address: calls={calls} \
+accepted={accepted} total={ms}ms",
+                ms = ns / 1_000_000,
+            );
+        }
+    }
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
@@ -235,7 +394,7 @@ fn maybe_dump_shutdown_reports() {
         // `[compact-inline] MISS` census under CRATONVM_DBG_COMPACT_INLINE:
         // MISS names the SITES that cannot inline, this names the ACCESSES that
         // paid the helper's `is_object_address` walk. See
-        // fixed-suite-bugs/jit/every-jit-getfield-takes-the-helper-FIXED-20260820.md.
+        // every-jit-getfield-takes-the-helper-FIXED-20260820.md.
         eprintln!(
             "[cratonvm] getfield helper calls: {} (of which trusted-ref: {}) | CALL sites emitted by arm: {}",
             cratonvm_vm::jit::helpers::jit_getfield_helper_calls()
@@ -683,7 +842,7 @@ fresh-ctor={fresh_ctor} body={body}"
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`feature-designs/c2/loop-02-planner-admission-gates.md`) and is
+        // (`loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
@@ -1210,7 +1369,7 @@ struct Args {
     /// `-XX:MaxDirectMemorySize=<size>` -> direct (off-heap NIO) buffer
     /// accounting cap. Mirrors real JDK: when absent, the cap defaults to
     /// `-Xmx` instead of a fixed value. See
-    /// fixed-suite-bugs/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+    /// bug-h2-largeblob-direct-memory-oom.md.
     #[arg(
         long = "XX:MaxDirectMemorySize",
         value_name = "SIZE",
@@ -3235,8 +3394,7 @@ fn detect_jdk_feature(java_home: Option<&str>) -> Option<u32> {
 ///   poll already reports them at their real time of occurrence.
 /// * The three process sinks behind `SharedVm::jdk_only_process_violations` —
 ///   these are JIT/dispatch refusals, and they are *process*-global (retired
-///   record: feature-designs/jdk-only-wave2/
-///   additional-wave2-markers-not-in-the-original-inventory.md §2). Note that
+///   record: additional-wave2-markers-not-in-the-original-inventory.md §2). Note that
 ///   §2's own subject — the JIT compatibility latch — is no longer one of
 ///   them; what remains process-global here is the violation SINKS, not the
 ///   policy. Giving them a live sink means giving them a VM first; a per-VM sink
@@ -5726,7 +5884,7 @@ fn run() -> Result<()> {
     // Interpreter intrinsic-table stats. `CRATONVM_INTRINSIC_STATS=1` prints
     // the steady-state intrinsic-dispatch hit count on shutdown — the
     // counter that verifies acceptance criterion §9 of
-    // gaps/feature_roadmap_interpreter_intrinsic_table.md.
+    // feature_roadmap_interpreter_intrinsic_table.md.
     if matches!(
         std::env::var("CRATONVM_INTRINSIC_STATS").as_deref(),
         Ok("1")
@@ -5960,7 +6118,7 @@ fn run() -> Result<()> {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still
             // running JIT code, i.e. that cycle marked from an INCOMPLETE root
-            // set. See audits/old-sweep-liveness.md.
+            // set. See old-sweep-liveness.md.
             use std::sync::atomic::Ordering as O;
             let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
             let cycles =
@@ -6219,7 +6377,7 @@ fn run() -> Result<()> {
             // and emit no `\tat ...` lines. Promoting the synthetic capture
             // to populate the heap field (or wiring this CLI to read from
             // `throwable_stacks` directly) is roadmap item T2.2.18 — see
-            // `history/roadmap-100.md` line 471.
+            // `roadmap-100.md` line 471.
             //
             // INTENTIONAL (reviewed): omitting the `\tat ...` frames here is an
             // acceptable, honest degradation — NOT a wrong-result stub. The

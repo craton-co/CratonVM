@@ -59,7 +59,7 @@
 //!
 //! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
 //! mean": the [`parse`] module carries five *different* boolean parsers because
-//! five different ones are in use today. `audits/flag-census.md` §10 has
+//! five different ones are in use today. `flag-census.md` §10 has
 //! the full matrix. Unifying them is a behaviour change and is deliberately not
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
@@ -406,7 +406,7 @@ pub mod parse {
     /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
     /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
     /// [`affirmative_word`]. Truth table 8 (see the module docs and
-    /// `audits/flag-census.md` §10). Lifted from
+    /// `flag-census.md` §10). Lifted from
     /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
     #[inline]
     pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {
@@ -600,7 +600,7 @@ pub enum BlockedAccessMode {
 /// correlated). Then run a class-unloading lane, not just the throughput and
 /// differential lanes.
 ///
-/// See `arch-2026-07-26/moving-young-precise-roots.md`.
+/// See `moving-young-precise-roots.md`.
 pub const DEFAULT_MOVING_YOUNG: bool = true;
 
 /// Whether the JIT publishes a complete, mechanically-enumerable **relocation
@@ -788,6 +788,24 @@ pub struct GcFlags {
     /// any suspected parallel-evacuation regression, and a cycle record still
     /// names which evacuator ran.
     pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC_SCREEN` — apply the serial evacuator's header
+    /// screens on the PARALLEL arm too: the root-is-an-object-start guard, the
+    /// per-holder element clamp, and the per-candidate plausibility screen.
+    /// Default **ON** ([`parse::on_unless_zero`]); `=0` restores the
+    /// pre-2026-09-05 unscreened walks.
+    ///
+    /// The screens are not new — `scan_and_evacuate_refs`,
+    /// `scan_source_region_for_cset_refs` and the two serial drivers' root
+    /// loops have had them since 2026-08-26/2026-09-02. They simply never
+    /// crossed to the parallel arm, which is the DEFAULT one, so a corrupt or
+    /// interior candidate that the serial path refuses was followed, copied and
+    /// written through. `=0` is the same-binary A/B for that claim.
+    ///
+    /// It also stands down `SharedEvac::evacuate`'s last-ditch alignment
+    /// refusal, deliberately: an off word that left one guard armed would be a
+    /// HALF A/B — the abort it exists to reproduce would not come back, and the
+    /// arm would read as evidence that the screens were not the fix.
+    pub g1_parallel_evac_screen: bool,
     /// `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` — let the parallel evacuator run for
     /// pauses taken while a thread is inside compiled code. Default **ON**
     /// ([`parse::on_unless_zero`]); `=0` restores the serial fallback.
@@ -1032,6 +1050,70 @@ pub struct GcFlags {
     /// switch even though the ordering that makes it safe is written down and
     /// tested.
     pub g1_uncommit: bool,
+    /// `CRATONVM_GEN_UNCOMMIT` — return the EVACUATED young semi-space to the
+    /// OS at the end of each young collection, instead of only zeroing it.
+    ///
+    /// **Default-ON opt-out since 2026-09-05** ([`parse::on_unless_zero`]);
+    /// `=0` restores the zero-only behaviour exactly. It shipped opt-in the same
+    /// day and earned the default on a 90/90 HotSpot-differential regression
+    /// suite with it (and the exact object-start bitmap) enabled on this
+    /// collector, having returned 31457280 bytes of a 96 MB heap on the probe
+    /// workload.
+    ///
+    /// The generational collector was the one backend that never gave memory
+    /// back: ZGC does it by default, G1 on request ([`Self::g1_uncommit`]), and
+    /// `gen_heap.rs` contained no `decommit` call at all. Its old generation
+    /// still cannot — that is a `Vec<u8>`, committed in full at construction,
+    /// with no reservation to shrink — but the two young semi-spaces are
+    /// `HeapStore`-backed and the INACTIVE one is, by construction, entirely
+    /// dead the moment the flip completes.
+    ///
+    /// THE COST, stated when the default was flipped ON: this collector
+    /// publishes its young arenas' FULL reserved range into
+    /// `JIT_REGION_BOUNDS` and `JIT_READ_BOUNDS`, and a decommitted granule
+    /// FAULTS on touch rather than reading as zero. The window is not created
+    /// here — the young arenas already commit lazily while the published bound
+    /// covers the whole reservation — but it is WIDENED, from "granules never
+    /// yet allocated into" to "granules that held objects one collection ago".
+    /// A compiled access through a STALE reference into the evacuated
+    /// semi-space therefore moves from reading a stale value to a SIGSEGV.
+    ///
+    /// # BACK TO OPT-IN, 2026-09-06, because that cost was paid
+    ///
+    /// `-XX:+UseGenerationalGC` over the H2 JDBC corpus SIGSEGVs in **10
+    /// seconds** with this on, and completes with it off. Attribution, one
+    /// binary, five arms, `org.h2.test.jdbc.TestPreparedStatement` alone at
+    /// `--Xmx 512m`:
+    ///
+    /// | arm | rc |
+    /// |---|---|
+    /// | default (this flag ON) | 139, fault addr in a `site=unbumped-middle` span |
+    /// | `CRATONVM_GEN_UNCOMMIT=0` | 0 |
+    /// | `CRATONVM_GC_RESERVE=0` (nothing decommits) | 0 |
+    /// | `--nojit` | 0 |
+    /// | `CRATONVM_GC_OBJECT_STARTS=0` (the other flipped default) | 139 |
+    ///
+    /// `CRATONVM_DBG_STALE_FRAME_WORDS=1` names the holders:
+    /// `org/h2/command/Command.stop` and `org/h2/mvstore/tx/Transaction.commit`
+    /// keep young addresses this collection moved, in `gpr-safepoint-spill` and
+    /// `operand-spill` slots, after every slot the oop maps name has been
+    /// rewritten.
+    ///
+    /// So the fault is exactly the predicted one and the flag is behaving as
+    /// documented -- the defect it exposes is a compiled frame's, not this
+    /// flag's. **It is the DEFAULT that was wrong.** The evidence for the flip
+    /// was a regression suite that does not run this corpus, and the same
+    /// measurement that justified the flip put the benefit at "free to within
+    /// noise" -- 2552 ms against 2562 ms on the probe workload. A change with
+    /// no measurable benefit does not get to crash a supported collector on a
+    /// real workload by default. The switch stays, and it is now the sharpest
+    /// instrument in the tree for finding a stale young reference: it turns one
+    /// from a silent stale read into an immediate, attributable SIGSEGV.
+    ///
+    /// See the retired cross-collector page's finding 7 for the ON-by-default
+    /// reasoning this replaces, and the stale-compiled-frame-reference record
+    /// for the defect underneath.
+    pub gen_uncommit: bool,
     /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
     /// source walks against a per-arena CARD TABLE, instead of walking every
     /// byte of every named source region. Default **ON**
@@ -1157,7 +1239,7 @@ pub struct GcFlags {
     /// barrier inline instead of routing every compiled reference store to the
     /// `jit_putfield_object` helper. Opt-in ([`parse::present`]).
     ///
-    /// Closing defect G1-2 (`audits/g1-audit.md` §8.1, §10) made every
+    /// Closing defect G1-2 (`g1-audit.md` §8.1, §10) made every
     /// JIT-compiled reference store an out-of-line call, because the inline
     /// fast paths are gated on the `JIT_REGION_BOUNDS` table, which G1
     /// deliberately never publishes. §10 measured the cost as falling on the
@@ -1331,7 +1413,7 @@ pub struct GcFlags {
     /// actually means "the conservative scan found none", which is unknown, not
     /// none. Evacuating against it is what moved a live
     /// `StringLatin1.newString` reference out from under a compiled frame
-    /// (`bug-g1-evacuates-live-jit-reference-20260819.md`).
+    /// (`bug-g1-evacuates-live-jit-reference-20260819-FIXED.md`).
     ///
     /// **It ships OFF because a refusal reclaims nothing**, so it can only buy
     /// time for a publication that later becomes non-empty. Measured before the
@@ -1468,6 +1550,11 @@ pub struct GcFlags {
     pub dbg_sweep_edges: bool,
     /// `CRATONVM_DBG_SWEEP_ZERO`
     pub dbg_sweep_zero: bool,
+    /// `CRATONVM_GC_LATE_RESOLVE_DROPPED` -- also run the late grid-resolution
+    /// pass over the candidates `mark_young` DROPPED as free/gap space inside a
+    /// proved anchor span, not only the ones it left unresolved. Over-retention
+    /// only. Default off; see `gen_heap.rs` for the defect it was opened for.
+    pub late_resolve_dropped: bool,
     /// `CRATONVM_DBG_WATCHREF`
     pub dbg_watchref: bool,
     /// `CRATONVM_DBG_WATCH_CELL` — hex address to watch, `0` when disabled.
@@ -1504,8 +1591,7 @@ pub struct GcFlags {
     /// old/pinned) before and after every `collect_garbage()` call, and a
     /// fuller breakdown (incl. humongous) right before the "out of heap
     /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
-    /// see fixed-suite-bugs/
-    /// g1-native-alloc-no-safepoint-oom-FIXED.md.
+    /// see g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
     /// `CRATONVM_DBG_G1ACCESSOR` — at VM exit, print how many of this
     /// collector's field/array accessor calls had to take the global `regions`
@@ -1519,6 +1605,43 @@ pub struct GcFlags {
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,
     /// `CRATONVM_G1_DBG_REACH`
+    /// `CRATONVM_G1_VERIFY_HOLDERS` — re-validate a worklist holder's header
+    /// before walking its slots (ten-findings item 4).
+    ///
+    /// Default OFF. The holder is a to-space copy `evacuate_object` already
+    /// screened at both ends, and the slot loops clamp their bounds to the
+    /// holder's own region rather than trusting its header, so the check buys
+    /// no safety in the pause -- only one cold cache line per holder. It stays
+    /// as an instrument for the one defect that would otherwise be invisible:
+    /// a copy overwritten WITHIN the pause that made it.
+    /// `CRATONVM_G1_HUMONGOUS_MARKS` — mark a humongous span "referenced" as
+    /// the pause's slot loops scan into it (ten-findings item 1).
+    ///
+    /// Default **OFF**. Correct and cheap in isolation, but it reads
+    /// `regions[idx].region_type` for every scanned slot, which after item 4 is
+    /// the only region-table access left on the old->old path. Measured
+    /// engagement on 2026-09-05 was ZERO spans decided, on every workload
+    /// tried: a humongous span's holders are old objects the pause never scans,
+    /// which is exactly why the remembered-set walk exists.
+    pub g1_humongous_marks: bool,
+    /// `CRATONVM_G1_IHOP_COUNTS_REGIONS=0` — measure old-generation occupancy
+    /// for IHOP by summing live bytes instead of counting the regions the old
+    /// generation has taken.
+    ///
+    /// Default **OFF**, on measurement rather than on principle. The argument
+    /// for it is sound -- an Old region is unavailable whether it is 5% or
+    /// 100% full, and 211 regions holding 44.7 MB read as 25% of a 179 MB
+    /// threshold they can never cross -- and it does what it claims: concurrent
+    /// marking engaged in 2 of 6 H2 runs against 0 of 6 for the byte count.
+    ///
+    /// But engaging is not helping. `to_space_exhausted` over the same 12 runs
+    /// was 28/40/37/45/30/98 with it on against 4/21/55/22/25/16 with it off --
+    /// no better, plausibly worse, on the only outcome that matters here. A
+    /// mark cycle that starts is still not a mixed collection that reclaims,
+    /// and until the rest of that chain is understood this changes when G1
+    /// spends effort without changing what it gets back.
+    pub g1_ihop_counts_regions: bool,
+    pub g1_verify_holders: bool,
     pub g1_dbg_reach: bool,
     /// `CRATONVM_G1_DBG_ROOTCENSUS`
     pub g1_dbg_rootcensus: bool,
@@ -1573,6 +1696,7 @@ impl GcFlags {
             gc_jit_ref_store_gates: on_unless_zero(src, "CRATONVM_GC_JIT_REF_STORE_GATES"),
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_parallel_evac_screen: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_SCREEN"),
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
@@ -1583,6 +1707,7 @@ impl GcFlags {
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
+            gen_uncommit: non_empty_non_zero(src, "CRATONVM_GEN_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
             g1_card_screen_jit_pinned: on_unless_zero(
@@ -1651,6 +1776,7 @@ impl GcFlags {
             dbg_sweep_census: present(src, "CRATONVM_DBG_SWEEP_CENSUS"),
             dbg_sweep_edges: present(src, "CRATONVM_DBG_SWEEP_EDGES"),
             dbg_sweep_zero: present(src, "CRATONVM_DBG_SWEEP_ZERO"),
+            late_resolve_dropped: present(src, "CRATONVM_GC_LATE_RESOLVE_DROPPED"),
             dbg_watchref: present(src, "CRATONVM_DBG_WATCHREF"),
             dbg_watch_cell: hex_addr_or_zero(src, "CRATONVM_DBG_WATCH_CELL"),
             dbg_youngstate: present(src, "CRATONVM_DBG_YOUNGSTATE"),
@@ -1663,6 +1789,9 @@ impl GcFlags {
             g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
             g1_dbg_accessor: present(src, "CRATONVM_DBG_G1ACCESSOR"),
             g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
+            g1_humongous_marks: present(src, "CRATONVM_G1_HUMONGOUS_MARKS"),
+            g1_ihop_counts_regions: present(src, "CRATONVM_G1_IHOP_COUNTS_REGIONS"),
+            g1_verify_holders: present(src, "CRATONVM_G1_VERIFY_HOLDERS"),
             g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
             g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
             g1_dbg_zero: present(src, "CRATONVM_G1_DBG_ZERO"),
@@ -1721,6 +1850,14 @@ pub struct LoaderFlags {
     /// **Default ON**; `0` / `false` / `no` turn it off.
     /// [`parse::on_unless_off_word`].
     pub boot_module_registry: bool,
+    /// `CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE` — a class from a modular jar
+    /// reached through the CLASS path belongs to the unnamed module, as on
+    /// HotSpot, rather than to the module its `module-info.class` declares.
+    /// **Default ON**; `0` / `false` restore the pre-2026-09-05 behaviour in
+    /// which `--add-opens …=ALL-UNNAMED` could not reach such a class. See
+    /// `ModuleRegistry::named_module_for_package`.
+    /// [`parse::on_unless_zero_or_false`].
+    pub classpath_jar_unnamed_module: bool,
     /// `CRATONVM_ALLOW_JSR_RET` — accept `jsr`/`ret` in the verifier.
     /// [`parse::non_empty_non_zero`].
     pub allow_jsr_ret: bool,
@@ -1800,6 +1937,10 @@ impl LoaderFlags {
                 "CRATONVM_LOADER_AWARE_RESOLUTION",
             ),
             boot_module_registry: on_unless_off_word(src, "CRATONVM_BOOT_MODULE_REGISTRY"),
+            classpath_jar_unnamed_module: on_unless_zero_or_false(
+                src,
+                "CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE",
+            ),
             allow_jsr_ret: non_empty_non_zero(src, "CRATONVM_ALLOW_JSR_RET"),
             harden_manifest_classpath: non_empty_non_zero(
                 src,

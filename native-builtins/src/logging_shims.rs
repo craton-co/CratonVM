@@ -450,7 +450,7 @@ pub(crate) fn jul_logger_config_is_real(ctx: &mut dyn NativeContext, obj: Object
 /// `NoSuchMethodError: java/lang/String.size()I` (surfaced from
 /// `org.apache.juli.ClassLoaderLogManager.resetLoggers`, which calls
 /// `logger.getHandlers()` during webapp/classloader shutdown -- see
-/// fixed-suite-bugs/tomcat/largeclienthello-string-size-nosuchmethod-FIXED.md).
+/// largeclienthello-string-size-nosuchmethod-FIXED.md).
 /// Keying by identity hash and holding the list as a global GC root
 /// sidesteps field layout entirely -- correct for both real and synthetic
 /// loggers, and immune to future real-JDK field-order changes.
@@ -752,7 +752,7 @@ pub(crate) fn jul_logger_filter_set(
 /// `encoding`, then `StreamHandler`'s and `FileHandler`'s own real fields).
 /// A prior fix attempt wrote the resolved filename to raw slot 0 (aliasing
 /// `Handler.manager`) and a closed flag to slot 2 -- see
-/// fixed-suite-bugs/springboot/filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md
+/// filehandler-noarg-ctor-handler-field-layout-gap-FIXED.md
 /// for the full diagnosis. Keying by identity hash sidesteps field layout
 /// entirely, exactly like the `Logger` handler-list/filter tables above,
 /// and leaves `Handler`'s real `logLevel`/`filter`/`formatter` fields (which
@@ -2816,7 +2816,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // prefers `ctx.new_object_initialized` when the real class is
     // loadable) — an overlay/real-class-layout mismatch in the same family
     // as the already-fixed `loggerContextListenerList` corruption (see
-    // fixed-suite-bugs/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md).
+    // logback-loggercontext-listenerlist-final-field-corruption-FIXED.md).
     // Every `ch/qos/logback/classic/Logger` instance method below
     // (`addAppender`, `info`/`warn`/`error`/etc., `filterAndLog_*`) was
     // ALSO natively stubbed to a no-op, so even a caller holding a real

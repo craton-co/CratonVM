@@ -2822,7 +2822,7 @@ pub(super) fn op_checkcast(
                 // reclaimed object usually surfaces as a failed CAST
                 // first, and that path reported nothing — so setting
                 // the flag and reproducing still produced silence. See
-                // audits/old-sweep-liveness.md section 7.
+                // old-sweep-liveness.md section 7.
                 // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
                 // below is too narrow. A block freed while still
                 // referenced only reads back as `java.lang.Object`
@@ -3647,8 +3647,7 @@ pub(super) fn op_putfield(
     // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
     // real putfield to any Page/RootReference field, unconditional
     // (not tied to a construction-site guess or a GC-move-fragile
-    // address watch list). See fixed-suite-bugs/h2-suite-bugs/
-    // bug-h2-suite-residual-fail-triage-FIXED.md.
+    // address watch list). See bug-h2-suite-residual-fail-triage-FIXED.md.
     if crate::runtime::env_cache::dbg_field_watch() {
         diag_putfield_watch(shared, thread, frame_idx, current_class_id, *index, obj_ref, &field, value, old_value)?;
     }

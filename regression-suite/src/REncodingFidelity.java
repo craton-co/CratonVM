@@ -22,7 +22,7 @@
 // `probes/EncodingFidelity.java` prints it, so it stays observable.
 //
 //   docs/known-issues/jdk-only/
-//     bug-printstream-charset-answers-the-abstract-base-20260825.md §5, §6.1
+//     bug-printstream-charset-answers-the-abstract-base-20260825-FIXED-20260901.md §5, §6.1
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.Charset;

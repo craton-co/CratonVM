@@ -21,7 +21,7 @@
 //! It discarded the reason-9 frame the compiled body had just published, and
 //! RBC.6's `getfield`/`putfield` admission let a NullPointerException escape a
 //! handler that catches it — every compiled `try`-wrapped field access in the
-//! tree. See `fixed-bugs/rbc6-getfield-putfield-npe-escape-FIXED-20260818.md`.
+//! tree. See `rbc6-getfield-putfield-npe-escape-FIXED-20260818.md`.
 //!
 //! The fix removed that clear and now *relies* on the wiring. This test is what
 //! makes that reliance checkable: unwire either half and the frame the handler
