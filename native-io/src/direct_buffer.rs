@@ -1948,7 +1948,7 @@ impl WideKind {
     /// Turn the argument `Value` into the bits to store, or `None` when the
     /// operand is not the shape the descriptor declares — which bails to the
     /// class-file body rather than storing a guess.
-    fn from_value(self, v: Value) -> Option<i64> {
+    fn to_bits(self, v: Value) -> Option<i64> {
         Some(match (self, v) {
             (WideKind::Short | WideKind::Char, Value::Int(x)) => i64::from(x as u16),
             (WideKind::Int, Value::Int(x)) => i64::from(x as u32),
@@ -2000,7 +2000,7 @@ fn dbb_wide_put(
     let (Some(Value::Int(index)), Some(raw)) = (args.get(1).copied(), args.get(2).copied()) else {
         return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
     };
-    let Some(bits) = kind.from_value(raw) else {
+    let Some(bits) = kind.to_bits(raw) else {
         return ctx.invoke_virtual_bytecode_only(this, name, descriptor, &args[1..]);
     };
     // Cast: `width()` is 2, 4 or 8.

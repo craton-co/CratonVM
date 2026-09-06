@@ -1125,59 +1125,88 @@ pub struct GcFlags {
     /// A compiled access through a STALE reference into the evacuated
     /// semi-space therefore moves from reading a stale value to a SIGSEGV.
     ///
-    /// # BACK TO OPT-IN, 2026-09-06, because that cost was paid
+    /// # OFF, then ON again — the whole arc, because the middle of it is a
+    /// record of the fault this flag exists to make visible
     ///
-    /// `-XX:+UseGenerationalGC` over the H2 JDBC corpus SIGSEGVs in **10
-    /// seconds** with this on, and completes with it off. Attribution, one
-    /// binary, five arms, `org.h2.test.jdbc.TestPreparedStatement` alone at
-    /// `--Xmx 512m`:
+    /// **2026-09-05, flipped ON** on a 90/0 HotSpot-differential regression
+    /// suite plus a sequential-ABBA timing that measured no cost.
+    ///
+    /// **2026-09-06 morning, reverted to opt-in.** `-XX:+UseGenerationalGC`
+    /// over the H2 JDBC corpus SIGSEGV'd in **ten seconds** with it on and
+    /// completed with it off. One binary, five arms,
+    /// `org.h2.test.jdbc.TestPreparedStatement` alone at `--Xmx 512m`:
     ///
     /// | arm | rc |
     /// |---|---|
-    /// | default (this flag ON) | 139, fault addr in a `site=unbumped-middle` span |
+    /// | this flag ON | 139, fault addr in a `site=unbumped-middle` span |
     /// | `CRATONVM_GEN_UNCOMMIT=0` | 0 |
     /// | `CRATONVM_GC_RESERVE=0` (nothing decommits) | 0 |
     /// | `--nojit` | 0 |
-    /// | `CRATONVM_GC_OBJECT_STARTS=0` (the other flipped default) | 139 |
     ///
-    /// `CRATONVM_DBG_STALE_FRAME_WORDS=1` names the holders:
-    /// `org/h2/command/Command.stop` and `org/h2/mvstore/tx/Transaction.commit`
-    /// keep young addresses this collection moved, in `gpr-safepoint-spill` and
-    /// `operand-spill` slots, after every slot the oop maps name has been
-    /// rewritten.
+    /// The third and fourth rows are the ones that name the defect rather than
+    /// the switch: with the reservation kept mapped, the same stale reference
+    /// reads stale bytes instead of faulting, and with no JIT there is no
+    /// stale reference at all. The flag was behaving exactly as documented.
     ///
-    /// So the fault is exactly the predicted one and the flag is behaving as
-    /// documented -- the defect it exposes is a compiled frame's, not this
-    /// flag's. **It is the DEFAULT that was wrong.** The evidence for the flip
-    /// was a regression suite that does not run this corpus, and the same
-    /// measurement that justified the flip put the benefit at "free to within
-    /// noise" -- 2552 ms against 2562 ms on the probe workload. A change with
-    /// no measurable benefit does not get to crash a supported collector on a
-    /// real workload by default. The switch stays, and it is now the sharpest
-    /// instrument in the tree for finding a stale young reference: it turns one
-    /// from a silent stale read into an immediate, attributable SIGSEGV.
+    /// **2026-09-06 afternoon, the defect was found and fixed** — the
+    /// cross-thread coverage handshake was discharging a peer thread's
+    /// compiled frames by PINNING their conservative roots, on a collector
+    /// that cannot honour a pin (Cheney reclaims from-space wholesale, so
+    /// `gen_heap.rs` has no reader of `pinned_jit_roots_snapshot()` and could
+    /// not acquire one). See [`VmHeap::honours_conservative_pins`].
     ///
-    /// # The crash is fixed; the default stays off anyway
+    /// **2026-09-06, back ON by default**, which is where it is now.
     ///
-    /// 2026-09-06: the stale compiled-frame reference this exposed was found
-    /// and fixed — a peer thread's coverage obligation was being discharged by
-    /// PINNING its conservative roots on a collector that cannot honour a pin.
-    /// The ten-second H2 reproduction is gone (0/5, against 5/5 with the old
-    /// accounting restored on the same binary).
+    /// # Why ON, given the same measurement that argued against it
     ///
-    /// So the *first* of the two grounds for the revert is discharged. The
-    /// second is not, and it is the one that decides: concurrent paired arms
-    /// put this switch at 0.942 / 1.015 / 1.042 / 1.070 — free, and buying
-    /// nothing measurable — while it still WIDENS the window in which any
-    /// stale young reference becomes a SIGSEGV rather than a stale read. A
-    /// change with no measured benefit does not earn a default on that trade,
-    /// and the switch is worth more where it is: it is the sharpest instrument
-    /// in the tree for finding the next one of these, which is exactly what it
-    /// just did.
+    /// Concurrent paired arms put this switch at 0.942 / 1.015 / 1.042 / 1.070
+    /// — free to within noise. That was read once as "buys nothing"; it is the
+    /// wrong reading, and the flip corrects it. **Returning the memory IS the
+    /// benefit.** Being wall-clock-neutral while doing it is the property that
+    /// makes the give-back shippable, not an argument against shipping it.
     ///
-    /// See the retired cross-collector page's finding 7 for the ON-by-default
-    /// reasoning this replaces, and the retired stale-compiled-frame-reference
-    /// record for the defect underneath and how it was closed.
+    /// The number that was missing is what it hands back on a REAL workload
+    /// rather than a probe. Measured 2026-09-06 with the default on, from the
+    /// shutdown census (`[cratonvm] generational young uncommit: N bytes`):
+    ///
+    /// | workload | returned |
+    /// |---|---|
+    /// | `DodH2JdbcSuite`, one class, `--Xmx 512m` | **220 MB** |
+    /// | `DodH2JdbcSuite`, full, `--Xmx 1g` | **369 MB** |
+    /// | Spring Boot + Tomcat over TLS, `--Xmx 1g` | **136 MB** |
+    ///
+    /// against the 30 MiB of a 96 MB heap the probe had reported. A JVM that
+    /// peaks and then idles held its peak for the life of the process before
+    /// this, and the generational collector was the only backend of which that
+    /// was true — ZGC gives memory back by default and G1 on request.
+    ///
+    /// # What is still true, and is the first thing to reach for
+    ///
+    /// The cost stated at the original flip has not changed: this collector
+    /// publishes its young arenas' FULL reserved range into
+    /// `JIT_REGION_BOUNDS` and `JIT_READ_BOUNDS`, and a decommitted granule
+    /// FAULTS on touch rather than reading as zero. The window is not created
+    /// here — the young arenas already commit lazily while the published bound
+    /// covers the whole reservation — but it is WIDENED, from "granules never
+    /// yet allocated into" to "granules that held objects one collection ago".
+    ///
+    /// So any stale young reference that still exists anywhere becomes a
+    /// SIGSEGV rather than a silent stale read. **`CRATONVM_GEN_UNCOMMIT=0` is
+    /// the first thing to set if a compiled frame ever faults on a young
+    /// address**, and the crash handler prints the released span, the site and
+    /// the code buffer to make that attribution immediate.
+    ///
+    /// That loudness is a feature and it has already earned its keep once: it
+    /// is what turned a silent compiled-frame use-after-free — invisible to a
+    /// 90/0 regression suite — into a ten-second reproducer with a five-arm
+    /// attribution. Note also that withdrawing `JIT_READ_BOUNDS`, the fix
+    /// finding 7 applied to ZGC for the identical shape, does NOT close this
+    /// window: `emit_trusted_oop_receiver_check_at` dereferences the receiver
+    /// consulting no bounds table at all.
+    ///
+    /// See the retired cross-collector page's finding 7 for where the give-back
+    /// was built, and the retired stale-compiled-frame-reference record for the
+    /// defect this exposed and how it was closed.
     pub gen_uncommit: bool,
     /// `CRATONVM_G1_CARD_RSET` — F-05: screen G1's Phase-2 remembered-set
     /// source walks against a per-arena CARD TABLE, instead of walking every
@@ -1781,13 +1810,10 @@ impl GcFlags {
             g1_adaptive_tenuring: on_unless_zero(src, "CRATONVM_G1_ADAPTIVE_TENURING"),
             g1_reserve_heap: on_unless_zero(src, "CRATONVM_G1_RESERVE_HEAP"),
             g1_uncommit: present(src, "CRATONVM_G1_UNCOMMIT"),
-            gen_uncommit: non_empty_non_zero(src, "CRATONVM_GEN_UNCOMMIT"),
+            gen_uncommit: on_unless_zero(src, "CRATONVM_GEN_UNCOMMIT"),
             g1_card_rset: on_unless_zero(src, "CRATONVM_G1_CARD_RSET"),
             g1_card_clean: present(src, "CRATONVM_G1_CARD_CLEAN"),
-            g1_card_screen_jit_pinned: on_unless_zero(
-                src,
-                "CRATONVM_G1_CARD_SCREEN_JIT_PINNED",
-            ),
+            g1_card_screen_jit_pinned: on_unless_zero(src, "CRATONVM_G1_CARD_SCREEN_JIT_PINNED"),
             g1_inline_barrier: on_unless_zero(src, "CRATONVM_G1_INLINE_BARRIER"),
             g1_mark_lock_yield: on_unless_zero(src, "CRATONVM_G1_MARK_LOCK_YIELD"),
             g1_shared_alloc: on_unless_zero(src, "CRATONVM_G1_SHARED_ALLOC"),

@@ -804,11 +804,28 @@ pub(super) fn stw_take_over_and_wait(
     // collection is the repair that keeps BUG-03's protection for a genuinely
     // un-retired tail.
     // `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` restores the pre-fix guard
-    // for a one-binary A/B. With it set, `io.netty.util.internal
-    // .ObjectCleanerTest` returns to 6/8 non-clean under Generational and 8/8
-    // under G1, and the `cratonvm::gc::guard` "a ROOT points into a published
-    // TLAB skip span" error fires -- which is also what proves that guard is
-    // not vacuous.
+    // for a one-binary A/B.
+    //
+    // **This lever ALONE no longer reproduces anything, and has not since
+    // `24238e856`.** Re-measured 2026-09-06 on `ObjectCleanerTest`, 8 reps per
+    // arm, one binary:
+    //
+    //   lever alone                      gen 0/8   g1 0/8   guard_fired 0/8
+    //   CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE=1 alone
+    //                                    gen 0/8   g1 0/8
+    //   BOTH levers together             gen 3/8   g1 0/8
+    //
+    // The reclamation needs a PRODUCER of a stale span and a publish path that
+    // will not overwrite it, and the two fixes each closed one half: the
+    // unconditional publish here, and the ninth exit (`stw_publish_frame_traces`
+    // never retiring what it published) in `24238e856`. Either fix alone is
+    // sufficient, so either lever alone reads zero. Set BOTH to exercise this
+    // code, or the arm is vacuous and the guard will look dead when it is not.
+    //
+    // The earlier text here promised "6/8 non-clean under Generational and 8/8
+    // under G1" for the lever on its own. That was true when written and is
+    // not true now; the G1 half was never reproduced on this probe by anyone
+    // (see `24238e856`'s own table, which says so about its probe too).
     if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH").is_some()
     {
         if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
@@ -5155,6 +5172,45 @@ pub(super) fn scan_frame_roots(
     }
 }
 
+
+/// `CRATONVM_GC_G1_ONLY_JIT_PINS=1` -- restore the pre-2026-09-06 gate on the
+/// two deposit-side publications of a parked thread's CONSERVATIVE JIT-frame
+/// roots into `gc_quiescence`'s process-global pin registry.
+///
+/// Those two sites were written when G1 was the only backend that moved, and
+/// their own comments said so: *"they can only over-retain (the young sweep
+/// runs non-moving while any thread is in JIT, so nothing is relocated)"*.
+/// That premise expired twice and neither expiry reached the gate:
+///
+///  * ZGC compaction shipped 2026-08-13, and ZGC withholds the PAGE of every
+///    address in `pinned_jit_roots_snapshot()` from its relocation set
+///    (`zgc.rs`, "CONSERVATIVE JIT ROOTS PIN THEIR PAGE TOO"). With the
+///    publication gated on G1, that consumer only ever saw the INITIATOR's
+///    pins -- every parked peer's compiled frames were unprotected.
+///  * The cross-thread JIT coverage handshake (2026-08-23) let the
+///    generational moving-young cycle run while peers are in JIT, so its
+///    Cheney copy started relocating exactly the objects the comment promised
+///    it would not.
+///
+/// Measured on the `qdox-parser-static-array-race` reproducer (4 threads x
+/// 400 fresh-builder QDox parses, Azure 20.80.105.49):
+/// ZGC lost 1-11 parses per run to `ArrayIndexOutOfBoundsException: Index N
+/// out of bounds for length 0` -- ZGC's own documented signature for a
+/// conservative root left pointing at a vacated, zeroed span -- and
+/// Generational SIGSEGV'd 3/3 inside compiled `java/lang/StringUTF16.compress`
+/// on an array whose base had been evacuated. G1, the one backend the gate
+/// admitted, was clean 3/3.
+///
+/// Publishing unconditionally costs one `Vec<usize>` collect and one map
+/// insert per deposit, on a path that has just finished a conservative stack
+/// scan. Nothing consumes the registry on a backend that does not relocate.
+pub(crate) fn g1_only_jit_pins() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_G1_ONLY_JIT_PINS").is_some()
+    })
+}
+
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     remap_trace_push(shared, thread, "publish", "");
     // CRATONVM_DBG_CORRUPT_CELL backstop. Every instrumented door above names
@@ -5626,14 +5682,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // consumed by `G1Collector::jit_pinned_region_set`. Replace
         // semantics: a deposit with no live JIT frames clears this thread's
         // stale pins.
-        if shared.mem.heap.is_g1() {
+        // 2026-09-06: NOT `is_g1()` any more. See `g1_only_jit_pins` for the
+        // two collectors this gate had silently stopped covering and for the
+        // measurement.
+        if !g1_only_jit_pins() || shared.mem.heap.is_g1() {
             let addrs: Vec<usize> = snapshot[jit_scan_start..]
                 .iter()
                 .map(|r| r.as_ptr() as usize)
                 .collect();
             cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
         }
-    } else if shared.mem.heap.is_g1() {
+    } else if !g1_only_jit_pins() || shared.mem.heap.is_g1() {
         // Precise-relocation mode covers every JIT oop with rewritable
         // shadow-stack slots — no conservative pins needed; drop stale ones.
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);

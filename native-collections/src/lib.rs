@@ -21385,15 +21385,15 @@ const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 enum CarrierFamily {
     /// `java/util/HashMap` and `java/util/LinkedHashMap` — one cluster, because
     /// `LinkedHashMap` extends `HashMap` and shares its `table`.
-    HashMapCluster,
+    HashMap,
     /// `java/util/Hashtable`. `Properties` rides with it in the registry even
     /// though its storage differs, because `is_hashtable_receiver` accepts both.
-    HashtableCluster,
+    Hashtable,
     /// `java/util/TreeMap` — the one whose `H4-1` §2 example is sharpest,
     /// because a `TreeMap$Values` carrier is minted by `register_tree_map_natives`.
-    TreeMapCluster,
+    TreeMap,
     /// `java/util/concurrent/ConcurrentHashMap`.
-    ChmCluster,
+    Chm,
 }
 
 /// The `NativeKind` a carrier of `family` must be registered under: the kind
@@ -21403,7 +21403,7 @@ enum CarrierFamily {
 /// refactor inert. When a cluster moves, change its arm here and its carriers
 /// follow — the one edit, in the one place, that `H4-1` §2 asks for.
 ///
-/// **Before moving [`CarrierFamily::HashMapCluster`], read
+/// **Before moving [`CarrierFamily::HashMap`], read
 /// [`register_set_view_carrier_natives`]'s cluster note.** The
 /// [`MAP_KEY_ITR_CARRIERS`] rows cannot be refused while a `Hashtable$KeySet`
 /// still mints a `HashMap$KeyIterator`; that edge is closed separately by
@@ -21411,28 +21411,28 @@ enum CarrierFamily {
 /// have to move together.
 fn carrier_family_kind(family: CarrierFamily) -> cratonvm_native_api::NativeKind {
     match family {
-        CarrierFamily::HashMapCluster => cratonvm_native_api::NativeKind::Bridge,
-        CarrierFamily::HashtableCluster => cratonvm_native_api::NativeKind::Bridge,
-        CarrierFamily::TreeMapCluster => cratonvm_native_api::NativeKind::Bridge,
-        CarrierFamily::ChmCluster => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::HashMap => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::Hashtable => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::TreeMap => cratonvm_native_api::NativeKind::Bridge,
+        CarrierFamily::Chm => cratonvm_native_api::NativeKind::Bridge,
     }
 }
 
 /// The owning cluster of a [`MAP_VIEW_CARRIERS`] / [`SET_VIEW_CARRIERS`] name.
 ///
 /// Exhaustive over both lists by construction: an unlisted name answers
-/// `HashMapCluster`, which is the conservative default only because every
+/// `HashMap`, which is the conservative default only because every
 /// carrier that reaches here IS in one of the two lists — the registrars are
 /// the only callers and they iterate those lists.
 fn carrier_family_of(name: &str) -> CarrierFamily {
     match name {
         "java/util/Hashtable$ValueCollection"
         | "java/util/Hashtable$KeySet"
-        | "java/util/Hashtable$EntrySet" => CarrierFamily::HashtableCluster,
-        "java/util/TreeMap$Values" | "java/util/TreeMap$EntrySet" => CarrierFamily::TreeMapCluster,
+        | "java/util/Hashtable$EntrySet" => CarrierFamily::Hashtable,
+        "java/util/TreeMap$Values" | "java/util/TreeMap$EntrySet" => CarrierFamily::TreeMap,
         "java/util/concurrent/ConcurrentHashMap$ValuesView"
-        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => CarrierFamily::ChmCluster,
-        _ => CarrierFamily::HashMapCluster,
+        | "java/util/concurrent/ConcurrentHashMap$EntrySetView" => CarrierFamily::Chm,
+        _ => CarrierFamily::HashMap,
     }
 }
 
@@ -59969,6 +59969,15 @@ fn chm_reject_bad_ctor_args(
     concurrency: Option<&Value>,
 ) -> Result<(), MethodCallFailed> {
     let bad_cap = matches!(capacity, Some(Value::Int(c)) if *c < 0);
+    // `clippy::neg_cmp_op_on_partial_ord` wants `partial_cmp` here, and the
+    // negated comparison is the whole point -- see the third bullet of this
+    // function's doc. `!(f > 0.0)` is false for NaN, so NaN is REJECTED; the
+    // shapes the lint would steer this to (`f <= 0.0`, or a `partial_cmp`
+    // match that treats `None` as "not less") let NaN through, the threshold
+    // becomes NaN and the table never resizes. It is also the JDK's own source
+    // line, quoted verbatim above, which is what makes this checkable against
+    // `javap` rather than against memory.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     let bad_lf = matches!(load_factor, Some(Value::Float(f)) if !(*f > 0.0));
     let bad_cl = matches!(concurrency, Some(Value::Int(c)) if *c <= 0);
     if bad_cap || bad_lf || bad_cl {
@@ -77591,8 +77600,9 @@ mod tests {
                 "the supplementary key sorts FIRST, as HotSpot orders it"
             );
             assert!(
-                "\u{10000}".to_string() > "\u{FFFF}".to_string(),
-                "...and a Rust String would have sorted it LAST"
+                "\u{10000}" > "\u{FFFF}",
+                "...and Rust's own string ordering, which is byte-lexicographic \
+                 over UTF-8, would have sorted it LAST"
             );
         }
 
