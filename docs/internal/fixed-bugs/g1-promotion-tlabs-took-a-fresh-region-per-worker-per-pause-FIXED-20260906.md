@@ -168,6 +168,28 @@ the eighth test — a field read that returned null on a live object, i.e. the
 corrupt-cell family the WarXml page is about. That defect is still open and is
 not this one.
 
+### Re-measured on the merged dev tip
+
+The tables above were produced on this branch's own binary. `dev` moved 475
+lines of `g1.rs` under it in the same day — including the evacuator's
+forwarding-tag retirement — so the same A/B was repeated on the merge result
+(`e5202bef6`), one binary, arms interleaved, `-Xmx2g`:
+
+| arm | pauses | **peak Old** | min free | modal Old growth | `resumed_dest_regions` | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| off | 51 | 649 | 1351 | **+23** | — | PASS |
+| off | 58 | **953** | 1032 | **+23** | — | PASS |
+| on | 81 | **46** | 1955 | **+1** | 1296 | PASS |
+| on | 45 | **42** | 1950 | **+1** | 610 | PASS |
+
+**At `-Xmx1g` the class is NOT fixed, and neither arm is healthy on that tip.**
+One run each: `off` OOMed with Old at 1021 of 1024; `on` kept Old to 43 and
+still FAILed 6 of 8 cases with `Error starting child` and a cascade of
+`FileAlreadyExistsException: external.war` from the first case that failed to
+tear down — a functional failure at `free_regions=0`, not an old-generation
+one. What this fix removes is the old generation eating the heap; the rest of
+what that class does under pressure is the WarXml page's business.
+
 ## What made it invisible
 
 **The per-pause region census was filled by `young_collection_serial` alone.**
