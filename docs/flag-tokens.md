@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-526 tokens.
+527 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -461,6 +461,7 @@ export inherited from a parent shell.
 | `refersto` | `CRATONVM_DBG_REFERSTO` |
 | `reflection-factory` | `CRATONVM_DBG_REFLECTION_FACTORY` |
 | `refproc` | `CRATONVM_DBG_NO_REFPROC` |
+| `refproc-audit` | `CRATONVM_DBG_REFPROC_AUDIT` |
 | `refproc-remark` | `CRATONVM_DBG_REFPROC_REMARK` |
 | `remap-trace` | `CRATONVM_DBG_REMAP_TRACE` |
 | `replovr` | `CRATONVM_DBG_REPLOVR` |
@@ -592,7 +593,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-371 tokens.
+373 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -703,6 +704,7 @@ export inherited from a parent shell.
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-phi-edge-interfere` | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
 | `ir-osr-entry` | `CRATONVM_JIT_IR_OSR_ENTRY` |
@@ -954,6 +956,7 @@ export inherited from a parent shell.
 | `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
 | `merge-marks-exact` | `CRATONVM_JIT_MERGE_MARKS_EXACT` |
 | `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
+| `loader-blind-cp-resolve` | `CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE` |
 | `local-mask-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` |
 | `wide-local-oop-maps` | `CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS` |
 | `arm64-safepoints` | `CRATONVM_JIT_ARM64_SAFEPOINTS` |
@@ -970,7 +973,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-157 tokens.
+161 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -978,6 +981,8 @@ export inherited from a parent shell.
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
 | `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
+| `g1-only-jit-pins` | `CRATONVM_GC_G1_ONLY_JIT_PINS` |
+| `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
@@ -1020,6 +1025,8 @@ export inherited from a parent shell.
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
 | `g1-parallel-evac-screen` | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` |
+| `g1-evac-copy-watch` | `CRATONVM_G1_EVAC_COPY_WATCH` |
+| `g1-parallel-evac-shared-dest` | `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` |
 | `g1-evac-ref-implausible-refuse` | `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
 | `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |

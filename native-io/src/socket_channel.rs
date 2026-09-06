@@ -763,7 +763,32 @@ pub(crate) fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> 
     // reference stored in these slots along with every other, so a lock seeded
     // first survives the move. A lock seeded after would be written to a stale
     // address instead — which is the exact failure the paragraph above records.
-    for f in ["closeLock", "keyLock", "regLock"] {
+    //
+    // `stateLock` is the FOURTH member of the family and was missing until
+    // 2026-09-05. Unlike the other three it is declared on the CONCRETE
+    // `sun.nio.ch.SocketChannelImpl` / `ServerSocketChannelImpl` (`private
+    // final Object stateLock = new Object()`), which is the class
+    // `alloc_channel_as_impl` has minted since 2026-08-21 — so the slot really
+    // exists on every channel this file builds and really reads null. Every
+    // `SocketChannelImpl` method that reports state locks it, and the one
+    // Tomcat reaches on a path we do NOT override is `toString()`:
+    // `NioChannel.toString` → `SocketChannelImpl.toString` →
+    // `monitorenter null` → `NullPointerException: Cannot enter synchronized
+    // block because "this.stateLock" is null`. That NPE is thrown from inside
+    // Tomcat's own error/teardown path (`SocketWrapperBase.toString` in
+    // `AbstractProcessorLight.process`, `NioSocketWrapper.doClose`, and
+    // `StringManager.getString` formatting a socket into a log message), so it
+    // propagates out and kills the connection in flight — 12 failures across
+    // `TestFlowControl`, `TestHttp2Section_5_1`, `TestHttp2Section_6_1` and
+    // `TestAsyncContextImpl` in the 2026-09-05 ZGC suite run. `sc_to_string`
+    // below now answers `toString()` natively so the bytecode does not run at
+    // all; this seed is the belt to that braces, covering every OTHER
+    // `synchronized (stateLock)` site (`close`, `connect`,
+    // `implConfigureBlocking`, …) that a future path could reach.
+    //
+    // `set_field_by_name` is a no-op when the slot is absent, so naming a
+    // field only some channel classes declare costs nothing on the others.
+    for f in ["closeLock", "keyLock", "regLock", "stateLock"] {
         if !matches!(ctx.get_field_by_name(ch, f), Value::Object(Some(_))) {
             ctx.set_field_by_name(ch, f, Value::Object(Some(ch)));
         }
@@ -1973,6 +1998,183 @@ fn sc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }))),
         _ => Ok(Some(Value::Int(1))),
     }
+}
+
+/// The channel's local endpoint, rendered the way `InetSocketAddress.toString()`
+/// renders one, or `None` when the channel has no local end yet.
+///
+/// Built as a Rust string straight off the registry rather than by calling
+/// `sc_local_address` and then `toString()` on the result: the toString natives
+/// below run on Tomcat's error and teardown paths, where allocating a Java
+/// `InetSocketAddress` (and running its bytecode) to format a log message is
+/// both avoidable work and an avoidable GC point.
+fn channel_local_addr_text(ctx: &dyn NativeContext, this: ObjectRef) -> Option<String> {
+    if is_unix_family(ctx, this) {
+        return cf_get_str(ctx, this, F_UDS_PATH).filter(|p| !p.is_empty());
+    }
+    let id = read_reg_id(ctx, this)?;
+    let map = tcp_registry().read();
+    let addr = match map.get(&id) {
+        Some(TcpHandle::Stream(s)) => s.local_addr().ok(),
+        Some(TcpHandle::Bound(s)) => s.local_addr().ok(),
+        Some(TcpHandle::Connecting(s)) | Some(TcpHandle::ConnectFailed(s, _)) => {
+            s.local_addr().ok()
+        }
+        Some(TcpHandle::Listener(l)) => l.local_addr().ok(),
+        _ => None,
+    }?;
+    Some(format!("/{}:{}", addr.ip(), addr.port()))
+}
+
+/// The channel's peer endpoint in the same rendering, or `None`.
+fn channel_remote_addr_text(ctx: &dyn NativeContext, this: ObjectRef) -> Option<String> {
+    if is_unix_family(ctx, this) {
+        return cf_get_str(ctx, this, F_UDS_PATH).filter(|p| !p.is_empty());
+    }
+    let (host, port) = cf_remote(ctx, this)?;
+    if port <= 0 || host.is_empty() {
+        return None;
+    }
+    Some(format!("/{host}:{port}"))
+}
+
+/// `sun.nio.ch.SocketChannelImpl.toString()`.
+///
+/// **The defect this closes.** The real bytecode is
+/// `synchronized (stateLock) { switch (state) ... }`, and `stateLock` is a
+/// `private final Object` that only `SocketChannelImpl`'s own constructor
+/// assigns. CratonVM builds its channels without running that constructor, so
+/// the slot read null and the `monitorenter` threw
+/// `NullPointerException: Cannot enter synchronized block because
+/// "this.stateLock" is null` -- from `SocketChannelImpl.toString` line 1583.
+///
+/// That is not a cosmetic logging fault. Every call site Tomcat reaches it
+/// through is an ERROR or TEARDOWN path that does not expect `toString()` to
+/// throw, so the NPE propagates out and aborts the connection:
+/// `AbstractProcessorLight.process` (via `SocketWrapperBase.toString`),
+/// `NioSocketWrapper.doClose` (via `SocketWrapperBase.close`), and
+/// `StringManager.getString` formatting the socket into a `SEVERE`/`FINE`
+/// message from `AbstractProtocol$ConnectionHandler.process`. Tomcat then logs
+/// the NPE itself as "An error occurred during processing that was fatal to the
+/// connection", and the client sees the response truncated --
+/// `IOException: End of input stream with [9] bytes left to read`
+/// (`TestFlowControl`), `connection closed before response head`
+/// (`TestAsyncContextImpl`), `SocketException: Broken pipe`
+/// (`TestHttp2Section_5_1`). 12 failures across four classes in the 2026-09-05
+/// ZGC 640-class run.
+///
+/// The remedy is DF01's (`nio_selector::channel_key_for_native`, the same shape
+/// on `keyLock`): answer natively out of the side table that actually holds this
+/// channel's state, so the bytecode that dereferences the un-populated field
+/// never runs. `init_channel_locks` additionally seeds `stateLock` for every
+/// OTHER `synchronized (stateLock)` site.
+///
+/// The rendering mirrors the JDK's: the class prefix is
+/// `getClass().getSuperclass().getName()`, then one state word, then the
+/// endpoints. `state`/`isInputClosed`/`isOutputClosed`/`localAddress` are real
+/// object slots on the JDK class that CratonVM never writes -- reading them
+/// would report a permanently `unconnected` channel with no addresses, which is
+/// why this reads `chan_fields` instead.
+fn sc_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = foreign_nio_delegate(ctx, args, "toString", "()Ljava/lang/String;") {
+        return r;
+    }
+    let Some(this) = obj_or_none(args, 0) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let mut out = String::from("java.nio.channels.SocketChannel[");
+    if !matches!(cf_get(ctx, this, F_OPEN), Value::Int(1)) {
+        out.push_str("closed");
+    } else {
+        if matches!(cf_get(ctx, this, F_CONNECTED), Value::Int(1)) {
+            out.push_str("connected");
+            if matches!(cf_get(ctx, this, F_INPUT_SHUTDOWN), Value::Int(1)) {
+                out.push_str(" ishut");
+            }
+            if matches!(cf_get(ctx, this, F_OUTPUT_SHUTDOWN), Value::Int(1)) {
+                out.push_str(" oshut");
+            }
+        } else if read_reg_id(ctx, this).is_some_and(|id| {
+            matches!(
+                tcp_registry().read().get(&id),
+                Some(TcpHandle::Connecting(_)) | Some(TcpHandle::ConnectFailed(_, _))
+            )
+        }) {
+            out.push_str("connection-pending");
+        } else {
+            out.push_str("unconnected");
+        }
+        if let Some(local) = channel_local_addr_text(ctx, this) {
+            out.push_str(" local=");
+            out.push_str(&local);
+        }
+        if let Some(remote) = channel_remote_addr_text(ctx, this) {
+            out.push_str(" remote=");
+            out.push_str(&remote);
+        }
+    }
+    out.push(']');
+    let s = ctx.create_string(&out);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+/// `sun.nio.ch.ServerSocketChannelImpl.toString()` -- the listener half of
+/// [`sc_to_string`], with the same `stateLock` root cause. The JDK prints the
+/// CONCRETE class name here (not the superclass), and its three states are
+/// `closed`, `unbound`, and -- for a bound listener -- the address ONLY when
+/// the channel is a Unix-domain one.
+///
+/// That last asymmetry is the JDK's, not a simplification. `javap -c
+/// sun.nio.ch.ServerSocketChannelImpl` on JDK 25.0.3.9 reads
+/// `getfield localAddress; ifnull -> "unbound"; invokevirtual isUnixSocket;
+/// ifeq -> end; append(addr)` -- there is no arm appending an INET address, so
+/// a bound TCP listener renders as `sun.nio.ch.ServerSocketChannelImpl[]` with
+/// nothing between the brackets. MEASURED: HotSpot 25.0.3.9 prints exactly
+/// that for `ServerSocketChannel.open().bind(127.0.0.1:0)`. A first cut of
+/// this native printed the address there, which is more useful and WRONG --
+/// this method exists to remove a divergence from HotSpot, not to add one.
+fn ssc_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = foreign_nio_delegate(ctx, args, "toString", "()Ljava/lang/String;") {
+        return r;
+    }
+    let Some(this) = obj_or_none(args, 0) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let mut out = String::from("sun.nio.ch.ServerSocketChannelImpl[");
+    if !matches!(cf_get(ctx, this, F_OPEN), Value::Int(1)) {
+        out.push_str("closed");
+    } else {
+        match channel_local_addr_text(ctx, this) {
+            None => out.push_str("unbound"),
+            Some(local) => {
+                if is_unix_family(ctx, this) {
+                    out.push_str(&local);
+                }
+            }
+        }
+    }
+    out.push(']');
+    let s = ctx.create_string(&out);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+/// `SocketChannelImpl.implConfigureBlocking(boolean)` /
+/// `ServerSocketChannelImpl.implConfigureBlocking(boolean)`.
+///
+/// `configureBlocking` itself is already overridden for our channels, so this
+/// protected hook is normally unreachable -- but only "normally": anything that
+/// reaches `AbstractSelectableChannel.configureBlocking`'s bytecode (a foreign
+/// subclass's `super` call, `SocketAdaptor`, a JDK internal) drives the hook
+/// directly, and its real body takes `readLock`/`acceptLock` (null
+/// `ReentrantLock`s here) and then `synchronized (stateLock)`. Route it to the
+/// same state update the public method performs so no such path can resurrect
+/// the NPE this file's `stateLock` seed exists to prevent. Void return.
+fn sc_impl_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(r) = foreign_nio_delegate(ctx, args, "implConfigureBlocking", "(Z)V") {
+        return r;
+    }
+    sc_configure_blocking(ctx, args)?;
+    Ok(None)
 }
 
 /// `isBound()Z` for a (server) socket channel. Not a method on the abstract
@@ -5786,6 +5988,32 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             sc_supported_options,
         );
     }
+
+    // `toString()` and `implConfigureBlocking(boolean)` are registered on the
+    // CONCRETE `sun.nio.ch.*Impl` spellings ONLY, never on the abstract
+    // `java.nio.channels.*` ones.
+    //
+    // Both are the `stateLock` family (see `sc_to_string`): real bytecode that
+    // locks a `private final` field only the JDK's own constructor assigns, and
+    // which therefore reads null on a CratonVM-built channel. The concrete
+    // classes are the ones that DECLARE them, and they are the classes
+    // `alloc_channel_as_impl` mints, so this covers every receiver that can hit
+    // the defect.
+    //
+    // Registering `toString` on the abstract names instead would be actively
+    // wrong: native dispatch walks the receiver's SUPERCLASS chain, so a
+    // registration on `java/nio/channels/SocketChannel` also answers for every
+    // third-party subclass of it -- and `toString()` is a method EVERY object
+    // has, so such a subclass would silently lose `Object.toString()` (the
+    // barchart-udt shape recorded on `foreign_nio_receiver`). The concrete
+    // `sun.nio.ch` classes are package-private in `java.base` and cannot be
+    // subclassed from outside it. The `foreign_nio_delegate` guard inside each
+    // native is the second line of defence.
+    for c in [scimpl, sscimpl] {
+        r.register(c, "implConfigureBlocking", "(Z)V", sc_impl_configure_blocking);
+    }
+    r.register(scimpl, "toString", "()Ljava/lang/String;", sc_to_string);
+    r.register(sscimpl, "toString", "()Ljava/lang/String;", ssc_to_string);
 
     // -- ServerSocketChannel factory + lifecycle --
     for c in [ssc, sscimpl] {
