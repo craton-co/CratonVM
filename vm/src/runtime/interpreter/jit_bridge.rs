@@ -9192,7 +9192,7 @@ pub(super) fn background_compile_task(
                 )
             },
         );
-    let c2_upgrade_candidate = (published
+    let c2_upgrade_candidate = published
         && !optimized
         && crate::runtime::env_cache::c2_supersede()
         && fetch_osr_compile_inputs(
@@ -9212,7 +9212,7 @@ pub(super) fn background_compile_task(
                 crate::runtime::env_cache::jit_ir_call_virtual(),
             )
         })
-        .unwrap_or(false));
+        .unwrap_or(false);
     // A `None` above is not one thing. The comment on `published` already lists
     // the causes — "skip-listed, resolver miss, code-cache cap, concurrent
     // redefine" — and two of them are PERMANENT POLICY, not a codegen attempt
@@ -10580,7 +10580,7 @@ fn resolve_inline_site_from(
     // removes the emitter's fallback as well, so a nested splice that bails
     // during emission bails the enclosing splice instead of quietly becoming a
     // dispatch. Refusing costs the site its inline; admitting it costs 3.5x.
-    let mut invoke_targets = invoke_targets;
+    // (`invoke_targets` is already `let mut` where it is built, ~540 lines up.)
 
     // Direct-bind whatever the same resolver the TOP LEVEL uses will bind.
     //

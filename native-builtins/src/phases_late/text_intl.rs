@@ -1552,7 +1552,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(set))))
     });
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 /// Build a Java String[] from a Rust slice of &str.
@@ -2988,7 +2988,7 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 // =============================================================================

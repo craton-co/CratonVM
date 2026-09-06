@@ -7740,7 +7740,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 /// Allocate a fresh SSLEngine with default field values.
@@ -8880,7 +8880,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 // =============================================================================

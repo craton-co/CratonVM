@@ -7307,7 +7307,7 @@ mod default_field_init_tests {
     /// edit that (say) folds `Z` in with `J` is red here and not in a vector.
     #[test]
     fn every_jvm_field_descriptor_gets_its_spec_default() {
-        for b in [b'I', b'B', b'C', b'S', b'Z'] {
+        for b in *b"IBCSZ" {
             assert_eq!(
                 jvm_default_for_descriptor(b),
                 Value::Int(0),
@@ -7408,7 +7408,7 @@ mod default_field_init_tests {
         heap.set_field(obj, 1, Value::Object(None));
 
         for (slot, what) in [(0usize, "raw zero"), (1usize, "explicit null")] {
-            for desc in [b'L', b'['] {
+            for desc in *b"L[" {
                 assert_eq!(
                     heap.get_field_as(obj, slot, desc),
                     Value::Object(None),

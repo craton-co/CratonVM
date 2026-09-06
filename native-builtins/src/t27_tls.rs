@@ -16887,7 +16887,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 // -- wrap/unwrap closures (split out for arity / arg shapes) -----------------
@@ -20578,7 +20578,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(out))))
         },
     );
-    ()
+    
 }
 
 /// Lazily allocate (and cache in the session's own last field) the

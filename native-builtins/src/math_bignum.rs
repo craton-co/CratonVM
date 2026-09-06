@@ -1882,7 +1882,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.set_category(__prev_cat);
-    ()
+    
 }
 
 // ---------------------------------------------------------------------------
@@ -3744,7 +3744,7 @@ pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(bd_alloc(ctx, "10", 0)?))))
     });
     registry.set_category(__prev_cat);
-    ()
+    
 }
 
 /// Read a `BigDecimal`'s `(unscaled-digits, scale)` in real-JDK layout, or

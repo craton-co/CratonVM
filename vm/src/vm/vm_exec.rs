@@ -29964,7 +29964,7 @@ mod tests {
     /// `java.util.Properties`'s inherited `loadFactor`.
     #[test]
     fn a_null_written_over_a_primitive_slot_is_a_cross_type_access() {
-        for desc in [b'I', b'J', b'F', b'D', b'Z', b'B', b'C', b'S'] {
+        for desc in *b"IJFDZBCS" {
             assert!(
                 overlay_access_is_cross_type(Value::Object(None), desc),
                 "null over '{}' must report",

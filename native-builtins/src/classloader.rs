@@ -8575,7 +8575,7 @@ pub(crate) fn ucl_try_define_local_class(
             let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
             *in_progress = false;
             self.cvar.notify_all();
-            ()
+            
         }
     }
     let _define_in_progress_guard = DefineInProgressGuard {

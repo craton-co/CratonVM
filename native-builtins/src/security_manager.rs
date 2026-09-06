@@ -1793,7 +1793,7 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
     // the invokespecial path doesn't fall through to the missing-method
     // branch.
     r.register(p, "<init>", "()V", |_ctx, _args| Ok(None));
-    ()
+    
 }
 
 // ---------------------------------------------------------------------------

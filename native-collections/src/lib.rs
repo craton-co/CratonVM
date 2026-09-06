@@ -77603,7 +77603,7 @@ mod tests {
                 "the supplementary key sorts FIRST, as HotSpot orders it"
             );
             assert!(
-                "\u{10000}".to_string() > "\u{FFFF}".to_string(),
+                "\u{10000}" > "\u{FFFF}",
                 "...and a Rust String would have sorted it LAST"
             );
         }

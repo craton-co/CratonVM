@@ -962,7 +962,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(dos, "flush", "()V", dos_flush);
     r.register(dos, "close", "()V", dos_close);
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 /// Register the bulk stream-transfer helper used by Spring's `StreamUtils`.
@@ -3323,7 +3323,7 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 // =============================================================================
@@ -4509,7 +4509,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 #[cfg(test)]

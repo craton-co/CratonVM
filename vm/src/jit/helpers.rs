@@ -4523,7 +4523,6 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
 // passed through from the interpreter. atype encodes a JVM array element type (T_BOOLEAN..T_LONG).
 // length is the requested array size. The returned i64 is a raw heap pointer to the new array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-
 /// Open a ZGC concurrent mark cycle from a JIT allocation helper, if the
 /// occupancy threshold has been crossed.
 ///
@@ -16298,10 +16297,9 @@ fn varhandle_operand_value(vm: &SharedVm, raw: i64, value_desc: u8) -> Option<Va
             if raw == 0 {
                 Value::Object(None)
             } else {
-                // SAFETY: validated as a live heap address before use.
-                Value::Object(Some(unsafe {
-                    vm.mem.heap.is_object_address(raw as usize)
-                }?))
+                // `is_object_address` is a safe fn: it is the validation,
+                // not something that assumes it.
+                Value::Object(Some(vm.mem.heap.is_object_address(raw as usize)?))
             }
         }
         b'J' => Value::Long(raw),

@@ -21765,7 +21765,10 @@ pub(crate) mod tests {
             walk = walk.min(us);
 
             let t = std::time::Instant::now();
-            heap.mark_clear_all();
+            // `black_box`, like the header walk above: the value is
+            // `#[must_use]` and discarding it is both a lint and an invitation
+            // to optimise away the pass this loop exists to time.
+            std::hint::black_box(heap.mark_clear_all());
             clear = clear.min(t.elapsed().as_micros() as f64);
         }
         println!(

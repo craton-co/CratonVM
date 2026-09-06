@@ -2527,7 +2527,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         |ctx, _args| Err(xpath_unsupported(ctx, "XPath.compile")),
     );
     r.set_category(__prev_cat);
-    ()
+    
 }
 
 // =============================================================================
