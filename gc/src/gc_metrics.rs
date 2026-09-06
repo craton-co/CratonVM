@@ -126,6 +126,16 @@ struct Counters {
     /// frees memory outside the collection set. When a humongous object goes
     /// missing, the first question is which of the two reclaimers took it, and
     /// `spans` answers it without a rebuild.
+    /// Ten-findings item 1 — spans decided LIVE by this pause's own scan
+    /// marks, so their remembered set was never read and their sources never
+    /// walked. The engagement counter for the marking half: a run where this
+    /// stays 0 while `humongous_eager_walked_sources` climbs is one where the
+    /// marking bought nothing and the walk is still doing all the work.
+    humongous_eager_marked: AtomicU64,
+    /// Source regions the undecided-span walk actually read.
+    /// Spans the ROOT/finalizer seed decided (not the scan marking).
+    humongous_eager_root_seeded: AtomicU64,
+    humongous_eager_walked_sources: AtomicU64,
     humongous_eager_spans: AtomicU64,
     humongous_eager_bytes: AtomicU64,
     /// Pauses that had eager reclaim enabled but declined to run it, because
@@ -161,6 +171,9 @@ impl Counters {
             cset_verify_dangling: AtomicU64::new(0),
             cset_verify_truncated: AtomicU64::new(0),
             rset_coarsened: AtomicU64::new(0),
+            humongous_eager_marked: AtomicU64::new(0),
+            humongous_eager_root_seeded: AtomicU64::new(0),
+            humongous_eager_walked_sources: AtomicU64::new(0),
             humongous_eager_spans: AtomicU64::new(0),
             humongous_eager_bytes: AtomicU64::new(0),
             humongous_eager_declined: AtomicU64::new(0),
@@ -355,6 +368,18 @@ pub fn record_g1_cset_verify(objects: u64, dangling: u64, truncated: bool) {
 ///
 /// `spans == 0` with `declined == false` is the ordinary "nothing was dead"
 /// outcome; `declined == true` means the pause never asked the question.
+/// Ten-findings item 1 — record how the pause decided span liveness.
+pub fn record_g1_humongous_liveness(marked: u64, seeded_by_roots: u64, walked_sources: u64) {
+    with_counters(|c| {
+        c.humongous_eager_marked
+            .fetch_add(marked, Ordering::Relaxed);
+        c.humongous_eager_root_seeded
+            .fetch_add(seeded_by_roots, Ordering::Relaxed);
+        c.humongous_eager_walked_sources
+            .fetch_add(walked_sources, Ordering::Relaxed);
+    });
+}
+
 pub fn record_g1_eager_humongous(spans: u64, bytes: u64, declined: bool) {
     with_counters(|c| {
         c.humongous_eager_spans.fetch_add(spans, Ordering::Relaxed);
@@ -433,6 +458,9 @@ pub struct GcMetricsRaw {
     pub cset_verify_dangling: u64,
     pub cset_verify_truncated: u64,
     pub rset_coarsened: u64,
+    pub humongous_eager_marked: u64,
+    pub humongous_eager_root_seeded: u64,
+    pub humongous_eager_walked_sources: u64,
     pub humongous_eager_spans: u64,
     pub humongous_eager_bytes: u64,
     pub humongous_eager_declined: u64,
@@ -595,6 +623,9 @@ pub fn gc_metrics_raw() -> GcMetricsRaw {
         cset_verify_dangling: c.cset_verify_dangling.load(Ordering::Relaxed),
         cset_verify_truncated: c.cset_verify_truncated.load(Ordering::Relaxed),
         rset_coarsened: c.rset_coarsened.load(Ordering::Relaxed),
+        humongous_eager_marked: c.humongous_eager_marked.load(Ordering::Relaxed),
+        humongous_eager_root_seeded: c.humongous_eager_root_seeded.load(Ordering::Relaxed),
+        humongous_eager_walked_sources: c.humongous_eager_walked_sources.load(Ordering::Relaxed),
         humongous_eager_spans: c.humongous_eager_spans.load(Ordering::Relaxed),
         humongous_eager_bytes: c.humongous_eager_bytes.load(Ordering::Relaxed),
         humongous_eager_declined: c.humongous_eager_declined.load(Ordering::Relaxed),
@@ -1082,10 +1113,25 @@ pub fn collector_decision_report() -> String {
     if verify.humongous_eager_spans > 0 || verify.humongous_eager_declined > 0 {
         s.push('\n');
         s.push_str(&format!(
-            "[GC] g1 humongous-eager: spans={} bytes={} declined_pauses={}",
+            "[GC] g1 humongous-eager: spans={} bytes={} declined_pauses={}              marked_live={} root_seeded={} walked_sources={}{}",
             verify.humongous_eager_spans,
             verify.humongous_eager_bytes,
             verify.humongous_eager_declined,
+            verify.humongous_eager_marked,
+            verify.humongous_eager_root_seeded,
+            verify.humongous_eager_walked_sources,
+            {
+                let reasons = g1_eager_decline_counts();
+                if reasons.is_empty() {
+                    String::new()
+                } else {
+                    let body: Vec<String> = reasons
+                        .iter()
+                        .map(|(label, n)| format!("{label}={n}"))
+                        .collect();
+                    format!(" declined_by: {}", body.join(" "))
+                }
+            },
         ));
     }
     s
@@ -1353,6 +1399,52 @@ static G1_PAUSES_COVERAGE_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
 /// Measured on H2 (`org.h2.test.store.TestMVStoreTool`, 612 compiled frames),
 /// G1 reports 100% incomplete where the probes report 0%, and the reason is
 /// exactly what that difference needed naming.
+/// Why a pause declined to reclaim humongous spans eagerly.
+///
+/// The `declined_pauses` total says the feature did not run; it never said
+/// WHICH gate stopped it, and on H2 the answer decides whether the remembered-
+/// set source walk beneath it is buying anything at all. Same shape as
+/// `G1_COVERAGE_REASONS`, and for the same reason: a count without a cause
+/// cannot direct work.
+pub mod eager_decline {
+    pub const CENSUS_INCOMPLETE: usize = 0;
+    pub const MARKING_ACTIVE: usize = 1;
+    pub const GRAY_SET_NON_EMPTY: usize = 2;
+    pub const EVACUATION_FAILURE: usize = 3;
+    pub const SOURCE_WALK_ABORTED: usize = 4;
+    pub const COUNT: usize = 5;
+
+    pub const LABELS: [&str; COUNT] = [
+        "census-incomplete",
+        "marking-active",
+        "gray-set-non-empty",
+        "evacuation-failure",
+        "source-walk-aborted",
+    ];
+}
+
+static G1_EAGER_DECLINE_REASONS: [AtomicU64; eager_decline::COUNT] =
+    [const { AtomicU64::new(0) }; eager_decline::COUNT];
+
+/// Record which gate stopped an eager humongous reclaim.
+pub fn record_g1_eager_decline_reason(code: usize) {
+    if let Some(slot) = G1_EAGER_DECLINE_REASONS.get(code) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(label, count)` for every decline reason seen at least once.
+pub fn g1_eager_decline_counts() -> Vec<(&'static str, u64)> {
+    eager_decline::LABELS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, label)| {
+            let n = G1_EAGER_DECLINE_REASONS[i].load(Ordering::Relaxed);
+            (n > 0).then_some((*label, n))
+        })
+        .collect()
+}
+
 static G1_COVERAGE_REASONS: [AtomicU64; crate::gc_quiescence::incomplete_reason::COUNT] =
     [const { AtomicU64::new(0) }; crate::gc_quiescence::incomplete_reason::COUNT];
 
@@ -1497,6 +1589,9 @@ mod tests {
             cset_verify_dangling: 0,
             cset_verify_truncated: 0,
             rset_coarsened: 0,
+            humongous_eager_marked: 0,
+            humongous_eager_root_seeded: 0,
+            humongous_eager_walked_sources: 0,
             humongous_eager_spans: 0,
             humongous_eager_bytes: 0,
             humongous_eager_declined: 0,
