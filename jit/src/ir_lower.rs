@@ -935,6 +935,12 @@ struct Lowerer<'a> {
     carries_read: usize,
     carries_refused: usize,
     carry_stores_dropped: usize,
+    /// Memoised [`Self::graph_cannot_deopt`].
+    graph_trap_free: std::cell::OnceCell<bool>,
+    /// ENGAGEMENT: homes dropped because every frame state naming them is
+    /// unreachable, and deopt points skipped for the same reason.
+    unreachable_homes: usize,
+    unreachable_points_skipped: std::cell::Cell<usize>,
     /// ENGAGEMENT: constant operands folded into their ALU instruction.
     alu_imms_folded: usize,
     /// Why an adjacent pair was not carried, per cause, and how many carried
@@ -1471,6 +1477,9 @@ impl<'a> Lowerer<'a> {
             carries_read: 0,
             carries_refused: 0,
             carry_stores_dropped: 0,
+            graph_trap_free: std::cell::OnceCell::new(),
+            unreachable_homes: 0,
+            unreachable_points_skipped: std::cell::Cell::new(0),
             alu_imms_folded: 0,
             carry_skips: [0; 6],
             carry_named: 0,
@@ -1586,6 +1595,36 @@ impl<'a> Lowerer<'a> {
         )
     }
 
+    /// Can NOTHING in this graph transfer to the interpreter?
+    ///
+    /// The PREDICTION half of [`ir_drop_unreachable_homes_enabled`]. Computed
+    /// from the graph because the decision it feeds — which homes to drop — is
+    /// made before a byte is emitted; `lower_inner` checks the answer against
+    /// the emission afterwards.
+    fn graph_cannot_deopt(&self) -> bool {
+        if !ir_drop_unreachable_homes_enabled() {
+            return false;
+        }
+        *self.graph_trap_free.get_or_init(|| {
+            self.graph
+                .nodes
+                .iter()
+                .all(|n| op_cannot_deopt(&n.op))
+        })
+    }
+
+    /// Is this value pinned to its home only by frame states nothing can
+    /// reach?
+    ///
+    /// `deopt_named` says a frame state mentions it. That is a reason to keep
+    /// the home word only if some deopt can consult that frame state.
+    fn deopt_naming_is_reachable(&self, id: NodeId) -> bool {
+        if !self.deopt_named.get(id as usize).copied().unwrap_or(true) {
+            return false;
+        }
+        !self.graph_cannot_deopt()
+    }
+
     /// May this ORDINARY value's home word go unwritten?
     ///
     /// The same conjunction as [`Self::phi_home_droppable`] with the phi's
@@ -1614,7 +1653,13 @@ impl<'a> Lowerer<'a> {
         {
             return false;
         }
-        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false) {
+        // `deopt_nameable` asks "can a deopt frame NAME this in a register".
+        // A body nothing can deopt from never asks, so an assigned register is
+        // enough — the readers need it, the frame states do not exist to be
+        // wrong. Verified against the emission in `lower_inner`.
+        if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false)
+            && !(self.graph_cannot_deopt() && self.assigned_gpr(id).is_some())
+        {
             return false;
         }
         let Some(node) = self.graph.nodes.get(id as usize) else {
@@ -6331,6 +6376,9 @@ impl<'a> Lowerer<'a> {
         //  consumer-arm, wrong-operand-position].
         let mut carry_skips = [0usize; 6];
         let mut carry_named = 0usize;
+        // Values whose only pin was a frame state nothing can reach.
+        let mut carry_unreachable = 0usize;
+        let graph_trap_free = self.graph_cannot_deopt();
         let mut carry_droppable: Vec<NodeId> = Vec::new();
         if ir_carry_single_use_enabled() {
             for block in &self.schedule.blocks {
@@ -6410,10 +6458,22 @@ impl<'a> Lowerer<'a> {
                     // already answers no for those operands (the bci's frame
                     // state lists them), and this clause is what makes that
                     // agreement a rule rather than a coincidence.
+                    //
+                    // `deopt_named` alone is the wrong question: a frame state
+                    // that names this value is a reason to keep its home word
+                    // only if some deopt can consult that frame state. When the
+                    // graph can trap nowhere, none of them can — and
+                    // `lower_inner` checks that prediction against the emission
+                    // before any point is skipped.
                     let consumer_traps = matches!(cn.op, Op::Div | Op::Rem);
-                    if consumer_traps || deopt_named.get(prod as usize).copied().unwrap_or(true) {
+                    let named = deopt_named.get(prod as usize).copied().unwrap_or(true);
+                    let reachable = named && !graph_trap_free;
+                    if consumer_traps || reachable {
                         carry_named += 1;
                     } else {
+                        if named {
+                            carry_unreachable += 1;
+                        }
                         carry_droppable.push(prod);
                     }
                 }
@@ -6434,6 +6494,7 @@ impl<'a> Lowerer<'a> {
         }
         self.carry_skips = carry_skips;
         self.carry_named = carry_named;
+        self.unreachable_homes += carry_unreachable;
         self.carry_of = carry_of;
         self.use_count = use_count;
         self.deopt_named = deopt_named;
@@ -10123,7 +10184,28 @@ impl<'a> Lowerer<'a> {
     /// keyed by the native offset of its bci. Returns them sorted+deduped by
     /// `native_offset` so [`CompiledMethod::find_deopt_point`] can binary
     /// search. Snapshots whose bci emitted no machine code are skipped.
-    fn build_deopt_points(&self) -> Vec<DeoptimizationPoint> {
+    /// `emission_trap_free` is `lower_inner`'s `osr_sentinel_free`: the body
+    /// emitted no deopt stub and no call-exception stub, so nothing inside it
+    /// can transfer to the interpreter.
+    ///
+    /// **This is the verification, not the prediction.** `graph_cannot_deopt`
+    /// decided which homes to drop before emission; this is the emission
+    /// answering. The two must agree for a point to be skipped, and when they
+    /// do not, every point is built and `frame_value_of` refuses the compile on
+    /// the first dropped home it cannot describe — the behaviour with this
+    /// switch off, unchanged.
+    fn build_deopt_points(&self, emission_trap_free: bool) -> Vec<DeoptimizationPoint> {
+        if ir_drop_unreachable_homes_enabled() && emission_trap_free && self.graph_cannot_deopt() {
+            // Every frame state in this body describes a program point no
+            // deopt can arrive at. `find_deopt_point` is an exact-offset
+            // lookup from a trapping pc and there are no trapping pcs; the
+            // by-bci readers in `deopt_resume` sit on the resume path, which
+            // is reached only after a deopt that cannot happen, and both
+            // return an error rather than a value when they find nothing.
+            self.unreachable_points_skipped
+                .set(self.graph.safepoints.len());
+            return Vec::new();
+        }
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
         for (index, sp) in self.graph.safepoints.iter().enumerate() {
             let native_offset = match self.bci_native.get(&sp.bci) {
@@ -11836,6 +11918,101 @@ fn ir_alu_imm_enabled() -> bool {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
+}
+
+/// Let a value lose its home word when the only things naming it are frame
+/// states NO DEOPT CAN REACH -- **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES=1`.
+///
+/// # The problem
+///
+/// `graph.safepoints` records the FULL OPERAND STACK at every bci, so an
+/// intermediate is "deopt-named" from its definition until its consumer pops
+/// it. Both `plan_register_residency` (`blocked_deopt`) and the single-use
+/// carry (`still_deopt_named`) refuse on that. Yet `OsrTierBench.kernel`
+/// reports `sentinel_free=true` — the body emits no deopt stub and no
+/// call-exception stub, so it cannot transfer to the interpreter from anywhere
+/// inside itself. Thirty-three frame states, not one of them reachable, and
+/// they are what pins every intermediate to memory.
+///
+/// # Why this does not remove the fail-closed net
+///
+/// The obvious implementation — stop building the unreachable points — would
+/// make the trap classification LOAD-BEARING: misclassify one and a deopt
+/// reconstructs a confidently wrong value. This does the opposite. It
+/// **predicts** trap-freedom from the graph to decide what to drop, and then
+/// **verifies it against the emission that actually happened**: `lower_inner`
+/// computes `osr_sentinel_free` from `deopt_stub_patches` and
+/// `call_exc_patches` before `build_deopt_points` runs, and the points are
+/// skipped only when that says the body really did emit no trap.
+///
+/// If the prediction was wrong, the points ARE built, `frame_value_of` meets a
+/// dropped home with no register describing it, and refuses the compile —
+/// exactly as it does today. Nothing is taken away; a case is added in which
+/// the net is provably not needed.
+fn ir_drop_unreachable_homes_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// Can lowering `op` emit a deopt stub or a call-exception stub — i.e. can a
+/// frame ever transfer to the interpreter from it?
+///
+/// An ALLOWLIST of ops that cannot, so an op this file has never heard of
+/// counts as trapping and the method is treated as reachable. `Op::Div` and
+/// `Op::Rem` are absent because their zero-divisor guard is a deopt point;
+/// every memory, call, allocation, cast and monitor op is absent for the
+/// reasons its own arm gives.
+///
+/// The claim is checked against the emission rather than trusted: see
+/// [`ir_drop_unreachable_homes_enabled`].
+fn op_cannot_deopt(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Start
+            | Op::Proj(_)
+            | Op::Param(_)
+            | Op::Const(_)
+            | Op::ConstF(_)
+            | Op::Phi
+            | Op::Merge
+            | Op::Region
+            | Op::If
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::I2L
+            | Op::L2I
+            | Op::I2F
+            | Op::I2D
+            | Op::L2F
+            | Op::L2D
+            | Op::F2I
+            | Op::F2L
+            | Op::F2D
+            | Op::D2I
+            | Op::D2L
+            | Op::D2F
+            | Op::Cmp(_)
+            | Op::LCmp
+            | Op::FCmp { .. }
+            // A return cannot trap. It was missing from the first cut, which
+            // is why `OsrTierBench.kernel` -- pure arithmetic and a `Return` --
+            // reported `graph_trap_free=false` and the optimization declined
+            // itself. The allowlist failing safe is the intended direction;
+            // this is the cost of that direction, paid once.
+            | Op::Return
+            | Op::Dead
+    )
 }
 
 fn op_reads_rax_then_rcx(op: &Op) -> bool {
@@ -14624,7 +14801,7 @@ pub(crate) fn lower_inner_with_scopes(
     // real-frame-deopt (step 2): resolve recorded safepoint snapshots into
     // native-offset-keyed DeoptimizationPoints before the buffer is consumed.
     // Emit-and-discard: nothing reads these yet, so codegen is unchanged.
-    let deopt_points = lowerer.build_deopt_points();
+    let deopt_points = lowerer.build_deopt_points(osr_sentinel_free);
     let deopt_boxes = std::mem::take(&mut lowerer.deopt_boxes);
     // Gap B: a method containing an `Op::Call` takes the VM context pointer as a
     // hidden first arg, so it must be invoked via `try_call_with_context`.
@@ -14799,6 +14976,12 @@ pub(crate) fn lower_inner_with_scopes(
             s[0], s[1], s[2], s[3], s[4], s[5],
         );
         eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
+        eprintln!(
+            "[ir-ls] unreachable frame states: graph_trap_free={} homes_freed={} points_skipped={}",
+            lowerer.graph_cannot_deopt(),
+            lowerer.unreachable_homes,
+            lowerer.unreachable_points_skipped.get(),
+        );
     }
 
     // Carry the identity the prologue encoded, so publication can bind it to

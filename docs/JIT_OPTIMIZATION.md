@@ -2733,6 +2733,81 @@ expose it, and the test was the only thing in the tree sensitive enough to
 notice. Any workload whose lambda call site sits in a method that tiers up has
 been losing its inline cache at the tier-up boundary.
 
+#### The frame states nothing can reach, and how to drop them without removing the net
+
+The stores this section kept naming as the residual were home writes for values
+pinned by frame states. `graph.safepoints` records the **full operand stack at
+every bci**, so an intermediate is deopt-named from its definition until its
+consumer pops it — which is what `plan_register_residency`'s `blocked_deopt` and
+the carry's `still_deopt_named` refuse on. Meanwhile the OSR door reports
+`sentinel_free=true` for the same method: it emits **no deopt stub and no
+call-exception stub**, so nothing inside it can transfer to the interpreter.
+Thirty-three frame states, not one reachable, all of them pinning intermediates
+to memory.
+
+**The obvious implementation is the dangerous one.** Stop building the
+unreachable points and the trap classification becomes load-bearing: misclassify
+one op and a deopt reconstructs a confidently wrong value — the failure mode
+this area produces, and the reason this was split out of the perf arc rather
+than done inline.
+
+So this does the opposite. It **predicts** trap-freedom from the graph to decide
+what to drop, and then **verifies the prediction against the emission that
+actually happened**. `lower_inner` computes `osr_sentinel_free` from
+`deopt_stub_patches` and `call_exc_patches` *before* `build_deopt_points` runs,
+and a point is skipped only when the graph prediction and the emission agree.
+
+If they disagree, every point is built, `frame_value_of` meets a dropped home it
+cannot describe, and refuses the compile — the behaviour with this switch off,
+unchanged. **Nothing is taken away; a case is added in which the net is provably
+not needed.** `op_cannot_deopt` is an allowlist, so an op this file has never
+heard of counts as trapping.
+
+That direction was not theoretical. The first cut omitted `Op::Return`, so
+`OsrTierBench.kernel` — pure arithmetic and a return — reported
+`graph_trap_free=false` and **declined itself**: `homes_freed=0`, loop unchanged.
+A missing entry costs an optimization, never a value.
+
+With it fixed:
+
+```text
+[ir-ls] unreachable frame states: graph_trap_free=true homes_freed=4 points_skipped=33
+[ir-ls] carries: planned=4 taken=4 read=4 refused=0 stores_dropped=4 still_deopt_named=0
+[ir-ls] homes:   dropped_values=8 stores_skipped=7 read_refusals=0
+```
+
+| arm | loop insns | frame ops | loads | stores |
+|---|---|---|---|---|
+| the arc as merged | 40 | 10 | 3 | 7 |
+| **+ unreachable homes dropped** | **37** | **7** | 3 | **4** |
+
+`still_deopt_named` goes 4 → 0 and the seven stores this section has been
+pointing at become four.
+
+**Correctness is shown where the loop kernels cannot show it.** They are
+trap-free, so no deopt is ever taken and a frame state that reconstructed
+garbage would never be consulted — a green run there is agreement about a path
+nobody took. `probes/DeoptLiveProbe.java` is the other half: three hot loops
+that really trap part-way through, with an intermediate live across the trap
+point (a zero divisor, a null receiver, an out-of-bounds index), each folding
+into a checksum that depends on the values live at the deopt. It agrees with
+HotSpot under the default, with the switch on, with the switch on plus the OSR
+door, and under `--nojit`.
+
+**On the clock it is a null result, and that is the right size.** Paired user
+CPU, each arm run twice per round over fifteen rounds at host load 5-8:
+`before` 0.4840 s, `after` 0.4850 s — 0.2% apart, against a same-config control
+floor of **2.2-2.9%**. Three instructions and three frame operations out of 40
+and 10 is roughly 7% of the loop, and this host cannot resolve that. An earlier
+nine-round pass appeared to show a 16% regression; it was small-sample scatter
+in a bimodal distribution and did not survive pairing. The counted change is the
+result here — the stopwatch has nothing to add at this size.
+
+(The first run of that comparison passed **vacuously** — the probe was not yet
+on the remote worktree, HotSpot printed nothing, and empty matched empty. The
+script now refuses to compare against an empty oracle. A differential harness
+that cannot fail is worth less than no harness, because it reports success.)
+
 ### Performance — current status
 
 Checksums stay exact (e.g. `bintrees-18` = 68332206) across every change

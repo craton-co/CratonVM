@@ -1254,6 +1254,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-drop-phi-home", on_key: Some("CRATONVM_JIT_IR_DROP_PHI_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-publish-at-def", on_key: Some("CRATONVM_JIT_IR_PUBLISH_AT_DEF"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-drop-home", on_key: Some("CRATONVM_JIT_IR_DROP_HOME"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    E { group: Group::JIT, token: "ir-drop-unreachable-homes", on_key: Some("CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-carry-single-use", on_key: Some("CRATONVM_JIT_IR_CARRY_SINGLE_USE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-sink-late", on_key: Some("CRATONVM_JIT_IR_SINK_LATE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::JIT, token: "ir-alu-imm", on_key: Some("CRATONVM_JIT_IR_ALU_IMM"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
