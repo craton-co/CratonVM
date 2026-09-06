@@ -4604,15 +4604,23 @@ unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
 /// Two separate defects were measured behind this switch. The first is FIXED
 /// and is no longer a reason:
 ///
-/// 1. CORRUPT CELLS -- GONE. Runs on 2026-09-05 reported >=32 `corrupt Value
-///    cell` errors each, always after the first mixed pause, one in three
-///    ending in a fatal `forwarding target must have its low 2 bits clear`.
-///    That was `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
-///    (fixed the same day, `CRATONVM_G1_PARALLEL_EVAC_SCREEN`), not something
-///    new here: the holder report this branch added printed `class_id`
-///    163587104 = 0x09C02470, the low half of the heap pointer 0x1f509c02470,
-///    which is that page's fabrication pattern verbatim. Re-measured on the
-///    merged tip: 0 corrupt cells in 3/3 driver-on runs.
+/// 1. CORRUPT CELLS -- NOT GONE, and the "gone" reading was a SAMPLING FLUKE.
+///    Runs on 2026-09-05 reported >=32 `corrupt Value cell` errors each, and
+///    the parallel-evacuator screen fix
+///    (`g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`,
+///    `CRATONVM_G1_PARALLEL_EVAC_SCREEN`) plainly relates to them: the holder
+///    report this branch added prints `class_id` 163587104 = 0x09C02470, the
+///    low half of the heap pointer 0x1f509c02470 beside it, which is that
+///    page's fabrication pattern verbatim.
+///
+///    But three clean runs right after that merge did NOT mean the family was
+///    closed. A four-rep interleaved A/B of the two tips on the same workload
+///    (2026-09-06, `c67f6bbc3` against `8d83c7585`, driver on in both) gives
+///    the SAME rate on each: 2 of the 3 runs that reached mixed GC report 32
+///    corrupt cells, on BOTH tips. It is not a regression from the GC commits
+///    in between, and it is not depth-dependent -- the old tip stayed clean
+///    through 24 mixed pauses and corrupted at 4, the new one corrupted at 31
+///    and stayed clean at 16. It is stochastic, pre-existing, and roughly 2/3.
 ///
 /// 2. A SIGSEGV THAT SURVIVED IT -- still open, and the actual blocker. On the
 ///    fixed tip, 2 of 3 driver-on runs still die with SIGSEGV, and the count of
@@ -4624,9 +4632,17 @@ unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
 ///    header, the copy, and a reference slot all reach the screen implausible.
 ///
 /// The driver-off arm is NOT a clean negative for (2): it never segfaults, but
-/// it also dies of OOM in 46-102 s and so never reaches the depth where the
-/// fault happens. What the control does establish is that the corrupt-cell
-/// family is gone from both arms.
+/// it also dies of OOM in 46-182 s and so never reaches the depth where the
+/// fault happens.
+///
+/// One ablation worth not repeating: `CRATONVM_GC_RESERVE=0` changes nothing
+/// here (32 corrupt cells in 3/3, SIGSEGV still 1/3). On the Generational
+/// give-back page
+/// (`a-compiled-frame-keeps-a-young-reference-the-collector-moved-20260906`)
+/// that switch converts the SIGSEGV into a silent stale read, which is what
+/// named the fault there as reporting rather than cause. The two have a very
+/// similar signature and are NOT the same defect; this one is not a
+/// decommit-window fault.
 ///
 /// So this switch is how you REACH the remaining defect, not a tuning knob.
 /// Default it on once a driver-on run survives without implausible-header
