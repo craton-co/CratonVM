@@ -1046,6 +1046,17 @@ struct CopyWatch {
     reported: AtomicUsize,
 }
 
+/// The one [`CopyWatch`] a run has, hoisted to module scope so the corrupt-cell
+/// drain can ASK IT a question the checkpoints cannot answer: was this holder
+/// a copy THIS pause made at all?
+///
+/// The checkpoints prove a copy's first word does not change after the copy.
+/// They are blind to two things, and those two are now the whole search: a
+/// SOURCE that was already corrupt when it was copied (the copy faithfully
+/// reproduces it and nothing 'changes'), and an object never copied at all
+/// (never in the ledger, so no checkpoint ever looks at it).
+static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
+
 impl CopyWatch {
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1066,6 +1077,23 @@ impl CopyWatch {
     /// Drop every recorded entry. The cross-pause checkpoint verifies the
     /// PREVIOUS pause's copies and then starts again, so one pause's worth of
     /// entries is the most this ever holds.
+    /// Was `addr` a to-space copy THIS pause made, and if so what did its
+    /// header look like at the instant of the copy, and where did it come from?
+    ///
+    /// This is the split the checkpoints cannot make. A corrupt holder that IS
+    /// in the ledger was copied from `src` with the recorded `class_id`/`shape`;
+    /// if those match what the walk later read, the SOURCE was already corrupt
+    /// and the search moves to from-space. A corrupt holder that is NOT in the
+    /// ledger was never evacuated this pause, so no copy path touched it and the
+    /// writer reached a resident object in place.
+    fn lookup(&self, addr: usize) -> Option<(usize, u32, u32)> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.0 == addr)
+            .map(|e| (e.1, e.2, e.3))
+    }
+
     fn clear(&self) {
         self.entries.lock().clear();
     }
@@ -8110,7 +8138,6 @@ impl G1Collector {
         // measured 0 of 374k and 0 of 401k copies rewritten, so the interval
         // that matters is the one BETWEEN pauses: if a copy this pause made is
         // corrupt when the next pause starts, the writer is not the collector.
-        static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
         let copy_watch: Option<&CopyWatch> = gc_flags()
             .g1_evac_copy_watch
             .then(|| COPY_WATCH.get_or_init(CopyWatch::default));
@@ -10431,6 +10458,20 @@ impl G1Collector {
         let drained: Vec<(usize, u32, u32, u64)> =
             std::mem::take(&mut *PENDING_CORRUPT_HOLDERS.lock());
         for (addr, cid, slots, mark) in drained {
+            // THE SPLIT. See `CopyWatch::lookup`: in-ledger means the source was
+            // already corrupt (the checkpoints prove the copy did not change it),
+            // not-in-ledger means nothing copied this object this pause.
+            let provenance = COPY_WATCH
+                .get()
+                .and_then(|w| w.lookup(addr))
+                .map(|(src, was_cid, was_shape)| {
+                    format!(
+                        "copied_this_pause=YES src={src:#x} was(class_id={was_cid} \
+                         shape={was_shape}) source_was_already_corrupt={}",
+                        was_cid == cid && was_shape == slots,
+                    )
+                })
+                .unwrap_or_else(|| "copied_this_pause=no".to_string());
             let where_from = self
                 .lookup_region_for_addr(addr)
                 .and_then(|i| regions.get(i).map(|r| (i, r)))
