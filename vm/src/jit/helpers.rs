@@ -8229,6 +8229,105 @@ fn compact_inline_dbg() -> bool {
     })
 }
 
+/// `CRATONVM_DBG_NULL_FIELD_PROVENANCE=<internal/class/Name>` — when a
+/// reference field of that class reads back NULL through the getfield helper,
+/// say what the RECEIVER actually is.
+///
+/// Written for the DoHead Generational residual, where
+/// `java/util/concurrent/locks/ReentrantLock.sync` is null at `unlock()` having
+/// been non-null at `lock()` — the slot is live entering the critical section
+/// and zero leaving it, while the owning thread is blocked inside. "A final
+/// field reads null" has several very different causes and the crash site
+/// cannot tell them apart:
+///
+///   * the receiver is a STALE copy the collector already evacuated and the
+///     sweep then zeroed (every slot reads zero, and the header may still
+///     resolve) — a missed frame update, not a missed mark;
+///   * the receiver is memory the collector RECLAIMED and handed to a new
+///     allocation that has not run its constructor yet;
+///   * the receiver is genuinely live and its slot was overwritten by
+///     something writing through a stale address.
+///
+/// Those are distinguishable at the read, and nowhere else: `reclaimed_hole_at`
+/// answers free-list membership outright, an all-zero body separates "swept
+/// corpse" from "live object with one null field", and `live_holders_of` names
+/// who still points at it.
+///
+/// Reached only with `CRATONVM_JIT_GETFIELD_HELPER=1`, since the inline
+/// getfield never calls this helper.
+fn null_field_provenance_watch() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_NULL_FIELD_PROVENANCE").ok())
+        .as_deref()
+}
+
+/// Bounded: a reclaimed span is read by many call sites and the first few
+/// carry all of it.
+static NULL_FIELD_PROVENANCE_REPORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cold]
+fn note_null_field_provenance(vm_ptr: i64, obj_ptr: i64, field_index: usize) {
+    let Some(want) = null_field_provenance_watch() else {
+        return;
+    };
+    if obj_ptr == 0 {
+        return;
+    }
+    // SAFETY: the helper's own contract — `vm_ptr` is the live `SharedVm` the
+    // JIT was compiled against, and this runs on the same thread.
+    let shared: &crate::vm::SharedVm = unsafe { &*(vm_ptr as *const crate::vm::SharedVm) };
+    let addr = obj_ptr as usize;
+    let obj = unsafe { cratonvm_types::ObjectRef::from_raw(obj_ptr as *mut u8) };
+    if shared.mem.heap.is_object_address(addr).is_none() {
+        return;
+    }
+    let cid = shared.mem.heap.class_id_of(obj);
+    let name = {
+        let Some(cm) = shared.classes.class_manager.try_read() else {
+            return;
+        };
+        match cm.get_class(cid) {
+            Some(c) => c.name.to_string(),
+            None => return,
+        }
+    };
+    // EXACT, not `contains`. The first run of this probe watched
+    // "java/util/concurrent/locks/ReentrantLock" and matched
+    // `ReentrantLock$NonfairSync` too, whose `head`/`tail`/`exclusiveOwnerThread`
+    // are LEGITIMATELY null on an idle lock — 64 reports in a round with zero
+    // failures, and they exhausted the report cap before anything real could be
+    // seen. A watch that fires on healthy code is worse than no watch.
+    if name != want {
+        return;
+    }
+    if !matches!(
+        shared.mem.heap.get_field(obj, field_index),
+        cratonvm_types::Value::Object(None)
+    ) {
+        return;
+    }
+    let n = NULL_FIELD_PROVENANCE_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 32 {
+        return;
+    }
+    let nf = shared.mem.heap.num_fields(obj);
+    let all_zero = (0..nf).all(|i| {
+        matches!(
+            shared.mem.heap.get_field(obj, i),
+            cratonvm_types::Value::Object(None) | cratonvm_types::Value::Int(0)
+        )
+    });
+    let hole = shared.mem.heap.reclaimed_hole_at(addr);
+    let holders = shared.mem.heap.live_holders_of(addr, 6);
+    eprintln!(
+        "[null-field] {name}.slot{field_index} read NULL — receiver=0x{addr:x}          class_id={} num_fields={nf} whole_body_zero={all_zero}(degenerate when num_fields==1) reclaimed_hole={hole:?}          live_holders={holders:x?} (report {}/8)",
+        cid.as_u32(),
+        n + 1
+    );
+}
+
 fn getfield_receiver_census_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -8804,6 +8903,9 @@ unsafe fn jit_getfield_impl(
     }
     if getfield_receiver_census_enabled() {
         note_getfield_receiver_shape(obj_ptr, field_index);
+    }
+    if null_field_provenance_watch().is_some() {
+        note_null_field_provenance(vm_ptr, obj_ptr, field_index as usize);
     }
     if compact_inline_dbg() {
         dump_getfield_guard_failure(obj_ptr);

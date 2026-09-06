@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-527 tokens.
+528 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -396,6 +396,7 @@ export inherited from a parent shell.
 | `nocode` | `CRATONVM_DBG_NOCODE` |
 | `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
+| `null-field-provenance` | `CRATONVM_DBG_NULL_FIELD_PROVENANCE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
 | `a5-engagement` | `CRATONVM_DBG_A5_ENGAGEMENT` |

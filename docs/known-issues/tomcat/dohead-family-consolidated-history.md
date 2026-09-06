@@ -68,3 +68,48 @@ Ran the complete 651-class Tomcat suite under all three GC backends in parallel 
 - **This is already mitigated at the product level**: ZGC has been the shipped default since 2026-08-10 specifically because it cannot exhibit this class of fallback. Anyone hitting this is doing so under an explicit `-XX:+UseGenerationalGC`.
 - **A real fix, if ever undertaken, is the same one named throughout Part 2**: precise oop maps or a shadow stack for compiled frames, so `moving_young_coverage_complete()` can actually certify what it currently has to assume. That is a substantially larger undertaking than anything in Part 1, and nothing in this investigation's history suggests a smaller intervention (timeout increases, isolated fallback-reason fixes like `innermost_frame_method`) will clear the DoHead family specifically — the Spring Boot investigation already found that two of its four classes needed a collector switch, not a fix, for exactly this reason.
 - **Not chased further here**: per-fallback-reason attribution specific to the DoHead family (which of the seven reasons dominates *this* class shape, the way the Spring Boot doc did for its four classes) would be the natural next step if someone wants to reduce fallback volume rather than switch collectors — not attempted in this session.
+
+### 2026-09-06 (later the same day): the residual NO LONGER REPRODUCES
+
+Interleaved control -- one box, the same minutes, 4-way parallelism, arms
+alternated round by round, 900 s cap on both so a hang cannot pass as a pass:
+
+| arm | runs | OK | non-OK | truncated | NPE lines |
+|---|---:|---:|---:|---:|---:|
+| the binary that measured 5/24 earlier today | 24 | 22 | **2** | 0 | 2 |
+| current `dev` | 24 | **24** | **0** | 0 | 0 |
+
+Both surviving failures on the old binary are this residual's exact signature
+(`Http2TestBase$TestInput.fill:1094`). Mean completed-run duration is
+equivalent -- 101.1 s old, 99.0 s new -- so the newer binary is not passing by
+running slower or by dying early, and neither arm truncated. Counting an
+earlier plain-vs-instrumented sweep on the same build, current `dev` is
+**0 failures in 72 runs**.
+
+**This is a REPRODUCTION result, not a root cause.** Two limits belong with it:
+
+* The old binary's rate TODAY is 2/24 (~8%) against 5/24 (~21%) when this
+  residual was characterised. The host is less sensitive than it was, so 72
+  clean runs prove less than 72 runs at the earlier sensitivity would.
+* **No commit is credited.** `dev` took many GC commits in the interval,
+  including one that landed a moving-young root cause and was then WITHDRAWN by
+  its author. Attributing the disappearance to any of them would be a guess.
+
+**The shape to look for if it returns**, since the characterisation cost more
+than the disappearance did: the victim is
+`java.util.concurrent.locks.ReentrantLock.sync` -- null at `unlock()` and
+non-null at `lock()`, so the slot is live entering the critical section and zero
+leaving it, while the owning thread is blocked INSIDE it. Seen on two unrelated
+instances and paths (`NioSocketImpl.readLock` on the HTTP/2 client read,
+`LinkedBlockingQueue.takeLock` under `TaskQueue.take` on a worker). Gated on
+young relocation, and Generational-specific rather than moving-young-generic:
+G1 relocates young objects and never exhibited it.
+
+**Instruments that make this findable again**, because the default symptom names
+the wrong object: JUnit sees only a messageless NPE at `TestInput.fill:1094`,
+which reads as a zeroed `private final InputStream` and is not.
+`CRATONVM_DBG_NPE_NONE=1` shows the raise is Rust-side with `fill` as the
+DEEPEST Java frame; `CRATONVM_DBG_STTRACE=1` recovers the compiled frames that
+already left the stack, whose deepest is `ReentrantLock.unlock`; and
+`ReentrantLock.unlock()` is `sync.release(1)`. Without the STTRACE snapshot the
+six JDK frames holding the answer are invisible.

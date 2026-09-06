@@ -784,6 +784,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "nocode", on_key: Some("CRATONVM_DBG_NOCODE"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "nonmoving-reclaim", on_key: None, off_key: Some("CRATONVM_DBG_NO_NONMOVING_RECLAIM"), off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None, since: "2026-05-20" },
+    E { group: Group::DBG, token: "null-field-provenance", on_key: Some("CRATONVM_DBG_NULL_FIELD_PROVENANCE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None, since: "2026-08-05" },
     E { group: Group::DBG, token: "a5-engagement", on_key: Some("CRATONVM_DBG_A5_ENGAGEMENT"), off_key: None, off_word: None, since: "2026-08-18" },
