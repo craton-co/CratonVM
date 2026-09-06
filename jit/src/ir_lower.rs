@@ -19915,7 +19915,10 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
+                // No `defer_publish`: this fixture drives the memory path only
+                // (`src_node_of`/`phi_of_dst` are empty, so nothing publishes a
+                // register and nothing can alias one).
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &[], &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 
