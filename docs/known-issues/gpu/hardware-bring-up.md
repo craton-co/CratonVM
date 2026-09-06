@@ -11,8 +11,8 @@ step 5, not step 1 — the value is in the first run, not in the automation.
 **First full run: 2026-09-05**, RTX 2060 (sm_75), CUDA 13.3, driver 610.88,
 Windows 11, JDK 25.0.3, `cratonvm-cli --features gpu-driver` at `b82da0607`.
 Steps 1-4 all executed. Results are recorded inline below. That run found
-two things: [a concurrent-dispatch wrong answer](concurrent-dispatch-wrong-answer-20260905.md)
-(two races, both fixed the same day) and a gate that had been switched off
+two things: a concurrent-dispatch wrong answer (two races in `input_cache`,
+both fixed the same day and both re-verified on 2026-09-06) and a gate that had been switched off
 for two months on a stale premise (step 3, gate e).
 Enrolment (step 5) is still not done.
 
@@ -232,14 +232,21 @@ same `CV`/`JDK`/`TG`:
 same day: a lost filter bit in `insert` (12/30 → 0/30), and — visible only
 once that was fixed — a compiled-store drain that cleared its `DIRTY`
 flags before performing the eviction they authorised (12/300 → 0/300).
-Full write-up, including the first diagnosis that was wrong and how it was
-refuted:
-[concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md).
+The full write-up — including the first diagnosis, which was wrong, and the
+cheap measurements that refuted it before any code was read — was retired
+into the internal tree on 2026-09-06, once both races were fixed and
+verified. `git log --diff-filter=D -- docs/known-issues/gpu/` finds it.
 
 Note what this meant for the ordering advice above: the gate battery was
 fully green while a real correctness defect sat one script away.
 `ci-gate.sh` has no concurrent-dispatch shape at all. That is the whole
 argument for step 3b.
+
+And it happened a second time, differently, on 2026-09-06: the compiled
+caller stopped offloading any kernel declared in ANOTHER CLASS from its
+caller, worth 7.5x, with every gate in the battery green throughout —
+because every GPU fixture in this tree happens to declare its kernels
+beside its driver. `ci-gate.sh` gate f is the fixture that can see it.
 
 ## 4. What you can check WITHOUT the device, to isolate a failure
 
@@ -271,8 +278,7 @@ which".
 
 **Still not done as of 2026-09-05, and nothing in the tree is now blocking
 it.** The blocker that stood here — a red first run caused by the
-`concurrent` scenario — is gone. Both races behind it are fixed
-([concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md)),
+`concurrent` scenario — is gone. Both races behind it are fixed,
 the scenario is 0/300 with the amplifier and 0/100 on each of the three
 collectors, and the whole battery is green on this box. Enrolment is now
 purely the operational task it was always described as.
@@ -303,8 +309,8 @@ is the useful part of the estimate.
    `--gpu-min-work` still defaults to 4096, which those pages show is 3-5x
    too eager at ops=1, so the open part is what replaces it, not what it costs.
 4. ~~**The concurrent-dispatch wrong answer.**~~ **Settled** — two races,
-   both fixed on 2026-09-05:
-   [concurrent-dispatch-wrong-answer-20260905.md](concurrent-dispatch-wrong-answer-20260905.md).
+   both fixed on 2026-09-05, re-verified 2026-09-06, page retired into the
+   internal tree.
    Worth reading for the method rather than the bugs: the first diagnosis
    was wrong and was refuted by cheap switch-flipping before any code was
    read, and the second race was invisible until the first was fixed. Note

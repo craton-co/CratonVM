@@ -113,8 +113,9 @@ Measured, same census, same class:
      pool_len=1 — but 2017 of 2025 non-CSet Old regions still have room for it.
 ```
 
-A **forty-eight byte** promotion failing with 2017 usable regions, 16 such
-reports in the parallel arm and **0 in the serial arm** of the same census.
+A **forty-eight byte** promotion failing with 2017 usable regions. Same binary,
+arms interleaved, parallel against `CRATONVM_G1_PARALLEL_EVAC=0`: **14 such
+reports in the parallel arm, 0 in the serial arm.**
 That is why the two arms diverge: one of them spends the pause copying and the
 other spends it failing to copy, and the failure path is the fragile one.
 
@@ -125,10 +126,22 @@ deliberately NOT a TLAB — a TLAB owns its region's cursor and `retire_tlab`
 STORES it, which would discard a shared bump — and it skips the pool and the
 CSet for that reason and for Phase 5's.
 
-Same binary, arms interleaved: **16 pool-exhaustion events and 8
-`compact reference walk REFUSED a field offset past the holder's own body`
-reports with the fallback OFF, 0 and 0 with it ON.** The corruption signal
+A SECOND census, again one binary with the arms interleaved, this time the
+fallback off against on, three repetitions each:
+
+| arm | pool-exhaustion reports |
+|---|---|
+| `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST=0` | 16, 19, 14 |
+| default | 9, 0, 0 |
+
+and the `compact reference walk REFUSED a field offset past the holder's own
+body` count goes 8 with the fallback off to 0 with it on. The corruption signal
 tracks the exhaustion, which is the causal chain this page was looking for.
+
+(These are two SEPARATE censuses and the numbers must not be spliced: the
+parallel-vs-serial 14/0 above and the off-vs-on table here were measured in
+different runs, and an earlier revision of this page quoted "16 … and 0 in the
+serial arm" by taking one number from each.)
 
 The clincher is what the exhaustion report says on each arm. It prints how much
 room the serial arm WOULD have found at that instant, and after the fallback has

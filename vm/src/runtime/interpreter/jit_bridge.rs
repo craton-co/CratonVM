@@ -4037,6 +4037,29 @@ pub(super) fn try_osr(
         // Taken BEFORE the construction below re-captures a stack the compiled
         // frames have already left — see `attach_snapshotted_trap_frames`.
         let npe_snapshot = crate::jit::helpers::take_jit_pending_trap_frames();
+        // The JEP 358 action code the null-check stub recorded. Consuming it
+        // here is what `take_jit_pending_npe_action`'s own contract says the
+        // drain does ("the interpreter drain calls this right after
+        // `take_jit_pending_npe` to build the action-only message") and no
+        // drain did until 2026-09-06 — `jit_npe_message_gated` had no
+        // production caller at all.
+        //
+        // LATENT, and deliberately so: measured 2026-09-06, this cannot change
+        // an observable message today. The ONLY setter of an action code is
+        // `jit_npe_with_action`, which pairs it with `set_jit_deopt_pending`,
+        // so a recorded action always bails to the interpreter, which replays
+        // the trapping bytecode and raises the FULLER message with the
+        // `because "…" is null` clause (HotSpot-exact — see
+        // `vm/tests/jit_npe_message_from_compiled_code.rs`). The other setter,
+        // `stash_jit_pending_npe_action`, has no callers. So every NPE that
+        // actually reaches this drain carries `NONE`, and
+        // `jit_action_message(NONE)` is `None`.
+        //
+        // Wired anyway because the alternative is a silent drop: a future stub
+        // that records an action WITHOUT deopting would otherwise lose it here
+        // with nothing to notice, which is exactly how this machinery came to
+        // be fully built, unit-tested and connected to nothing.
+        let npe_action = crate::jit::helpers::take_jit_pending_npe_action();
         // Round-9/10 HIGH fix: route the NPE through the OSR'd method's own
         // exception table rather than losing it. The OSR target IS the method
         // whose code raised the NPE, so this frame's table is the one to
@@ -4055,7 +4078,11 @@ pub(super) fn try_osr(
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException {
+                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                    npe_action,
+                ),
+            },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_trap_frames(
@@ -11386,7 +11413,11 @@ pub(super) fn execute_jit_call(
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException {
+                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                    sig.npe_action,
+                ),
+            },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_trap_frames(
@@ -11905,7 +11936,11 @@ pub(super) fn execute_jit_call_decoded(
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException {
+                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                    sig.npe_action,
+                ),
+            },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_trap_frames(
@@ -12321,7 +12356,11 @@ pub(super) fn execute_jit_call_oneshot(
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
-            RuntimeError::NullPointerException { message: None },
+            RuntimeError::NullPointerException {
+                message: crate::runtime::exceptions::helpful_npe::jit_npe_message_gated(
+                    sig.npe_action,
+                ),
+            },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 crate::runtime::exceptions::attach_snapshotted_trap_frames(

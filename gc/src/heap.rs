@@ -4764,7 +4764,7 @@ mod tests {
         let _g = g30_lock();
         let site = FieldCoercionSite::store(None, 0);
         let before = field_coercion_loss_total();
-        for d in [b'J', b'D', b'F', b'I', b'B', b'C', b'S', b'Z', b'L', b'['] {
+        for d in *b"JDFIBCSZL[" {
             coerce_field_value_for_slot(Value::Uninitialized, d, site);
         }
         assert_eq!(
@@ -4854,7 +4854,7 @@ mod tests {
         // round-trip. Signalling patterns are deliberately not used.
         for l in [0i64, 1, 5, -1, 0x0123_4567_89AB_CDEF, i64::MIN] {
             let as_double = Value::Double(f64::from_bits(l as u64));
-            for d in [b'I', b'B', b'C', b'S', b'Z'] {
+            for d in *b"IBCSZ" {
                 assert!(
                     same(c(Value::Long(l), d), c(as_double, d)),
                     "a long and the untagged slot it decodes from must agree \
@@ -4901,7 +4901,7 @@ mod tests {
         let l = 5i64;
         let as_double = Value::Double(f64::from_bits(l as u64));
 
-        for d in [b'I', b'J', b'D'] {
+        for d in *b"IJD" {
             assert!(
                 same(c(Value::Long(l), d), c(as_double, d)),
                 "the pair must agree at {}",
@@ -4952,9 +4952,7 @@ mod tests {
             Value::ReturnAddress(9),
         ];
         for v in values {
-            for d in [
-                b'J', b'D', b'F', b'I', b'B', b'C', b'S', b'Z', b'L', b'[', b'V',
-            ] {
+            for d in *b"JDFIBCSZL[V" {
                 let once = coerce_field_value_for_slot(v, d, site);
                 let twice = coerce_field_value_for_slot(once, d, site);
                 assert!(

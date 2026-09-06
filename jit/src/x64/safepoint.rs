@@ -1222,8 +1222,8 @@ impl Compiler {
                 "[SHADOW2] method={} pc={} stack={:?} marks={:?} local_reached={} local_mask={:#x} homes={:?}",
                 self.method_label,
                 self.cur_bc_pc,
-                &self.stack,
-                &self.stack_oop_marks,
+                self.stack,
+                self.stack_oop_marks,
                 reached,
                 lm,
                 homes
