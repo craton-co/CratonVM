@@ -21072,75 +21072,103 @@ mod tests {
         // Large enough that one step is hundreds of batches, small enough to
         // fit an 8 MB heap several times over.
         const GRAYS: usize = 20_000;
-        let gc = Arc::new(make_collector());
-        let grays: Vec<usize> = (0..GRAYS)
-            .map(|_| gc.alloc_object(ClassId::new(1), 0).as_ptr() as usize)
-            .collect();
-        gc.start_concurrent_mark(&stw());
-        gc.mark_worklist.lock().extend(grays);
+        // An attempt is INCONCLUSIVE when the marker drains the whole step
+        // before this thread can queue behind it. That is rare (we queue after
+        // two batches of ~GRAYS/MARK_LOCK_BATCH) and it is not a failure, so
+        // try again -- but never silently pass: running out of attempts is red.
+        const ATTEMPTS: usize = 8;
+        let mut observed: Option<(usize, usize)> = None;
+        for _ in 0..ATTEMPTS {
+            let gc = Arc::new(make_collector());
+            let grays: Vec<usize> = (0..GRAYS)
+                .map(|_| gc.alloc_object(ClassId::new(1), 0).as_ptr() as usize)
+                .collect();
+            gc.start_concurrent_mark(&stw());
+            gc.mark_worklist.lock().extend(grays);
+            let before = gc.mark_lock_batches.load(Ordering::Relaxed);
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(AtomicBool::new(false));
-        let acquisitions = Arc::new(AtomicUsize::new(0));
-        let observer = {
-            let gc = Arc::clone(&gc);
-            let stop = Arc::clone(&stop);
-            let started = Arc::clone(&started);
-            let acquisitions = Arc::clone(&acquisitions);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    {
-                        let _exclusive = gc.regions.write();
-                        acquisitions.fetch_add(1, Ordering::Relaxed);
-                    }
-                    started.store(true, Ordering::Relaxed);
-                    std::thread::yield_now();
-                }
-            })
-        };
+            // THE MARKER RUNS ON ITS OWN THREAD AND THIS THREAD IS THE WAITING
+            // WRITER, which is the whole of the repair.
+            //
+            // The previous shape had it the other way round: a spawned observer
+            // POLLED `regions.write()` in a loop while this thread ran the step,
+            // and the assertion was on how many times it got in. That asked
+            // whether a competing OS thread was SCHEDULED during a sub-second
+            // step, which is the scheduler's answer, not this collector's -- it
+            // failed in 3 of 6 gc-lib-suite runs on unmodified `dev` at host
+            // load ~20 (2026-09-06), while the same binary passed 40 of 40 when
+            // the test was run alone. An earlier session had already cut the
+            // assertion from `>= 8` to `> 0` for the same reason; `> 0` was the
+            // same defect one notch down.
+            //
+            // Blocking removes the scheduler from the claim. `parking_lot`'s
+            // `RwLock` is task-fair, so a thread parked in `write()` is QUEUED:
+            // the marker's next `read()` lines up behind it and the guard is
+            // handed over at the next batch boundary whether or not this thread
+            // ever gets a time slice in between. And the counter that says WHEN
+            // it was handed over is `mark_lock_batches`, which no scheduler
+            // touches -- while we hold the write guard the marker cannot take a
+            // batch, so the value we read is exactly the count at handoff.
+            let marker = {
+                let gc = Arc::clone(&gc);
+                std::thread::spawn(move || gc.concurrent_mark_step(usize::MAX))
+            };
 
-        // Do not start measuring until the observer has demonstrably run.
-        while !started.load(Ordering::Relaxed) {
-            std::thread::yield_now();
+            // Do not queue until the marker is demonstrably inside the step, or
+            // "it was admitted before the step began" would read as a pass.
+            while gc.mark_lock_batches.load(Ordering::Relaxed) - before < 2
+                && !marker.is_finished()
+            {
+                std::hint::spin_loop();
+            }
+            if marker.is_finished() {
+                let done = marker.join().expect("marker thread");
+                let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - before;
+                // "The step outran us" and "the guard was never dropped" both
+                // arrive here, and only the first is a retry. The batch counter
+                // separates them, so the pre-F-10 regression asserts on the
+                // spot with the message that names it instead of being retried
+                // eight times and reported as an unobservable claim.
+                assert!(
+                    batches >= GRAYS / MARK_LOCK_BATCH,
+                    "the marker drained {GRAYS} grays in {batches} regions-lock                      acquisition(s); at MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at                      least {} - a reading of 1 means the guard is held for the whole step                      again (F-10)",
+                    GRAYS / MARK_LOCK_BATCH
+                );
+                assert!(done, "one unbounded step must drain the whole gray set");
+                continue;
+            }
+
+            let granted_at = {
+                let _exclusive = gc.regions.write();
+                gc.mark_lock_batches.load(Ordering::Relaxed) - before
+            };
+            let done = marker.join().expect("marker thread");
+            let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - before;
+
+            assert!(done, "one unbounded step must drain the whole gray set");
+            // The MAGNITUDE claim, from the same scheduler-free counter: the
+            // marker dropped and retook the guard once per batch. Deterministic,
+            // so it is checked on every attempt.
+            assert!(
+                batches >= GRAYS / MARK_LOCK_BATCH,
+                "the marker drained {GRAYS} grays in {batches} regions-lock acquisition(s); at                  MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at least {} - a reading of 1                  means the guard is held for the whole step again (F-10)",
+                GRAYS / MARK_LOCK_BATCH
+            );
+            observed = Some((granted_at, batches));
+            break;
         }
-        acquisitions.store(0, Ordering::Relaxed);
 
-        // ONE step, unbounded budget: pre-F-10 this held the lock from the
-        // first gray to the last.
-        let batches_before = gc.mark_lock_batches.load(Ordering::Relaxed);
-        let done = gc.concurrent_mark_step(usize::MAX);
-        let during_the_step = acquisitions.load(Ordering::Relaxed);
-        let batches = gc.mark_lock_batches.load(Ordering::Relaxed) - batches_before;
-
-        stop.store(true, Ordering::Relaxed);
-        observer.join().expect("observer thread");
-
-        assert!(done, "one unbounded step must drain the whole gray set");
-        // THE CLAIM IS ADMISSION, NOT THROUGHPUT. This asserted `>= 8` and
-        // failed 3 runs in 5 ALONE on an idle host (2026-09-05), and again in
-        // `cargo test --workspace`. The observer is a competing OS thread, so
-        // how MANY times it wins the lock inside one sub-second step is the
-        // scheduler's answer, not this collector's. Pre-F-10 the count is 0 and
-        // stays 0 however the threads interleave, which is what makes `> 0` the
-        // whole of the property: the marker let a waiting writer in before the
-        // step ended.
-        assert!(
-            during_the_step > 0,
-            "a competing writer NEVER got the region table while the marker drained {GRAYS} \
-             objects — that is the pre-F-10 behaviour, the marker holding the guard for the \
-             entire step"
+        // THE ADMISSION CLAIM. Pre-F-10 the marker holds the guard from the
+        // first gray to the last, so a writer that queues mid-step is served
+        // only when the step ends and `granted_at == batches`. Post-F-10 it is
+        // served at the next batch boundary, hundreds of batches short of the
+        // end. There is no thread race left in either reading.
+        let (granted_at, batches) = observed.expect(
+            "every attempt was inconclusive: the marker finished the whole step before this              thread could queue behind it, so the admission claim was never observed",
         );
-        // And the magnitude claim, taken from a counter the scheduler does not
-        // touch: the marker dropped and retook the guard once per batch. This
-        // is deterministic where the thread-race count is not, so a regression
-        // that reduced the drop RATE without reaching zero still fails here —
-        // which is the part `> 0` alone would have given up.
         assert!(
-            batches >= GRAYS / MARK_LOCK_BATCH,
-            "the marker drained {GRAYS} grays in {batches} regions-lock acquisition(s); at \
-             MARK_LOCK_BATCH={MARK_LOCK_BATCH} it must take at least {} — a reading of 1 means \
-             the guard is held for the whole step again (F-10)",
-            GRAYS / MARK_LOCK_BATCH
+            granted_at < batches,
+            "a writer that queued after 2 of {batches} batches was not served until batch              {granted_at} - the marker held the region table for the entire step (F-10)"
         );
     }
 
