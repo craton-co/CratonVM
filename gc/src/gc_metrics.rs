@@ -1043,6 +1043,18 @@ pub fn collector_decision_report() -> String {
                 "[GC] decision history: moving_cycles_under_live_jit={cycles} \
                  coverage_fallbacks={fallbacks}"
             ));
+            // The peer ledger only runs when `peer_depth > 0`. Report the zeros
+            // beside the fallbacks, because a cycle that skipped the ledger and
+            // a cycle the ledger accepted are indistinguishable in every other
+            // counter here -- and only one of them was actually checked.
+            let pz = crate::gc_quiescence::PEER_DEPTH_ZERO_TOTAL.load(Ordering::Relaxed);
+            let pz_torn = crate::gc_quiescence::PEER_DEPTH_ZERO_TORN.load(Ordering::Relaxed);
+            let pz_quiet = crate::gc_quiescence::PEER_DEPTH_ZERO_GLOBAL_ZERO.load(Ordering::Relaxed);
+            s.push('\n');
+            s.push_str(&format!(
+                "[GC] peer ledger skipped: peer_depth_zero={pz} \
+                 (global_zero={pz_quiet} torn_global_lt_local={pz_torn})"
+            ));
             s
         }
     };
