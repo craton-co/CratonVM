@@ -25695,8 +25695,24 @@ fn try_compile_inner(
                     // refusal. See `ir_evidence` for the measurement that
                     // motivates the default and for why the list is a judgment.
                     let evidence = ir_evidence::take();
+                    // EXEMPTION, and it is not a special case so much as the
+                    // gate's own premise failing: "if C2 applied nothing C1
+                    // lacks, C1's body is at least as good" assumes there IS a
+                    // C1 body. `promote_scalar_selfrec_to_ir` reaches this tier
+                    // WITHOUT a predecessor -- deliberately, because compiling
+                    // the narrow `static int f(int)` self-recursion shape as C1
+                    // first strands recursive frames in the slower body -- and
+                    // `fib` is pure arithmetic, so it produces no evidence at
+                    // all. Refusing it would send it to single-pass, which is
+                    // the exact outcome that door exists to prevent.
+                    //
+                    // Asked with the SAME predicate the VM used to reach the
+                    // door (`scalar_selfrec_ir_would_engage`), so the two
+                    // cannot disagree about which methods it covers.
+                    let selfrec_no_predecessor =
+                        scalar_selfrec_ir_would_engage(code, code_len, &cached.method_descriptor);
                     let lowered = match lowered {
-                        Some(cm) if !ir_evidence::accept(evidence) => {
+                        Some(cm) if !selfrec_no_predecessor && !ir_evidence::accept(evidence) => {
                             if ir_stage_reporting() {
                                 eprintln!(
                                     "[ir] acceptance {}.{}{}: REFUSED (evidence: {}) -- keeping the single-pass body",

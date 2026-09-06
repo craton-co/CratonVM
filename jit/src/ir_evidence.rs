@@ -176,6 +176,16 @@ pub enum AcceptPolicy {
     Never,
 }
 
+/// One exemption exists and it is a failure of the gate's PREMISE rather than a
+/// special case: "if C2 applied nothing C1 lacks, C1's body is at least as
+/// good" assumes there is a C1 body. `promote_scalar_selfrec_to_ir` reaches the
+/// optimizing tier with no predecessor -- deliberately, because compiling the
+/// narrow `static int f(int)` self-recursion shape as C1 first strands
+/// recursive frames in the slower body -- and `fib` is pure arithmetic, so it
+/// produces no evidence at all. `try_compile_inner` asks
+/// `scalar_selfrec_ir_would_engage`, the same predicate the VM used to reach
+/// that door, and skips the gate for it.
+///
 /// `CRATONVM_C2_ACCEPT=always|evidence|never`, default `evidence`.
 ///
 /// **This is a policy, and the default is a judgment made on one workload.**
