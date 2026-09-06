@@ -2495,6 +2495,46 @@ fn a5_census_enabled() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A5_CENSUS").is_some())
 }
 
+/// How many times the residue filter DECLINED a hit, and how many heap objects
+/// those declines chose not to conservatively mark.
+///
+/// The filter exists to stop a returned frame's leftovers from pinning the
+/// whole native stack (the H2 `FileNioMapped.unMap` timeout). Declining is
+/// therefore the safe direction for RETENTION and the unsafe direction for
+/// LIVENESS: the band it skips is the only thing this site would have marked.
+/// Nothing counted either half, so "the filter is why that object was swept"
+/// could only ever be an inference.
+pub static UNREG_DECLINED: AtomicUsize = AtomicUsize::new(0);
+/// Objects the declines above chose not to mark — see [`UNREG_DECLINED`].
+pub static UNREG_DECLINED_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot of the declined-band census: `(declines, objects not marked)`.
+pub fn unreg_declined_census() -> (usize, usize) {
+    (
+        UNREG_DECLINED.load(Ordering::Relaxed),
+        UNREG_DECLINED_ROOTS.load(Ordering::Relaxed),
+    )
+}
+
+/// `CRATONVM_DBG_UNREG_DECLINED=1` — name the compiled body each declined hit
+/// belongs to, and list the heap objects the decline is not marking.
+///
+/// The body's `method_label` is the question this census exists to answer: a
+/// declined hit in a method whose frame is genuinely live means an entry door
+/// that pushed no `JitEntryGuard`, and the repair is to register it. A declined
+/// hit in a method that has demonstrably returned means the band is being kept
+/// alive for some other reason, and the repair is elsewhere.
+///
+/// Costs a second walk of the band (the `scan_one_frame` the decline skipped,
+/// into a throw-away vector), so it is opt-in.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn unreg_declined_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNREG_DECLINED").is_some()
+    })
+}
+
 /// Kill switch for the residue filter on the unregistered-JIT-frame probe --
 /// see its call site in `scan_active_jit_frames`. Set it to accept every hit
 /// again, as before the filter existed.
@@ -6046,6 +6086,56 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                                 || unreg_jit_accept_residue()
                         }
                     };
+                    // WHAT THE DECLINE COSTS. `accept == false` with a hit
+                    // means the residue filter judged the band to hold no live
+                    // compiled frame — and that band is the only thing this
+                    // site would have conservatively marked. Under
+                    // `CRATONVM_DBG_UNREG_DECLINED` say which body the hit
+                    // belongs to and which objects the decline is dropping, so
+                    // a `CRATONVM_DBG_SWEEP_ZERO` victim can be LOOKED UP here
+                    // rather than attributed by argument.
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    if !accept {
+                        if let Some((hit_slot, word)) = probe {
+                            let n = UNREG_DECLINED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if unreg_declined_dbg() {
+                                let mut would: Vec<ObjectRef> = Vec::new();
+                                scan_one_frame(search_lo, high, heap, &mut would);
+                                UNREG_DECLINED_ROOTS
+                                    .fetch_add(would.len(), Ordering::Relaxed);
+                                // Every address, every time: the victim this is
+                                // meant to explain is named by a DIFFERENT probe
+                                // after the fact, so a rate-limited sample of
+                                // the list is a list that will not contain it.
+                                let mut addrs = String::new();
+                                for o in would.iter() {
+                                    addrs.push_str(&format!("{:x},", o.as_ptr() as usize));
+                                }
+                                let label = match cratonvm_jit::pin_jit_code_range_owner(word) {
+                                    Some(cm) => {
+                                        let entry = cm.entry_ptr() as usize;
+                                        if cm.method_label.is_empty() {
+                                            format!("<unlabelled>+0x{:x}", word - entry)
+                                        } else {
+                                            format!(
+                                                "{}+0x{:x}",
+                                                cm.method_label,
+                                                word - entry
+                                            )
+                                        }
+                                    }
+                                    None => "<body reclaimed>".to_string(),
+                                };
+                                eprintln!(
+                                    "[unreg-declined] #{n} body={label} slot=0x{hit_slot:x} \
+                                     word=0x{word:x} residue_hi=0x{:x} chain_len={chain_len} \
+                                     band=[0x{search_lo:x},0x{high:x}) unmarked={} objs={addrs}",
+                                    jit_residue_hi(),
+                                    would.len(),
+                                );
+                            }
+                        }
+                    }
                     if accept {
                         // A hit anywhere in the checked band still conservatively
                         // marks (and flags) the FULL `[search_lo, high)` span —
