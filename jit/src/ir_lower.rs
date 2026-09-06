@@ -900,23 +900,43 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
-
-    /// `gp_reg_owner[r]` = the node whose value physically occupies GP
-    /// register `r` right now, as emission walks the body.
+    /// `gp_reg_owner[r]` = the node whose value GP register `r` currently
+    /// holds, or `None` before anything published into it.
     ///
-    /// `gp_reg_live` alone cannot answer that. The residency plan hands ONE
-    /// physical register to any number of values whose ranges do not overlap
-    /// (`plan_slots` only demotes a pair whose ranges DO overlap), so
-    /// `gp_reg_of` is a many-to-one map -- and `gp_reg_live` was set at each
-    /// value's publish and never cleared. Once two values shared a register,
-    /// both read back as "resident in it" forever, and the second one's
-    /// publish silently made the first one's `resident_gpr` a lie.
+    /// `gp_reg_live` is indexed by NODE, so on its own it can only say "node
+    /// `id` was published at some point" -- never "and nobody has overwritten
+    /// its register since". The publish sites' shared comment argued that
+    /// nothing could ("the allocator gives a register to one value at a time
+    /// over its live range"), and that is true of two values whose live ranges
+    /// overlap. It is NOT true across an edge: a phi's live range BEGINS at the
+    /// edge, so the allocator may hand it the register of a value whose range
+    /// ENDS there -- and `emit_phi_copies` reads the source values and
+    /// publishes the phis into the SAME sequence of instructions.
     ///
-    /// Every write to a GP register goes through `mark_gp_reg_live`, so
-    /// evicting the previous owner there is enough to keep the invariant
-    /// `resident_gpr` actually needs: *this node is the CURRENT occupant of
-    /// its register*. Sixteen entries because `IR_LOWER_LS_GPRS` is a subset
-    /// of the sixteen 64-bit GPRs.
+    /// The resulting hazard is a wrong value, not a crash. `resolve_parallel_copy`
+    /// orders the edge's copies so every source SLOT is read before it is
+    /// written, and `emit_copy_op`'s comment extends that to registers on the
+    /// grounds that "a register and its home word go stale at the same point".
+    /// They do not, when the register belongs to one node and the word to
+    /// another: an earlier copy's `mov <phi's reg>, rax` publish clobbers a
+    /// register a later copy still reads its own source out of, and
+    /// `resident_gpr` -- consulting only the per-node bit -- hands that register
+    /// back as if it still held the old value.
+    ///
+    /// MEASURED (2026-09-05, `perf/ir-defaults-on-20260905` defaults): Mockito's
+    /// inline mock maker produced class bytes whose forward branch operands were
+    /// left as ASM's `ff ff` placeholder -- `Label.resolve` never patched them,
+    /// because `Label.addForwardReference`'s `forwardReferences[0]` count read
+    /// back wrong -- so CratonVM's verifier rejected the retransformation with
+    /// `branch at offset N targets N-1, which is not an instruction boundary`
+    /// and every `mock()` of a class failed with `MockitoException: Could not
+    /// modify all classes`. 4/4 runs of
+    /// `GrpcChannelBuilderCustomizersTests` under the defaults, 0/8 with either
+    /// `CRATONVM_JIT_IR_PHI_COPY_REGS=0` (removes the publish) or
+    /// `CRATONVM_JIT_LS_CARRY_RELIEF=0` (moves the allocation off the shape).
+    ///
+    /// Sized by the architectural register file, not by the node count: it is a
+    /// map from PHYSICAL register to owner.
     gp_reg_owner: [Option<NodeId>; 16],
     /// Edge copies that read their source out of a register, and edge copies
     /// that published their phi's register from RAX. Both are ENGAGEMENT
@@ -1489,6 +1509,7 @@ impl<'a> Lowerer<'a> {
             gp_reg_of: Vec::new(),
             gp_reg_owner: [None; 16],
             gp_reg_live: Vec::new(),
+            gp_reg_owner: [None; 16],
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
             phi_copy_publish_deferred: 0,
@@ -1538,6 +1559,7 @@ impl<'a> Lowerer<'a> {
         self.reg_live = vec![false; residency.reg_of.len()];
         self.reg_of = residency.reg_of;
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
+        self.gp_reg_owner = [None; 16];
         self.gp_reg_of = residency.gp_reg_of;
         self.gp_reg_owner = [None; 16];
         // Exclusive ownership, computed once: how many values share each
@@ -1853,29 +1875,25 @@ impl<'a> Lowerer<'a> {
         self.gp_reg_of.get(id as usize).copied().flatten()
     }
 
-    /// Mark `id` readable from its assigned GP register, and EVICT whatever
-    /// value was in that register before.
+    /// Mark `id` readable from its assigned GP register — and mark whoever held
+    /// that register before UNREADABLE.
     ///
-    /// The eviction is the whole point. `gp_reg_of` is many-to-one -- the
-    /// allocator reuses one register across values whose ranges do not
-    /// overlap -- so writing `id` into register `r` is exactly the instant the
-    /// previous occupant of `r` stops being readable from it. Without this,
-    /// `gp_reg_live` was monotone and `resident_gpr` kept answering with a
-    /// register another value had since taken over.
+    /// The second half is the whole of the interlock. Setting the per-node bit
+    /// says "id's value is in its register"; without dropping the previous
+    /// owner's bit, `resident_gpr` goes on answering that register for a node
+    /// whose value this very instruction has just overwritten. See
+    /// [`Self::gp_reg_owner`] for the edge that makes two nodes share one
+    /// register while both are still being read, and for what it produced.
     ///
-    /// Landed with the `PHI_COPY_REGS` reproducer (Byte Buddy's
-    /// `net/bytebuddy/jar/asm/Label.resolve` and `ClassReader.readCode`,
-    /// through Spring Boot's `NestedUrlConnectionTests`): the phi-copy edge
-    /// read is the first reader that asks about a value far from its own
-    /// definition, which is where a stale answer becomes wrong code rather
-    /// than a missed optimisation.
+    /// A node re-published into its own register is not a transfer and clears
+    /// nothing; that is the ordinary definition-site case and the common path.
     fn mark_gp_reg_live(&mut self, id: NodeId) {
-        if let Some(reg) = self.gp_reg_of.get(id as usize).copied().flatten() {
+        if let Some(reg) = self.assigned_gpr(id) {
             if let Some(slot) = self.gp_reg_owner.get_mut(reg as usize) {
-                let prev = slot.replace(id);
-                if let Some(prev) = prev {
-                    if prev != id {
-                        if let Some(cell) = self.gp_reg_live.get_mut(prev as usize) {
+                let previous = slot.replace(id);
+                if let Some(previous) = previous {
+                    if previous != id {
+                        if let Some(cell) = self.gp_reg_live.get_mut(previous as usize) {
                             *cell = false;
                         }
                     }
