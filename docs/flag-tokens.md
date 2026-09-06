@@ -591,7 +591,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-369 tokens.
+370 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -934,6 +934,7 @@ export inherited from a parent shell.
 | `xt-helper-window-discharge` | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` |
 | `xt-pinned-peer-depth` | `CRATONVM_XT_PINNED_PEER_DEPTH` |
 | `xt-pinned-peer-publish-only` | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` |
+| `xt-pinned-peer-unpinnable` | `CRATONVM_XT_PINNED_PEER_UNPINNABLE` |
 | `xt-peer-shadow-scan` | `CRATONVM_XT_PEER_SHADOW_SCAN` |
 | `dbg-stale-frame-words` | `CRATONVM_DBG_STALE_FRAME_WORDS` |
 | `pin-unnamed-frame-refs` | `CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS` |
