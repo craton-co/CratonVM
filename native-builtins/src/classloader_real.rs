@@ -875,7 +875,6 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 /// `ClassLoader.loadClass(String)` for real-JDK mode.

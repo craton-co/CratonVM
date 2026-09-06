@@ -106,23 +106,35 @@ use super::{zgc_corpse_enabled, ZgcRealHeap, ZGC_TLAB_ALIGN};
 /// nothing but set the start bit — at which point this becomes a candidate for
 /// default-on again, against this same measurement.
 ///
-/// # It is not suite-clean either, and that is UNTRIAGED
+/// # It IS suite-clean, as of 2026-09-06 — 92/92, and the reason is one bug
 ///
-/// `regression-suite/run.sh` against the same debug binary, one run each:
+/// This section used to read "it is not suite-clean either, and that is
+/// UNTRIAGED", over five extra failures against the default arm
+/// (`RJitMultiArrayClass`, `RArrayStoreLibrary`, `ROverlaySystemGcStress`,
+/// `RSyncMethodJit`, `RVarHandleAccess`) and a note that five failures need
+/// not be five defects. They were not. Three were closed by unrelated work
+/// between 2026-09-02 and 2026-09-06; the last two were ONE defect, and it was
+/// not in this module.
 ///
-/// * unset (this default): **83 passed, 2 failed** — `RMapResizeGc`,
-///   `RMapGcStress`. The default path is `refill_tlab -> None` with nothing in
-///   this module reachable, so those two are pre-existing on this host and say
-///   nothing about this arm.
-/// * `=1`: **78 passed, 7 failed** — the same two plus `RJitMultiArrayClass`,
-///   `RArrayStoreLibrary`, `ROverlaySystemGcStress`, `RSyncMethodJit`,
-///   `RVarHandleAccess`.
+/// `jit_post_tlab_init` stamped a freshly minted identity hash at raw offset 8
+/// of the object header, which was an `identity_hash_code: i32` field when
+/// that store was written and has been the MARK WORD since 2026-08-07. The
+/// hash went in unshifted, over the two-bit lock-state tag, so three objects
+/// in four came back not-`MARK_NEUTRAL` — read afterwards as thin-locked, as
+/// INFLATED (a monitor pointer synthesised from hash bits: the SIGSEGV) or as
+/// FORWARDED (a relocation target synthesised the same way: the hang).
 ///
-/// Five additional failures, one run each, not yet bisected —
-/// `RArrayStoreLibrary` in particular tripped a harness check-count complaint
-/// rather than an assertion, so five failures are not necessarily five
-/// defects. Whoever picks this up starts there: they are the reason this
-/// cannot be flipped on the strength of a throughput fix alone.
+/// **The arm is what made that reachable, and nothing else can.** The inline
+/// bump calls that helper only when `skip_helper` is false, and `skip_helper`
+/// is `helper_is_noop && !jit_tlab_registration_required()` — registration is
+/// required only here. Every other configuration either skips the helper or
+/// never inlines, so the store was dead code everywhere else in the process.
+/// It is the third defect this arm has exposed rather than caused; see the
+/// two in the module doc's obligation 1.
+///
+/// `regression-suite/run.sh`, release binary, one run each, 2026-09-06:
+/// unset **92/92**, `=1` **92/92**. The remaining reason this is opt-in is the
+/// throughput measurement above, which is unchanged.
 pub(crate) fn zgc_vm_tlab_enabled_by_default() -> bool {
     match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_JIT_TLAB") {
         Some(raw) => {

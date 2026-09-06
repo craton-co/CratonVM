@@ -1,5 +1,37 @@
 # Every blocking `connect` re-resolves the destination hostname, and Windows stalls after a few dozen
 
+**Retirement re-verification, 2026-09-06.** Retired from
+`docs/known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+The fix was re-measured on `dev` at `6430e495f` with a freshly built Windows
+binary, running the page's own falsifier in BOTH directions from ONE binary and
+one probe build — so the repair is attributable to the switch and not to
+anything else that moved in the eight days since:
+
+| arm | destination | result |
+|---|---|---|
+| fix on (default) | `InetAddress.getLoopbackAddress()` → `localhost` | **`CLIENT_OK connected=150`, 1 s** |
+| fix on (default) | `InetAddress.getByName("127.0.0.1")` → literal | `CLIENT_OK connected=150`, 0 s |
+| `CRATONVM_SC_PRERESOLVED=0` | `localhost` | **stalls — last line `[11] connect`, killed at the 150 s cap (rc=124)** |
+
+The third row is the one that matters: with the pre-resolved dial switched off
+on the same binary the stall comes straight back, at a fresh index (`#11` here
+against `#43` on 2026-09-05), which is also a second confirmation of the "no
+fixed threshold" finding below. Each arm got its own HotSpot server process, so
+no arm inherited another's socket state.
+
+Command, verbatim:
+
+```bash
+javac -d probeout probes/WinConnectStallProbe.java
+java  -cp probeout WinConnectStallProbe server 400          # prints PORT=<p>
+                    ./target/release/cratonvm.exe -cp probeout WinConnectStallProbe client <p> 150
+                    ./target/release/cratonvm.exe -cp probeout WinConnectStallProbe client <p> 150 literal
+CRATONVM_SC_PRERESOLVED=0 ./target/release/cratonvm.exe -cp probeout WinConnectStallProbe client <p> 150
+```
+
+---
+
+
 **Status: FIXED 2026-09-05.** Found while building F3's
 acceptance curve for `socket-transfer-per-call-costs-20260904.md`.
 **Not caused by that work** — the exoneration arm is below and is one command.

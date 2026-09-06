@@ -5234,7 +5234,6 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
         },
     );
-    ()
 }
 
 // ===========================================================================
@@ -6034,7 +6033,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return ();
+        return;
     }
     let sock = "java/net/Socket";
 
@@ -6717,7 +6716,6 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
         re1_close_socket(ctx, owner)
     });
-    ()
 }
 
 /// Shut down and forget the TCP stream backing `this`, and mark the socket
@@ -7144,7 +7142,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // surface so real bytecode drives sun/nio/ch/Net. See
     // register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return ();
+        return;
     }
     // Install the plain-`ServerSocket` handler set for native-io's winning
     // `ss_wrapper_*` natives to delegate to (BUG-04). Every method native-io
@@ -7494,7 +7492,6 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ia))))
         },
     );
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -7849,7 +7846,6 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         });
         register_inet_address_object_methods(r, cls);
     }
-    ()
 }
 
 /// Parse the `IA_ADDR` field of an InetAddress mirror and apply `pred`.
@@ -12447,7 +12443,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // this to set custom request headers before `exists()`/`getInputStream()`
     // send the request — `ResourceTests.UrlResourceTests
     // .canCustomizeHttpUrlConnectionForExists[Fallback]`).;
-    ()
 }
 
 // ===========================================================================
@@ -13332,10 +13327,7 @@ fn re5_new_request_builder(
     // it exists, and both are read back through their pins before use. The
     // batch started FIRST is the one unpinned at the end: releasing it releases
     // everything pinned after it.
-    let uri_text = match uri {
-        Some(u) => Some(re5_uri_string(ctx, u)),
-        None => None,
-    };
+    let uri_text = uri.map(|u| re5_uri_string(ctx, u));
     let text_pin = uri_text.map(|t| (ctx.pin_native_root(t), t));
     let b = try_alloc_concurrent_synthetic(
         ctx,
@@ -15418,7 +15410,6 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&text);
         Ok(Some(Value::Object(Some(s))))
     });
-    ()
 }
 
 // ===========================================================================
@@ -18315,7 +18306,6 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let _this = obj_arg(args, 0)?;
         ds_supported_options(ctx)
     });
-    ()
 }
 
 /// The fd of an open `DatagramSocket`, or the JDK's "Socket is closed".
@@ -21806,7 +21796,6 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     crate::phases_late::net_channels::register_http_context_surface(r);
 
     r.alias_class(hs, HS_IMPL_CLASS);
-    ()
 }
 
 // ---------------------------------------------------------------------------

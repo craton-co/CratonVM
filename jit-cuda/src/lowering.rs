@@ -3383,8 +3383,7 @@ mod tests {
         // disagrees copies. Asserting the old shape would forbid the fix.
         let join_label = text
             .lines()
-            .filter(|l| l.trim_start().starts_with("L_body_"))
-            .next_back()
+            .rfind(|l| l.trim_start().starts_with("L_body_"))
             .expect("a join label")
             .trim()
             .to_string();

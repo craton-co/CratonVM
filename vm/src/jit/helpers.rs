@@ -4523,7 +4523,6 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
 // passed through from the interpreter. atype encodes a JVM array element type (T_BOOLEAN..T_LONG).
 // length is the requested array size. The returned i64 is a raw heap pointer to the new array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-
 /// Open a ZGC concurrent mark cycle from a JIT allocation helper, if the
 /// occupancy threshold has been crossed.
 ///
@@ -5057,11 +5056,15 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
 /// Called from JIT-emitted code AFTER the inline TLAB bump has already
 /// claimed `HEADER_SIZE + num_fields * SLOT_SIZE` bytes at `obj_ptr`
 /// and written only the `class_id` field at offset 0. This helper
-/// finishes the header (kind = Object, identity_hash_code, num_slots —
-/// the surrounding bytes are TLAB-zeroed so `mark_word`, `forwarding_ptr`,
-/// `gc_age`, `gc_flags`, etc. are already correctly initialized),
-/// installs primitive-field typed-zero defaults, and registers the
+/// finishes the header (the shape word — the rest of a 16-byte header is
+/// TLAB-zeroed, which is `kind = Object`, `element_type = Reference`,
+/// `gc_age = 0`, `gc_flags = 0` and a `MARK_NEUTRAL` mark word with no
+/// hash), installs primitive-field typed-zero defaults, and registers the
 /// object with the finalizer queue when its class overrides `finalize()`.
+/// It does NOT mint an identity hash: that is installed lazily on first
+/// request, into the mark word, and the store that used to do it here was
+/// writing to a header field deleted on 2026-08-07. See the layout comment
+/// in the body.
 ///
 /// Separating this from `jit_new_object` lets the JIT emit the cheap
 /// bump-pointer prologue inline (~5-7 instructions) and pay a single
@@ -5073,6 +5076,25 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
 /// freshly-bumped TLAB allocation of at least `HEADER_SIZE + num_fields
 /// * SLOT_SIZE` zeroed bytes with `class_id` already written at offset 0.
 /// `num_fields` must match the class metadata.
+/// `CRATONVM_JIT_POST_TLAB_HASH_STAMP`: restore the identity-hash store that
+/// [`jit_post_tlab_init`] made into the mark word until 2026-09-06.
+///
+/// A BISECTION LEVER, not a tuning knob — what it restores is the defect, so
+/// that the before and after of its fix are two runs of one binary rather than
+/// two binaries (`docs/` has the general argument; the specific one is that a
+/// crash reachable only on `CRATONVM_ZGC_JIT_TLAB=1` has no cross-binary
+/// control that is otherwise identical).
+///
+/// On: `RArrayStoreLibrary` SIGSEGVs in `displaced_hash_from_mark` and
+/// `ROverlaySystemGcStress` hangs, both about 23 runs in 25. Off: neither, in
+/// 25.
+fn jit_post_tlab_hash_stamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_POST_TLAB_HASH_STAMP").is_some()
+    })
+}
+
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_post_tlab_init(
     vm_ptr: i64,
@@ -5087,39 +5109,46 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     let class_id = ClassId::new(class_id_raw as u32);
     let raw_ptr = obj_ptr as *mut u8;
 
-    // Finish header: identity_hash_code, num_slots.
+    // Finish header: the shape word. Nothing else here is this helper's.
     //
-    // Everything else (kind, element_type, padding, mark_word,
-    // forwarding_ptr, gc_age/flags, array_length) is correctly zero
-    // already from the TLAB refill: `ObjectKind::Object` discriminant
-    // is 0, `ArrayElementType::Reference` is 0, `MARK_NEUTRAL` is 0,
-    // `gc_age=0`/`gc_flags=0`/`array_length=0` match a fresh object.
+    // LAYOUT, and it is 16 bytes (`types/src/heap_types.rs`, `HEADER_SIZE`).
+    // The reminder that stood here described a FORTY-byte header and had
+    // survived all three shrinks that produced this one -- `forwarding_ptr`
+    // folding into the mark word (32 -> 24, 2026-08-06), then
+    // `identity_hash_code`, then the `kind`/`element_type`/`gc_age`/`gc_flags`
+    // quartet into bits 48..63 (24 -> 16, 2026-08-07). A stale layout comment
+    // is not a documentation problem when raw `ptr.add(N)` stores are written
+    // from it; the identity-hash store below was written from this one.
     //
-    // Layout reminder (see `types/src/heap_types.rs`):
-    //   off  0: class_id (4 bytes)       — written inline by JIT
-    //   off  4: kind (1)                 — already zero == Object
-    //   off  5: element_type (1)         — already zero == Reference
-    //   off  6: padding (2)              — already zero
-    //   off  8: identity_hash_code (4)
-    //   off 12: array_length (4)         — already zero
-    //   off 12: shape / full num_slots (4)
-    //   off 20: gc_age + gc_flags + _gc_reserved — already zero
-    //   off 24: forwarding_ptr (8)       — already zero
-    //   off 32: mark_word (8)            — already zero == MARK_NEUTRAL
-    // CRIT (#23, BinTrees-18): the documented assumption "TLAB-refill
-    // leaves everything zeroed" is empirically violated on long runs.
-    // Defensively zero the four header bytes at offset 4 (kind=Object=0,
-    // elem=Reference=0, padding=0) and the array_length at offset 12.
-    // Without this, a kind=Object header can ship with a non-zero
-    // array_length (observed: 0x01010101 from prior byte[] data), which
-    // causes the GC walker to mis-decode the object as an array and step
-    // into the next object's payload — surfacing as ECJ's
-    // HashtableOfInt.put `/by zero` on a zero-length keyTable.
-    *(raw_ptr.add(4) as *mut u32) = 0;
-    // Compact reference-field layout: array_length (off 12) carries the body
-    // size in bytes and gc_flags (off 21) gets GC_FLAG_COMPACT — matching the
-    // inline header the JIT already wrote (idempotent), and required on the
-    // non-skip path so the helper does not clobber them back to legacy.
+    //   off 0..4   class_id                      -- written inline by the JIT
+    //   off 4..8   num_slots / shape             -- `NUM_SLOTS_OFFSET`
+    //   off 8..16  mark_word                     -- `MARK_WORD_OFFSET`
+    //                bits 0..2   lock state tag  -- `MARK_NEUTRAL` == 0
+    //                bits 2..33  identity hash   -- `MARK_HASH_SHIFT`
+    //                bits 48..64 kind / element_type / gc_age / gc_flags
+    //                            (`KIND_TAGS_BYTE_OFFSET` == 14,
+    //                             `GC_FLAGS_BYTE_OFFSET` == 15)
+    //
+    // A fresh TLAB object arrives with all of it zero, which is
+    // `kind=Object`, `element_type=Reference`, `gc_age=0`, `gc_flags=0`,
+    // `MARK_NEUTRAL` and no hash -- and `emit_inline_tlab_new` re-zeroes the
+    // mark word unconditionally rather than trusting that.
+    //
+    // CRIT (#23, BinTrees-18): the documented assumption "TLAB-refill leaves
+    // everything zeroed" is empirically violated on long runs, so the shape
+    // word is written rather than assumed. (It was `array_length` at offset 12
+    // when that was observed as `0x01010101` from prior `byte[]` data, which
+    // made the GC walker read the object as an array and step into the next
+    // object's payload -- ECJ's `HashtableOfInt.put` `/by zero`.) The store is
+    // superseded by the `shape` write a few lines below and kept because that
+    // one is conditional in shape, not in whether it happens.
+    *(raw_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32) = 0;
+    // Compact reference-field layout: `GC_FLAGS_BYTE_OFFSET` (the mark word's
+    // top byte) gets GC_FLAG_COMPACT -- matching the inline header the JIT
+    // already wrote (idempotent), and required on the non-skip path so the
+    // helper does not clobber it back to legacy. A whole-byte store is sound
+    // only because the object is FRESH: `gc_age` shares this byte, and it is
+    // zero exactly here and nowhere else.
     let compact_body = if cratonvm_types::compact_ref_fields_enabled() {
         cratonvm_types::class_layout(class_id_raw as u32)
             .filter(|l| l.field_count() == num_fields as usize)
@@ -5135,8 +5164,39 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         num_fields as u32
     };
     *(raw_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32) = shape;
-    let hash = vm.mem.heap.next_identity_hash();
-    *(raw_ptr.add(8) as *mut i32) = hash;
+    // NO IDENTITY-HASH STAMP HERE, and its absence is the fix.
+    //
+    // Until 2026-09-06 this read
+    //
+    //     let hash = vm.mem.heap.next_identity_hash();
+    //     *(raw_ptr.add(8) as *mut i32) = hash;
+    //
+    // written against a 24-byte header in which offset 8 was a dedicated
+    // `identity_hash_code: i32`. On 2026-08-07 that field was deleted and the
+    // header shrank to 16 bytes: offset 8 is now the MARK WORD
+    // (`cratonvm_types::MARK_WORD_OFFSET`), whose low two bits are the lock
+    // STATE TAG and whose bits 2..32 are the hash -- `MARK_HASH_SHIFT`. The
+    // store was never moved with the field, so it published a raw 31-bit hash
+    // over the tag: three values in four leave `mark_state != MARK_NEUTRAL`,
+    // and the object is then read as thin-locked, INFLATED (a monitor pointer
+    // synthesised out of hash bits -- the SIGSEGV in `displaced_hash_from_mark`)
+    // or FORWARDED (a relocation target synthesised the same way).
+    //
+    // The hash is installed LAZILY on first request, into the mark word and
+    // through the mark word's own accessors (`identity_hash_code` ->
+    // `java_identity_hash`), exactly as the interpreter's TLAB path leaves it:
+    // `init_object_header` writes no hash either. There is nothing for this
+    // helper to do about the hash, and the emitter agrees -- it zeroes both
+    // halves of the mark word (`emit_inline_tlab_new`, at `MARK_WORD_OFFSET`)
+    // immediately before the call.
+    //
+    // `CRATONVM_JIT_POST_TLAB_HASH_STAMP=1` restores the old store so the
+    // before/after is a re-run of ONE binary. It is a bisection lever, not a
+    // tuning knob: what it restores is the defect.
+    if jit_post_tlab_hash_stamp() {
+        let hash = vm.mem.heap.next_identity_hash();
+        *(raw_ptr.add(8) as *mut i32) = hash;
+    }
 
     // Family-A forensics (CRATONVM_DBG_A2, default-inert): record the
     // JIT-inline allocation into the a2dbg breadcrumb ring, exactly like the
@@ -14025,7 +14085,30 @@ enum CompiledOffloadSite {
     Active(u32),
     /// Declined past the cap; the hook is never consulted here again.
     Retired,
+    /// The target's declaring class was not loaded when this site was first
+    /// resolved, so neither the registry nor the gate could answer. `n` is how
+    /// many times we have come back; see [`OFFLOAD_SITE_UNRESOLVED_TRIES`].
+    ///
+    /// AUDIT 2026-09-06. Without this the first execution of a site decided
+    /// `NotKernel` FOREVER, using a registry that could not yet know — and the
+    /// class that same dispatch was about to resolve was very often the
+    /// kernel's own. That is the "forward references" limitation in
+    /// `runtime::offload_jit_gate`'s module docs, and it cost the device for
+    /// the life of the process on any caller that got hot before its kernel
+    /// branch was first taken.
+    Unresolved(u8),
 }
+
+/// How many times a site whose target class is still unloaded is re-asked
+/// before it is written off as [`CompiledOffloadSite::NotKernel`].
+///
+/// One retry would do in the ordinary case: the dispatch this helper falls
+/// through to resolves and initializes the class, so the SECOND execution of
+/// the site has a real answer. The cap exists for the case where that dispatch
+/// throws — a site whose every call ends in `NoClassDefFoundError` must not
+/// re-run the gate query forever.
+#[cfg(feature = "gpu-offload")]
+const OFFLOAD_SITE_UNRESOLVED_TRIES: u8 = 4;
 
 /// Per-site offload state.
 ///
@@ -14150,6 +14233,94 @@ unsafe fn decode_static_args(
 /// and GC-forwarded. The thread borrow is the standard `jit_thread_mut`
 /// scoped one.
 #[cfg(feature = "gpu-offload")]
+/// What one compiled static call site is, as far as offload is concerned.
+///
+/// The cheap answer first: `offload_hook`'s registry, populated as a side
+/// effect of `offload_jit_gate` scanning CALLERS. A hit is the common path and
+/// costs the three `Box<str>` `is_kernel` allocates, once per site.
+///
+/// AUDIT 2026-09-06: a MISS used to mean `NotKernel`, permanently. That is
+/// wrong whenever the registry could not have known — the gate skips any call
+/// target whose declaring class is not loaded at the moment the caller is
+/// scanned (its "forward references" limitation), and the first execution of a
+/// site is very often the thing that loads that very class. A caller that got
+/// hot before its kernel branch was first taken therefore lost the device for
+/// the rest of the run, silently, with the census printing zeroes.
+///
+/// So a miss now asks the gate itself:
+///
+/// * [`descriptor_could_ever_dispatch`] first, off `info.descriptor` alone —
+///   no lock, no allocation, no bytecode. `try_dispatch` launches only `)V`, or
+///   `)I`/`)J` for a reduction, and above `--gpu-min-work` 0 it needs an array
+///   parameter. Nearly every compiled static site in a program fails this and
+///   stops here.
+/// * [`target_is_dispatchable_kernel`] for the few that pass — the identical
+///   question `judge_target` asks during a caller scan. `None` means the class
+///   is STILL unloaded, and the site is left [`CompiledOffloadSite::Unresolved`]
+///   so the next call re-asks rather than being written off.
+/// * A kernel it finds is `note_kernel`ed, which is what repairs the
+///   compile-time doors too: `jit/src/lib.rs` and `jit/src/x64/bytecode_walk.rs`
+///   read the same registry to decide whether to bind a static call directly or
+///   inline it, and both of those are one-way once taken.
+/// Does a registry miss get to ask the gate, or is it written off on the spot?
+///
+/// `CRATONVM_GPU_JIT_GATE_LATE_REGISTER=0` restores the pre-2026-09-06
+/// behaviour, in which the FIRST execution of a compiled static call site
+/// decided `NotKernel` permanently from a registry that could not yet know
+/// about a forward-referenced kernel. Kept as a switch and not just as history:
+/// it is the control arm for measuring what the fix is worth, on ONE binary --
+/// see `test_classes/gpu/GpuForwardRef.java`, whose two arms differ only in
+/// whether the caller gets hot before or after the kernel's class is loaded.
+#[cfg(feature = "gpu-offload")]
+fn offload_site_late_register() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_GPU_JIT_GATE_LATE_REGISTER")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
+}
+
+#[cfg(feature = "gpu-offload")]
+fn resolve_offload_site(vm: &SharedVm, info: &JitInvokeInfo, tries: u8) -> CompiledOffloadSite {
+    if cratonvm_jit::offload_hook::is_kernel(info.class_name, info.method_name, info.descriptor) {
+        return CompiledOffloadSite::Active(0);
+    }
+    if !offload_site_late_register() {
+        return CompiledOffloadSite::NotKernel;
+    }
+    if !crate::runtime::offload_jit_gate::descriptor_could_ever_dispatch(
+        info.descriptor,
+        vm.config.gpu_min_work,
+    ) {
+        return CompiledOffloadSite::NotKernel;
+    }
+    match crate::runtime::offload_jit_gate::target_is_dispatchable_kernel(
+        vm,
+        info.class_name,
+        info.method_name,
+        info.descriptor,
+    ) {
+        Some(true) => {
+            cratonvm_jit::offload_hook::note_kernel(
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+            );
+            cratonvm_types::gpu_jit_gate_census::note_late_registered(format!(
+                "{}.{}{}",
+                info.class_name, info.method_name, info.descriptor
+            ));
+            CompiledOffloadSite::Active(0)
+        }
+        Some(false) => CompiledOffloadSite::NotKernel,
+        None if tries + 1 >= OFFLOAD_SITE_UNRESOLVED_TRIES => CompiledOffloadSite::NotKernel,
+        None => CompiledOffloadSite::Unresolved(tries + 1),
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
 unsafe fn try_compiled_offload(
     vm: &SharedVm,
     info: &JitInvokeInfo,
@@ -14161,29 +14332,30 @@ unsafe fn try_compiled_offload(
 
     let cap = compiled_offload_giveup_after();
 
-    // One `usize` hash on the hot path. The name lookup behind
-    // `is_kernel` runs once per site, on the miss.
+    // One `usize` hash on the hot path. Everything below the hit runs once per
+    // SITE, not once per call.
     let state = {
         let known = compiled_offload_sites().read().get(&site).copied();
         match known {
+            Some(CompiledOffloadSite::Unresolved(tries)) => {
+                // Come back: the dispatch that followed our last visit
+                // resolved the class, so the gate can answer now.
+                let st = resolve_offload_site(vm, info, tries);
+                compiled_offload_sites().write().insert(site, st);
+                st
+            }
             Some(st) => st,
             None => {
-                let st = if cratonvm_jit::offload_hook::is_kernel(
-                    info.class_name,
-                    info.method_name,
-                    info.descriptor,
-                ) {
-                    CompiledOffloadSite::Active(0)
-                } else {
-                    CompiledOffloadSite::NotKernel
-                };
+                let st = resolve_offload_site(vm, info, 0);
                 compiled_offload_sites().write().insert(site, st);
                 st
             }
         }
     };
     match state {
-        CompiledOffloadSite::NotKernel | CompiledOffloadSite::Retired => return None,
+        CompiledOffloadSite::NotKernel
+        | CompiledOffloadSite::Retired
+        | CompiledOffloadSite::Unresolved(_) => return None,
         CompiledOffloadSite::Active(_) => {}
     }
 
@@ -16416,10 +16588,9 @@ fn varhandle_operand_value(vm: &SharedVm, raw: i64, value_desc: u8) -> Option<Va
             if raw == 0 {
                 Value::Object(None)
             } else {
-                // SAFETY: validated as a live heap address before use.
-                Value::Object(Some(unsafe {
-                    vm.mem.heap.is_object_address(raw as usize)
-                }?))
+                // `is_object_address` is a safe fn: it is the validation,
+                // not something that assumes it.
+                Value::Object(Some(vm.mem.heap.is_object_address(raw as usize)?))
             }
         }
         b'J' => Value::Long(raw),
