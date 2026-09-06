@@ -660,3 +660,70 @@ Next measurement, replacing §8's list:
 2. Pair the census with the fault per CYCLE rather than per run.
 3. Do **not** re-run the widening arm; §10.8 is 113 VM launches and the answer
    is null.
+
+### 10.9 Correction to §10.8: the scalar/LICM zero is VACUOUS, and `unclassified` means something else
+
+§10.8 said the `region=unclassified` words are the surviving lead because
+`FrameLayout::region_name` "cannot place them, which is exactly how a
+scalar-replacement or LICM hoist slot would present". **Both halves of that are
+wrong, and the correction points somewhere different.**
+
+**`region_name` already classifies all three.** Its ladder names
+`scalar-replaced-field`, `licm-ref-hoist` and `licm-arith` before it reaches
+anything else. So an unnamed word is not an unnamed scalar/hoist slot; those
+have names and would have used them.
+
+**And their zero is vacuous, which is worse.** Across every log this branch
+produced — 8 naming-probe reps plus every other armed run — the tally is:
+
+```
+13064 region=operand-spill
+ 6071 region=safepoint-gpr-spill-image
+ 5620 region=callee-saved-gpr-image      (these are [jit-register-image-remap]
+ 4829 region=outgoing-args-or-deopt-regs  lines, i.e. the 2026-08-23 repair
+  315 region=java-local                   doing its job, not stale words)
+   21 region=unclassified
+```
+
+`scalar-replaced-field`, `licm-ref-hoist`, `licm-arith` and
+`reserved-locals-tail`: **zero occurrences, in either stream.** That is not
+evidence they are clean. `x64/frames.rs` builds `scalar_lo/scalar_hi` from
+`self.scalar_replaced` and `ref_hoist_lo/ref_hoist_hi` from
+`self.hoist_offsets`, both of which are `(0, 0)` when the optimisation produced
+no slots — and `region_name`'s `hit()` requires `hi > lo`. **On a frame where
+scalar replacement and LICM did not fire, those regions do not exist and no word
+can land in one.** A zero from a region with no extent says nothing about the
+region; it says the optimisation did not run.
+
+So §8's two surviving candidates are **untested on this workload, not
+eliminated**, and the prerequisite for testing them is an engagement census —
+does scalar replacement or LICM hoisting produce any slots at all in the netty
+methods live at the fault? `moving-young-corruption-rootcause.md` hit the same
+wall from the other side: its `BinTreesClassic.bottomUpTree` frame was
+`FrameLayout { scalar_lo: 0, scalar_hi: 0, ref_hoist_lo: 0, ref_hoist_hi: 0 }`,
+which is why that page's §3 verdict was right in shape and wrong in mechanism
+for that benchmark.
+
+**What `unclassified` actually is.** Reading the ladder rather than guessing at
+it: the final `else if self.reg_spill_hi > 0 && off >= self.reg_spill_hi`
+catches everything past the safepoint spill, so `unclassified` is only reachable
+when **`reg_spill_hi == 0`** — a frame `x64/frames.rs` built with
+`reg_spill_base == 0 || !safepoint_reg_spill`, i.e. one with no safepoint
+register spill at all — at an offset past the spill area. 21 such words across 8
+reps, in three methods:
+
+```
+io/netty/channel/DefaultChannelPromise.setSuccess:()L…;                 off=448
+io/netty/channel/ChannelInitializer.initChannel:(L…;)Z                  off=528
+io/netty/channel/AbstractChannelHandlerContext.findContextInbound:(I)L…; off=544
+```
+
+That is a real and much narrower question — *why does a live compiled frame have
+no safepoint register spill, and what is in its tail?* — but it is a different
+question from §8's, and it should not be filed under §8's heading.
+
+**Method note.** This is the same engagement trap the rest of this page is
+careful about, one level further down: §10.8 read a zero from a census without
+first asking whether the thing being counted could occur. The check is one
+question — *does this region have a non-empty extent in the frames I am
+measuring?* — and it costs nothing to ask before the count is believed.
