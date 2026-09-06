@@ -95,9 +95,22 @@ count. Every one came back empty:
 |---|---|---:|
 | workload concurrency | 4 concurrent netty VMs | 0 |
 | the post-evacuation verifier | `MOVING_YOUNG_VERIFY=1` on/off | 0 vs 0 |
-| machine state from compiling | measured DURING a `cargo build --release -j 8` | **0** |
-| …and its control | quiet before / quiet after the same build | 1 / 0 |
+| machine state from compiling | measured DURING a `cargo build --release -j 8` | **0** (3/3 runs reported) |
+| …and its control | quiet before the same build | 0 (3/3 reported) |
+| …and its other control | quiet after | **UNMEASURED — see below** |
 | heap size (the suite uses 1500m, probes used 1g) | `--Xmx 1500m`, `--Xmx 2g` | 0 / 0 |
+
+**The quiet-after control never ran.** Its three runs died with
+`timeout: failed to run command ... No such file or directory` because a cleanup
+step of mine deleted the binary while the arm was still executing. It is
+recorded as unmeasured rather than as a zero, because a run that could not start
+is not evidence about the collector — that distinction has already produced one
+wrong reading on this page. The quiet-vs-under-build comparison is unaffected:
+both those arms reported 3/3.
+
+(An earlier tally of mine put the quiet arm at 1 moving cycle. That was a glob
+bug — `quiet-*` also matched `quiet-after-*`. The harness's own figure, 0 across
+3/3, is the correct one.)
 
 The build-load arm is the one that hurts, because it was the best hypothesis:
 every run that reproduced today was interleaved with heavy build or suite
