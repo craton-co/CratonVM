@@ -1,6 +1,6 @@
 # 19 netty classes fail on **Generational only** — the moving young cycle corrupts a live object
 
-**Status:** OPEN, but **currently MASKED on dev — see §0.** Found by a
+**Status:** OPEN, does not currently reproduce. **§0: my dev-movement attribution and bisect are RETRACTED; the credible root cause is another session's independent fix.** Found by a
 per-collector sweep of the full netty suite.
 **This is a correctness defect, not a throughput one**, and it is invisible to
 every run that uses the shipped default collector.
@@ -22,86 +22,69 @@ frame home. §7 has the amplifier that reproduces it 3/3.
 
 ---
 
-## 0. It no longer reproduces on dev, and that is NOT a fix (2026-09-06, late)
+## 0. It no longer reproduces — attribution RETRACTED, and the root cause is elsewhere
 
-Re-checked on dev `da44c949a`, 80 commits after the binary this page was
-written against. Four of the 19 classes, 3 reps each, concurrent, plain
-`-XX:+UseGenerationalGC` — no amplifier, no verifier, the configuration a user
-would actually run:
+Two things happened after this page was first written, and they point opposite
+ways.
 
-| class | NPE | timeouts | moving cycles |
-|---|---:|---:|---:|
-| `DuplicatedByteBufTest` | 0 | 0 | 1 |
-| `BigEndianHeapByteBufTest` | 0 | 0 | 1 |
-| `SimpleLeakAwareByteBufTest` | 0 | 0 | 0 |
-| `SlicedByteBufTest` | 0 | 0 | 0 |
+### 0.1 The likely real fix, found independently
 
-**12 runs, zero failures.** And the reason is in the last column: **the moving
-young cycle has stopped running on this workload.** This morning the same
-workload took 9-24 moving cycles per run across four separately-built binaries;
-it now takes 0-1, and the collector says why:
+The internal fixed-bugs tree gained
+**`a-compiled-frame-keeps-a-young-reference-the-collector-moved-FIXED-20260906.md`**
+(commit `70c486744`, 10:07 on 2026-09-06) while this investigation was running.
+It describes this defect: a peer thread's compiled frames discharged from the
+cross-thread coverage obligation by PINNING their conservative roots, on the
+generational Cheney collector, which cannot honour a pin — so the object is kept
+alive at a NEW address with nothing having rewritten the peer's frame. Its
+stated scope is **Generational only, JIT only, multi-threaded only; G1 and ZGC
+never affected**, which is this family exactly (§1, §2), and its mechanism is a
+stale reference in a **compiled frame, outside the heap** — where §6's verifier
+dichotomy independently pointed. That page carries its own A/B (H2, 4/5 → 0/5,
+and 5/5 again with `CRATONVM_XT_PINNED_PEER_UNPINNABLE=1`).
 
-```
-histogram: moving=0 non_moving=314 nonmoving-conservative-jit-roots=15
-                                   nonmoving-coverage-incomplete=299
-reason=unregistered-jit-frame-on-stack   (12 of 14 sampled)
-```
+**Treat that as the credible root cause.** It is their evidence, not this
+page's.
 
-Relocation is necessary for this defect (§3, §4). Relocation no longer happens,
-so the defect no longer fires. **Nothing here shows the corruption was fixed —
-it shows it is no longer exercised.**
+### 0.2 My own attribution is RETRACTED — the measurement is not stable
 
-That has a specific and uncomfortable consequence. The refusal now dominating
-the histogram is the SAME mechanism the DoHead page documents as a
-Generational-only *throughput collapse* and dismisses as "not a correctness
-bug". On this workload that throughput bug is currently the only thing standing
-between the user and this correctness bug. **Whoever repairs moving-young
-engagement — the obvious and desirable performance fix — re-exposes this.** The
-green above is conditional on a collector declining to do its job.
+I tried to confirm that the netty family stopped reproducing because of dev
+movement, by building `8d83c7585` and running it interleaved against dev on one
+host. First attempt, 4 pairs:
 
-Not bisected: the shift is consistent across four binaries built today on one
-host, so it is attributed to dev movement rather than host state, but no arm
-rebuilt the old commit to confirm it. Two commits in this exact machinery landed
-in the window (`70c486744` peer pin credit, `65e7bffc2` peer pins G1-only).
+| binary | NPE | moving cycles |
+|---|---:|---:|
+| `8d83c7585` | 11 | 64 (15/19/17/13) |
+| dev | 0 | 1 |
 
-### The obligation/flag mismatch, resolved — and what it exposes
+That looked decisive, and a `git bisect run` over the 80 commits between them
+converged on `70c486744`. **Both results are withdrawn.** Re-running the SAME
+interleaved A/B, same binaries, same host, later the same evening, 6 pairs:
 
-The decision line reads `unproven_obligation=unregistered-jit-frame-on-stack`
-while the live flag in the SAME line reads `unregistered_jit_frame=false`. It
-was filed here as a possible stale obligation. **It is not.** Both are set
-together at one site (`conservative_roots.rs`, the unregistered-frame branch),
-and both are reset once per collection. The reason they disagree is that they
-have **different scopes**:
+| binary | NPE | moving cycles |
+|---|---:|---:|
+| `8d83c7585` | 0 | 4 (0/1/2/1/0/0) |
+| dev | 0 | 1 |
 
-```rust
-#[cfg(not(test))] static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool   // PROCESS-GLOBAL
-#[cfg(not(test))] static MOVING_YOUNG_INCOMPLETE_REASON:   AtomicUsize  // PROCESS-GLOBAL
-                  thread_local! { UNREGISTERED_JIT_FRAME: Cell<bool> }  // PER-THREAD
-```
+The old binary now behaves like the new one. So:
 
-The verdict and its reason are process-global first-wins atomics; the flag is
-the collecting thread's own. So the line is reporting a reason **some other
-thread** recorded next to a flag that only ever describes this one. Nothing is
-stale; two differently-scoped facts are printed as though they were one.
+* **the endpoint difference is not a property of the binaries** — the same old
+  binary gives 64 and then 4;
+* **the bisect is void.** Each step voted `bad` on `moving <= 2` over two reps,
+  and a breadth check confirmed the OLD binary reaches `moving=0-2` on five of
+  six classes unprompted. Most steps could be false verdicts, and the
+  convergence is an artifact of which step happened to catch a high reading.
+  Only `e24ff3173`'s 31 and the first A/B's 64 were ever unambiguous.
 
-**The substantive consequence.** `refresh_moving_young_coverage_for_current_thread`
-runs on every mutator at its root-snapshot deposit, and a mutator whose own
-frames are unproven sets the GLOBAL verdict. **One thread failing its own proof
-therefore refuses relocation process-wide for that cycle** — on a workload with
-many event-loop threads, that needs only one. This is the same blanket
-"any peer in JIT means unproven" behaviour the cross-thread handshake was built
-to replace (§7), re-entering through a different door: not the peer ledger, but
-the global verdict every thread can set. It is a plausible mechanism for the
-moving-cycle collapse in the table above, and it is fail-closed, so it costs
-throughput rather than correctness.
+**What drives engagement is still unidentified.** It is not shard concurrency
+(both A/Bs ran two VMs), not the verifier, and not any flag tested here. The
+runs that reproduced were interleaved with heavy build/suite activity; the
+quiet ones were not — but that is a correlation across a day, not a controlled
+variable.
 
-**And a coverage gap worth fixing on its own.** Under `#[cfg(test)]` those same
-two statics become `thread_local!` cells. The stated reason is sound — stop one
-test's deliberate "incomplete" from diverting another's collection — but the
-effect is that **every unit test of this decision path exercises per-thread
-semantics that production does not have.** No test in this machinery can
-observe one thread refusing another's cycle, which is precisely the behaviour
-that matters in a multi-threaded collector.
+**Consequence for anyone picking this up: you cannot currently reproduce this
+family on demand, and until you can, no lever tested against it means
+anything.** Establishing a reliable trigger for a moving young cycle on this
+workload is the prerequisite for every other question on this page.
 
 ## 1. The measurement that found it
 
