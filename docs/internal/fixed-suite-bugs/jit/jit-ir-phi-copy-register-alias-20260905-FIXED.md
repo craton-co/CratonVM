@@ -5,8 +5,9 @@
 `vm/tests/jit_ir_phi_copy_register_alias.rs` with fixture
 `vm/tests/jit_ir_phi_copy_register_alias_fixtures/PhiCopyRegisterAliasProbe.java`.
 
-Found while retiring
-`hib-reactive-mysql-beforeeach-checkpoint-timeout-family-20260905`: it was the
+Found while retiring the hibernate-reactive MySQL checkpoint-timeout page
+(`../hibernate-reactive/mysql-beforeeach-checkpoint-timeout-was-a-30s-budget-20260905-CLOSED.md`):
+it was the
 one genuine correctness defect in that page's 24-class FAIL set, and the only
 class that failed in ISOLATION on a quiet host.
 
@@ -89,7 +90,8 @@ bytecode-for-bytecode:
 
 ## Root cause, in the disassembly
 
-`CRATONVM_DBG_JIT_DISASM=FieldMerge2.a` on the minimised probe. The
+`CRATONVM_DBG_JIT_DISASM=<Class>.<method>` on the minimised shape (it is
+`PhiCopyRegisterAliasProbe.shape` in the checked-in fixture). The
 single-pass artifact is correct. The optimizing-tier recompile has this in the
 **not-taken** arm's merge block, where `r13` holds `seconds`, `rbx` holds
 `(long) nanos`, and `r12` is phi_nanos's register:
@@ -143,6 +145,19 @@ source's register on that edge does not publish inline. Its home store is kept
 already exists, for the FP half and for self-copies the resolver drops —
 publishes it from that word, after every source on the edge has been read.
 Every other phi keeps the reg-to-reg publish it had.
+
+### The other place this could have been fixed
+
+`regalloc.rs` already models the outgoing-edge position — "one position past
+the block's last instruction: the outgoing edge, where `emit_phi_copies` reads
+this block's phi arguments" — so a source's interval reaches the edge. What it
+does not do is extend the PHI's interval back to that same position, which is
+why a phi and a source read on the same edge can be given one register. Doing
+that in the allocator is the root fix and would make the screen above
+unnecessary; it also lengthens every phi's live range at every incoming edge,
+which changes pressure and allocation across the whole tier. That is a
+measurement project, not a correctness fix, and it is not what a wrong-answer
+bug should wait for. Left for whoever wants the instruction back.
 
 The cost is one word load per deferred phi per edge, on edges that alias;
 `phi_copy_publish_deferred` (printed by `CRATONVM_DBG_IR_LINEAR_SCAN`) counts

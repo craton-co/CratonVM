@@ -2581,9 +2581,10 @@ impl<'a> Lowerer<'a> {
         // copy's publish then overwrites a register a later copy still has to
         // read, and the resolver's word-level order says nothing about it.
         //
-        // Measured on `probes/FieldMerge2.java` (and, in the wild,
-        // `java.time.Duration.toNanos()` — 198,356 wrong answers in 200,000
-        // calls): the else-arm of `if (seconds < 0)` emitted
+        // Measured on
+        // `vm/tests/jit_ir_phi_copy_register_alias_fixtures/PhiCopyRegisterAliasProbe.java`
+        // (and, in the wild, `java.time.Duration.toNanos()` — 198,356 wrong
+        // answers in 200,000 calls): the else-arm of `if (seconds < 0)` emitted
         //   `mov rbx,rax`   ; publish phi_seconds, whose GPR is RBX
         //   `mov rax,rbx`   ; read phi_nanos's SOURCE, whose GPR is also RBX
         // so `nanos` came back as `seconds` and `toNanos()` returned
@@ -19914,7 +19915,10 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
+                // No `defer_publish`: this fixture drives the memory path only
+                // (`src_node_of`/`phi_of_dst` are empty, so nothing publishes a
+                // register and nothing can alias one).
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &[], &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 

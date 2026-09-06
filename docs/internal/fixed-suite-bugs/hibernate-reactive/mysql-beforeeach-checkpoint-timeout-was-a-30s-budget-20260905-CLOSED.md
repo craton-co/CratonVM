@@ -2,9 +2,9 @@
 
 ## Status
 
-**CLOSED 2026-09-05.** Retires
-`docs/known-issues/hibernate/hib-reactive-mysql-beforeeach-checkpoint-timeout-family-20260905.md`,
-which reported ~21 of 23-25 FAIL classes sharing one
+**CLOSED 2026-09-05.** Retires the public page
+`hib-reactive-mysql-beforeeach-checkpoint-timeout-family-20260905` (deleted
+from `docs/known-issues/hibernate/` by the same commit), which reported ~21 of 23-25 FAIL classes sharing one
 `VertxTestContext` checkpoint-timeout signature on two of three GC arms and
 said "root cause not yet isolated". It is isolated now, with the control arm
 that page did not have.
@@ -22,7 +22,7 @@ Two separate things were tangled in it:
    nothing to do with the timeout: a JIT optimizing-tier phi-copy
    register-aliasing miscompile that made `java.time.Duration.toNanos()`
    return `seconds * 1e9 + seconds`. **FIXED** — see
-   `jit-ir-phi-copy-register-alias-20260905-FIXED` (internal tree, `fixed-suite-bugs/jit/`).
+   `../jit/jit-ir-phi-copy-register-alias-20260905-FIXED.md`.
 
 ## The four-arm control the original page did not have
 
@@ -88,7 +88,7 @@ from that one inequality:
   201 PASS / 3 FAIL (`fullbatch-craton-20260903`), because a Postgres
   container starts in a fraction of the MySQL one's time.
 * **`NoLiveTransactionValidationErrorTest` is not "ZGC-only"** — the earlier
-  page that guessed that (`hib-reactive-3gc-run-regressions-FIXED-20260824`)
+  page that guessed that (`../hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md`)
   was reading a threshold, and a threshold has no collector.
 
 ## Four corrections to the original page, from its own logs
@@ -137,6 +137,17 @@ fails the same 22 classes. A ZGC-only event cannot be the cause of a
 GC-independent family. (That signature is the documented stale-pointer-into-a-
 compacted-away-object shape; `CRATONVM_DBG_ZGC_CORPSE` names the corpse.)
 
+**5. The G1 arm's `MultithreadedIdentityGenerationTest` HANG is the OTHER
+family.** The page flags it as "consistent with the same defect manifesting
+more severely under G1" and asks for a re-check. It is not: on Linux the class
+passes in isolation (113 s CratonVM, 55 s HotSpot) and under 6-way load fails
+with `TimeoutException: testIdentityGenerator ... timed out after 120 seconds`
+out of `TimeoutExceptionFactory` — the harness's own
+`junit.jupiter.execution.timeout.default`, a different exception shape
+entirely, and exactly where the page already puts its sibling
+`MultithreadedInsertionTest`:
+`docs/known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`.
+
 ## What was actually fixed
 
 `types.BasicTypesAndCallbacksForAllDBsTest` failed 2 of 28 in **isolation**,
@@ -154,7 +165,7 @@ JIT warm-up `ChronoUnit.MILLIS.getDuration().toNanos()` answered **0** —
 198,356 wrong answers in 200,000 calls, first wrong at call 1,644. Root cause
 is a phi-copy register-aliasing miscompile in the optimizing tier, fixed on
 this branch with an end-to-end regression test; the full write-up is
-`jit-ir-phi-copy-register-alias-20260905-FIXED` (internal tree, `fixed-suite-bugs/jit/`).
+`../jit/jit-ir-phi-copy-register-alias-20260905-FIXED.md`.
 
 ## The residual
 
@@ -165,7 +176,7 @@ budget is tight, and it is the only thing left here worth spending time on. It
 belongs with the existing cost families, not in a per-class bug page:
 
 * `docs/known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`
-* `hib-reactive-3gc-run-regressions-FIXED-20260824` (the
+* `../hibernate/hib-reactive-3gc-run-regressions-FIXED-20260824.md` (the
   `CompletableFuture`/lambda-composition cost section)
 * `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`
 
@@ -179,12 +190,18 @@ afternoon.
 
 ## Reproduction
 
+Nothing here needs a harness. `common-mysql.args` is
+`apps/hibernate-reactive-suite-runner/common.args` with `-Ddb=PostgreSQL`
+rewritten to `-Ddb=MySQL`; nothing else differs, and the runner class is the
+one already sitting beside it.
+
 ```bash
-# 24-class union, one class per JVM, MySQL via Testcontainers, on Linux:
-#   probe/hr-mysql-iso.sh  <craton|hotspot> <listfile> [outdir]     -> 23-24/24 pass
-#   probe/hr-mysql-load.sh <craton|hotspot> <listfile> 6            -> 7/24 vs 22/24
-# common-mysql.args is apps/hibernate-reactive-suite-runner/common.args with
-# -Ddb=PostgreSQL rewritten to -Ddb=MySQL; nothing else differs.
+# one class, one JVM, its own MySQL container -- 23-24 of 24 pass, both VMs
+cd apps/hibernate-reactive-suite-runner
+<cratonvm> --java-home <jdk25> @common-mysql.args -Dcraton.batch=1 CratonRunner org.hibernate.reactive.NoEntitiesTest
+<jdk25>/bin/java @common-mysql.args -Dcraton.batch=1 CratonRunner org.hibernate.reactive.NoEntitiesTest
+
+# the same command six ways at once is the whole defect: 7/24 against 22/24.
 ```
 
 The Windows evidence the original page was written from is at
