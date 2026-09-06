@@ -1943,7 +1943,7 @@ mod tests {
     /// This is the table the pre-G46 slot map collided with, written down so
     /// the collision is a property the test can state rather than a fact in a
     /// comment.
-    const REAL_CHANNEL_LAYOUT: [(&'static str, &'static str); 11] = [
+    const REAL_CHANNEL_LAYOUT: [(&str, &str); 11] = [
         ("closeLock", "Ljava/lang/Object;"),
         ("closed", "Z"),
         ("interruptor", "Lsun/nio/ch/Interruptible;"),
