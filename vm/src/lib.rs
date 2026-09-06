@@ -87,6 +87,17 @@ pub use cratonvm_gc::gen_heap::young_bytes_uncommitted;
 /// `is_object_address` (`CRATONVM_GC_OBJECT_STARTS`). Re-exported for the
 /// shutdown census in `vm-cli`.
 pub use cratonvm_gc::gen_heap::object_start_counts;
+/// The GC-trigger publish verifier's `(checks, divergences)` -- see
+/// `cratonvm_gc::gen_heap::gc_trigger_verify_counts`. Re-exported for the same
+/// reason its neighbours are: `vm-cli` depends on `cratonvm-vm`, not on
+/// `cratonvm-gc`.
+pub use cratonvm_gc::gen_heap::gc_trigger_verify_counts;
+/// `MarkBitmap::clear`'s `(calls, worked, words, nanos)`.
+pub use cratonvm_gc::mark_bitmap::clear_census as mark_bitmap_clear_census;
+/// G1 `is_object_address`'s `(calls, accepted, nanos)`.
+pub use cratonvm_gc::g1_object_address_census;
+/// The young-mark drain's `(calls, parallel_calls, workers_last, nanos)`.
+pub use cratonvm_gc::young_mark::drain_census as young_mark_drain_census;
 
 // ---------------------------------------------------------------------------
 // T17.E.2 — Windows test-harness teardown shim

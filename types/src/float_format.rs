@@ -141,7 +141,7 @@ fn significant_digit_count(sci: &str) -> usize {
 
 fn ends_in_five(sci: &str) -> bool {
     let mantissa = sci.split_once('e').map(|(m, _)| m).unwrap_or(sci);
-    mantissa.chars().filter(|c| c.is_ascii_digit()).next_back() == Some('5')
+    mantissa.chars().rfind(|c| c.is_ascii_digit()) == Some('5')
 }
 
 /// Given Ryu's shortest form and an exact expansion of the same value, return

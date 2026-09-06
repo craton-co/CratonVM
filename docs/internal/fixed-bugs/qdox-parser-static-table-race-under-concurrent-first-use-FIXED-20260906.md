@@ -198,3 +198,24 @@ whole question:
   sides' loaders. Its old `target_cid` is the loader-BLIND unique-by-name
   answer, which is `None` the moment two loaders define the name -- so on
   exactly the class-identity failures it exists to explain, it reported nothing.
+
+## The `checkcast` half was fixed independently the same day, at the other end
+
+While this was in flight, another session landed
+`publicsuffixlist-forked-classpath-jit-checkcast-loader-duplication-FIXED-20260905`:
+the JIT's `checkcast` now ACCEPTS two loader copies of one class name by name
+(`recorded-site-loader-duplication-by-name`), which the interpreter has always
+done. That is what first turned this test green, and this page's dev-side
+update recorded it while keeping the page open for "the static-publication gap
+the concurrent probe measured" -- the half this write-up closes.
+
+**The two fixes are complementary and both are wanted.** A program may
+legitimately hold two copies of one class name, and refusing such a cast where
+the interpreter accepts it is a JIT-vs-interpreter divergence worth removing on
+its own terms -- that is the acceptance path. But the duplication in THIS test
+was not the program's: the compiler minted it, out of a loader-blind lookup
+that had no business defining anything. Accepting a duplicate identity is a
+safety net; not creating one is the repair. With only the acceptance path,
+compiled code still allocates objects in a namespace its own class was not
+loaded in, and every OTHER consequence of that -- `getClass()`, reflection,
+`instanceof` chains through the interpreter, static state -- is left in place.

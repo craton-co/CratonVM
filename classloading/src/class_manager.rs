@@ -6523,12 +6523,27 @@ impl ClassManager {
 
         // Determine this class's module membership from the package registry
         // (N4: unnamed-module baseline + named-module assignment).
+        //
+        // `named_module_for_package`, NOT `module_for_package`: a modular jar
+        // reached through the CLASS path keeps its descriptor in the registry
+        // (service discovery and labelling want it) but a real JVM puts its
+        // classes in the UNNAMED module, and MEMBERSHIP is the surface where
+        // that difference is observable — `--add-opens java.base/…=ALL-UNNAMED`
+        // is qualified to the unnamed module, so a class wrongly labelled with
+        // its jar's declared module name cannot be granted by it. Measured on
+        // Tomcat's `catalina.jar` (which declares `org.apache.tomcat.catalina`);
+        // see the note on `named_module_for_package`. `ClassManager::new`'s own
+        // comment has said "the real JDK puts them in the unnamed module" since
+        // the eager scan was written — this is the half of that sentence the
+        // scan could not implement on its own.
         let pkg = package_of(&class_file.this_class);
-        let module_name = self
-            .module_registry
-            .module_for_package(pkg)
-            .map(|s| s.to_string())
-            .or(module_name_from_attr);
+        let module_name = if loader_flags().classpath_jar_unnamed_module {
+            self.module_registry.named_module_for_package(pkg)
+        } else {
+            self.module_registry.module_for_package(pkg)
+        }
+        .map(|s| s.to_string())
+        .or(module_name_from_attr);
 
         // NEW-8 + WP2.3: hidden classes register under a mangled name
         // (e.g. `Foo/0x1`) distinct from their class file's `this_class`.

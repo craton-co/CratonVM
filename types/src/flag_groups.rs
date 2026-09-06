@@ -505,6 +505,26 @@ pub const INVENTORY: &[E] = &[
     // a wrong number, it is a live static field left pointing at a vacated
     // address, and a unit test cannot answer the question on a real class set.
     E { group: Group::DBG, token: "static-slot-verify", on_key: Some("CRATONVM_DBG_STATIC_SLOT_VERIFY"), off_key: None, off_word: None, since: "2026-09-05" },
+    // The GC-trigger publish's coverage oracle: read the lock-free triple, then
+    // take the lock and assert the arena agrees. Under the lock the two MUST be
+    // equal -- every writer holds that mutex and the guard republishes before
+    // releasing it -- so a divergence is a mutation that reached the arena
+    // without passing through `YoungFromGuard::drop`, which is the only way the
+    // design can be wrong.
+    E { group: Group::DBG, token: "gc-trigger-verify", on_key: Some("CRATONVM_DBG_GC_TRIGGER_VERIFY"), off_key: None, off_word: None, since: "2026-09-06" },
+    // `MarkBitmap::clear`: calls, calls that actually cleared, words, nanos.
+    // The pair `calls`/`worked` is the engagement half -- the thing being
+    // measured is the `any_marked` early return, so `worked == calls` says it
+    // never fired and the reading is about the clear loop instead.
+    E { group: Group::DBG, token: "markclear", on_key: Some("CRATONVM_DBG_MARKCLEAR"), off_key: None, off_word: None, since: "2026-09-06" },
+    // G1's `is_object_address`: calls, acceptances, nanos. The question it
+    // answers is whether G1 should get the exact object-start bitmap the
+    // generational predicate got, and the answer is a share of a run.
+    E { group: Group::DBG, token: "g1-objaddr", on_key: Some("CRATONVM_DBG_G1_OBJADDR"), off_key: None, off_word: None, since: "2026-09-06" },
+    // `update_all_roots`: calls, pointer-map entries, nanos. What the
+    // value-carrying root ABI costs per run -- `rootprof` prints only when one
+    // call exceeds 20 ms, which cannot see a thousand 1 ms fix-ups.
+    E { group: Group::DBG, token: "rootfixup", on_key: Some("CRATONVM_DBG_ROOTFIXUP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "gcpart", on_key: Some("CRATONVM_DBG_GCPART"), off_key: None, off_word: None, since: "2026-07-22" },
     E { group: Group::DBG, token: "jni-localref", on_key: Some("CRATONVM_DBG_JNI_LOCALREF"), off_key: None, off_word: None, since: "2026-08-26" },
     E { group: Group::DBG, token: "gcpause", on_key: Some("CRATONVM_DBG_GCPAUSE"), off_key: None, off_word: None, since: "2026-07-07" },
@@ -698,6 +718,12 @@ pub const INVENTORY: &[E] = &[
     // signal. `credits_consumed` is the engagement counter for the netty
     // lost-wakeup fix.
     E { group: Group::DBG, token: "monitor-notify", on_key: Some("CRATONVM_DBG_MONITOR_NOTIFY"), off_key: None, off_word: None, since: "2026-08-24" },
+    // The execution profiler (`runtime::exec_sampler`). A VALUE flag: the
+    // millisecond sampling interval, off when unset or 0. It exists because
+    // there was no way to ask this VM where a workload's time goes --
+    // `jdk.ExecutionSample` is defined in the JFR crate with no caller, and
+    // `wpr -start CPU` needs a privilege this host does not carry.
+    E { group: Group::DBG, token: "profile-sample-ms", on_key: Some("CRATONVM_PROFILE_SAMPLE_MS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "mic-method", on_key: Some("CRATONVM_DBG_MIC_METHOD"), off_key: None, off_word: None, since: "2026-08-11" },
     E { group: Group::DBG, token: "mark-why-class", on_key: Some("CRATONVM_DBG_MARK_WHY_CLASS"), off_key: None, off_word: None, since: "2026-08-10" },
     E { group: Group::DBG, token: "mirrorpin-why", on_key: Some("CRATONVM_DBG_MIRRORPIN_WHY"), off_key: None, off_word: None, since: "2026-08-10" },
@@ -1952,10 +1978,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-young-pause-target", on_key: Some("CRATONVM_G1_YOUNG_PAUSE_TARGET"), off_key: None, off_word: Some("0"), since: "2026-08-18" },
     E { group: Group::GC, token: "g1-humongous-marks", on_key: Some("CRATONVM_G1_HUMONGOUS_MARKS"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "g1-ihop-counts-regions", on_key: Some("CRATONVM_G1_IHOP_COUNTS_REGIONS"), off_key: None, off_word: None, since: "2026-09-05" },
+    E { group: Group::GC, token: "g1-jit-mark-driver", on_key: Some("CRATONVM_G1_JIT_MARK_DRIVER"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "g1-verify-holders", on_key: Some("CRATONVM_G1_VERIFY_HOLDERS"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "g1-scrub-free", on_key: Some("CRATONVM_G1_SCRUB_FREE"), off_key: None, off_word: None, since: "2026-08-18" },
     E { group: Group::GC, token: "g1-narrow-fixup", on_key: Some("CRATONVM_G1_NARROW_FIXUP"), off_key: None, off_word: Some("0"), since: "2026-08-18" },
     E { group: Group::GC, token: "g1-parallel-evac-in-jit", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_IN_JIT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::GC, token: "g1-parallel-evac-screen", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::GC, token: "g1-cleanup-walk", on_key: Some("CRATONVM_G1_CLEANUP_WALK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "g1-adaptive-ihop", on_key: Some("CRATONVM_G1_ADAPTIVE_IHOP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-adaptive-tenuring", on_key: Some("CRATONVM_G1_ADAPTIVE_TENURING"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
@@ -2097,23 +2125,38 @@ pub const INVENTORY: &[E] = &[
     // rather than one build apart. Statics are the first root class in this VM
     // carried as a SLOT rather than a value -- see `memory::roots::
     // STATIC_REF_SLOTS` for why they are the ones that can be.
-    // Default-ON opt-out since 2026-09-05: hand the evacuated young semi-space
-    // back to the OS at the end of
+    // Opt-in: hand the evacuated young semi-space back to the OS at the end of
     // each young collection instead of only zeroing it. The generational
     // collector was the one backend that never gave memory back at all. Off by
     // default for the same reason `g1-uncommit` is: it publishes the young
     // arenas' full reserved range to the JIT, and a decommitted granule faults
     // on touch rather than reading as zero.
-    // Default-ON opt-out since 2026-09-05: maintain an EXACT object-start bitmap
+    //
+    // It WAS default-ON from 2026-09-05 to 2026-09-06, and the flip was
+    // reverted when that fault turned out to be reachable in ten seconds on the
+    // H2 JDBC corpus -- see `Flags::gen_uncommit` for the five-arm attribution
+    // and for why the defect it exposes belongs to a compiled frame rather than
+    // to this switch.
+    // Opt-in: maintain an EXACT object-start bitmap
     // on the arenas whose owner asks for one (a bit per 8
     // bytes, set in `hand_out`, cleared in `add_free_block` and on reset) and
     // let `is_object_address` answer from it instead of deducing the answer
     // from header bytes. Consulted in the ACCEPT direction only -- a miss falls
     // through to the deduction, because the bitmap is knowably incomplete for
     // TLAB-allocated objects and using it to REJECT would drop live roots.
-    E { group: Group::GC, token: "object-starts", on_key: Some("CRATONVM_GC_OBJECT_STARTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
-    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    //
+    // It WAS default-ON from 2026-09-05 to 2026-09-06. The flip was reverted
+    // because its 7% came from a sequential ABBA on a shared box, and concurrent
+    // paired arms reproduce no win on either shape -- see
+    // `arena::object_starts_enabled` for the two tables.
+    E { group: Group::GC, token: "object-starts", on_key: Some("CRATONVM_GC_OBJECT_STARTS"), off_key: None, off_word: None, since: "2026-09-05" },
+    E { group: Group::GC, token: "gen-uncommit", on_key: Some("CRATONVM_GEN_UNCOMMIT"), off_key: None, off_word: None, since: "2026-09-05" },
     E { group: Group::GC, token: "static-root-slots", on_key: Some("CRATONVM_GC_STATIC_ROOT_SLOTS"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
+    // Default-ON opt-out: the young-GC trigger predicate reads `used`,
+    // `free_list_bytes` and `capacity` from a triple republished by the
+    // `young_from` mutex guard's `Drop`, instead of taking that mutex on the
+    // ALLOCATION path. `=0` takes the lock, so the two are one binary apart.
+    E { group: Group::GC, token: "trigger-lockfree", on_key: Some("CRATONVM_GC_TRIGGER_LOCKFREE"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::GC, token: "dbg-compact-tlab", on_key: Some("CRATONVM_DBG_COMPACT_TLAB"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None, since: "2026-06-21" },
     E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None, since: "2026-06-23" },
@@ -2326,6 +2369,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::LOADER, token: "cf-delegating-yield", on_key: Some("CRATONVM_CF_DELEGATING_YIELD"), off_key: None, off_word: Some("0"), since: "2026-08-22" },
     E { group: Group::LOADER, token: "aware-resolution", on_key: Some("CRATONVM_LOADER_AWARE_RESOLUTION"), off_key: None, off_word: None, since: "2026-06-24" },
     E { group: Group::LOADER, token: "boot-module-registry", on_key: Some("CRATONVM_BOOT_MODULE_REGISTRY"), off_key: None, off_word: Some("off"), since: "2026-06-23" },
+    E { group: Group::LOADER, token: "classpath-jar-unnamed-module", on_key: Some("CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     E { group: Group::LOADER, token: "cl-bootstrap-scoped", on_key: Some("CRATONVM_CL_BOOTSTRAP_SCOPED"), off_key: None, off_word: Some("0"), since: "2026-06-23" },
     E { group: Group::LOADER, token: "fwd-resolve-strict", on_key: Some("CRATONVM_FWD_RESOLVE_STRICT"), off_key: None, off_word: None, since: "2026-06-09" },
     E { group: Group::LOADER, token: "jar-mmap", on_key: None, off_key: Some("CRATONVM_DISABLE_JAR_MMAP"), off_word: None, since: "2026-07-24" },

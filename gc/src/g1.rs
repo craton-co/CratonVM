@@ -183,6 +183,9 @@ fn for_each_flat_object_reference_capped(
         // `max_slots` is the caller's region-derived bound; `usize::MAX` from
         // the uncapped entry point leaves the old behaviour exactly as it was.
         let end = (header.num_slots() as usize).min(max_slots);
+        // Snapshot for the holder report below: the census moving across one
+        // cell read is what identifies THAT read as the corrupt one.
+        let mut census_before = cratonvm_types::cell_census::decoded();
         for index in first_index..end {
             let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
             // Discriminant-screened: see `heap::read_value_cell_checked`. An
@@ -199,9 +202,117 @@ fn for_each_flat_object_reference_capped(
             if let Value::Object(Some(reference)) = value {
                 visit(slot, reference.as_ptr() as usize, false);
             }
+            // NAME THE HOLDER, not just the slot.
+            //
+            // `read_value_cell_checked` already reports a corrupt cell, but it
+            // reports a SLOT ADDRESS and two raw words, and it stops after 32
+            // (`n < 32` there). Thirty-two identical-looking lines cannot say
+            // WHICH object was being walked, or why this walk took the legacy
+            // 16-byte-cell arm for it -- and "always exactly 32" is that cap,
+            // not a property of the defect.
+            //
+            // Keyed on the census counter rather than on the returned `Value`:
+            // a corrupt cell decodes to `Value::Object(None)`, which is also
+            // what a genuine null decodes to, so the value alone cannot tell
+            // them apart. `cell_census::decoded()` moving across this one read
+            // can.
+            //
+            // Measured 2026-09-06 on `org.h2.test.store.TestMVStoreTool`
+            // (-Xmx256m, G1, `CRATONVM_G1_JIT_MARK_DRIVER=1`): >=32 corrupt
+            // cells per run, in one burst inside a single second, always after
+            // mixed evacuation has run, one run in three escalating to a fatal
+            // `forwarding target must have its low 2 bits clear`. Never once in
+            // a driver-off run, including one that took 232 young pauses -- so
+            // it is not "more GC finds more". Ruled out by ablation:
+            // `CRATONVM_COMPACT_TLAB_ALLOC=0` (2/2 still corrupt) and
+            // `CRATONVM_G1_SCRUB_FREE=1` (this file's own first suggestion for
+            // a G1 corruption hunt -- 1/2 still corrupt).
+            //
+            // What is left is this branch's own premise: `is_compact_object`
+            // said the holder is NOT compact, so the walk strode 16-byte cells.
+            // These are the fields that decided that.
+            //
+            // ANSWERED, first run it fired (2026-09-06, 700 s, 30 mixed pauses,
+            // rc=139). The second horn: the holder is not an object.
+            //
+            //   holder=0x1f506711e40 class_id=163587104 num_slots=501
+            //                        mark=0x310001f509c02470 gc_age=3
+            //   holder=0x1f50e091ad8 class_id=163587104 num_slots=501
+            //                        mark=0x200001f509c02470 gc_age=2
+            //   holder=0x1f50e646b20 class_id=163587104 num_slots=501
+            //                        mark=0x100001f509c02470 gc_age=1
+            //
+            // Three addresses, one shape, ages 1/2/3: ONE object that three
+            // successive evacuations copied. `class_id` 163587104 is 0x09C02470
+            // and `num_slots` 501 is 0x1F5, so the header's first eight bytes are
+            // the single word 0x000001F509C02470 -- a HEAP POINTER, in a run
+            // whose heap is at 0x1f5.......  The mark word beside it is
+            // well-formed (a plausible quartet, an age that increments per
+            // copy), so this is not a torn header: something wrote a pointer
+            // over the `class_id`/`shape` dword pair and left the mark alone.
+            //
+            // The cells the walk then read are the payload of a Java string --
+            // raw0=0x6f57206f6c6c6548 is "Hello Wo", raw1=0x3532363620646c72 is
+            // "rld 6625". The walk is reading string bytes as reference cells.
+            //
+            // The producer is named one line earlier in the same log:
+            //   [g1] IMPLAUSIBLE legacy header at ref-slot-candidate (#5):
+            //   obj=0x1f507f00300 class_id=163587104 num_slots=501
+            //   mark=0x000001f50e646b23 claims=0x1f60 bytes source=r127/Old/off=0x30
+            // -- mark 0x...b23 is 0x1f50e646b20 tagged 0x3, a FORWARDING
+            // pointer, and 0x1f50e646b20 is the third holder above. A fourth
+            // report has mark 0x000001f505b00383 against holder 0x1f505b00380:
+            // its own address, tagged 3 -- a SELF-forward, the
+            // evacuation-failure path.
+            //
+            // So the next question is not about layout at all: who leaves a
+            // forwarding pointer where a walk later reads a `class_id`, and why
+            // does `retire_forwards` not reach it? That is where a fix goes.
+            //
+            // ANSWERED AGAIN, and it was not `retire_forwards`. That pointer
+            // came from the PARALLEL evacuator, which had none of the serial
+            // arm's header screens and is the default arm -- fixed the same day
+            // under `CRATONVM_G1_PARALLEL_EVAC_SCREEN`. The `class_id` above,
+            // 163587104 = 0x09C02470, is the low half of the heap pointer
+            // 0x1f509c02470 printed beside it, which is that page's fabrication
+            // pattern verbatim. Re-measured on the merged tip: 0 corrupt cells
+            // in 3/3 driver-on runs, where every run before it had >=32.
+            //
+            // This report therefore has no known live producer. It stays
+            // because the crash it was built to explain did NOT go with it:
+            // 2 of 3 driver-on runs still SIGSEGV, tracking `IMPLAUSIBLE legacy
+            // header` refusals (13 and 8 in the two that crashed, 0 in the one
+            // that did not) rather than corrupt cells. If this fires again it
+            // means a second producer, and the fields above are what separate
+            // it from the one already fixed.
+            if cratonvm_types::cell_census::decoded() != census_before {
+                census_before = cratonvm_types::cell_census::decoded();
+                let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}): \
+                         holder=0x{:x} class_id={} num_slots={} kind={:?} \
+                         mark=0x{:016x} gc_flags=0x{:x} gc_age={} is_compact={} \
+                         slot_index={index} end={end} -- the cell screen rejected \
+                         this word, so either the holder IS compact and this walk \
+                         chose the wrong arm, or the holder is not an object at all.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        header.kind(),
+                        header.mark_word.load(Ordering::Relaxed),
+                        header.gc_flags(),
+                        header.gc_age(),
+                        cratonvm_types::is_compact_object(header),
+                    );
+                }
+            }
         }
     }
 }
+
+/// Rate-limit counter for the corrupt-cell holder report above.
+static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 
 fn write_flat_object_reference(slot: *mut u8, raw: usize, compact: bool) {
     if compact {
@@ -508,6 +619,20 @@ pub static EVAC_SOURCE_WALK_DESYNC: AtomicUsize = AtomicUsize::new(0);
 /// there. Expected to be ZERO.
 pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 
+/// How many candidates the PARALLEL evacuator's last-ditch alignment guard
+/// refused, i.e. how many times `SharedEvac::evacuate` was handed an address
+/// that cannot be an object start.
+///
+/// Expected to be ZERO now that both worker walks screen their candidates the
+/// way the serial arm does. It is not redundant with that screen: `evacuate`
+/// also has three DRIVER-side callers (the Phase-1 root seed, the Phase-1b
+/// keep-alive seed, and `drain_deferred_self_forwarded`), and an unaligned
+/// address reaching the evacuation-failure arm is a `make_forwarded` ASSERT —
+/// which is an abort of the whole VM from a `g1-evac-N` worker, the loudest and
+/// least recoverable way for this to be reported. See
+/// `g1-evac-forwarding-assert-and-three-sigsegv-clusters`.
+pub static PARALLEL_EVAC_UNALIGNED_CANDIDATE: AtomicUsize = AtomicUsize::new(0);
+
 /// How many times the legacy 16-byte-slot walk was handed — and REFUSED — a
 /// header whose kind is `Array`.
 ///
@@ -728,6 +853,74 @@ struct RegionsBase(*mut G1Region);
 // SAFETY: see the module-level SAFETY MODEL note — disjoint per-worker access.
 unsafe impl Send for RegionsBase {}
 unsafe impl Sync for RegionsBase {}
+
+/// Which end of a holder's region bounds a reference walk.
+///
+/// See [`G1Collector::holder_walkable_slots_view`] for why the two evacuators
+/// need different answers: the serial arm publishes a destination cursor as it
+/// copies, the parallel arm carves TLABs and only writes the cursor back when a
+/// worker retires one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HolderBound {
+    /// The region's published allocation cursor — exact, and what every
+    /// serial-arm caller has always used.
+    Cursor,
+    /// The region's committed extent. Weaker than `Cursor`, but true for a
+    /// to-space holder still sitting inside an unretired worker TLAB.
+    RegionEnd,
+}
+
+/// Read-only access to the region table for the screens BOTH evacuators share.
+///
+/// The serial arm holds the regions guard and can hand out a `&[G1Region]`.
+/// The parallel arm deliberately cannot: the driver drops its guard-derived
+/// borrow for the whole dispatch (see the module SAFETY MODEL note) and workers
+/// reach individual regions through [`RegionsBase`], so materialising a
+/// whole-table slice there would assert an exclusivity the discipline does not
+/// have — a `&[G1Region]` over the array aliases the `&mut G1Region` a worker
+/// holds for the region it claimed.
+///
+/// This enum is what lets ONE body serve both arms. The alternative — a second
+/// copy of `classify_candidate_header` / `holder_walkable_slots` for the
+/// parallel arm — is the twin-pair shape this file's history already has one
+/// defect from (G1-9, a divergence between the two ref walks), and the whole
+/// reason the parallel arm needs these screens at all is that the serial arm's
+/// 2026-09-02 hardening never crossed to it.
+#[derive(Clone, Copy)]
+enum RegionView<'a> {
+    /// The serial arm: a slice borrowed from the held regions guard.
+    Slice(&'a [G1Region]),
+    /// The parallel arm: base pointer plus length, read ONE region at a time.
+    Raw(RegionsBase, usize),
+}
+
+impl<'a> From<&'a [G1Region]> for RegionView<'a> {
+    fn from(s: &'a [G1Region]) -> Self {
+        RegionView::Slice(s)
+    }
+}
+
+impl<'a> RegionView<'a> {
+    #[inline]
+    fn get(&self, idx: usize) -> Option<&'a G1Region> {
+        match *self {
+            RegionView::Slice(s) => s.get(idx),
+            // SAFETY: `idx < len` bounds the offset into the live regions
+            // table, which outlives the dispatch. This hands out a SHARED
+            // reference to ONE region — exactly the access `seed_source_region`
+            // already takes (`&*self.regions_base.0.add(source_idx)`) — and
+            // every field read through it (`region_type`, `data`, `cursor()`)
+            // is either immutable for the pause or an atomic.
+            RegionView::Raw(base, len) => {
+                if idx < len {
+                    Some(unsafe { &*base.0.add(idx) })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Region-index sets (F-03)
@@ -992,6 +1185,11 @@ impl Default for TlabSet {
 struct SharedEvac<'a> {
     collector: &'a G1Collector,
     regions_base: RegionsBase,
+    /// Length of the regions table `regions_base` points at, so the shared
+    /// header screens can be reached through a [`RegionView::Raw`]. Without it
+    /// the parallel arm has no bounded way to read a region and had to go
+    /// without the screens the serial arm has applied since 2026-09-02.
+    regions_len: usize,
     /// CSet membership (region indices being evacuated FROM).
     cset: &'a RegionSet,
     /// Free-region indices available for to-space TLAB claiming.
@@ -1007,6 +1205,78 @@ struct SharedEvac<'a> {
 }
 
 impl<'a> SharedEvac<'a> {
+    /// The region table as the shared screens want it. See [`RegionView`].
+    #[inline]
+    fn view(&self) -> RegionView<'_> {
+        RegionView::Raw(self.regions_base, self.regions_len)
+    }
+
+    /// Is the serial arm's header-screen parity armed on this arm?
+    /// `CRATONVM_G1_PARALLEL_EVAC_SCREEN=0` stands it down, which is the
+    /// same-binary A/B for the crash clusters it was added for.
+    #[inline]
+    fn screens_armed(&self) -> bool {
+        gc_flags().g1_parallel_evac_screen
+    }
+
+    /// `declared`, clamped to the holder's region when the screens are armed.
+    #[inline]
+    fn walkable(&self, obj_ptr: *mut u8, declared: usize, stride: usize) -> usize {
+        if !self.screens_armed() {
+            return declared;
+        }
+        self.collector.holder_walkable_slots_view(
+            self.view(),
+            obj_ptr,
+            declared,
+            stride,
+            HolderBound::RegionEnd,
+        )
+    }
+
+    /// May this CSet-resident candidate be dereferenced and evacuated?
+    #[inline]
+    fn candidate_ok(
+        &self,
+        site: &'static str,
+        holder: *mut u8,
+        slot: usize,
+        raw: usize,
+    ) -> bool {
+        if !self.screens_armed() {
+            return true;
+        }
+        self.collector
+            .evacuation_candidate_is_an_object_view(self.view(), site, holder, slot, raw)
+    }
+
+    /// The parallel driver's copy of the serial arms' root guard: is this
+    /// CSet-resident root the start of a live object, and if not, count the
+    /// skip. Returns `true` when the root may be followed.
+    ///
+    /// The serial sites also PIN nothing (see the long comment there: the JNI
+    /// `pinned` flag is a different vocabulary with a different clearing rule),
+    /// so leaving the root untouched is the whole action here too.
+    fn note_root_object_plausibility_or_skip(&self, old_ptr: *mut u8) -> bool {
+        if !self.screens_armed() {
+            return true;
+        }
+        if self
+            .collector
+            .note_root_object_plausibility_view(self.view(), old_ptr as usize)
+        {
+            return true;
+        }
+        let n = NON_OBJECT_ROOT_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] a NON-OBJECT root was SKIPPED by the PARALLEL evacuator (#{n}): 0x{:x}                  — it is not the start of a live object, so evacuating it would have sized an                  object from bytes that are not a header. The root is left unchanged.",
+                old_ptr as usize,
+            );
+        }
+        false
+    }
+
     fn append_self_forwarded_from_forwards(
         forwards: &[(usize, usize)],
         deferred_self_forwarded: &mut Vec<usize>,
@@ -1122,6 +1392,41 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
     ) -> Option<(*mut u8, bool)> {
+        // LAST-DITCH ALIGNMENT GUARD. Everything below dereferences `old_ptr`
+        // as an `ObjectHeader`, and the evacuation-failure arm feeds `old_ptr`
+        // itself to `ObjectHeader::make_forwarded`, whose FIRST assert is
+        // "forwarding target must have its low 2 bits clear". An unaligned
+        // candidate therefore does not degrade — it PANICS in a `g1-evac-N`
+        // worker, and `RetireOnExit` converts that into a `main-vm` abort of
+        // the whole process. That is the shape of all five Cluster-D crashes in
+        // `g1-evac-forwarding-assert-and-three-sigsegv-clusters`.
+        //
+        // The two worker walks now screen their candidates with
+        // `evacuation_candidate_is_an_object_view`, so nothing SHOULD arrive
+        // here misaligned. This guard is for the three driver-side callers that
+        // do not (roots, keep-alive, the self-forward drain) and for whatever
+        // the next supply route turns out to be: two instructions to turn an
+        // unrecoverable abort into a counted refusal and a continued pause.
+        // `None` is the caller-visible "evacuation failed", which every one of
+        // the six call sites already handles by leaving the slot alone.
+        //
+        // Gated with the rest of the parity work on
+        // `CRATONVM_G1_PARALLEL_EVAC_SCREEN`, so `=0` really does restore the
+        // pre-2026-09-05 behaviour — abort included. A guard that stayed armed
+        // under the off word would make the switch a HALF A/B: the crash it is
+        // meant to reproduce would not come back, and the arm would look like
+        // evidence that the screens were not what fixed it.
+        if self.screens_armed() && (old_ptr.is_null() || (old_ptr as usize) & 0x7 != 0) {
+            let n = PARALLEL_EVAC_UNALIGNED_CANDIDATE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] parallel evacuation REFUSED an unaligned candidate (#{n}):                      addr=0x{:x} — an object start is 8-aligned, so this word is not one.                      Evacuating it would have asserted inside `make_forwarded` and aborted                      the VM. The reference is left unchanged and the pause continues.",
+                    old_ptr as usize,
+                );
+            }
+            return None;
+        }
+
         // Since the 32 -> 24 header shrink the forwarding slot IS the mark
         // word, so this is a tagged CAS rather than a zero-vs-nonzero one: the
         // unforwarded value is not 0 but "any word whose 2-bit state is not
@@ -1322,9 +1627,20 @@ impl<'a> SharedEvac<'a> {
     ) {
         let header = &*(obj_ptr as *const ObjectHeader);
         let (kind, etype, alen) = (header.kind(), header.element_type(), header.array_length());
+        // PARITY WITH THE SERIAL ARM (2026-09-05). `scan_and_evacuate_refs`
+        // clamps its element walk with `holder_walkable_slots` and screens
+        // every candidate with `evacuation_candidate_is_an_object` before
+        // `evacuate_object` dereferences it; this walk did neither, and it is
+        // the DEFAULT arm. `array_length` is a u32 bounded only by `i32::MAX`,
+        // so `HEADER_SIZE + len * 8` is not implied to be inside the region by
+        // anything — one wrong header walked into the next region, read its
+        // bytes as references, and (below) REWROTE the ones that looked like
+        // CSet pointers with forwarding addresses. See
+        // `g1-evac-forwarding-assert-and-three-sigsegv-clusters`.
         if kind == ObjectKind::Array {
             if etype == ArrayElementType::Reference {
-                for i in 0..alen as usize {
+                let walkable = self.walkable(obj_ptr, alen as usize, 8);
+                for i in 0..walkable {
                     let slot_ptr = obj_ptr.add(HEADER_SIZE + i * 8);
                     let raw: u64 = std::ptr::read(slot_ptr as *const u64);
                     if raw == 0 {
@@ -1333,6 +1649,18 @@ impl<'a> SharedEvac<'a> {
                     let ref_ptr = raw as usize as *mut u8;
                     if let Some(ridx) = self.collector.lookup_region_for_addr(ref_ptr as usize) {
                         if self.cset.contains(&ridx) {
+                            // Item 4 ordering, as on the serial arm: region
+                            // membership first (cheap, and a non-CSet referent
+                            // is never followed), the header screen only for a
+                            // CSet resident.
+                            if !self.candidate_ok(
+                                "parallel-scan[array]",
+                                obj_ptr,
+                                i,
+                                raw as usize,
+                            ) {
+                                continue;
+                            }
                             if let Some((new_ptr, fresh)) =
                                 self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                             {
@@ -1383,14 +1711,28 @@ impl<'a> SharedEvac<'a> {
             // `alloc_object(ClassId, n)` with no layout registered, so their
             // objects are legacy-layout and this loop was accidentally correct
             // for every one of them.
-            for_each_flat_object_reference_trusting_header(
+            // Same two additions as the array arm above, for the same reason
+            // and with the same stride argument the serial arm makes: a legacy
+            // 16-byte `Value` slot leaves the region TWICE as fast as an 8-byte
+            // array element, and this walk WRITES.
+            let walkable = self.walkable(obj_ptr, header.num_slots() as usize, SLOT_SIZE);
+            for_each_flat_object_reference_capped(
                 obj_ptr,
                 header,
                 0,
+                walkable,
                 |slot_ptr, raw, compact| {
                     let ref_ptr = raw as *mut u8;
                     if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
                         if self.cset.contains(&ridx) {
+                            if !self.candidate_ok(
+                                "parallel-scan[object]",
+                                obj_ptr,
+                                (slot_ptr as usize).wrapping_sub(obj_ptr as usize),
+                                raw,
+                            ) {
+                                return;
+                            }
                             if let Some((new_ptr, fresh)) =
                                 self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                             {
@@ -1529,7 +1871,14 @@ impl<'a> SharedEvac<'a> {
 
             if kind == ObjectKind::Array {
                 if etype == ArrayElementType::Reference {
-                    for i in 0..alen as usize {
+                    // PARITY (2026-09-05) — see `process_object`. The linear
+                    // walk above bounds the HOLDER (`offset + obj_size >
+                    // cursor` breaks), but nothing bounded the holder's own
+                    // element count or screened the candidates it produced.
+                    // `scan_source_region_for_cset_refs`, this walk's serial
+                    // twin, does both.
+                    let walkable = self.walkable(obj_ptr, alen as usize, 8);
+                    for i in 0..walkable {
                         let slot_ptr = obj_ptr.add(HEADER_SIZE + i * 8);
                         let raw: u64 = std::ptr::read(slot_ptr as *const u64);
                         if raw == 0 {
@@ -1542,6 +1891,14 @@ impl<'a> SharedEvac<'a> {
                                 holds_cross_region = true;
                             }
                             if self.cset.contains(&ridx) {
+                                if !self.candidate_ok(
+                                    "parallel-seed[array]",
+                                    obj_ptr,
+                                    i,
+                                    raw as usize,
+                                ) {
+                                    continue;
+                                }
                                 if let Some((new_ptr, fresh)) =
                                     self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                                 {
@@ -1567,10 +1924,12 @@ impl<'a> SharedEvac<'a> {
                 // remembered-set source whose CSet-bound edges are never
                 // rewritten at all.
                 let header = &*(obj_ptr as *const ObjectHeader);
-                for_each_flat_object_reference_trusting_header(
+                let walkable = self.walkable(obj_ptr, nslots as usize, SLOT_SIZE);
+                for_each_flat_object_reference_capped(
                     obj_ptr,
                     header,
                     0,
+                    walkable,
                     |slot_ptr, raw, compact| {
                         let ref_ptr = raw as *mut u8;
                         if let Some(ridx) = self.collector.lookup_region_for_addr(raw) {
@@ -1579,6 +1938,14 @@ impl<'a> SharedEvac<'a> {
                                 holds_cross_region = true;
                             }
                             if self.cset.contains(&ridx) {
+                                if !self.candidate_ok(
+                                    "parallel-seed[object]",
+                                    obj_ptr,
+                                    (slot_ptr as usize).wrapping_sub(obj_ptr as usize),
+                                    raw,
+                                ) {
+                                    return;
+                                }
                                 if let Some((new_ptr, fresh)) =
                                     self.evacuate(tlab, ref_ptr, forwards, objs, bytes)
                                 {
@@ -3155,6 +3522,48 @@ pub struct G1PauseSummary {
 // ---------------------------------------------------------------------------
 
 /// G1 garbage collector implementing the `GarbageCollector` trait.
+// ---------------------------------------------------------------------------
+// `is_object_address` census -- CRATONVM_DBG_G1_OBJADDR=1
+// ---------------------------------------------------------------------------
+
+/// Calls, acceptances and nanoseconds inside [`G1Collector::is_object_address`].
+///
+/// # What this is for
+///
+/// `gen_heap`'s sibling predicate got an exact object-start bitmap because it
+/// was ~180 lines of header-shaped deduction with an extent computation and two
+/// commit probes in it. The obvious follow-up -- give G1 one too -- is NOT the
+/// same trade, and the reason is measurable rather than arguable: G1 does not
+/// allocate through `Arena`, so it has no bitmap to consult and would need one
+/// maintained at its own chokepoint; and its predicate is already the cheaper
+/// of the two, with no extent arithmetic and no second commit probe, so the
+/// expensive half a bitmap replaces in `gen_heap` is not there to replace.
+///
+/// Whether the cheap half is worth replacing is a number, and this is the
+/// number: the share of a G1 run spent inside this function at all. Off by
+/// default -- two `Instant::now()` calls around a function whose body is an
+/// alignment test and two byte loads would dominate what it measures, which is
+/// why the reading is a share of a run rather than a per-call cost.
+static G1_OBJADDR_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static G1_OBJADDR_ACCEPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static G1_OBJADDR_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn g1_objaddr_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_G1_OBJADDR").is_some())
+}
+
+/// `(calls, accepted, nanos)` -- see [`G1_OBJADDR_CALLS`].
+pub fn g1_object_address_census() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        G1_OBJADDR_CALLS.load(Ordering::Relaxed),
+        G1_OBJADDR_ACCEPTED.load(Ordering::Relaxed),
+        G1_OBJADDR_NANOS.load(Ordering::Relaxed),
+    )
+}
+
 pub struct G1Collector {
     /// Compact-layout domain of the VM that owns this heap. See
     /// `Heap::set_layout_domain`: `class_id` is a per-`ClassStore` index, so
@@ -7142,6 +7551,7 @@ impl G1Collector {
     unsafe fn parallel_evacuate(
         &self,
         regions_base: RegionsBase,
+        regions_len: usize,
         cset_set: &RegionSet,
         pool: Vec<usize>,
         roots: &mut [ObjectRef],
@@ -7166,6 +7576,7 @@ impl G1Collector {
         let shared = SharedEvac {
             collector: self,
             regions_base,
+            regions_len,
             cset: cset_set,
             pool: &pool,
             pool_next: &pool_next,
@@ -7190,6 +7601,21 @@ impl G1Collector {
             let old_ptr = root.as_ptr();
             if let Some(ridx) = self.lookup_region_for_addr(old_ptr as usize) {
                 if cset_set.contains(&ridx) {
+                    // A ROOT THAT IS NOT AN OBJECT START IS NOT EVACUATED —
+                    // the 2026-09-02 rule the SERIAL drivers apply at
+                    // `young_collection` and `mixed_collection`, arriving on
+                    // the arm that is actually the default. Read the long note
+                    // at the serial site: a conservative JIT root landing 0x28
+                    // bytes inside a live reference array made `evacuate` size
+                    // an object out of an array ELEMENT, copy eight kilobytes
+                    // of it into a Survivor region, and rewrite the root to
+                    // name the result. Every downstream symptom — rejected
+                    // candidates, dangling references, a SIGSEGV in whatever
+                    // touched the fabricated object next — follows from that
+                    // one copy, and this arm had no guard against it at all.
+                    if !shared.note_root_object_plausibility_or_skip(old_ptr) {
+                        continue;
+                    }
                     if let Some((new_ptr, fresh)) = shared.evacuate(
                         &mut main_tlab,
                         old_ptr,
@@ -7592,6 +8018,7 @@ impl G1Collector {
 
         // Take the raw regions base; do NOT deref `regions` again until after
         // `parallel_evacuate` returns (see the module SAFETY MODEL note).
+        let regions_len = regions.len();
         let regions_base = RegionsBase(regions.as_mut_ptr());
         // F-05 — the parallel arm reports seed+closure as one `closure_us`, so
         // the card-screen counters are diffed around the whole call rather than
@@ -7600,6 +8027,7 @@ impl G1Collector {
         let (pointer_map, objects_copied, bytes_copied) = unsafe {
             self.parallel_evacuate(
                 regions_base,
+                regions_len,
                 &cset_set,
                 pool,
                 roots,
@@ -7877,6 +8305,7 @@ impl G1Collector {
         let mut phases = G1PausePhases::default();
         let mut phase_mark = std::time::Instant::now();
 
+        let regions_len = regions.len();
         let regions_base = RegionsBase(regions.as_mut_ptr());
         // F-05 — the parallel arm reports seed+closure as one `closure_us`, so
         // the card-screen counters are diffed around the whole call rather than
@@ -7885,6 +8314,7 @@ impl G1Collector {
         let (pointer_map, objects_copied, bytes_copied) = unsafe {
             self.parallel_evacuate(
                 regions_base,
+                regions_len,
                 &cset_set,
                 pool,
                 roots,
@@ -8473,6 +8903,18 @@ impl G1Collector {
         header: &ObjectHeader,
         site: &'static str,
     ) -> bool {
+        self.note_implausible_legacy_header_view(RegionView::Slice(regions), obj_ptr, header, site)
+    }
+
+    /// [`Self::note_implausible_legacy_header`] against a [`RegionView`], so the
+    /// parallel evacuator reaches the same body. See [`RegionView`].
+    fn note_implausible_legacy_header_view(
+        &self,
+        regions: RegionView<'_>,
+        obj_ptr: *mut u8,
+        header: &ObjectHeader,
+        site: &'static str,
+    ) -> bool {
         // Two shapes, both of which `classify_candidate_header` accepts because
         // it only validates the TAG bytes and an upper bound on `shape`:
         //
@@ -8595,7 +9037,35 @@ impl G1Collector {
         slot: usize,
         raw: usize,
     ) -> bool {
-        let (verdict, _) = self.classify_candidate_header(regions, raw);
+        self.evacuation_candidate_is_an_object_view(
+            RegionView::Slice(regions),
+            site,
+            holder,
+            slot,
+            raw,
+        )
+    }
+
+    /// [`Self::evacuation_candidate_is_an_object`] against a [`RegionView`].
+    ///
+    /// This is the screen the PARALLEL evacuator was missing. `evacuate`'s own
+    /// doc comment on the serial side records the contract — "every caller has
+    /// already established that `old_ptr` is a plausible object header inside a
+    /// live CSet region (roots go through `note_root_object_plausibility`,
+    /// slots through `evacuation_candidate_is_an_object`)" — and
+    /// `SharedEvac::process_object` / `seed_source_region` established neither,
+    /// which is how a word that is merely INSIDE a CSet region's span reached
+    /// `ObjectHeader::make_forwarded` and tripped its low-2-bits assert from a
+    /// `g1-evac-N` worker. See `g1-evac-forwarding-assert-and-three-sigsegv-clusters`.
+    fn evacuation_candidate_is_an_object_view(
+        &self,
+        regions: RegionView<'_>,
+        site: &'static str,
+        holder: *mut u8,
+        slot: usize,
+        raw: usize,
+    ) -> bool {
+        let (verdict, _) = self.classify_candidate_header_view(regions, raw);
         if verdict == HeaderVerdict::Object {
             // Same second look as `note_root_object_plausibility`'s, on the
             // other supply route. A slot holding an INTERIOR address passes
@@ -8605,7 +9075,12 @@ impl G1Collector {
             // SAFETY: the verdict above validated the tag bytes and the
             // address's containment below its region's cursor.
             let cand = unsafe { &*(raw as *const ObjectHeader) };
-            self.note_implausible_legacy_header(regions, raw as *mut u8, cand, "ref-slot-candidate");
+            self.note_implausible_legacy_header_view(
+                regions,
+                raw as *mut u8,
+                cand,
+                "ref-slot-candidate",
+            );
             return true;
         }
         // WHICH refusal, not just THAT one. See [`EVAC_REF_REJECTED_TORN`]:
@@ -8645,8 +9120,8 @@ impl G1Collector {
             };
             let holder_region = self
                 .lookup_region_for_addr(holder as usize)
-                .map(|i| {
-                    let r = &regions[i];
+                .and_then(|i| regions.get(i).map(|r| (i, r)))
+                .map(|(i, r)| {
                     format!(
                         "r{i}/{:?}/off={}/cursor={}",
                         r.region_type,
@@ -8675,8 +9150,8 @@ impl G1Collector {
             // overwritten, and that reads back as exactly the censused shape.
             let holder_grid = self
                 .lookup_region_for_addr(holder as usize)
-                .map(|i| {
-                    let r = &regions[i];
+                .and_then(|i| regions.get(i))
+                .map(|r| {
                     let off = (holder as usize).wrapping_sub(r.data.as_ptr() as usize);
                     format!(
                         "{} {}",
@@ -8727,19 +9202,61 @@ impl G1Collector {
         declared: usize,
         stride: usize,
     ) -> usize {
+        self.holder_walkable_slots_view(
+            RegionView::Slice(regions),
+            obj_ptr,
+            declared,
+            stride,
+            HolderBound::Cursor,
+        )
+    }
+
+    /// [`Self::holder_walkable_slots`] against a [`RegionView`], with the
+    /// holder's end selected by `bound`.
+    ///
+    /// # Why the parallel arm cannot use `HolderBound::Cursor`
+    ///
+    /// The serial evacuator places every to-space copy with
+    /// `alloc_in_type_locked`, which publishes the destination region's cursor
+    /// as it bumps — so a to-space holder is always BELOW its region's cursor
+    /// and the cursor bound is exact. The parallel evacuator carves per-worker
+    /// TLABs and only writes the cursor back in `retire_tlab`, so for the whole
+    /// dispatch a freshly-copied holder sits ABOVE the region's published
+    /// cursor. Clamping it to the cursor would return 0 for every object the
+    /// parallel arm copies — it would not harden the walk, it would stop the
+    /// closure from following any reference at all.
+    ///
+    /// `HolderBound::RegionEnd` is the bound that is still true there: the
+    /// holder's own region is committed (it holds the copy), and the point of
+    /// the clamp is that a walk must not leave the region it started in.
+    fn holder_walkable_slots_view(
+        &self,
+        regions: RegionView<'_>,
+        obj_ptr: *mut u8,
+        declared: usize,
+        stride: usize,
+        bound: HolderBound,
+    ) -> usize {
         let addr = obj_ptr as usize;
         let region_size = self.config.region_size;
         if region_size == 0 || addr < self.arena_base || addr >= self.arena_end {
             return declared;
         }
         // The holder may be humongous: walk forward across continuation slices
-        // so a legitimately large array is not clamped.
-        let mut idx = (addr - self.arena_base) / region_size;
+        // so a legitimately large array is not clamped. Shift, not `div` — see
+        // the note in `classify_candidate_header_view`; this one is called once
+        // per HOLDER rather than once per reference, but it is the same
+        // argument and the two should not drift.
+        let mut idx = (addr - self.arena_base) >> self.region_shift;
         let Some(start) = regions.get(idx) else {
             return declared;
         };
         let base = start.data.as_ptr() as usize;
-        let mut end = base + start.cursor();
+        let mut end = base
+            + match bound {
+                HolderBound::Cursor => start.cursor(),
+                HolderBound::RegionEnd => start.data.len(),
+            };
         while let Some(next) = regions.get(idx + 1) {
             if next.region_type != RegionType::HumongousContinuation {
                 break;
@@ -8775,7 +9292,12 @@ impl G1Collector {
     /// direction for this guard: a false accept is only the pre-guard
     /// behaviour, whereas a false reject would drop a live reference.
     fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
-        self.classify_candidate_header(regions, addr).0 == HeaderVerdict::Object
+        self.candidate_header_is_plausible_view(RegionView::Slice(regions), addr)
+    }
+
+    /// [`Self::candidate_header_is_plausible`] against a [`RegionView`].
+    fn candidate_header_is_plausible_view(&self, regions: RegionView<'_>, addr: usize) -> bool {
+        self.classify_candidate_header_view(regions, addr).0 == HeaderVerdict::Object
     }
 
     /// [`Self::candidate_header_is_plausible`], but returning WHICH check said
@@ -8792,6 +9314,15 @@ impl G1Collector {
         regions: &[G1Region],
         addr: usize,
     ) -> (HeaderVerdict, Option<usize>) {
+        self.classify_candidate_header_view(RegionView::Slice(regions), addr)
+    }
+
+    /// [`Self::classify_candidate_header`] against a [`RegionView`].
+    fn classify_candidate_header_view(
+        &self,
+        regions: RegionView<'_>,
+        addr: usize,
+    ) -> (HeaderVerdict, Option<usize>) {
         if addr == 0 || addr & 0x7 != 0 {
             return (HeaderVerdict::NullOrUnaligned, None);
         }
@@ -8802,7 +9333,14 @@ impl G1Collector {
         if region_size == 0 {
             return (HeaderVerdict::NoRegionGeometry, None);
         }
-        let idx = (addr - self.arena_base) / region_size;
+        // F-09's shift, not a `div`. This screen was a cold path when it was
+        // written — a few conservative roots per pause — and became a HOT one
+        // on 2026-09-05, when the parallel evacuator (the DEFAULT arm) started
+        // calling it once per CSet-bound reference. `region_size` is a runtime
+        // value, so `/` compiles to a real 64-bit `div`: tens of cycles,
+        // unpipelined. `lookup_region_for_addr` already carries the note and
+        // the `normalize_region_size` argument that licenses the shift.
+        let idx = (addr - self.arena_base) >> self.region_shift;
         let Some(r) = regions.get(idx) else {
             return (HeaderVerdict::NoSuchRegion, None);
         };
@@ -8855,7 +9393,12 @@ impl G1Collector {
     /// One line of context for a rejected address: the verdict, and what the
     /// owning region looks like right now.
     fn describe_rejected_address(&self, regions: &[G1Region], addr: usize) -> String {
-        let (verdict, idx) = self.classify_candidate_header(regions, addr);
+        self.describe_rejected_address_view(RegionView::Slice(regions), addr)
+    }
+
+    /// [`Self::describe_rejected_address`] against a [`RegionView`].
+    fn describe_rejected_address_view(&self, regions: RegionView<'_>, addr: usize) -> String {
+        let (verdict, idx) = self.classify_candidate_header_view(regions, addr);
         match idx.and_then(|i| regions.get(i).map(|r| (i, r))) {
             Some((i, r)) => {
                 let base = r.data.as_ptr() as usize;
@@ -8900,13 +9443,23 @@ impl G1Collector {
         addr: usize,
         site: &'static str,
     ) -> bool {
-        if !self.candidate_header_is_plausible(regions, addr) {
+        self.addr_is_followable_object_view(RegionView::Slice(regions), addr, site)
+    }
+
+    /// [`Self::addr_is_followable_object`] against a [`RegionView`].
+    fn addr_is_followable_object_view(
+        &self,
+        regions: RegionView<'_>,
+        addr: usize,
+        site: &'static str,
+    ) -> bool {
+        if !self.candidate_header_is_plausible_view(regions, addr) {
             return false;
         }
         // SAFETY: the screen above validated the tag bytes and placed `addr`
         // inside a live region's committed span.
         let header = unsafe { &*(addr as *const ObjectHeader) };
-        !self.note_implausible_legacy_header(regions, addr as *mut u8, header, site)
+        !self.note_implausible_legacy_header_view(regions, addr as *mut u8, header, site)
     }
 
     /// Is this CSet-resident root the start of a live object? Counts and, for
@@ -8926,14 +9479,24 @@ impl G1Collector {
     /// Wiring the refusal to the tag screen alone measured `skipped=0` on a run
     /// that was still fabricating objects out of array elements.
     fn note_root_object_plausibility(&self, regions: &[G1Region], addr: usize) -> bool {
-        if self.addr_is_followable_object(regions, addr, "cset-root") {
+        self.note_root_object_plausibility_view(RegionView::Slice(regions), addr)
+    }
+
+    /// [`Self::note_root_object_plausibility`] against a [`RegionView`], so the
+    /// PARALLEL driver's Phase-1 root seed applies the identical screen. It did
+    /// not before 2026-09-05: the 2026-09-02 "a root that is not an object
+    /// start is not evacuated" hardening landed on `young_collection` /
+    /// `mixed_collection` only, and parallel evacuation is the DEFAULT arm
+    /// (`CRATONVM_G1_PARALLEL_EVAC`, on unless `0`).
+    fn note_root_object_plausibility_view(&self, regions: RegionView<'_>, addr: usize) -> bool {
+        if self.addr_is_followable_object_view(regions, addr, "cset-root") {
             return true;
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
             tracing::warn!(
                 "[g1] CSet ROOT is not an object (#{n}): addr=0x{addr:x} {}",
-                self.describe_rejected_address(regions, addr),
+                self.describe_rejected_address_view(regions, addr),
             );
         }
         false
@@ -10258,6 +10821,26 @@ impl G1Collector {
         // is a dangling pointer into a (now-freed) CSet region.
         let is_dangling = |addr: usize| -> bool {
             if addr == 0 {
+                return false;
+            }
+            // NOT 8-ALIGNED IS NOT A REFERENCE. Every object start in this heap
+            // is 8-aligned — `plausible_heap_pointer` and
+            // `ObjectHeader::make_forwarded` both assert it — so a misaligned
+            // word cannot be a reference the collector failed to remap. It is a
+            // primitive, a stale slot, or a conservatively-discovered `long`,
+            // and the evacuator has just DECLINED to follow it
+            // (`evacuation_candidate_is_an_object`, both arms since
+            // 2026-09-05). Counting a deliberate refusal as an "incomplete
+            // remembered set => UAF" makes this verifier report the fix as the
+            // defect.
+            //
+            // The screen is alignment ONLY, deliberately. The obvious stronger
+            // one — `candidate_header_is_plausible` — would make the whole
+            // check vacuous here: this walk runs AFTER Phase 5, so every CSet
+            // region is already `Free` and the classifier answers `RegionFree`
+            // for every address in one, including the genuinely dangling ones
+            // this verifier exists to catch.
+            if addr & 0x7 != 0 {
                 return false;
             }
             match self.lookup_region_for_addr(addr) {
@@ -16490,6 +17073,23 @@ impl G1Collector {
     }
 
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
+        let __t0 = g1_objaddr_census_on().then(std::time::Instant::now);
+        let __r = self.is_object_address_inner(addr);
+        if let Some(t0) = __t0 {
+            G1_OBJADDR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if __r.is_some() {
+                G1_OBJADDR_ACCEPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            G1_OBJADDR_NANOS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        __r
+    }
+
+    #[inline]
+    fn is_object_address_inner(&self, addr: usize) -> Option<ObjectRef> {
         if addr == 0 || addr & 0x7 != 0 {
             return None;
         }
@@ -26866,6 +27466,92 @@ mod tests {
         let result = gc.young_collection_parallel(&mut roots, &NoopMonitors);
         assert!(result.stats.objects_copied >= 1);
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(42));
+    }
+
+    /// A reference slot holding an address that is INSIDE a CSet region but is
+    /// not an object start must be refused, not followed — on the PARALLEL arm,
+    /// which is the default one.
+    ///
+    /// Before 2026-09-05 `SharedEvac::process_object` gated a candidate on
+    /// `lookup_region_for_addr` + CSet membership and nothing else, while its
+    /// serial twin `scan_and_evacuate_refs` had screened every candidate with
+    /// `evacuation_candidate_is_an_object` since 2026-08-26. An interior or
+    /// misaligned word therefore reached `SharedEvac::evacuate`, and when
+    /// to-space happened to be exhausted the self-forward arm handed it
+    /// straight to `ObjectHeader::make_forwarded`, whose first assert is
+    /// "forwarding target must have its low 2 bits clear". That is a panic in a
+    /// `g1-evac-N` worker, which `RetireOnExit` turns into a `main-vm` abort:
+    /// the whole process dies. Reproduced on Tomcat's
+    /// `org.apache.jasper.compiler.TestEncodingDetector` under `-XX:+UseG1GC`,
+    /// 2026-09-05; see
+    /// `g1-evac-forwarding-assert-and-three-sigsegv-clusters`.
+    ///
+    /// The test writes the raw word rather than going through
+    /// `set_array_element`, because `ObjectRef` is checked at that door and the
+    /// defect is precisely about a word that never came through it — a
+    /// conservative JIT root, a stale slot, a `long` whose bits land in the
+    /// heap range.
+    ///
+    /// Reaching the panic needs no to-space exhaustion here: the assertion is
+    /// that the pause SURVIVES and the well-formed neighbours still move.
+    #[test]
+    fn the_parallel_evacuator_refuses_a_misaligned_reference_slot() {
+        let gc = G1Collector::new(parallel_config(4, 8));
+
+        let good: Vec<ObjectRef> = (0..8)
+            .map(|i| {
+                let o = gc.alloc_object(ClassId::new(11), 1);
+                gc.set_field(o, 0, Value::Int(500 + i));
+                o
+            })
+            .collect();
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Reference, 9);
+        for (i, &g) in good.iter().enumerate() {
+            gc.set_array_element(arr, i, Value::Object(Some(g))).unwrap();
+        }
+
+        // Element 8: `good[0]` + 3 — inside the same live CSet region, past its
+        // header, and NOT 8-aligned. `lookup_region_for_addr` says yes and the
+        // CSet contains it, so every pre-fix screen passes it through.
+        let bogus = good[0].as_ptr() as usize + 3;
+        unsafe {
+            let slot = arr.as_ptr().add(HEADER_SIZE + 8 * 8) as *mut u64;
+            std::ptr::write(slot, bogus as u64);
+        }
+
+        let refused_before = EVAC_REF_REJECTED.load(Ordering::Relaxed);
+
+        let mut roots = vec![arr];
+        // Pre-fix this call ABORTS the process from a worker thread.
+        let res = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        // The array plus its eight well-formed elements, each copied once. The
+        // bogus word contributes nothing — refusing it must not cost a real
+        // reference, which is the failure mode a too-strict screen would have.
+        assert_eq!(
+            res.stats.objects_copied,
+            1 + good.len(),
+            "the array and every well-formed element move exactly once"
+        );
+        let arr2 = roots[0];
+        for i in 0..good.len() {
+            let v = gc.get_array_element(arr2, i).unwrap();
+            let o = match v {
+                Value::Object(Some(o)) => o,
+                other => panic!("element {i} lost its referent: {other:?}"),
+            };
+            assert_eq!(
+                gc.get_field(o, 0).as_int(),
+                Some(500 + i as i32),
+                "element {i} was rewritten to the wrong object"
+            );
+        }
+        // Monotone global counter: other tests in this binary may also bump it,
+        // so assert it MOVED rather than pinning an exact value.
+        assert!(
+            EVAC_REF_REJECTED.load(Ordering::Relaxed) > refused_before,
+            "the misaligned candidate must be counted as a refusal, not followed"
+        );
     }
 
     #[test]
