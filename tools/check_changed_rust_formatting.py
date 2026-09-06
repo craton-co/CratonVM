@@ -5,7 +5,7 @@
 that of every changed file, and 171 of this repository's 978 tracked `.rs` files
 answer "no" — so the job failed on 33 of the last 60 non-merge commits for
 formatting those commits did not introduce (see
-`docs/known-issues/the-fmt-ci-job-is-red-on-half-of-all-pushes-20260906.md`).
+`the-fmt-ci-job-was-red-on-half-of-all-pushes-RESOLVED-20260906.md`).
 This asks the question the job's name implies instead: **are the lines this diff
 touched formatted?**
 

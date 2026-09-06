@@ -1670,7 +1670,6 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,7 +1886,6 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(client))))
     });
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2073,7 +2071,6 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(opt))))
     });
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2335,7 +2332,6 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2481,7 +2477,6 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(opt))))
     });
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,7 +2839,6 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 /// Process-wide map from BodySubscriber identity → downstream Flow.Subscriber.
@@ -2948,7 +2942,6 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------

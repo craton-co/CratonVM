@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-528 tokens.
+532 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -379,6 +379,8 @@ export inherited from a parent shell.
 | `monenter` | `CRATONVM_DBG_MONENTER` |
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
 | `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
+| `relocation-blockers` | `CRATONVM_DBG_RELOCATION_BLOCKERS` |
+| `jit-remap-all-unverifiable` | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
 | `moving-young-no-band-verify` | `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` |
@@ -397,6 +399,7 @@ export inherited from a parent shell.
 | `nocode` | `CRATONVM_DBG_NOCODE` |
 | `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
+| `null-field-provenance` | `CRATONVM_DBG_NULL_FIELD_PROVENANCE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
 | `a5-engagement` | `CRATONVM_DBG_A5_ENGAGEMENT` |
@@ -527,6 +530,7 @@ export inherited from a parent shell.
 | `swchain` | `CRATONVM_DBG_SWCHAIN` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
+| `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
 | `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
@@ -594,7 +598,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-375 tokens.
+376 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -817,6 +821,7 @@ export inherited from a parent shell.
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
 | `poison-free` | `CRATONVM_JIT_POISON_FREE` |
+| `post-tlab-hash-stamp` | `CRATONVM_JIT_POST_TLAB_HASH_STAMP` |
 | `precise-coverage-pin` | `CRATONVM_PRECISE_COVERAGE_PIN` |
 | `callee-handler-precise-frame` | `CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME` |
 | `precise-handler-frames` | `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES` |
@@ -976,7 +981,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-165 tokens.
+166 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1032,6 +1037,7 @@ export inherited from a parent shell.
 | `g1-parallel-evac-screen` | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` |
 | `g1-evac-copy-watch` | `CRATONVM_G1_EVAC_COPY_WATCH` |
 | `g1-parallel-evac-shared-dest` | `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` |
+| `g1-parallel-evac-resume-dest` | `CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST` |
 | `g1-evac-ref-implausible-refuse` | `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
 | `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |

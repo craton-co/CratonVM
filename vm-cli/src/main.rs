@@ -49,6 +49,59 @@ use tracing::info;
 static GC_STATS_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A WEAK handle to the running VM, stashed as soon as `Vm::new` returns so
+/// that [`maybe_dump_shutdown_reports`] can reach `VmHeap::print_gc_summary`.
+///
+/// That report carries everything in `G1Collector::print_gc_summary` that needs
+/// `&self` -- the heap/IHOP/card-clean/tenuring policy state and the
+/// `[GC-SUMMARY]` pause percentiles -- plus the card census, the parallel-evac
+/// census and the ZGC block. Every one of them was on the NORMAL-RETURN arm
+/// only, and `System.exit` never unwinds Rust frames, so no JUnit workload in
+/// the suites had ever emitted a single one of those lines. The
+/// process-static G1 guard counters that used to sit beside them moved into
+/// `gc_metrics::collector_decision_report`, which this function already
+/// emitted on both arms; these could not follow, because they are per
+/// collector.
+///
+/// WEAK on purpose. A strong `Arc` here would keep the VM alive past the end
+/// of `run()` and change what its `Drop` does and when -- a real behaviour
+/// change for a diagnostic. On the `System.exit` arm the VM is unambiguously
+/// alive (the hook runs before the process goes away), which is the arm this
+/// exists for; on the normal-return arm `run()` prints the summary itself
+/// while it still owns the VM, and [`GC_SUMMARY_PRINTED`] stops the two from
+/// both firing.
+static VM_FOR_SHUTDOWN: std::sync::OnceLock<std::sync::Weak<cratonvm_vm::vm::SharedVm>> =
+    std::sync::OnceLock::new();
+
+/// Claimed by whichever of the two call sites reaches `print_gc_summary`
+/// first. The normal-return arm prints from inside `run()` (VM alive, values
+/// exact); the `System.exit` arm prints from the shutdown hook through
+/// [`VM_FOR_SHUTDOWN`]. Exactly one of them runs per process.
+static GC_SUMMARY_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Claim the right to print the GC summary. `true` for the first caller only.
+fn claim_gc_summary_print() -> bool {
+    GC_SUMMARY_PRINTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Are GC statistics wanted? The same three-way test `run()` applies, lifted
+/// out so the shutdown hook -- which is handed no `args` -- asks the identical
+/// question. `g1_dbg_accessor` is in it because the accessor census rides
+/// inside `print_gc_summary`.
+fn gc_stats_requested() -> bool {
+    GC_STATS_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+        || std::env::var_os("CRATONVM_GC_STATS").is_some()
+        || cratonvm_types::flags::flags().gc.g1_dbg_accessor
+}
+
 fn maybe_dump_shutdown_reports() {
     static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -84,10 +137,20 @@ fn maybe_dump_shutdown_reports() {
     // does, which is the page's own repro. That is the same "detector wired to
     // the arm that does not run" shape as W7-90's slot-map sweep, and this
     // function is where W7-90 put its answer.
-    if GC_STATS_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
-        || std::env::var_os("CRATONVM_GC_STATS").is_some()
-    {
+    if gc_stats_requested() {
         eprintln!("{}", cratonvm_vm::collector_decision_report());
+        // The collector-state half of the same census -- see
+        // `VM_FOR_SHUTDOWN`. Only reachable while the VM is alive, which is
+        // the `System.exit` arm; on the normal-return arm `run()` has already
+        // claimed the print and this is a no-op.
+        // Upgrade BEFORE claiming: a claim that cannot print is a claim that
+        // stops anyone else from printing, and the handle is deliberately
+        // weak.
+        if let Some(vm) = VM_FOR_SHUTDOWN.get().and_then(std::sync::Weak::upgrade) {
+            if claim_gc_summary_print() {
+                vm.mem.heap.print_gc_summary();
+            }
+        }
     }
 
     // `CRATONVM_DBG=ir-isel` — the instruction selector's process totals.
@@ -5089,6 +5152,13 @@ fn run() -> Result<()> {
     // Create VM and execute main method
     let mut vm = Vm::new(config);
 
+    // Stash a WEAK handle for `maybe_dump_shutdown_reports`, which runs on the
+    // `System.exit` arm where this scope's `vm` is not in reach. See
+    // `VM_FOR_SHUTDOWN` for why weak and not strong.
+    if let Some(arc) = vm.shared.try_get_arc() {
+        let _ = VM_FOR_SHUTDOWN.set(std::sync::Arc::downgrade(&arc));
+    }
+
     // JDK-only: drain the violation logs now, not only at shutdown. Native
     // registration refusals all happen inside `Vm::new`, so this is their real
     // time of occurrence — reporting them at shutdown would print them after
@@ -6110,16 +6180,23 @@ fn run() -> Result<()> {
     // `print_gc_summary`, and a census whose only output path is gated behind a
     // DIFFERENT flag prints nothing when you ask for it — which reads as
     // "zero accessor calls" rather than "you never enabled the report".
-    let gc_stats_requested = args.verbose_gc
-        || std::env::var_os("CRATONVM_GC_STATS").is_some()
-        || cratonvm_types::flags::flags().gc.g1_dbg_accessor;
+    // `GC_STATS_REQUESTED` already carries `--verbose:gc` (it is set as soon as
+    // the arguments are parsed), so this is the same question
+    // `gc_stats_requested()` asks -- and asking it through that function is
+    // what keeps the two arms from drifting apart.
+    let gc_stats_requested = gc_stats_requested();
     // A stale or refused arena translation is a correctness event, so it is
     // reported whether or not anyone asked for statistics -- gating one behind
     // a stats flag turns "nobody asked" into "nothing happened". With the flag
     // on, the line prints unconditionally so the DENOMINATOR is available too.
     cratonvm_native_builtins::arena_translation_exit_summary(gc_stats_requested);
     if gc_stats_requested {
-        vm.shared.mem.heap.print_gc_summary();
+        // Claimed rather than called: `maybe_dump_shutdown_reports` prints the
+        // same summary on the `System.exit` arm, and both arms reach this
+        // process. Whichever gets here first prints; see `GC_SUMMARY_PRINTED`.
+        if claim_gc_summary_print() {
+            vm.shared.mem.heap.print_gc_summary();
+        }
         {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still

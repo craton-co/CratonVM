@@ -542,7 +542,7 @@ pub fn policy_connect(target: &str) -> Result<std::net::TcpStream, PolicyConnect
 /// and on Windows it also HUNG: the resolver stops returning after a few dozen
 /// rapid `localhost` lookups, and because the block is inside resolution rather
 /// than the dial, [`connect_timeout`]'s finite cap never applies. See
-/// `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+/// `internal/fixed-suite-bugs/netty/blocking-connect-re-resolves-the-destination-hostname-FIXED-20260905.md`.
 ///
 /// # What is preserved, and why it is not just a literal substitution
 ///

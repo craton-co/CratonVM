@@ -1718,10 +1718,7 @@ pub fn try_dispatch(
                 || (runtime_work as u32) < shared.config.gpu_min_work
             {
                 if timed {
-                    cratonvm_types::gpu_refusal_census::add(
-                        2,
-                        mark.elapsed().as_nanos() as u64,
-                    );
+                    cratonvm_types::gpu_refusal_census::add(2, mark.elapsed().as_nanos() as u64);
                 }
                 // Per-call gate, not a property of the method: the next
                 // call at this site may pass a larger array, so the site

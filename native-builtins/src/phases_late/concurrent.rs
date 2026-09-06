@@ -1085,7 +1085,6 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
@@ -1354,7 +1353,6 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 pub(crate) fn p58_new_cf(
@@ -4789,7 +4787,6 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
     // Also register under Java 25's package: java.util.concurrent.StructuredTaskScope
     register_p67_structured_task_scope_j25(r);
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
@@ -5597,7 +5594,6 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
     );
 
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
@@ -8675,7 +8671,6 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 /// T19_K3 — Whitelist for the

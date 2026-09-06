@@ -3715,7 +3715,6 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================

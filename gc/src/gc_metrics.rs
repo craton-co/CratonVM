@@ -1105,6 +1105,78 @@ pub fn collector_decision_report() -> String {
             100.0 * empty_pub as f64 / g1_pauses as f64,
         ));
     }
+    // The G1 guard counters, every one of which is a process static and every
+    // one of which is expected to read ZERO.
+    //
+    // Here rather than in `G1Collector::print_gc_summary` for the reason the
+    // `promo_dest` block below already gives, and which turns out to have
+    // applied to all of them: that function is reached only from `vm-cli`'s
+    // normal-return teardown, and `System.exit` never unwinds Rust frames, so
+    // on every JUnit workload in the suites (`JUnitCore` exits) not one of
+    // these lines had ever been emitted. Their own doc comments say they print
+    // "unconditionally ... before the early return" so that a zero can be
+    // CITED as evidence; the zero was never printed at all.
+    //
+    // Unconditional here too, and for the same reason: a counter that only
+    // appears when it is non-zero cannot be told apart from a counter whose
+    // report never ran.
+    {
+        let (holder_rejected, holder_clamped) = crate::g1::evacuation_holder_counts();
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 evac_ref_rejected={} (torn={}) evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
+            crate::g1::evacuation_refs_rejected(),
+            crate::g1::evacuation_refs_rejected_torn(),
+            crate::g1::evacuation_source_walk_desyncs(),
+        ));
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 non_object_roots_skipped={}",
+            crate::g1::non_object_roots_skipped(),
+        ));
+        // Which evacuator actually ran. Without this pair an A/B over the
+        // worker count measures an unknown, and the nearest-looking counter
+        // belongs to a different collector.
+        let (par, ser, workers) = crate::g1::g1_young_evac_counts();
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 young evacuation: parallel={par} serial={ser} workers_last={workers}"
+        ));
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
+            crate::g1::evacuation_implausible_class0_copies(),
+            crate::g1::evacuation_copy_shape_drifts(),
+        ));
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 flat_walk_refused_array={} kept_seed_rejected={}",
+            crate::g1::flat_walks_refused_for_array(),
+            crate::g1::kept_seeds_rejected(),
+        ));
+    }
+    // Promotion destination supply. Here rather than in
+    // `G1Collector::print_gc_summary` because that function runs on the
+    // normal-return arm only, and every workload this number is wanted for
+    // ends in `System.exit`.
+    //
+    // `resumed_dest_regions` near zero beside a large pause count is the
+    // pre-2026-09-06 behaviour, in which each worker's promotion TLAB took a
+    // whole fresh Free region every pause and the old generation grew by the
+    // WORKER COUNT per young pause however little was promoted. Read it
+    // against `[GC] g1 cycle` above. See `g1::SharedEvac::resume`.
+    {
+        use std::sync::atomic::Ordering as O;
+        let resumed = crate::g1::PARALLEL_EVAC_RESUMED_DEST_REGIONS.load(O::Relaxed);
+        let shared = crate::g1::PARALLEL_SHARED_DEST_ALLOCS.load(O::Relaxed);
+        let exhausted = crate::g1::PARALLEL_TLAB_POOL_EXHAUSTED.load(O::Relaxed);
+        if resumed | shared | exhausted != 0 {
+            s.push('\n');
+            s.push_str(&format!(
+                "[GC] g1 promo_dest: resumed_dest_regions={resumed} shared_dest_allocs={shared} tlab_pool_exhausted={exhausted}"
+            ));
+        }
+    }
     // I-6 coverage. Printed whenever the verifier ran at all, including the
     // budgeted release pass, because the interesting reading is `objects`: a
     // zero `dangling` means nothing without the number of objects it is a
@@ -1737,6 +1809,48 @@ mod tests {
             "unknown",
             "COUNT must be one PAST the last defined reason",
         );
+    }
+
+    /// The G1 guard counters must be in the report, and must be there when
+    /// NOTHING has collected.
+    ///
+    /// They used to live in `G1Collector::print_gc_summary`, whose comments
+    /// called them "unconditional ... before the early return" so that a zero
+    /// could be cited as evidence. That function is reached only from
+    /// `vm-cli`'s normal-return teardown, and `JUnitCore` -- every Tomcat, H2
+    /// and Spring Boot workload in the suites -- ends in `System.exit`, which
+    /// never unwinds Rust frames. So the zero was never printed once. This
+    /// report is the census emitted on BOTH exit arms.
+    ///
+    /// Asserted on the LINE PREFIXES, not on the values: the counters behind
+    /// them are process statics that every other test in this binary shares,
+    /// and a test that pinned their values would be asserting test ordering.
+    /// Presence is exactly the property that was broken.
+    #[test]
+    fn the_decision_report_carries_the_g1_guard_counters_with_no_collection() {
+        // Fresh test thread — the decision record is thread-local, so this is
+        // the "nothing has run" shape a real process has before its first
+        // collection, and the one the old location could not report at all.
+        assert!(last_collector_decision().is_none());
+        let text = collector_decision_report();
+        for needle in [
+            "[GC] g1 evac_ref_rejected=",
+            "evac_holder_rejected=",
+            "evac_holder_clamped=",
+            "source_walk_desync=",
+            "[GC] g1 non_object_roots_skipped=",
+            "[GC] g1 young evacuation: parallel=",
+            "workers_last=",
+            "[GC] g1 implausible_legacy_headers=",
+            "copy_shape_drift=",
+            "[GC] g1 flat_walk_refused_array=",
+            "kept_seed_rejected=",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the decision report must carry `{needle}`: it is the only shutdown census emitted on BOTH exit arms. Report was: {text}"
+            );
+        }
     }
 
     #[test]

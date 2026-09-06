@@ -8713,7 +8713,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 /// The platform line separator, as `System.lineSeparator()` reports it.
@@ -17973,7 +17972,6 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // `jdk-only-dead-everywhere.tsv` already carries `separatorChar` as
     // `method-nowhere`. No test in the tree calls any of the four.
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -19081,7 +19079,6 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 /// Allocate a `java.nio.file.attribute.FileTime` carrying `millis`.
@@ -23434,7 +23431,7 @@ pub(crate) fn posix_file_permission_value_of(
     Err(RuntimeError::IllegalArgumentException {
         message: format!(
             "No enum constant {}.{requested}",
-            POSIX_FILE_PERMISSION.replace('/', ".").replace('$', ".")
+            POSIX_FILE_PERMISSION.replace(['/', '$'], ".")
         ),
     }
     .into())
@@ -23807,7 +23804,6 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     );
     register_posix_file_permission_stub_clinit(r);
     r.set_category(__prev_cat);
-    ()
 }
 
 /// The enum-constant minting laws this file has already broken once.
@@ -24501,7 +24497,6 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 #[cfg(test)]

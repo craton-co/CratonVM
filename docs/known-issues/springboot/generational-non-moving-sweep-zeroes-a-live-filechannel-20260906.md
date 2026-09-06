@@ -2,7 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | OPEN. Reproducible on dev `785e777cb`, named by a one-flag probe, 4 reclaim lines in each of two instrumented runs. |
+| **Status** | PARTIALLY FIXED 2026-09-06. The RECLAIM's producer is found and fixed — `native_fcimpl_open` built the channel out of five allocations while holding every result in an unrooted Rust local, so nothing referred to them until the first field store; see `internal/fixed-bugs/filechannelimpl-construction-window-was-never-rooted-FIXED-20260906.md`. The test's remaining failure is NOT explained by that and stays OPEN — it fails at the same rate with the reclaim gone. |
+| **Was** | OPEN. Reproducible on dev `785e777cb`, named by a one-flag probe, 4 reclaim lines in each of two instrumented runs. |
 | **Scope** | `--XX:UseGc Generational` with the JIT on. HotSpot, CratonVM ZGC (the shipped default) and Generational `--nojit` all pass the same test at the same host load. |
 | **Reproducer** | one test METHOD, 1-10 minutes |
 | **Probe** | `CRATONVM_DBG_SWEEP_ZERO=1` names the victim by class and sweep cycle |

@@ -45,11 +45,13 @@ mod build_script {
             root.join("CratonVM").join("craton-gpu")
         }
 
-        /// The pre-aggregator layout: `<checkout>/src/main/java`.
+        /// The pre-aggregator layout under the legacy checkout name:
+        /// `<root>/craton-gpu-java/src/main/java`.
         ///
-        /// Still one of the two the resolver accepts, and the one it picks
-        /// when that directory actually exists — which is why the tests
-        /// that CREATE it expect this.
+        /// Still one of the three layouts the resolver accepts, under one
+        /// of the two checkout names it accepts, and the one it picks when
+        /// that directory actually exists — which is why the tests that
+        /// CREATE it expect this.
         fn documented_java_src(root: &Path) -> PathBuf {
             root.join("craton-gpu-java")
                 .join("src")
@@ -57,14 +59,25 @@ mod build_script {
                 .join("java")
         }
 
-        /// The layout gpu-java has had since it became a Maven aggregator
-        /// on 2026-08-28: `<checkout>/craton-gpu/src/main/java`.
+        /// The layout the project has had since the 2026-09-06 gpu4j
+        /// rename: `<root>/gpu4j/gpu4j-core/src/main/java`.
         ///
-        /// `first_existing_layout` returns this one when NEITHER layout is
+        /// `first_existing_layout` returns this one when NO layout is
         /// present, deliberately, so that the `cargo:warning` names the
         /// path a current checkout would use rather than a path no
         /// checkout has had for months. A test for the nothing-exists case
         /// therefore expects this, not [`documented_java_src`].
+        fn current_java_src(root: &Path) -> PathBuf {
+            root.join("gpu4j")
+                .join("gpu4j-core")
+                .join("src")
+                .join("main")
+                .join("java")
+        }
+
+        /// The intermediate layout, under the legacy checkout name:
+        /// `<root>/craton-gpu-java/craton-gpu/src/main/java`. Accepted
+        /// between 2026-08-28 and the gpu4j rename.
         fn aggregator_java_src(root: &Path) -> PathBuf {
             root.join("craton-gpu-java")
                 .join("craton-gpu")
@@ -185,9 +198,10 @@ mod build_script {
         fn missing_non_windows_sources_fall_back_to_documented_sibling_path() {
             let temp = TempDir::new("missing");
             let manifest = manifest_dir(temp.path());
-            // Nothing is created, so neither layout exists and the resolver
-            // names the current one. See `aggregator_java_src`.
-            let expected = aggregator_java_src(temp.path());
+            // Nothing is created, so no layout under either checkout name
+            // exists and the resolver names the current one. See
+            // `current_java_src`.
+            let expected = current_java_src(temp.path());
             fs::create_dir_all(&manifest).expect("create manifest dir");
 
             let resolution = resolve_java_root_from(None, &manifest, false);
@@ -200,6 +214,80 @@ mod build_script {
                     used_absolute_fallback: false,
                 }
             );
+        }
+
+        /// The 2026-09-06 rename, from the resolver's side.
+        ///
+        /// A checkout named `gpu4j` whose module is `gpu4j-core` is what a
+        /// current clone looks like. Before this test the resolver knew
+        /// neither name, and the failure mode is the one this whole file
+        /// exists to guard: no error, an empty annotations jar, and a VM
+        /// that recognises no `@GpuKernel` anywhere.
+        #[test]
+        fn resolves_renamed_gpu4j_checkout_and_module() {
+            let temp = TempDir::new("gpu4j");
+            let manifest = manifest_dir(temp.path());
+            let expected = current_java_src(temp.path());
+            fs::create_dir_all(&manifest).expect("create manifest dir");
+            fs::create_dir_all(&expected).expect("create gpu4j source dir");
+
+            let resolution = resolve_java_root_from(None, &manifest, false);
+
+            assert_eq!(
+                resolution,
+                JavaRootResolution {
+                    path: expected,
+                    invalid_override: None,
+                    used_absolute_fallback: false,
+                }
+            );
+        }
+
+        /// Both checkout names present: the new one wins.
+        ///
+        /// Someone who clones the renamed repository beside an existing
+        /// `craton-gpu-java` gets the sources they just cloned, not the
+        /// stale ones they forgot to delete.
+        #[test]
+        fn new_checkout_name_wins_over_the_legacy_one() {
+            let temp = TempDir::new("bothnames");
+            let manifest = manifest_dir(temp.path());
+            let expected = current_java_src(temp.path());
+            fs::create_dir_all(&manifest).expect("create manifest dir");
+            fs::create_dir_all(&expected).expect("create gpu4j source dir");
+            fs::create_dir_all(documented_java_src(temp.path()))
+                .expect("create legacy source dir");
+
+            let resolution = resolve_java_root_from(None, &manifest, false);
+
+            assert_eq!(resolution.path, expected);
+        }
+
+        /// Both layouts present inside one checkout: the new module wins.
+        ///
+        /// A working tree mid-rename, or one where a `git mv` left the old
+        /// directory behind, must compile the module that is current.
+        #[test]
+        fn new_module_layout_wins_over_the_aggregator_one() {
+            let temp = TempDir::new("bothlayouts");
+            let manifest = manifest_dir(temp.path());
+            let expected = temp
+                .path()
+                .join("craton-gpu-java")
+                .join("gpu4j-core")
+                .join("src")
+                .join("main")
+                .join("java");
+            fs::create_dir_all(&manifest).expect("create manifest dir");
+            fs::create_dir_all(&expected).expect("create gpu4j-core source dir");
+            fs::create_dir_all(aggregator_java_src(temp.path()))
+                .expect("create aggregator source dir");
+            fs::create_dir_all(documented_java_src(temp.path()))
+                .expect("create flat source dir");
+
+            let resolution = resolve_java_root_from(None, &manifest, false);
+
+            assert_eq!(resolution.path, expected);
         }
     }
 }
