@@ -1199,6 +1199,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_G1_NO_LIVE_REGION_MEMO` | GC | `CRATONVM_GC=g1-live-region-memo` | opt-out | on | behaviour | snapshot | gc |
 | `CRATONVM_G1_PARALLEL_EVAC` | GC | `CRATONVM_GC=g1-parallel-evac` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` | GC | `CRATONVM_GC=g1-parallel-evac-in-jit` | default-on | on | behaviour | snapshot | types |
+| `CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST` | GC | `CRATONVM_GC=g1-parallel-evac-resume-dest` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` | GC | `CRATONVM_GC=g1-parallel-evac-screen` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` | GC | `CRATONVM_GC=g1-parallel-evac-shared-dest` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_G1_PARALLEL_MARK` | GC | `CRATONVM_GC=g1-parallel-mark` | default-on | on | behaviour | snapshot | types |

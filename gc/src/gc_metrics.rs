@@ -1105,6 +1105,28 @@ pub fn collector_decision_report() -> String {
             100.0 * empty_pub as f64 / g1_pauses as f64,
         ));
     }
+    // Promotion destination supply. Here rather than in
+    // `G1Collector::print_gc_summary` because that function runs on the
+    // normal-return arm only, and every workload this number is wanted for
+    // ends in `System.exit`.
+    //
+    // `resumed_dest_regions` near zero beside a large pause count is the
+    // pre-2026-09-06 behaviour, in which each worker's promotion TLAB took a
+    // whole fresh Free region every pause and the old generation grew by the
+    // WORKER COUNT per young pause however little was promoted. Read it
+    // against `[GC] g1 cycle` above. See `g1::SharedEvac::resume`.
+    {
+        use std::sync::atomic::Ordering as O;
+        let resumed = crate::g1::PARALLEL_EVAC_RESUMED_DEST_REGIONS.load(O::Relaxed);
+        let shared = crate::g1::PARALLEL_SHARED_DEST_ALLOCS.load(O::Relaxed);
+        let exhausted = crate::g1::PARALLEL_TLAB_POOL_EXHAUSTED.load(O::Relaxed);
+        if resumed | shared | exhausted != 0 {
+            s.push('\n');
+            s.push_str(&format!(
+                "[GC] g1 promo_dest: resumed_dest_regions={resumed} shared_dest_allocs={shared} tlab_pool_exhausted={exhausted}"
+            ));
+        }
+    }
     // I-6 coverage. Printed whenever the verifier ran at all, including the
     // budgeted release pass, because the interesting reading is `objects`: a
     // zero `dangling` means nothing without the number of objects it is a
