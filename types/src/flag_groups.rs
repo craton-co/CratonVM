@@ -754,6 +754,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "moving-young-band-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_DBG"), off_key: None, off_word: None, since: "2026-07-26" },
+    // Pairs the per-cycle relocation verdict with `ThreadStateCensus::
+    // relocation_blockers()`, which is the codebase's own statement of the
+    // `mark_moving_young_coverage_incomplete_because` obligation. Off by default.
+    E { group: Group::DBG, token: "relocation-blockers", on_key: Some("CRATONVM_DBG_RELOCATION_BLOCKERS"), off_key: None, off_word: None, since: "2026-09-06" },
     // Diagnostic widening of the register-image remap to the whole unverifiable
     // frame tail, to TEST the four-region partition in `conservative_roots`'s
     // module comment rather than continue to argue it. Off by default; see

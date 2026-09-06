@@ -999,6 +999,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_REFLECTION_FACTORY` | DBG | `CRATONVM_DBG=reflection-factory` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_REFPROC_AUDIT` | DBG | `CRATONVM_DBG=refproc-audit` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_REFPROC_REMARK` | DBG | `CRATONVM_DBG=refproc-remark` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_RELOCATION_BLOCKERS` | DBG | `CRATONVM_DBG=relocation-blockers` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_REMAP_RESIDUE` | DBG | `CRATONVM_DBG=remap-residue` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_REMAP_TRACE` | DBG | `CRATONVM_DBG=remap-trace` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_REPLOVR` | DBG | `CRATONVM_DBG=replovr` | opt-in | off | diag | snapshot | types |
