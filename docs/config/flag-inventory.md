@@ -1270,6 +1270,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_GPU_JIT_ARRAY_WRITERS` | GC | `CRATONVM_GC=gpu-jit-array-writers` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_JIT_GATE_CALLERS` | GC | `CRATONVM_GC=gpu-jit-gate-callers` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_JIT_GATE_DISPATCHABLE` | GC | `CRATONVM_GC=gpu-jit-gate-dispatchable` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_GPU_JIT_GATE_LATE_REGISTER` | GC | `CRATONVM_GC=gpu-jit-gate-late-register` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_GPU_MIN_WORK_GIVEUP` | GC | `CRATONVM_GC=gpu-min-work-giveup` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_GPU_NO_SUBMISSION_DRAIN` | GC | `CRATONVM_GC=gpu-submission-drain` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_GPU_NO_ZEROCOPY` | GC | `CRATONVM_GC=gpu-zerocopy` | opt-out | on | behaviour | snapshot | vm |

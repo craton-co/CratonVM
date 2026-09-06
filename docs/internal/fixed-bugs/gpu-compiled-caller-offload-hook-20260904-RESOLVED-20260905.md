@@ -33,7 +33,7 @@ registering printed a gate census byte-identical to a healthy one.
 
 Both halves of that disagreement are closed, and the refusal is now
 counted:
-`../gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md`.
+`../../internal/gpu/compiled-caller-gate-refused-ldc-kernels-FIXED-20260905.md`.
 
 `GpuHookOverheadBench`, one binary, this switch the only difference:
 
