@@ -173,6 +173,23 @@ a write some parallel worker makes. That is consistent with everything above —
 the corruption appears on to-space copies, mid-pause — and it narrows the
 search from "GC code" to one module.
 
+### and the caveat that keeps this honest
+
+**The corrupt-cell family is on BOTH arms.** One of the three passing serial
+runs reported 17 corrupt holders. So the corruption is not the discriminator —
+the OUTCOME is. Either the parallel arm carries a second defect that decides
+whether the corruption is fatal, or the same corrupted header is only acted on
+destructively when a parallel worker reaches it (it is the arm that both sizes
+a copy from the header and rewrites slots through it, concurrently).
+
+A second regularity, across all thirteen runs of this investigation, is worth
+carrying forward because it will otherwise be re-derived: **corrupt HOLDERS and
+implausible CANDIDATES never co-occur.** Every run with `hold > 0` has
+`ref-slot-candidate = 0`, and the single run with `ref-slot-candidate = 10` has
+`hold = 0`. Two populations, never together — which is the strongest evidence
+on this page that the damage lands on holders (to-space copies, after the copy)
+rather than on the candidates the screens inspect.
+
 It does NOT follow that the parallel evacuator should be turned off: it is the
 default for throughput reasons, this is one class on one host, and switching
 collectors' arms on the strength of nine runs would be trading a measured
