@@ -5454,6 +5454,20 @@ impl IrBuilder {
         if !self.splice.is_empty() {
             self.splice_guard_seen = true;
         }
+        // FAIL CLOSED on a missing frame state, and this is the hazard worth
+        // spelling out: `ir_lower`'s `resolve_frame_state_for_bci` answers a
+        // bci it has no snapshot for with an EMPTY `FrameState` -- no locals,
+        // no stack -- rather than an error. A trap resolved that way would park
+        // the interpreter at `pc` with a blank frame, which is a plausible
+        // wrong answer rather than a crash.
+        //
+        // The main walk pushes a snapshot at the top of every bci it visits, so
+        // this holds by construction today and the check has never fired. It is
+        // here because the property it depends on lives two thousand lines away
+        // and nothing else would notice it changing.
+        if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+            return false;
+        }
         let zero = self.iconst(0);
         self.graph.add(
             Op::Guard { bci: pc },
