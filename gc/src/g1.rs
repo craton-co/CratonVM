@@ -9281,6 +9281,37 @@ impl G1Collector {
             //
             // `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE=0` restores the
             // note-only behaviour, which is the same-binary A/B for the claim.
+            // WHAT THIS DOES AND DOES NOT FIX -- measured 2026-09-06 on
+            // `org.h2.test.store.TestMVStoreTool` (-Xmx256m, G1,
+            // `CRATONVM_G1_JIT_MARK_DRIVER=1`), one binary, ABBA, refusing
+            // against the note-only arm:
+            //
+            //   refusing    ref-slot 9 / 16 refused   evacuate-src 0   dest 0
+            //   note-only   ref-slot 4 accepted       evacuate-src 4   dest 2
+            //
+            // So it closes the chain it is on: candidates refused here stop
+            // reaching `evacuate_object` and the downstream implausible-header
+            // reports go to zero.
+            //
+            // It does NOT stop the `corrupt Value cell` bursts, and expecting it
+            // to was a mistake worth recording. Those are 32 in BOTH arms (32 is
+            // the report cap, so read ">= 32") at 17-62 mixed pauses. They are a
+            // SEPARATE defect that merely co-occurs, and its shape is different
+            // in every respect that matters here: the holders carry PLAUSIBLE
+            // class ids -- 665 with 192 slots, 13079432 with 1024 -- which is
+            // precisely why this screen never fires on them. What is wrong is
+            // their MARK WORD, which holds a heap-address-shaped value with
+            // `gc_flags=0` (0x200001ea4fb17cd0, 0x100001ea4fb14cf0,
+            // 0x300001ea4fb16850: age nibble intact, the rest an address in the
+            // live heap). A zero `gc_flags` makes `is_compact_object` answer
+            // false, so the walk strides 16-byte legacy cells over what is
+            // really a compact object and every slot decodes as garbage.
+            //
+            // Those marks are NOT forwarding pointers -- `make_forwarded` ORs in
+            // MARK_FORWARDED and these have the low two bits clear -- so
+            // `retire_forwards` is excluded as well. What writes a
+            // heap-address-shaped value into a live object's mark word and
+            // clears its `gc_flags` is the open question.
             if implausible && gc_flags().g1_evac_ref_implausible_refuse {
                 let n = EVAC_REF_REJECTED_IMPLAUSIBLE.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {

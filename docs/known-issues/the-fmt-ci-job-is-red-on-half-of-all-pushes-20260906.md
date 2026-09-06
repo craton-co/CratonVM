@@ -1,7 +1,8 @@
 # The `fmt` CI job is red on roughly half of all pushes, and it is not the pushes' fault — OPEN 2026-09-06
 
-**Status:** OPEN. Measured, not fixed — deliberately; §4 says why the obvious
-fix is the wrong thing to do this week.
+**Status:** the SYMPTOM is fixed (§5 option 4 landed the same day — the job now
+asks about the lines the diff touched); the DEBT is still open and §1's census
+still describes it. §4 says why paying it down is not this record's to do.
 **Gate:** `.github/workflows/ci.yml`, job `fmt` ("Formatting (changed files)").
 
 ---
@@ -113,10 +114,50 @@ repository's own history:
    is the only version that makes the job mean something again, and it needs a
    window with no lanes in flight.
 
-A fourth option worth pricing: have the job check only the **hunks the diff
-touched** rather than whole changed files. That makes the gate say what its
-name says, needs no tree-wide edit, and would have been green for both of the
-2026-09-05/06 pushes. It is a `ci.yml` change and not this record's to make.
+A fourth option: have the job check only the **hunks the diff touched** rather
+than whole changed files. That makes the gate say what its name says and needs
+no tree-wide edit.
+
+**This one landed, 2026-09-06.** `tools/check_changed_rust_formatting.py` runs
+the same `rustfmt --check --edition 2021` over the same changed files and keeps
+only the hunks overlapping lines the diff touched; `ci.yml`'s `fmt` job calls
+it, and is now named "Formatting (changed lines)".
+
+Two `rustfmt` behaviours make it a script rather than three lines of `bash`:
+
+* **it follows `mod` declarations.** `rustfmt --check vm/src/runtime/
+  interpreter.rs` reports hunks in `vm/src/runtime/interpreter/
+  dispatch_static.rs`. A hunk is therefore attributed by the path in its OWN
+  header, never by the file that was passed in — and it also means §1's
+  per-file counts are per-*module-tree* counts, so 1,883 is an upper bound on
+  distinct hunks rather than an exact one. The file count of 171 is exact.
+* **its non-zero exit has two meanings**, formatting and a parse failure, which
+  `ci.yml` already says is why a separate parse job exists. The script reports a
+  parse failure separately and always fails on it.
+
+Inherited hunks are counted and printed on every run, so the debt above stays
+visible; it just stops being charged to whoever touched the file next.
+
+Measured against four real `dev` commits — the old check, then the new one:
+
+| commit | old | new | hunks it attributed |
+|---|---|---|---|
+| `9047a9945` | FAIL | FAIL | 4 of 426 |
+| `70c486744` | FAIL | **pass** | 0 of 22 |
+| `045413437` | FAIL | FAIL | 1 of 135 |
+| `7f21336d5` | FAIL | **pass** | 0 of 67 |
+
+Two of four stop being red for other people's formatting; the other two stay red
+and now point at one and four hunks instead of 135 and 426. `045413437`'s single
+hunk is a `pub mod exec_sampler;` the commit itself added out of alphabetical
+order — a real defect the old output buried under 134 inherited ones.
+
+Falsified as well as confirmed, because a filter that passes everything would
+also have produced the two passes above: a deliberately misformatted line that
+the diff adds FAILS; a file that no longer parses FAILS, reported as a parse
+error rather than a formatting one; a diff with no `.rs` passes; and a correctly
+formatted addition to `vm/src/runtime/interpreter.rs` (81 inherited hunks)
+passes while printing all 81.
 
 ## 6. Reproducing the numbers
 

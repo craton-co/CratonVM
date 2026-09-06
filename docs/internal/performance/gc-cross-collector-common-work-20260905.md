@@ -3,11 +3,16 @@
 **RETIRED.** Every residual this page carried is discharged below by name: five
 closed by a measurement that turned a hypothesis into a decision, two closed by
 finding the answer already in the tree, one closed by a defect this page's own
-follow-up list found. Two of its three defaults are reverted, and the reason in
-both cases is the evidence rather than the mechanism. What it discovered and
-could not close — a compiled frame that keeps a young reference the collector
-moved — moved to its own record, with a ten-second reproducer this page did not
-have.
+follow-up list found.
+
+Both of its 2026-09-05 defaults were reverted on 2026-09-06 —
+`CRATONVM_GEN_UNCOMMIT` because it crashed H2 in ten seconds,
+`CRATONVM_GC_OBJECT_STARTS` because its 7% was a sequential-ABBA artefact — and
+**the first came back ON the same day**, once the defect it exposed was found
+and fixed. What this page discovered and could not close, a compiled frame
+keeping a young reference the collector moved, is therefore also closed: the
+handshake was discharging a peer's coverage by PINNING its roots on a collector
+that cannot pin.
 
 A review of `gc/` asking only one question: **what is shared by Generational,
 G1 and ZGC, and what is wrong with it?** Eight findings, what landed against
@@ -690,13 +695,20 @@ land on the allocation path of every thread rather than one.
 
 ---
 
-## The two defaults, reverted, and the two different reasons
+## The two defaults, and where each of them ended up
 
-Both were flipped ON on 2026-09-05 on the strength of a 90/0 HotSpot-differential
-regression suite plus a three-run-per-arm sequential ABBA. Both are back to
-opt-in. The switches, the kill switches and the instruments all stay.
+Both were flipped ON on 2026-09-05 on the strength of a 90/0
+HotSpot-differential regression suite plus a three-run-per-arm sequential ABBA.
+Both were reverted on 2026-09-06. **One of them came back the same day.**
 
-### `CRATONVM_GEN_UNCOMMIT` — it SIGSEGVs H2 in ten seconds
+| flag | now | why |
+|---|---|---|
+| `CRATONVM_GEN_UNCOMMIT` | **ON** | reverted when it SIGSEGV'd H2 in ten seconds; the defect it exposed was found and fixed that afternoon, and the give-back returns real memory — 3.7 GB over a multi-thread run — at no measurable wall-clock cost |
+| `CRATONVM_GC_OBJECT_STARTS` | opt-in | its 7% was a measurement artefact, and nothing has replaced it |
+
+The switches, the kill switches and the instruments all stay either way.
+
+### `CRATONVM_GEN_UNCOMMIT` — it SIGSEGV'd H2 in ten seconds, and that is fixed
 
 `-XX:+UseGenerationalGC` over `org.h2.test.jdbc.TestPreparedStatement` alone:
 
@@ -727,10 +739,32 @@ have helped: `emit_trusted_oop_receiver_check_at` emits a bare null test and
 then dereferences the receiver unconditionally, consulting no bounds table at
 all. The read bound is not the only door.
 
-The switch is now the sharpest instrument in the tree for this family — it turns
-a stale young reference from a silent read of the previous cycle's bytes into an
+The switch is the sharpest instrument in the tree for this family — it turns a
+stale young reference from a silent read of the previous cycle's bytes into an
 immediate, attributable SIGSEGV with the span, the site and the code buffer
 already printed. That is what found the compiled-frame record.
+
+**And that record is now closed, so the default is back ON (2026-09-06).** The
+cause was not the blind GPR spill: the cross-thread coverage handshake was
+discharging a peer thread's compiled frames by PINNING their conservative roots,
+on a collector that cannot honour a pin. `VmHeap::honours_conservative_pins()`
+is the fix; the ten-second reproduction is 0/5 with it and 5/5 with the old
+accounting restored on the same binary.
+
+The paragraph above this one argued the default should stay off anyway, on the
+grounds that the give-back "buys nothing measurable". **That reading was wrong
+and is corrected here.** Returning the memory IS the benefit; being
+wall-clock-neutral while doing it is the property that makes it shippable, not
+an argument against shipping. The generational collector was the only backend
+that never gave a byte back — ZGC does it by default, G1 on request — and a JVM
+that peaked and then idled held its peak for the life of the process. It hands
+back 3.7 GB over the multi-thread churn probe and 30 MiB of a 96 MB heap on the
+single-threaded one.
+
+What has not changed is the cost, and it stays stated: a decommitted granule
+FAULTS on touch, so any stale young reference that still exists anywhere becomes
+a SIGSEGV rather than a silent stale read. `CRATONVM_GEN_UNCOMMIT=0` is the
+first thing to reach for if a compiled frame faults on a young address.
 
 ### `CRATONVM_GC_OBJECT_STARTS` — its 7% was a measurement artefact
 
