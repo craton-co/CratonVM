@@ -68,9 +68,9 @@
 //! already cost `RJitStackTraceLines` a draft. Using `CRATONVM_DISABLE_JIT=1`
 //! on one binary sidesteps it entirely and cannot go stale on a probe edit.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::io::Read;
 use std::time::Duration;
 
 mod common;
