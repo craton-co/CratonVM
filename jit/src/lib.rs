@@ -23151,7 +23151,35 @@ fn try_compile_inner(
             );
         }
     }
+    // A method the acceptance gate has already refused for want of evidence is
+    // not offered to the IR pipeline again. The verdict is a property of the
+    // BYTECODE and the PASSES, both of which are the same on every attempt, so
+    // re-deriving it means building an artifact only to throw it away.
+    // Measured before this: 577 refusals on the H2 JDBC workload drove
+    // `fell_through_to_single_pass` from 12 compiles (44 ms) to 150 (586 ms).
+    //
+    // A conjunct of the admission `if` rather than an early return, because
+    // this must skip the IR ATTEMPT and fall through to the single-pass
+    // backend below — returning here would leave the method interpreted, which
+    // is a far worse outcome than the one the gate exists to avoid.
+    let ir_method_hash = compute_jit_key_hash(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let ir_refused_before = ir_evidence::method_already_refused(ir_method_hash);
+    if ir_refused_before {
+        ir_evidence::note_memo_skip();
+        if ir_stage_reporting() {
+            eprintln!(
+                "[ir] acceptance {}.{}{}: SKIPPED (a previous compile carried no evidence)",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+    }
     if optimize
+        && !ir_refused_before
         // IR lowering has no exact-RBP or safepoint-map publication, so a
         // mapless IR frame must never be live while the young collector
         // RELOCATES. The question this gate has to ask is therefore whether
@@ -25722,6 +25750,7 @@ fn try_compile_inner(
                                     ir_evidence::describe(evidence.unwrap_or(0)),
                                 );
                             }
+                            ir_evidence::note_method_refused(ir_method_hash);
                             drop(cm);
                             None
                         }

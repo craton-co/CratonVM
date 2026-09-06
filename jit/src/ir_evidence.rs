@@ -53,7 +53,6 @@
 //! distinction that keeps a plumbing mistake from silently disabling the whole
 //! tier.
 
-use std::cell::Cell;
 
 /// One transform. Values are bit positions, not a count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,14 +102,27 @@ impl Transform {
 }
 
 thread_local! {
-    /// `None` until [`begin_compile`] arms it. See the module's thread-model
-    /// note for why the two states are distinguished.
-    static CURRENT: Cell<Option<u32>> = const { Cell::new(None) };
+    /// A STACK of armed compiles, innermost last. Empty means nothing is armed.
+    ///
+    /// A stack rather than one cell, and the reason is measured: with IR-tier
+    /// inlining on, the H2 JDBC workload reported `unjudged=190` -- 190 gate
+    /// decisions taken with no evidence recorded -- because a compile can enter
+    /// this function again on the same thread before the outer one finishes.
+    /// A single cell made the inner `take` disarm the OUTER compile, which then
+    /// read `None` and was waved through unjudged.
+    ///
+    /// With a stack, an inner compile's transforms are attributed to the inner
+    /// compile and the outer one keeps its own bits. The `unjudged` counter is
+    /// what found this; it is the reason the fail-open case is counted rather
+    /// than silently accepted.
+    static STACK: std::cell::RefCell<Vec<u32>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
-/// Arm the slot for a new optimizing compile on this thread.
+/// Arm a new optimizing compile on this thread. Nests.
 pub fn begin_compile() {
-    CURRENT.with(|c| c.set(Some(0)));
+    STACK.with(|s| s.borrow_mut().push(0));
 }
 
 /// Record that `t` was applied to the compile running on this thread.
@@ -121,17 +133,20 @@ pub fn begin_compile() {
 /// whatever compile came next on the same thread.
 #[inline]
 pub fn note(t: Transform) {
-    CURRENT.with(|c| {
-        if let Some(bits) = c.get() {
-            c.set(Some(bits | t.bit()));
+    STACK.with(|s| {
+        if let Ok(mut v) = s.try_borrow_mut() {
+            if let Some(bits) = v.last_mut() {
+                *bits |= t.bit();
+            }
         }
     });
 }
 
-/// Read and disarm. `None` means no compile was recorded on this thread, which
-/// a caller must treat as "cannot judge" rather than as "did nothing".
+/// Pop the innermost armed compile. `None` means none was armed on this
+/// thread, which a caller must treat as "cannot judge" rather than as "did
+/// nothing".
 pub fn take() -> Option<u32> {
-    CURRENT.with(|c| c.replace(None))
+    STACK.with(|s| s.borrow_mut().pop())
 }
 
 /// Render a bitset for a diagnostic line.
@@ -269,12 +284,17 @@ pub fn census() -> (u64, u64, u64, u64) {
 mod tests {
     use super::*;
 
+    /// Drain any residue a sibling test left on this thread.
+    fn drain() {
+        while take().is_some() {}
+    }
+
     /// The armed/un-armed distinction is the whole safety argument, so it is
     /// the first thing tested: an un-armed `note` must not leak into the next
     /// compile on the same thread.
     #[test]
     fn an_unarmed_note_is_ignored_and_does_not_leak() {
-        let _ = take();
+        drain();
         note(Transform::Inlined);
         assert_eq!(take(), None, "a note with no armed compile records nothing");
         begin_compile();
@@ -285,9 +305,35 @@ mod tests {
         );
     }
 
+    /// A compile that begins INSIDE another must not disarm it. With one cell
+    /// instead of a stack, the H2 JDBC workload reported `unjudged=190` -- the
+    /// outer compile read `None` and the gate waved it through without judging.
+    #[test]
+    fn a_nested_compile_does_not_disarm_the_outer_one() {
+        drain();
+        begin_compile();
+        note(Transform::Inlined);
+        // ...an inner compile starts and finishes...
+        begin_compile();
+        note(Transform::GuardElided);
+        let inner = take().expect("the inner compile is armed");
+        assert_eq!(
+            describe(inner),
+            "guard-elided",
+            "the inner compile must see ONLY its own transforms",
+        );
+        let outer = take().expect("the outer compile must still be armed");
+        assert_eq!(
+            describe(outer),
+            "inlined",
+            "the outer compile must keep its own bits across a nested one",
+        );
+        assert_eq!(take(), None, "and the stack is empty again");
+    }
+
     #[test]
     fn bits_accumulate_and_describe() {
-        let _ = take();
+        drain();
         begin_compile();
         note(Transform::Inlined);
         note(Transform::GuardElided);
@@ -302,7 +348,7 @@ mod tests {
     /// so that changing it is a deliberate edit rather than a drift.
     #[test]
     fn a_transform_the_baseline_tier_also_has_is_not_evidence() {
-        let _ = take();
+        drain();
         begin_compile();
         note(Transform::Unrolled);
         note(Transform::Licm);
@@ -317,7 +363,7 @@ mod tests {
     /// A plumbing mistake must cost an unfiltered publish, not a disabled tier.
     #[test]
     fn an_unrecorded_compile_is_accepted_and_counted() {
-        let _ = take();
+        drain();
         let before = census().3;
         // Only meaningful under the default policy; another test may have
         // latched a different one into the `OnceLock`.
@@ -364,4 +410,83 @@ impl Drop for AcceptAlways {
     fn drop(&mut self) {
         ACCEPT_FORCE.with(|c| c.set(None));
     }
+}
+
+// ── Refusal memo ────────────────────────────────────────────────────
+//
+// A refusal is decided AFTER the IR body is built, because the evidence is an
+// output of building it. That is unavoidable the first time and pure waste
+// every time after: on the H2 JDBC workload the gate refused 577 bodies and
+// drove `fell_through_to_single_pass` from 12 compiles (44 ms) to 150
+// (586 ms), because each refusal discards the IR artifact and the single-pass
+// backend recompiles the method from scratch.
+//
+// The verdict is a property of the METHOD, not of the attempt: the same
+// bytecode, put through the same passes, produces the same evidence. So record
+// it once and skip the IR attempt on every later compile of that method.
+//
+// A memo is only ever a REFUSAL. An accepted method is never recorded, so the
+// memo can cost an optimization only by being consulted for a method whose
+// evidence would now differ -- which needs the passes themselves to change,
+// i.e. a new build.
+
+fn refused_methods() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
+    static SET: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashSet<u64>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// How many methods may be remembered as refused. Bounded for the same reason
+/// every other memo here is: an unbounded set keyed by method is a leak on a
+/// program that generates classes.
+const MAX_REFUSED_MEMOS: usize = 8192;
+
+/// Record that this method's optimizing body carried no evidence.
+pub fn note_method_refused(hash: u64) {
+    let mut set = refused_methods().write();
+    if set.len() < MAX_REFUSED_MEMOS {
+        set.insert(hash);
+    }
+}
+
+/// Has this method already been refused for want of evidence?
+///
+/// Consulted BEFORE the IR pipeline runs, which is the whole point: the first
+/// refusal pays for a discarded build, and no later one does.
+pub fn method_already_refused(hash: u64) -> bool {
+    if accept_policy() != AcceptPolicy::Evidence {
+        return false;
+    }
+    if !refused_methods_memo_enabled() {
+        return false;
+    }
+    refused_methods().read().contains(&hash)
+}
+
+/// `CRATONVM_C2_ACCEPT_MEMO=0` restores the un-memoized gate, which rebuilds
+/// and re-discards on every compile of a refused method. Kept because it is
+/// the arm that separates "the gate refuses the right methods" from "the memo
+/// remembers the right verdict".
+fn refused_methods_memo_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_C2_ACCEPT_MEMO").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// Methods skipped because a previous compile of them was refused.
+static MEMO_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_memo_skip() {
+    MEMO_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many IR builds the memo avoided. A zero with a large
+/// `refused_no_evidence` means the memo is not being consulted.
+pub fn memo_skips() -> u64 {
+    MEMO_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
 }

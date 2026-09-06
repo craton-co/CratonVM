@@ -7982,14 +7982,33 @@ impl<'a> Lowerer<'a> {
                             ));
                             return;
                         }
+                        // ORDER IS LOAD-BEARING, and getting it wrong is how
+                        // this arm SIGSEGV'd on the H2 workload the first time:
+                        // the map goes FIRST, the arguments SECOND.
+                        //
+                        // `emit_safepoint_map` reaches `emit_shadow_push`,
+                        // which clobbers RAX/RCX/R10/R11 and CALLS
+                        // `get_current_thread` -- and a call clobbers every
+                        // volatile register, which on Win64 is exactly
+                        // `CALL_ARG_REGS` (RCX, RDX, R8, R9). Marshalling
+                        // first and mapping second therefore handed
+                        // `jit_aastore` four destroyed arguments, the first of
+                        // which it dereferences as a `SharedVm`.
+                        //
+                        // Mapping first is safe and is what the safepoint poll
+                        // already does: this backend homes every live value in
+                        // a frame slot, so the map is a set of frame offsets
+                        // that does not depend on any register, and the
+                        // residency file is callee-saved (RBX, R12-R15) so it
+                        // survives the shadow push's call by the ABI.
+                        let mapped = Self::ir_gc_point_maps_enabled()
+                            && self.emit_safepoint_map_if_enabled();
                         // (vm_ptr, array_ptr, index, val), loaded in ARG order
                         // so no load clobbers a later one's source.
                         self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
                         self.gp_load_value(CALL_ARG_REGS[1], node.inputs[2]);
                         self.gp_load_value(CALL_ARG_REGS[2], node.inputs[3]);
                         self.gp_load_value(CALL_ARG_REGS[3], node.inputs[4]);
-                        let mapped = Self::ir_gc_point_maps_enabled()
-                            && self.emit_safepoint_map_if_enabled();
                         self.emit_mov_reg_imm64(RAX, self.aastore as u64);
                         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
                         if mapped {
@@ -22010,6 +22029,62 @@ mod tests {
              this test would now pass vacuously"
         );
         out
+    }
+
+    /// The `aastore` arm must publish its safepoint map BEFORE it marshals the
+    /// helper's arguments, and this test exists because getting it the other
+    /// way round SIGSEGV'd the H2 JDBC workload.
+    ///
+    /// `emit_safepoint_map` reaches `emit_shadow_push`, which clobbers
+    /// RAX/RCX/R10/R11 and CALLS `get_current_thread` -- and a call clobbers
+    /// every volatile register, which on Win64 is exactly `CALL_ARG_REGS`
+    /// (RCX, RDX, R8, R9). Marshalling first therefore handed `jit_aastore`
+    /// four destroyed arguments, the first of which it dereferences as a
+    /// `SharedVm`. The reverse order is safe because this backend homes every
+    /// live value in a frame slot, so the map depends on no register, and the
+    /// residency file is callee-saved.
+    ///
+    /// A source scan rather than a behavioural test, for the same reason the
+    /// other audits in this module are: reaching this arm at run time needs a
+    /// live heap and a real reference array, and the property is about the
+    /// ORDER of two emissions, which a disassembly of a hand-built graph would
+    /// not distinguish from a coincidence.
+    #[test]
+    fn the_aastore_arm_maps_before_it_marshals() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let arm = src
+            // Anchored on a string unique to THIS arm. `if matches!(kind,
+            // MemKind::Ref) {` is not: the `Op::Store` (putfield) arm opens
+            // the same way and comes FIRST, so splitting on it scans the
+            // wrong code and the test fails for a reason that has nothing
+            // to do with the property.
+            .split("ir_lower: ArrayStore(Ref) needs the aastore helper")
+            .nth(1)
+            .expect("the ArrayStore(Ref) arm is in this file")
+            .split("\n                    }")
+            .next()
+            .expect("the arm ends");
+        let map_at = arm
+            .find("emit_safepoint_map_if_enabled()")
+            .expect("the arm must publish an oop map: `jit_aastore` allocates");
+        let marshal_at = arm
+            .find("CALL_ARG_REGS[0]")
+            .expect("the arm must marshal the helper's arguments");
+        assert!(
+            map_at < marshal_at,
+            "the safepoint map must be emitted BEFORE the arguments are loaded \
+             into CALL_ARG_REGS -- `emit_shadow_push` calls `get_current_thread`, \
+             and a call clobbers every volatile register, which on Win64 is \
+             exactly the argument registers. This ordering SIGSEGV'd H2.",
+        );
+        // And the call itself comes last, or the marshalling is pointless.
+        let call_at = arm
+            .find("self.aastore as u64")
+            .expect("the arm must call the helper");
+        assert!(
+            marshal_at < call_at,
+            "arguments must be marshalled before the CALL",
+        );
     }
 
     /// `op_home_is_one_store_rax` claims a property of SOURCE the compiler
