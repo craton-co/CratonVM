@@ -126,7 +126,7 @@ this page's mechanism.
 
 **Note added while landing the above (same day, later merge)**: `dev` just
 landed
-[`moving-young-fallback-was-residue-and-not-the-cost-FIXED-20260906.md`](../../internal/fixed-bugs/moving-young-fallback-was-residue-and-not-the-cost-FIXED-20260906.md),
+`moving-young-fallback-was-residue-and-not-the-cost-FIXED-20260906.md`,
 a different workload (Spring Boot's Kafka integration test) but a finding
 that bears directly on this page's central assumption. Two things it
 establishes there:

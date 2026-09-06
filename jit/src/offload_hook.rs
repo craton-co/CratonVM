@@ -43,22 +43,45 @@
 //!
 //! # Unarmed is free, and armed is the only way to be wrong
 //!
-//! [`is_kernel`] reads one relaxed `bool` and returns `false` when nothing has
-//! ever been registered, which is every run without `--gpu`. Armed, it costs a
-//! read lock and a hash on a path that is already several probes deep.
+//! [`is_kernel`] reads one relaxed `bool` and returns `false` when the run is
+//! not doing GPU offload at all, which is every run without `--gpu`. Armed, it
+//! costs a read lock and a hash on a path that is already several probes deep.
 //!
 //! Missing a door is not a correctness bug: the site simply does not offload,
 //! which is exactly what a compiled caller did before any of this existed. The
 //! failure mode is a lost optimisation, and
 //! `gpu_compiled_offload_census` is what makes it visible rather than silent.
+//!
+//! # AUDIT 2026-09-06: armed means "offload is live", not "something was
+//! registered"
+//!
+//! [`any_kernels`] used to be true only once `note_kernel` had inserted a row,
+//! and `jit_invoke_dispatch` reads it to decide whether to consult the hook at
+//! all. That made the registry unable to learn: a program whose ONLY kernel is
+//! forward-referenced (its class not yet loaded when its caller was scanned)
+//! registered nothing, so the flag stayed false, so the compiled dispatch
+//! helper never looked, so nothing ever registered it. The empty case was
+//! self-sealing.
+//!
+//! [`arm`] now also sets it from `runtime::offload_jit_gate` the first time
+//! that gate runs with a real device, so a `--gpu` run is armed whether or not
+//! a caller scan happened to find a kernel — and the per-site resolution in
+//! `try_compiled_offload` gets a chance to ask the gate about a target the scan
+//! could not judge. A run WITHOUT `--gpu` never reaches `arm`, and still pays
+//! exactly one relaxed bool per compiled static dispatch.
+//!
+//! See `internal/gpu/compiled-caller-gate-refused-ldc-kernels-FIXED-20260905.md`.
 
 use parking_lot::RwLock;
 use rustc_hash::FxHashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-/// Has anything ever been registered? Read on every compiled static
+/// Is GPU offload live in this process? Read on every compiled static
 /// dispatch, so it is a plain relaxed bool rather than a lock.
+///
+/// Set by [`note_kernel`] and by [`arm`] — see the AUDIT note in the module
+/// docs for why registration alone is not enough to arm.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 type Key = (Box<str>, Box<str>, Box<str>);
@@ -88,7 +111,18 @@ pub fn note_kernel(class_name: &str, method_name: &str, descriptor: &str) {
     }
 }
 
-/// Has any kernel been registered at all?
+/// Arm the hook because GPU offload is live, without registering anything.
+///
+/// Called once from `runtime::offload_jit_gate`'s scan, after it has confirmed
+/// a usable device. Without this the registry cannot learn about a kernel no
+/// caller scan was able to judge — see the AUDIT note in the module docs.
+pub fn arm() {
+    // Relaxed-store-then-Release is not needed here: unlike `note_kernel`
+    // there is no table row this publication has to order after.
+    ARMED.store(true, Ordering::Release);
+}
+
+/// Is GPU offload live — i.e. is it worth asking about a call site at all?
 ///
 /// One relaxed bool, and the only thing a run without `--gpu` pays per
 /// compiled static dispatch. [`is_kernel`] allocates to build its key,

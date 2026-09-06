@@ -1547,7 +1547,7 @@ fn initialize_class_shared(
                 if crate::runtime::env_cache::modstatic_dbg()
                     && &*class_name_for_jfr == "org/jboss/modules/Module"
                 {
-                    eprintln!("MODSTATIC: Module <clinit> FAILED: {:?}", &e);
+                    eprintln!("MODSTATIC: Module <clinit> FAILED: {:?}", e);
                 }
                 // If <clinit> failed with a stack underflow (broken invokedynamic
                 // in JDK internal classes), treat the class as initialized anyway.
@@ -1583,7 +1583,7 @@ fn initialize_class_shared(
                         shared,
                         "<clinit>",
                         "stack-error/invokedynamic",
-                        &format!("class={} err={:?}", class_name_for_jfr, &e),
+                        &format!("class={} err={:?}", class_name_for_jfr, e),
                     );
                     finalize_init(shared, class_id, ClassState::Initialized);
                     return Ok(());
@@ -1599,7 +1599,7 @@ fn initialize_class_shared(
                 {
                     eprintln!(
                         "CRATONVM_LENIENT_CLINIT: NOT swallowing <clinit> stack-error/invokedynamic failure (no recovery path) — class={} err={:?} — propagating per JVMS §5.5",
-                        class_name_for_jfr, &e
+                        class_name_for_jfr, e
                     );
                 }
                 // For non-critical exception types during <clinit> (ClassCastException,
