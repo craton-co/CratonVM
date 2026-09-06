@@ -431,6 +431,21 @@ pub static PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new
 /// which walk a run's corruption came through.
 pub static SERIAL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new(0);
 
+/// How many holders the serial reference scan refused because their declared
+/// legacy body is larger than a whole region.
+///
+/// Expected to be ZERO. Measured as the residual of the word0 screen on H2,
+/// 2026-09-06: 20 of 20 reports in two runs were one `num_slots=65536` holder.
+pub static SERIAL_SCAN_HOLDER_BODY_TOO_BIG: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders the PHASE-4 fixup refused, by either impossibility test.
+///
+/// Expected to be ZERO. Separate from the evacuation-time counters because
+/// Phase 4 runs after them: a non-zero count here with zeros there means a
+/// header went bad between evacuation and the fixup, which is a different
+/// window from the one the evacuation screens close.
+pub static PHASE4_HOLDER_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
 /// How many compact reference-field offsets were skipped because the resolved
 /// layout places them past the body that same layout declares.
 ///
@@ -9400,6 +9415,31 @@ impl G1Collector {
     /// this file already has defects from. A holder refused by one evacuator and
     /// walked by the other is not a screen, it is a coin flip on which arm the
     /// pause happened to take.
+    /// The holder's declared legacy body, when it CANNOT FIT IN A REGION.
+    ///
+    /// A legacy object occupies `HEADER_SIZE + num_slots * SLOT_SIZE`. If that
+    /// exceeds the region size, no allocator ever placed such an object here and
+    /// the count is not a count. Independent of [`Self::holder_word0_arena_pointer`]:
+    /// this catches the shape MEASURED as that screen's residual on H2
+    /// (2026-09-06, `class_id=0 num_slots=65536` -> a 1 MiB body), whose two
+    /// header dwords are not a pointer and so pass the word0 test.
+    ///
+    /// Not screened on `class_id == 0` alone: id 0 is a legitimate class id in
+    /// this tree (`is_zeroed` needs four fields to agree, and the allocator
+    /// tests use it), so it is the SIZE that is impossible, not the id.
+    fn holder_body_cannot_fit_a_region(&self, header: &ObjectHeader) -> Option<usize> {
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return None;
+        }
+        let declared = (header.num_slots() as usize).saturating_mul(SLOT_SIZE);
+        if HEADER_SIZE.saturating_add(declared) > region_size {
+            Some(declared)
+        } else {
+            None
+        }
+    }
+
     fn holder_word0_arena_pointer(&self, header: &ObjectHeader) -> Option<u64> {
         let paired =
             (header.class_id.as_u32() as u64) | ((header.num_slots() as u64) << 32);
@@ -10403,6 +10443,24 @@ impl G1Collector {
                 }
                 return;
             }
+            if let Some(declared) = self.holder_body_cannot_fit_a_region(header) {
+                let n = SERIAL_SCAN_HOLDER_BODY_TOO_BIG.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] serial ref-scan REFUSED a HOLDER whose declared body cannot \
+                         FIT IN A REGION (#{n}): holder=0x{:x} class_id={} num_slots={} \
+                         declared_body={declared} region_size={} mark=0x{:016x} -- no \
+                         allocator placed an object this size here, so the count is not a \
+                         count. Walking it would rewrite the rest of the region. Skipped.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        self.config.region_size,
+                        header.mark_word.load(Ordering::Relaxed),
+                    );
+                }
+                return;
+            }
         }
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
@@ -11239,18 +11297,53 @@ impl G1Collector {
                     );
                 }
 
-                if rewrite {
-                    update_object_refs(obj_ptr, header, &forwards);
+                // PHASE 4 WALKS THE SAME HEADER, TWICE, WITH NO BOUND AND NO
+                // SCREEN. Both calls below reach
+                // `for_each_flat_object_reference_trusting_header`, whose own doc
+                // says it "bounds it by nothing" -- and `update_object_refs`
+                // WRITES every slot it visits. Measured on H2 2026-09-06: with the
+                // evacuation-time screens on, corrupt-cell reports moved to
+                // exactly these two callers (`collect_outgoing_cross_region_edges`
+                // and `update_object_refs`), carrying the same arena-pointer
+                // holders the evacuator had just refused.
+                //
+                // Screening here rather than inside the two walks is what covers
+                // both with one test: this is the only caller of either, and it is
+                // the only place that holds the region geometry the test needs.
+                let refuse = gc_flags().g1_serial_evac_holder_screen
+                    && (self.holder_word0_arena_pointer(header).is_some()
+                        || self.holder_body_cannot_fit_a_region(header).is_some());
+                if refuse {
+                    let n = PHASE4_HOLDER_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n.is_power_of_two() {
+                        tracing::warn!(
+                            "[g1] Phase-4 fixup REFUSED a HOLDER (#{n}): holder=0x{:x} \
+                             class_id={} num_slots={} mark=0x{:016x} region={i} -- its \
+                             header is not a header, and BOTH walks below trust the \
+                             count. `update_object_refs` would rewrite the rest of the \
+                             region with forwarding addresses. Skipped; the walk \
+                             advances by this object's own size.",
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            header.num_slots(),
+                            header.mark_word.load(Ordering::Relaxed),
+                        );
+                    }
                 }
-                self.collect_outgoing_cross_region_edges(
-                    regions,
-                    i,
-                    obj_ptr,
-                    header,
-                    &mut new_rset_edges,
-                    &mut seen_targets,
-                    want_census.then_some(&mut census),
-                );
+                if !refuse {
+                    if rewrite {
+                        update_object_refs(obj_ptr, header, &forwards);
+                    }
+                    self.collect_outgoing_cross_region_edges(
+                        regions,
+                        i,
+                        obj_ptr,
+                        header,
+                        &mut new_rset_edges,
+                        &mut seen_targets,
+                        want_census.then_some(&mut census),
+                    );
+                }
                 offset += obj_size;
             }
         }
