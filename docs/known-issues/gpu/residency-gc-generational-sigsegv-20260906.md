@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN. Deterministic — 3/3 on a PRISTINE dev binary, interleaved against a modified one. Not a flake and not new to any branch. |
+| **Status** | OPEN. Deterministic — 3/3 on a PRISTINE dev binary, interleaved against a modified one, and 3/3 again after merging `154d9e845`, which carried the day's `gc/src/heap.rs`, `gc/src/zgc.rs` and `jit/src/x64/safepoint.rs` traffic. Not a flake and not new to any branch. |
 | **Scope** | `-XX:+UseGenerationalGC` **and** `--gpu` **and** the JIT **and** an offload that actually happens. ZGC, G1, `--nojit`, and `--gpu` with the threshold raised out of reach all pass. |
 | **Reproducer** | one local fixture, ~10 seconds |
 | **Found** | 2026-09-06, while re-verifying the battery for two unrelated GPU pages |
