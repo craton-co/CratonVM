@@ -934,6 +934,14 @@ pub struct GcFlags {
     /// heap-corruption investigation wants the old "a freed region reads as
     /// zeros" world back — a use-after-free read is the one thing the scrub was
     /// really buying — and it is what makes the change a single-binary A/B.
+    /// `CRATONVM_G1_ACCEPT_IMPLAUSIBLE_SLOT=1` -- restore the pre-2026-09-06
+    /// behaviour of `evacuation_candidate_is_an_object_view`, which reported an
+    /// implausible ref-slot candidate and then evacuated it anyway.
+    ///
+    /// The one-binary A/B for that fix. Default OFF (the screen refuses), so
+    /// setting this re-opens the door that carves a multi-kilobyte "object"
+    /// whose header is a heap pointer into a Survivor region.
+    pub g1_accept_implausible_slot: bool,
     pub g1_scrub_free: bool,
     /// `CRATONVM_G1_NARROW_FIXUP` — restrict G1's Phase-4 reference fix-up to
     /// the regions that can actually need it, instead of every non-CSet region
@@ -1718,6 +1726,7 @@ impl GcFlags {
             g1_parallel_evac_in_jit: on_unless_zero(src, "CRATONVM_G1_PARALLEL_EVAC_IN_JIT"),
             g1_eager_humongous: on_unless_zero(src, "CRATONVM_G1_EAGER_HUMONGOUS"),
             g1_young_pause_target: on_unless_zero(src, "CRATONVM_G1_YOUNG_PAUSE_TARGET"),
+            g1_accept_implausible_slot: present(src, "CRATONVM_G1_ACCEPT_IMPLAUSIBLE_SLOT"),
             g1_scrub_free: present(src, "CRATONVM_G1_SCRUB_FREE"),
             g1_narrow_fixup: on_unless_zero(src, "CRATONVM_G1_NARROW_FIXUP"),
             g1_cleanup_walk: present(src, "CRATONVM_G1_CLEANUP_WALK"),

@@ -9075,12 +9075,58 @@ impl G1Collector {
             // SAFETY: the verdict above validated the tag bytes and the
             // address's containment below its region's cursor.
             let cand = unsafe { &*(raw as *const ObjectHeader) };
-            self.note_implausible_legacy_header_view(
+            let implausible = self.note_implausible_legacy_header_view(
                 regions,
                 raw as *mut u8,
                 cand,
                 "ref-slot-candidate",
             );
+            // ACT ON THE VERDICT. This screen used to DISCARD it and return
+            // `true` regardless, so every candidate it detected was reported
+            // and then evacuated anyway -- measured on
+            // `org.h2.test.store.TestMVStoreTool` (-Xmx256m, G1,
+            // `CRATONVM_G1_JIT_MARK_DRIVER=1`, 2026-09-06): 40 reports at this
+            // site, 40 accepted.
+            //
+            // The report's own text is the argument: "no allocation in this VM
+            // produces a class-0 legacy object with that many fields; a
+            // reference array whose kind bit is unset reads exactly this way,
+            // and the walk it authorises is eight times the array's extent."
+            // WHAT THIS DOES AND DOES NOT FIX -- measured, one binary, ABBA
+            // against `CRATONVM_G1_ACCEPT_IMPLAUSIBLE_SLOT=1`:
+            //
+            //   refusing   ref-slot 9 / 16 refused, evacuate-src 0, dest 0
+            //   accepting  ref-slot 4 accepted, evacuate-src 4, dest 2
+            //
+            // So it DOES close the chain it is on: candidates refused here stop
+            // reaching `evacuate_object`, and the downstream implausible-header
+            // reports at `evacuate-src` / `evacuate-dest` go to zero.
+            //
+            // It does NOT fix the `corrupt Value cell` bursts, and it was wrong
+            // to expect it to. Those are 32 in BOTH arms (the report cap, so
+            // ">= 32"), at 17-62 mixed pauses. They are a SEPARATE defect that
+            // merely co-occurs: their holders carry PLAUSIBLE class ids -- 665
+            // with 192 slots, 13079432 with 1024 -- which is why the
+            // implausible screen never fires on them, and their mark words hold
+            // a heap-address-shaped value with `gc_flags=0`
+            // (0x200001ea4fb17cd0, 0x100001ea4fb14cf0, 0x300001ea4fb16850: age
+            // nibble intact, everything else an address in the live heap). A
+            // zero `gc_flags` makes `is_compact_object` answer false, so the
+            // walk takes the legacy 16-byte cell stride over what is really a
+            // compact object and every slot decodes as garbage. Those marks are
+            // NOT forwarding pointers -- `make_forwarded` sets MARK_FORWARDED
+            // and these have the low two bits clear -- so `retire_forwards` is
+            // not the suspect either. That is the open thread.
+            //
+            // Refusing is the SAME disposition the verdict arm below already
+            // takes for a candidate that fails `classify_candidate_header`, and
+            // it is safe for the same reason: the test is deliberately narrow
+            // (a class-id band no id occupies, or class 0 with >= 1024 fields),
+            // so a refusal here is not declining a live object.
+            if implausible && !gc_flags().g1_accept_implausible_slot {
+                EVAC_REF_REJECTED.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
             return true;
         }
         // WHICH refusal, not just THAT one. See [`EVAC_REF_REJECTED_TORN`]:
