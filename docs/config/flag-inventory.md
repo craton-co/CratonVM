@@ -1087,6 +1087,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_UNDERFLOW` | DBG | `CRATONVM_DBG=underflow` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_UNPARK_MISS` | DBG | `CRATONVM_DBG=unpark-miss` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_UNPIN_RING` | DBG | `CRATONVM_DBG=unpin-ring` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_UNREG_DECLINED` | DBG | `CRATONVM_DBG=unreg-declined` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_UNREG_MEMO_AUDIT` | DBG | `CRATONVM_DBG=unreg-memo-audit` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_UNROLL` | DBG | `CRATONVM_DBG=unroll` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_URLCL` | DBG | `CRATONVM_DBG=urlcl` | opt-in | off | diag | snapshot | types |

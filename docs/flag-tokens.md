@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-529 tokens.
+530 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -528,6 +528,7 @@ export inherited from a parent shell.
 | `swchain` | `CRATONVM_DBG_SWCHAIN` |
 | `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
 | `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
+| `unreg-declined` | `CRATONVM_DBG_UNREG_DECLINED` |
 | `sweep-referrers` | `CRATONVM_DBG_SWEEP_REFERRERS` |
 | `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
 | `sweep-trace-class` | `CRATONVM_DBG_SWEEP_TRACE_CLASS` |
