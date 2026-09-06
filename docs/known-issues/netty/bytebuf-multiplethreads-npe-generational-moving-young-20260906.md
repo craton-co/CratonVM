@@ -598,3 +598,65 @@ instead of bypassing it. The order of work has changed, though:
    `unrewritable_conservative_jit_roots`, and it is a deliberate correctness
    term with a QDox repro behind it, not an accident. Removing it re-exposes
    this at ~25 % per run on `UniqueIpFilterTest`.
+
+### 10.8 §8's blind-spill candidate is eliminated, and the surviving lead is `region=unclassified`
+
+`moving-young-corruption-rootcause.md` nominates three storage classes, and §8
+adopts them: **scalar-replacement slots**, **LICM hoist slots**, and the **blind
+GPR spill area**. One of the three can now be crossed off.
+
+`CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE=1` (added with this section) widens the
+register-image remap from the callee-saved GPR image alone to the entire
+unverifiable tail — so `operand-spill`, `safepoint-gpr-spill-image` and
+`outgoing-args-or-deopt-regs` all get rewritten. On the §10.4 repro:
+
+| arm | crashes / runs | rate |
+|---|---|---|
+| default | **11 / 81** | 13.6 % |
+| widened | **2 / 32** | 6.3 % |
+
+Fisher p ≈ 0.37 — **no difference**. Rewriting every one of those regions does
+not move the crash rate, so none of them holds the reference that faults. That
+eliminates the blind GPR spill area, and it also retires the worry in §10.5 that
+the narrow `resumed_from` classifier was hiding a live stale word in the other
+two: if one were live, writing it would have helped.
+
+**A methodological note, because this nearly went in as a finding.** The first
+batch read narrow 0/14 vs wide 2/14 and I wrote it up as "widening makes it
+worse". The pooled default rate is 13.6 %, so 2/14 *is* the baseline and 0/14
+was the outlier — and the second matched batch came back narrow 2/18 vs wide
+0/18, i.e. the same null with the arms swapped. Neither batch means anything
+alone. The pooled counts are the finding; a 14-rep arm against a ~14 % event is
+not an arm.
+
+**What survives.** The stale-word census (§10.5) has one population small enough
+to be real rather than dead slop: `region=unclassified`, at **0–6 words per
+rep** against thousands for every named region. They sit at fixed frame offsets
+in specific compiled methods —
+
+```
+method=io/netty/channel/DefaultChannelPromise.setSuccess:()Lio/netty/channel/ChannelPromise;      off=448
+method=io/netty/channel/ChannelInitializer.initChannel:(Lio/netty/channel/ChannelHandlerContext;)Z off=528
+method=io/netty/channel/AbstractChannelHandlerContext.findContextInbound:(I)L…;                    off=544
+```
+
+— and `FrameLayout::region_name` cannot place them, which is precisely what a
+**scalar-replacement or LICM hoist slot** would look like to a classifier that
+does not know those regions: §8's other two candidates, and the only ones left.
+Some rows even resolve a class (`io/netty/channel/embedded/…`), so they are not
+all noise.
+
+Stated honestly: the crashing reps carried 5 and 4 such words and two clean reps
+carried 0 — but another clean rep carried 6, so this is a **lead, not a
+correlation**, and it wants the per-cycle pairing (does a crash follow a cycle
+that left one of these behind?) rather than a per-run count.
+
+Next measurement, replacing §8's list:
+
+1. Teach `FrameLayout::region_name` the scalar-replacement and LICM hoist
+   spans, so `unclassified` resolves into one of them or stays genuinely
+   unknown. Right now the census cannot tell those two candidates apart, and
+   they are the last two standing.
+2. Pair the census with the fault per CYCLE rather than per run.
+3. Do **not** re-run the widening arm; §10.8 is 113 VM launches and the answer
+   is null.

@@ -754,6 +754,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "moving-young-band-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_DBG"), off_key: None, off_word: None, since: "2026-07-26" },
+    // Diagnostic widening of the register-image remap to the whole unverifiable
+    // frame tail, to TEST the four-region partition in `conservative_roots`'s
+    // module comment rather than continue to argue it. Off by default; see
+    // `register_image_remap_admits`.
+    E { group: Group::DBG, token: "jit-remap-all-unverifiable", on_key: Some("CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "moving-young-band-skip-in-map", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "moving-young-coverage-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_COVERAGE_DBG"), off_key: None, off_word: None, since: "2026-07-01" },
     E { group: Group::DBG, token: "moving-young-fallbacks", on_key: Some("CRATONVM_MOVING_YOUNG_FALLBACKS"), off_key: None, off_word: None, since: "2026-07-01" },
