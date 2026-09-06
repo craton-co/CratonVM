@@ -10530,6 +10530,44 @@ impl G1Collector {
     /// desynced before reaching it" means the region's own grid is broken and
     /// the address is a symptom rather than the cause.
 
+    /// Does this region's object grid CLOSE -- does the linear walk land
+    /// exactly on the cursor, having stepped only whole objects?
+    ///
+    /// This is the check [`Self::locate_in_object_grid`]'s own doc says is
+    /// missing. That function strides each object by the size ITS OWN header
+    /// declares, so `grid=OBJECT-START` reports where the walk ARRIVED, not
+    /// that an allocator put an object there: one wrong size upstream misparses
+    /// every boundary after it and still lands on an "object start" each time.
+    ///
+    /// A walk that ends exactly at the cursor stepped a consistent set of
+    /// sizes, so the boundaries it printed are the allocator's. A walk that
+    /// OVERSHOOTS crossed at least one wrong size, and every verdict it gave
+    /// for that region is an artefact of the misparse rather than evidence
+    /// about the address asked about. Without this, the two cases are
+    /// indistinguishable in the log -- which is how `grid=OBJECT-START` came to
+    /// be read as proof of a real object start.
+    fn grid_closes_on_cursor(&self, region: &G1Region) -> (bool, usize, usize) {
+        let base = region.data.as_ptr() as usize;
+        let cursor = region.cursor();
+        let jit_skips = self.jit_tlab_skip_spans();
+        let (mut offset, mut objects) = (0usize, 0usize);
+        while offset < cursor {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                offset += skip;
+                continue;
+            }
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let obj_size = object_total_size(header);
+            if obj_size == 0 || obj_size > cursor.saturating_sub(offset) {
+                return (false, objects, offset);
+            }
+            offset += obj_size;
+            objects += 1;
+        }
+        (offset == cursor, objects, offset)
+    }
+
     fn locate_in_object_grid(&self, region: &G1Region, addr: usize) -> String {
         let base = region.data.as_ptr() as usize;
         if addr < base {
@@ -10661,8 +10699,9 @@ impl G1Collector {
                 .map(|(i, r)| {
                     let base = r.data.as_ptr() as usize;
                     let off = addr.wrapping_sub(base);
+                    let (closes, walked, ended) = self.grid_closes_on_cursor(r);
                     format!(
-                        "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={} {} {}",
+                        "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={} grid_closes_on_cursor={closes} grid_walked={walked} grid_ended={ended:#x} {} {}",
                         r.region_type,
                         r.cursor(),
                         r.reuse_epoch,
