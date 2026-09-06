@@ -153,6 +153,30 @@ driving a concrete `AsynchronousSocketChannel` through a `CompletionHandler` hit
 this. Only the WebSocket classes were measured; **a NIO2-connector sweep has not
 been done.**
 
+## The G1 arm's 15 CRASH classes — **FIXED 2026-09-05**
+
+This page measures the DEFAULT collector, so the 15 CRASH classes a 2026-09-05
+three-collector run found on the **G1** arm (and nowhere else: 0 in the same
+run's Generational and ZGC arms) were never in its scope. They are fixed, and
+the reason is worth carrying forward here because it is not a Tomcat fact at
+all:
+
+> `CRATONVM_G1_PARALLEL_EVAC` is **on by default**, and every header screen the
+> serial evacuator gained in 2026-08/09 — the per-candidate plausibility check,
+> the per-holder element clamp, the "a root that is not an object start is not
+> evacuated" rule — had been added to the SERIAL arm only. The hardening was
+> landing on the code that does not run.
+
+Same-binary A/B on the Azure fixture, six interleaved repetitions of
+`catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml` under
+`-XX:+UseG1GC`, with `CRATONVM_G1_PARALLEL_EVAC_SCREEN=0` as the only
+difference: **3 CRASH / 6 with the screens off, 0 CRASH / 6 with them on.**
+Across all 15 classes at n=1: 4 CRASH → 0.
+
+**Run the suite once per collector.** Two of the three collectors were clean on
+the exact commit where G1 lost 15 classes to a defect that had been introduced
+by a fix landing on one arm of a two-arm path.
+
 ## Reproduction
 
 Whole suite, one shard of two (Linux). Pick the shard count from the cores you
