@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **OPEN.** The producer is not identified. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
+| **Status** | **OPEN.** The producer is not identified, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
 | **Scope** | G1 only. Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
 | **Left behind by** | `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens` (2026-09-05), whose own "What is NOT closed" section names this class. |
 
@@ -362,6 +362,61 @@ reading; it does not on its own prove it, and 29 of 53 are not small.
 its destination -- it exhausts the pool one region per attempt and returns
 `None`, which is this page's OOM, not an overwrite. Whatever writes the run of
 bytes, it is not that call site overrunning.
+
+## The walks are READERS: screening them moves the reports, it does not stop them
+
+Measured 2026-09-06 on H2 (`TestMVStoreTool`, -Xmx256m, G1, mark driver on),
+one binary, one kill switch, 5 interleaved pairs. Arm A ablates a new
+word0-is-an-arena-pointer holder refusal on the serial evacuator and on the
+Phase-4 fixup; arm B has it on.
+
+| arm | corrupt per rep | serial refusals | phase-4 refusals |
+|---|---|---|---|
+| A | 13, 13, 0, 0, 21 | 0 | 0 |
+| B | 16, 0, 13, 0, 19 | 10, 4, 0, 9, 9 | 12, 11, 11, 14, 12 |
+
+47 against 48, and 8 of 10 runs SIGSEGV in both arms. The screens **engage** --
+this is not a vacuous arm -- and the family survives them.
+
+**Where the reports went is the whole result.** `#[track_caller]` on the same
+runs:
+
+* `A-1` -- 13 of 13 at `scan_and_evacuate_refs` (the walk arm B screens);
+* `B-1` -- 15 of 16 at `scan_source_region_for_cset_refs`, which has no screen;
+* `A-5` -- 19 of 21 at `update_object_refs`;
+* `B-4` -- spread across five different walks.
+
+Screening one reader moved the population to the next one. There are **six**
+flat-walk sites, not the three this page's `#[track_caller]` census found:
+`scan_and_evacuate_refs`, `scan_source_region_for_cset_refs`,
+`collect_outgoing_cross_region_edges`, `note_humongous_targets_in_region`,
+`update_object_refs`, `seed_source_region`.
+
+### what that settles about the producer
+
+A holder that is already corrupt when six independent walks read it was not
+corrupted by any of them. This page's search has been aimed at the walks; the
+walks are readers.
+
+The write they perform past a holder's end is real and worth stopping on its
+own terms -- `update_object_refs` reaches
+`for_each_flat_object_reference_trusting_header`, whose own doc says it "bounds
+it by nothing", and one refusal in these runs names a holder declaring 102736
+legacy slots: a 1.6 MB body in a 1 MiB region, rewritten cell by cell with
+forwarding addresses. But it is an AMPLIFIER. It explains why corruption
+arrives in bursts within one second and why victims' first two words are two
+arena pointers one object-size apart. It does not explain the first one.
+
+**The origin is upstream of every walk on this page and is still unfound.**
+
+### and the copy watch says it is not the copy either
+
+`CopyWatch` (`CRATONVM_G1_EVAC_COPY_WATCH=1`), run on H2 for the first time:
+**zero** first-word rewrites over ~700k to-space copies, at all three of its
+checkpoints -- before the pause, after the parallel closure, after the serial
+drain -- in runs that reported 13 and 17 corrupt holders. So the victims are
+not sound to-space copies overwritten after the copy, which is the inference
+the top of this page rests on.
 
 ## The next step
 
