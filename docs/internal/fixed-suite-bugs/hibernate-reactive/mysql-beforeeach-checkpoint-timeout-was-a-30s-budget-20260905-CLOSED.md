@@ -1,0 +1,192 @@
+# The hibernate-reactive MySQL `@BeforeEach` checkpoint-timeout family was a 30-second budget, not a defect — and it was hiding one real JIT miscompile, now FIXED
+
+## Status
+
+**CLOSED 2026-09-05.** Retires
+`docs/known-issues/hibernate/hib-reactive-mysql-beforeeach-checkpoint-timeout-family-20260905.md`,
+which reported ~21 of 23-25 FAIL classes sharing one
+`VertxTestContext` checkpoint-timeout signature on two of three GC arms and
+said "root cause not yet isolated". It is isolated now, with the control arm
+that page did not have.
+
+Two separate things were tangled in it:
+
+1. **The family itself is a budget, not a fault.** vertx-junit5 gives an
+   intercepted `@BeforeEach` a fixed **30-second** join budget. On the MySQL
+   arm that budget has to cover the Testcontainers MySQL container start AND
+   the `SessionFactory` build, and CratonVM's share of the second is large
+   enough that under shard concurrency the pair crosses 30 s. HotSpot, on the
+   same host under the same concurrency, crosses it too — just far less often
+   (2 of 24 classes against CratonVM's 17 of 24).
+2. **One genuine correctness defect was inside the same FAIL set** and had
+   nothing to do with the timeout: a JIT optimizing-tier phi-copy
+   register-aliasing miscompile that made `java.time.Duration.toNanos()`
+   return `seconds * 1e9 + seconds`. **FIXED** — see
+   `jit-ir-phi-copy-register-alias-20260905-FIXED` (internal tree, `fixed-suite-bugs/jit/`).
+
+## The four-arm control the original page did not have
+
+Azure Linux (8 cores, shared, load 10-20 throughout), one binary built from
+`origin/dev` at `a044e1fe1`, MySQL 26.7.0 via Testcontainers with
+`testcontainers.reuse.enable=false` — one fresh container per class, exactly
+the isolation the Windows run had — one class per JVM, `-Ddb=MySQL`. The class
+list is the 24-class FAIL/HANG union of the three Windows GC arms, minus the
+four the page itself excludes (`TechEmpowerTest`,
+`DatabaseHibernateReactiveTest`, `MultithreadedInsertion*`).
+
+| arm | classes | all-pass | classes with the checkpoint signature |
+|---|---:|---:|---:|
+| CratonVM, one class at a time | 24 | **23** | 0 |
+| HotSpot, one class at a time | 24 | **24** | 0 |
+| CratonVM, **6 concurrent** JVMs | 24 | **7** | 17 |
+| HotSpot, **6 concurrent** JVMs | 24 | **22** | 2 |
+
+The signature reproduces on Linux, on both VMs, and only under concurrency.
+That is what settles it: a CratonVM correctness defect cannot make HotSpot
+produce the identical `TimeoutException: The test execution timed out ... ->
+checkpoint at io.vertx.junit5.VertxExtension.lambda$testContext$1` out of
+`interceptBeforeEachMethod`, and 2 of 24 HotSpot classes did.
+
+The single CratonVM isolation failure is
+`types.BasicTypesAndCallbacksForAllDBsTest` (26 ok / 2 failed) — the JIT
+miscompile in item 2, not the timeout family (`checkpointTO=0` on that row).
+
+## The arithmetic
+
+Per-class wall, same host, same load, three representative classes:
+
+| class | CratonVM iso | HotSpot iso | CratonVM 6-way | HotSpot 6-way |
+|---|---:|---:|---:|---:|
+| `LockTimeoutTest` | 26 s | 16 s | 35 s | 36 s |
+| `NoEntitiesTest` | 23 s | 14 s | 38 s | 28 s |
+| `MutationDelegateTest` | 26 s | 18 s | 49 s | 35 s |
+| (24-class median) | ~26 s | ~15 s | ~44 s | ~33 s |
+
+The container start is logged and is inside the timed `@BeforeEach` — the
+container is a per-JVM static that the first test touches, and with one class
+per JVM that first touch is always the `@BeforeEach`:
+
+```
+CratonVM, isolation :  container PT10.5-11.0S, JUnit total 21.7-24.5 s
+CratonVM, 6-way     :  container PT17.0-19.4S, JUnit total 33.1-47.0 s
+```
+
+So the budget is spent as `container start + SessionFactory build <= 30 s`.
+At 6-way the container alone takes 17-19 s, leaving 11-13 s; CratonVM's build
+does not fit in that and HotSpot's (whose whole isolated class, container
+included, is 14-17 s) usually does. Everything the original page found follows
+from that one inequality:
+
+* **GC-independent** — the budget does not care which collector is running.
+  92% overlap between the ZGC and Generational FAIL sets is what a shared
+  threshold produces, not a coincidence needing explanation.
+* **Feature-area-independent** — soft-delete, embedded ids, mutation
+  delegates and `NoEntitiesTest` (which has no entities at all) fail
+  identically because none of them has reached its own code yet.
+* **Only the sharded suite** — one class at a time, 23 of 24 pass.
+* **Only MySQL** — the same suite on the same host with PostgreSQL is
+  201 PASS / 3 FAIL (`fullbatch-craton-20260903`), because a Postgres
+  container starts in a fraction of the MySQL one's time.
+* **`NoLiveTransactionValidationErrorTest` is not "ZGC-only"** — the earlier
+  page that guessed that (`hib-reactive-3gc-run-regressions-FIXED-20260824`)
+  was reading a threshold, and a threshold has no collector.
+
+## Four corrections to the original page, from its own logs
+
+**1. The checkpoint timeout is the FIRST failure of each class, not the
+family.** Counting all three shards of each Windows arm:
+
+| arm | `The test execution timed out` | `Failed to read any response from the server` |
+|---|---:|---:|
+| default (ZGC) | 38 | 240 |
+| generational | 40 | 281 |
+| g1 | 34 | 232 |
+
+The dominant exception is
+`io.vertx.sqlclient.ClosedConnectionException: Failed to read any response
+from the server`, raised out of `SqlClientPool` while building
+`JdbcEnvironment` — i.e. the SECOND and later attempts, after the first
+`@BeforeEach` has already blown its budget and left the pool half-built. The
+page reports the first exception of each class and calls it the family; the
+retries are the bulk of the log. (This second-order shape did not reproduce on
+Linux at all: `closedconn=0` on every row of both 6-way arms. It is a Docker
+Desktop / Windows artifact of the pool being abandoned mid-handshake.)
+
+**2. Container-start latency is not "ruled out", it is half the budget.** The
+page rules it out by comparing 30-32 s starts against the harness's 240 s
+per-class cap — the wrong cap. Against the 30 s cap that actually fires, a
+30-42 s container start has already spent the whole budget before Hibernate
+runs a line. The page's own data says the same thing once it is cross-tabbed:
+container start does not separate PASS from FAIL (PASS n=148, 16.3/23.8/43.4 s
+min/median/max; FAIL n=10, 18.1/22.6/26.3 s) because it is only ONE of the two
+terms — but 13 further FAIL classes never logged a completed container start
+at all.
+
+**3. `@Timeout(value = 10, timeUnit = MINUTES)` on `BaseReactiveTest.before`
+is not the budget.** `VertxExtension.joinActiveTestContexts` reads the
+annotation from `extensionContext.getTestMethod()` — the TEST method — never
+from the `@BeforeEach` it is intercepting. Test classes here carry no
+`@Timeout`, so the 30 s default applies to the setup join. That is upstream
+vertx-junit5 behaviour and is correct; it is simply much smaller than the page
+assumed.
+
+**4. The ZGC arm's 165 `zgc real: field index OOB index=0 num_slots=0
+op="get"` lines are a real but SEPARATE signature.** They appear in the ZGC
+arm only; the Generational arm has zero VM-level warnings of any kind and
+fails the same 22 classes. A ZGC-only event cannot be the cause of a
+GC-independent family. (That signature is the documented stale-pointer-into-a-
+compacted-away-object shape; `CRATONVM_DBG_ZGC_CORPSE` names the corpse.)
+
+## What was actually fixed
+
+`types.BasicTypesAndCallbacksForAllDBsTest` failed 2 of 28 in **isolation**,
+with no timeout and no connection loss:
+
+```
+testLocalDateTimeType : java.lang.ArithmeticException: / by zero
+        at java.time.LocalTime.truncatedTo(LocalTime.java:991)
+        at java.time.LocalDateTime.truncatedTo(LocalDateTime.java:1120)
+testInstant           : the same, wrapped in a CompletionException
+```
+
+`LocalTime.truncatedTo` divides by `unit.getDuration().toNanos()`, and after
+JIT warm-up `ChronoUnit.MILLIS.getDuration().toNanos()` answered **0** —
+198,356 wrong answers in 200,000 calls, first wrong at call 1,644. Root cause
+is a phi-copy register-aliasing miscompile in the optimizing tier, fixed on
+this branch with an end-to-end regression test; the full write-up is
+`jit-ir-phi-copy-register-alias-20260905-FIXED` (internal tree, `fixed-suite-bugs/jit/`).
+
+## The residual
+
+CratonVM's hibernate-reactive `SessionFactory` bootstrap is roughly **1.7x**
+HotSpot's on the full per-class wall (and several times HotSpot's once the
+shared container start is subtracted). That gap is the reason a 30-second
+budget is tight, and it is the only thing left here worth spending time on. It
+belongs with the existing cost families, not in a per-class bug page:
+
+* `docs/known-issues/hibernate/hib-reactive-multithreaded-insertion-lazy-connection-20260822.md`
+* `hib-reactive-3gc-run-regressions-FIXED-20260824` (the
+  `CompletableFuture`/lambda-composition cost section)
+* `docs/known-issues/perf/interpreted-invoke-cost-350ns-20260825.md`
+
+**Do not re-open this page from a sharded MySQL run.** A 3-arm x 3-shard
+MySQL run is 9 concurrent JVMs each starting its own MySQL container; the
+30-second budget will be crossed and the same 20-odd classes will report the
+same signature, on any VM. Run the affected class alone before believing it,
+and put a HotSpot arm under the SAME concurrency next to it — that pairing is
+what took this page from "root cause not yet isolated" to closed in one
+afternoon.
+
+## Reproduction
+
+```bash
+# 24-class union, one class per JVM, MySQL via Testcontainers, on Linux:
+#   probe/hr-mysql-iso.sh  <craton|hotspot> <listfile> [outdir]     -> 23-24/24 pass
+#   probe/hr-mysql-load.sh <craton|hotspot> <listfile> 6            -> 7/24 vs 22/24
+# common-mysql.args is apps/hibernate-reactive-suite-runner/common.args with
+# -Ddb=PostgreSQL rewritten to -Ddb=MySQL; nothing else differs.
+```
+
+The Windows evidence the original page was written from is at
+`apps/hibernate-reactive-suite-runner/runs/mysql-{default,generational,g1}-20260905-3gc-mysql-local/`
+(untracked).
