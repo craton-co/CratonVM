@@ -149,11 +149,42 @@ same reasoning is why the compact-arm bound IS default-on: skipping a field
 that the holder's own layout places outside the holder's own body cannot drop a
 live reference, because no live reference is there.
 
+## The kill switch that makes it go away
+
+The sharpest fact on this page, and the one to start from:
+
+| arm | PASS | CRASH | FAIL | OOM |
+|---|---:|---:|---:|---:|
+| parallel evacuator (default, and with the 2026-09-05 screens off) | **0** | 2 | 1 | 3 |
+| `CRATONVM_G1_PARALLEL_EVAC=0` | **3** | 0 | 0 | 0 |
+
+Six completed parallel-arm runs, none healthy; three serial-arm runs, all
+`OK (8 tests)`. (Runs killed by a session restart are excluded, not counted as
+either.) Fisher exact on 0/6 against 3/3 is p ≈ 0.012.
+
+**The serial arm is not a control that dies early.** It finishes the whole
+class in 232-264 s, against 387 s for the one parallel run that reached a JUnit
+summary at all — it does the same work, faster, and passes. So this is not
+"the serial arm never reaches the depth where the fault happens", which is the
+shape that invalidated a neighbouring page's driver-off arm.
+
+**The producer is therefore inside `SharedEvac`**, and the eight-byte write is
+a write some parallel worker makes. That is consistent with everything above —
+the corruption appears on to-space copies, mid-pause — and it narrows the
+search from "GC code" to one module.
+
+It does NOT follow that the parallel evacuator should be turned off: it is the
+default for throughput reasons, this is one class on one host, and switching
+collectors' arms on the strength of nine runs would be trading a measured
+defect for an unmeasured regression everywhere else.
+
 ## The next step
 
-**Find the eight-byte write.** Everything above narrows it to: GC code, during
-a pause, at the base of an object already copied into to-space. The candidates
-worth instrumenting, in order:
+**Find the eight-byte write.** Everything above narrows it to: parallel-evacuator
+code, during a pause, at the base of an object already copied into to-space.
+
+**Start inside `SharedEvac`** — the kill switch above says the writer is there.
+The candidates worth instrumenting, in order:
 
 1. `write_flat_object_reference(.., compact = true)` — the only eight-byte
    reference write in the walk, now bounded by the layout but not by the
