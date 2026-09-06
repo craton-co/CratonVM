@@ -216,6 +216,12 @@ fn maybe_dump_shutdown_reports() {
     // them cannot be told from "nobody looked".
     cratonvm_vm::report_punned_watch_at_exit();
 
+    // The execution profile, on `CRATONVM_PROFILE_SAMPLE_MS`. Prints nothing
+    // unarmed, and prints its DENOMINATOR first when armed -- a ranking whose
+    // total is unstated invites reading 40% of samples as 40% of the run, and
+    // on a workload that spends its time blocked those differ by everything.
+    cratonvm_vm::runtime::exec_sampler::report_at_exit();
+
     // The notification-credit census, on `CRATONVM_DBG=monitor-notify`.
     // `credits_consumed` is the engagement counter for the `Object.wait()`
     // lost-wakeup fix: a run with no stalls says nothing about whether the

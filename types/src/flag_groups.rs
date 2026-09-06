@@ -716,6 +716,12 @@ pub const INVENTORY: &[E] = &[
     // signal. `credits_consumed` is the engagement counter for the netty
     // lost-wakeup fix.
     E { group: Group::DBG, token: "monitor-notify", on_key: Some("CRATONVM_DBG_MONITOR_NOTIFY"), off_key: None, off_word: None, since: "2026-08-24" },
+    // The execution profiler (`runtime::exec_sampler`). A VALUE flag: the
+    // millisecond sampling interval, off when unset or 0. It exists because
+    // there was no way to ask this VM where a workload's time goes --
+    // `jdk.ExecutionSample` is defined in the JFR crate with no caller, and
+    // `wpr -start CPU` needs a privilege this host does not carry.
+    E { group: Group::DBG, token: "profile-sample-ms", on_key: Some("CRATONVM_PROFILE_SAMPLE_MS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "mic-method", on_key: Some("CRATONVM_DBG_MIC_METHOD"), off_key: None, off_word: None, since: "2026-08-11" },
     E { group: Group::DBG, token: "mark-why-class", on_key: Some("CRATONVM_DBG_MARK_WHY_CLASS"), off_key: None, off_word: None, since: "2026-08-10" },
     E { group: Group::DBG, token: "mirrorpin-why", on_key: Some("CRATONVM_DBG_MIRRORPIN_WHY"), off_key: None, off_word: None, since: "2026-08-10" },
@@ -1870,6 +1876,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "xt-helper-window-discharge", on_key: Some("CRATONVM_XT_HELPER_WINDOW_DISCHARGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-pinned-peer-depth", on_key: Some("CRATONVM_XT_PINNED_PEER_DEPTH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-pinned-peer-publish-only", on_key: Some("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY"), off_key: None, off_word: None, since: "2026-09-02" },
+    // Credit the pinned-peer depth even on a collector that cannot honour the
+    // pin. Default OFF, which is the corrected behaviour; setting it restores
+    // the ten-second H2 SIGSEGV, so the fix has a positive control rather than
+    // only an absence of crashes.
+    E { group: Group::JIT, token: "xt-pinned-peer-unpinnable", on_key: Some("CRATONVM_XT_PINNED_PEER_UNPINNABLE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "dbg-stale-frame-words", on_key: Some("CRATONVM_DBG_STALE_FRAME_WORDS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "pin-unnamed-frame-refs", on_key: Some("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS"), off_key: None, off_word: None, since: "2026-09-03" },

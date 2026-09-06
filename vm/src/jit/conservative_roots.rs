@@ -4398,7 +4398,7 @@ const fn peer_jit_frames_present(global_depth: usize, local_depth: usize) -> boo
 /// `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` restores the blanket refusal on the
 /// same binary, which is what makes this an A/B rather than a rebuild.
 /// Over-diverting costs compaction; under-diverting costs the heap.
-pub fn refresh_moving_young_coverage_for_collection() -> bool {
+pub fn refresh_moving_young_coverage_for_collection(pins_honoured: bool) -> bool {
     if !moving_young_enabled() {
         return true;
     }
@@ -4418,10 +4418,44 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
         //
         // `xt_cycle_pinned_jit_depth` applies the third condition itself: it
         // returns 0 if any pinned peer's depth was unknown.
-        let pinned = if xt_pinned_peer_depth_enabled()
-            && !xt_pinned_peer_publish_only()
-            && crate::jit::xt_root_scan::helper_windows_all_pinned_this_cycle()
-        {
+        //  - AND THE COLLECTOR ABOUT TO RUN HONOURS THE PIN. This one was
+        //    missing, and it is the difference between a discharge and a lie.
+        //
+        //    The credit says "this peer's frames need not be rewritable,
+        //    because the objects they name will not move". Only a collector
+        //    that can WITHHOLD an object makes that true. G1 withholds the
+        //    region and ZGC the page, and both consume
+        //    `gc_quiescence::pinned_jit_roots_snapshot()` to do it. The
+        //    generational young collector is Cheney copying: from-space is
+        //    reclaimed wholesale, so every live object in it moves by
+        //    construction, and `gen_heap.rs` and `gen_evac.rs` accordingly
+        //    contain no reader of that snapshot. The pinned addresses reach
+        //    that backend only as ROOTS -- which keeps them ALIVE, and says
+        //    nothing whatever about keeping them PUT.
+        //
+        //    So on the generational collector this credit discharged a peer's
+        //    coverage obligation against a pin nobody applied, the cycle
+        //    relocated, and the peer resumed with a stale reference in a
+        //    compiled frame. Reproducible in ten seconds on the H2 JDBC corpus
+        //    with `CRATONVM_GEN_UNCOMMIT=1` as the detector -- 3/3 SIGSEGV, and
+        //    0/3 with either half of this credit switched off
+        //    (`CRATONVM_XT_PINNED_PEER_DEPTH=0`,
+        //    `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1`). The accounting line
+        //    immediately before the fault was
+        //    `peer_depth=2 proven=0 pinned=2 accounted=true`; the run that did
+        //    not crash had `pinned=0 accounted=false`.
+        //
+        //    `CRATONVM_XT_PINNED_PEER_UNPINNABLE=1` restores the old behaviour
+        //    on the same binary, which is what makes this an A/B rather than a
+        //    rebuild -- and, on a collector that cannot pin, a way to reproduce
+        //    the defect deliberately.
+        let pinned = if pinned_credit_admissible(
+            xt_pinned_peer_depth_enabled(),
+            xt_pinned_peer_publish_only(),
+            pins_honoured,
+            xt_pinned_peer_credit_when_unpinnable(),
+            crate::jit::xt_root_scan::helper_windows_all_pinned_this_cycle(),
+        ) {
             cratonvm_gc::gc_quiescence::xt_cycle_pinned_jit_depth()
         } else {
             0
@@ -4432,7 +4466,8 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
         cratonvm_gc::gc_quiescence::note_peer_coverage_verdict(accounted);
         if xt_coverage_dbg() {
             eprintln!(
-                "[xt-coverage] peer_depth={peer_depth} proven={proven} pinned={pinned} accounted={accounted}"
+                "[xt-coverage] peer_depth={peer_depth} proven={proven} pinned={pinned} \
+pins_honoured={pins_honoured} accounted={accounted}"
             );
         }
         if !accounted {
@@ -4443,6 +4478,27 @@ pub fn refresh_moving_young_coverage_for_collection() -> bool {
         }
     }
     complete
+}
+
+/// May this cycle discharge a peer's coverage obligation by PINNING?
+///
+/// Split out for the same reason [`peer_coverage_accounted`] is: every input is
+/// a process-global read at the call site, so the RULE is untestable there and
+/// this is the part that has to be right.
+///
+/// `pins_honoured` is the condition that was missing until 2026-09-06, and it
+/// is the one that makes the other four mean anything — see the call site for
+/// the reproduction. `credit_when_unpinnable` is the deliberate override that
+/// re-opens the defect, so the fix has a positive control.
+#[inline]
+const fn pinned_credit_admissible(
+    enabled: bool,
+    publish_only: bool,
+    pins_honoured: bool,
+    credit_when_unpinnable: bool,
+    all_windows_pinned: bool,
+) -> bool {
+    enabled && !publish_only && (pins_honoured || credit_when_unpinnable) && all_windows_pinned
 }
 
 /// The handshake's acceptance test, split out so it is testable without racing
@@ -4518,6 +4574,20 @@ fn xt_coverage_dbg() -> bool {
 /// the blocked-region WAKE to remap JIT frames (it currently remaps only
 /// interpreter frames), which is a real change; this says whether it is worth
 /// making.
+/// `CRATONVM_XT_PINNED_PEER_UNPINNABLE=1` -- credit the pinned-peer depth even
+/// on a collector that cannot honour the pin.
+///
+/// Default OFF, which is the corrected behaviour. It exists because the defect
+/// this closes is invisible without it: with it set, the generational
+/// collector's ten-second H2 reproduction comes back, so the fix has a positive
+/// control rather than only an absence of crashes.
+fn xt_pinned_peer_credit_when_unpinnable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_XT_PINNED_PEER_UNPINNABLE").is_some()
+    })
+}
+
 fn xt_jit_coverage_assume() -> bool {
     cratonvm_types::flags::runtime_var_os("CRATONVM_XT_JIT_COVERAGE_ASSUME").is_some()
 }
@@ -9646,6 +9716,42 @@ mod tests {
         }
     }
 
+    /// **A PIN DOES NOT DISCHARGE COVERAGE ON A COLLECTOR THAT CANNOT PIN.**
+    ///
+    /// The cross-thread handshake lets a moving cycle proceed while a peer
+    /// holds compiled frames nobody proved rewritable, provided their
+    /// conservative roots were pinned instead. That is sound exactly when the
+    /// collector withholds a pinned object from relocation — G1 withholds the
+    /// region, ZGC the page — and the generational young collector cannot: it
+    /// is Cheney copying, from-space is reclaimed wholesale, and `gen_heap.rs`
+    /// contains no reader of `pinned_jit_roots_snapshot()` at all. The pinned
+    /// addresses reach it as ROOTS, which keeps them ALIVE and says nothing
+    /// about keeping them PUT.
+    ///
+    /// Until 2026-09-06 the credit was granted anyway, and the peer resumed
+    /// with a stale reference in a compiled frame: `-XX:+UseGenerationalGC`
+    /// over `org.h2.test.jdbc.TestPreparedStatement` SIGSEGV'd in ten seconds,
+    /// 5/5 with the credit and 0/5 without.
+    #[test]
+    fn a_pin_discharges_coverage_only_where_the_collector_honours_it() {
+        // The whole point: everything else says yes, and the collector says no.
+        assert!(
+            !pinned_credit_admissible(true, false, false, false, true),
+            "a pinned peer credited its depth on a collector that cannot \
+             withhold the object -- this is the defect"
+        );
+        // The same row on a collector that CAN pin is the behaviour being kept.
+        assert!(pinned_credit_admissible(true, false, true, false, true));
+        // The override re-opens it deliberately, which is what makes the fix
+        // testable by a positive control rather than by an absence of crashes.
+        assert!(pinned_credit_admissible(true, false, false, true, true));
+        // The three pre-existing conditions still each veto on their own, so
+        // this change added a term rather than replacing one.
+        assert!(!pinned_credit_admissible(false, false, true, false, true));
+        assert!(!pinned_credit_admissible(true, true, true, false, true));
+        assert!(!pinned_credit_admissible(true, false, true, false, false));
+    }
+
     /// With moving-young explicitly opted out, the collection-authoritative
     /// refresh is a no-op that reports "proven" — the coverage machinery must
     /// not impose cost or verdicts on the compatibility path.
@@ -9654,7 +9760,7 @@ mod tests {
         if moving_young_enabled() {
             return; // validating a moving-young build; nothing to assert here
         }
-        assert!(refresh_moving_young_coverage_for_collection());
+        assert!(refresh_moving_young_coverage_for_collection(false));
         assert!(refresh_moving_young_coverage_for_current_thread());
     }
 
