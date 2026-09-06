@@ -1408,7 +1408,8 @@ fn register_aifu(r: &mut NativeMethodRegistry) {
         native_aifu_decrement_and_get,
     );
     // getAndIncrement / getAndDecrement / addAndGet on both impl + base.
-    for cls in [CLS_INT_FIELD_UPDATER_IMPL] {
+    {
+        let cls = CLS_INT_FIELD_UPDATER_IMPL;
         r.register(
             cls,
             "getAndIncrement",
@@ -1523,7 +1524,8 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
     // decrementAndGet on both impl + base. (incrementAndGet/decrementAndGet
     // were previously missing — kotlinx.coroutines' CoroutineScheduler calls
     // incrementAndGet(Object)J, which ABENDed the VM with NoSuchMethodError.)
-    for cls in [CLS_LONG_FIELD_UPDATER_IMPL] {
+    {
+        let cls = CLS_LONG_FIELD_UPDATER_IMPL;
         r.register(
             cls,
             "getAndIncrement",

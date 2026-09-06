@@ -10332,7 +10332,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             // frame `inForkJoinPool()`/`getPool()` read. The closure is what
             // gives the frame exactly one exit path, `?` included.
             let frame = fjp_pool_frame_enter(ctx, args);
-            let out = (|| -> MethodCallResult {
+            let out = {
                 // `ForkJoinPool.invoke(task)` DOES rethrow the task's
                 // exception, as a same-class copy — see
                 // `fjp_pool_invoke_exception`.
@@ -10345,7 +10345,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                     }
                     Err(internal) => Err(internal),
                 }
-            })();
+            };
             fjp_pool_frame_leave(ctx, frame);
             out
         },
@@ -10371,7 +10371,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 let (done, _) = fjp_state_get(task);
                 if !done {
                     let frame = fjp_pool_frame_enter(ctx, args);
-                    let out = (|| fjp_compute_for_submit(ctx, task))();
+                    let out = fjp_compute_for_submit(ctx, task);
                     fjp_pool_frame_leave(ctx, frame);
                     task = out?;
                 }
@@ -10406,7 +10406,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             // task done with a null result, so `Future.get()` reported
             // success for a callable that had blown up.
             let frame = fjp_pool_frame_enter(ctx, args);
-            let out = (|| fjp_run_callable_as_task(ctx, callable))();
+            let out = fjp_run_callable_as_task(ctx, callable);
             fjp_pool_frame_leave(ctx, frame);
             Ok(Some(Value::Object(Some(out?))))
         },
@@ -10422,7 +10422,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let frame = fjp_pool_frame_enter(ctx, args);
-            let out = (|| fjp_run_runnable_as_task(ctx, runnable, Value::Object(None)))();
+            let out = fjp_run_runnable_as_task(ctx, runnable, Value::Object(None));
             fjp_pool_frame_leave(ctx, frame);
             Ok(Some(Value::Object(Some(out?))))
         },
@@ -10439,7 +10439,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             };
             let fixed_result = args.get(2).copied().unwrap_or(Value::Object(None));
             let frame = fjp_pool_frame_enter(ctx, args);
-            let out = (|| fjp_run_runnable_as_task(ctx, runnable, fixed_result))();
+            let out = fjp_run_runnable_as_task(ctx, runnable, fixed_result);
             fjp_pool_frame_leave(ctx, frame);
             Ok(Some(Value::Object(Some(out?))))
         },
@@ -13795,7 +13795,6 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
@@ -14068,7 +14067,6 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -20490,7 +20488,6 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         });
     }
     r.set_category(__prev_cat);
-    ()
 }
 
 // ---------------------------------------------------------------------------

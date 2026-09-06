@@ -1717,6 +1717,17 @@ pub struct ZgcRealHeap {
 unsafe impl Send for ZgcRealHeap {}
 unsafe impl Sync for ZgcRealHeap {}
 
+/// Kill switch for the latched publish in [`ZgcRealHeap::new_shared`]
+/// (`CRATONVM_ZGC_TLAB_FLAG_PUBLISH_FALSE=1`). With it set, constructing a heap
+/// without VM TLABs publishes `false` again, exactly as before 2026-09-06 --
+/// which is what makes the change measurable inside one binary.
+fn zgc_tlab_flag_publish_false() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB_FLAG_PUBLISH_FALSE").is_some()
+    })
+}
+
 impl ZgcRealHeap {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -2150,7 +2161,37 @@ impl ZgcRealHeap {
         // keep calling the post-init helper that announces each one. Set
         // before any method can be compiled: heap construction precedes the
         // first compile. See `cratonvm_types::jit_tlab_registration_required`.
-        cratonvm_types::set_jit_tlab_registration_required(heap.vm_tlab_enabled());
+        //
+        // PUBLISH `true`, NEVER `false` (2026-09-06). This was
+        // `set_jit_tlab_registration_required(heap.vm_tlab_enabled())`, and the
+        // `false` half of that is dead in the ordinary case and harmful in the
+        // rest: the flag starts `false`, so a heap without VM TLABs publishing
+        // `false` changes nothing -- while a SECOND heap built later publishes
+        // over the FIRST one's `true` and switches announcing off for a heap
+        // that is still handing out TLABs. `libcratonvm` / `cratonvm-embed`
+        // allow more than one VM per process, which is where that ordering is
+        // reachable, and the failure it produces is the one this flag exists to
+        // prevent: an inline-allocated object the registry was never told
+        // about, decoding as `null` at the next native boundary.
+        //
+        // The flag is fail-safe upward -- a spurious `true` costs one helper
+        // call per inline allocation, a wrong `false` costs an object -- so a
+        // latch is the direction to be wrong in.
+        //
+        // Its shadow was a test flake: `a_shared_heap_tells_the_jit_that_tlab_
+        // objects_must_be_announced` sets the flag `false`, builds a
+        // TLAB-enabled heap and asserts the flag came back `true`, and any
+        // concurrently-running test constructing an ordinary shared heap
+        // published `false` into that window. Measured at 2 failures in 500
+        // runs of `zgc::vm_tlab` alone at `--test-threads=8`.
+        // `CRATONVM_ZGC_TLAB_FLAG_PUBLISH_FALSE=1` restores the old
+        // unconditional publish, so the before/after is a re-run of ONE binary
+        // rather than a comparison of two.
+        if heap.vm_tlab_enabled() {
+            cratonvm_types::set_jit_tlab_registration_required(true);
+        } else if zgc_tlab_flag_publish_false() {
+            cratonvm_types::set_jit_tlab_registration_required(false);
+        }
         heap
     }
 

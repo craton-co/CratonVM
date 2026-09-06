@@ -2003,7 +2003,6 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 3)))
     });
     r.set_category(__prev_cat);
-    ()
 }
 
 pub(crate) fn p62_alloc_char_buffer(

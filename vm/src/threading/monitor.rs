@@ -4567,7 +4567,6 @@ mod tests {
     /// `wait`/`notify` round-trip across two threads, driven entirely through
     /// the mark word (the object is already inflated before either thread
     /// starts, so no inflation happens on either side).
-    #[test]
     /// A NOTIFICATION SURVIVES A CONDVAR SIGNAL THAT IS NEVER OBSERVED.
     ///
     /// This is the invariant the netty `ParameterizedSslHandlerTest` stall cost

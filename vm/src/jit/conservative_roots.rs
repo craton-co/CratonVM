@@ -3747,10 +3747,7 @@ fn band_has_unpublished_young_word(
     // point in the method; without it there is no liveness question to ask.
     let sp_id = active_safepoint_id(rbp, cm);
     let ask = sp_id.map(|bci| move |off: i32| verifier_local_verdict(cm, off, bci));
-    let ask_ref: Option<&dyn Fn(i32) -> VerifierSlotVerdict> = match ask {
-        Some(ref f) => Some(f),
-        None => None,
-    };
+    let ask_ref: Option<&dyn Fn(i32) -> VerifierSlotVerdict> = ask.as_ref().map(|x| x as _);
     band_has_unpublished_word_with_map(
         rbp,
         frame_size,
@@ -10298,7 +10295,6 @@ mod tests {
     /// only, while the frame also carries scalar-replacement field slots, LICM
     /// hoist slots and the blind full-GPR safepoint spill area. The band scan
     /// is what closes that gap, so it must FAIL when such a word is present.
-    #[test]
     /// A movable word in a DEAD java-local slot is not a root, and must not
     /// refuse the collection.
     ///

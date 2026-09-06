@@ -2020,6 +2020,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-bitmap-sweep", on_key: Some("CRATONVM_ZGC_BITMAP_SWEEP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-mark-root-filter", on_key: Some("CRATONVM_ZGC_MARK_ROOT_FILTER"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-jit-tlab", on_key: Some("CRATONVM_ZGC_JIT_TLAB"), off_key: None, off_word: None, since: "2026-09-02" },
+    E { group: Group::GC, token: "tlab-flag-publish-false", on_key: Some("CRATONVM_ZGC_TLAB_FLAG_PUBLISH_FALSE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "zgc-tlab-tail-sink", on_key: Some("CRATONVM_ZGC_TLAB_TAIL_SINK"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "zgc-mark-pool-persistent", on_key: Some("CRATONVM_ZGC_MARK_POOL_PERSISTENT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::GC, token: "g1-reserve-heap", on_key: Some("CRATONVM_G1_RESERVE_HEAP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
@@ -2066,6 +2067,13 @@ pub const INVENTORY: &[E] = &[
     // DISPATCHER could actually launch. The control arm for that
     // narrowing; see `offload_jit_gate::target_can_ever_dispatch`.
     E { group: Group::GC, token: "gpu-jit-gate-dispatchable", on_key: Some("CRATONVM_GPU_JIT_GATE_DISPATCHABLE"), off_key: None, off_word: None, since: "2026-09-04" },
+    // `=0` restores the pre-2026-09-06 compiled site memo: a site whose
+    // target is not in the offload registry the first time it executes is
+    // written off as NotKernel forever, instead of asking the gate once the
+    // class exists. The CONTROL ARM for the forward-reference fix -- with it
+    // off, `GpuForwardRef forward` goes dark and `GpuForwardRef preload` does
+    // not, on one binary. See `offload_jit_gate`'s module docs.
+    E { group: Group::GC, token: "gpu-jit-gate-late-register", on_key: Some("CRATONVM_GPU_JIT_GATE_LATE_REGISTER"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     // `=0` drops the caller-blocking half of `offload_jit_gate`: a caller
     // of an eligible kernel compiles, and offload silently ends there.
     // A CONTROL ARM, not a production setting -- it isolates the cost of

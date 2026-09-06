@@ -1227,7 +1227,7 @@ fn identity_time_converter(scope: &mut NativeHandleScope<'_>) -> Option<ObjectRe
     scope.set_field_by_name(converter, "zoneOffset", Value::Object(Some(utc)));
     // Read the one field whose absence would be silent and catastrophic.
     match scope.get_field_by_name(converter, "divisor") {
-        Value::Double(divisor) if divisor == 1.0 => Some(converter),
+        Value::Double(1.0) => Some(converter),
         other => {
             tracing::warn!(
                 ?other,

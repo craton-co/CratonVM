@@ -74,8 +74,8 @@ jobs:
   #
   # Inherited hunks are COUNTED AND PRINTED, not dropped: the debt stays visible
   # in every run, it just stops being charged to whoever touched the file next.
-  # docs/known-issues/the-fmt-ci-job-is-red-on-half-of-all-pushes-20260906.md
-  # has the census and the options for paying it down.
+  # `the-fmt-ci-job-was-red-on-half-of-all-pushes-RESOLVED-20260906.md` (in
+  # the internal tree) has the census and the options for paying it down.
   fmt:
     name: Formatting (changed lines)
     runs-on: ubuntu-latest

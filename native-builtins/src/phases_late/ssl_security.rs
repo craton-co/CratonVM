@@ -7740,7 +7740,6 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    ()
 }
 
 /// Allocate a fresh SSLEngine with default field values.
@@ -8656,7 +8655,13 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                     let serial_dec = u128::from_str_radix(&serial_hex, 16)
                         .map(|v| v.to_string())
                         .unwrap_or_else(|_| "0".to_string());
-                    let bi = bi_alloc(ctx, &serial_dec);
+                    // `?`, because `bi_alloc` is fallible: it allocates a
+                    // `BigInteger` and its `mag:[I`, either of which can fail.
+                    // Without it the `Result` itself went into `Value::Object`,
+                    // which is `E0308` — this arm is behind
+                    // `legacy-synthetic-crypto` and nothing that builds by
+                    // default compiles it.
+                    let bi = bi_alloc(ctx, &serial_dec)?;
                     return Ok(Some(Value::Object(Some(bi))));
                 }
             }
@@ -8880,7 +8885,6 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
     r.set_category(__prev_cat);
-    ()
 }
 
 // =============================================================================
