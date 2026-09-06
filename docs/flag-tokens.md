@@ -963,7 +963,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-153 tokens.
+154 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1012,6 +1012,7 @@ export inherited from a parent shell.
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |
 | `g1-parallel-evac-in-jit` | `CRATONVM_G1_PARALLEL_EVAC_IN_JIT` |
+| `g1-parallel-evac-screen` | `CRATONVM_G1_PARALLEL_EVAC_SCREEN` |
 | `g1-cleanup-walk` | `CRATONVM_G1_CLEANUP_WALK` |
 | `g1-adaptive-ihop` | `CRATONVM_G1_ADAPTIVE_IHOP` |
 | `g1-adaptive-tenuring` | `CRATONVM_G1_ADAPTIVE_TENURING` |
@@ -1159,7 +1160,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_LOADER`
 
-16 tokens.
+17 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1170,6 +1171,7 @@ export inherited from a parent shell.
 | `cf-delegating-yield` | `CRATONVM_CF_DELEGATING_YIELD` |
 | `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
 | `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
+| `classpath-jar-unnamed-module` | `CRATONVM_CLASSPATH_JAR_UNNAMED_MODULE` |
 | `cl-bootstrap-scoped` | `CRATONVM_CL_BOOTSTRAP_SCOPED` |
 | `fwd-resolve-strict` | `CRATONVM_FWD_RESOLVE_STRICT` |
 | `jar-mmap` | `CRATONVM_DISABLE_JAR_MMAP` |
