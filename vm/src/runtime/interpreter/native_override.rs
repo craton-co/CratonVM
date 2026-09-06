@@ -5448,6 +5448,7 @@ pub(super) fn redefine_immune_layout_native(
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
         || redefine_immune_synthetic_collection_native(class_name)
         || redefine_immune_thread_local_native(class_name)
+        || redefine_immune_zip_file_native(class_name, method_name)
 }
 
 pub(super) fn redefine_immune_string_builder_native(
@@ -5564,6 +5565,75 @@ pub(crate) fn is_datagram_channel_open_native_override(
                 && method_name == "openDatagramChannel"))
 }
 
+/// `ZipFile`/`JarFile` archives live in a Rust handle table, not in the JDK's
+/// `res`/`zsrc` field graph.
+///
+/// CratonVM serves the operations listed below from registered natives whose
+/// state is a `jar_table()` entry keyed by a handle stashed on the object
+/// (`native-io/src/zip_real_jar.rs`). The real `java.util.zip.ZipFile` body
+/// reads `this.res.zsrc` -- a `CleanableResource` those natives never
+/// populate -- so it can only ever NPE, for every archive the process has
+/// opened. Exactly the shape of the synthetic-collection and `ThreadLocal`
+/// arms above, and exactly the same trigger: Mockito's inline mock maker
+/// instruments its target's whole superclass chain, so `spy()` of ANY
+/// `JarFile` subclass retransforms `java.util.jar.JarFile` and
+/// `java.util.zip.ZipFile` themselves, the suppress-native-shadow-on-redefine
+/// rule fires, and the next `getInputStream` on ANY jar in the process runs
+/// the real body against an instance that has no `res`.
+///
+/// Found by Spring Boot's `JarUrlConnectionTests`: 46 of its 47 tests pass,
+/// and the 47th fails only when it runs after
+/// `getInputStreamWhenNoCachedClosesJarFileOnClose`, the one test in the class
+/// that calls `spy(jarFile)`:
+///
+/// ```text
+/// java.lang.NullPointerException: Cannot read field "zsrc" because "<local3>.res" is null
+///     at java.util.zip.ZipFile.getInputStream(ZipFile.java:327)
+///     at java.util.jar.JarFile.getInputStream(JarFile.java:834)
+/// ```
+///
+/// Method-wise rather than class-wide, and deliberately keyed to the SAME
+/// method sets the two force-native gates already use (the `java/util/zip/
+/// ZipFile` arm in this file's warm-cache policy and the `java/util/jar/
+/// JarFile` arm in the cold-path twin). That is the principled boundary: a
+/// method is forced to its native because the instance lacks the JDK field
+/// graph it needs, and a redefinition cannot conjure that field graph -- so
+/// every force-native method here is immune, and nothing else is. A `JarFile`
+/// method NOT on that list is ordinary bytecode and stays evictable, so an
+/// agent can still weave it.
+pub(super) fn redefine_immune_zip_file_native(class_name: &str, method_name: &str) -> bool {
+    match class_name {
+        "java/util/zip/ZipFile" => matches!(
+            method_name,
+            "<init>"
+                | "getEntry"
+                | "getInputStream"
+                | "entries"
+                | "stream"
+                | "getComment"
+                | "close"
+                | "getName"
+                | "isMultiRelease"
+                | "size"
+        ),
+        "java/util/jar/JarFile" => matches!(
+            method_name,
+            "<init>"
+                | "getManifest"
+                | "getManifestFromReference"
+                | "stream"
+                | "entries"
+                | "getEntry"
+                | "getJarEntry"
+                | "getInputStream"
+                | "size"
+                | "close"
+                | "getName"
+        ),
+        _ => false,
+    }
+}
+
 /// The full immunity set, for the slow dispatch path.
 ///
 /// The invoke-cache sites deliberately use the narrower
@@ -5603,6 +5673,7 @@ pub(crate) fn redefine_immune_forced_native(
             ))
         || redefine_immune_synthetic_collection_native(class_name)
         || redefine_immune_thread_local_native(class_name)
+        || redefine_immune_zip_file_native(class_name, method_name)
 }
 
 /// CratonVM implements these collections as small synthetic objects — a bucket
@@ -8855,6 +8926,80 @@ mod redefine_immunity_tests {
         }
     }
 
+    /// Every operation CratonVM forces to its `ZipFile`/`JarFile` native must
+    /// survive a redefinition of those two classes, on BOTH aggregators. One
+    /// `spy()` of a `JarFile` subclass retransforms the whole chain, and the
+    /// real bodies read a `res`/`zsrc` field graph no CratonVM archive has.
+    #[test]
+    fn zip_and_jar_layout_natives_survive_a_redefinition() {
+        for name in [
+            "<init>",
+            "getEntry",
+            "getInputStream",
+            "entries",
+            "stream",
+            "getComment",
+            "close",
+            "getName",
+            "isMultiRelease",
+            "size",
+        ] {
+            assert!(
+                redefine_immune_forced_native("java/util/zip/ZipFile", name, "()V"),
+                "java/util/zip/ZipFile.{name} must survive a redefinition"
+            );
+            assert!(
+                super::redefine_immune_layout_native("java/util/zip/ZipFile", name, "()V"),
+                "java/util/zip/ZipFile.{name} must be immune on the invoke-cache path too"
+            );
+        }
+        for name in [
+            "<init>",
+            "getManifest",
+            "getManifestFromReference",
+            "stream",
+            "entries",
+            "getEntry",
+            "getJarEntry",
+            "getInputStream",
+            "size",
+            "close",
+            "getName",
+        ] {
+            assert!(
+                redefine_immune_forced_native("java/util/jar/JarFile", name, "()V"),
+                "java/util/jar/JarFile.{name} must survive a redefinition"
+            );
+            assert!(
+                super::redefine_immune_layout_native("java/util/jar/JarFile", name, "()V"),
+                "java/util/jar/JarFile.{name} must be immune on the invoke-cache path too"
+            );
+        }
+    }
+
+    /// The immunity is method-wise, and its boundary is the force-native list:
+    /// an operation CratonVM does NOT claim is ordinary bytecode and must stay
+    /// evictable, or an agent could never weave it. A `JarFile` SUBCLASS is
+    /// ordinary throughout -- its own bodies are its own bytecode, and
+    /// `NestedJarFile.getInputStream` is exactly such an override.
+    #[test]
+    fn leaves_unclaimed_zip_operations_evictable() {
+        for (class, name) in [
+            ("java/util/jar/JarFile", "getVersion"),
+            ("java/util/jar/JarFile", "isSigned"),
+            ("java/util/zip/ZipFile", "getComment2"),
+            (
+                "org/springframework/boot/loader/jar/NestedJarFile",
+                "getInputStream",
+            ),
+        ] {
+            assert!(
+                !redefine_immune_forced_native(class, name, "()V"),
+                "{class}.{name} must stay evictable"
+            );
+        }
+    }
+
     /// The two aggregators are consulted by different dispatch paths — the
     /// invoke-cache sites use `redefine_immune_layout_native`, everything else
     /// `redefine_immune_forced_native`. An arm added to one only is the failure
@@ -9062,6 +9207,7 @@ mod redefine_immunity_tests {
                     "redefine_immune_jfr_native(",
                     "redefine_immune_synthetic_collection_native(",
                     "redefine_immune_thread_local_native(",
+                    "redefine_immune_zip_file_native(",
                 ] {
                     // An arm's own `fn` declaration is not a call site.
                     if code.contains(part) && !code.contains(&format!("fn {part}")) {

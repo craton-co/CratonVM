@@ -11,11 +11,20 @@ the first exception line. This page exists so the 12 items aren't lost, not
 because any one of them is understood yet — treat every "likely" below as a
 guess, not a verdict.
 
-Excluded from this page (already have their own docs from the same triage):
-the `PublicSuffixList` classloader-identity cluster (4 classes), the
-`JarUrlConnectionTests`/`NestedUrlConnectionTests` NPE pair, and the 3
-`BOTH-FAIL` classes already confirmed not-CratonVM-bugs (fail identically on
-HotSpot).
+Excluded from this page: the `PublicSuffixList` classloader-identity cluster
+(4 classes) and the `JarUrlConnectionTests`/`NestedUrlConnectionTests` NPE
+pair -- both **FIXED 2026-09-05** and retired to the internal tree as the
+`publicsuffixlist-forked-classpath-jit-checkcast-loader-duplication-FIXED-20260905`
+and `loader-jar-nested-url-connection-npe-pair-FIXED-20260905` write-ups; and
+the 3 `BOTH-FAIL` classes already confirmed not-CratonVM-bugs (fail identically
+on HotSpot).
+
+Two of the fixes those retired pages carry are process-wide, so a row below
+that was recorded on the 2026-09-04/05 binary may no longer reproduce:
+`java.util.zip.ZipFile`/`java.util.jar.JarFile` natives are now immune to the
+redefinition any `spy()`/inline `mock()` of a `JarFile` performs, and the
+compiled `checkcast` no longer refuses two loader copies of one class name.
+**Re-run a row before investigating it.**
 
 ## Likely one shared cause: missing test infrastructure (4 classes)
 

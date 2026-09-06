@@ -10810,6 +10810,51 @@ unsafe fn jit_typecheck_resolve(
             ) {
                 return true;
             }
+            // Loader-duplication fallback -- the TWIN of the one at the bottom
+            // of this function, which this branch's early `return false` was
+            // hiding from every site that had an id to record.
+            //
+            // The interpreter accepts a same-named class from another loader:
+            // `op_checkcast`/`op_instanceof` both end their assignability
+            // chain in `loader_aware_name_assignable`, and
+            // `CRATONVM_LOADER_AWARE_RESOLUTION` defaults ON. So refusing here
+            // is not "stricter", it is a JIT/interpreter DIVERGENCE -- the same
+            // one the by-name fallback below was already written to close for
+            // `SpringBootContextLoaderAotTests` (Residual 6). That fix landed
+            // on the by-name path only, and a site whose target class WAS
+            // loaded at compile time never reaches it.
+            //
+            // Spring Boot's forked-classpath tests are where the gap shows.
+            // `ModifiedClassPathClassLoader` re-defines a framework jar's
+            // classes in a child loader, and CratonVM's flat store can hand
+            // one CONSTANT_Class reference the app copy while the compiler
+            // resolved this site to the child copy through the compiling
+            // class's own loader. Under `-Jit on` that surfaced as
+            //
+            //   ClassCastException: class org.apache.hc.client5.http.psl.PublicSuffixList
+            //     cannot be cast to class org.apache.hc.client5.http.psl.PublicSuffixList
+            //
+            // out of `PublicSuffixMatcher.<init>`, in four Spring Boot classes
+            // that all pass under `--nojit`. `[DBG_TYPECHECK]` named it
+            // exactly: `recv=(id=3125 loader=Application)` against
+            // `resolved_target=(id=3126 loader=UserDefined(3))`, same binary
+            // name on both sides.
+            if vm
+                .classes
+                .class_manager
+                .read()
+                .is_assignable_to_name(obj_class_id, class_name)
+            {
+                jit_typecheck_trace(
+                    vm,
+                    obj_class_id,
+                    class_name,
+                    lenient,
+                    "recorded-site-loader-duplication-by-name",
+                    Some(target_class_id),
+                );
+                return true;
+            }
             jit_typecheck_trace(
                 vm,
                 obj_class_id,

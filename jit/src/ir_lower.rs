@@ -900,6 +900,24 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+
+    /// `gp_reg_owner[r]` = the node whose value physically occupies GP
+    /// register `r` right now, as emission walks the body.
+    ///
+    /// `gp_reg_live` alone cannot answer that. The residency plan hands ONE
+    /// physical register to any number of values whose ranges do not overlap
+    /// (`plan_slots` only demotes a pair whose ranges DO overlap), so
+    /// `gp_reg_of` is a many-to-one map -- and `gp_reg_live` was set at each
+    /// value's publish and never cleared. Once two values shared a register,
+    /// both read back as "resident in it" forever, and the second one's
+    /// publish silently made the first one's `resident_gpr` a lie.
+    ///
+    /// Every write to a GP register goes through `mark_gp_reg_live`, so
+    /// evicting the previous owner there is enough to keep the invariant
+    /// `resident_gpr` actually needs: *this node is the CURRENT occupant of
+    /// its register*. Sixteen entries because `IR_LOWER_LS_GPRS` is a subset
+    /// of the sixteen 64-bit GPRs.
+    gp_reg_owner: [Option<NodeId>; 16],
     /// Edge copies that read their source out of a register, and edge copies
     /// that published their phi's register from RAX. Both are ENGAGEMENT
     /// counts: a zero says the wiring never fired, which is a different
@@ -1458,6 +1476,7 @@ impl<'a> Lowerer<'a> {
             reg_of: Vec::new(),
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
+            gp_reg_owner: [None; 16],
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
@@ -1505,6 +1524,7 @@ impl<'a> Lowerer<'a> {
         self.reg_of = residency.reg_of;
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
         self.gp_reg_of = residency.gp_reg_of;
+        self.gp_reg_owner = [None; 16];
         // Exclusive ownership, computed once: how many values share each
         // register, and a value is nameable only if the answer for its own is
         // one. See the field comment for why "resident" is not enough.
@@ -1782,8 +1802,35 @@ impl<'a> Lowerer<'a> {
         self.gp_reg_of.get(id as usize).copied().flatten()
     }
 
-    /// Mark `id` readable from its assigned GP register.
+    /// Mark `id` readable from its assigned GP register, and EVICT whatever
+    /// value was in that register before.
+    ///
+    /// The eviction is the whole point. `gp_reg_of` is many-to-one -- the
+    /// allocator reuses one register across values whose ranges do not
+    /// overlap -- so writing `id` into register `r` is exactly the instant the
+    /// previous occupant of `r` stops being readable from it. Without this,
+    /// `gp_reg_live` was monotone and `resident_gpr` kept answering with a
+    /// register another value had since taken over.
+    ///
+    /// Landed with the `PHI_COPY_REGS` reproducer (Byte Buddy's
+    /// `net/bytebuddy/jar/asm/Label.resolve` and `ClassReader.readCode`,
+    /// through Spring Boot's `NestedUrlConnectionTests`): the phi-copy edge
+    /// read is the first reader that asks about a value far from its own
+    /// definition, which is where a stale answer becomes wrong code rather
+    /// than a missed optimisation.
     fn mark_gp_reg_live(&mut self, id: NodeId) {
+        if let Some(reg) = self.gp_reg_of.get(id as usize).copied().flatten() {
+            if let Some(slot) = self.gp_reg_owner.get_mut(reg as usize) {
+                let prev = slot.replace(id);
+                if let Some(prev) = prev {
+                    if prev != id {
+                        if let Some(cell) = self.gp_reg_live.get_mut(prev as usize) {
+                            *cell = false;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(cell) = self.gp_reg_live.get_mut(id as usize) {
             *cell = true;
         }
@@ -22189,6 +22236,70 @@ mod tests {
             peak_live: 0,
         });
         lo
+    }
+
+    /// Two values sharing one physical register: publishing the second must
+    /// EVICT the first, or `resident_gpr` keeps naming a register that no
+    /// longer holds it.
+    ///
+    /// The residency plan is allowed to hand one register to any number of
+    /// values whose ranges do not overlap, so this is not a hypothetical: it
+    /// is the ordinary output of the allocator. Before `gp_reg_owner` existed,
+    /// `gp_reg_live` was set at every publish and cleared nowhere, so the
+    /// assertion below read `Some(RBX)` for BOTH nodes -- and the phi-copy
+    /// edge read, which asks about a value far from its own definition, turned
+    /// that stale answer into wrong code (Byte Buddy's ASM writer, through
+    /// Spring Boot's `NestedUrlConnectionTests`).
+    ///
+    /// Asserted on `resident_gpr`, not on `gp_reg_live`, because the predicate
+    /// is what every reader actually calls.
+    #[test]
+    fn publishing_into_a_shared_register_evicts_its_previous_owner() {
+        const RBX: u8 = 3;
+        let mut lo = lowerer_with_resident_gpr(16384, RBX);
+        // A second node in the SAME register — what a non-overlapping pair
+        // looks like coming out of the allocator.
+        if lo.gp_reg_of.len() < 2 {
+            lo.gp_reg_of.resize(2, None);
+            lo.gp_reg_live.resize(2, false);
+        }
+        lo.gp_reg_of[1] = Some(RBX);
+
+        lo.mark_gp_reg_live(0);
+        assert_eq!(lo.resident_gpr(0), Some(RBX), "node 0 published into RBX");
+        assert_eq!(lo.resident_gpr(1), None, "node 1 has not published yet");
+
+        lo.mark_gp_reg_live(1);
+        assert_eq!(lo.resident_gpr(1), Some(RBX), "node 1 now occupies RBX");
+        assert_eq!(
+            lo.resident_gpr(0),
+            None,
+            "node 0 must NOT still claim RBX: node 1's publish overwrote it"
+        );
+
+        // Re-publishing the current occupant is idempotent, not self-eviction.
+        lo.mark_gp_reg_live(1);
+        assert_eq!(lo.resident_gpr(1), Some(RBX));
+    }
+
+    /// The eviction is per REGISTER, not global: a value in a different
+    /// register is untouched by someone else's publish. Without this the
+    /// "fix" could pass the test above by simply clearing everything.
+    #[test]
+    fn publishing_does_not_evict_a_value_in_a_different_register() {
+        const RBX: u8 = 3;
+        const R12: u8 = 12;
+        let mut lo = lowerer_with_resident_gpr(16384, RBX);
+        if lo.gp_reg_of.len() < 2 {
+            lo.gp_reg_of.resize(2, None);
+            lo.gp_reg_live.resize(2, false);
+        }
+        lo.gp_reg_of[1] = Some(R12);
+
+        lo.mark_gp_reg_live(0);
+        lo.mark_gp_reg_live(1);
+        assert_eq!(lo.resident_gpr(0), Some(RBX));
+        assert_eq!(lo.resident_gpr(1), Some(R12));
     }
 
     /// The end-to-end one: a value that exists ONLY in a register at the trap
