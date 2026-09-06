@@ -86,6 +86,100 @@ use std::sync::Arc;
 pub static COMPACT_OOP_MAP_MISSING: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Invariant: a published TLAB skip span holds NO ROOT
+// ---------------------------------------------------------------------------
+
+/// Roots found pointing INTO a published TLAB skip span, across every backend.
+///
+/// A skip span is by contract the still-RESERVED, **un-allocated** tail
+/// `[cursor, end)` of some thread's TLAB, so any non-zero reading is a stale
+/// span hiding a live object. See [`skip_spans_hold_no_root`].
+pub static SKIP_SPAN_ROOT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded report counter for [`SKIP_SPAN_ROOT_VIOLATIONS`].
+static SKIP_SPAN_ROOT_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// A ROOT pointing into a published TLAB skip span **disproves the span**.
+///
+/// A skip span is the still-reserved, un-allocated tail of a thread's TLAB.
+/// The non-moving sweeps' linear walks resync past it so an un-retired tail
+/// cannot desync them (BUG-03), and `mark_young`'s anchor oracle builds its
+/// `verified_spans` from the same list -- so an address inside one is answered
+/// "free/gap space, not an object" and a root pointing there is dropped
+/// without marking. That is sound exactly while the span really is
+/// unallocated, and catastrophic the moment it is not: the object is neither
+/// scanned nor swept, so it survives while everything it references is freed
+/// underneath it.
+///
+/// `roots` is the exact set the mark phase is about to be given, so the
+/// question is decidable at the top of a collection, cheaply (the skip list
+/// has at most one entry per live thread), and unconditionally -- which is the
+/// point. The defect this exists for hid behind an `AbstractMethodError` in
+/// netty's `ObjectCleanerTest` and took a full session to reach, because
+/// nothing in either sweep said the span was wrong: it was published by an
+/// earlier collection, its owner then bump-allocated into it, and a later
+/// collection declined to overwrite it (see the unconditional publish in
+/// `vm::runtime::interpreter::gc_and_alloc`, which is the repair).
+///
+/// **Reports, never repairs.** Dropping the span here would put the walk back
+/// on bytes that may genuinely be an un-retired tail -- the desync skipping
+/// was introduced to prevent -- and this check cannot tell a stale span from a
+/// live one, only that THIS one is stale. The publish side establishes the
+/// invariant; this is where it is checked.
+///
+/// ONE function for both backends deliberately. The first cut lived in
+/// `gen_heap.rs` alone, which is why the G1 arm of the original A/B reported
+/// `guard_fired=0/8` on runs that were failing 8/8 -- a check present in one
+/// sweep and absent from the other reads as "the collector is fine here", and
+/// that is the reading a second copy would eventually drift into.
+///
+/// `spans` are ABSOLUTE `[start, end)` address pairs; a caller holding offsets
+/// (the generational sweep does) converts before calling.
+pub(crate) fn skip_spans_hold_no_root(
+    spans: &[(usize, usize)],
+    roots: &[ObjectRef],
+    backend: &'static str,
+) {
+    if spans.is_empty() || roots.is_empty() {
+        return;
+    }
+    let mut violations = 0usize;
+    let mut first: Option<(usize, usize, usize)> = None;
+    for r in roots {
+        let a = r.as_ptr() as usize;
+        for &(start, end) in spans {
+            if a >= start && a < end {
+                violations += 1;
+                if first.is_none() {
+                    first = Some((a, start, end - start));
+                }
+            }
+        }
+    }
+    if violations == 0 {
+        return;
+    }
+    SKIP_SPAN_ROOT_VIOLATIONS.fetch_add(violations as u64, Ordering::Relaxed);
+    let n = SKIP_SPAN_ROOT_REPORTS.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        let (root, span, sz) = first.unwrap_or((0, 0, 0));
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            backend,
+            roots_in_spans = violations,
+            root = format!("{root:#x}"),
+            span = format!("{span:#x}+{sz:#x}"),
+            spans = spans.len(),
+            "a ROOT points into a published TLAB skip span, which is supposed to be the \
+             un-allocated tail of a reserved TLAB. The span is therefore stale: its owner \
+             allocated into it after it was published. Every walk in this collection skips \
+             it and the mark oracle calls it gap space, so the object the root names is \
+             neither marked nor swept while everything it references is freed.",
+        );
+    }
+}
+
 #[inline]
 pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayout>, usize)> {
     if !is_compact_object(header) {

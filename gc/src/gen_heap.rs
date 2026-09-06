@@ -4416,6 +4416,24 @@ impl GenerationalHeap {
     /// reclaimed), whereas the desync it prevents frees live memory. The
     /// `debug_assert!` records the invariant the callers rely on.
     fn jit_tlab_skip_offsets(&self, from_base: usize, from_end: usize) -> Vec<(usize, usize)> {
+        // `CRATONVM_GC_NO_TLAB_SKIP=1` -- ignore every published skip span.
+        //
+        // A published span is supposed to be a still-RESERVED, un-allocated
+        // TLAB tail, and the sweep's linear walks skip it so an un-retired tail
+        // cannot desync them (BUG-03). A span that is STALE -- published by an
+        // earlier collection and not cleared, by which time the owning thread
+        // has bump-allocated into it -- has the opposite effect: it hides LIVE
+        // objects from every walk, and the mark oracle then answers "gap space,
+        // not an object" for any root pointing into one, so the object is
+        // neither scanned nor swept while everything it references is freed.
+        //
+        // The switch exists to price that, in one binary, against
+        // `io.netty.util.internal.ObjectCleanerTest` -- whose reclaimed lambda
+        // is held by a `Collections$ReverseComparator2` that the cycle-0 sweep
+        // reports as `in_jit_tlab_skip=Some(..)`.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_TLAB_SKIP").is_some() {
+            return Vec::new();
+        }
         let g = self.jit_tlab_skip_regions.lock();
         if g.is_empty() {
             return Vec::new();
@@ -9335,6 +9353,19 @@ impl GenerationalHeap {
         // from-space walk below merges these into its free-block skip list so
         // an un-retired tail is neither walked as objects nor reclaimed.
         let jit_skips = self.jit_tlab_skip_offsets(from_base, from_end);
+        // ----- Invariant: a published skip span holds NO ROOT ---------------
+        //
+        // A root pointing into a skip span DISPROVES the span; see
+        // `crate::heap::skip_spans_hold_no_root` for why, and for why it
+        // reports rather than repairs. `jit_skips` are young-from OFFSETS and
+        // the shared check takes absolute `[start, end)` pairs, so convert.
+        if !jit_skips.is_empty() {
+            let abs: Vec<(usize, usize)> = jit_skips
+                .iter()
+                .map(|&(soff, ssz)| (from_base + soff, from_base + soff + ssz))
+                .collect();
+            crate::heap::skip_spans_hold_no_root(&abs, roots, "generational");
+        }
         // Merge a sorted free-block list with `jit_skips` (both ascending,
         // disjoint — a TLAB tail is reserved, never on the free list). Cheap;
         // the skip list has at most one entry per live thread.
@@ -13657,6 +13688,148 @@ impl GenerationalHeap {
                      {found} reference(s) from a SURVIVING object into a span this sweep \
                      is about to free (0 is the only clean answer)"
                 );
+            }
+
+            // TARGETED CLASS TRACE (`CRATONVM_DBG_SWEEP_TRACE_CLASS=<internal/Name>`).
+            //
+            // The scans above answer aggregate questions -- "does ANY surviving
+            // object point at a doomed one" -- and when the answer is 0 they
+            // leave the next question unanswerable: was the object I expected
+            // to be the holder even THERE, in which generation, marked or not,
+            // and what did its slots actually contain at this instant?
+            //
+            // Chasing `ObjectCleanerTest` that gap cost a whole session. The
+            // victim is a lambda held by `java/util/Collections$ReverseComparator2
+            // .cmp`; the inverted scan says no surviving object points into a
+            // doomed span; and those two statements are only compatible if the
+            // holder did not yet hold it. Nothing in the sweep could say which.
+            //
+            // So: name a class, and every young and old instance of it is
+            // dumped at every sweep with its address, generation, mark state
+            // and every slot, each slot flagged if it targets a span this sweep
+            // is about to free. One env var, no rebuild per question.
+            if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_SWEEP_TRACE_CLASS") {
+                // Own copy of the dead-span index: the inverted scan's lives in
+                // its own block, and duplicating four lines is cheaper than
+                // widening that block's scope for a diagnostic.
+                let mut tspans: Vec<(usize, usize)> = dead_regions
+                    .iter()
+                    .map(|&(off, sz, _c, _k, _n)| (from_base + off, from_base + off + sz))
+                    .collect();
+                tspans.sort_unstable_by_key(|&(start, _)| start);
+                let victim_span = |addr: usize| -> Option<usize> {
+                    tspans
+                        .partition_point(|&(start, _)| start <= addr)
+                        .checked_sub(1)
+                        .and_then(|i| tspans.get(i))
+                        .filter(|&&(_, end)| addr < end)
+                        .map(|&(start, _)| start)
+                };
+                let mut seen = 0usize;
+                let mut walked = 0usize;
+                let mut walk_broke_at: Option<usize> = None;
+                let mut dump = |gen: &str,
+                                optr: usize,
+                                h: &ObjectHeader,
+                                tot: usize,
+                                marked: bool,
+                                seen: &mut usize| {
+                    let cid = h.class_id.as_u32();
+                    let name = crate::gc::resolve_class_info(cid)
+                        .map(|(n, _)| n)
+                        .unwrap_or_else(|| format!("cid{cid:#x}"));
+                    if name != want {
+                        return;
+                    }
+                    *seen += 1;
+                    let mut slots = String::new();
+                    let mut w = optr + HEADER_SIZE;
+                    let hi = optr + tot;
+                    while w + 8 <= hi {
+                        // SAFETY: `[optr, optr + tot)` is this object's own span.
+                        let word = unsafe { *(w as *const u64) } as usize;
+                        let doomed = victim_span(word).is_some();
+                        slots.push_str(&format!(
+                            "{:+#x}={:#x}{} ",
+                            w - optr,
+                            word,
+                            if doomed { "<<DOOMED" } else { "" }
+                        ));
+                        w += 8;
+                    }
+                    eprintln!(
+                        "[sweep-trace] cycle={sweep_zero_cycle} {gen} {name}@{optr:#x} \
+                         size={tot} marked={marked} slots=[{slots}]"
+                    );
+                };
+                // Young, walked as objects (same walk as the inverted scan).
+                let existing_free_tr = merge_skips(young_from.free_blocks_sorted());
+                let mut free_it_tr = existing_free_tr.iter().peekable();
+                let mut c = 0usize;
+                let used_tr = young_from.used();
+                while c < used_tr {
+                    if skip_free_blocks(&mut c, &mut free_it_tr).0 {
+                        continue;
+                    }
+                    let optr = from_base + c;
+                    // SAFETY: see the inverted scan's identical walk above.
+                    let h = unsafe { &*(optr as *const ObjectHeader) };
+                    let tot = gen_object_total_size(h);
+                    if tot < HEADER_SIZE || c + tot > used_tr {
+                        // A walk that breaks here has NOT looked at the rest of
+                        // the arena, and "0 instances" from a truncated walk is
+                        // a different statement from "0 instances found". Say
+                        // which, or the next reader builds a timeline on it.
+                        walk_broke_at = Some(c);
+                        break;
+                    }
+                    walked += 1;
+                    let marked = h.gc_flags() & GC_FLAG_MARKED != 0;
+                    let gen = if victim_span(optr).is_some() {
+                        "YOUNG-DOOMED"
+                    } else {
+                        "YOUNG"
+                    };
+                    dump(gen, optr, h, tot, marked, &mut seen);
+                    c += tot;
+                }
+                for (optr, osz) in old_gen.walk_objects() {
+                    let lo = optr as usize;
+                    // SAFETY: `optr` is a live old-gen object header.
+                    let h = unsafe { &*(lo as *const ObjectHeader) };
+                    let marked = h.gc_flags() & GC_FLAG_MARKED != 0;
+                    dump("OLD", lo, h, osz, marked, &mut seen);
+                }
+                eprintln!(
+                    "[sweep-trace] cycle={sweep_zero_cycle} {seen} instance(s) of {want}                      (young walk: {walked} objects, {}; used={used_tr})",
+                    match walk_broke_at {
+                        None => "COMPLETE".to_string(),
+                        Some(off) => {
+                            format!("TRUNCATED at off={off} - the count is a LOWER BOUND")
+                        }
+                    }
+                );
+                // Every DOOMED lambda-proxy object, and whether the root set
+                // the mark phase was handed contained it. A lambda proxy is
+                // recognisable without any class lookup: its synthetic class id
+                // carries the high bit. `in_roots` is the whole question when a
+                // reclaimed object turns out to have been live -- `false` means
+                // the ROOT SET was incomplete (a different bug, in a different
+                // file, from a marker that dropped a root it was given), and
+                // nothing else in this sweep distinguishes the two.
+                for &(doff, dsz, dcid, _dk, _dn) in dead_regions.iter() {
+                    if dcid & 0x8000_0000 == 0 {
+                        continue;
+                    }
+                    let victim = from_base + doff;
+                    let in_roots = roots.iter().any(|r| {
+                        let a = r.as_ptr() as usize;
+                        a >= victim && a < victim + dsz
+                    });
+                    eprintln!(
+                        "[sweep-trace] cycle={sweep_zero_cycle} DOOMED-LAMBDA @{victim:#x}                          size={dsz} class_id={dcid:#x} in_roots={in_roots}"
+                    );
+                }
             }
         }
 

@@ -2142,6 +2142,60 @@ fn allocate_lambda_proxy_from_values(
             }
         }
     };
+    // DBG (`CRATONVM_DBG_WATCH_ALLOC_CID=<hex class id>`): arm the young
+    // marker's edge trace on THIS proxy the moment it exists.
+    //
+    // A lambda proxy has no class NAME to point `CRATONVM_DBG_MARK_WHY_CLASS`
+    // at — its class id is synthetic (>= 0x8000_0000) and deliberately absent
+    // from the ClassStore — so the one instrument that can say "why was this
+    // object marked, or why was it not" had nothing to key on. The ids are
+    // handed out sequentially and never recycled, so they ARE stable across
+    // runs of the same workload, which makes them a usable handle.
+    //
+    // Added chasing `io.netty.util.internal.ObjectCleanerTest`, where a
+    // one-capture proxy (`Comparator.comparing(fn)`'s result) is freed by the
+    // first young sweep while nothing in the heap, the roots, or any scanned
+    // side table refers to it, and the address is then written into a
+    // `Collections$ReverseComparator2` built afterwards.
+    // Memoised: this sits on the lambda-proxy allocation path, and an env
+    // lookup per allocation is not a diagnostic cost, it is a permanent one.
+    // `None` (the overwhelmingly common case) is one `OnceLock` load.
+    {
+        static WANT_CID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        let want_cid = *WANT_CID.get_or_init(|| {
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCH_ALLOC_CID")
+                .ok()
+                .and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        });
+        if let Some(want_cid) = want_cid {
+            if proxy_class_id.as_u32() == want_cid {
+                let addr = proxy_ref.as_ptr() as usize;
+                let mut stk = String::new();
+                {
+                    use std::fmt::Write as _;
+                    for f in thread.frames.iter().rev().take(6) {
+                        let _ = write!(stk, "
+[WATCH-ALLOC]     at {}.{}", f.class_name(), f.method_name());
+                    }
+                }
+                eprintln!(
+                    "[WATCH-ALLOC] lambda proxy cid={:#x} captures={num_captures}                      site_pc={site_pc} -> {addr:#x} tid={} frames={}{}",
+                    proxy_class_id.as_u32(),
+                    thread.thread_id.0,
+                    thread.frames.len(),
+                    stk
+                );
+                // BOTH watches: `set_young_mark_watch` is what
+                // `mark_edge_precise` / `mark_young` consult to print
+                // `[MARKWHY] young marker reached <addr> via <edge>` — and its
+                // SILENCE is the finding when the object is swept.
+                // `set_dynamic_watch` additionally reports writes through the
+                // cell, which names whoever stores the address afterwards.
+                cratonvm_gc::heap::set_young_mark_watch(addr);
+                cratonvm_gc::heap::set_dynamic_watch(addr);
+            }
+        }
+    }
     // Refresh any captured object references from their pins — the retry
     // path above may have relocated them during GC.
     for (j, h) in handles.iter().enumerate() {
