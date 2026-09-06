@@ -906,6 +906,11 @@ struct Lowerer<'a> {
     /// finding from "it fired and did not pay".
     phi_copy_reg_reads: usize,
     phi_copy_reg_publishes: usize,
+    /// Publishes DEFERRED to the end of their edge because the phi's register
+    /// is also a source's register on that edge (see `emit_phi_copies`). A
+    /// non-zero here is the wrong-code hazard being taken off the table, not a
+    /// missed optimization: the value is still published, one word-load later.
+    phi_copy_publish_deferred: usize,
     /// The value `lower_data_node` is currently emitting, so `store_rax` can
     /// tell the one store that writes a value's OWN home word from the many
     /// that write an argument stage word, a shadow-stack word, or somebody
@@ -1467,6 +1472,7 @@ impl<'a> Lowerer<'a> {
             gp_reg_live: Vec::new(),
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
+            phi_copy_publish_deferred: 0,
             cur_def: None,
             cur_def_published: false,
             reg_publishes_at_def: 0,
@@ -2563,9 +2569,60 @@ impl<'a> Lowerer<'a> {
         } else {
             (HashMap::new(), HashMap::new())
         };
+        // ── The register layer's OWN interference, which the resolver cannot see
+        //
+        // `resolve_parallel_copy` sequentialises over FRAME WORDS. The register
+        // fast path below then reads a source from its assigned GPR and
+        // publishes a destination into the phi's assigned GPR — and two
+        // DISTINCT frame words can be homed in the SAME register, because the
+        // allocator sees a phi's live range as beginning after the merge and a
+        // dying source's as ending at it, so they do not interfere by its
+        // reckoning. They do interfere across the copy sequence: an earlier
+        // copy's publish then overwrites a register a later copy still has to
+        // read, and the resolver's word-level order says nothing about it.
+        //
+        // Measured on
+        // `vm/tests/jit_ir_phi_copy_register_alias_fixtures/PhiCopyRegisterAliasProbe.java`
+        // (and, in the wild, `java.time.Duration.toNanos()` — 198,356 wrong
+        // answers in 200,000 calls): the else-arm of `if (seconds < 0)` emitted
+        //   `mov rbx,rax`   ; publish phi_seconds, whose GPR is RBX
+        //   `mov rax,rbx`   ; read phi_nanos's SOURCE, whose GPR is also RBX
+        // so `nanos` came back as `seconds` and `toNanos()` returned
+        // `seconds * 1e9 + seconds`. `CRATONVM_JIT_IR_PHI_COPY_REGS=0` and
+        // `CRATONVM_JIT_IR_PHI_RESIDENCY=0` each made it disappear, which is
+        // what named this layer as the owner.
+        //
+        // The fix is per-edge and conservative: a phi whose publish register is
+        // ALSO some source's register on this edge does not publish inline.
+        // Its home store is kept (so there is a word to read) and the trailing
+        // residency loop below publishes it from that word — after every source
+        // on the edge has been read. Everything else keeps the reg-to-reg
+        // publish it had. The cost is one load per deferred phi per edge; the
+        // alternative, ordering the two layers together, would have to model a
+        // copy that writes two locations at once.
+        let mut defer_publish: Vec<NodeId> = Vec::new();
+        if ir_phi_copy_regs_enabled() {
+            let src_regs: Vec<(NodeId, u8)> = gathered
+                .iter()
+                .filter_map(|c| self.assigned_gpr(c.src).map(|r| (c.src, r)))
+                .collect();
+            for c in &gathered {
+                if let Some(dst_reg) = self.assigned_gpr(c.phi) {
+                    if src_regs
+                        .iter()
+                        .any(|(src, r)| *r == dst_reg && *src != c.phi)
+                    {
+                        defer_publish.push(c.phi);
+                        self.phi_copy_publish_deferred += 1;
+                    }
+                }
+            }
+        }
         let mut published: Vec<NodeId> = Vec::new();
         for op in ops {
-            if let Err(bailout) = self.emit_copy_op(op, &src_node_of, &phi_of_dst, &mut published) {
+            if let Err(bailout) =
+                self.emit_copy_op(op, &src_node_of, &phi_of_dst, &defer_publish, &mut published)
+            {
                 self.latch_bailout(bailout);
                 return;
             }
@@ -2597,6 +2654,19 @@ impl<'a> Lowerer<'a> {
                     self.publish_fp_from_slot(c.phi, c.dst, is_double);
                 }
             }
+        } else {
+            // The publish `emit_copy_op` skipped for an aliasing phi still has
+            // to happen, whatever the residency switch says: it was skipped
+            // because doing it inline would have been WRONG, not because it was
+            // unwanted. The loop above covers this when residency is on; this
+            // arm is the same duty when it is off (the inline publish is gated
+            // on `ir_phi_copy_regs_enabled` alone, so it runs in that
+            // configuration too, and so must its deferral).
+            for c in &gathered {
+                if defer_publish.contains(&c.phi) {
+                    self.publish_gp_from_slot(c.phi, c.dst);
+                }
+            }
         }
     }
 
@@ -2612,6 +2682,7 @@ impl<'a> Lowerer<'a> {
         op: CopyOp,
         src_node_of: &HashMap<i32, NodeId>,
         phi_of_dst: &HashMap<i32, NodeId>,
+        defer_publish: &[NodeId],
         published: &mut Vec<NodeId>,
     ) -> CompileResult<()> {
         let scratch = self.phi_copy_scratch_slot_off;
@@ -2682,9 +2753,13 @@ impl<'a> Lowerer<'a> {
         // value whose register a deopt frame can name, whose every reader takes
         // that register, needs no frame word at all — and this store was the
         // last frame traffic left in the loop after the two reloads went.
-        let drop_home = phi_of_dst
-            .get(&dst)
-            .is_some_and(|phi| self.home_dropped.get(*phi as usize).copied().unwrap_or(false));
+        // A deferred publish (see `emit_phi_copies`) reads this word back at the
+        // end of the edge, so the store it would otherwise have dropped is the
+        // only thing that carries the value — keep it.
+        let drop_home = phi_of_dst.get(&dst).is_some_and(|phi| {
+            !defer_publish.contains(phi)
+                && self.home_dropped.get(*phi as usize).copied().unwrap_or(false)
+        });
         if drop_home {
             self.home_stores_dropped += 1;
         } else {
@@ -2700,10 +2775,12 @@ impl<'a> Lowerer<'a> {
         if ir_phi_copy_regs_enabled() {
             if let Some(&phi) = phi_of_dst.get(&dst) {
                 if let Some(dst_reg) = self.assigned_gpr(phi) {
-                    self.emit_mov_reg_reg64(dst_reg, RAX);
-                    self.mark_gp_reg_live(phi);
-                    published.push(phi);
-                    self.phi_copy_reg_publishes += 1;
+                    if !defer_publish.contains(&phi) {
+                        self.emit_mov_reg_reg64(dst_reg, RAX);
+                        self.mark_gp_reg_live(phi);
+                        published.push(phi);
+                        self.phi_copy_reg_publishes += 1;
+                    }
                 }
             }
         }
@@ -14931,11 +15008,15 @@ pub(crate) fn lower_inner_with_scopes(
     // both arms had been running identical machine code.
     if ls_active
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
-        && (lowerer.phi_copy_reg_reads > 0 || lowerer.phi_copy_reg_publishes > 0)
+        && (lowerer.phi_copy_reg_reads > 0
+            || lowerer.phi_copy_reg_publishes > 0
+            || lowerer.phi_copy_publish_deferred > 0)
     {
         eprintln!(
-            "[ir-ls] phi copies: reg_reads={} reg_publishes={}",
-            lowerer.phi_copy_reg_reads, lowerer.phi_copy_reg_publishes,
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={} publish_deferred={}",
+            lowerer.phi_copy_reg_reads,
+            lowerer.phi_copy_reg_publishes,
+            lowerer.phi_copy_publish_deferred,
         );
     }
     if ls_active
@@ -19834,7 +19915,10 @@ mod tests {
         let ops = phi_copy_sequence(copies).expect("the fixture's copies sequentialise");
         for op in ops.iter().copied() {
             lowerer
-                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &mut Vec::new())
+                // No `defer_publish`: this fixture drives the memory path only
+                // (`src_node_of`/`phi_of_dst` are empty, so nothing publishes a
+                // register and nothing can alias one).
+                .emit_copy_op(op, &HashMap::new(), &HashMap::new(), &[], &mut Vec::new())
                 .expect("every location in this backend is a frame word");
         }
 

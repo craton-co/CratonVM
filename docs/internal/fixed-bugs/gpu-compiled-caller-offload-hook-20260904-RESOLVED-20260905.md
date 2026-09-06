@@ -6,10 +6,34 @@
 Held opt-in for one day on one scenario — `runtime-stress.sh`'s
 `cache_coherence` — which turned out to be a JIT miscompilation this mode
 merely became the first thing to expose (`wide iinc` invisible to LICM;
-see `../jit/osr-miscompiles-cachecoherence-20260904.md`). With that fixed,
-every GPU suite passes with this as the default: `runtime-stress` (7/7),
-`jit-writer-stale`, `residency-gc` (3 collectors), `marshal-stress`,
-`submission-drain`, `gate-overbroad`, `ci-gate` (4 gates).
+see the retired record `osr-miscompiles-cachecoherence-20260904-FIXED-20260905.md`).
+With that fixed, every GPU suite passes with this as the default:
+`runtime-stress` (7/7), `jit-writer-stale`, `residency-gc` (3
+collectors), `marshal-stress`, `submission-drain`, `gate-overbroad`,
+`ci-gate` (**5** gates as of 2026-09-05 — gate e, the dot-reduction
+checksum, was turned on that day after two months off on a stale
+premise).
+
+## What the default flip then exposed
+
+"Every GPU suite passes with this as the default" was true of the suites,
+and still missed a defect — because no suite covered the shape. Making a
+compiled caller offload turned a long-standing, harmless disagreement
+between `offload_jit_gate` and the dispatcher into a live one: the gate
+judged targets with the constant-pool-FREE `analyze`, so every kernel
+whose body needed an `ldc`/`ldc_w`/`ldc2_w` was judged ineligible, never
+registered with the offload hook, and had its compiled call sites bound
+directly. Up to **10.8x** slower.
+
+That is not an argument against this feature — the gate was always asking
+the wrong question, and this default merely made the answer load-bearing.
+It is an argument about what "every suite passes" is worth: the refusal
+had no census, so a run whose kernels had all silently stopped
+registering printed a gate census byte-identical to a healthy one.
+
+Both halves of that disagreement are closed, and the refusal is now
+counted:
+`../gpu/compiled-caller-gate-refused-ldc-kernels-20260905.md`.
 
 `GpuHookOverheadBench`, one binary, this switch the only difference:
 

@@ -1,45 +1,73 @@
 # `--gpu` refuses OSR for the hot loop, and kfusion runs 8x slower
 
-## RESOLVED 2026-09-05 — the 8x does not reproduce
+## RESOLVED 2026-09-05 — re-measured with a control arm, and the residual is closed too
 
-Re-measured on the 2026-09-05 dev tip, and **neither half of the title
-still holds**:
+Neither half of the title holds, and the "what is LEFT" trade at the
+bottom of this page is closed as well.
 
-* **The OSR refusal is gone.** `Integration.integrate` gets **1** OSR
-  enter under `--gpu`, the same as without it. The page recorded 0.
-* **The 8x is gone.** Integration time, `--gpu` / no-`--gpu`, over three
-  alternating rounds: **0.98x, 0.99x, 1.56x** (totals 1.00x, 1.09x,
-  1.54x). The page's figures were 42.9 s → 327.6 s, a 7.6x regression.
+### The measurement the first closure lacked
 
-The breadth fix this page already documents
-(`fix/gpu-jit-gate-overbroad-20260904`) evidently closed the case it said
-it had left open. Its "What is LEFT" section below argues the residual is
-"still 8x for an offload that almost never happens"; on this workload
-that is now false.
+That closure (0.98x / 0.99x / 1.56x) was honest about its own weakness:
+87% host load, 2.5x swings between rounds of the same arm, and **no
+same-config control arm**, so its ratios had no noise floor to be read
+against. Re-run three arms per round — `nogpu` / `--gpu` / `nogpu` —
+alternating, so the two identical arms measure the noise directly:
 
-**What is NOT claimed.** The box was at 87% load and absolute times swung
-2.5x between rounds (integration 52 s to 128 s for the *same* arm), and
-there was no same-config control arm, so the ratio has wide error bars
-and the >1 lean in round 3 is not resolvable. The claim is only that the
-7.6x is absent — the worst round is 1.56x, five times smaller — not that
-`--gpu` is free here.
+| round | nogpu-A | `--gpu` | nogpu-B |
+|---|---:|---:|---:|
+| 1 | 97.3 | 125.2 | 93.6 |
+| 2 | 107.0 | 109.4 | 120.1 |
+| 3 | 114.1 | 100.9 | 100.1 |
 
-**Reproduced how.** The blocker was recorded as "kfusion, whose dataset
-and build output are no longer on this box". The build output IS on the
-box, at `C:/craton/CratonVM1/apps/kfusion-tornadovm`; only the dataset
-and `bm-1f.settings` were missing. Both are now recoverable without the
-slambench build chain:
+(integration seconds, one frame, `--Xms 4g`.)
 
-* `bench-gpu/kfusion-1frame-dataset.py` writes the one-frame `.raw`
-  directly from the ICL-NUIM tarball (the layout is 16 + w*h*5 bytes,
-  read out of `RawDevice.java`);
-* `bench-gpu/kfusion-bm-1f.settings` is the settings file, reconstructed
-  from `bm-traj2.settings` since the original was never committed.
+**Six same-config runs span 93.6 to 120.1 — a 1.28x spread with nothing
+changed between them.** Against that floor: `--gpu` median 109.4 vs
+control median 103.5 = **1.06x**. The largest single-round ratio, 1.31x
+in round 1, is barely outside a noise band that wide, and rounds 2 and 3
+put `--gpu` *faster* than their controls.
 
-That reconstruction is why the ABSOLUTE numbers here are not comparable
-with the ones above (integration 128 s vs the page's 42.9 s): the volume
-dimensions and integration rate come from `bm-traj2` and may differ from
-whatever the original `bm-1f` held. The ratio is what carries.
+So the 7.6x (42.9 s → 327.6 s) is gone, and there is no measurable
+`--gpu` penalty left to argue about. The host was ~59% loaded from other
+work throughout, which is exactly why the control arm — not a quiet box —
+is what makes the number readable.
+
+### The OSR refusal is gone, on more than one sample
+
+`Integration.integrate` reports **`osr_integrate=1` in all nine runs**,
+`--gpu` arms included. The page below recorded 0 under `--gpu` against 14
+other methods entering; the first closure saw 1 but on a single run.
+
+### The "trade rather than a bug" residual is closed
+
+The bottom of this page argues a caller of a launchable kernel is still
+denied JIT and OSR, "still 8x for an offload that almost never happens",
+and proposes a give-up-after-N gate that could not be built because
+kfusion was unmeasurable.
+
+That residual was overtaken rather than fixed on its own terms.
+`CallerGateMode::CompiledHook` — default since 2026-09-05, see
+`gpu-compiled-caller-offload-hook-20260904.md` — means the caller is no
+longer denied JIT at all: it compiles *and* the site still offloads
+through the hook. Strictly better than give-up-after-N, and it is why
+`integrate` now gets its OSR enter.
+
+Note what did **not** change: the GPU arm still prints no compiled-caller
+offload census, so kfusion still offloads essentially nothing here. The
+page's own framing was "8x for an offload that almost never happens" —
+the offload still almost never happens; what is gone is the 8x, because
+the caller is no longer paying for the refusal.
+
+### Reproduced how
+
+The blocker was recorded as "kfusion, whose dataset and build output are
+no longer on this box". The build output is at
+`C:/craton/CratonVM1/apps/kfusion-tornadovm`; the one-frame dataset and
+settings are reconstructible without the slambench chain via
+`bench-gpu/kfusion-1frame-dataset.py` and `bench-gpu/kfusion-bm-1f.settings`.
+Absolute times here are therefore not comparable with the original 42.9 s
+— the volume dimensions come from `bm-traj2` — which is why every claim
+above is a ratio against a control measured in the same session.
 
 ## Status (as recorded 2026-09-04)
 
