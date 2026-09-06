@@ -495,6 +495,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gc-verify-stale", on_key: Some("CRATONVM_GC_VERIFY_STALE"), off_key: None, off_word: None, since: "2026-05-23" },
     E { group: Group::GC, token: "late-resolve-dropped", on_key: Some("CRATONVM_GC_LATE_RESOLVE_DROPPED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "tlab-skip", on_key: None, off_key: Some("CRATONVM_GC_NO_TLAB_SKIP"), off_word: None, since: "2026-09-06" },
+    E { group: Group::GC, token: "g1-only-jit-pins", on_key: Some("CRATONVM_GC_G1_ONLY_JIT_PINS"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::GC, token: "peer-pin-divert", on_key: None, off_key: Some("CRATONVM_GC_NO_PEER_PIN_DIVERT"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "conditional-tlab-skip-publish", on_key: Some("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "frame-trace-span-retire", on_key: None, off_key: Some("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE"), off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
@@ -1923,6 +1925,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "self-call-arg-maps", on_key: Some("CRATONVM_JIT_SELF_CALL_ARG_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "merge-marks-exact", on_key: Some("CRATONVM_JIT_MERGE_MARKS_EXACT"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-oop-coverage", on_key: Some("CRATONVM_JIT_INLINE_OOP_COVERAGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "loader-blind-cp-resolve", on_key: Some("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "local-mask-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "wide-local-oop-maps", on_key: Some("CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::JIT, token: "arm64-safepoints", on_key: Some("CRATONVM_JIT_ARM64_SAFEPOINTS"), off_key: None, off_word: Some("0"), since: "2026-09-03" },

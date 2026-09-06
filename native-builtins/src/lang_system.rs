@@ -6516,6 +6516,31 @@ pub(crate) fn native_classloader_define_class1(
         preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
     }
 
+    // `CRATONVM_DBG_DEFINE=1` + `CRATONVM_DBG_DUPCLASS_FILTER=<substring>` --
+    // the JAVA callers of this `defineClass`. The class-manager side of the
+    // same switch prints the name and the loader; what it cannot print is
+    // WHICH Java code decided to define it, and for a duplicate-identity
+    // defect that is the whole question -- a loader that defines a class its
+    // parent already has is either an isolating loader doing its job or a
+    // delegation that failed, and only the caller chain separates the two.
+    if cratonvm_types::flags().loader.dbg_define
+        && cratonvm_types::flags().loader
+            .dbg_dupclass_filter
+            .as_deref()
+            .is_some_and(|f| name.contains(f))
+    {
+        let callers: Vec<String> = ctx
+            .frame_class_ids()
+            .into_iter()
+            .rev()
+            .take(12)
+            .filter_map(|cid| ctx.class_name_of_id(cid))
+            .collect();
+        eprintln!(
+            "[DEFINE-DBG-JAVA] defineClass name={name} loader_id={loader_id} callers={callers:?}"
+        );
+    }
+
     let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
         ..Default::default()

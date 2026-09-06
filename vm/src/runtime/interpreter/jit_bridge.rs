@@ -2404,9 +2404,7 @@ pub(super) fn compile_osr_artifact(
             let mut elidable_init_pcs: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
             for (pc, tclass, pcount) in pending_ctor_sites {
-                let elidable = shared
-                    .load_class_concurrent(&tclass)
-                    .ok()
+                let elidable = resolve_cp_class_for_owner(shared, class_id, &tclass)
                     .map(|tid| {
                         let cm2 = shared.classes.class_manager.read();
                         is_elidable_construction(shared, &cm2, tid)
@@ -2837,8 +2835,8 @@ pub(super) fn compile_osr_artifact(
                 };
                 for (pc_new, cp_idx_new, name_opt) in new_class_names {
                     if let Some(name) = name_opt {
-                        let load_result = shared.load_class_concurrent(&name);
-                        if let Ok(target_id) = load_result {
+                        let load_result = resolve_cp_class_for_owner(shared, class_id, &name);
+                        if let Some(target_id) = load_result {
                             // JVMS 5.4.4 / 6.5 `new` access check -- mirrors
                             // the `new_info` site above (same rationale: an
                             // inaccessible `new` site must not be baked into
@@ -2897,7 +2895,7 @@ pub(super) fn compile_osr_artifact(
                 }
                 for (pc_arr, cp_idx_arr, name_opt) in arr_class_names {
                     if let Some(name) = name_opt {
-                        if let Ok(target_id) = shared.load_class_concurrent(&name) {
+                        if let Some(target_id) = resolve_cp_class_for_owner(shared, class_id, &name) {
                             anewarray_info2.push((pc_arr, target_id.as_u32()));
                         } else {
                             anewarray_deferred2.push((pc_arr, class_id.as_u32(), cp_idx_arr));
@@ -5174,6 +5172,85 @@ pub(super) fn jit_method_calls_forced_class_generic_metadata(
     false
 }
 
+/// Resolve a constant-pool class NAME for a method that is being COMPILED,
+/// through the compiling class's own defining loader.
+///
+/// # The defect this exists to stop
+///
+/// The compiler used to answer these with `SharedVm::load_class_concurrent`,
+/// which is deliberately loader-BLIND: its own doc says it "can only ever
+/// produce a Bootstrap/Extension/Application-loaded class". For a method whose
+/// owner was defined by a USER-DEFINED loader that is not a lookup at all --
+/// it is a DEFINITION. `resolve_fast_path_class_id` sees the user loader's
+/// copy, correctly refuses to hand a built-in-chain caller someone else's
+/// namespace, and defines a SECOND copy under `Application`; the compiler then
+/// bakes that second `ClassId` into the site.
+///
+/// Measured on `TestContextAotGeneratorIntegrationTests.processAheadOfTimeWithWebTests`
+/// (Spring's `@CompileWithForkedClassLoader`, whose
+/// `CompileWithForkedClassLoaderClassLoader` re-defines the whole classpath on
+/// purpose): the background compiler, OSR-compiling
+/// `com.thoughtworks.qdox.parser.impl.Parser.yyparse` for the FORK loader's
+/// copy, resolved the method's `new` sites this way and baked
+/// `TypeDef`-under-`Application`. Compiled code then allocated
+/// Application-namespace `TypeDef`s inside a fork-namespace parser, and the
+/// site's own `checkcast` -- correctly resolved through the compiling class's
+/// loader by `intern_typecheck_target` -- refused them:
+///
+/// ```text
+/// [cv-checkcast-fail] typecheck REFUSED: obj_cid=5444 obj_loader=Application
+///     obj_cls=com/thoughtworks/qdox/parser/structs/TypeDef
+///     site_target=5400 site_target_loader=UserDefined(3)
+/// ```
+///
+/// which Java sees as `ClassCastException: class ...TypeDef cannot be cast to
+/// class ...TypeDef` -- the textbook two-copies-one-name message, produced by
+/// the compiler rather than by the program.
+///
+/// # What this does instead
+///
+/// * Owner defined by a BUILT-IN loader (the overwhelming majority): unchanged
+///   -- `load_class_concurrent`, which for such an owner produces exactly the
+///   class the interpreter would have resolved.
+/// * Owner defined by a USER-DEFINED loader: LOOK UP only, through
+///   `get_loaded_class_id_for_requester`, which prefers that loader's own
+///   definition and then the built-in parent chain -- and never defines. A
+///   miss returns `None`, so the site takes the DEFERRED path it already has
+///   for an unresolvable target and the interpreter resolves it correctly at
+///   run time. Declining to optimise is always available; defining a second
+///   identity is not.
+///
+/// `CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE=1` restores the old call for a
+/// one-binary A/B.
+pub(super) fn resolve_cp_class_for_owner(
+    shared: &SharedVm,
+    owner: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if jit_loader_blind_cp_resolve() {
+        return shared.load_class_concurrent(name).ok();
+    }
+    let owner_loader = {
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(owner).map(|c| c.loader_id)
+    };
+    match owner_loader {
+        Some(loader @ cratonvm_types::ClassLoaderId::UserDefined(_)) => {
+            let cm = shared.classes.class_manager.read();
+            cm.get_loaded_class_id_for_requester(name, loader)
+        }
+        _ => shared.load_class_concurrent(name).ok(),
+    }
+}
+
+/// Kill switch for [`resolve_cp_class_for_owner`].
+fn jit_loader_blind_cp_resolve() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE").is_some()
+    })
+}
+
 /// Shared body for the JIT `cp_elidable_init_resolver` closures: given the
 /// holder class `holder_cid` and an `invokespecial` constant-pool index, return
 /// `true` iff it targets a no-arg `<init>()V` whose construction is elidable
@@ -5220,7 +5297,7 @@ pub(super) fn resolve_jit_elidable_init_loading(
         }
     };
     // 2. Resolve the target (loading if necessary) with NO `cm` lock held.
-    let Ok(target_id) = shared.load_class_concurrent(&target_name) else {
+    let Some(target_id) = resolve_cp_class_for_owner(shared, holder_cid, &target_name) else {
         return false;
     };
     // 3. Check elidability (brief `cm` read).

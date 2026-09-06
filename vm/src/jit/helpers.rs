@@ -11449,15 +11449,31 @@ pub unsafe extern "C" fn jit_checkcast(
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "<none>".into());
             let target_cid = cm.find_unique_class_by_name(class_name);
+            // `target_cid` is the LOADER-BLIND unique-by-name answer, which is
+            // `None` the moment two loaders define the name -- so on exactly
+            // the class-identity failures this trace exists to explain it
+            // reports nothing. `site_target` is the identity the decision was
+            // actually made against: the `ClassId` this site's
+            // `CONSTANT_Class` resolved to through the COMPILING class's own
+            // loader (`intern_typecheck_target`). Printed with the loaders of
+            // both sides, because "obj_cid != site_target while both names
+            // match" and "the target was never resolved" are opposite repairs.
+            let site_target = cratonvm_jit::typecheck_target_for_site(class_name_ptr);
+            let loader_of = |id: cratonvm_types::ClassId| {
+                cm.get_class(id).map(|c| format!("{:?}", c.loader_id))
+            };
             eprintln!(
-                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_loader={:?} obj_cls={} target_name={} target_cid={:?} site_target={:?} site_target_loader={:?}",
                 obj_ptr,
                 kind,
                 arr_desc,
                 obj_class_id.as_u32(),
+                loader_of(obj_class_id),
                 obj_cls_name,
                 class_name,
-                target_cid.map(|c| c.as_u32())
+                target_cid.map(|c| c.as_u32()),
+                site_target,
+                site_target.and_then(|t| loader_of(cratonvm_types::ClassId::new(t))),
             );
         }
         // A definitive refusal — the object's class is known and provably not

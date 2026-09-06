@@ -593,7 +593,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-372 tokens.
+373 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -956,6 +956,7 @@ export inherited from a parent shell.
 | `self-call-arg-maps` | `CRATONVM_JIT_SELF_CALL_ARG_MAPS` |
 | `merge-marks-exact` | `CRATONVM_JIT_MERGE_MARKS_EXACT` |
 | `inline-oop-coverage` | `CRATONVM_JIT_INLINE_OOP_COVERAGE` |
+| `loader-blind-cp-resolve` | `CRATONVM_JIT_LOADER_BLIND_CP_RESOLVE` |
 | `local-mask-fail-closed` | `CRATONVM_JIT_LOCAL_MASK_FAIL_CLOSED` |
 | `wide-local-oop-maps` | `CRATONVM_JIT_WIDE_LOCAL_OOP_MAPS` |
 | `arm64-safepoints` | `CRATONVM_JIT_ARM64_SAFEPOINTS` |
@@ -972,7 +973,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-157 tokens.
+159 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -980,6 +981,8 @@ export inherited from a parent shell.
 | `g1-mark-oob-failsafe` | `CRATONVM_G1_MARK_OOB_FAILSAFE` |
 | `late-resolve-dropped` | `CRATONVM_GC_LATE_RESOLVE_DROPPED` |
 | `tlab-skip` | `CRATONVM_GC_NO_TLAB_SKIP` |
+| `g1-only-jit-pins` | `CRATONVM_GC_G1_ONLY_JIT_PINS` |
+| `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |

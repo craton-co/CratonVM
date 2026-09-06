@@ -1,14 +1,17 @@
 # 19 netty classes fail on **Generational only** — the moving young cycle corrupts a live object
 
-**Status:** OPEN, **root cause identified** (2026-09-06). Found by a
-per-collector sweep of the full netty suite. **This is a correctness defect,
-not a throughput one**, and it is invisible to every run that uses the shipped
-default collector.
+**Status:** OPEN. Found by a per-collector sweep of the full netty suite.
+**This is a correctness defect, not a throughput one**, and it is invisible to
+every run that uses the shipped default collector.
 
-**One line:** a moving young cycle copies an object into to-space and never
-scans it, so every reference slot in that one object keeps pointing into
-from-space. See §6 for the named slots and §7 for the amplifier that reproduces
-it 3/3.
+**One line:** relocation is necessary for the failure, and the stale reference
+is **not in the heap** — so it is held by an unenumerated root or a compiled
+frame home. §7 has the amplifier that reproduces it 3/3.
+
+> **An earlier revision of this page claimed the root cause was "a to-space
+> survivor copied but never scanned". That claim is WITHDRAWN — see §6.** It
+> rested on two observations of a missed heap rewrite; instrumenting the scan
+> cursor refuted it across 80 moving cycles.
 
 | | |
 |---|---|
@@ -150,53 +153,71 @@ checked against the lever before being ruled out.
   stack is a coincidence of which object happens to be young, small, and
   allocated once per test invocation.
 
-## 6. Root cause — a to-space survivor that is copied but never SCANNED
+## 6. WITHDRAWN root cause, and what the instrument actually proved
 
-`CRATONVM_MOVING_YOUNG_VERIFY=1` runs a post-evacuation pass that reports any
-surviving heap reference still pointing at a forwarded young-from object. Its
-own contract splits the diagnosis in two: **non-zero means a heap reference
-rewrite was missed; zero with a wrong result means the stale reference lives
-outside the heap** (an unenumerated root or compiled-frame home).
+The first attempt at a root cause was wrong, and the way it was wrong is worth
+keeping.
 
-It comes back **non-zero**, and it names the victims. Two reps under the
-amplifier, both failing 3/416 with the NPE:
+`CRATONVM_MOVING_YOUNG_VERIFY=1` reports any surviving heap reference still
+pointing at a forwarded young-from object. Its contract splits the diagnosis
+cleanly: **non-zero = a HEAP rewrite was missed; zero with a wrong result = the
+stale reference lives OUTSIDE the heap** (an unenumerated root or compiled-frame
+home).
+
+Two runs came back non-zero and named the slots — every miss in a cycle
+belonging to one object, whose referents had all been copied and rehomed:
 
 ```
-rep 0  forwarded_heap_refs_remaining young=4 old=0
-  MISSED-HEAP-REWRITE YOUNG TestTemplateExtensionContext@0x17590030b60
-      slot=24 -> UnmodifiableSet             old=0x175826b0e78 new=0x175900268c0
-      slot=40 -> DefaultExecutableInvoker    old=0x175826b0568 new=0x1759002 68f0
-      slot=48 -> MutableExtensionRegistry    old=0x175826af9f8 new=0x17590026838
-      slot=64 -> NamespacedHierarchicalStore old=0x175826b0ea8 new=0x17590026910
-
-rep 1  forwarded_heap_refs_remaining young=2 old=0
-  MISSED-HEAP-REWRITE YOUNG ConcurrentHashMap@0x204d5f028b8
-      slot=0 -> Object                       old=0x204e958e088 new=0x204d5ef8d68
-      slot=2 -> ConcurrentHashMap$Node       old=0x204e968ed50 new=0x204d5ef8d98
+rep A  young=4 old=0   TestTemplateExtensionContext@0x17590030b60
+                         slot=24 -> UnmodifiableSet, slot=40 -> DefaultExecutableInvoker,
+                         slot=48 -> MutableExtensionRegistry,
+                         slot=64 -> NamespacedHierarchicalStore
+rep B  young=2 old=0   ConcurrentHashMap@0x204d5f028b8  slot=0, slot=2
 ```
 
-**So it is not a missed root.** Every referent was found, copied, and given a
-new home — the collector knew about all of them. What was not done is the
-referrer's own slot rewrite, and in each cycle **every missed slot belongs to a
-single object**. An object whose referents all moved and none of whose slots
-were updated was copied into to-space and then **never scanned**.
+An object whose every slot was missed looked like an object copied into
+to-space and never scanned, and the referrers sat at HIGHER addresses than
+their referents' new homes — consistent with a Cheney scan cursor that finished
+early. The mechanism was plausible: the main drain runs to the `used()` of its
+moment, phase 2.5 then resurrects finalizable objects (copying MORE into
+to-space), and the re-drain after it is guarded by
+`if !dead_finalizers.is_empty()`.
 
-The addresses agree: in both reps the un-scanned referrer sits at a HIGHER
-address than the new homes of the objects it points at
-(`0x…30b60` vs `0x…268c0-26910`; `0x…f028b8` vs `0x…ef8d68-ef8d98`). Cheney
-scans to-space in address order, so a referrer above the region where its
-referents were placed should have been scanned after them and rewritten. It
-reads as a scan cursor that finished before reaching the object — i.e. the
-object was copied after the scan loop believed it was done.
+**So the cursor was instrumented, and it refutes the story.** Every
+`[moving-young-verify]` line now carries the frontier:
 
-Only one of the 22-29 moving cycles in a run reports a miss, which is why the
-symptom is 2-3 failures in 416 tests rather than a crash.
+```
+[moving-young-verify] scan frontier: scan_cursor=0x15fd30 to_used=0x15fd30 \
+                      unscanned_tail=0x0 dead_finalizers=0
+```
 
-**Stated as a hypothesis, not a conclusion:** the address ordering is
-consistent with a late copy that no re-scan followed, but this has not been
-confirmed by instrumenting the scan cursor itself. That is the next
-measurement, and it is a small one — record the final to-space scan cursor
-beside each `MISSED-HEAP-REWRITE` and check the referrer is above it.
+Five reps under the amplifier:
+
+| rep | NPE failures | moving cycles | cycles with a missed rewrite | cycles with `unscanned_tail > 0` |
+|---:|---:|---:|---:|---:|
+| 0 | 4 | 18 | 0 | 0 |
+| 1 | 3 | 15 | 0 | 0 |
+| 2 | 3 | 17 | 0 | 0 |
+| 3 | 3 | 20 | 0 | 0 |
+| 4 | 4 | 10 | 0 | 0 |
+
+**80 moving cycles. The scan cursor reached `to_used` on every one of them, and
+not one missed a heap rewrite — while the NPE fired 17 times.** Two conclusions,
+and the second is the useful one:
+
+1. The early-cursor hypothesis is dead. The Cheney drain completes.
+2. **A missed heap rewrite is NOT necessary for the failure.** It is real — it
+   was observed twice — but it is rare and it is a second signature, not the
+   cause. A mechanism absent while the symptom is present is not the mechanism.
+
+**What the zero therefore means, by the verifier's own contract: the stale
+reference is outside the heap.** The heap is self-consistent after evacuation;
+something that is not a heap slot still holds the pre-move address.
+
+The methodological error is worth naming: the withdrawn claim was published off
+two observations of a signature that turned out to be neither necessary nor
+typical, and the confirming instrument was built only afterwards. The
+instrument is what should have come first.
 
 ## 7. Why the coverage proof does not stop it
 
@@ -228,17 +249,33 @@ Two candidate doors were tested and **refuted**, so nobody re-runs them:
   `torn_global_lt_local=0`, i.e. `global == local` every time — a consistent
   reading meaning only the initiator was in compiled code.
 
-## 8. Status of the older lead
+## 8. The indicated cause: precise-only under-coverage
 
-The pre-root-cause suspicion was *precise-only under-coverage* -- that
-`moving-jit-coverage-proven` certifies a compiled frame whose oops live in
-scalar-replacement slots, LICM hoist slots or the blind GPR spill area, per
-`moving-young-corruption-rootcause.md`. **The verifier rules that out as the
-mechanism here**: a missed compiled-frame home would leave the heap consistent
-and show `forwarded_heap_refs_remaining young=0`, with the stale reference
-outside the heap. It reports non-zero, in the heap, in one object. The coverage
-proof is still the gate that lets the cycle run (§7) -- it is not the thing that
-loses the pointer.
+An earlier revision of this page said the *precise-only under-coverage* lead in
+`moving-young-corruption-rootcause.md` was "ruled out". **That was wrong**, and
+it was ruled out on exactly the evidence that has since been withdrawn.
+
+That page root-caused an earlier instance as a coverage bit computed from the
+abstract interpreter's locals + operand stack, while a compiled frame also
+holds oops in **scalar-replacement slots**, **LICM hoist slots** and the
+**blind GPR spill area**. A stale reference in any of those is invisible to the
+heap verifier and survives evacuation un-rewritten — which is precisely the
+`young=0 old=0` + wrong-result signature §6 now reports 5/5.
+
+It also fits everything else: the failures need relocation (§3), they need
+peers (every failing test is `*MultipleThreads`), and forcing the peer ledger to
+accept amplifies them to 3/3 (§7) — a ledger whose whole job is to decide
+whether peers' compiled frames are rewritable.
+
+Next measurement, in order:
+
+1. `CRATONVM_MOVING_YOUNG_BAND_DBG=1` — dump the frame offset of every word the
+   band verifier rejects, on a cycle that relocates under the amplifier. That
+   names the frame slot the same way §6's instrument named heap slots.
+2. The `CRATONVM_MOVING_YOUNG_NO_BAND_*` screens, one at a time, to find which
+   screen admits the un-rewritable word.
+3. Only then a fix. The prior art is explicit that the real repair is precise
+   oop maps or a shadow stack, not a policy patch.
 
 ## 9. Reproducing
 
