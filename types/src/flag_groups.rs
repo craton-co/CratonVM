@@ -1254,6 +1254,12 @@ pub const INVENTORY: &[E] = &[
     // this row is the whole fix.
     E { group: Group::JIT, token: "precise-getstatic-checkcast", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST"), off_word: None, since: "2026-08-11" },
     E { group: Group::JIT, token: "precise-alloc-athrow", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW"), off_word: None, since: "2026-08-17" },
+    // `invokedynamic` (0xba). Bookkeeping, not a new lowering: the bridged arm
+    // already runs `emit_post_invoke_exception_check` and every other arm
+    // deopts unconditionally before the call. It was keeping
+    // `MVMap.flushAppendBuffer` -- 15.2% of CPU on a contended H2 workload --
+    // permanently interpreted.
+    E { group: Group::JIT, token: "precise-indy", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_INDY"), off_word: None, since: "2026-09-06" },
     // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
     // the flip still wants a wall-clock measurement -- see
     // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the
