@@ -123,3 +123,35 @@ was not attempted here (it is the same multi-hour cost as the original
 measurement). Until that is run, treat today's specific 2-CRASH data point
 as **unconfirmed at the current dev tip**, not as a fresh reproduction of
 this page's mechanism.
+
+**Note added while landing the above (same day, later merge)**: `dev` just
+landed
+[`moving-young-fallback-was-residue-and-not-the-cost-FIXED-20260906.md`](../../internal/fixed-bugs/moving-young-fallback-was-residue-and-not-the-cost-FIXED-20260906.md),
+a different workload (Spring Boot's Kafka integration test) but a finding
+that bears directly on this page's central assumption. Two things it
+establishes there:
+
+1. Most `[moving-young]` fallback triggers were a **false positive** in the
+   A5 coverage probe (a stale return address left below a compiled frame's
+   own `entry_sp`), now screened out by default
+   (`CRATONVM_JIT_A5_RESIDUE_FILTER=1`). This page's own fallback-reason
+   tallies (§7 of the netty page this history cites, and the DoHead
+   fallback-reason breakdown in Part 2) predate that screen and may
+   overcount for the same reason.
+2. More importantly: **the non-moving sweep this page calls the "sound,
+   fail-closed response" is not unconditionally safe.** On that workload it
+   reclaimed a live object outright — `CRATONVM_DBG_SWEEP_ZERO=1` caught a
+   `NativeThreadSet` zeroed by the non-moving sweep while still reachable
+   through a register/native-stack root the marker missed — and that, not
+   any throughput cost, was the test's real failure.
+
+**This page's "Not a correctness bug" verdict for the DoHead family is not
+re-examined by that finding** — nobody has run `CRATONVM_DBG_SWEEP_ZERO=1`
+against a DoHead-family class to check for the same live-reclaim signature,
+and the two workloads are different enough (this page's failures are all
+timeouts, not `ClassCastException`/`NullPointerException`-shaped wrong
+answers) that the same mechanism should not be assumed. But the general
+premise this page's verdict leans on — "falling back to non-moving is
+safety-first" — no longer holds unconditionally project-wide, and that is
+worth knowing before treating any future DoHead-family symptom as "just
+throughput" without checking.
