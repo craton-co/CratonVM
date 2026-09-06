@@ -592,7 +592,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-372 tokens.
+381 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -750,6 +750,14 @@ export inherited from a parent shell.
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `deferred-new-retry-blind` | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND` |
 | `deferred-new-looks` | `CRATONVM_JIT_DEFERRED_NEW_LOOKS` |
+| `ir-site-trap` | `CRATONVM_JIT_IR_SITE_TRAP` |
+| `ir-scalar-intrinsics` | `CRATONVM_JIT_IR_SCALAR_INTRINSICS` |
+| `ir-aastore` | `CRATONVM_JIT_IR_AASTORE` |
+| `ir-check-elim` | `CRATONVM_JIT_IR_CHECK_ELIM` |
+| `ir-hot-layout` | `CRATONVM_JIT_IR_HOT_LAYOUT` |
+| `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
+| `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `c2-accept` | `CRATONVM_C2_ACCEPT` |
 | `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `ir-param-copy` | `CRATONVM_JIT_IR_PARAM_COPY` |
 | `ir-rpo-layout` | `CRATONVM_JIT_IR_RPO_LAYOUT` |
@@ -916,6 +924,7 @@ export inherited from a parent shell.
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
 | `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
+| `tier-pgo-c2-window` | `CRATONVM_TIER_PGO_C2_WINDOW` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |

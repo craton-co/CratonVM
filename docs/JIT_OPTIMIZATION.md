@@ -2917,3 +2917,215 @@ String access/search, Arrays, CRC32).
 | Lint status | `clippy -D warnings` is a release gate, not a baked-in metric |
 | Native methods | **~3,100+** |
 | vs JDK C2 | See [`../BENCHMARK.md`](../BENCHMARK.md) for the current interleaved series |
+
+---
+
+## 2026-09-06 — the seven-item pass: C2 was a SMALLER optimizer than C1
+
+### The audit that opened it
+
+An audit asked why the optimizing tier delivers no measurable gain, and found a
+different answer from the one this file's tier-inversion arc had been chasing.
+That arc was about the BODY — frame traffic, register residency, the latency of
+a store-then-load chain — and it took `OsrTierBench.kernel` from 1.70x behind to
+parity. This one is about the OPTIMIZER, and the finding is structural:
+
+**C2 is not a superset of C1.** Tracing which modules each analysis is reachable
+from, on `dev@91d3077a9`:
+
+| Optimization | C1 single-pass | C2 optimizing (before this pass) |
+|---|---|---|
+| Bounds-check elimination (`range_analysis` + `x64/bce.rs`) | default on | **absent** |
+| Null-check elimination (`null_check_elim`, the `this` seed) | default on | **absent** |
+| Runtime-trip loop unrolling (`x64/loop_unroll_admission.rs`) | 4x | const-trip only |
+| Method inlining (`x64/inlining.rs` + guarded virtual) | default on | **off by default** |
+| Call-site intrinsics (~40) | ~40 | **0, and refuses the method** |
+| Vectorization (`x64/simd_analysis.rs`, `x64/vec_emit.rs`) | present | **absent** |
+| Loop-carried values in registers | default on | write-through cache |
+| Escape analysis / scalar replacement | bytecode-walk | SSA graph |
+| SSA GVN, LICM, sink-late, ALU-imm folding | partial | full |
+| Exception-handler bodies | compiled | skipped |
+
+`range_analysis` is referenced by `x64/bce.rs` and nothing else;
+`null_check_elim` by `x64/*` and nothing else. So
+`ir_lower::emit_array_null_bounds_guards` emitted a null test, a length load and
+a bounds compare at EVERY `ArrayLoad` and `ArrayStore`, every iteration, with no
+elision and no proof — in the tier that is supposed to be the optimizing one.
+
+**And the tier consumed no profile.** `CRATONVM_TIER_PGO` has never shipped on,
+so `MethodProfile::branches` is empty and the `ir_branch_hints` map
+`lower_inner` receives is empty in every default run. Worse, the production
+pipeline called `ir_schedule::schedule(&graph)`, which is
+`schedule_with_options(graph, &ScheduleOptions::default())` — and `Default` is
+documented as "the historical scheduler exactly: no profile, no reordering,
+dependence-order-only intra-block scheduling". Two of the three stages that
+module implements were off in every compile the VM has ever run.
+
+### The measurement that made it a defect rather than an observation
+
+H2 JDBC (`probes/DodJdbcWorkload.java` against the local h2corpus), three arms
+interleaved run-by-run with the order reversed on alternate reps, the same
+configuration run twice as its own noise floor, process CPU time. Windows
+workstation, 32 logical cores, host load ~76% from other sessions — so only
+within-run ratios are readable, which is why the control pair is there.
+
+| arm | run A median | run A min | run B median | run B min |
+|---|---:|---:|---:|---:|
+| C2 on (default) | 3.938 | 3.594 | 4.734 | 4.109 |
+| C2 on (control) | 3.953 | 3.516 | 4.547 | 3.922 |
+| **`CRATONVM_C2_SUPERSEDE=0`** | **3.703** | **3.297** | **4.234** | **3.891** |
+
+Control-vs-control floor 0.4% and 4.1%. `c2-off` is the fastest arm in both
+runs, on median AND minimum. About a quarter of the difference is background
+compile CPU (161 extra compiles, `total_compile_time_ms` 201 against 143); the
+rest is the published bodies and the supersede epoch bump.
+
+The size census says the same thing from the other side. Over 161 supersedes:
+**81 C2 bodies larger** than the C1 body they replaced, 66 smaller, 14 the same,
+519,344 bytes against 488,834 — **6% larger in aggregate**. A tier that neither
+inlines nor unrolls cannot explain a larger body by having done more work.
+
+### The refusal census: one site refused the whole method, five times over
+
+Reach at the method-entry door was never the problem — 164 of 199 C1 compiles
+reach C2 on H2. What was lost, was lost to one design decision repeated at five
+sites: when the IR front end meets something it cannot lower, it discards the
+entire method rather than the site.
+
+| refusal | count | what it was |
+|---|---:|---|
+| `ir.rs:7150` — invoke with no `invoke_info` | 64 | downstream of the discard below |
+| invoke plan discarded whole | **68** | **100% "one call-site intrinsic somewhere in the method"** |
+| `invokedynamic` anywhere | 53 | C1 lowers indy to an uncommon trap and compiles the rest |
+| opcode `0x53` (`aastore`) | 35 | no IR lowering, though `jit_aastore` exists |
+| unresolved `checkcast` / `instanceof` | 34 | a class that has never been loaded |
+| `new` of a not-yet-loaded class | 13 | an exception construction on a path that never runs |
+
+The intrinsics were `Math.max` (7), `System.arraycopy` (7), `Long.longValue`
+(7), `AtomicLong.get` (7), `Long.numberOfLeadingZeros` (4), `Math.min` (2),
+`Integer.compare` (2), `Long.compare` (2) and a long tail.
+
+And the deferred-`new` retry sweep, which runs on every class definition,
+re-resolved **8,131 sites over 101 distinct ones** in a single run — the top one
+3,905 times, a `new java/nio/charset/MalformedInputException` on a decoding
+error path inside `java/lang/String`, for a class the program never loads
+*because* that path never runs.
+
+### What landed
+
+Seven changes, each with a kill switch and an engagement census.
+
+| # | change | default | kill switch |
+|---|---|---|---|
+| 1 | IR-tier inlining | **ON** | `CRATONVM_JIT_IR_INLINE=0` |
+| 2a | IR null-check + bounds-check elimination | **ON** | `CRATONVM_JIT_IR_CHECK_ELIM=0` |
+| 2b | unroll over unreachable frame states | **ON** | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES=0` |
+| 3a | scalar intrinsics lowered as arithmetic | **ON** | `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` |
+| 3b | uncommon trap at an unlowerable site | **ON** | `CRATONVM_JIT_IR_SITE_TRAP=0` |
+| 3c | `aastore` through `jit_aastore` | **ON** | `CRATONVM_JIT_IR_AASTORE=0` |
+| 4a | frequency block layout + list scheduling | **ON** | `CRATONVM_JIT_IR_HOT_LAYOUT=0`, `CRATONVM_JIT_IR_LIST_SCHED=0` |
+| 4b | branch profile window around a C2 nomination | **ON** | `CRATONVM_TIER_PGO_C2_WINDOW=0` |
+| 5 | `ScalarIntrinsic` + `ArrayLoad` may drop their home | **ON** | (rides `CRATONVM_JIT_IR_DROP_HOME`) |
+| 6 | C1→C2 acceptance gate | `evidence` | `CRATONVM_C2_ACCEPT=always` |
+| 7 | deferred-`new` look budget | **16** | `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` |
+
+Four of them are worth reading for their reasoning rather than their effect.
+
+**The trap is not a new mechanism, it is `Op::Guard` with a constant-zero
+condition** — the shape `add_div_zero_guard` already builds. Its lowering
+already emits `DeoptReason::UncommonTrap` with `DeoptAction::Reinterpret`, so
+the interpreter re-runs the bytecode at that bci, which is exactly what a site
+this tier declined to compile needs. Each caller owes a coldness argument and
+two of the three have a real one: an unresolved `new`/`checkcast`/`instanceof`
+names a class that **has never been loaded**, and a class that has never been
+loaded cannot have been touched by any path that has executed. That is a proof.
+`invokedynamic` has no such proof, and is on the list because the single-pass
+backend has made exactly this trade by default since it stopped bailing on indy.
+
+**The intrinsics split by what the intrinsic replaces, not by convenience.**
+Letting an unlowerable intrinsic site take an ordinary `Op::Call` is a
+DOWNGRADE — a dispatch is a ~300 ns floor where the single-pass backend emits
+two instructions — so the families whose emitted form is a handful of
+straight-line instructions (`Math.min`/`max`/`abs`, `Integer.compare`,
+`Long.compare`) are lowered as ARITHMETIC through one new op,
+`Op::ScalarIntrinsic`, and the families whose intrinsic replaces a LOOP
+(`arraycopy`, `Arrays.fill`/`equals`/`sort`, `String.equals`/`indexOf`, CRC32)
+keep the method-level refusal. `scalar_intrinsic_census` counts both halves, and
+the refused count is the work list for whoever extends the first.
+
+One op with a sub-enum rather than eight ops, because every new `Op` has to be
+added to `ir_verify`'s arity table, `regalloc::ir_op_defines_value` and
+`ir_lower::op_defines_result_slot` — and the last two are the pair
+`the_two_value_defining_enumerations_agree` exists to keep in lockstep after a
+drift that silently disabled register residency on every array-touching method.
+
+**The unroller's blocker was never sizing.** It refuses any loop whose body is
+named by a safepoint snapshot, because a `SafepointSnapshot` is keyed by one
+`bci` and `trip` copies of a body bci cannot be represented by one snapshot.
+That reasoning is correct and it is unchanged. What it did not ask is whether
+any of those snapshots is REACHABLE — and on a trap-free graph none is, which is
+the same fact `lower_inner`'s `graph_trap_free` already computes and acts on
+when it skips building unreachable deopt points. The relaxation is a
+PREDICTION, and it carries its own net: `UNROLL_USED_UNREACHABLE_FRAMES` is read
+in `lower_inner`, and if any deopt point was in fact built the compile is
+refused and the method takes the single-pass backend — which is what it did
+before the relaxation existed.
+
+**The acceptance gate is a policy and says so.** `ir_evidence` records which
+transforms a compile applied, and `CRATONVM_C2_ACCEPT=evidence` (the default)
+publishes only a body that applied one the baseline tier has no equivalent for:
+scalar replacement, splicing, guard elision, late sinking, a scalar intrinsic.
+`Unrolled` and `Licm` are deliberately absent — the single-pass backend has
+both, so doing the same is not a reason to replace its body. The membership of
+that list is a judgment, stated as one so it can be argued with. A compile with
+no recorded evidence (a plumbing mistake) is ACCEPTED and counted as `unjudged`,
+because a mistake there must cost an unfiltered publish and never a silently
+disabled tier.
+
+### Verified
+
+`cargo test -p cratonvm-jit --lib`: **2,267 passed, 0 failed**. `cargo test -p
+cratonvm-types`: green, including the flag-surface guards and the regenerated
+`docs/config/flag-inventory.md` / `docs/flag-tokens.md`.
+
+The new emitted sequences are EXECUTED against the answers the JLS specifies,
+edges included: `the_scalar_intrinsic_sequences_execute_to_the_specified_answers`
+runs each compiled body and checks `Math.abs(Integer.MIN_VALUE) ==
+Integer.MIN_VALUE` (JLS 15.15.4 — the negation wraps, and the branchless
+`(x ^ (x>>31)) - (x>>31)` reproduces that exactly), signed `min`/`max` across
+zero, and `Long.compare` on operands whose low halves are equal — the case that
+catches sizing the `CMP` from the RESULT type, which is why
+`ScalarOp::operands_are_long` exists separately from `ScalarOp::result_type`.
+
+Three source-scanning audits keep the couplings visible rather than remembered:
+`every_eligible_op_is_claimed_or_explicitly_rejected` (an op whose arm is shaped
+for a dropped home must be claimed or listed in `DELIBERATELY_NOT_DROPPABLE`
+with a reason), `the_block_node_order_is_the_emission_order` (the check-elision
+pass reads `Block::nodes` in order and treats that as program order, which is
+sound only while `ir_lower` emits a block the same way), and the existing
+`every_droppable_op_writes_its_home_once_through_store_rax`.
+
+### What is owed, stated rather than left to be inferred
+
+**No throughput claim is made for any of the seven.** Every number above is a
+COUNT — a census, a refusal tally, a body size — or the C2-off A/B that
+motivated the work. The arms that would price these changes have not been run,
+and the host they would have to be run on was at ~76% load throughout.
+
+Three measurements are owed, in this order:
+
+1. **The H2 A/B again, on the new binary.** The claim being tested is that the
+   `c2-off` arm is no longer the fastest one. If it still is, the acceptance
+   gate is doing its job and the tier is still not worth its epoch bumps.
+2. **The IR-inlining flip on a second real workload.** Its 8% netty / 15-26%
+   hibernate came from the 2026-08-28 gauntlet soak, taken BEFORE the deopt-bci
+   fix; those numbers should be re-taken rather than inherited.
+3. **A per-collector regression sweep.** Frequency-driven block layout moves
+   every oop-map and safepoint position in every compiled method, which is
+   exactly the change the RPO-layout work validated per collector for the same
+   reason.
+
+And one thing is NOT claimed: that C2's code generation was wrong. It was not.
+The existing arc took `OsrTierBench.kernel` from 1.70x behind to parity, and
+every checksum on every arm of this pass matched HotSpot. The problem was the
+size of the optimizer, not the quality of its emitter.

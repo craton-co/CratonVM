@@ -855,6 +855,10 @@ impl CompilerCore {
             state.queued_for_compilation = true;
             state.queued_tier = Some(CompilationTier::C2);
         }
+        // Open the branch-profile window: there is now an optimizing compile
+        // pending that will read the counts. See
+        // `profile::arm_branch_profiling_for_c2`.
+        crate::profile::arm_branch_profiling_for_c2();
         self.enqueue(CompilationTask {
             method_key: key.clone(),
             target_tier: CompilationTier::C2,
@@ -892,6 +896,7 @@ impl CompilerCore {
             state.queued_for_compilation = true;
             state.queued_tier = Some(CompilationTier::C2);
         }
+        crate::profile::arm_branch_profiling_for_c2();
         self.enqueue(CompilationTask {
             method_key: key.clone(),
             target_tier: CompilationTier::C2,
@@ -1007,6 +1012,13 @@ impl CompilerCore {
                     self.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        // Close the branch-profile window for this nomination, on EVERY
+        // outcome and not only on success: a C2 task that failed, declined or
+        // was dropped still opened the window, and a nomination that opens
+        // without closing pins branch recording on for the life of the process.
+        if tier == CompilationTier::C2 {
+            crate::profile::disarm_branch_profiling_for_c2();
         }
         if success {
             match tier {

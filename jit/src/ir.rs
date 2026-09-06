@@ -564,6 +564,39 @@ pub enum Op {
         bci: usize,
     },
 
+    /// A call-site intrinsic this tier lowers to arithmetic instead of a call.
+    ///
+    /// # Why this exists, and why it is ONE op with a sub-enum
+    ///
+    /// `try_compile_inner`'s invoke-planning loop refuses the WHOLE METHOD when
+    /// any call site is a `JitIntrinsic` the optimizing tier cannot emit. On
+    /// the H2 JDBC workload that was **68 methods, 100% of every invoke-plan
+    /// discard** -- `Math.max`, `Integer.compare`, `Long.numberOfLeadingZeros`
+    /// and friends, each of them costing a whole method's optimization.
+    ///
+    /// The obvious repair -- let the site take an ordinary `Op::Call` -- is a
+    /// DOWNGRADE, and a large one: a dispatch is a ~300 ns floor where the
+    /// single-pass backend emits two instructions. So the families whose
+    /// intrinsic is a handful of straight-line instructions get lowered here as
+    /// arithmetic, which is strictly better than either alternative (a node the
+    /// optimizer can fold, GVN and schedule). The families whose intrinsic
+    /// replaces a LOOP -- `System.arraycopy`, `Arrays.fill`/`equals`/`sort`,
+    /// `String.equals`/`indexOf`/`hashCode`, CRC32 -- keep the method-level
+    /// refusal, because there the intrinsic really is worth more than the rest
+    /// of the method's optimization. See [`try_ir_scalar_intrinsic`].
+    ///
+    /// One op with a sub-enum rather than eight ops, because every new `Op`
+    /// arm has to be added to `ir_verify`'s arity table, `regalloc`'s
+    /// `ir_op_defines_value` and `ir_lower`'s `op_defines_result_slot` -- and
+    /// the last two are the pair `the_two_value_defining_enumerations_agree`
+    /// exists to keep in lockstep after a drift that silently disabled register
+    /// residency on every array-touching method. Eight chances to get that
+    /// wrong is eight too many.
+    ///
+    /// Inputs are `[a]` for unary and `[a, b]` for binary; [`ScalarOp::arity`]
+    /// is the single source of truth and `ir_verify` reads it.
+    ScalarIntrinsic(ScalarOp),
+
     // ── Dead / removed ───────────────────────────────────────────────
     /// Placeholder for a removed node (inputs cleared, not referenced).
     Dead,
@@ -585,6 +618,7 @@ impl Op {
             Op::Const(_)
                 | Op::ConstF(_)
                 | Op::Param(_)
+                | Op::ScalarIntrinsic(_)
                 | Op::Add
                 | Op::Sub
                 | Op::Mul
@@ -4308,6 +4342,25 @@ pub struct IrBuilder {
     /// live across the call — found by the conservative GC scan of the spilled
     /// frame, sound because GC is non-moving while a JIT frame is active).
     invoke_info: HashMap<usize, (usize, usize, u8)>,
+    /// Call sites the invoke planner recognised as a scalar-intrinsic family
+    /// and deliberately left OUT of `invoke_info`, keyed by caller pc.
+    ///
+    /// A pc in here is not a missing plan -- it is a plan to emit arithmetic.
+    /// The distinction matters because every invoke arm's `None` from
+    /// `invoke_info` means "refuse the method", and without this map a site the
+    /// planner handled on purpose would be indistinguishable from one it could
+    /// not handle at all.
+    scalar_intrinsics: HashMap<usize, ScalarOp>,
+    /// `invokedynamic` sites this tier replaces with an uncommon trap, keyed by
+    /// caller pc: `(operand-stack entries the call consumes, return type tag)`.
+    ///
+    /// The stack effect is the ONLY thing needed, because the site emits no
+    /// call -- but it is needed exactly, or every bytecode after it reads the
+    /// wrong entries. The counts come from `count_param_slots`, which counts
+    /// one entry per ARGUMENT (a `long` is one), matching this builder's
+    /// one-entry-per-value abstract stack; `compute_param_jvm_slots` counts
+    /// two for a `long` and is the wrong function here.
+    indy_trap_sites: HashMap<usize, (usize, u8)>,
     /// IR-tier inlining: callee bodies to splice, keyed by the CALLER pc of the
     /// `invoke` each replaces. Empty on every compile that inlines nothing,
     /// which is every compile with the gate off. See [`IrInlineSite`].
@@ -4477,6 +4530,8 @@ impl IrBuilder {
             trivial_init_pcs: HashSet::new(),
             object_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
+            scalar_intrinsics: HashMap::new(),
+            indy_trap_sites: HashMap::new(),
             inline_sites: HashMap::new(),
             splice: Vec::new(),
             splices_done: 0,
@@ -4972,6 +5027,47 @@ impl IrBuilder {
     /// num_args, ret_type)`) the builder lowers into `Op::Call`. Must be called
     /// before [`Self::build`]; an `invokestatic` pc not present bails the build
     /// to single-pass. `ret_type` is the JVM return-type byte (see the field doc).
+    /// Record the call sites the planner will lower as arithmetic. Keyed by
+    /// caller pc, exactly like [`Self::set_invoke_info`], and deliberately a
+    /// SEPARATE map: a site here has no `JitInvokeInfo` box and never will.
+    pub fn set_scalar_intrinsics(&mut self, sites: HashMap<usize, ScalarOp>) {
+        self.scalar_intrinsics = sites;
+    }
+
+    /// Record the `invokedynamic` sites this tier may replace with a trap.
+    /// See [`IrBuilder::indy_trap_sites`].
+    pub fn set_indy_trap_sites(&mut self, sites: HashMap<usize, (usize, u8)>) {
+        self.indy_trap_sites = sites;
+    }
+
+    /// Emit the arithmetic for a scalar-intrinsic call site, if this pc is one.
+    ///
+    /// Returns `true` when it consumed the site. The operands come off the
+    /// abstract stack in reverse order, which is the same convention every
+    /// binary arm in this builder uses; the receiver is never popped because
+    /// every family in [`ScalarOp`] is declared `static`.
+    fn try_emit_scalar_intrinsic(&mut self, pc: usize) -> bool {
+        let Some(&sop) = self.scalar_intrinsics.get(&pc) else {
+            return false;
+        };
+        let inputs = if sop.arity() == 2 {
+            let b = self.pop();
+            let a = self.pop();
+            vec![a, b]
+        } else {
+            vec![self.pop()]
+        };
+        let node = self.add_data(
+            Op::ScalarIntrinsic(sop),
+            sop.result_type(),
+            inputs,
+            pc,
+        );
+        self.push(node);
+        note_scalar_intrinsic_lowered();
+        true
+    }
+
     pub fn set_invoke_info(&mut self, info: HashMap<usize, (usize, usize, u8)>) {
         self.invoke_info = info;
     }
@@ -5065,6 +5161,9 @@ impl IrBuilder {
             returns_value,
         });
         self.splices_done += 1;
+        // A callee body in the graph is the transform that makes every other
+        // pass here worth running -- see `ir_evidence`.
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Inlined);
         Some(base)
     }
 
@@ -5294,6 +5393,85 @@ impl IrBuilder {
     /// No-op in unreachable code (no live control token), which is also where
     /// no safepoint snapshot is recorded and where the lowerer therefore emits
     /// no guard either.
+    /// Plant an UNCONDITIONAL uncommon trap at `pc` and keep building.
+    ///
+    /// This is the answer to the question this front end used to answer by
+    /// discarding the whole method: what to do with a construct at ONE bytecode
+    /// index that this tier cannot lower. HotSpot's answer is an uncommon trap,
+    /// and CratonVM's own single-pass backend already gives that answer for
+    /// `invokedynamic` -- the site becomes a transfer to the interpreter at
+    /// that bci and the rest of the method still compiles.
+    ///
+    /// Mechanically it is `Op::Guard { bci: pc }` with a condition that is the
+    /// constant zero, which is exactly the shape [`Self::add_div_zero_guard`]
+    /// builds when a divisor is provably zero. `Op::Guard` is a DCE root
+    /// (`ir_optimize::eliminate_dead_nodes` lists it), nothing rewrites a guard
+    /// on a constant condition, and its lowering already emits
+    /// `DeoptReason::UncommonTrap` with `DeoptAction::Reinterpret` -- so the
+    /// interpreter re-runs the bytecode at `pc`, which is precisely the
+    /// semantics a site this tier declined to compile needs.
+    ///
+    /// # Why the code after it is still built
+    ///
+    /// The guard always fires, so everything the builder appends after it is
+    /// unreachable at run time. It is built anyway because the alternative --
+    /// truncating the walk -- leaves the abstract stack and the block structure
+    /// in a state the rest of the builder is not written to accept, and an
+    /// unreachable tail costs code size at compile time and nothing at run
+    /// time. The caller pushes a zero of the site's result type so the stack
+    /// depth stays what the verifier proved.
+    ///
+    /// # The coldness argument, and why it is different per caller
+    ///
+    /// A trap on a HOT path is worse than not compiling the method: every
+    /// execution re-enters the interpreter. Each caller therefore owes an
+    /// argument that its site is cold, and two of the three have a real one:
+    ///
+    /// * an unresolved `new` / `checkcast` / `instanceof` names a class that
+    ///   **has never been loaded**, and a class that has never been loaded
+    ///   cannot have been touched by any path that has executed. That is a
+    ///   proof, not a heuristic.
+    /// * `invokedynamic` has no such proof, but the single-pass backend has
+    ///   made exactly this trade by default since it stopped bailing on indy,
+    ///   so matching it here is consistent with a decision already soaked.
+    ///
+    /// [`ir_trap_census`] counts what was PLANTED by cause; the runtime side
+    /// counts what is TAKEN. A cause whose taken count is not ~0 has had its
+    /// coldness argument refuted, which is the falsifiable form of the claim.
+    fn plant_uncommon_trap(&mut self, pc: usize, cause: TrapCause) -> bool {
+        if !ir_site_trap_enabled() {
+            return false;
+        }
+        let Some(ctrl) = self.ctrl_opt() else {
+            return false;
+        };
+        // A trap inside a spliced callee body would record a bci the OUTER
+        // method does not have -- the shape that produced the
+        // `ir-inline-turns-an-index-out-of-bounds-into-an-internalerror`
+        // regression. `Op::Guard`'s lowering maps through `resume_bci`, and
+        // `splice_guard_seen` is the fence that refuses such a graph outright;
+        // raise it here for the same reason `add_div_zero_guard` does.
+        if !self.splice.is_empty() {
+            self.splice_guard_seen = true;
+        }
+        let zero = self.iconst(0);
+        self.graph.add(
+            Op::Guard { bci: pc },
+            IrType::Void,
+            vec![ctrl, zero],
+            Some(pc),
+        );
+        note_trap_planted(cause);
+        if ir_bail_reporting() {
+            eprintln!(
+                "[ir] site TRAP planted at bytecode pc {pc} ({}) in {} -- the rest of the method still compiles",
+                cause.as_str(),
+                self.method_label.as_deref().unwrap_or("<unknown>"),
+            );
+        }
+        true
+    }
+
     fn add_div_zero_guard(&mut self, divisor: NodeId, ty: IrType, pc: usize) {
         let Some(ctrl) = self.ctrl_opt() else {
             return;
@@ -6527,19 +6705,32 @@ impl IrBuilder {
                 }
                 // iastore / lastore / bastore / castore / sastore.
                 //
-                // `aastore` (0x53) is OUT OF SCOPE and stays out, stated here
-                // rather than left for the next reader to infer from an absence:
-                // a reference element store needs the SATB pre-write barrier and
-                // the card-mark write barrier the single-pass backend emits
-                // around `emit_ref_astore_regs`, and a missing barrier is
-                // invisible until a concurrent collection drops the only path to
-                // an overwritten-but-live target. Refusing the method is the
-                // cheap answer; emitting the store without the barriers is a
-                // use-after-free that surfaces somewhere else entirely.
-                0x4f | 0x50 | 0x54 | 0x55 | 0x56 => {
+                // `aastore` (0x53) is IN scope as of 2026-09-06, and the
+                // paragraph that used to stand here is worth keeping because
+                // its reasoning is still correct -- it just argued for the
+                // wrong conclusion. It said a reference element store needs the
+                // SATB pre-write barrier and the card mark the single-pass
+                // backend emits around `emit_ref_astore_regs`, that a missing
+                // barrier is invisible until a concurrent collection drops the
+                // only path to an overwritten-but-live target, and that
+                // refusing the method is the cheap answer.
+                //
+                // All true. What it missed is that emitting the store INLINE is
+                // not the only alternative to refusing: `jit_aastore` owns the
+                // covariance check and both barriers, and the single-pass
+                // backend already calls it as its own escape hatch under the
+                // ZGC barrier gate. So this arm builds the node and
+                // `ir_lower` calls that helper -- no barrier contract moves
+                // into this tier, which is the property the old paragraph was
+                // really protecting.
+                //
+                // Measured: **35 methods refused on the H2 JDBC workload**, the
+                // second-largest build refusal there after the invoke plan.
+                0x4f | 0x50 | 0x53 | 0x54 | 0x55 | 0x56 => {
                     let kind = match op {
                         0x4f => MemKind::Int,
                         0x50 => MemKind::Long,
+                        0x53 => MemKind::Ref,
                         0x54 => MemKind::Byte,
                         0x55 => MemKind::Char,
                         // 0x56 sastore
@@ -6633,7 +6824,26 @@ impl IrBuilder {
                 0xc0 => {
                     let (name_ptr, name_len) = match self.checkcast_info.get(&pc) {
                         Some(&info) => info,
-                        None => return ir_build_bail(line!(), pc),
+                        // The named class is not loaded, so no path that has
+                        // ever executed reached this `checkcast` -- trap here
+                        // and compile the rest. `plant_uncommon_trap` carries
+                        // the argument; the operand is replaced by a null so
+                        // the abstract stack keeps the depth the verifier
+                        // proved, and the code that reads it is unreachable.
+                        None => {
+                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedTypeCheck) {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            let _obj = self.pop();
+                            // A `Ref`-typed null, not `iconst(0)`: the value
+                            // this arm replaces is a reference, and a
+                            // mistyped stack entry would be joined against a
+                            // real reference at the next merge.
+                            let null = self.aconst_null();
+                            self.push(null);
+                            pc += 3;
+                            continue;
+                        }
                     };
                     let obj = self.pop();
                     let result = self.graph.add(
@@ -6652,7 +6862,18 @@ impl IrBuilder {
                 0xc1 => {
                     let (name_ptr, name_len) = match self.instanceof_info.get(&pc) {
                         Some(&info) => info,
-                        None => return ir_build_bail(line!(), pc),
+                        // Same argument as the `checkcast` arm above: an
+                        // unloaded class has been reached by nothing.
+                        None => {
+                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedTypeCheck) {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            let _obj = self.pop();
+                            let zero = self.iconst(0);
+                            self.push(zero);
+                            pc += 3;
+                            continue;
+                        }
                     };
                     let obj = self.pop();
                     let result = self.graph.add(
@@ -6885,7 +7106,24 @@ impl IrBuilder {
                 0xbb => {
                     let (class_id, num_fields) = match self.new_info.get(&pc) {
                         Some(&ci) => ci,
-                        None => return ir_build_bail(line!(), pc),
+                        // `JitNewSite::Deferred`: the class is not loaded, so
+                        // nothing has ever run this `new`. Trap and keep the
+                        // method. Note the `<init>` that follows names the same
+                        // unloaded class and so has no `invoke_info` either --
+                        // it takes the unplanned-invoke trap for the same
+                        // reason, and the two together are what actually saves
+                        // the method. Item 7's look budget is the other half of
+                        // this story: it stops the retry sweep re-resolving a
+                        // site that traps perfectly well.
+                        None => {
+                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedNew) {
+                                return ir_build_bail(line!(), pc);
+                            }
+                            let null = self.aconst_null();
+                            self.push(null);
+                            pc += 3;
+                            continue;
+                        }
                     };
                     let newobj = self.graph.add(
                         Op::New {
@@ -7145,6 +7383,14 @@ impl IrBuilder {
                             None => return ir_build_bail(line!(), pc),
                         }
                     }
+                    // A scalar-intrinsic family: emit the arithmetic and skip
+                    // the call entirely. Checked BEFORE `invoke_info`, because
+                    // the planner deliberately builds no row for such a site --
+                    // see `IrBuilder::scalar_intrinsics`.
+                    if self.try_emit_scalar_intrinsic(pc) {
+                        pc += 3;
+                        continue;
+                    }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
@@ -7204,6 +7450,47 @@ impl IrBuilder {
                 // cp_lo, count, 0). The trailing count/0 bytes are not consumed by
                 // the builder (the descriptor was resolved from the cp index by
                 // the caller); only the pc advance differs.
+                // invokedynamic — replaced by an uncommon trap, not compiled.
+                //
+                // This tier has no lowering for a bootstrap-method call site
+                // and is not going to grow one soon. Before this arm existed,
+                // `ir_compatible` refused any method containing one: **53
+                // methods on the H2 JDBC workload**, most of them lambda or
+                // string-concatenation sites on paths that run once.
+                //
+                // The single-pass backend made exactly this trade first -- an
+                // indy site there lowers to an uncommon-trap deopt stub and the
+                // rest of the method still compiles -- so this is matching a
+                // decision already taken and soaked, not making a new one.
+                //
+                // The stack effect must still be exact. A pc with no recorded
+                // shape means the descriptor resolver declined, and there the
+                // method IS refused: guessing how many entries an indy consumes
+                // would silently corrupt every bytecode after it.
+                0xba => {
+                    let Some(&(arg_entries, ret_tag)) = self.indy_trap_sites.get(&pc) else {
+                        return ir_build_bail(line!(), pc);
+                    };
+                    if !self.plant_uncommon_trap(pc, TrapCause::Indy) {
+                        return ir_build_bail(line!(), pc);
+                    }
+                    for _ in 0..arg_entries {
+                        self.pop();
+                    }
+                    if ret_tag != b'V' {
+                        let placeholder = match ret_tag {
+                            b'J' => self.lconst(0),
+                            b'F' => self.fconst(0.0),
+                            b'D' => self.dconst(0.0),
+                            b'L' | b'[' => self.aconst_null(),
+                            _ => self.iconst(0),
+                        };
+                        self.push(placeholder);
+                    }
+                    // invokedynamic is five bytes: opcode, two CP index bytes,
+                    // and two zero bytes JVMS §invokedynamic reserves.
+                    pc += 5;
+                }
                 0xb9 => {
                     // IR-tier inlining — five bytes, not three.
                     if self.inline_sites.contains_key(&pc) {
@@ -8179,6 +8466,245 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
 ///
 /// `site` is `line!()` at the refusal rather than a parallel reason enum: it
 /// names the site exactly and cannot drift out of step with the code.
+/// A call-site intrinsic family the optimizing tier lowers as arithmetic.
+///
+/// Every member is BRANCHLESS and uses only baseline x86-64 encodings -- `CMP`,
+/// `CMOVcc`, `SETcc`, `SAR`, `XOR`, `SUB`. Nothing here needs a CPU feature bit,
+/// which is deliberate: `POPCNT`/`LZCNT`/`TZCNT` would each need a runtime
+/// probe and a fallback, and a family that is *sometimes* an intrinsic is a
+/// family whose A/B measures the host rather than the change. The bit-scan
+/// families (`bitCount`, `numberOfLeadingZeros`, `numberOfTrailingZeros`,
+/// `reverseBytes`, `highestOneBit`, `lowestOneBit`) are the obvious next
+/// entries and are deliberately NOT here yet -- see the census, which counts
+/// what each family would have been worth before anyone builds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScalarOp {
+    /// `Math.min(int,int)` / `StrictMath.min`.
+    MinI,
+    /// `Math.max(int,int)`.
+    MaxI,
+    /// `Math.min(long,long)`.
+    MinL,
+    /// `Math.max(long,long)`.
+    MaxL,
+    /// `Math.abs(int)`. NOTE `Math.abs(Integer.MIN_VALUE) == Integer.MIN_VALUE`
+    /// by JLS 15.15.4, which the branchless sequence reproduces exactly (the
+    /// two's-complement negation of the minimum is itself); a `CMOV` form
+    /// written from the obvious `x < 0 ? -x : x` would too, but only because
+    /// the negation wraps -- worth knowing before anyone "simplifies" it.
+    AbsI,
+    /// `Math.abs(long)`, same edge at `Long.MIN_VALUE`.
+    AbsL,
+    /// `Integer.compare(int,int)` -> `-1`/`0`/`1`, SIGNED.
+    CompareI,
+    /// `Long.compare(long,long)` -> `-1`/`0`/`1`, SIGNED.
+    CompareL,
+}
+
+impl ScalarOp {
+    /// How many data inputs the node takes. `ir_verify` reads this rather than
+    /// carrying a second copy of the table.
+    pub fn arity(self) -> usize {
+        match self {
+            ScalarOp::AbsI | ScalarOp::AbsL => 1,
+            _ => 2,
+        }
+    }
+
+    /// The node's result type.
+    pub fn result_type(self) -> IrType {
+        match self {
+            ScalarOp::MinL | ScalarOp::MaxL | ScalarOp::AbsL => IrType::Long,
+            // `Integer.compare` and `Long.compare` both return `int`.
+            _ => IrType::Int,
+        }
+    }
+
+    /// True when the operands are 64-bit. Distinct from [`Self::result_type`]
+    /// precisely because `Long.compare` takes `long`s and returns an `int` --
+    /// reading the result type to size the `CMP` is the bug this pair exists to
+    /// make impossible.
+    pub fn operands_are_long(self) -> bool {
+        matches!(
+            self,
+            ScalarOp::MinL | ScalarOp::MaxL | ScalarOp::AbsL | ScalarOp::CompareL
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScalarOp::MinI => "Math.min(II)",
+            ScalarOp::MaxI => "Math.max(II)",
+            ScalarOp::MinL => "Math.min(JJ)",
+            ScalarOp::MaxL => "Math.max(JJ)",
+            ScalarOp::AbsI => "Math.abs(I)",
+            ScalarOp::AbsL => "Math.abs(J)",
+            ScalarOp::CompareI => "Integer.compare(II)",
+            ScalarOp::CompareL => "Long.compare(JJ)",
+        }
+    }
+}
+
+/// Does this call site name a family the optimizing tier lowers as arithmetic?
+///
+/// The single source of truth, consulted from BOTH sides: `try_compile_inner`
+/// asks it to decide whether a `JitIntrinsic` site still refuses the method,
+/// and `IrBuilder` asks it again to decide what to emit. Two enumerations of
+/// one question is the failure this file has recorded more than once, so there
+/// is one.
+///
+/// `StrictMath` is accepted alongside `Math` for `min`/`max`/`abs` only: those
+/// three are specified identically in both classes (JLS 15.20, `StrictMath`'s
+/// own javadoc delegates), unlike the transcendentals, which are not.
+pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> Option<ScalarOp> {
+    if !ir_scalar_intrinsics_enabled() {
+        return None;
+    }
+    match (class, method, descriptor) {
+        ("java/lang/Math" | "java/lang/StrictMath", "min", "(II)I") => Some(ScalarOp::MinI),
+        ("java/lang/Math" | "java/lang/StrictMath", "max", "(II)I") => Some(ScalarOp::MaxI),
+        ("java/lang/Math" | "java/lang/StrictMath", "min", "(JJ)J") => Some(ScalarOp::MinL),
+        ("java/lang/Math" | "java/lang/StrictMath", "max", "(JJ)J") => Some(ScalarOp::MaxL),
+        ("java/lang/Math" | "java/lang/StrictMath", "abs", "(I)I") => Some(ScalarOp::AbsI),
+        ("java/lang/Math" | "java/lang/StrictMath", "abs", "(J)J") => Some(ScalarOp::AbsL),
+        ("java/lang/Integer", "compare", "(II)I") => Some(ScalarOp::CompareI),
+        ("java/lang/Long", "compare", "(JJ)I") => Some(ScalarOp::CompareL),
+        _ => None,
+    }
+}
+
+/// May the optimizing tier lower the scalar intrinsic families as arithmetic?
+/// **Default ON**; `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` restores the
+/// method-level refusal for these families too, which is the A arm of the only
+/// A/B that means anything here.
+pub fn ir_scalar_intrinsics_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SCALAR_INTRINSICS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// Scalar-intrinsic sites lowered as arithmetic, this process.
+static SCALAR_INTRINSICS_LOWERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Call sites REFUSED because their intrinsic family is loop-shaped and a
+/// generic dispatch would be a downgrade.
+///
+/// Counted beside the lowered ones so the split is readable rather than
+/// asserted: a large number here is the work list for whoever extends
+/// [`try_ir_scalar_intrinsic`], and it is the only thing that says how much of
+/// the original 68-method refusal is still on the table.
+static SCALAR_INTRINSICS_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_scalar_intrinsic_lowered() {
+    SCALAR_INTRINSICS_LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::ir_evidence::note(crate::ir_evidence::Transform::ScalarIntrinsic);
+}
+
+pub fn note_scalar_intrinsic_refused() {
+    SCALAR_INTRINSICS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(lowered, refused)` call-site intrinsic decisions in the optimizing tier.
+pub fn scalar_intrinsic_census() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SCALAR_INTRINSICS_LOWERED.load(Relaxed),
+        SCALAR_INTRINSICS_REFUSED.load(Relaxed),
+    )
+}
+
+/// Why a site was replaced by an uncommon trap instead of refusing the method.
+///
+/// One variant per CALLER, not per opcode, because the census exists to test
+/// each caller's coldness argument separately -- `checkcast` and `instanceof`
+/// share a cause because they share an argument (the named class is unloaded),
+/// while `invokedynamic` is its own because its argument is different and
+/// weaker. See [`IrBuilder::plant_uncommon_trap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrapCause {
+    /// `invokedynamic`. No coldness proof; matches the single-pass backend.
+    Indy,
+    /// `checkcast` / `instanceof` naming a class that is not loaded.
+    UnresolvedTypeCheck,
+    /// `new` of a class that is not loaded (`JitNewSite::Deferred`).
+    UnresolvedNew,
+}
+
+impl TrapCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrapCause::Indy => "invokedynamic",
+            TrapCause::UnresolvedTypeCheck => "unresolved-typecheck",
+            TrapCause::UnresolvedNew => "unresolved-new",
+        }
+    }
+    const COUNT: usize = 3;
+    fn index(self) -> usize {
+        match self {
+            TrapCause::Indy => 0,
+            TrapCause::UnresolvedTypeCheck => 1,
+            TrapCause::UnresolvedNew => 2,
+        }
+    }
+}
+
+/// Traps planted, by cause. Process-wide; read by `ir_trap_census`.
+static TRAPS_PLANTED: [std::sync::atomic::AtomicU64; TrapCause::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn note_trap_planted(cause: TrapCause) {
+    TRAPS_PLANTED[cause.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(cause, planted)` for every trap cause, always all three rows.
+///
+/// All three even when zero, because a zero on one row cannot be told from
+/// "this workload has no such site" unless the other rows are beside it -- the
+/// distinction this file has been burned by often enough to make a rule of.
+pub fn ir_trap_census() -> [(&'static str, u64); TrapCause::COUNT] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (TrapCause::Indy.as_str(), TRAPS_PLANTED[0].load(Relaxed)),
+        (
+            TrapCause::UnresolvedTypeCheck.as_str(),
+            TRAPS_PLANTED[1].load(Relaxed),
+        ),
+        (
+            TrapCause::UnresolvedNew.as_str(),
+            TRAPS_PLANTED[2].load(Relaxed),
+        ),
+    ]
+}
+
+/// May a site this tier cannot lower become an uncommon trap, instead of
+/// refusing the whole method? **Default ON**; `CRATONVM_JIT_IR_SITE_TRAP=0` is
+/// the kill switch and restores the method-level refusal at every caller.
+///
+/// Measured on the H2 JDBC workload before this existed: 53 methods refused for
+/// an `invokedynamic`, 34 for a `checkcast`/`instanceof` on an unloaded class,
+/// and 13 for a `new` of one -- 100 methods, none of which had anything wrong
+/// with the code the optimizing tier would actually have run.
+pub fn ir_site_trap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SITE_TRAP").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 #[cold]
 #[inline(never)]
 pub fn ir_build_bail<T>(site: u32, pc: usize) -> Option<T> {
@@ -8347,7 +8873,20 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // pre-scans on a method the IR path was never going to lower anyway.
     // Methods containing invokedynamic always fall back to the x64
     // single-pass backend, which lowers it directly.
-    if !scan.indy_ops.is_empty() {
+    //
+    // 2026-09-06: no longer unconditional. `IrBuilder`'s `0xba` arm now
+    // replaces such a site with an uncommon trap -- the SAME trade the
+    // single-pass backend has made by default since it stopped bailing on indy
+    // -- so the method is admitted and compiles around the site. Measured
+    // before this: **53 methods refused on the H2 JDBC workload**, none of them
+    // for anything wrong with the code the optimizing tier would have run.
+    //
+    // The refusal survives with the kill switch, and it also survives ANYWHERE
+    // the descriptor resolver cannot supply the site's stack effect: the `0xba`
+    // arm bails the method on a pc it has no shape for, because guessing how
+    // many operand-stack entries an indy consumes corrupts every bytecode after
+    // it. The gate is the *admission*; the shape is the *proof*.
+    if !scan.indy_ops.is_empty() && !ir_site_trap_enabled() {
         return ir_reject("!scan.indy_ops.is_empty()");
     }
 
@@ -9356,9 +9895,12 @@ mod tests {
             "cov-07: athrow no longer refuses the whole method"
         );
         scan.has_athrow = false;
-        // invokedynamic: no IR builder arm.
+        // invokedynamic: admitted since 2026-09-06 -- the builder's `0xba` arm
+        // traps at the site and compiles the rest. The kill switch restores
+        // the refusal, which is what this asserts against rather than a
+        // constant.
         scan.indy_ops = vec![(0, 1)];
-        assert!(!ir_compatible(&scan));
+        assert_eq!(ir_compatible(&scan), ir_site_trap_enabled());
         scan.indy_ops.clear();
         // multianewarray: needs a helper sequence the lowerer cannot synthesize.
         scan.multianewarray_ops = vec![(0, 1, 2)];
@@ -9423,11 +9965,34 @@ mod tests {
             has_newarray: false,
             ldc_ops: vec![],
         };
+        // 2026-09-06: this assertion was inverted, deliberately. The IR
+        // builder's `0xba` arm now replaces the site with an uncommon trap and
+        // compiles the rest of the method -- the same trade the single-pass
+        // backend already makes -- so the ADMISSION gate must let it through.
+        //
+        // What did not change is that a site with no resolved stack effect
+        // still refuses: the gate is the admission, `set_indy_trap_sites` is
+        // the proof, and that half is tested next.
+        assert_eq!(
+            ir_compatible(&scan),
+            ir_site_trap_enabled(),
+            "with the site-trap gate ON an invokedynamic no longer refuses the              method at the admission gate; with it OFF the old refusal must be              restored exactly"
+        );
+    }
+
+    /// The admission gate is not the proof. A method admitted with an
+    /// `invokedynamic` whose descriptor the resolver could not supply has no
+    /// recorded stack effect, and the builder must refuse it rather than guess
+    /// how many operand-stack entries the site consumes -- a wrong count
+    /// silently corrupts every bytecode after it.
+    #[test]
+    fn an_indy_with_no_resolved_shape_still_refuses_the_method() {
+        // invokedynamic #1, 0, 0 ; return
+        let code = [0xba, 0x00, 0x01, 0x00, 0x00, 0xb1, 0, 0];
+        let builder = IrBuilder::new(0, 1);
         assert!(
-            !ir_compatible(&scan),
-            "a method containing invokedynamic must never be routed through \
-             the IR pipeline — it must fall back to the x64 single-pass \
-             backend, which is the only backend that lowers 0xba"
+            builder.build(&code, 6).is_none(),
+            "no `set_indy_trap_sites` call means no shape for pc 0, and the              builder must bail rather than guess the site's stack effect",
         );
     }
 

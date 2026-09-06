@@ -182,6 +182,50 @@ pub fn report_at_exit() {
         for (why, n) in cratonvm_jit::runtime_lowering::inline_tlab_declines() {
             eprintln!("[c2-supersede]   inline-TLAB declined {n}x: {why}");
         }
+        // Site-level refusals replaced by an uncommon trap, and call-site
+        // intrinsics lowered as arithmetic. Both always printed, including all
+        // three trap rows as zeros: a zero on one row alone cannot be told from
+        // "this workload has no such site", and the refused count is the work
+        // list for whoever extends `try_ir_scalar_intrinsic`.
+        let traps = cratonvm_jit::ir::ir_trap_census();
+        let trap_line = traps
+            .iter()
+            .map(|(cause, n)| format!("{cause}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("[c2-supersede] ir site traps planted: {trap_line}");
+        let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
+        eprintln!(
+            "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered}              refused_method={refused}"
+        );
+        // The branch-profile window. `still_open` at exit should be ~0: a
+        // nomination that opens the window and never closes it pins branch
+        // recording on for the rest of the process, which is the global cost
+        // the window exists to avoid.
+        let (wo, wc, ws) = cratonvm_jit::profile::c2_branch_window_census();
+        eprintln!(
+            "[c2-supersede] branch-profile window: opened={wo} closed={wc} still_open={ws}"
+        );
+        // The C1->C2 acceptance gate. `unjudged` is the one to read first: a
+        // non-zero there means the per-compile evidence slot was not armed on
+        // the thread that compiled, so the gate accepted without judging --
+        // which is the fail-open this design chose deliberately, and a number
+        // that should be zero.
+        let (acc, ref_ev, ref_pol, unjudged) = cratonvm_jit::ir_evidence::census();
+        eprintln!(
+            "[c2-supersede] acceptance: accepted={acc} refused_no_evidence={ref_ev}              refused_by_policy={ref_pol} unjudged={unjudged}"
+        );
+        // Array guard elision. Elided AND emitted on both rows, always: an
+        // elision count alone cannot tell a working pass from a workload that
+        // compiles no array accesses in this tier.
+        let (ne, nm, be, bm) = cratonvm_jit::ir_check_elim::census();
+        eprintln!(
+            "[c2-supersede] ir array guards: null_elided={ne} null_emitted={nm}              bounds_elided={be} bounds_emitted={bm}"
+        );
+        eprintln!(
+            "[c2-supersede] ir aastore sites lowered: {}",
+            cratonvm_jit::ir_lower::ir_aastore_census(),
+        );
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",

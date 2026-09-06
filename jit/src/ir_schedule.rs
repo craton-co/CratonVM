@@ -645,7 +645,79 @@ impl Schedule {
 /// emits are unchanged from before block frequencies existed; the only
 /// addition is the read-only [`Schedule::freq`] / [`Schedule::layout`] report.
 pub fn schedule(graph: &Graph) -> Schedule {
-    schedule_with_options(graph, &ScheduleOptions::default())
+    schedule_with_options(graph, &production_schedule_options())
+}
+
+/// The options the PRODUCTION optimizing pipeline schedules with.
+///
+/// This function exists because for the life of this backend the production
+/// pipeline called `schedule(graph)`, `schedule` called `schedule_with_options`
+/// with `ScheduleOptions::default()`, and `Default` is documented as
+/// reproducing "the historical scheduler exactly: no profile, no reordering,
+/// dependence-order-only intra-block scheduling". Two of the three stages this
+/// module implements were therefore switched off in every compile the VM ever
+/// ran, and nothing said so -- the default was doing its job, which is to be a
+/// neutral starting point for a TEST, and it had quietly become the shipping
+/// configuration as well.
+///
+/// **`layout_hot_paths`** turns on frequency-driven block layout. It needs no
+/// profile to be worth having: [`static_branch_probs`] derives probabilities
+/// from loop structure alone -- a back edge closes a loop, and a loop is
+/// entered to be repeated; leaving the innermost loop is improbable by exactly
+/// its trip count -- which is enough to sink cold subtrees past the loop
+/// bodies. That matters more in this tier than in most, because the optimizing
+/// tier lays out exception and rare-branch blocks INLINE with hot loop code
+/// today.
+///
+/// **`priority_within_blocks`** list-schedules the pure nodes inside a block by
+/// critical path instead of plain dependence order. The reason to want it is on
+/// the record with a number: `docs/JIT_OPTIMIZATION.md` traced this tier's
+/// residual 1.36x to a dependency chain of store-then-load pairs on the same
+/// slot two instructions apart, and showed that a probe with four INDEPENDENT
+/// accumulators shrank the gap to 1.18x. Reordering by critical path is the
+/// pass whose job is exactly that.
+///
+/// Both stages are TOTAL: each validates its own output (`validate_order`) and
+/// keeps the previous state on failure, recording the reason in
+/// [`Schedule::layout`]. So the failure mode of turning them on is the layout
+/// this tier already had.
+///
+/// `CRATONVM_JIT_IR_HOT_LAYOUT=0` and `CRATONVM_JIT_IR_LIST_SCHED=0` are the
+/// kill switches, separately, because the blast radii differ: one moves blocks
+/// and therefore every oop-map and safepoint position in the method, the other
+/// moves only pure nodes within a block.
+pub fn production_schedule_options() -> ScheduleOptions {
+    ScheduleOptions {
+        layout_hot_paths: hot_layout_enabled(),
+        priority_within_blocks: list_sched_enabled(),
+        ..ScheduleOptions::default()
+    }
+}
+
+/// Frequency-driven block layout in the production pipeline. **Default ON**
+/// since 2026-09-06; `CRATONVM_JIT_IR_HOT_LAYOUT=0` is the kill switch.
+pub fn hot_layout_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_HOT_LAYOUT").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// Critical-path list scheduling within a block. **Default ON** since
+/// 2026-09-06; `CRATONVM_JIT_IR_LIST_SCHED=0` is the kill switch.
+pub fn list_sched_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LIST_SCHED").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// Schedule the IR graph into basic blocks, with frequency-driven block layout
@@ -807,6 +879,9 @@ pub fn schedule_with_options(graph: &Graph, opts: &ScheduleOptions) -> Schedule 
     // touched.
     if opts.sink_pure_late || sink_late_enabled() {
         let (moved, reverted) = sink_pure_nodes(graph, &mut blocks, &mut node_to_block, &dom);
+        if moved > 0 {
+            crate::ir_evidence::note(crate::ir_evidence::Transform::SunkLate);
+        }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_SINK").is_some() {
             eprintln!("[ir-sink] moved={moved} reverted_for_safepoints={reverted}");
         }
