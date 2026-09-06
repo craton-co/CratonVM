@@ -17586,6 +17586,19 @@ impl GarbageCollector for G1Collector {
         // the rationale. No-op when `gpu-offload` is off.
         crate::vm_heap::wait_for_gpu_critical_drain();
 
+        // ----- Invariant: a published skip span holds NO ROOT ---------------
+        //
+        // The G1 twin of the generational sweep's check. G1's walks consume
+        // the same published list, so a stale span hides live objects from
+        // this collector too, and the netty `ObjectCleanerTest` reclamation
+        // reproduced 8/8 here as well. G1 holds the spans as ABSOLUTE
+        // `[start, end)` pairs rather than young-from offsets, which is the
+        // only difference; see `crate::heap::skip_spans_hold_no_root`.
+        //
+        // This is the once-per-collection site that has the roots in hand,
+        // before any of them are followed.
+        crate::heap::skip_spans_hold_no_root(&self.jit_tlab_skip_spans(), &roots[..], "g1");
+
         // 1. Check if mixed GC is needed. Bracket the inner collection in an
         //    `Instant` so we can feed the actual pause delta (milliseconds)
         //    into `update_ihop` below. Previously this site passed
