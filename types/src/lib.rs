@@ -1169,6 +1169,42 @@ pub mod gpu_jit_gate_census {
         }
     }
 
+    static TARGET_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+    static LATE_REGISTERED: AtomicU64 = AtomicU64::new(0);
+    static LATE_REGISTERED_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// One `invokestatic` target the gate could not judge because its
+    /// declaring class was not loaded yet — the module docs' "forward
+    /// references" limitation.
+    ///
+    /// Counted, never named: an ordinary VM boot walks past thousands, since
+    /// most classes a freshly-loaded caller mentions have never been touched.
+    /// The number that matters is [`note_late_registered`] below, which says
+    /// how many of these turned out to be real kernels the caller scan had
+    /// missed. This counter is here so a run where that number is zero can be
+    /// told from one where the question never arose.
+    #[inline]
+    pub fn note_target_unresolved() {
+        TARGET_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One kernel registered by the COMPILED dispatch helper rather than by a
+    /// caller scan — a target that was forward-referenced when its caller was
+    /// judged, and would have been dark for the life of the process before
+    /// 2026-09-06.
+    ///
+    /// Named, because this is the actionable half and the count is small by
+    /// construction: it fires once per kernel, not once per site or per call.
+    pub fn note_late_registered(target: String) {
+        LATE_REGISTERED.fetch_add(1, Ordering::Relaxed);
+        let mut v = LATE_REGISTERED_NAMES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if v.len() < MAX_NAMED && !v.iter().any(|t| *t == target) {
+            v.push(target);
+        }
+    }
+
     /// One caller NOT blocked because its eligible-looking callee fails a
     /// gate `try_dispatch` applies unconditionally. `target` is the
     /// callee, which is the interesting half: one bad target releases
@@ -1250,6 +1286,32 @@ pub mod gpu_jit_gate_census {
                 );
                 for t in BODY_REFUSED_NAMES.lock().unwrap_or_else(|p| p.into_inner()).iter() {
                     eprintln!("[cratonvm] gpu jit gate:   kernel-shaped, body refused: {t}");
+                }
+            }
+            // FORWARD REFERENCES. A target whose class was not loaded when
+            // its caller was scanned is skipped, and until 2026-09-06 that
+            // skip was terminal: nothing registered it, so
+            // `try_compiled_offload` memoized the site `NotKernel` and
+            // offload ended there for the life of the process. The helper now
+            // re-asks the gate once the class exists, and `late_registered`
+            // is what that recovered. A non-zero value is not a warning — it
+            // is the fix working.
+            let unresolved = TARGET_UNRESOLVED.load(Ordering::Relaxed);
+            let late = LATE_REGISTERED.load(Ordering::Relaxed);
+            if unresolved > 0 || late > 0 {
+                eprintln!(
+                    "[cratonvm] gpu jit gate: forward-referenced targets={unresolved} \
+                     (class not loaded when the caller was scanned), \
+                     late-registered kernels={late}"
+                );
+                for t in LATE_REGISTERED_NAMES
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                {
+                    eprintln!(
+                        "[cratonvm] gpu jit gate:   registered late, by the compiled site: {t}"
+                    );
                 }
             }
             let drains = DRAINS.load(Ordering::Relaxed);
