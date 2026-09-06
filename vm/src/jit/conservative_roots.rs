@@ -9310,6 +9310,80 @@ fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bo
         && off < layout.callee_saved_hi
 }
 
+/// Does the register-image remap rewrite the word at `off`?
+///
+/// Default: the callee-saved GPR image alone, which is what
+/// [`is_callee_saved_gpr_image`] answers and what the module comment above
+/// argues for at length.
+///
+/// `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE=1` widens it to the whole unverifiable
+/// tail (`off >= callee_saved_lo`). **A DIAGNOSTIC, and deliberately not a
+/// proposed default.** It exists because that module comment partitions the
+/// tail into one region something resumes from and three it calls dead or
+/// write-only, and that partition is an ARGUMENT rather than a measurement --
+/// while the instrument that looks like it could check it cannot: the
+/// stale-word census reports `resumed_from` as `is_callee_saved_gpr_image` and
+/// nothing else, so it reads `false` for all three of the regions in question
+/// by construction, and its zero is not an all-clear for them.
+///
+/// The experiment this enables is a single A/B on the reproducer in
+/// `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+/// §10.4 -- `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` on
+/// `io.netty.handler.ipfilter.UniqueIpFilterTest`, which SIGSEGVs 3 runs in 13
+/// with compiled code reading a decommitted span. If widening the write removes
+/// the crash, one of the three "dead" regions is read after all and the
+/// partition is wrong. If the crash survives, they are exonerated on this
+/// workload and the stale reference lives somewhere neither pass touches.
+///
+/// Stated cost of the widened arm, so nobody ships it by accident: it also
+/// rewrites the callee-saved XMM image, where an object-shaped bit pattern
+/// would be a double rather than a reference. `heap.is_object_address` vets
+/// every candidate against the arena bounds and the object-start bitmap, so a
+/// false positive needs a double whose bits are exactly a live young object's
+/// base -- unlikely, not impossible, and a reason this is off by default.
+///
+/// # THE ANSWER, measured 2026-09-06 -- widening changes NOTHING
+///
+/// | arm | crashes / runs | rate |
+/// |---|---|---|
+/// | default (callee-saved GPR image only) | **11 / 81** | 13.6 % |
+/// | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE=1` | **2 / 32** | 6.3 % |
+///
+/// Fisher p ~ 0.37 -- not a difference. Two interleaved matched batches on one
+/// binary (narrow 0/14 vs wide 2/14, then narrow 2/18 vs wide 0/18) land on
+/// either side of the pooled baseline, which is what a null result looks like
+/// when each batch is read on its own; the first batch alone reads as "widening
+/// makes it worse" and that was wrong.
+///
+/// So `operand-spill`, `safepoint-gpr-spill-image` and
+/// `outgoing-args-or-deopt-regs` are **not** where this defect's repair goes:
+/// rewriting every one of them does not move the crash rate. That is a negative
+/// result worth keeping, because the blind GPR spill area is one of the three
+/// storage classes `moving-young-corruption-rootcause.md` nominates and this
+/// eliminates it on this workload.
+///
+/// The flag stays for the next person who wants to re-ask the question on a
+/// different workload -- it is a few lines and it is off by default -- but it
+/// is NOT a candidate fix and should not be flipped on.
+#[inline]
+fn register_image_remap_admits(off: i32, layout: &cratonvm_jit::FrameLayout) -> bool {
+    if is_callee_saved_gpr_image(off, layout) {
+        return true;
+    }
+    remap_all_unverifiable()
+        && layout.callee_saved_hi > layout.callee_saved_lo
+        && off >= layout.callee_saved_lo
+}
+
+/// `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE=1` -- see
+/// [`register_image_remap_admits`]. Default off.
+fn remap_all_unverifiable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE").is_some()
+    })
+}
+
 /// Rewrite the moved references held in one frame's callee-saved GPR image.
 fn remap_one_frame_register_images(
     rbp: usize,
@@ -9337,7 +9411,7 @@ fn remap_one_frame_register_images(
     while addr + 8 <= rbp {
         // Cast: a compiled frame is far smaller than i32::MAX bytes.
         let off = (rbp - addr) as i32;
-        if !is_callee_saved_gpr_image(off, &cm.frame_layout) {
+        if !register_image_remap_admits(off, &cm.frame_layout) {
             // Everything else is either VERIFIED storage -- where an
             // unpublished movable oop has already forced the non-moving sweep
             // and a published one was rewritten by `remap_one_jit_frame` -- or

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-528 tokens.
+529 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -379,6 +379,7 @@ export inherited from a parent shell.
 | `monenter` | `CRATONVM_DBG_MONENTER` |
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
 | `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
+| `jit-remap-all-unverifiable` | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
 | `moving-young-no-band-verify` | `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` |
@@ -594,7 +595,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-375 tokens.
+376 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -817,6 +818,7 @@ export inherited from a parent shell.
 | `osr-strip-all-high-halves` | `CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES` |
 | `osr-single-pc` | `CRATONVM_JIT_OSR_SINGLE_PC` |
 | `poison-free` | `CRATONVM_JIT_POISON_FREE` |
+| `post-tlab-hash-stamp` | `CRATONVM_JIT_POST_TLAB_HASH_STAMP` |
 | `precise-coverage-pin` | `CRATONVM_PRECISE_COVERAGE_PIN` |
 | `callee-handler-precise-frame` | `CRATONVM_NO_JIT_CALLEE_HANDLER_PRECISE_FRAME` |
 | `precise-handler-frames` | `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES` |
