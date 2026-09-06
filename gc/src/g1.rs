@@ -9090,8 +9090,11 @@ impl G1Collector {
             return declared;
         }
         // The holder may be humongous: walk forward across continuation slices
-        // so a legitimately large array is not clamped.
-        let mut idx = (addr - self.arena_base) / region_size;
+        // so a legitimately large array is not clamped. Shift, not `div` — see
+        // the note in `classify_candidate_header_view`; this one is called once
+        // per HOLDER rather than once per reference, but it is the same
+        // argument and the two should not drift.
+        let mut idx = (addr - self.arena_base) >> self.region_shift;
         let Some(start) = regions.get(idx) else {
             return declared;
         };
@@ -9177,7 +9180,14 @@ impl G1Collector {
         if region_size == 0 {
             return (HeaderVerdict::NoRegionGeometry, None);
         }
-        let idx = (addr - self.arena_base) / region_size;
+        // F-09's shift, not a `div`. This screen was a cold path when it was
+        // written — a few conservative roots per pause — and became a HOT one
+        // on 2026-09-05, when the parallel evacuator (the DEFAULT arm) started
+        // calling it once per CSet-bound reference. `region_size` is a runtime
+        // value, so `/` compiles to a real 64-bit `div`: tens of cycles,
+        // unpipelined. `lookup_region_for_addr` already carries the note and
+        // the `normalize_region_size` argument that licenses the shift.
+        let idx = (addr - self.arena_base) >> self.region_shift;
         let Some(r) = regions.get(idx) else {
             return (HeaderVerdict::NoSuchRegion, None);
         };
