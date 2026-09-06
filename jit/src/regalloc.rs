@@ -4465,6 +4465,43 @@ fn ls_ctrl_block_of(graph: &Graph, schedule: &Schedule, mut ctrl: NodeId) -> Opt
     None
 }
 
+/// Make a phi interfere with the sources read on its incoming edges --
+/// **DEFAULT ON** since 2026-09-06; `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=0` is
+/// the kill switch.
+///
+/// It shipped opt-in for one day because it is a register-pressure change and
+/// the first numbers came from a synthetic probe. They were the wrong numbers:
+/// that probe is built to CONTAIN the aliasing, so extending intervals there
+/// genuinely adds interference (+2 spills, +3 reloads). On code that does not
+/// alias, extending a phi's interval by one position changes nothing, and the
+/// measurement that matters is the deterministic one.
+///
+/// `CratonBench`, all seven phases, allocator counters (load-proof, unlike
+/// wall clock on a shared host):
+///
+/// ```text
+///   arithmetic fib sieve matrix hashmap stringregex   IDENTICAL off vs on
+///   bintrees   splits 23->21  scan_reloads 10->7  reg_publishes 4->6
+/// ```
+///
+/// Six of seven byte-identical; the seventh allocates BETTER. The timing arm
+/// over the same phases spread 0.910-1.035 with `publish_deferred` at zero on
+/// every one of them -- i.e. the flag provably could not have done anything,
+/// so that spread is this host's noise floor and not a cost.
+///
+/// Engagement is real and not synthetic. `publish_deferred` with the flag off,
+/// on netty: `DefaultPromiseTest` 8, `ByteBufUtilTest` 2 -- both 0 with it on.
+/// That is the aliasing actually occurring in shipped code, which is also what
+/// says the two downstream guards (`emit_phi_copies`'s deferral screen and
+/// `gp_reg_owner`'s reader interlock) are load-bearing rather than theoretical.
+/// They stay: this removes the CAUSE, they catch anything that still mints one.
+fn phi_edge_interfere_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_EDGE_INTERFERE") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 /// Build the liveness model for one scheduled graph.
 ///
 /// Total: never panics, never fails. See [`LiveModel`] for the fallback when
@@ -4665,6 +4702,37 @@ pub fn build_live_model(graph: &Graph, schedule: &Schedule) -> LiveModel {
                     uses[vi].push(at);
                     weight[vi] = weight[vi].saturating_add(pos_weight(at));
                     ls_bit_set(&mut phi_out_bits[pred * words..(pred + 1) * words], vi);
+
+                    // OPT-IN (`CRATONVM_JIT_IR_PHI_EDGE_INTERFERE=1`): the phi
+                    // is DEFINED at this same position, so extend its interval
+                    // back to it and let the allocator see that it overlaps
+                    // every source read on this edge.
+                    //
+                    // Without this the two do not interfere by the allocator's
+                    // reckoning -- a phi's range begins at its def in the merge
+                    // block, a dying source's ends here -- so one register can
+                    // serve both, and `ir_lower::emit_copy_op`'s publish then
+                    // overwrites a register a later copy still has to read.
+                    // That is the 2026-09-05 wrong-code bug two lanes fixed
+                    // downstream (`emit_phi_copies`'s deferral screen, and
+                    // `gp_reg_owner`'s reader interlock). This is the same bug
+                    // taken at the source, where the false "no interference"
+                    // is minted.
+                    //
+                    // Only `lo` moves, and deliberately: the phi is not USED
+                    // here, so pushing a use would distort the spill
+                    // heuristics, and setting `phi_out_bits` would make the phi
+                    // live-OUT of a block that does not define it -- which the
+                    // backward dataflow below would then propagate live-IN
+                    // through every predecessor, turning a one-position
+                    // extension into a whole-CFG one.
+                    if phi_edge_interfere_enabled() {
+                        let pi = pid as usize;
+                        if pi < n && wants_loc[pi] {
+                            lo[pi] = lo[pi].min(at);
+                            hi[pi] = hi[pi].max(at);
+                        }
+                    }
                 }
             }
         }

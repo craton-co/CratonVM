@@ -545,7 +545,17 @@ fn native_redefine_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         let elem = match ctx.get_array_element(arr, i) {
             Value::Object(Some(o)) => o,
-            _ => continue,
+            // Reported, not swallowed — the same rule the retransform twin
+            // now follows. A dropped element is a class the agent asked to
+            // redefine and did not get, with no exception to say so.
+            other => {
+                eprintln!(
+                    "[instrument] redefineClasses0: element {i} of {n} is not a \
+                     ClassDefinition ({other:?}); that class is NOT redefined and the \
+                     agent is not told"
+                );
+                continue;
+            }
         };
         let elem_pin = ctx.pin_native_root(elem);
         let class_mirror = read_class_def_field(ctx, elem, "mClass", 0);
@@ -554,11 +564,20 @@ fn native_redefine_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             Some(m) => match ctx.class_id_from_mirror(m) {
                 Some(cid) => (m, cid),
                 None => {
+                    eprintln!(
+                        "[instrument] redefineClasses0: element {i} of {n} has a mClass \
+                         with no class id; that class is NOT redefined and the agent is \
+                         not told"
+                    );
                     ctx.unpin_native_roots(elem_pin);
                     continue;
                 }
             },
             None => {
+                eprintln!(
+                    "[instrument] redefineClasses0: element {i} of {n} has no mClass; \
+                     that definition is NOT applied and the agent is not told"
+                );
                 ctx.unpin_native_roots(elem_pin);
                 continue;
             }
@@ -567,6 +586,10 @@ fn native_redefine_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let bytes_obj = match bytes_arr {
             Some(o) => o,
             None => {
+                eprintln!(
+                    "[instrument] redefineClasses0: element {i} of {n} has no mClassFile; \
+                     that definition is NOT applied and the agent is not told"
+                );
                 ctx.unpin_native_roots(elem_pin);
                 continue;
             }
@@ -1205,6 +1228,53 @@ fn run_chain_over_bytes(
         );
         return Vec::new();
     }
+    // The SNAPSHOT's own transformer refs, pinned before anything allocates.
+    //
+    // HARDENING, NOT A FIXED CRASH — read the last paragraph before believing
+    // this closed something that was firing.
+    //
+    // `scan_transformer_roots` + `remap_transformer_refs` keep the CANONICAL
+    // chain correct across a moving collection, and their comment names the
+    // exact failure they exist to stop: a surviving `transformer_ref` left
+    // "pointing at the object's *old* address after compaction ... a dispatch
+    // onto a relocated object the next time `run_transformer_chain` invokes
+    // `transform`".
+    //
+    // That guard does not reach this walk. It iterates
+    // `snapshot_transformer_chain`, which is `chain.to_vec()` — a COPY the
+    // collector has never heard of, so the remap does not rewrite it. Every
+    // entry after the first is therefore held across the PREVIOUS
+    // transformer's `transform` call, which runs Java and allocates. If a
+    // collection relocates a transformer object in that window, the canonical
+    // chain follows it and this snapshot does not.
+    // `a_snapshot_taken_before_a_relocation_keeps_the_old_address` is that
+    // half, asserted.
+    //
+    // The snapshot is kept — it is what makes the walk stable against a
+    // transformer that registers or removes another mid-chain — but its refs
+    // are now read back through pins rather than used raw. Pinned first so a
+    // single `unpin_native_roots` at the bottom releases these and the three
+    // below with them.
+    //
+    // NOT DEMONSTRATED FIRING (2026-09-06). A probe that puts an allocating
+    // transformer ahead of Mockito's in the chain, churns ~6 GB through it and
+    // calls `System.gc()` twice inside the `transform` call, was clean 20/20
+    // on a pristine-dev control as well as here. The transformer object is
+    // registered once and long-lived, so reaching it needs an OLD-GEN
+    // compaction inside a transform call, which that probe never produced.
+    // What is established is the shape: the identical unpinned-across-Java
+    // hazard one level up — the `Class[]` in the two loops below — moved
+    // before `i=1` in 60 of 60 processes and cost ~12% of them a
+    // half-instrumented mock. This is the same reference discipline applied
+    // one level down, at the cost of one pin per registered transformer.
+    let transformer_pins: Vec<usize> = rust_chain
+        .iter()
+        .map(|entry| ctx.pin_native_root(entry.transformer_ref))
+        .collect();
+    // `rust_chain` is non-empty here (the early return above), so this is
+    // always `Some` and is the lowest pin index this function takes.
+    let unpin_from = transformer_pins[0];
+
     // Resolve constants used on every iteration once.
     //
     // All three live across `alloc_byte_array` and the `transform` call below,
@@ -1224,7 +1294,7 @@ fn run_chain_over_bytes(
     //    a native, see [`register_instrumentation_natives`]), or via
     //    the internal `addTransformer0`, or via the in-process
     //    [`cratonvm.Instrument.addTransformer`] bridge).
-    for entry in rust_chain {
+    for (slot, entry) in rust_chain.iter().enumerate() {
         if retransform_only && !entry.can_retransform {
             continue;
         }
@@ -1252,7 +1322,10 @@ fn run_chain_over_bytes(
         ];
         let descriptor = "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;\
                           Ljava/security/ProtectionDomain;[B)[B";
-        let result = ctx.invoke_virtual(entry.transformer_ref, "transform", descriptor, &args);
+        // Read back through the pin, not out of the snapshot: by this point
+        // every earlier transformer in this chain has run Java.
+        let transformer = ctx.read_native_pin(transformer_pins[slot], entry.transformer_ref);
+        let result = ctx.invoke_virtual(transformer, "transform", descriptor, &args);
         let dbg = cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok();
         match result {
             Ok(Some(Value::Object(Some(out_obj)))) => {
@@ -1296,7 +1369,7 @@ fn run_chain_over_bytes(
             }
         }
     }
-    ctx.unpin_native_roots(name_pin);
+    ctx.unpin_native_roots(unpin_from);
     bytes_vec
 }
 
@@ -2600,27 +2673,76 @@ mod tests {
         }
     }
 
-    /// The element read out of that array is itself carried across the
-    /// transformer chain, so it needs the same treatment. Asserted separately
-    /// because the array pin alone does not cover it: a relocation between the
-    /// element read and `run_transformer_chain` moves the mirror, not the
+    /// The class reference read out of that array is itself carried across
+    /// the transformer chain, so it needs the same treatment. Asserted
+    /// separately because the array pin alone does not cover it: a relocation
+    /// between the element read and the chain call moves the mirror, not the
     /// array.
+    ///
+    /// Both loops, because they are twins and the twin is where a fix stops
+    /// being applied — `native_redefine_classes0` reaches the same chain with
+    /// the same shape and had the same hazard.
     #[test]
-    fn the_retransform_loop_refreshes_the_mirror_before_running_the_chain() {
-        let body = fn_body("native_retransform_classes0");
+    fn both_loops_refresh_the_class_reference_before_running_the_chain() {
+        for (name, pin_call, refresh_call) in [
+            (
+                "native_retransform_classes0",
+                "pin_native_root(mirror)",
+                "read_native_pin(mirror_pin, mirror)",
+            ),
+            (
+                "native_redefine_classes0",
+                "pin_native_root(target_class)",
+                "read_native_pin(class_pin, target_class)",
+            ),
+        ] {
+            let body = fn_body(name);
+            let pin = body
+                .find(pin_call)
+                .unwrap_or_else(|| panic!("{name}: the class reference must be pinned"));
+            let refresh = body.find(refresh_call).unwrap_or_else(|| {
+                panic!("{name}: the class reference must be re-read from its pin")
+            });
+            let chain = body
+                .find("run_transformer_chain(")
+                .unwrap_or_else(|| panic!("{name}: the transformer chain call is gone"));
+            assert!(
+                pin < refresh && refresh < chain,
+                "{name}: pin, then refresh, then hand to the chain \
+                 (pin={pin} refresh={refresh} chain={chain})"
+            );
+        }
+    }
+
+    /// The chain walk holds a SNAPSHOT of the transformer list across every
+    /// `transform` call in it, and each of those runs Java. The canonical
+    /// chain is a GC root and is remapped; the snapshot is not — see
+    /// `a_snapshot_taken_before_a_relocation_keeps_the_old_address`. So each
+    /// ref must be pinned and read back, and the `invoke_virtual` must use the
+    /// value that came out of the pin rather than the one in the snapshot.
+    ///
+    /// One registered transformer hides this completely, which is why it has
+    /// to be a witness: the common case (Mockito alone) never has a second
+    /// entry to dispatch on.
+    #[test]
+    fn the_chain_walk_dispatches_on_a_pinned_transformer_not_the_snapshot() {
+        let body = fn_body("run_chain_over_bytes");
         let pin = body
-            .find("pin_native_root(mirror)")
-            .expect("the class mirror must be pinned");
-        let refresh = body
-            .find("read_native_pin(mirror_pin, mirror)")
-            .expect("the class mirror must be re-read from its pin");
-        let chain = body
-            .find("run_transformer_chain(")
-            .expect("the transformer chain call is gone");
+            .find("pin_native_root(entry.transformer_ref)")
+            .expect("every transformer ref in the snapshot must be pinned");
+        let read = body
+            .find("read_native_pin(transformer_pins[slot], entry.transformer_ref)")
+            .expect("each transformer ref must be read back through its pin");
+        let call = body
+            .find("invoke_virtual(transformer,")
+            .expect("the dispatch must use the value read out of the pin");
         assert!(
-            pin < refresh && refresh < chain,
-            "the mirror must be pinned, then refreshed, then handed to the chain \
-             (pin={pin} refresh={refresh} chain={chain})"
+            pin < read && read < call,
+            "pin, then read back, then dispatch (pin={pin} read={read} call={call})"
+        );
+        assert!(
+            !body.contains("invoke_virtual(entry.transformer_ref"),
+            "the dispatch must not use the snapshot's raw ref"
         );
     }
 
@@ -3099,6 +3221,51 @@ mod tests {
         let snap = snapshot_transformer_chain(vm);
         assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x9000);
         assert_eq!(snap[1].transformer_ref.as_ptr() as usize, 0x2000);
+        forget_vm_transformers(vm);
+    }
+
+    /// A snapshot taken BEFORE a collection is not repaired by it — which is
+    /// the whole reason `run_chain_over_bytes` pins the refs it walks.
+    ///
+    /// `remap_transformer_refs` rewrites the CANONICAL chain; a
+    /// `snapshot_transformer_chain` result is a `to_vec()` copy the collector
+    /// has never heard of. The chain walk holds such a copy across every
+    /// transformer's `transform` call, each of which runs Java and allocates,
+    /// so without a pin the second and later entries would be dispatched on a
+    /// dead address. That is the failure `scan_transformer_roots`'s own doc
+    /// comment describes and that the canonical remap alone does not prevent.
+    ///
+    /// This asserts the staleness rather than the fix, deliberately: if the
+    /// snapshot ever DOES get remapped this test fails and whoever made that
+    /// true can retire the pins with evidence.
+    #[test]
+    fn a_snapshot_taken_before_a_relocation_keeps_the_old_address() {
+        let vm = unique_vm();
+        add_transformer_entry(
+            vm,
+            TransformerEntry {
+                transformer_ref: fake_objref(0x4000),
+                can_retransform: true,
+                native_method_prefix: None,
+            },
+        );
+        let stale = snapshot_transformer_chain(vm);
+
+        let mut map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
+        map.insert(0x4000, 0xA000);
+        remap_transformer_refs(vm, &map);
+
+        assert_eq!(
+            snapshot_transformer_chain(vm)[0].transformer_ref.as_ptr() as usize,
+            0xA000,
+            "the canonical chain must follow the relocation"
+        );
+        assert_eq!(
+            stale[0].transformer_ref.as_ptr() as usize,
+            0x4000,
+            "a snapshot taken earlier is NOT rewritten — so a walk over one must \
+             read its refs back through a pin, not use them raw"
+        );
         forget_vm_transformers(vm);
     }
 

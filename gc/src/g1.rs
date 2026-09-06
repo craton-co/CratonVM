@@ -371,6 +371,24 @@ fn for_each_flat_object_reference_capped(
     }
 }
 
+/// How many objects the parallel evacuator placed in an EXISTING destination
+/// region after its Free pool ran out, instead of failing the evacuation.
+///
+/// Every one of these was an evacuation FAILURE before 2026-09-06 — a
+/// self-forward, a kept CSet region, and a `retry_after_evacuation_failure`
+/// pass — while the serial arm would have found the same space.
+pub static PARALLEL_SHARED_DEST_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the parallel evacuator's TLAB allocator ran out of POOL —
+/// the Free regions reserved before the dispatch — and sent an object down the
+/// evacuation-failure path.
+///
+/// Its serial twin does not fail at the same point: it first scans every
+/// existing non-CSet region of the destination type. A non-zero count here
+/// beside a non-zero `with_room` in the report means the parallel arm declared
+/// to-space exhaustion while to-space still had room.
+pub static PARALLEL_TLAB_POOL_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
+
 /// Rate-limit counter for the corrupt-cell holder report above.
 static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -957,6 +975,124 @@ enum HolderBound {
     RegionEnd,
 }
 
+/// Every to-space copy this pause made, as it looked the instant it was made.
+///
+/// `CRATONVM_G1_EVAC_COPY_WATCH=1` only. The question it exists to answer is
+/// the one `g1-eight-byte-write-at-a-live-objects-base-20260906` could not:
+/// the corrupt holders that walk reports find are TO-SPACE COPIES whose
+/// `class_id`/`shape` dword pair — the object's first eight bytes — has become
+/// a pointer into this arena, with the mark word at +8 intact. Whether they
+/// were sound when `evacuate` copied them was an INFERENCE (candidates screen
+/// clean, holders do not). This makes it a timestamp.
+///
+/// Recording is a push per copy under one lock, which is why it is opt-in: the
+/// point is to be able to run it, not to run it always.
+#[derive(Default)]
+struct CopyWatch {
+    /// `(addr, src, class_id, shape, region_idx, reuse_epoch)` at the moment
+    /// of the copy. The SOURCE is recorded so a mismatch names the from-space
+    /// object it came from; the REGION and its reuse epoch are recorded so the
+    /// cross-pause checkpoint can drop an entry whose region has since been
+    /// freed and handed out again — that is a legitimate change, not a write.
+    entries: Mutex<Vec<(usize, usize, u32, u32, usize, u64)>>,
+    /// How many mismatches each checkpoint found, so a later checkpoint does
+    /// not re-report what an earlier one already did.
+    reported: AtomicUsize,
+}
+
+impl CopyWatch {
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn note_copy(
+        &self,
+        addr: usize,
+        src: usize,
+        class_id: u32,
+        shape: u32,
+        region_idx: usize,
+        reuse_epoch: u64,
+    ) {
+        self.entries
+            .lock()
+            .push((addr, src, class_id, shape, region_idx, reuse_epoch));
+    }
+
+    /// Drop every recorded entry. The cross-pause checkpoint verifies the
+    /// PREVIOUS pause's copies and then starts again, so one pause's worth of
+    /// entries is the most this ever holds.
+    fn clear(&self) {
+        self.entries.lock().clear();
+    }
+
+    /// Re-read every recorded copy's first word and say which ones changed.
+    ///
+    /// `label` names the interval that just closed. Two checkpoints separate
+    /// "a worker did it during the closure" from "the serial drain did it",
+    /// which is the split that decides where to look next.
+    fn verify(
+        &self,
+        label: &'static str,
+        arena: std::ops::Range<usize>,
+        regions: Option<RegionView<'_>>,
+    ) {
+        let entries = self.entries.lock();
+        let mut changed = 0usize;
+        let mut skipped = 0usize;
+        let mut first: Vec<String> = Vec::new();
+        for &(addr, src, cid, shape, ridx, epoch) in entries.iter() {
+            // CROSS-PAUSE ONLY: a region that has been freed and handed out
+            // again since the copy legitimately holds different bytes. Dropping
+            // those is what keeps this checkpoint from reporting the collector
+            // doing its job. `regions = None` is the in-pause case, where no
+            // region can have been recycled yet.
+            if let Some(view) = regions {
+                match view.get(ridx) {
+                    Some(r) if r.region_type != RegionType::Free && r.reuse_epoch == epoch => {}
+                    _ => {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            // SAFETY: `addr` is a to-space copy this pause made; the pause is
+            // still open, so the region is still typed and mapped.
+            let h = unsafe { &*(addr as *const ObjectHeader) };
+            let (now_cid, now_shape) = (h.class_id.as_u32(), h.num_slots());
+            if now_cid == cid && now_shape == shape {
+                continue;
+            }
+            changed += 1;
+            if first.len() < 8 {
+                let paired = (now_cid as u64) | ((now_shape as u64) << 32);
+                first.push(format!(
+                    "obj=0x{addr:x} was(class_id={cid} shape={shape})                      now(class_id={now_cid} shape={now_shape})                      paired=0x{paired:016x} pair_is_arena_pointer={}                      mark=0x{:016x}",
+                    arena.contains(&(paired as usize)),
+                    h.mark_word.load(Ordering::Relaxed),
+                ));
+            }
+        }
+        let _ = skipped;
+        if changed == 0 {
+            // WARN, not INFO. At the default level an `info!` here is invisible,
+            // and "0 changed" then reads exactly like "the checkpoint never
+            // ran" — which is the one thing a reader must be able to tell
+            // apart, because a clean result is the interesting one here.
+            tracing::warn!(
+                "[g1][copy-watch] {label}: {} copies, 0 changed since the copy                  ({skipped} skipped as legitimately recycled).",
+                entries.len()
+            );
+            return;
+        }
+        self.reported.fetch_add(changed, Ordering::Relaxed);
+        tracing::error!(
+            "[g1][copy-watch] {label}: {changed} of {} to-space copies had their FIRST WORD              rewritten after `evacuate` copied them. `class_id`(4)+`shape`(4) IS that word, so              every one of these is an eight-byte write at a live object's base, inside this              pause, in the interval this checkpoint closes. First few: {}",
+            entries.len(),
+            first.join(" | "),
+        );
+        let _ = skipped;
+    }
+}
+
 /// Read-only access to the region table for the screens BOTH evacuators share.
 ///
 /// The serial arm holds the regions guard and can hand out a `&[G1Region]`.
@@ -1281,6 +1417,11 @@ struct SharedEvac<'a> {
     cset: &'a RegionSet,
     /// Free-region indices available for to-space TLAB claiming.
     pool: &'a [usize],
+    /// [`Self::pool`] as a membership test. A region in the pool is, or is
+    /// about to be, some worker's exclusively-owned TLAB, and `retire_tlab`
+    /// STORES its cursor — so the shared-destination fallback below must never
+    /// bump-allocate into one, or that store would clobber the bump.
+    pool_set: &'a RegionSet,
     /// Lock-free claim cursor into `pool`.
     pool_next: &'a AtomicUsize,
     /// Gray-object work queue (to-space addresses awaiting a ref scan).
@@ -1289,6 +1430,8 @@ struct SharedEvac<'a> {
     outstanding: &'a AtomicUsize,
     /// Tenuring threshold copied from the collector config.
     promotion_age: u8,
+    /// `CRATONVM_G1_EVAC_COPY_WATCH=1` only; see [`CopyWatch`].
+    copy_watch: Option<&'a CopyWatch>,
 }
 
 impl<'a> SharedEvac<'a> {
@@ -1413,6 +1556,76 @@ impl<'a> SharedEvac<'a> {
             }
             let i = self.pool_next.fetch_add(1, Ordering::Relaxed);
             if i >= self.pool.len() {
+                // TO-SPACE EXHAUSTION — but exhaustion of WHAT?
+                //
+                // This arm can only ever allocate out of `pool`, the Free
+                // regions reserved before the dispatch. Its serial twin
+                // `alloc_in_type_locked_scan` first scans EVERY existing
+                // non-CSet region of the destination type and bump-allocates
+                // into a partially-filled one, and only then claims a Free
+                // region. So the two arms do not run out at the same time, and
+                // the difference is not a detail: returning `None` here sends
+                // the object down the evacuation-FAILURE path (self-forward,
+                // kept region, `retry_after_evacuation_failure`), which is a
+                // different and much more fragile machine than a copy.
+                //
+                // The number that decides whether that gap is real is how much
+                // room the serial arm WOULD have found at this instant, so
+                // count it here rather than reasoning about it. Rate-limited
+                // and only on the failure path, so a healthy pause pays
+                // nothing.
+                // FALL BACK THE WAY THE SERIAL ARM ALREADY DOES.
+                //
+                // `alloc_in_type_locked_scan` scans every existing non-CSet
+                // region of the destination type and bump-allocates into a
+                // partially-filled one BEFORE it claims a Free region. This arm
+                // only ever had the Free pool, so it declared to-space
+                // exhaustion — and sent the object down the evacuation-FAILURE
+                // path — while to-space was still there. MEASURED 2026-09-06 on
+                // `TestHostConfigAutomaticDeploymentXmlExternalWarXml`:
+                //
+                //   EXHAUSTED ITS POOL: dest_type=Old size=48 pool_len=1
+                //     — but 2017 of 2025 non-CSet Old regions still have room
+                //
+                // for a FORTY-EIGHT byte promotion, and zero such events on the
+                // serial arm in the same census.
+                //
+                // `bump_alloc` takes `&self` and advances the cursor with a
+                // compare-exchange (F-11 made it atomic for exactly this), so a
+                // shared destination is inside the module's discipline — it is
+                // the "atomically-CAS shared regions" half, extended from CSet
+                // regions to destination ones. What it is NOT is a TLAB: a TLAB
+                // owns its region's cursor and `retire_tlab` STORES it, so this
+                // path deliberately leaves `tlab` untouched and hands back one
+                // object's worth of space.
+                if gc_flags().g1_parallel_evac_shared_dest {
+                    if let Some(p) = self.shared_dest_alloc(tlab.dest_type, size) {
+                        return Some(p);
+                    }
+                }
+                let n = PARALLEL_TLAB_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    let mut with_room = 0usize;
+                    let mut of_type = 0usize;
+                    for idx in 0..self.regions_len {
+                        // SAFETY: `idx < regions_len`; a shared read of one
+                        // region, exactly as `seed_source_region` takes.
+                        let r = &*self.regions_base.0.add(idx);
+                        if r.region_type != tlab.dest_type || self.cset.contains(&idx) {
+                            continue;
+                        }
+                        of_type += 1;
+                        if r.data.len().saturating_sub(r.cursor()) >= size {
+                            with_room += 1;
+                        }
+                    }
+                    tracing::warn!(
+                        "[g1] parallel evacuation EXHAUSTED ITS POOL (#{n}): dest_type={:?}                          size={size} pool_len={} — but {with_room} of {of_type} non-CSet                          {:?} regions still have room for it. The SERIAL evacuator                          (`alloc_in_type_locked_scan`) scans those before claiming a Free                          region; this arm never does, so it fails over to the                          evacuation-FAILURE path while to-space is still available.                          `with_room > 0` means the two arms disagree about whether this                          pause is out of space.",
+                        tlab.dest_type,
+                        self.pool.len(),
+                        tlab.dest_type,
+                    );
+                }
                 return None;
             }
             let idx = self.pool[i];
@@ -1445,6 +1658,40 @@ impl<'a> SharedEvac<'a> {
             tlab.len = region.data.len();
             tlab.offset = 0;
         }
+    }
+
+    /// One object's worth of space in an EXISTING non-CSet region of
+    /// `dest_type`, for when the Free pool is gone.
+    ///
+    /// Skips the pool entirely: every region in it is, or is about to become, a
+    /// worker's TLAB, and `retire_tlab` stores that TLAB's offset as the
+    /// region's cursor — a store that would silently discard anything this
+    /// path bumped into the same region. Skips CSet regions for the reason
+    /// `alloc_in_type_locked_scan` spells out: Phase 5 frees them, so a copy
+    /// placed there is lost and every reference to it dangles.
+    unsafe fn shared_dest_alloc(&self, dest_type: RegionType, size: usize) -> Option<usize> {
+        for idx in 0..self.regions_len {
+            if self.pool_set.contains(&idx) || self.cset.contains(&idx) {
+                continue;
+            }
+            // SAFETY: `idx < regions_len`; a shared read, and `bump_alloc`
+            // takes `&self` and is a CAS.
+            let r = &*self.regions_base.0.add(idx);
+            if r.region_type != dest_type {
+                continue;
+            }
+            // F-16: under a reserved heap a region may be address space rather
+            // than memory. An in-use region of the destination type is already
+            // committed, but ask rather than assume.
+            if !self.collector.commit_through_region(idx) {
+                continue;
+            }
+            if let Some((ptr, _)) = r.bump_alloc(size, 8, "parallel-evac:shared-dest") {
+                PARALLEL_SHARED_DEST_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                return Some(ptr as usize);
+            }
+        }
+        None
     }
 
     /// Write a TLAB's final bump cursor back to its region and clear the TLAB.
@@ -1586,6 +1833,29 @@ impl<'a> SharedEvac<'a> {
                 ) {
                     Ok(_) => {
                         forwards.push((old, old));
+                        // The evacuation-FAILURE arm. The first version of this
+                        // watch recorded only the normal-copy winner and so
+                        // could not see the objects an OOM-ing run actually
+                        // produces — this arm is the one to-space exhaustion
+                        // takes, and its objects are queued and walked in
+                        // place, in from-space, exactly like a copy.
+                        if let Some(w) = self.copy_watch {
+                            let h = &*(old_ptr as *const ObjectHeader);
+                            let ridx = self
+                                .collector
+                                .lookup_region_for_addr(old)
+                                .unwrap_or(usize::MAX);
+                            let epoch =
+                                self.view().get(ridx).map(|r| r.reuse_epoch).unwrap_or(0);
+                            w.note_copy(
+                                old,
+                                old,
+                                h.class_id.as_u32(),
+                                h.num_slots(),
+                                ridx,
+                                epoch,
+                            );
+                        }
                         Some((old_ptr, true))
                     }
                     // A racing worker got there first. Its word is FORWARDED by
@@ -1645,6 +1915,25 @@ impl<'a> SharedEvac<'a> {
                 forwards.push((old_ptr as usize, new_addr));
                 *objs += 1;
                 *bytes += obj_size;
+                // Record the copy AFTER winning the CAS, so the watch holds
+                // exactly the copies this pause published — a CAS loser's
+                // speculative copy is abandoned to-space garbage and its later
+                // contents mean nothing.
+                if let Some(w) = self.copy_watch {
+                    let ridx = self
+                        .collector
+                        .lookup_region_for_addr(new_addr)
+                        .unwrap_or(usize::MAX);
+                    let epoch = self.view().get(ridx).map(|r| r.reuse_epoch).unwrap_or(0);
+                    w.note_copy(
+                        new_addr,
+                        old_ptr as usize,
+                        new_header.class_id.as_u32(),
+                        new_header.num_slots(),
+                        ridx,
+                        epoch,
+                    );
+                }
                 Some((new_ptr, true))
             }
             // The loser must DECODE the winner's word. `compare_exchange`
@@ -7701,6 +7990,30 @@ impl G1Collector {
                 );
             }
         }
+        // `CRATONVM_G1_EVAC_COPY_WATCH=1` only; see [`CopyWatch`]. Declared here
+        // so it outlives `shared` and can be verified at two checkpoints.
+        // A PROCESS static, not a per-pause local. The in-pause checkpoints
+        // measured 0 of 374k and 0 of 401k copies rewritten, so the interval
+        // that matters is the one BETWEEN pauses: if a copy this pause made is
+        // corrupt when the next pause starts, the writer is not the collector.
+        static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
+        let copy_watch: Option<&CopyWatch> = gc_flags()
+            .g1_evac_copy_watch
+            .then(|| COPY_WATCH.get_or_init(CopyWatch::default));
+        let arena = self.arena_base..self.arena_end;
+        // CHECKPOINT 0 — the previous pause's copies, re-read before this pause
+        // touches anything. Entries whose region has been recycled since are
+        // dropped rather than reported.
+        if let Some(w) = copy_watch {
+            w.verify(
+                "at the START of the next pause",
+                arena.clone(),
+                Some(RegionView::Raw(regions_base, regions_len)),
+            );
+            w.clear();
+        }
+        // Membership test for the reserved pool; see `SharedEvac::pool_set`.
+        let pool_set: RegionSet = pool.iter().copied().collect();
         let pool_next = AtomicUsize::new(0);
         let queue: Mutex<Vec<usize>> = Mutex::new(Vec::new());
         let outstanding = AtomicUsize::new(0);
@@ -7710,6 +8023,7 @@ impl G1Collector {
             regions_len,
             cset: cset_set,
             pool: &pool,
+            pool_set: &pool_set,
             pool_next: &pool_next,
             queue: &queue,
             outstanding: &outstanding,
@@ -7719,6 +8033,7 @@ impl G1Collector {
             // moved mid-pause would tenure two objects of the same age
             // differently for no reason the heap could explain.
             promotion_age: self.tenuring_threshold(),
+            copy_watch,
         };
 
         let mut objs = 0usize;
@@ -7871,6 +8186,12 @@ impl G1Collector {
                 }
             });
         }
+        // CHECKPOINT 1 — the parallel closure has ended and every worker has
+        // joined, so anything the watch reports here was written by a WORKER
+        // (or the driver acting as one) while the closure ran.
+        if let Some(w) = copy_watch {
+            w.verify("after the parallel closure", arena.clone(), None);
+        }
         for shard in shards {
             let shard = shard.into_inner();
             objs += shard.objs;
@@ -7922,6 +8243,14 @@ impl G1Collector {
         }
         unsafe {
             shared.retire_all(&mut serial_tlab);
+        }
+
+        // CHECKPOINT 2 — the serial self-forward drain has run. A mismatch that
+        // is new since checkpoint 1 was written by the DRAIN, not by a worker;
+        // one that was already there is the closure's. Two checkpoints is the
+        // smallest split that decides which half to read.
+        if let Some(w) = copy_watch {
+            w.verify("after the serial self-forward drain", arena.clone(), None);
         }
 
         // Merge the per-worker forward shards into the pointer map consumed by
@@ -9281,6 +9610,37 @@ impl G1Collector {
             //
             // `CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE=0` restores the
             // note-only behaviour, which is the same-binary A/B for the claim.
+            // WHAT THIS DOES AND DOES NOT FIX -- measured 2026-09-06 on
+            // `org.h2.test.store.TestMVStoreTool` (-Xmx256m, G1,
+            // `CRATONVM_G1_JIT_MARK_DRIVER=1`), one binary, ABBA, refusing
+            // against the note-only arm:
+            //
+            //   refusing    ref-slot 9 / 16 refused   evacuate-src 0   dest 0
+            //   note-only   ref-slot 4 accepted       evacuate-src 4   dest 2
+            //
+            // So it closes the chain it is on: candidates refused here stop
+            // reaching `evacuate_object` and the downstream implausible-header
+            // reports go to zero.
+            //
+            // It does NOT stop the `corrupt Value cell` bursts, and expecting it
+            // to was a mistake worth recording. Those are 32 in BOTH arms (32 is
+            // the report cap, so read ">= 32") at 17-62 mixed pauses. They are a
+            // SEPARATE defect that merely co-occurs, and its shape is different
+            // in every respect that matters here: the holders carry PLAUSIBLE
+            // class ids -- 665 with 192 slots, 13079432 with 1024 -- which is
+            // precisely why this screen never fires on them. What is wrong is
+            // their MARK WORD, which holds a heap-address-shaped value with
+            // `gc_flags=0` (0x200001ea4fb17cd0, 0x100001ea4fb14cf0,
+            // 0x300001ea4fb16850: age nibble intact, the rest an address in the
+            // live heap). A zero `gc_flags` makes `is_compact_object` answer
+            // false, so the walk strides 16-byte legacy cells over what is
+            // really a compact object and every slot decodes as garbage.
+            //
+            // Those marks are NOT forwarding pointers -- `make_forwarded` ORs in
+            // MARK_FORWARDED and these have the low two bits clear -- so
+            // `retire_forwards` is excluded as well. What writes a
+            // heap-address-shaped value into a live object's mark word and
+            // clears its `gc_flags` is the open question.
             if implausible && gc_flags().g1_evac_ref_implausible_refuse {
                 let n = EVAC_REF_REJECTED_IMPLAUSIBLE.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {

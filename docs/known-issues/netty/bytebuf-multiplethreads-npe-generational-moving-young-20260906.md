@@ -1,8 +1,17 @@
 # 19 netty classes fail on **Generational only** — the moving young cycle corrupts a live object
 
-**Status:** OPEN. Found 2026-09-06 by a per-collector sweep of the full netty
-suite. **This is a correctness defect, not a throughput one**, and it is
-invisible to every run that uses the shipped default collector.
+**Status:** OPEN. Found by a per-collector sweep of the full netty suite.
+**This is a correctness defect, not a throughput one**, and it is invisible to
+every run that uses the shipped default collector.
+
+**One line:** relocation is necessary for the failure, and the stale reference
+is **not in the heap** — so it is held by an unenumerated root or a compiled
+frame home. §7 has the amplifier that reproduces it 3/3.
+
+> **An earlier revision of this page claimed the root cause was "a to-space
+> survivor copied but never scanned". That claim is WITHDRAWN — see §6.** It
+> rested on two observations of a missed heap rewrite; instrumenting the scan
+> cursor refuted it across 80 moving cycles.
 
 | | |
 |---|---|
@@ -144,22 +153,131 @@ checked against the lever before being ruled out.
   stack is a coincidence of which object happens to be young, small, and
   allocated once per test invocation.
 
-## 6. Where to look next
+## 6. WITHDRAWN root cause, and what the instrument actually proved
 
-The nine cycles all claim `moving-jit-coverage-proven` under live JIT, so the
-first question is whether that proof is sound for these frames. Prior art says
-to distrust it: `moving-young-corruption-rootcause.md` root-caused an earlier
-instance as *precise-only under-coverage* — the coverage bit was computed from
-locals + operand stack while a compiled frame also holds oops in
-scalar-replacement slots, LICM hoist slots and the blind GPR spill area — and
-this codebase has repeatedly found coverage proofs that certify a frame they
-never actually inspected.
+The first attempt at a root cause was wrong, and the way it was wrong is worth
+keeping.
 
-Not attempted here: naming the corrupted slot. The instrument that would do it
-is a watch on the JUnit object at allocation (`CRATONVM_DBG_WATCH_ALLOC_CID`),
-the same one that closed the 2026-09-06 TLAB-skip-span defect.
+`CRATONVM_MOVING_YOUNG_VERIFY=1` reports any surviving heap reference still
+pointing at a forwarded young-from object. Its contract splits the diagnosis
+cleanly: **non-zero = a HEAP rewrite was missed; zero with a wrong result = the
+stale reference lives OUTSIDE the heap** (an unenumerated root or compiled-frame
+home).
 
-## 7. Reproducing
+Two runs came back non-zero and named the slots — every miss in a cycle
+belonging to one object, whose referents had all been copied and rehomed:
+
+```
+rep A  young=4 old=0   TestTemplateExtensionContext@0x17590030b60
+                         slot=24 -> UnmodifiableSet, slot=40 -> DefaultExecutableInvoker,
+                         slot=48 -> MutableExtensionRegistry,
+                         slot=64 -> NamespacedHierarchicalStore
+rep B  young=2 old=0   ConcurrentHashMap@0x204d5f028b8  slot=0, slot=2
+```
+
+An object whose every slot was missed looked like an object copied into
+to-space and never scanned, and the referrers sat at HIGHER addresses than
+their referents' new homes — consistent with a Cheney scan cursor that finished
+early. The mechanism was plausible: the main drain runs to the `used()` of its
+moment, phase 2.5 then resurrects finalizable objects (copying MORE into
+to-space), and the re-drain after it is guarded by
+`if !dead_finalizers.is_empty()`.
+
+**So the cursor was instrumented, and it refutes the story.** Every
+`[moving-young-verify]` line now carries the frontier:
+
+```
+[moving-young-verify] scan frontier: scan_cursor=0x15fd30 to_used=0x15fd30 \
+                      unscanned_tail=0x0 dead_finalizers=0
+```
+
+Five reps under the amplifier:
+
+| rep | NPE failures | moving cycles | cycles with a missed rewrite | cycles with `unscanned_tail > 0` |
+|---:|---:|---:|---:|---:|
+| 0 | 4 | 18 | 0 | 0 |
+| 1 | 3 | 15 | 0 | 0 |
+| 2 | 3 | 17 | 0 | 0 |
+| 3 | 3 | 20 | 0 | 0 |
+| 4 | 4 | 10 | 0 | 0 |
+
+**80 moving cycles. The scan cursor reached `to_used` on every one of them, and
+not one missed a heap rewrite — while the NPE fired 17 times.** Two conclusions,
+and the second is the useful one:
+
+1. The early-cursor hypothesis is dead. The Cheney drain completes.
+2. **A missed heap rewrite is NOT necessary for the failure.** It is real — it
+   was observed twice — but it is rare and it is a second signature, not the
+   cause. A mechanism absent while the symptom is present is not the mechanism.
+
+**What the zero therefore means, by the verifier's own contract: the stale
+reference is outside the heap.** The heap is self-consistent after evacuation;
+something that is not a heap slot still holds the pre-move address.
+
+The methodological error is worth naming: the withdrawn claim was published off
+two observations of a signature that turned out to be neither necessary nor
+typical, and the confirming instrument was built only afterwards. The
+instrument is what should have come first.
+
+## 7. Why the coverage proof does not stop it
+
+`moving-jit-coverage-proven` is emitted on `has_conservative_roots` — "a JIT
+frame was live" — not on any peer proof. The peer ledger that would be a proof
+is `refresh_moving_young_coverage_for_collection`, and on this workload **it
+never accepts**: 0 `accounted=true` out of 750 decisions, minimum
+`peer_depth` 4. Two levers bracket it on one binary:
+
+| arm | failing | moving cycles |
+|---|---:|---:|
+| baseline | 1/3 | 1 |
+| `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE=0` (force refuse) | **0/3** | 0 |
+| `CRATONVM_XT_PINNED_PEER_DEPTH=0` | 1/3 | 0 |
+| `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` (force accept) | **3/3** | **14-24** |
+
+`ASSUME=1` is a **deliberate amplifier**: it turns an intermittent 1-in-3 defect
+into a 3/3 one and is what made the verifier catch the miss. Use it to
+reproduce.
+
+Two candidate doors were tested and **refuted**, so nobody re-runs them:
+
+* **The pin credit is not it.** `pinned=0` in all 750 samples and
+  `XT_PINNED_PEER_DEPTH=0` changes nothing.
+* **`peer_depth` is not torn.** `peer_jit_depth()` reduces a striped counter
+  with `saturating_sub`, whose comment calls zero "the safe reading" — and zero
+  skips the whole ledger, so it looked like an unguarded door. Counters added
+  for this say otherwise: of the `peer_depth == 0` cycles, `global_zero=0` and
+  `torn_global_lt_local=0`, i.e. `global == local` every time — a consistent
+  reading meaning only the initiator was in compiled code.
+
+## 8. The indicated cause: precise-only under-coverage
+
+An earlier revision of this page said the *precise-only under-coverage* lead in
+`moving-young-corruption-rootcause.md` was "ruled out". **That was wrong**, and
+it was ruled out on exactly the evidence that has since been withdrawn.
+
+That page root-caused an earlier instance as a coverage bit computed from the
+abstract interpreter's locals + operand stack, while a compiled frame also
+holds oops in **scalar-replacement slots**, **LICM hoist slots** and the
+**blind GPR spill area**. A stale reference in any of those is invisible to the
+heap verifier and survives evacuation un-rewritten — which is precisely the
+`young=0 old=0` + wrong-result signature §6 now reports 5/5.
+
+It also fits everything else: the failures need relocation (§3), they need
+peers (every failing test is `*MultipleThreads`), and forcing the peer ledger to
+accept amplifies them to 3/3 (§7) — a ledger whose whole job is to decide
+whether peers' compiled frames are rewritable.
+
+Next measurement, in order:
+
+1. `CRATONVM_MOVING_YOUNG_BAND_DBG=1` — dump the frame offset of every word the
+   band verifier rejects, on a cycle that relocates under the amplifier. That
+   names the frame slot the same way §6's instrument named heap slots.
+2. The `CRATONVM_MOVING_YOUNG_NO_BAND_*` screens, one at a time, to find which
+   screen admits the un-rewritable word.
+3. Only then a fix. The prior art is explicit that the real repair is precise
+   oop maps or a shadow stack, not a policy patch.
+
+## 9. Reproducing
 
 ```bash
 CV=<cratonvm.exe>
