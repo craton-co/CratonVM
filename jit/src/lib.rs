@@ -21750,7 +21750,49 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if matches!(op, 0xbb | 0xbf) {
         return precise_alloc_athrow_enabled();
     }
+    if op == 0xba {
+        return precise_indy_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
+}
+
+/// Whether a protected `invokedynamic` (0xba) may be treated as publishing a
+/// precise exceptional frame.
+///
+/// **This admission is BOOKKEEPING, and the distinction matters** -- the `new`
+/// admission below is emphatic that admitting an opcode whose lowering does not
+/// publish is a miscompile, not a speedup. Both of this opcode's arms already
+/// publish, and neither needed a new exit:
+///
+/// * A **bridged** site (`StringConcatFactory`, `LambdaMetafactory`,
+///   `SwitchBootstraps`, `ObjectMethods`) calls its bridge and then runs
+///   `emit_post_invoke_exception_check`, which is the SAME publishing exit
+///   `invokestatic`/`invokespecial` use -- and those are admitted
+///   unconditionally on the line above.
+/// * Every other site takes an UNCONDITIONAL deopt at the bci before the call
+///   is made. Nothing executes in compiled code there, so no compiled frame can
+///   reach a handler unpublished; the interpreter runs the bootstrap and owns
+///   the exception with its own precise frame.
+///
+/// # What it was costing
+///
+/// `MVMap.flushAppendBuffer` -- **15.2% of CPU** on
+/// `org.h2.test.jdbc.TestConcurrentConnectionUsage`, measured with
+/// `CRATONVM_PROFILE_SAMPLE_MS=10` -- was refused for an `invokedynamic` at
+/// pc=195 inside a protected range, `tier_fail_count=3 queued=false`, i.e.
+/// permanently interpreted. It is H2's MVStore append path, and the workload
+/// that found it is 12-21x slower than HotSpot with the gap scaling in
+/// contention.
+///
+/// This is the case `first_unsupported_precise_frame_site`'s doc anticipated
+/// when it said the pc/opcode is what makes a refusal actionable: the reason
+/// alone named a policy, and the opcode named the lowering.
+fn precise_indy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_INDY").is_none()
+    })
 }
 
 /// Whether a protected `new` (0xbb) / `athrow` (0xbf) may be treated as
