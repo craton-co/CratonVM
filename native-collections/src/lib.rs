@@ -7469,6 +7469,41 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // A `values()`/`entrySet()` view is LIVE, and the fast path below reads a
+    // view's CAPTURED `(elementData, size)` straight out of `al_state`. That
+    // makes this the one remaining reader of a view's raw slots that never went
+    // through the resync funnel: `collect_collection_elements_pinned` opens with
+    // one ("the read has to go through the funnel like every other reader"),
+    // and `native_al_get` / `contains` / `iterator` / `for_each` / `stream` /
+    // `toString` each open with their own. `addAll` reads the ARGUMENT rather
+    // than the receiver, which is why the receiver-side sweep missed it.
+    //
+    // MEASURED (`apps/probes/StaleViewAddAllProbe.java`, --nojit, all three map
+    // families): put a,b,c; `addAll(m.values())` -> 3; put d,e;
+    // `addAll(m.values())` -> **3**, where `size()`, `toArray()`, the for-each
+    // and `new ArrayList<>(m.values())` on the very same view all answer 5.
+    //
+    // The consumer that found it is Hibernate's
+    // `InFlightMetadataCollectorImpl.collectTableMappings()` --
+    // `new ArrayList<>()` then `addAll(namespace.getTables())`, where
+    // `getTables()` is `tables.values()` on a map that GROWS when Envers
+    // contributes its audit tables. The stale copy left `Country_AUD` out of the
+    // table set the foreign-key second pass walks, so
+    // `ForeignKey.referencedTable` was never assigned and schema export threw
+    // `NullPointerException: Cannot invoke "org.hibernate.mapping.Table
+    // .isPhysicalTable()" because "this.referencedTable" is null` --
+    // `HibernateJpaAutoConfigurationTests` (4 methods) and
+    // `DataJpaRepositoriesWithEnversRevisionAutoConfigurationTests` on the
+    // twelve-unclustered Spring residuals page.
+    //
+    // `resync_values_view` returns its argument unchanged for a receiver with no
+    // view marker, so an ordinary `ArrayList.addAll(ArrayList)` pays one field
+    // read it was going to pay anyway. It CAN allocate (it rebuilds the view's
+    // backing array), so `this` is pinned across it.
+    let this_pin = ctx.pin_native_root(this);
+    let other = resync_values_view(ctx, other)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     // Fast path: the source is a plain ArrayList whose synthetic
     // (data, size) slots are directly readable — copy its backing
     // array in one shot.

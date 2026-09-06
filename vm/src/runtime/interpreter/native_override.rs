@@ -5447,6 +5447,7 @@ pub(super) fn redefine_immune_layout_native(
     redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
         || redefine_immune_synthetic_collection_native(class_name)
+        || redefine_immune_vm_minted_carrier_native(class_name)
         || redefine_immune_thread_local_native(class_name)
 }
 
@@ -5602,6 +5603,7 @@ pub(crate) fn redefine_immune_forced_native(
                 "<init>" | "publish" | "flush" | "close"
             ))
         || redefine_immune_synthetic_collection_native(class_name)
+        || redefine_immune_vm_minted_carrier_native(class_name)
         || redefine_immune_thread_local_native(class_name)
 }
 
@@ -5655,6 +5657,47 @@ fn redefine_immune_synthetic_collection_native(class_name: &str) -> bool {
             | "java/util/TreeSet"
             | "java/util/concurrent/ConcurrentHashMap"
     )
+}
+
+/// A class the VM MINTED has no bytecode to yield to, in this or any image.
+///
+/// `cratonvm/internal/*` names a carrier this VM allocates and serves entirely
+/// from registered natives -- `UnmodifiableList`, `UnmodifiableMap`, the
+/// iterator and entry-set carriers, `MemorySegmentImpl`, `SystemLogger`. No
+/// image contains a class file for any of them, so "drop the native and let the
+/// woven bytecode run" cannot mean what it means for a real class: there is no
+/// bytecode of theirs to run, and `find_method_recursive` walks past them to
+/// whatever ANCESTOR declares the name -- in practice `java/lang/Object`.
+///
+/// Mockito's inline mock maker retransforms `java.lang.Object` whenever it mocks
+/// a class (rather than an interface), which bumps Object's redefine generation
+/// for the rest of the process. Without this arm, `vm_exec`'s
+/// `native_shadow_dropped_by_redefine` then resolved
+/// `cratonvm/internal/UnmodifiableList.equals` to `Object.equals`'s body, saw
+/// `has_body && generation > 0`, and dropped the carrier's native -- so every
+/// `Collections.unmodifiableList(..)` / `List.of(..)` /
+/// `Collections.unmodifiableSet(..)` in the process compared by IDENTITY from
+/// the first `mock()` onwards. Measured on `apps/probes/MinAssertRedefine.java`
+/// (mock an abstract class, then compare):
+///
+/// ```text
+/// [native-shadow] cratonvm/internal/UnmodifiableList.equals(Ljava/lang/Object;)Z
+///                 dropped=true probe=Some((ClassId(0), true, 2)) immune=false
+/// ```
+///
+/// and, one door up, AssertJ's `assertThat(list).isEqualTo(other)` failing with
+/// `expected: "[x] (SingletonList@..)" but was: "[x] (UnmodifiableRandomAccessList@..)"`
+/// while `list.equals(other)` on the same two objects answered `true` -- the
+/// shape recorded for `LoggersEndpointTests` and
+/// `CouchbaseAutoConfigurationTests` in the twelve-unclustered Spring residuals.
+///
+/// Class-wide and name-prefixed on purpose: the property is structural, not a
+/// per-method judgement. A `cratonvm/internal/*` receiver never has a real body
+/// under it, so there is nothing an agent could have woven into it and nothing
+/// to narrow later. An agent that wants to intercept these collections mocks the
+/// `java.util` class it sees, which is what the arm above covers.
+fn redefine_immune_vm_minted_carrier_native(class_name: &str) -> bool {
+    class_name.starts_with("cratonvm/internal/")
 }
 
 /// `ThreadLocal`'s values do not live where its real JDK body looks for them.
@@ -8872,10 +8915,63 @@ mod redefine_immunity_tests {
         }
     }
 
+    /// A VM-minted carrier has no bytecode in any image, so the "yield to the
+    /// woven body" rule has nothing to yield TO -- `find_method_recursive` walks
+    /// past it to `java/lang/Object`, whose generation Mockito bumps the first
+    /// time anything mocks a class. Measured: without this arm, one `mock()`
+    /// made every `Collections.unmodifiableList` / `List.of` in the process
+    /// compare by identity.
+    #[test]
+    fn vm_minted_carriers_keep_their_natives_across_a_redefinition() {
+        for class in [
+            "cratonvm/internal/UnmodifiableList",
+            "cratonvm/internal/UnmodifiableSet",
+            "cratonvm/internal/UnmodifiableMap",
+            "cratonvm/internal/UnmodifiableCollection",
+            "cratonvm/internal/UnmodifiableSortedSet",
+            "cratonvm/internal/UnmodifiableNavigableSet",
+            "cratonvm/internal/UnmodifiableEntrySet",
+            "cratonvm/internal/UnmodifiableMapEntry",
+            "cratonvm/internal/ArrayListSubList",
+            "cratonvm/internal/foreign/MemorySegmentImpl",
+        ] {
+            for (name, desc) in [
+                ("equals", "(Ljava/lang/Object;)Z"),
+                ("hashCode", "()I"),
+                ("size", "()I"),
+                ("toString", "()Ljava/lang/String;"),
+            ] {
+                assert!(
+                    redefine_immune_forced_native(class, name, desc),
+                    "{class}.{name}{desc} must survive a redefinition"
+                );
+            }
+        }
+    }
+
+    /// Same arm, the other aggregator -- the failure
+    /// `thread_local_immunity_reaches_the_invoke_cache_sites_too` exists to
+    /// catch, made once already by the collection arm.
+    #[test]
+    fn vm_minted_carrier_immunity_reaches_the_invoke_cache_sites_too() {
+        assert!(super::redefine_immune_layout_native(
+            "cratonvm/internal/UnmodifiableList",
+            "equals",
+            "(Ljava/lang/Object;)Z"
+        ));
+    }
+
     #[test]
     fn ordinary_classes_stay_evictable() {
         assert!(!redefine_immune_forced_native(
             "com/example/Service",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ));
+        // The prefix is `cratonvm/internal/`, not `cratonvm`: an application
+        // class that merely starts with the vendor word is an ordinary class.
+        assert!(!redefine_immune_forced_native(
+            "cratonvm/app/Service",
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;"
         ));
@@ -9061,6 +9157,7 @@ mod redefine_immunity_tests {
                     "redefine_immune_path_native(",
                     "redefine_immune_jfr_native(",
                     "redefine_immune_synthetic_collection_native(",
+                    "redefine_immune_vm_minted_carrier_native(",
                     "redefine_immune_thread_local_native(",
                 ] {
                     // An arm's own `fn` declaration is not a call site.

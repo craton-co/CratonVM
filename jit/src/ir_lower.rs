@@ -900,6 +900,44 @@ struct Lowerer<'a> {
     /// definition arm costs an optimization and can never produce a read of a
     /// register nothing wrote.
     gp_reg_live: Vec<bool>,
+    /// `gp_reg_owner[r]` = the node whose value GP register `r` currently
+    /// holds, or `None` before anything published into it.
+    ///
+    /// `gp_reg_live` is indexed by NODE, so on its own it can only say "node
+    /// `id` was published at some point" -- never "and nobody has overwritten
+    /// its register since". The publish sites' shared comment argued that
+    /// nothing could ("the allocator gives a register to one value at a time
+    /// over its live range"), and that is true of two values whose live ranges
+    /// overlap. It is NOT true across an edge: a phi's live range BEGINS at the
+    /// edge, so the allocator may hand it the register of a value whose range
+    /// ENDS there -- and `emit_phi_copies` reads the source values and
+    /// publishes the phis into the SAME sequence of instructions.
+    ///
+    /// The resulting hazard is a wrong value, not a crash. `resolve_parallel_copy`
+    /// orders the edge's copies so every source SLOT is read before it is
+    /// written, and `emit_copy_op`'s comment extends that to registers on the
+    /// grounds that "a register and its home word go stale at the same point".
+    /// They do not, when the register belongs to one node and the word to
+    /// another: an earlier copy's `mov <phi's reg>, rax` publish clobbers a
+    /// register a later copy still reads its own source out of, and
+    /// `resident_gpr` -- consulting only the per-node bit -- hands that register
+    /// back as if it still held the old value.
+    ///
+    /// MEASURED (2026-09-05, `perf/ir-defaults-on-20260905` defaults): Mockito's
+    /// inline mock maker produced class bytes whose forward branch operands were
+    /// left as ASM's `ff ff` placeholder -- `Label.resolve` never patched them,
+    /// because `Label.addForwardReference`'s `forwardReferences[0]` count read
+    /// back wrong -- so CratonVM's verifier rejected the retransformation with
+    /// `branch at offset N targets N-1, which is not an instruction boundary`
+    /// and every `mock()` of a class failed with `MockitoException: Could not
+    /// modify all classes`. 4/4 runs of
+    /// `GrpcChannelBuilderCustomizersTests` under the defaults, 0/8 with either
+    /// `CRATONVM_JIT_IR_PHI_COPY_REGS=0` (removes the publish) or
+    /// `CRATONVM_JIT_LS_CARRY_RELIEF=0` (moves the allocation off the shape).
+    ///
+    /// Sized by the architectural register file, not by the node count: it is a
+    /// map from PHYSICAL register to owner.
+    gp_reg_owner: [Option<NodeId>; 16],
     /// Edge copies that read their source out of a register, and edge copies
     /// that published their phi's register from RAX. Both are ENGAGEMENT
     /// counts: a zero says the wiring never fired, which is a different
@@ -1470,6 +1508,7 @@ impl<'a> Lowerer<'a> {
             reg_live: Vec::new(),
             gp_reg_of: Vec::new(),
             gp_reg_live: Vec::new(),
+            gp_reg_owner: [None; 16],
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
             phi_copy_publish_deferred: 0,
@@ -1519,6 +1558,7 @@ impl<'a> Lowerer<'a> {
         self.reg_live = vec![false; residency.reg_of.len()];
         self.reg_of = residency.reg_of;
         self.gp_reg_live = vec![false; residency.gp_reg_of.len()];
+        self.gp_reg_owner = [None; 16];
         self.gp_reg_of = residency.gp_reg_of;
         // Exclusive ownership, computed once: how many values share each
         // register, and a value is nameable only if the answer for its own is
@@ -1833,8 +1873,31 @@ impl<'a> Lowerer<'a> {
         self.gp_reg_of.get(id as usize).copied().flatten()
     }
 
-    /// Mark `id` readable from its assigned GP register.
+    /// Mark `id` readable from its assigned GP register — and mark whoever held
+    /// that register before UNREADABLE.
+    ///
+    /// The second half is the whole of the interlock. Setting the per-node bit
+    /// says "id's value is in its register"; without dropping the previous
+    /// owner's bit, `resident_gpr` goes on answering that register for a node
+    /// whose value this very instruction has just overwritten. See
+    /// [`Self::gp_reg_owner`] for the edge that makes two nodes share one
+    /// register while both are still being read, and for what it produced.
+    ///
+    /// A node re-published into its own register is not a transfer and clears
+    /// nothing; that is the ordinary definition-site case and the common path.
     fn mark_gp_reg_live(&mut self, id: NodeId) {
+        if let Some(reg) = self.assigned_gpr(id) {
+            if let Some(slot) = self.gp_reg_owner.get_mut(reg as usize) {
+                let previous = slot.replace(id);
+                if let Some(previous) = previous {
+                    if previous != id {
+                        if let Some(cell) = self.gp_reg_live.get_mut(previous as usize) {
+                            *cell = false;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(cell) = self.gp_reg_live.get_mut(id as usize) {
             *cell = true;
         }
