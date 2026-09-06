@@ -1595,6 +1595,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-strip-all-high-halves", on_key: Some("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES"), off_key: None, off_word: None, since: "2026-08-06" },
     E { group: Group::JIT, token: "osr-single-pc", on_key: Some("CRATONVM_JIT_OSR_SINGLE_PC"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None, since: "2026-07-27" },
+    E { group: Group::JIT, token: "post-tlab-hash-stamp", on_key: Some("CRATONVM_JIT_POST_TLAB_HASH_STAMP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None, since: "2026-06-21" },
     // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
     // `run_jit_callee_handler` resume that zeroed a compiled callee's
