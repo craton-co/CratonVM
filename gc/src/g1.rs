@@ -183,6 +183,9 @@ fn for_each_flat_object_reference_capped(
         // `max_slots` is the caller's region-derived bound; `usize::MAX` from
         // the uncapped entry point leaves the old behaviour exactly as it was.
         let end = (header.num_slots() as usize).min(max_slots);
+        // Snapshot for the holder report below: the census moving across one
+        // cell read is what identifies THAT read as the corrupt one.
+        let mut census_before = cratonvm_types::cell_census::decoded();
         for index in first_index..end {
             let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
             // Discriminant-screened: see `heap::read_value_cell_checked`. An
@@ -199,9 +202,100 @@ fn for_each_flat_object_reference_capped(
             if let Value::Object(Some(reference)) = value {
                 visit(slot, reference.as_ptr() as usize, false);
             }
+            // NAME THE HOLDER, not just the slot.
+            //
+            // `read_value_cell_checked` already reports a corrupt cell, but it
+            // reports a SLOT ADDRESS and two raw words, and it stops after 32
+            // (`n < 32` there). Thirty-two identical-looking lines cannot say
+            // WHICH object was being walked, or why this walk took the legacy
+            // 16-byte-cell arm for it -- and "always exactly 32" is that cap,
+            // not a property of the defect.
+            //
+            // Keyed on the census counter rather than on the returned `Value`:
+            // a corrupt cell decodes to `Value::Object(None)`, which is also
+            // what a genuine null decodes to, so the value alone cannot tell
+            // them apart. `cell_census::decoded()` moving across this one read
+            // can.
+            //
+            // Measured 2026-09-06 on `org.h2.test.store.TestMVStoreTool`
+            // (-Xmx256m, G1, `CRATONVM_G1_JIT_MARK_DRIVER=1`): >=32 corrupt
+            // cells per run, in one burst inside a single second, always after
+            // mixed evacuation has run, one run in three escalating to a fatal
+            // `forwarding target must have its low 2 bits clear`. Never once in
+            // a driver-off run, including one that took 232 young pauses -- so
+            // it is not "more GC finds more". Ruled out by ablation:
+            // `CRATONVM_COMPACT_TLAB_ALLOC=0` (2/2 still corrupt) and
+            // `CRATONVM_G1_SCRUB_FREE=1` (this file's own first suggestion for
+            // a G1 corruption hunt -- 1/2 still corrupt).
+            //
+            // What is left is this branch's own premise: `is_compact_object`
+            // said the holder is NOT compact, so the walk strode 16-byte cells.
+            // These are the fields that decided that.
+            //
+            // ANSWERED, first run it fired (2026-09-06, 700 s, 30 mixed pauses,
+            // rc=139). The second horn: the holder is not an object.
+            //
+            //   holder=0x1f506711e40 class_id=163587104 num_slots=501
+            //                        mark=0x310001f509c02470 gc_age=3
+            //   holder=0x1f50e091ad8 class_id=163587104 num_slots=501
+            //                        mark=0x200001f509c02470 gc_age=2
+            //   holder=0x1f50e646b20 class_id=163587104 num_slots=501
+            //                        mark=0x100001f509c02470 gc_age=1
+            //
+            // Three addresses, one shape, ages 1/2/3: ONE object that three
+            // successive evacuations copied. `class_id` 163587104 is 0x09C02470
+            // and `num_slots` 501 is 0x1F5, so the header's first eight bytes are
+            // the single word 0x000001F509C02470 -- a HEAP POINTER, in a run
+            // whose heap is at 0x1f5.......  The mark word beside it is
+            // well-formed (a plausible quartet, an age that increments per
+            // copy), so this is not a torn header: something wrote a pointer
+            // over the `class_id`/`shape` dword pair and left the mark alone.
+            //
+            // The cells the walk then read are the payload of a Java string --
+            // raw0=0x6f57206f6c6c6548 is "Hello Wo", raw1=0x3532363620646c72 is
+            // "rld 6625". The walk is reading string bytes as reference cells.
+            //
+            // The producer is named one line earlier in the same log:
+            //   [g1] IMPLAUSIBLE legacy header at ref-slot-candidate (#5):
+            //   obj=0x1f507f00300 class_id=163587104 num_slots=501
+            //   mark=0x000001f50e646b23 claims=0x1f60 bytes source=r127/Old/off=0x30
+            // -- mark 0x...b23 is 0x1f50e646b20 tagged 0x3, a FORWARDING
+            // pointer, and 0x1f50e646b20 is the third holder above. A fourth
+            // report has mark 0x000001f505b00383 against holder 0x1f505b00380:
+            // its own address, tagged 3 -- a SELF-forward, the
+            // evacuation-failure path.
+            //
+            // So the next question is not about layout at all: who leaves a
+            // forwarding pointer where a walk later reads a `class_id`, and why
+            // does `retire_forwards` not reach it? That is where a fix goes.
+            if cratonvm_types::cell_census::decoded() != census_before {
+                census_before = cratonvm_types::cell_census::decoded();
+                let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] legacy 16-byte-cell walk hit a CORRUPT CELL (#{n}): \
+                         holder=0x{:x} class_id={} num_slots={} kind={:?} \
+                         mark=0x{:016x} gc_flags=0x{:x} gc_age={} is_compact={} \
+                         slot_index={index} end={end} -- the cell screen rejected \
+                         this word, so either the holder IS compact and this walk \
+                         chose the wrong arm, or the holder is not an object at all.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        header.kind(),
+                        header.mark_word.load(Ordering::Relaxed),
+                        header.gc_flags(),
+                        header.gc_age(),
+                        cratonvm_types::is_compact_object(header),
+                    );
+                }
+            }
         }
     }
 }
+
+/// Rate-limit counter for the corrupt-cell holder report above.
+static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 
 fn write_flat_object_reference(slot: *mut u8, raw: usize, compact: bool) {
     if compact {
