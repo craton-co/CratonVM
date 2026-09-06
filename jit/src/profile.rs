@@ -90,6 +90,90 @@ pub fn is_profiling_enabled() -> bool {
     PROFILING_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Outstanding C1->C2 nominations that want a branch profile.
+///
+/// Branch and back-edge recording is a per-method lock on every conditional
+/// branch in the interpreter, which is why `CRATONVM_TIER_PGO` has never
+/// shipped on -- it is a GLOBAL cost paid for a LOCAL benefit, and the local
+/// benefit is one tier's block layout.
+///
+/// The window makes the cost proportional to the benefit. It opens when a
+/// method is nominated for the optimizing tier and closes when the last such
+/// nomination has been compiled, so a program that never tiers up pays exactly
+/// what it paid before (one relaxed load per `execute_frame`), and a program
+/// that does pays branch recording only while there is a compile waiting to
+/// read the result.
+static C2_PROFILE_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The base state to restore when the window closes: whatever
+/// `CRATONVM_TIER_PGO` asked for. Captured on the first arm rather than assumed
+/// `false`, so arming does not silently DISABLE profiling for a run that asked
+/// for it globally.
+static C2_PROFILE_BASE: AtomicBool = AtomicBool::new(false);
+static C2_PROFILE_BASE_CAPTURED: AtomicBool = AtomicBool::new(false);
+
+/// Open the window for one nomination.
+pub fn arm_branch_profiling_for_c2() {
+    if !c2_branch_window_enabled() {
+        return;
+    }
+    if !C2_PROFILE_BASE_CAPTURED.swap(true, Ordering::AcqRel) {
+        C2_PROFILE_BASE.store(is_profiling_enabled(), Ordering::Relaxed);
+    }
+    C2_PROFILE_WINDOW.fetch_add(1, Ordering::AcqRel);
+    PROFILING_ENABLED.store(true, Ordering::Relaxed);
+    C2_WINDOW_OPENED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Close the window for one nomination. The last one out restores the base.
+///
+/// A `saturating_sub` shape rather than a bare decrement: a nomination that is
+/// dropped without ever reaching a compile (a full queue, a shutdown) must not
+/// wrap the counter and pin profiling on for the life of the process.
+pub fn disarm_branch_profiling_for_c2() {
+    if !c2_branch_window_enabled() {
+        return;
+    }
+    let prev = C2_PROFILE_WINDOW
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .unwrap_or(0);
+    if prev <= 1 {
+        PROFILING_ENABLED.store(C2_PROFILE_BASE.load(Ordering::Relaxed), Ordering::Relaxed);
+        C2_WINDOW_CLOSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+static C2_WINDOW_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static C2_WINDOW_CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(opened, closed, still_open)`. `still_open` large at exit means nominations
+/// are being armed and never disarmed, which pins branch recording on -- the
+/// failure this counter exists to make visible.
+pub fn c2_branch_window_census() -> (u64, u64, u64) {
+    (
+        C2_WINDOW_OPENED.load(Ordering::Relaxed),
+        C2_WINDOW_CLOSED.load(Ordering::Relaxed),
+        C2_PROFILE_WINDOW.load(Ordering::Relaxed),
+    )
+}
+
+/// **Default ON** since 2026-09-06.
+/// `CRATONVM_TIER_PGO_C2_WINDOW=0` restores the pre-window behaviour, in which
+/// the optimizing tier's scheduler received an empty `branch_counts` in every
+/// default run.
+pub fn c2_branch_window_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_TIER_PGO_C2_WINDOW").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 /// Receiver-type and call-site recording, independently of the master gate.
 ///
 /// 2026-09-02: the master gate (`CRATONVM_TIER_PGO`) had never been on by

@@ -684,6 +684,13 @@ fn expected_arity(op: &Op) -> (usize, usize) {
         Op::LambdaIntToDouble => (4, 4),
         // [ctrl, cond]
         Op::Guard { .. } => (2, 2),
+        // Pure arithmetic with NO control or memory edge: one or two data
+        // inputs and nothing else. `ScalarOp::arity` is the single source of
+        // truth, so a family added there cannot fall out of step with this.
+        Op::ScalarIntrinsic(sop) => {
+            let n = sop.arity();
+            (n, n)
+        }
         // [ctrl, mem, obj]
         Op::MonitorEnter | Op::MonitorExit => (3, 3),
         // cov-05 — [ctrl, mem, obj], same shape as `MonitorEnter` above.

@@ -16,6 +16,10 @@ use super::ir::{CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, NO_NODE};
 
 /// Run all optimization passes on the graph.
 pub fn optimize(graph: &mut Graph) {
+    // Node count before any pass, so the fixpoint loop below can report whether
+    // it actually removed anything. Diagnostic only -- see
+    // `ir_evidence::Transform::Simplified`.
+    let nodes_before = graph.live_count();
     // Affine strength-reduction (reassociation). Collapses an unrolled affine
     // recurrence such as `x = x*c1 + c2` (×N) into a single `k*root + c` — the
     // optimization C2 performs via Mul/Add reassociation, which dominated the
@@ -50,6 +54,7 @@ pub fn optimize(graph: &mut Graph) {
     // (the concrete induction values collapse the per-iteration computation)
     // and the retired loop nodes are reclaimed.
     if unroll_enabled() && unroll(graph) {
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Unrolled);
         for _ in 0..8 {
             let before = graph.live_count();
             fold_constants(graph);
@@ -70,8 +75,12 @@ pub fn optimize(graph: &mut Graph) {
     // GVN'd invariant expressions, then a final lightweight cleanup re-runs
     // GVN + DCE to dedup any anchor edges it rewrote.
     if licm_enabled() && licm(graph) {
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Licm);
         gvn(graph);
         eliminate_dead_nodes(graph);
+    }
+    if graph.live_count() < nodes_before {
+        crate::ir_evidence::note(crate::ir_evidence::Transform::Simplified);
     }
 }
 
@@ -2975,8 +2984,55 @@ fn forward_control_closure(
 /// and each carried phi by its running value, then redirect post-loop uses of
 /// each carried phi to its final value and straight-line the control. Anything
 /// not matching this shape is left untouched.
+/// May the unroller ignore a safepoint snapshot that names the loop body, when
+/// the graph is trap-free and so no snapshot can be consulted? **Default ON**
+/// since 2026-09-06; `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES=0` restores the
+/// blanket refusal.
+thread_local! {
+    /// Set when [`unroll`] transformed a loop whose body IS named by a
+    /// safepoint snapshot, on the strength of the graph being trap-free.
+    ///
+    /// This is a NET, not a diagnostic. The relaxation is a prediction, and the
+    /// prediction is only sound while `build_deopt_points` actually skips those
+    /// points -- which it does only when the EMISSION agrees the body is
+    /// trap-free. If emission disagrees, every point is built and the slots the
+    /// unroller killed resolve to `FrameValue::Undefined`, which is a deopt
+    /// that silently loses interpreter locals rather than one that fails.
+    ///
+    /// `lower_inner` reads this and refuses the compile in that case. The
+    /// method then takes the single-pass backend, which is what it did before
+    /// the relaxation existed.
+    pub(crate) static UNROLL_USED_UNREACHABLE_FRAMES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Read and clear the net above.
+pub fn take_unroll_used_unreachable_frames() -> bool {
+    UNROLL_USED_UNREACHABLE_FRAMES.with(|c| c.replace(false))
+}
+
+fn unroll_over_unreachable_frames() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES")
+                .as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 fn unroll(graph: &mut Graph) -> bool {
     let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
+    // Computed ONCE for the whole graph, before any header is transformed:
+    // unrolling only clones pure nodes and `Op::Load`s, so it cannot introduce
+    // a trapping op, and re-deriving it per header would give the same answer
+    // at N times the cost.
+    let trap_free = crate::ir_lower::graph_cannot_deopt(graph);
+    if dbg {
+        eprintln!("[DBG_UNROLL] graph trap-free: {trap_free}");
+    }
     // Normalize away the single-input Merge wrappers the builder puts around
     // branch projections, so loop headers/back-edges sit next to their If/Proj.
     collapse_trivial_merges(graph);
@@ -3198,8 +3254,40 @@ fn unroll(graph: &mut Graph) -> bool {
                 slot != NO_NODE && (to_clone.contains(&slot) || carried_set.contains(&slot))
             })
         });
+        // ...unless NOTHING in this graph can transfer to the interpreter, in
+        // which case no snapshot can ever be consulted and the objection does
+        // not apply.
+        //
+        // The refusal above is correct and its reasoning is unchanged: a
+        // `SafepointSnapshot` is keyed by one `bci`, and `trip` copies of a
+        // body bci cannot be represented by one snapshot. What it did not ask
+        // is whether any of those snapshots is REACHABLE. On a trap-free graph
+        // none is -- the same fact `lower_inner`'s `graph_trap_free` already
+        // computes and acts on when it skips building unreachable deopt points,
+        // now asked one pass earlier, where the unroller can use it.
+        //
+        // This is a PREDICTION, and it is backed the same way that one is: if
+        // the emission disagrees, `build_deopt_points` builds every point,
+        // `frame_value_of` meets a slot it cannot describe, and the compile is
+        // refused. Nothing is taken away; a case is added in which the net is
+        // provably not needed.
+        //
+        // Measured reach: the unroller previously fired only on loops whose
+        // body no snapshot names, which on javac output is almost none -- a
+        // snapshot records the full operand stack at every bci, so any loop
+        // whose body leaves a value on the stack was refused.
         if body_named_by_safepoint {
-            continue;
+            // The relaxation additionally requires the CONSUMER of the
+            // trap-free fact to be available: if `build_deopt_points` is not
+            // going to skip the points, the snapshots are live and the original
+            // refusal stands.
+            if !(unroll_over_unreachable_frames()
+                && trap_free
+                && crate::ir_lower::ir_drop_unreachable_homes_enabled())
+            {
+                continue;
+            }
+            UNROLL_USED_UNREACHABLE_FRAMES.with(|c| c.set(true));
         }
         // Bail on invariant loads pinned to the loop header (we'd have to
         // re-anchor them); milestone-1 only handles variant (cloned) loads.

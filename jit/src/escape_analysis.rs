@@ -3037,6 +3037,9 @@ pub fn analyze_escapes(graph: &Graph) -> EscapeAnalysisResult {
 /// A half-applied object — allocation killed, an unanswerable load still
 /// reading it — is worse than no optimisation.
 pub fn apply_scalar_replacement(graph: &mut Graph, info: &ScalarReplacementInfo) {
+    // The strongest single piece of evidence the optimizing tier can produce:
+    // an allocation that no longer happens. See `ir_evidence`.
+    crate::ir_evidence::note(crate::ir_evidence::Transform::ScalarReplacement);
     // Refuse before mutating anything. `find_scalar_replacements` already
     // guarantees no `Unknown` survives into a reported candidate, so this is the
     // belt-and-braces check for a hand-built or future-produced info.
