@@ -521,3 +521,62 @@ pub fn force_accept_always_for_this_process() {
 
 static PROCESS_FORCE_ALWAYS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+// ── The verdict, for a caller that can act on it ────────────────────
+//
+// The gate discards the IR body, `try_compile_inner` falls through to the
+// single-pass backend, and the caller publishes THAT. For a SUPERSEDE that is
+// the worst of both: the method already had an equivalent C1 body, so the
+// publish replaces it with an equal one and still bumps the process-wide
+// supersede epoch, which stales every cached invoke target in every thread
+// (1,558 evictions on one H2 run).
+//
+// Measured: with all seven items on and the gate refusing 571 bodies,
+// `CRATONVM_C2_SUPERSEDE=0` was still ~5% faster in mean CPU on H2 against a
+// control pair agreeing to 0.04%. A gate that refuses a body and then
+// republishes an equivalent one has not refused anything the caller can feel.
+//
+// So the verdict is published for the caller to read. The VM's compile-task
+// path is the only consumer, on the same thread, immediately after
+// `try_compile` returns: a REFUSED verdict on a method that already has a
+// published body means "leave the C1 body alone" -- no publish, no epoch bump,
+// no invalidation.
+//
+// A thread-local rather than a return value, because threading a 23rd
+// parameter through `try_compile` to carry one bit is worse than a slot the
+// caller reads at a known point. It is take-and-clear so a stale verdict from
+// an earlier compile can never be read as this one's.
+
+thread_local! {
+    static LAST_VERDICT: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Record this compile's acceptance verdict for the caller. `true` = accepted.
+pub fn publish_verdict(accepted: bool) {
+    LAST_VERDICT.with(|c| c.set(Some(accepted)));
+}
+
+/// Read and clear the verdict of the last optimizing compile on this thread.
+///
+/// `None` means no optimizing compile recorded one — the method never reached
+/// the IR pipeline at all — which a caller must treat as "no opinion", not as
+/// a refusal.
+pub fn take_last_verdict() -> Option<bool> {
+    LAST_VERDICT.with(|c| c.replace(None))
+}
+
+/// Supersedes abandoned because the optimizing body carried no evidence and a
+/// baseline body already existed.
+static SUPERSEDES_ABANDONED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_supersede_abandoned() {
+    SUPERSEDES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many epoch bumps and republishes the verdict avoided.
+pub fn supersedes_abandoned() -> u64 {
+    SUPERSEDES_ABANDONED.load(std::sync::atomic::Ordering::Relaxed)
+}

@@ -25746,8 +25746,13 @@ fn try_compile_inner(
                     // cannot disagree about which methods it covers.
                     let selfrec_no_predecessor =
                         scalar_selfrec_ir_would_engage(code, code_len, &cached.method_descriptor);
+                    // Publish the verdict for the VM's compile-task path,
+                    // which is the only caller that can act on it. See
+                    // `ir_evidence::take_last_verdict`.
+                    let accepted = selfrec_no_predecessor || ir_evidence::accept(evidence);
+                    ir_evidence::publish_verdict(accepted);
                     let lowered = match lowered {
-                        Some(cm) if !selfrec_no_predecessor && !ir_evidence::accept(evidence) => {
+                        Some(cm) if !accepted => {
                             if ir_stage_reporting() {
                                 eprintln!(
                                     "[ir] acceptance {}.{}{}: REFUSED (evidence: {}) -- keeping the single-pass body",

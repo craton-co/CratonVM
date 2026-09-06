@@ -213,8 +213,9 @@ pub fn report_at_exit() {
         // that should be zero.
         let (acc, ref_ev, ref_pol, unjudged) = cratonvm_jit::ir_evidence::census();
         eprintln!(
-            "[c2-supersede] acceptance: accepted={acc} refused_no_evidence={ref_ev} refused_by_policy={ref_pol} unjudged={unjudged} memo_skips={}",
+            "[c2-supersede] acceptance: accepted={acc} refused_no_evidence={ref_ev} refused_by_policy={ref_pol} unjudged={unjudged} memo_skips={} supersedes_abandoned={}",
             cratonvm_jit::ir_evidence::memo_skips(),
+            cratonvm_jit::ir_evidence::supersedes_abandoned(),
         );
         // Array guard elision. Elided AND emitted on both rows, always: an
         // elision count alone cannot tell a working pass from a workload that
