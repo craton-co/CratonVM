@@ -963,7 +963,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-151 tokens.
+152 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1006,6 +1006,7 @@ export inherited from a parent shell.
 | `g1-young-pause-target` | `CRATONVM_G1_YOUNG_PAUSE_TARGET` |
 | `g1-humongous-marks` | `CRATONVM_G1_HUMONGOUS_MARKS` |
 | `g1-ihop-counts-regions` | `CRATONVM_G1_IHOP_COUNTS_REGIONS` |
+| `g1-jit-mark-driver` | `CRATONVM_G1_JIT_MARK_DRIVER` |
 | `g1-verify-holders` | `CRATONVM_G1_VERIFY_HOLDERS` |
 | `g1-scrub-free` | `CRATONVM_G1_SCRUB_FREE` |
 | `g1-narrow-fixup` | `CRATONVM_G1_NARROW_FIXUP` |

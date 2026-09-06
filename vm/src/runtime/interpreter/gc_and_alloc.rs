@@ -1577,6 +1577,42 @@ pub fn zgc_concurrent_mark_cycle_pub(shared: &SharedVm, thread: &mut JvmThread) 
     zgc_concurrent_mark_cycle(shared, thread);
 }
 
+/// Drive G1's concurrent-mark lifecycle from a path compiled code reaches.
+///
+/// BOTH HALVES, in `maybe_concurrent_gc`'s order and for its reasons: finish
+/// first, so an active cycle whose background marker has drained gets its STW
+/// remark + cleanup from the thread that already has the barrier context;
+/// start second, so the two cannot race within one call.
+///
+/// Why it exists at all: `maybe_concurrent_gc` is the only caller of either
+/// half, and it lives inside `maybe_gc`, which a JIT-compiled workload reaches
+/// ZERO times (instrumented on `org.h2.test.store.TestMVStoreTool`, -Xmx256m,
+/// 2026-09-05: zero calls across a run with 65 young pauses). `needs_gc()` is
+/// false for G1 because the collector triggers its own young pauses from inside
+/// the allocator, so `maybe_gc` returns at its gate and the body never runs.
+///
+/// The consequence measured on that workload: `marking_complete` is never set,
+/// so `needs_mixed_gc()` is never true, so `mixed_phase_has_work()` is not
+/// called ONCE and no mixed collection ever runs. Old grew to 245 of 256
+/// regions, `free` reached 0, and the pause census reported 18-54 to-space
+/// exhaustions and 17 evacuation failures per run. Only `g1_force_full_cycle`,
+/// the last-ditch pre-OOM path, drove either half.
+///
+/// The FINISH half is the one with no substitute: a cycle that path starts is
+/// otherwise never remarked or cleaned up, so even the marking that does happen
+/// yields no `live_bytes` and no mixed candidates.
+pub fn g1_drive_concurrent_mark_pub(shared: &SharedVm, thread: &mut JvmThread) {
+    if shared.mem.heap.g1_is_marking_active() {
+        if shared.mem.heap.g1_concurrent_mark_finished() {
+            g1_final_remark_cleanup(shared, thread);
+        }
+        return;
+    }
+    if shared.mem.heap.g1_should_start_marking() {
+        g1_concurrent_mark_cycle(shared, thread);
+    }
+}
+
 /// Allocate a dynamically-produced `java.lang.String` under the SAME
 /// heap-exhaustion contract as `new`: collect, retry, and finally raise a
 /// catchable `OutOfMemoryError` -- never abort the process.

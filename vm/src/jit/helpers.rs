@@ -4488,6 +4488,75 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
 ///
 /// Cost on the other two backends and on a ZGC run with the feature off: one
 /// `match` and one load of a plain `usize` field that is `0`.
+/// G1's concurrent-mark lifecycle, on the path a compiled workload takes.
+///
+/// The G1 twin of the ZGC hook below, and for a defect one step worse than the
+/// one that hook was written for: ZGC's trigger merely engaged rarely on a JIT
+/// workload, while G1's is unreachable in BOTH directions -- nothing starts a
+/// cycle and, more importantly, nothing finishes one. See
+/// `g1_drive_concurrent_mark_pub` for the measurements.
+///
+/// Cost when G1 is not the collector, or has nothing to do: an `is_g1()` match
+/// and two relaxed loads, the same budget the ZGC arm spends.
+#[inline]
+unsafe fn jit_drive_g1_concurrent_mark(vm: &SharedVm) {
+    if !g1_jit_mark_driver_enabled() || !vm.mem.heap.is_g1() {
+        return;
+    }
+    // DECIDE BEFORE TOUCHING THE THREAD.
+    //
+    // `thread.tlab.retire()` costs the allocation fast path, so it must happen
+    // only when this call is really going to take a pause. The first version
+    // asked only "is a cycle active?", which is true for the WHOLE of a mark
+    // cycle -- so every JIT allocation in that window retired its TLAB and the
+    // H2 workload stopped finishing at all (rc=124 at 600 s against ~60 s).
+    // The mixed collections it unblocked were real (9 pauses, 516 MB freed);
+    // the cost of getting there was not.
+    let work = if vm.mem.heap.g1_is_marking_active() {
+        // Only a DRAINED cycle has anything to do here.
+        vm.mem.heap.g1_concurrent_mark_finished()
+    } else {
+        vm.mem.heap.g1_should_start_marking()
+    };
+    if !work {
+        return;
+    }
+    // Needs a `JvmThread`: both halves take a real STW pause, and only a
+    // registered thread can request one.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.retire();
+        crate::runtime::interpreter::g1_drive_concurrent_mark_pub(vm, thread);
+    }
+}
+
+/// OPT-IN, and the reason is measured, not cautious.
+///
+/// Driving the lifecycle works exactly as designed: on
+/// `org.h2.test.store.TestMVStoreTool` at `-Xmx256m` it turns 0 mixed pauses
+/// into 15-33, reclaims 620-1034 MB that the collector otherwise never gets
+/// back, and makes the to-space-exhaustion census disappear (3/3 runs). Without
+/// it the same workload dies with `OutOfMemoryError: Java heap space` after
+/// 60-232 young pauses and zero mixed pauses (3/3).
+///
+/// It cannot be the default yet because the path it unblocks is broken. Every
+/// driver-on run reports ~32 `corrupt Value cell` heap-integrity errors, always
+/// strictly AFTER the first mixed pause, and one run in three escalates to a
+/// fatal `forwarding target must have its low 2 bits clear` abort. Zero such
+/// reports appear in any driver-off run, including one that took 232 young
+/// pauses -- so it is not "more GC finds more"; it is mixed evacuation. Setting
+/// `CRATONVM_COMPACT_TLAB_ALLOC=0` does not change the count (32 in 2/2), which
+/// rules out the compact/legacy cell-layout mismatch that the raw words first
+/// suggested.
+///
+/// Turning this on is therefore the way to REACH that defect, not a tuning
+/// knob. Default it on only once mixed evacuation runs clean.
+fn g1_jit_mark_driver_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_G1_JIT_MARK_DRIVER").is_some()
+    })
+}
+
 #[inline]
 unsafe fn jit_maybe_start_zgc_concurrent_mark(vm: &SharedVm) {
     if !vm.mem.heap.zgc_should_start_concurrent_mark() {
@@ -4514,6 +4583,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     if vm_ptr != 0 {
         // SAFETY: same provenance as the `&*(vm_ptr as *const SharedVm)` below.
         jit_maybe_start_zgc_concurrent_mark(&*(vm_ptr as *const SharedVm));
+        jit_drive_g1_concurrent_mark(&*(vm_ptr as *const SharedVm));
     }
     let elem_type = match atype as u8 {
         4 => ArrayElementType::Boolean,
@@ -5131,6 +5201,9 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     let class_id = ClassId::new(class_id_raw as u32);
     // ZGC: the concurrent-start check the interpreter does in `maybe_gc`.
     jit_maybe_start_zgc_concurrent_mark(vm);
+    // G1: the concurrent-mark lifecycle the interpreter drives from the same
+    // place. See `jit_drive_g1_concurrent_mark`.
+    jit_drive_g1_concurrent_mark(vm);
 
     // JVMS §5.5 / §new: `new` must initialize its class before the object
     // is allocated -- same missing check, same shape of bug as the
