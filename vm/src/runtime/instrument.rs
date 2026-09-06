@@ -530,25 +530,49 @@ fn native_redefine_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(None),
     };
     let n = ctx.array_length(arr);
+    // GC-SAFETY: same hazard as `native_retransform_classes0` below, same
+    // shape. `run_transformer_chain` runs agent bytecode and `redefine_class`
+    // defines a class; both allocate, so `arr` and every reference read out of
+    // it must be pinned and re-read rather than carried across.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
+    let inst_pin = inst_receiver.map(|r| ctx.pin_native_root(r));
+    let mut inst_receiver = inst_receiver;
     for i in 0..n {
+        arr = ctx.read_native_pin(arr_pin, arr);
+        if let (Some(pin), Some(r)) = (inst_pin, inst_receiver) {
+            inst_receiver = Some(ctx.read_native_pin(pin, r));
+        }
         let elem = match ctx.get_array_element(arr, i) {
             Value::Object(Some(o)) => o,
             _ => continue,
         };
+        let elem_pin = ctx.pin_native_root(elem);
         let class_mirror = read_class_def_field(ctx, elem, "mClass", 0);
         let bytes_arr = read_class_def_field(ctx, elem, "mClassFile", 1);
         let (target_class, target_class_id) = match class_mirror {
             Some(m) => match ctx.class_id_from_mirror(m) {
                 Some(cid) => (m, cid),
-                None => continue,
+                None => {
+                    ctx.unpin_native_roots(elem_pin);
+                    continue;
+                }
             },
-            None => continue,
+            None => {
+                ctx.unpin_native_roots(elem_pin);
+                continue;
+            }
         };
+        let class_pin = ctx.pin_native_root(target_class);
         let bytes_obj = match bytes_arr {
             Some(o) => o,
-            None => continue,
+            None => {
+                ctx.unpin_native_roots(elem_pin);
+                continue;
+            }
         };
         let new_bytes = read_byte_array(ctx, bytes_obj);
+        let target_class = ctx.read_native_pin(class_pin, target_class);
         // Run the chain — only canRetransform=true entries fire on
         // redefineClasses (HotSpot fires every transformer, gated by
         // canRetransform, and threads outputs).
@@ -563,7 +587,9 @@ fn native_redefine_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if let Err(msg) = ctx.redefine_class(target_class_id, &final_bytes) {
             tracing::warn!("redefineClasses0: {msg}");
         }
+        ctx.unpin_native_roots(elem_pin);
     }
+    ctx.unpin_native_roots(arr_pin);
     Ok(None)
 }
 
@@ -581,14 +607,62 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
         eprintln!("[RETRANSFORM] retransformClasses0 called with {n} classes");
     }
+    // GC-SAFETY. Every iteration of this loop runs Java — the transformer
+    // chain is agent bytecode — and defines classes, so it allocates and can
+    // safepoint. `arr` and `inst_receiver` are raw `ObjectRef`s captured
+    // before that; a moving collector relocates the `Class[]` out from under
+    // them and the next `get_array_element` reads whatever now occupies the
+    // old address, which is a zero word. That is not a crash: the read yields
+    // `Object(None)`, the `_ => continue` arm swallows it, and the REMAINING
+    // CLASSES OF THE HIERARCHY ARE NEVER RETRANSFORMED — silently, with no
+    // error for the agent to see.
+    //
+    // Measured on Mockito's inline mock maker, whose `mock()` retransforms the
+    // whole superclass chain in one call. A relocation during the FIRST
+    // class's transformation left `[java/net/URLConnection]` woven and
+    // `[java/lang/Object, …/NestedUrlConnection]` untouched, so the mock did
+    // not intercept and the first call on it ran the real body:
+    // Spring Boot's `NestedUrlConnectionTests` NPE, ~12% of processes here and
+    // ~2.4% through the suite runner.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
+    let inst_pin = inst_receiver.map(|r| ctx.pin_native_root(r));
+    let mut inst_receiver = inst_receiver;
     for i in 0..n {
+        // The refresh that makes the rest of this loop safe. On the
+        // measured workload the array moved before EVERY i=1, so this is the
+        // common path, not a corner.
+        arr = ctx.read_native_pin(arr_pin, arr);
+        if let (Some(pin), Some(r)) = (inst_pin, inst_receiver) {
+            inst_receiver = Some(ctx.read_native_pin(pin, r));
+        }
         let mirror = match ctx.get_array_element(arr, i) {
             Value::Object(Some(o)) => o,
-            _ => continue,
+            // Reported, not swallowed. This arm is how the GC-safety bug
+            // above stayed invisible: the agent asked for a class, the read
+            // came back as a zero word, `continue` dropped it, and Mockito
+            // was handed a half-instrumented hierarchy with no error. If it
+            // ever fires again the next reader gets a line instead of a
+            // mystery.
+            other => {
+                eprintln!(
+                    "[instrument] retransformClasses0: element {i} of {n} is not a Class \
+                     ({other:?}); that class is NOT retransformed and the agent is not told"
+                );
+                continue;
+            }
         };
+        let mirror_pin = ctx.pin_native_root(mirror);
         let class_id = match ctx.class_id_from_mirror(mirror) {
             Some(cid) => cid,
-            None => continue,
+            None => {
+                eprintln!(
+                    "[instrument] retransformClasses0: element {i} of {n} has no class id; \
+                     that class is NOT retransformed and the agent is not told"
+                );
+                ctx.unpin_native_roots(mirror_pin);
+                continue;
+            }
         };
         if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
             let nm = ctx.class_name_of_id(class_id).unwrap_or_default();
@@ -622,6 +696,7 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // which is what the previous behaviour achieved anyway, minus the
         // spurious exception.
         if original.is_empty() {
+            ctx.unpin_native_roots(mirror_pin);
             tracing::warn!(
                 "retransformClasses0: no retransformation base for `{}`; skipping \
                  (see the preceding diagnostic for which of the three reasons applied)",
@@ -641,9 +716,11 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // future retransformation.  Both swaps preserve class identity and do
         // not run initializers.
         if let Err(msg) = ctx.retransform_class(class_id, &original) {
+            ctx.unpin_native_roots(mirror_pin);
             tracing::warn!("retransformClasses0: could not restore original bytes: {msg}");
             continue;
         }
+        let mirror = ctx.read_native_pin(mirror_pin, mirror);
         let final_bytes = run_transformer_chain(
             ctx,
             class_id,
@@ -653,6 +730,7 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             inst_receiver,
         );
         if final_bytes.is_empty() {
+            ctx.unpin_native_roots(mirror_pin);
             continue;
         }
         // retransform (not redefine): preserve the class's original cached
@@ -661,7 +739,9 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if let Err(msg) = ctx.retransform_class(class_id, &final_bytes) {
             tracing::warn!("retransformClasses0: {msg}");
         }
+        ctx.unpin_native_roots(mirror_pin);
     }
+    ctx.unpin_native_roots(arr_pin);
     Ok(None)
 }
 
@@ -2460,6 +2540,88 @@ mod tests {
         // Build a dummy ObjectRef from a raw addr. Only used inside
         // unit tests where we never dereference it.
         unsafe { std::mem::transmute::<usize, ObjectRef>(addr) }
+    }
+
+    // ---- GC-safety of the two agent-array loops (2026-09-06) ----
+
+    /// The body of `fn <name>(` in THIS file, from the declaration to the
+    /// first `\n}` in column 0 after it.
+    ///
+    /// Line endings are normalised first: `include_str!` embeds the file's raw
+    /// bytes and this repository is checked out with CRLF on Windows, where
+    /// every `contains` below would still work but the byte offsets used to
+    /// order two needles would not.
+    fn fn_body(name: &str) -> String {
+        let src = include_str!("instrument.rs").replace("\r\n", "\n");
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found in instrument.rs"));
+        let end = src[start..]
+            .find("\n}")
+            .map_or(src.len(), |i| start + i + 2);
+        src[start..end].to_string()
+    }
+
+    /// Both loops walk an agent-supplied array while running agent bytecode
+    /// and defining classes — that allocates, so a moving collector relocates
+    /// the array mid-loop. Measured 2026-09-06: it moved before `i=1` in
+    /// **60 of 60** processes, and roughly one in eight read a zero word out
+    /// of the vacated address, silently dropped the rest of the hierarchy, and
+    /// handed Mockito a mock that did not intercept.
+    ///
+    /// A source witness rather than a behavioural test because reproducing it
+    /// needs a real agent, a real GC and luck: every in-process instrument
+    /// that tried to observe it changed the allocation pattern and hid it. So
+    /// this asserts the SHAPE that makes it impossible — pin, then re-read
+    /// before every element access — and it fails if an edit drops either.
+    #[test]
+    fn the_agent_array_loops_pin_and_refresh_before_every_element_read() {
+        for name in ["native_retransform_classes0", "native_redefine_classes0"] {
+            let body = fn_body(name);
+            assert!(
+                body.contains("pin_native_root(arr)"),
+                "{name} must pin the agent array before the loop"
+            );
+            assert!(
+                body.contains("unpin_native_roots(arr_pin)"),
+                "{name} must release the array pin"
+            );
+            let refresh = body
+                .find("read_native_pin(arr_pin")
+                .unwrap_or_else(|| panic!("{name} never re-reads the array from its pin"));
+            let read = body
+                .find("get_array_element(arr, i)")
+                .unwrap_or_else(|| panic!("{name} no longer reads the array by index"));
+            assert!(
+                refresh < read,
+                "{name} reads element i BEFORE refreshing `arr` from its pin — that is \
+                 exactly the stale read this pin exists to stop"
+            );
+        }
+    }
+
+    /// The element read out of that array is itself carried across the
+    /// transformer chain, so it needs the same treatment. Asserted separately
+    /// because the array pin alone does not cover it: a relocation between the
+    /// element read and `run_transformer_chain` moves the mirror, not the
+    /// array.
+    #[test]
+    fn the_retransform_loop_refreshes_the_mirror_before_running_the_chain() {
+        let body = fn_body("native_retransform_classes0");
+        let pin = body
+            .find("pin_native_root(mirror)")
+            .expect("the class mirror must be pinned");
+        let refresh = body
+            .find("read_native_pin(mirror_pin, mirror)")
+            .expect("the class mirror must be re-read from its pin");
+        let chain = body
+            .find("run_transformer_chain(")
+            .expect("the transformer chain call is gone");
+        assert!(
+            pin < refresh && refresh < chain,
+            "the mirror must be pinned, then refreshed, then handed to the chain \
+             (pin={pin} refresh={refresh} chain={chain})"
+        );
     }
 
     // ---- Observability audit (2026-07-26): retransform seed validation ----

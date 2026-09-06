@@ -1820,6 +1820,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_XT_PEER_TOTAL_MS` | JIT | `CRATONVM_JIT=xt-peer-total-ms` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_PINNED_PEER_DEPTH` | JIT | `CRATONVM_JIT=xt-pinned-peer-depth` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY` | JIT | `CRATONVM_JIT=xt-pinned-peer-publish-only` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_XT_PINNED_PEER_UNPINNABLE` | JIT | `CRATONVM_JIT=xt-pinned-peer-unpinnable` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_YOUNGSCAN_STRIDE` | GC | `CRATONVM_GC=youngscan-stride` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_ZGC_ALLOC_TRIGGER` | GC | `CRATONVM_GC=zgc-alloc-trigger` | default-on | on | behaviour | snapshot | gc |
 | `CRATONVM_ZGC_ASSUME_REWRITABLE` | GC | `CRATONVM_GC=zgc-assume-rewritable` | opt-in | off | behaviour | snapshot | gc |

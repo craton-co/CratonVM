@@ -1882,6 +1882,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "xt-helper-window-discharge", on_key: Some("CRATONVM_XT_HELPER_WINDOW_DISCHARGE"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-pinned-peer-depth", on_key: Some("CRATONVM_XT_PINNED_PEER_DEPTH"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-pinned-peer-publish-only", on_key: Some("CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY"), off_key: None, off_word: None, since: "2026-09-02" },
+    // Credit the pinned-peer depth even on a collector that cannot honour the
+    // pin. Default OFF, which is the corrected behaviour; setting it restores
+    // the ten-second H2 SIGSEGV, so the fix has a positive control rather than
+    // only an absence of crashes.
+    E { group: Group::JIT, token: "xt-pinned-peer-unpinnable", on_key: Some("CRATONVM_XT_PINNED_PEER_UNPINNABLE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "xt-peer-shadow-scan", on_key: Some("CRATONVM_XT_PEER_SHADOW_SCAN"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "dbg-stale-frame-words", on_key: Some("CRATONVM_DBG_STALE_FRAME_WORDS"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "pin-unnamed-frame-refs", on_key: Some("CRATONVM_JIT_PIN_UNNAMED_FRAME_REFS"), off_key: None, off_word: None, since: "2026-09-03" },
