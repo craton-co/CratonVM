@@ -153,14 +153,26 @@ live reference, because no live reference is there.
 
 The sharpest fact on this page, and the one to start from:
 
-| arm | PASS | CRASH | FAIL | OOM |
-|---|---:|---:|---:|---:|
-| parallel evacuator (default, and with the 2026-09-05 screens off) | **0** | 2 | 1 | 3 |
-| `CRATONVM_G1_PARALLEL_EVAC=0` | **3** | 0 | 0 | 0 |
+One binary, three arms, interleaved per repetition, idle host:
 
-Six completed parallel-arm runs, none healthy; three serial-arm runs, all
-`OK (8 tests)`. (Runs killed by a session restart are excluded, not counted as
-either.) Fisher exact on 0/6 against 3/3 is p ≈ 0.012.
+| arm | PASS | CRASH | OOM |
+|---|---:|---:|---:|
+| `default` — parallel, every screen armed | **0** | 1 | 2 |
+| `screenoff` — parallel, the 2026-09-05 screens stood down | **0** | 1 | 2 |
+| `serial` — `CRATONVM_G1_PARALLEL_EVAC=0` | **3** | 0 | 0 |
+
+and across every census this investigation ran (runs killed by a session
+restart excluded, not counted as either):
+
+| arm | healthy | unhealthy |
+|---|---:|---:|
+| parallel | **0** | 10 |
+| serial | **5** | 0 |
+
+Fisher exact on 0/10 against 5/5 is p ≈ 3e-4. The two parallel arms are
+indistinguishable from each other, which is its own result: **the 2026-09-05
+screens change nothing here** — they were the right parity fix for the assert
+they were built for and they are not what this class needs.
 
 **The serial arm is not a control that dies early.** It finishes the whole
 class in 232-264 s, against 387 s for the one parallel run that reached a JUnit
