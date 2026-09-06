@@ -976,7 +976,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-163 tokens.
+164 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1043,6 +1043,7 @@ export inherited from a parent shell.
 | `zgc-bitmap-sweep` | `CRATONVM_ZGC_BITMAP_SWEEP` |
 | `zgc-mark-root-filter` | `CRATONVM_ZGC_MARK_ROOT_FILTER` |
 | `zgc-jit-tlab` | `CRATONVM_ZGC_JIT_TLAB` |
+| `tlab-flag-publish-false` | `CRATONVM_ZGC_TLAB_FLAG_PUBLISH_FALSE` |
 | `zgc-tlab-tail-sink` | `CRATONVM_ZGC_TLAB_TAIL_SINK` |
 | `zgc-mark-pool-persistent` | `CRATONVM_ZGC_MARK_POOL_PERSISTENT` |
 | `g1-reserve-heap` | `CRATONVM_G1_RESERVE_HEAP` |
