@@ -49,14 +49,32 @@ An eight-byte write at the base, with the mark word untouched, is a much
 narrower statement than "the header is corrupt": a sixteen-byte legacy `Value`
 write would have taken the mark word out too.
 
-### Why it OOMs
+### Why it OOMs — WITHDRAWN 2026-09-06, the OOM is a separate defect
 
-`object_total_size` reads `num_slots` from that same dword. A pointer's high
-dword is the arena's high dword — 752 on this host, 2048 on another — so a
-small object is sized at `16 + 752*16 ≈ 12 KB` and `evacuate` copies twelve
-kilobytes for it, every pause, until to-space is gone. The OOM is not a
-separate problem from the ClassCastExceptions; it is the same header read by
-the allocator instead of by a cast.
+**This section was wrong, and the correction is measured.** It said:
+
+> `object_total_size` reads `num_slots` from that same dword … so a small
+> object is sized at `16 + 752*16 ≈ 12 KB` and `evacuate` copies twelve
+> kilobytes for it, every pause, until to-space is gone. The OOM is not a
+> separate problem from the ClassCastExceptions.
+
+It is a separate problem. The OOM is
+`g1-promotion-tlabs-took-a-fresh-region-per-worker-per-pause` (FIXED,
+`CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST`): every evacuation worker's promotion
+TLAB took a whole fresh Free region in every pause and abandoned it partly
+filled, so the old generation grew by **one region per worker per young pause**
+— measured `+23` per pause against 23 workers, `+4` under
+`CRATONVM_G1_WORKERS=4`, `+1` on the serial arm — until `free_regions` hit 0.
+Total bytes ever copied in such a run: 0.64 GB, into 2.03 GB of Old regions.
+Nothing reclaimed them: every pause was `YoungOnly` and the first `Mixed` pause
+came AFTER the `OutOfMemoryError`, on the last-ditch path, where it handed back
+1100 regions at once.
+
+That also settles the kill switch below. `CRATONVM_G1_PARALLEL_EVAC=0` made the
+class healthy because the SERIAL evacuator's `alloc_in_type_locked_scan` scans
+existing non-CSet regions of the destination type before claiming a Free one —
+30 Old regions for the whole class against 2026. The 0/10-vs-5/5 split was this
+defect, not the eight-byte write.
 
 ## Which walk trips over it
 
@@ -157,9 +175,15 @@ regions still in its own pool. On, it only reports once the heap is genuinely
 full.** The parallel evacuator is no longer manufacturing to-space exhaustion;
 what is left is real.
 
-**It does not make the class pass.** Neither arm is healthy yet — the remaining
-failures are genuine heap exhaustion at `-Xmx2g` (and one CRASH). Pool
-exhaustion was real, is fixed, and is not the whole story.
+**It does not make the class pass.** Neither arm is healthy yet — but "the
+remaining failures are genuine heap exhaustion at `-Xmx2g`", which is what this
+line used to say, was an assumption rather than a measurement. **HotSpot
+runs the same eight test cases in 18 s at `-Xmx512m` with an 18-24 MB live set,
+flat.** The exhaustion was manufactured; see the WITHDRAWN section above and
+`g1-promotion-tlabs-took-a-fresh-region-per-worker-per-pause-FIXED-20260906`.
+Pool exhaustion was real, is fixed, and is not the whole story — in the OOM
+census it is a CONSEQUENCE, its first report landing only once `free_regions`
+was already down to single digits.
 
 ## The corruption happens INSIDE a pause, after the copy
 
