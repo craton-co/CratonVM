@@ -113,10 +113,15 @@ pub const NULL_PAGE_LIMIT: usize = 4096;
 /// Registered sites. 32,768 × two words = 512 KiB of zero-initialised BSS.
 const CAP: usize = 1 << 15;
 
-const ZERO: AtomicUsize = AtomicUsize::new(0);
 /// `0` means "empty, or retired". A real faulting PC is never 0.
-static FAULT_PC: [AtomicUsize; CAP] = [ZERO; CAP];
-static RECOVER_PC: [AtomicUsize; CAP] = [ZERO; CAP];
+///
+/// The inline `const` block is a fresh `AtomicUsize` PER ELEMENT. It replaced a
+/// named `const ZERO`, which worked for the same reason -- a `const` is copied
+/// at each use -- but is the shape `clippy::declare_interior_mutable_const`
+/// warns about, because the same name read anywhere else would silently
+/// produce a temporary to mutate rather than shared state.
+static FAULT_PC: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+static RECOVER_PC: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
 /// Monotonic high-water mark. Never decreases — see hazard 2.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 

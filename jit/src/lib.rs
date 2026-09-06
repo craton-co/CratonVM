@@ -11097,7 +11097,7 @@ pub const VARHANDLE_READ_MODES: [&str; 4] = ["get", "getVolatile", "getOpaque", 
 /// return is outside `varhandle_reference_return_mismatch`'s fire set today and
 /// a stand-in descriptor would have to reproduce that exclusion for no measured
 /// caller.
-pub const VARHANDLE_READ_RETURNS: [u8; 8] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D'];
+pub const VARHANDLE_READ_RETURNS: [u8; 8] = *b"ZBCSIJFD";
 
 /// Slot-minor kind for a site whose declared return is exactly
 /// `Ljava/lang/Object;`. The helpers' erased stand-in descriptor is that site's
@@ -11356,7 +11356,7 @@ pub const VARHANDLE_WRITE_MODES: [&str; 4] = ["set", "setVolatile", "setRelease"
 /// `L` IS here, unlike [`VARHANDLE_READ_RETURNS`] — see this section's header
 /// for why a reference is safe inbound. An array-typed field is stored under
 /// `L` too: the plan collapses both to `L`, and the store is the same word.
-pub const VARHANDLE_WRITE_KINDS: [u8; 9] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D', b'L'];
+pub const VARHANDLE_WRITE_KINDS: [u8; 9] = *b"ZBCSIJFDL";
 
 /// `VARHANDLE_WRITE_MODES.len() * VARHANDLE_WRITE_KINDS.len()`.
 pub const VARHANDLE_WRITE_SLOTS: usize = 36;
@@ -11486,7 +11486,7 @@ pub static VARHANDLE_CAS_DIRECT_FNS: [std::sync::atomic::AtomicUsize; VARHANDLE_
 
 /// The value kinds served, in slot order — the same nine the write bind takes,
 /// and for the same reason `L` is among them.
-pub const VARHANDLE_CAS_KINDS: [u8; 9] = [b'Z', b'B', b'C', b'S', b'I', b'J', b'F', b'D', b'L'];
+pub const VARHANDLE_CAS_KINDS: [u8; 9] = *b"ZBCSIJFDL";
 
 /// `VARHANDLE_CAS_KINDS.len()`. One mode only: `compareAndSet`.
 ///
