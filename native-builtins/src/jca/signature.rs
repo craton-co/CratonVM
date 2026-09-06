@@ -3102,25 +3102,6 @@ mod tests {
         assert_eq!(algo_name(SIG_MLDSA_65), "ML-DSA-65");
     }
 
-    /// Parameter-set → concrete SUN `ML_DSA_Impls$SIG{2,3,5}` SPI mapping
-    /// (matching `key_factory::pqc_spi_classes`' 2/3/5 NIST-category suffixes),
-    /// and a non-ML-DSA name rejects.
-    #[test]
-    /// The seed list and the SPI map are ONE set, in both directions.
-    ///
-    /// They are separate declarations — one is what `Security.getAlgorithms`
-    /// reports, the other is what `sign()` drives — and a name in the first
-    /// without an arm in the second is precisely the defect
-    /// `W7-63-jca-advertise-vs-serve.md` is named for: a provider advertising
-    /// an algorithm it will not serve. `seed_direct_native_engine_services`
-    /// would panic on that (`.expect`), which is a loud failure at VM start
-    /// rather than a quiet one at `getInstance` — but only if a VM is started,
-    /// so it is asserted here too.
-    ///
-    /// The reverse direction is the one that would rot silently: an SPI arm
-    /// nothing advertises serves a name `Security.getAlgorithms("Signature")`
-    /// says does not exist.
-    #[test]
     /// The ECDSA twin of `every_dsa_family_signature_name_maps_to_an_spi_class`,
     /// and it exists because the list it replaces had already drifted.
     ///

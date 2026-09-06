@@ -1,5 +1,5 @@
 [workspace]
-members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-builtins-crypto", "native-builtins-security", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu", "gc", "vm", "vm-cli", "jfr", "libcratonvm", "cratonvm-embed", "difftest"]
+members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-builtins-crypto", "native-builtins-security", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu4j", "gc", "vm", "vm-cli", "jfr", "libcratonvm", "cratonvm-embed", "difftest"]
 # `fuzz` is intentionally NOT a workspace member: its libFuzzer `fuzz_target!`
 # macros expand to `#![no_main]` / `#[no_mangle]` code that trips the
 # workspace's production lints. It is its own standalone workspace (see

@@ -1926,7 +1926,7 @@ impl BigUint {
             }
         }
         let mut out = BigUint {
-            limbs: mont.from_mont(&acc),
+            limbs: mont.out_of_mont(&acc),
         };
         out.normalize();
         out

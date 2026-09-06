@@ -155,3 +155,119 @@ premise this page's verdict leans on — "falling back to non-moving is
 safety-first" — no longer holds unconditionally project-wide, and that is
 worth knowing before treating any future DoHead-family symptom as "just
 throughput" without checking.
+
+## Part 5 — 2026-09-06: the CORRECTNESS residual, and what "does not reproduce" is worth
+
+Part 4 above asks how much of today's full-suite total is the moving-young
+mechanism versus host contention. This part answers the neighbouring question
+for the CORRECTNESS half — the `ReentrantLock.sync` NPE, not the timeouts —
+and it reaches Part 4's observation by a different route: Part 4 saw
+`no collection has run yet`, i.e. relocation had stopped; the measurements
+below quantify exactly that and then divide it out.
+
+### The interleaved control, and why its raw run counts could not settle it
+
+Interleaved control -- one box, the same minutes, 4-way parallelism, arms
+alternated round by round, 900 s cap on both so a hang cannot pass as a pass:
+
+| arm | runs | OK | non-OK | truncated | NPE lines |
+|---|---:|---:|---:|---:|---:|
+| the binary that measured 5/24 earlier today | 24 | 22 | **2** | 0 | 2 |
+| current `dev` | 24 | **24** | **0** | 0 | 0 |
+
+Both surviving failures on the old binary are this residual's exact signature
+(`Http2TestBase$TestInput.fill:1094`). Mean completed-run duration is
+equivalent -- 101.1 s old, 99.0 s new -- so the newer binary is not passing by
+running slower or by dying early, and neither arm truncated. Counting an
+earlier plain-vs-instrumented sweep on the same build, current `dev` is
+**0 failures in 72 runs** — subject to the masking caveat below, which is
+the first thing to read here.
+
+**MASKED, NOT FIXED — and this is the load-bearing caveat.** This defect
+REQUIRES young relocation (`CRATONVM_NO_MOVING_YOUNG=1` took it to 0/24). Young
+relocation is currently being refused on this workload: every
+`[moving-young]` line in BOTH arms of the run above is a `fallback` with
+`reason=unregistered-jit-frame-on-stack` (217 old, 216 new), and a
+`CRATONVM_GC_STATS=1` census shows the surviving moving cycles are not equal
+between the arms either:
+
+| arm | moving young cycles | non-moving |
+|---|---:|---:|
+| old binary | 7 and 3 (two runs) | 14, 23 |
+| current dev | 1 and 3 (two runs) | 25, 22 |
+
+Small sample (two runs per arm), but the direction is unambiguous and it is
+confounded with the result: the arm that failed relocated ~2.5x more than the
+arm that did not. **A relocation-gated defect not firing in the arm that
+relocates less is not evidence of a repair.**
+
+`docs/known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+reaches the same conclusion independently for its own 19 classes, and states the
+consequence plainly: the refusal now suppressing relocation is the SAME
+`[moving-young] fallback` this page's Part 2 documents as a *throughput*
+problem, so **whoever repairs moving-young engagement re-exposes this
+correctness bug**. The green is conditional on the collector declining to do its
+job.
+
+**Also a REPRODUCTION result, not a root cause.** Two further limits:
+
+* The old binary's rate TODAY is 2/24 (~8%) against 5/24 (~21%) when this
+  residual was characterised. The host is less sensitive than it was, so 72
+  clean runs prove less than 72 runs at the earlier sensitivity would.
+* **No commit is credited.** `dev` took many GC commits in the interval,
+  including one that landed a moving-young root cause and was then WITHDRAWN by
+  its author. Attributing the disappearance to any of them would be a guess.
+
+**The shape to look for if it returns**, since the characterisation cost more
+than the disappearance did: the victim is
+`java.util.concurrent.locks.ReentrantLock.sync` -- null at `unlock()` and
+non-null at `lock()`, so the slot is live entering the critical section and zero
+leaving it, while the owning thread is blocked INSIDE it. Seen on two unrelated
+instances and paths (`NioSocketImpl.readLock` on the HTTP/2 client read,
+`LinkedBlockingQueue.takeLock` under `TaskQueue.take` on a worker). Gated on
+young relocation, and Generational-specific rather than moving-young-generic:
+G1 relocates young objects and never exhibited it.
+
+**Instruments that make this findable again**, because the default symptom names
+the wrong object: JUnit sees only a messageless NPE at `TestInput.fill:1094`,
+which reads as a zeroed `private final InputStream` and is not.
+`CRATONVM_DBG_NPE_NONE=1` shows the raise is Rust-side with `fill` as the
+DEEPEST Java frame; `CRATONVM_DBG_STTRACE=1` recovers the compiled frames that
+already left the stack, whose deepest is `ReentrantLock.unlock`; and
+`ReentrantLock.unlock()` is `sync.release(1)`. Without the STTRACE snapshot the
+six JDK frames holding the answer are invisible.
+
+#### Resolved by normalising on relocation exposure
+
+The masking caveat above was the right question and the wrong answer. Current
+dev *does* relocate less — but that does not account for the green, and the way
+to show it is to stop counting runs and count the gated event.
+
+The defect fires only on a MOVING young collection, so failures per moving
+cycle is the rate that means anything. `CRATONVM_GC_STATS=1` in both arms,
+interleaved, 3 rounds, 8 classes:
+
+| arm | runs | non-OK | moving cycles | failures per 100 moving cycles |
+|---|---:|---:|---:|---:|
+| the binary that showed the defect | 24 | **5** | 73 | **6.85** |
+| current `dev` | 24 | **0** | 44 | **0.00** |
+
+Current dev relocates at 0.60x the old binary's rate over identical runs — the
+masking effect is REAL and is why the raw run counts could not settle this. But
+pooling every measured current-dev moving cycle from this and the amplifier run
+gives **0 failures in 137 moving cycles**, where the old binary's rate predicts
+**9.4**. P(observing zero | rate unchanged) ≈ **8.4e-5**.
+
+So the improvement is not explained by reduced relocation. Both things are true:
+dev relocates less, AND its failure rate per relocation is genuinely lower.
+
+**Still not a root cause, and still no commit credited.** The mechanism was
+never found; dev took many GC commits in the window, including a moving-young
+root cause that landed and was WITHDRAWN. This says the defect no longer fires
+at a measurable rate per unit of the exposure it needs — nothing about why.
+
+**The amplifier does not work on this workload**, which is worth recording so
+nobody re-runs it: `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` is the netty page's lever
+for forcing relocation (1 -> 14-24 cycles there), and here it measured 43 moving
+cycles against a plain arm's 50. Exposure on these classes cannot be forced
+level, only measured and divided out.

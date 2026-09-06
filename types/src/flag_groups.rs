@@ -754,6 +754,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "moving-young-band-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_DBG"), off_key: None, off_word: None, since: "2026-07-26" },
+    // Diagnostic widening of the register-image remap to the whole unverifiable
+    // frame tail, to TEST the four-region partition in `conservative_roots`'s
+    // module comment rather than continue to argue it. Off by default; see
+    // `register_image_remap_admits`.
+    E { group: Group::DBG, token: "jit-remap-all-unverifiable", on_key: Some("CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "moving-young-band-skip-in-map", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::DBG, token: "moving-young-coverage-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_COVERAGE_DBG"), off_key: None, off_word: None, since: "2026-07-01" },
     E { group: Group::DBG, token: "moving-young-fallbacks", on_key: Some("CRATONVM_MOVING_YOUNG_FALLBACKS"), off_key: None, off_word: None, since: "2026-07-01" },
@@ -785,6 +790,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "nocode", on_key: Some("CRATONVM_DBG_NOCODE"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "nonmoving-reclaim", on_key: None, off_key: Some("CRATONVM_DBG_NO_NONMOVING_RECLAIM"), off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None, since: "2026-05-20" },
+    E { group: Group::DBG, token: "null-field-provenance", on_key: Some("CRATONVM_DBG_NULL_FIELD_PROVENANCE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "npe-match", on_key: Some("CRATONVM_DBG_NPE_MATCH"), off_key: None, off_word: None, since: "2026-08-05" },
     E { group: Group::DBG, token: "a5-engagement", on_key: Some("CRATONVM_DBG_A5_ENGAGEMENT"), off_key: None, off_word: None, since: "2026-08-18" },
@@ -962,6 +968,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "swchain", on_key: Some("CRATONVM_DBG_SWCHAIN"), off_key: None, off_word: None, since: "2026-08-20" },
     E { group: Group::DBG, token: "sweep-census", on_key: Some("CRATONVM_DBG_SWEEP_CENSUS"), off_key: None, off_word: None, since: "2026-07-07" },
     E { group: Group::DBG, token: "sweep-edges", on_key: Some("CRATONVM_DBG_SWEEP_EDGES"), off_key: None, off_word: None, since: "2026-06-03" },
+    E { group: Group::DBG, token: "unreg-declined", on_key: Some("CRATONVM_DBG_UNREG_DECLINED"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "sweep-referrers", on_key: Some("CRATONVM_DBG_SWEEP_REFERRERS"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::DBG, token: "sweep-zero", on_key: Some("CRATONVM_DBG_SWEEP_ZERO"), off_key: None, off_word: None, since: "2026-06-16" },
     E { group: Group::DBG, token: "sweep-trace-class", on_key: Some("CRATONVM_DBG_SWEEP_TRACE_CLASS"), off_key: None, off_word: None, since: "2026-09-06" },
@@ -1590,6 +1597,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "osr-strip-all-high-halves", on_key: Some("CRATONVM_JIT_OSR_STRIP_ALL_HIGH_HALVES"), off_key: None, off_word: None, since: "2026-08-06" },
     E { group: Group::JIT, token: "osr-single-pc", on_key: Some("CRATONVM_JIT_OSR_SINGLE_PC"), off_key: None, off_word: None, since: "2026-08-03" },
     E { group: Group::JIT, token: "poison-free", on_key: Some("CRATONVM_JIT_POISON_FREE"), off_key: None, off_word: None, since: "2026-07-27" },
+    E { group: Group::JIT, token: "post-tlab-hash-stamp", on_key: Some("CRATONVM_JIT_POST_TLAB_HASH_STAMP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "precise-coverage-pin", on_key: Some("CRATONVM_PRECISE_COVERAGE_PIN"), off_key: None, off_word: None, since: "2026-06-21" },
     // Wrong-answer A/B lever, not a tuning knob: OFF restores the params-only
     // `run_jit_callee_handler` resume that zeroed a compiled callee's
@@ -1800,7 +1808,7 @@ pub const INVENTORY: &[E] = &[
     // instead of re-resolving its hostname on every connect. Default-ON and
     // opt-out-only; `=0` restores the per-dial `getaddrinfo`, which is the
     // "off" arm for
-    // `known-issues/netty/blocking-connect-accept-stalls-near-128-connections-20260905.md`.
+    // `internal/fixed-suite-bugs/netty/blocking-connect-re-resolves-the-destination-hostname-FIXED-20260905.md`.
     E { group: Group::JIT, token: "sc-preresolved", on_key: Some("CRATONVM_SC_PRERESOLVED"), off_key: None, off_word: Some("0"), since: "2026-09-05" },
     // Default-**ON** (`unwrap_or(true)` in `jit::strict_callee_roots_enabled`),
     // despite the prose on that function calling it an opt-in.
@@ -2005,6 +2013,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "g1-serial-evac-holder-screen", on_key: Some("CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::GC, token: "g1-evac-copy-watch", on_key: Some("CRATONVM_G1_EVAC_COPY_WATCH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-parallel-evac-shared-dest", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
+    E { group: Group::GC, token: "g1-parallel-evac-resume-dest", on_key: Some("CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::GC, token: "g1-evac-ref-implausible-refuse", on_key: Some("CRATONVM_G1_EVAC_REF_IMPLAUSIBLE_REFUSE"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "g1-cleanup-walk", on_key: Some("CRATONVM_G1_CLEANUP_WALK"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::GC, token: "g1-adaptive-ihop", on_key: Some("CRATONVM_G1_ADAPTIVE_IHOP"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
