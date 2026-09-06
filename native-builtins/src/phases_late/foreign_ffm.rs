@@ -5034,7 +5034,6 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // `.or()` compose over a lie ("yes, a library IS loaded") instead of a
     // clean unavailable signal.
     r.set_category(__prev_cat);
-    
 }
 
 #[cfg(test)]

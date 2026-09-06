@@ -13795,7 +13795,6 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
@@ -14068,7 +14067,6 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------
@@ -20490,7 +20488,6 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         });
     }
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------

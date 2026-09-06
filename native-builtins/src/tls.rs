@@ -666,7 +666,6 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| crate::jca::ssl_context_spi::ssl_context_provider(ctx, args),
     );
     r.set_category(__prev_cat);
-    
 }
 
 /// Protocol name for a `CTX_PROTOCOL_IDX` slot value.
@@ -1056,7 +1055,6 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------
@@ -2689,7 +2687,6 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------
@@ -3164,7 +3161,6 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------

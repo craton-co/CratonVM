@@ -21495,7 +21495,6 @@ pub fn register_essential_natives_with_shims(
             let raw = crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0);
             Ok(Some(Value::Int(raw.saturating_mul(1000))))
         });
-        
     }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
     // C12-1 (2026-08-12): `java/util/SimpleTimeZone` is DELIBERATELY NOT HERE.
@@ -37104,7 +37103,6 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.set_category(__prev_cat);
-    
 }
 
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
@@ -45359,7 +45357,6 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // where it used to live in `phases_early.rs`.
 
     // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases;
-    
 }
 
 // ===========================================================================

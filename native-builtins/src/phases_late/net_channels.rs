@@ -2931,7 +2931,6 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // ===========================================================================
@@ -3563,7 +3562,6 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.set_category(__prev_cat);
-    
 }
 
 // =============================================================================
@@ -5018,7 +5016,6 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // =============================================================================
@@ -5212,7 +5209,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
     // net_phase_e::register_re1_socket/register_re2_server_socket). See
     // `reference_server_socket_gap`.
     if crate::vmflags().io.real_net_sockets {
-        return ;
+        return;
     }
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5894,7 +5891,6 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     r.set_category(__prev_cat);
-    
 }
 
 /// Both class names a `createContext` result can carry.

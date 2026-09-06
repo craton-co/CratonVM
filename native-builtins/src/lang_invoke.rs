@@ -7387,7 +7387,6 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------
@@ -8402,7 +8401,6 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
         |ctx, args| array_element_accessor_handle(ctx, args, true),
     );
     r.set_category(__prev_cat);
-    
 }
 
 /// Shared body of the `arrayElementGetter` / `arrayElementSetter` bridges.
@@ -8503,7 +8501,6 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 /// `MethodHandles.identity(Class type)` — a *functional* shim returning an
@@ -8535,7 +8532,6 @@ pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegist
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 /// `CallSite.dynamicInvoker()` (concrete on `MutableCallSite` /
@@ -8575,7 +8571,6 @@ pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegis
         );
     }
     r.set_category(__prev_cat);
-    
 }
 
 fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9040,7 +9035,6 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     }
 
     r.set_category(__prev_cat);
-    
 }
 
 /// Read a call site's current target MethodHandle descriptor (real
@@ -9098,7 +9092,6 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // =============================================================================
@@ -14859,7 +14852,6 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // Lookup.find* are already registered in register_p63_method_handles_lookup
     // with full descriptor resolution. No duplicate registration needed here.
     r.set_category(__prev_cat);
-    
 }
 
 /// The `Class` mirror for one component of a method descriptor, named as
@@ -15453,7 +15445,6 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
-    
 }
 
 // ---------------------------------------------------------------------------

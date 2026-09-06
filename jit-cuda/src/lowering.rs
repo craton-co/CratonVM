@@ -3382,7 +3382,8 @@ mod tests {
         // now adopts the incoming registers instead and only the arm that
         // disagrees copies. Asserting the old shape would forbid the fix.
         let join_label = text
-            .lines().rfind(|l| l.trim_start().starts_with("L_body_"))
+            .lines()
+            .rfind(|l| l.trim_start().starts_with("L_body_"))
             .expect("a join label")
             .trim()
             .to_string();

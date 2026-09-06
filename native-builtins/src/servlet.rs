@@ -1683,7 +1683,6 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         if !paths.is_empty() {
             ctx.register_dynamic_classpath(&paths);
         }
-        
     }
 
     // URLClassLoader(URL[])
@@ -8308,7 +8307,6 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    
 }
 
 // ---- ByteOrder -------------------------------------------------------------
@@ -8372,7 +8370,6 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
         let b = s2_byte_order_ord(ctx, other);
         Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
     });
-    
 }
 
 // ---- SocketChannel (real TcpStream) ----------------------------------------
@@ -9058,7 +9055,6 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
         s2_register_channel,
     );
-    
 }
 
 // =============================================================================
@@ -9131,7 +9127,6 @@ pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cf))))
         },
     );
-    
 }
 
 /// Core HTTP/1.1 send implementation.

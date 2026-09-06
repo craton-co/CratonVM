@@ -497,7 +497,6 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
         NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
-    
 }
 
 /// `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` —

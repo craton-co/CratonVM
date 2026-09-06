@@ -1956,7 +1956,6 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(empty as i32)))
     });
-    
 }
 
 /// Build a `TabularDataSupport`-shaped carrier with the given tabular type

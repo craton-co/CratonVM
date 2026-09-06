@@ -3778,7 +3778,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     );
 
     registry.set_category(__prev_cat);
-    
 }
 
 /// Read an arbitrary `CharSequence` argument, not just `String`. `read_string`

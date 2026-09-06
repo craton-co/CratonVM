@@ -1555,7 +1555,6 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
     // This is registered elsewhere for UTF-8/ISO-8859-1; we add Shift_JIS support
     // The encoding/decoding for exotic charsets is best-effort.
     r.set_category(__prev_cat);
-    
 }
 
 // =============================================================================
