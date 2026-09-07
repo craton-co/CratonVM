@@ -464,6 +464,41 @@ in that run's arena. A-2 refused the SAME `paired=0x2525cd7d290` under two
 holders at `gc_age=1` and `gc_age=2`: one corrupted object, copied by two
 successive evacuations, which is the pattern this page recorded from the start.
 
+### which of the four: `PARALLEL_EVAC_RESUME_DEST`, alone
+
+Per-flag ablation, one flag off per arm, everything else default, two
+repetitions, same binary and workload:
+
+| flag turned OFF | rep 1 | rep 2 | arena-pointer holders |
+|---|---|---|---:|
+| **`CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST`** | **died at 32 s** | **SIGSEGV at 63 s** | **11, 15** |
+| `CRATONVM_G1_RETIRE_FORWARDS_LATE` | timeout 420 s | timeout 420 s | 0, 0 |
+| `CRATONVM_G1_REEVAC_GUARD` | timeout 420 s | timeout 420 s | 0, 0 |
+| `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` | timeout 420 s | timeout 420 s | 0, 0 |
+| none (control) | timeout 420 s | timeout 420 s | 0, 0 |
+
+2 of 2 with `RESUME_DEST` off, 0 of 2 for each of the other three and for the
+control. One variable.
+
+### so the producer is the EVACUATION-FAILURE path
+
+`RESUME_DEST` is what lets a parallel worker bump into an existing non-CSet Old
+region instead of only ever claiming a fresh one from `pool`. With it off,
+`tlab_alloc` returns `None` as soon as the pool is gone -- **while to-space is
+still free**, which is the "forty-eight byte promotion failing with 2017 usable
+regions" this page already measured -- and `None` is the evacuation-FAILURE
+signal: self-forward, keep the CSet region, `retry_after_evacuation_failure`.
+
+That is the fragile machine this page called out and never connected to the
+corruption. The corrupt headers are produced there, not by any walk, not by the
+copy, and not by `SharedEvac`'s normal path -- which is why the copy watch was
+clean at every checkpoint while holders kept appearing, and why corrupt holders
+and implausible CANDIDATES never co-occurred.
+
+The fix is already default-ON. What is NOT done is hardening the failure path
+itself: it is still reachable under genuine exhaustion, and it still produces
+this shape when it runs.
+
 ### why the depth difference does not void this
 
 The A arm is ~100x shallower, because with the fixes off the collector dies
