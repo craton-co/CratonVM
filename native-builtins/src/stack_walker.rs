@@ -138,7 +138,9 @@ fn build_options_set(
         "()V",
         &[Value::Object(Some(set))],
     );
+    let set_pin = ctx.pin_native_root(set);
     for opt in opts {
+        let set = ctx.read_native_pin(set_pin, set);
         let _ = ctx.invoke(
             "java/util/HashSet",
             "add",

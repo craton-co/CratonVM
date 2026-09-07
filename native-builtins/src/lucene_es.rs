@@ -1543,7 +1543,9 @@ pub(crate) fn native_es_knn_score_doc_query_init(
     }
     if starts_len != 2 {
         let mut search_from = 0usize;
+        let leaves_pin = ctx.pin_native_root(leaves);
         for segment in 1..starts_len.saturating_sub(1) {
+            let leaves = ctx.read_native_pin(leaves_pin, leaves);
             let leaf = match ctx.invoke_virtual(
                 leaves,
                 "get",
@@ -2010,7 +2012,9 @@ fn lucene_data_output_write_vint_raw(
     {
         lucene_byte_buffers_data_output_write_raw(ctx, this, &buf[..len])
     } else {
+        let this_pin = ctx.pin_native_root(this);
         for b in &buf[..len] {
+            let this = ctx.read_native_pin(this_pin, this);
             lucene_data_output_write_byte_direct(ctx, this, *b)?;
         }
         Ok(None)
@@ -2039,7 +2043,9 @@ fn lucene_data_output_write_signed_vlong_raw(
     {
         lucene_byte_buffers_data_output_write_raw(ctx, this, &buf[..len])
     } else {
+        let this_pin = ctx.pin_native_root(this);
         for b in &buf[..len] {
+            let this = ctx.read_native_pin(this_pin, this);
             lucene_data_output_write_byte_direct(ctx, this, *b)?;
         }
         Ok(None)
