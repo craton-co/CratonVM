@@ -29,11 +29,80 @@ reported phi copies, **one** engaged the guard, skipping **3** publishes — whi
 is exactly the three `[rbp-0B0h]` reads in the disassembly — and **zero**
 compiles were refused, so nothing lost the optimizing tier.
 
-**Finding 3 (`ASTParserLoadingTest`) is NOT verified.** That class discovers 106
-tests and starts none on this host (10 s, `found=106 started=0`, VM exits
-normally), so there is no local arm to read. Its symptom is the same loop in the
-same method with `withHaving` true, so the same fix should cover it, but that
-sentence is an inference and not a measurement.
+**Finding 3 (`ASTParserLoadingTest`) is VERIFIED — 2026-09-07, second pass.**
+It was recorded here as an inference, because the class discovered 106 tests and
+started none on this host (10 s, `found=106 started=0`, VM exits normally). It
+does start now; see *Residuals* below for what that was. With a local arm to
+read, the same one-switch A/B says the same thing the other two findings did:
+
+| arm | verdict | `#testHavingWithCustomColumnReadAndWrite` |
+|---|---|---|
+| guard ON (default) | `found=106 started=106 ok=101 failed=5` (278 s) | **passes** |
+| `..._GUARD=0` | `found=106 started=106 ok=100 failed=6` (271 s) | **FAILS** |
+
+One switch, one test moves. The other five `@@TESTFAIL` lines are byte-identical
+between the two arms — `testRowValueConstructorSyntaxInInList`,
+`testSelectClauseImplicitJoinOrderByJoinedProperty`,
+`testSelectNewTransformerQueries`, `testCollectionFetchWithDistinctionAndLimit`,
+`testSuperclassPropertyReferenceAfterCollectionIndexedAccess` — so they are
+unrelated to this defect and are NOT claimed fixed here. This class's own
+history is `fixed-suite-bugs/hibernate/astparserloadingtest-slow-and-21-real-failures-20260827-RETIRED.md`
+(plain-text path).
+
+## Residuals, closed 2026-09-07
+
+The three things this page left open, and what each turned out to be.
+
+### 1. Finding 3 could not be run on this host
+
+`found=106 started=0` was **the fixture, not the VM**. This runner's
+`common.args` is generated and untracked, so it records absolute paths into
+whichever checkout produced it — and every one of its 243 classpath entries
+still pointed at a `CratonVM/apps` directory that no longer existed (in two
+spellings, `C:/craton/CratonVM/apps` and `C:\craton\cratonvm\apps`). The VM
+started, JUnit discovered the 106 tests from the runner's own classes, and every
+test class then failed to load. Repointed at `CratonVM1/apps`, all 243 resolve
+and the class runs — which is what made the A/B above possible.
+
+The page already said "repoint both at `CratonVM1/apps` and all 243 entries
+resolve", as prose. **Prose is what let it happen twice**, so the check is now
+in the runner: `check_common_classpath` in
+`apps/hib-suite-runner/run-hib.sh` counts the entries that do not exist and says
+so loudly before the first class runs, naming the "generated in a checkout that
+has since moved" case when ALL of them are missing. A WARNING and not an error —
+a deliberately partial classpath is a legitimate thing to run, and refusing to
+start would be a worse failure than the one this prevents. What it must not do
+is stay silent, which is exactly what cost this finding a pass.
+
+The argfile itself is untracked and per-host, so the repoint cannot be
+committed. Redo it with:
+
+```bash
+cd <checkout>/apps/hib-suite-runner
+sed -i 's#[Cc]:[\\/]craton[\\/][Cc]raton[Vv][Mm]\([\\/]\)apps#C:/craton/CratonVM1\1apps#g' common.args
+```
+
+### 2. The spill-overlap hazard
+
+`Compiler::dbg_note_spill_overlap` fired 325 times on this workload and this
+page said it "deserves its own page". It has one, and re-measuring first
+changed what it says:
+`docs/known-issues/jit/inline-splice-return-value-lands-on-an-enclosing-callees-live-local-20260907.md`.
+
+The detector could not say WHICH open scope a reservation had hit, and that is
+the whole difference between a coincidence and a miscompile. It says so now,
+and the split is **151 ENCLOSING / 157 INNERMOST** on this same workload — so
+roughly half the reports are against a scope whose locals are LIVE, not the
+returning splice's dead ones. The hazard is real and still open; it is not
+firing observably here (the same run is 11/11) and it is not this page's
+defect — `Select.processGroupResult` is still absent from the reports, as this
+page originally noted.
+
+### 3. The `jit_bridge` sinks
+
+Not a residual of this page, but found beside it and recorded rather than
+dropped:
+`docs/known-issues/jit/jit-bridge-sinks-re-run-a-side-effecting-body-20260907.md`.
 
 ## The defect
 
@@ -225,6 +294,11 @@ Select.queryWindow(ILorg/h2/result/LocalResult;JZ)V          clean
   (all `Push` reservations onto a `num_locals=1` scope, mostly under
   `net/bytebuddy/...`), so that hazard is real and deserves its own page — but
   none of the reports is `Select.processGroupResult`.
+  > **Superseded, 2026-09-07 — see *Residuals* §2 at the top of this page.**
+  > The count is right and the reading of it was not available yet: the detector
+  > could not say WHICH open scope it had hit, which is the whole difference
+  > between a coincidence and a miscompile. Split, it is 151 ENCLOSING (the
+  > hazard) / 157 INNERMOST (harmless), not one benign thing.
 * `Compiler::dbg_report_never_stored_slots` — the in-VM twin of the offline
   scanner.
 
@@ -494,6 +568,10 @@ installing compiled code for one of the H2 methods it observed compiling in this
 another compiled frame concurrently reading/mutating the same per-query state.
 
 ## What isn't done here
+
+*(This is the FIRST pass's closing, kept as written. The second and third
+passes above found the instruction and the emitter; the fix and its A/B are in
+*Status* at the top.)*
 
 This doc stops at "JIT-compilation-and-warm-up-dependent, not the 20260727 bug,
 mechanism narrowed to the `SelectGroups`/window-buffering call set above" rather than

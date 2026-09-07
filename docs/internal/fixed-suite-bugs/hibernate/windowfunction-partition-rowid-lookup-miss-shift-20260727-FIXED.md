@@ -22,7 +22,7 @@
 > `groupData` delegation fix — it only reproduces after other tests warm up the
 > JIT in the same process, never in a fresh single-method process or under
 > `--nojit`. See
-> `docs/known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
+> `docs/internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`.
 
 **Status: OPEN, genuine CratonVM bug.** Confirmed via HotSpot diff (fails on CratonVM,
 100% clean on real HotSpot JDK 25, byte-identical SQL text and bound parameters both

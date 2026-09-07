@@ -4038,8 +4038,24 @@ pub fn execute(
                                     // them for no reason: on `TestScript` that
                                     // is `StringFunction1.getValue`, a
                                     // per-row expression evaluator.
+                                    //
+                                    // Through `despeculate_trapped_method` and
+                                    // not `deoptimize` directly, because the
+                                    // reason a bare `deoptimize` records here is
+                                    // the DEOPT POINT'S: for a trapping bci that
+                                    // carries a safepoint that reason is
+                                    // `TransferToInterpreter`, whose
+                                    // `recommend_action` is `Reinterpret` - the
+                                    // artifact stays live, the next call
+                                    // re-enters it, and it traps again, forever.
+                                    // The sibling sink
+                                    // (`try_resume_trapped_callee`) has always
+                                    // known that and asked for the site-trap
+                                    // policy instead; both now ask the same
+                                    // function, so they cannot answer
+                                    // differently again.
                                     if key_matches {
-                                        let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                                        crate::jit::helpers::despeculate_trapped_method(
                                             shared,
                                             &class_name_str,
                                             method_name,
@@ -4088,37 +4104,98 @@ pub fn execute(
                                     // fatal error killed at ~212 s with
                                     // `stashed key "org/h2/util/StringUtils.cache:..."`
                                     // while running `StringFunction1.getValue`.
+                                    //
+                                    // Three refusals the RECONSTRUCTED FRAME
+                                    // genuinely cannot answer, and they are the
+                                    // ones the sibling sink makes or the
+                                    // emission side names:
+                                    //
+                                    //  * an `ACC_SYNCHRONIZED` method - the
+                                    //    method monitor is not in the frame
+                                    //    (`try_resume_trapped_callee` refuses
+                                    //    the same shape, for the same reason);
+                                    //  * a body that takes a monitor at all.
+                                    //    Every `FrameState` `ir_lower` builds
+                                    //    hard-codes `monitors: Vec::new()`, so
+                                    //    a resumed frame for such a body
+                                    //    believes it holds no lock and its
+                                    //    `monitorexit` unbalances. `ir_lower`'s
+                                    //    own comment says the sink "cannot fire
+                                    //    on information that was never
+                                    //    recorded" - `bytecode_holds_monitor`
+                                    //    is that information, read off the
+                                    //    bytecode instead;
+                                    //  * a resume bci past this method's code.
+                                    let body_holds_monitor = cratonvm_jit::bytecode_holds_monitor(
+                                        &code_attr.code,
+                                        code_attr.code.len(),
+                                    );
+                                    let bci_in_code =
+                                        (rframe_for_despec.bci as usize) < code_attr.code.len();
+                                    // `can_deopt_resume` is very nearly not
+                                    // the question this sink has to ask, and
+                                    // asking it is what turned an ordinary
+                                    // trap into a hard process abort. "Nearly"
+                                    // because its elided-monitor conjunct DOES
+                                    // carry weight on the single-pass side --
+                                    // which is why `body_holds_monitor` above
+                                    // replaces it rather than dropping it. See
+                                    // `cratonvm_jit::deopt_sink_resume_enabled`
+                                    // for the whole argument and the measured
+                                    // population. The frame is already
+                                    // reconstructed and stashed; the sibling
+                                    // sink resumes exactly this stash, with
+                                    // exactly this builder, and has never
+                                    // consulted that flag.
+                                    //
+                                    // STRICTLY ADDITIVE. The `resume_gate_ok` arm is
+                                    // the pre-2026-09-07 condition, unchanged: when the
+                                    // backend set `can_deopt_resume` it has ALREADY
+                                    // vouched that no monitor was elided, so hanging the
+                                    // new guards on that arm too would turn a resume
+                                    // that works today - a single-pass body with a real
+                                    // `synchronized` block, trapping where no lock is
+                                    // held - into the very abort this change exists to
+                                    // remove. The guards belong to the NEW arm, the one
+                                    // running without the backend's word for it.
+                                    let resume_allowed = key_matches
+                                        && (resume_gate_ok
+                                            || (cratonvm_jit::deopt_sink_resume_enabled()
+                                                && !is_synchronized
+                                                && !body_holds_monitor
+                                                && bci_in_code));
                                     let mut materialize_failed = false;
-                                    if resume_gate_ok && key_matches {
-                                        let cached = Arc::new(CachedBytecodeMethod {
-                                            declaring_class_id: class_id,
-                                            class_name: Arc::from(class_name_str.as_str()),
-                                            method_name: Arc::from(method_name),
-                                            method_descriptor: Arc::from(method_descriptor),
-                                            source_file: source_file.as_deref().map(Arc::from),
-                                            code: crate::runtime::frame::padded_bytecode(
-                                                &code_attr.code,
-                                            ),
-                                            exception_table: Arc::from(
-                                                code_attr.exception_table.as_slice(),
-                                            ),
-                                            max_stack: code_attr.max_stack,
-                                            max_locals: code_attr.max_locals,
-                                            num_params: count_method_params(method_descriptor)
-                                                as u16,
-                                            is_synchronized,
-                                            is_static,
-                                            force_native_cache: std::sync::OnceLock::new(),
-                                            descriptor_facts_cache: std::sync::OnceLock::new(),
-                                            intercept_shape_cache: std::sync::OnceLock::new(),
-                                            interp_invocations: std::sync::atomic::AtomicU32::new(0),
-                                            native_callback_cache: std::sync::OnceLock::new(),
-                                            invoc_key: std::sync::OnceLock::new(),
-                                            jit_probe_generation: std::sync::atomic::AtomicU64::new(
-                                                0,
-                                            ),
-                                            quickened: std::sync::OnceLock::new(),
-                                        });
+                                    if resume_allowed {
+                                        let cached =
+                                            Arc::new(CachedBytecodeMethod {
+                                                declaring_class_id: class_id,
+                                                class_name: Arc::from(class_name_str.as_str()),
+                                                method_name: Arc::from(method_name),
+                                                method_descriptor: Arc::from(method_descriptor),
+                                                source_file: source_file.as_deref().map(Arc::from),
+                                                code: crate::runtime::frame::padded_bytecode(
+                                                    &code_attr.code,
+                                                ),
+                                                exception_table: Arc::from(
+                                                    code_attr.exception_table.as_slice(),
+                                                ),
+                                                max_stack: code_attr.max_stack,
+                                                max_locals: code_attr.max_locals,
+                                                num_params: count_method_params(method_descriptor)
+                                                    as u16,
+                                                is_synchronized,
+                                                is_static,
+                                                force_native_cache: std::sync::OnceLock::new(),
+                                                descriptor_facts_cache: std::sync::OnceLock::new(),
+                                                intercept_shape_cache: std::sync::OnceLock::new(),
+                                                interp_invocations:
+                                                    std::sync::atomic::AtomicU32::new(0),
+                                                native_callback_cache: std::sync::OnceLock::new(),
+                                                invoc_key: std::sync::OnceLock::new(),
+                                                jit_probe_generation:
+                                                    std::sync::atomic::AtomicU64::new(0),
+                                                quickened: std::sync::OnceLock::new(),
+                                            });
                                         let pin_base = thread.native_pin_roots.len();
                                         let built = build_deopt_frame_inner(
                                             shared,
@@ -4254,11 +4331,35 @@ pub fn execute(
                                         // past bci 0. Refuse a whole-method replay:
                                         // it is observably wrong for methods with
                                         // stores, I/O, monitor actions, or callbacks.
-                                        let why = if !resume_gate_ok {
-                                            "can_deopt_resume=false (no deopt points, \
-                                         or an elided monitor)"
+                                        // WHICH gate declined is the whole
+                                        // diagnosis, and they need completely
+                                        // different fixes. `can_deopt_resume`
+                                        // is no longer one of them unless the
+                                        // resume was switched off, so naming it
+                                        // bare would send the next reader after
+                                        // a flag that is not the cause.
+                                        // The monitor and bci refusals belong to the NEW arm
+                                        // only, so ask them only when that arm was in play:
+                                        // with `resume_gate_ok` set the resume was attempted
+                                        // regardless, and naming one of them would describe a
+                                        // decision that never happened.
+                                        let why = if !resume_gate_ok && is_synchronized {
+                                            "the method is ACC_SYNCHRONIZED, so a resumed frame \
+                                         would not hold the method monitor"
+                                        } else if !resume_gate_ok && body_holds_monitor {
+                                            "the body enters a monitor and the IR frame states \
+                                         record none"
+                                        } else if !resume_gate_ok && !bci_in_code {
+                                            "the resume bci is past this method's code"
                                         } else if materialize_failed {
+                                            // Asked BEFORE the switch: a resume that was
+                                            // attempted and FAILED is the real reason; the
+                                            // switch is only the reason when no attempt was
+                                            // made at all.
                                             "the frame could not be materialised from its map"
+                                        } else if !cratonvm_jit::deopt_sink_resume_enabled() {
+                                            "can_deopt_resume=false (no deopt points, or an \
+                                         elided monitor) and CRATONVM_JIT_DEOPT_SINK_RESUME=0"
                                         } else {
                                             "unknown"
                                         };

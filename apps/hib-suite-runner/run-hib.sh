@@ -328,6 +328,68 @@ declare -a INJECTED_SYSPROPS=()
 SYSPROPS_STATE="not loaded"
 USE_SYSPROPS="${USE_SYSPROPS:-1}"
 
+# --- does common.args' classpath actually RESOLVE? ----------------------------
+#
+# `common.args` is generated and untracked, so it records ABSOLUTE paths into
+# whichever checkout produced it. Move or rename that checkout and every entry
+# still parses, the VM still starts, and every class fails to load -- which
+# reads as a VM bug, class after class, until somebody opens the argfile.
+#
+# That is not hypothetical. On 2026-09-07 this fixture's argfile still pointed
+# all 243 entries at a `CratonVM/apps` directory that no longer existed (two
+# spellings of it), and the triage that tripped over it is recorded in
+# `docs/internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`
+# -- which had to say "repoint both at CratonVM1/apps and all 243 entries
+# resolve" as a prose instruction, because nothing checked.
+#
+# A WARNING and not an error: a deliberately partial classpath is a legitimate
+# thing to run, and refusing to start would be a worse failure than the one
+# this prevents. What it must not do is stay silent.
+check_common_classpath() {
+  local sep=':' line cp='' n=0 missing=0
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*|Windows*) sep=';' ;;
+  esac
+  # The entry list is the line AFTER a bare `-cp` / `-classpath`, exactly as
+  # an @argfile spells it.
+  local want=0
+  while IFS= read -r line || [ -n "${line:-}" ]; do
+    line="${line%$'\r'}"
+    if [ "$want" = 1 ]; then cp="$line"; break; fi
+    case "$line" in -cp|-classpath|--class-path) want=1 ;; esac
+  done < "$COMMON"
+  [ -n "$cp" ] || return 0
+
+  local old_ifs="$IFS" entry
+  IFS="$sep"
+  for entry in $cp; do
+    [ -n "$entry" ] || continue
+    n=$((n + 1))
+    [ -e "$entry" ] || missing=$((missing + 1))
+  done
+  IFS="$old_ifs"
+
+  [ "$missing" -eq 0 ] && return 0
+  echo "WARNING: $missing of $n classpath entries in $COMMON do not exist." >&2
+  if [ "$missing" -eq "$n" ]; then
+    echo "WARNING: ALL of them -- this argfile was generated in a checkout that has since moved or been renamed." >&2
+  fi
+  echo "WARNING: every class will fail to load, for a CONFIG reason, and will look like a VM bug." >&2
+  IFS="$sep"
+  local shown=0
+  for entry in $cp; do
+    [ -n "$entry" ] || continue
+    if [ ! -e "$entry" ]; then
+      echo "WARNING:   missing: $entry" >&2
+      shown=$((shown + 1))
+      [ "$shown" -ge 5 ] && break
+    fi
+  done
+  IFS="$old_ifs"
+  [ "$missing" -gt 5 ] && echo "WARNING:   ... and $((missing - 5)) more" >&2
+  return 0
+}
+
 load_required_sysprops() {
   INJECTED_SYSPROPS=()
   if [ "$USE_SYSPROPS" != 1 ]; then SYSPROPS_STATE="disabled (--no-sysprops)"; return 0; fi
@@ -432,6 +494,7 @@ cd "$HERE" || { echo "ERROR: cannot cd to fixture dir: $HERE" >&2; exit 1; }
 
 [ -f "$CV_BIN" ] || { echo "ERROR: cratonvm binary not found: $CV_BIN (set --bin or CV_BIN)" >&2; exit 1; }
 [ -f "$COMMON" ] || { echo "ERROR: common.args not found: $COMMON" >&2; exit 1; }
+check_common_classpath
 load_required_sysprops
 if [ ${#INJECTED_SYSPROPS[@]} -gt 0 ]; then
   echo "[sysprops] $COMMON is missing ${#INJECTED_SYSPROPS[@]} required -D; injecting: ${INJECTED_SYSPROPS[*]}" >&2

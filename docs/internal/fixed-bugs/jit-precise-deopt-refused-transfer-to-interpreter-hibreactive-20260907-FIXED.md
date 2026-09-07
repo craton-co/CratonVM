@@ -2,12 +2,17 @@
 
 ## Status
 
-**OPEN, new finding.** Confirmed reproducible and GC-independent: identical
-signature on all three collectors (Generational, G1, ZGC), same host, same
-binary, same run. Root mechanism identified from source (`can_deopt_resume`
-is unconditionally `false` in a production build), but the exact final
-raise site and a fix are not yet pinned — filed as a defect report with the
-evidence needed to pick it up, not as a closed investigation.
+**FIXED 2026-09-07** (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON).
+
+Was: OPEN, new finding. The mechanism, the fix and the in-repo A/B are in
+`deopt-sink-refused-a-frame-its-sibling-resumes-FIXED-20260907.md`; the same
+defect's H2 and Spring population is in
+`precise-deoptimization-unavailable-cross-suite-crash-20260907-FIXED.md`. This
+page keeps the hibernate-reactive evidence — 4 call sites, 7 classes, 17
+occurrences, identical on all three collectors — which is what established
+that the defect is GC-independent.
+
+The three open questions this page filed are answered below.
 
 ## The symptom
 
@@ -82,32 +87,32 @@ risk a double side effect — which is the right failure mode for a *library
 internals* problem, but it is surfacing here in ordinary hibernate-reactive
 application code, not a deliberately hostile or malformed program.
 
-## What is NOT yet established
+## What was NOT established here, and the answers
 
-- **The exact reason `try_resume_trapped_callee` declined for these four
-  call sites** — none of `CRATONVM_DBG_DEOPT`'s trace lines were captured
-  this run. Re-running any one of the four with that flag armed is the
-  fastest way to get past "some refusal in a five-way chain" to a named
-  one.
-- **Whether this is load-sensitive.** This run had unusually heavy
-  concurrent load — 9 hibernate-reactive JVMs (3 arms × 3 shards) plus a
-  concurrent, independent 12-JVM Spring Boot 3-GC suite on the same host —
-  which affects JIT tiering timing (when a method gets compiled, and under
-  what inlining/allocation state) and could change whether a given call
-  site is even *reachable* while compiled. The `can_deopt_resume=false`
-  mechanism itself is a permanent code property, not a load artifact — if
-  a trap is hit while compiled, this fires regardless of load — but load
-  may change *how often* the JIT has these specific methods compiled at
-  the moment a trap-triggering input arrives. Not yet re-verified under a
-  quiet, single-arm, single-JVM run.
-- **Whether the four call sites share one fixable cause or are four
-  independent instances of the same generic gate.** All four are
-  first-invocation-shaped entity/connection/adapter code reached from
-  hibernate-reactive's own reactive pipeline (`CompletionStage`/Mutiny
-  `Uni` continuations) — plausibly the same class of trap (a
-  monitor-adjacent or scalar-replacement-shaped bailout inside code the
-  JIT chose to compile), but this has not been traced past the shared
-  message shape.
+* **Why `try_resume_trapped_callee` declined for these four call sites.**
+  *It never ran.* The question assumed the wrong sink. That helper is reached
+  from a compiled caller's dispatch helper, for a callee that ALREADY has an
+  artifact; these traps were taken on the invocation `execute` itself made, and
+  reached a different sink (`execute-first-call-tierup`) that had no
+  `try_resume_trapped_callee`-style recovery at all. Arming
+  `CRATONVM_DBG_DEOPT` would have shown none of that helper's five refusal
+  lines, because none of them fired — and the absence would have been read as
+  "no trace captured" a second time. The two sinks now share one policy
+  function and the tier-up sink resumes the frame its sibling always could.
+
+* **Whether this is load-sensitive.** No. It reproduces in 0.1 s on an idle
+  machine, in-repo, with no concurrency at all
+  (`vm/tests/jit_deopt_sink_resumes_a_side_effecting_trap.rs`). The heavy
+  concurrent load on this run affected only WHICH methods happened to be at the
+  optimizing tier when a trap-triggering input arrived — exactly as this page
+  suspected — not whether the mechanism fires.
+
+* **Whether the four call sites share one fixable cause.** They do: one gate,
+  four call sites. All four are optimizing-tier bodies that trap and commit a
+  side effect; every one of them would have been resumed by the sibling sink.
+  The reactive-pipeline shape (`CompletionStage`/Mutiny `Uni` continuations) is
+  incidental — the same signature turned up the same day in H2's in-process
+  javac and in Spring's CORS configuration.
 
 ## Distinguishing this from the already-fixed 2026-08-02 case
 

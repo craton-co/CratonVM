@@ -2063,7 +2063,16 @@ const ACG_ABSTRACT_IMPLS: &[&str] = &["sun/nio/ch/Port", "sun/nio/ch/Asynchronou
 /// receiver this module did not allocate, so the shared `aio_asc_is_open` still
 /// answers correctly for a foreign or stub-mode object -- which is the other
 /// thing that comment said a one-sided renumber would break.
-fn aio_base(ctx: &mut dyn NativeContext, o: ObjectRef) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
+/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
+/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+fn aio_base(ctx: &dyn NativeContext, o: ObjectRef) -> usize {
     crate::concrete_receiver::concrete_base(ctx, o, N_FIELDS)
 }
 
