@@ -1,145 +1,117 @@
-# `native-io` unpinned-native-local audit — both shapes assessed and fixed; the rule's own reach is now the open question
+# `native-io` unpinned-native-local audit — swept, including the 95% the default rule could not see
 
 | | |
 |---|---|
-| **Status** | Both tranches closed. 24 parameter rows + 46 local rows read; **58 real bindings fixed**, 12 false positives classified. The audit reports **7** rows, all of them understood. |
+| **Status** | Swept. Three tranches read: 24 parameter rows, 46 local rows, 108 `--any-binding` rows. **154 pin/re-read pairs added across ~140 bindings**; 41 rows classified as false positives. The audit reports 4 by default and 25 with `--any-binding`, every one of them named below. |
 | **Scope** | `native-io/src` — the crate the `unpinned-native-locals-audit-48-fixed-20260825` pass never covered. |
 | **Tool** | `scripts/unpinned-native-local-audit.py` |
-| **Open** | `--any-binding` reports **139** rows against the default's 7. That gap is this page's remaining finding. |
 
-## The two numbers this page opened with were both wrong
+## The gate that hid most of it
 
-**"66 parameter candidates"** — there were 24. `statements()` reassembles a body
-starting at its signature line, and `gc_capable` reads the function's own name
-in `fn foo(` as a *call to `foo`*; for any transitively-allocating function that
-made statement 0 a GC-capable call, so every `ObjectRef` parameter used anywhere
-in the body qualified. 42 of the 66.
+Rule 1 required the BINDING's own statement to be GC-capable. That is a proxy
+for "this local names a fresh object", not the defect's definition, and the
+control priced it exactly: at the commit before the FileChannelImpl fix,
+`native_fcimpl_open` held seven references that fix had to root, and the rule
+reported **six**. `fd_obj`, bound by `match args.first()`, was invisible because
+`args.first()` does not allocate — and that is the shape of the one instance of
+this family anyone has observed failing.
 
-**"roughly 35–40 of the 48 locals are real"** — of the 46 that survived the
-earlier fixes, **34 are real and 12 are false positives**, which is the same
-ballpark by luck rather than by measurement: the reading had not been done.
+`--any-binding` drops the requirement, keeps the type filter, and reports 7 of 7
+on that control with the post-fix file still silent. On `native-io` it reported
+**139 against the default's 7**.
 
-## What was fixed
+Two rule corrections then took 139 to **108**, and both came from reading the
+rows rather than from theory:
 
-**58 bindings across 25 functions.** The parameter tranche is described below
-its own heading; the local tranche is one idiom in a dozen dresses:
+* **A GC on a path that LEAVES does not precede what follows it.** Ten
+  `socket_channel.rs` rows had latched onto
+  `let Some(id) = reg_id else { return Err(closed_channel_exception(ctx)); };`
+  and reported a window that cannot exist — hiding whichever later call is the
+  real one. `leaves()` now skips those and keeps looking. This is not a
+  branch-exclusivity guess: the statements below are reached only when that
+  branch did not run. A `match` arm is deliberately NOT included.
+* **The scalar test has to key on the destructuring ARM.** Looking for any
+  `Value::Int(` and no `Value::Object` anywhere in the statement is useless,
+  because the call's own ARGUMENTS carry `Value::Object(Some(buf))`:
+  `let n = match ctx.invoke_virtual(inner, "read", "([BII)I", &[Value::Object(Some(buf)), …]) { Ok(Some(Value::Int(n))) => n, … }`
+  binds an `i32` and mentions both in one breath.
+
+## 108 read, 94 fixes applied, 25 rows left standing
+
+Every row was read through a triage dump printing the three statements that
+make it one — binding, intervening GC, use — which is enough to type-triage
+most rows without opening the file.
+
+**83 insertions were applied mechanically** (73 on the first pass, 7 on the
+second, 3 on the third). The shape is uniform enough to automate: a
+tool inserts `pin_native_root` after the binding and `read_native_pin` before
+the use, and nothing else. No unpin — every function it was allowed to touch is
+a native entry point, and `safe_native_call` truncates the pin stack to its
+entry floor on return. It was run **to a fixpoint**: the shadowing `let` before
+the first use also covers later uses in that block, so applying, re-running the
+audit and applying again closes the second and third windows. Three passes.
+
+The tool decides nothing. An allowlist written by hand after reading decides,
+and the two compile errors it produced (a shadow that dropped a `mut`) were
+fixed by hand.
+
+**11 were fixed by hand** — the ones where a pin already existed and the
+re-read was one statement too early (`scan_make_pattern` releases `source`
+before the allocation that follows), where a second reference crossed the same
+window (`native_bos_write_bulk_locked`'s `src` alongside its `this`), or where
+the function is a helper that needs its pin released (`encode_isa`,
+`write_through`, `flush_pending_surrogate`, `read_process_redirects`).
+
+## Three functions were already right, and the rule cannot tell
+
+`native_process_wait_for`, `native_process_on_exit` and the three `pipe.rs`
+channel operations all do
 
 ```rust
-let obj = <allocate>;        // nothing in Java refers to it yet
+let mut held = [Value::Object(Some(buf))];
+ctx.begin_blocking_region();
 …
-let x = <allocate again>;    // ← moves `obj`; under the Generational
-ctx.set_field(obj, S, x);    //   non-moving young sweep, zeroes it
-Ok(Some(Value::Object(Some(obj))))   // …and this hands the stale one back
+ctx.end_blocking_region_refs(&mut held);
+let buf = match held[0] { Value::Object(Some(o)) => o, _ => buf };
 ```
 
-Ranked by what it costs:
+which is the correct idiom — and the refresh goes through an ARRAY, not through
+the name, so the scan cannot follow it. An automated pass inserted redundant
+re-reads into two of them before this was noticed; that pass was reverted and
+the functions added to the denylist. **A rule that cannot see a correct fix will
+"fix" it again**, which is its own kind of damage.
 
-**Returns a stale reference to Java.** `dbb_allocate_direct0`
-(`ByteBuffer.allocateDirect` — two `ensure_class_initialized` calls and two
-`alloc_object`s between the buffer's allocation and both its
-`discover_reference` registration and its return), `sc_socket`,
-`ssc_accept_impl`, `ssc_accept_unix`, `native_afc_try_lock`,
-`build_byte_array_input_stream`, `native_jarfile_get_manifest`,
-`native_ws_new`, `make_path_stream`, `dc_set_option`, `t16_afc_open_legacy`.
-
-**Throws a stale reference.** `throw_invalid_path_exception` allocates the
-`InvalidPathException`, then two Strings, then runs its `<init>`, and returns
-`MethodCallFailed::ExceptionThrown(exc)` naming the pre-allocation address. A
-garbage throwable discovered on the unwind path is the worst place to find one.
-
-**Loops.** `native_file_list` (one `create_string` per directory entry),
-`native_files_read_all_lines`, `build_zip_entry_list` (Jasper's TLD scan runs it
-121 times per embedded-container start), `native_process_descendants`,
-`ws_poll_event_names0_native`, `dc_interface_ipv4`, `read_process_environment`.
-
-**Worst single function.** `dc_inet_socket_address` — six allocations, four
-references, every store to an object minted before the allocation that follows
-it, and `inet` stored into `socket_holder` five allocations after it was
-created.
-
-**A caller the earlier fix did not cover.** `al_init`/`al_add` now pin what they
-are handed — but `native_files_read_all_lines` passes an address that is already
-stale from the previous iteration's `create_string`. A callee can only pin the
-address it is given; the caller has to hand it a live one.
-
-## Awareness is not coverage — a fourth instance, and this one made it worse
-
-`alloc_zip_entry` opens with:
-
-> Materialize every allocation-prone value before allocating the ZipEntry. This
-> keeps the fresh entry out of a bare native local across a GC point.
-
-It does. It also leaves `mtime`, `atime`, `ctime` and `name_str` in bare locals
-across a `create_string`, a `new_array`, an `ensure_class_initialized` and two
-`alloc_object`s — every one of them stored into the entry at the end. The
-mitigation moved the hazard from one reference to four. (Three of those four
-were invisible to the rule: `Option<ObjectRef>` locals whose use site names the
-unwrapped binding.)
-
-## The twelve false positives, by cause
+## The 25 that remain, by cause
 
 | cause | rows |
 |---|---|
-| an `invoke_*` RHS binding a SCALAR — `let limit = match ctx.invoke_virtual(target, "limit", "()I", …)` is an `i32`; `let flushed = ctx.invoke_virtual(..).map(\|_\| ())` is a `Result` | 7 |
-| a file gated by an INNER `#![cfg(test)]` — `test_support.rs` is a mock context whose whole point is that it has no GC | 1 |
-| `err.detail` read as a use of a local named `detail` | 1 |
-| branch-exclusive: the only GC is on a path that returns | 2 |
+| the refresh goes through `end_blocking_region_refs`, not through the name | 7 |
+| a Rust `String` / `Option<String>` bound from an `invoke_*` that returned an object (`object_to_string`, `read_string`) | 6 |
+| an integer or `FdId` the arm pattern does not reveal | 2 |
+| branch-exclusive: the only GC is on a path that returns, in a form `leaves()` deliberately does not decide (a `match` arm) | 8 |
 | a torn `let x = match { arm => { let …; … } }`, where the allocation that BINDS `x` reads as one that follows it | 1 |
+| `ensure_open`, which allocates only on the path that throws | 1 |
 
-Seven of those are now filtered — the scalar test keys on the destructuring ARM,
-not on any occurrence of a `Value` variant, because the call's own arguments
-routinely carry `Value::Object(Some(buf))`. The tear is deliberately NOT fixed:
-un-tearing `let … match` would hide `write_handle`, where the allocation and the
-stale store share one statement. Noise is the cheaper error.
+None of these is a defect. They are the residue of a rule that is deliberately
+noisy rather than confidently dismissive, and the page names each one so the
+next reader does not re-derive them.
 
-## The rule's reach is now the finding
+## Calibration
 
-Rule 1 requires the BINDING's own statement to be GC-capable. That is not the
-defect's definition — it is a proxy for "this local names a fresh object" — and
-the control shows what it costs. At the commit before the FileChannelImpl fix,
-`native_fcimpl_open` had seven references that fix had to root. The rule reports
-**six**: `fd_obj`, bound by `match args.first()`, is invisible because
-`args.first()` does not allocate.
+* **Rule 1**: `native_fcimpl_open` before and after `3950eed48` — 7/7 with
+  `--any-binding`, 0 after. Unchanged by every rule edit in this pass.
+* **Rule 2**: 83 historical commits that added a pin for a declared
+  `x: ObjectRef` parameter in `native-collections/src/lib.rs`, run at each
+  commit and its parent — **precision 81/83, recall 58/77**, identical before
+  and after this pass's filtering. The filtering cost no recall.
 
-`--any-binding` drops the requirement and keeps the type filter. On the control
-it reports **7 of 7**, with the post-fix file still silent. On `native-io`:
+## What this does NOT establish
 
-| | rows |
-|---|---|
-| default | **7** |
-| `--any-binding` | **139** |
+**No dynamic proof, and the same caveat the 2026-08-25 page carried.** These are
+structurally identical to a defect that WAS proven — the `FileChannelImpl` the
+Generational young sweep zeroed — and none was observed failing. Pinning across
+a call that can move the object is right whether or not a workload currently
+reaches it, but this is not "140 live bugs found".
 
-So the default rule sees a twentieth of the shape-eligible population, and the
-132 it does not see are references that arrived from `args`, from `get_field`,
-or from a helper that does not itself allocate — `fd_obj`'s exact shape, which
-is the one instance of this family anybody has actually observed failing.
-
-**That is the open item. It is not "132 bugs"** — the type filter is weaker on
-that population and the false-positive rate will be higher than the 12-in-46 of
-this pass. It is the number that has to be read down rather than assumed away.
-
-## Calibration, unchanged by the precision pass
-
-83 historical commits that added a pin for a declared `x: ObjectRef` parameter
-in `native-collections/src/lib.rs`, run at each commit and its parent:
-**precision 81/83, recall 58/77** (6 of the 25 apparent misses are contamination
-— the parent already pinned that parameter). Re-run after the precision pass:
-identical, so the filtering cost no recall.
-
-Rule 1's own control pair — `native_fcimpl_open` before and after `3950eed48` —
-holds at 6/7 by default and 7/7 with `--any-binding`, 0 after.
-
-## What the rule still cannot see, restated
-
-* **loop-carried** uses (`pq_sift_up` reads `this` in the NEXT iteration);
-* **same-statement** uses (`watch_event_kind_bit`'s `.or_else(|| …)` closure
-  runs after the call it is chained onto; `write_handle`'s stale store shares a
-  statement with its allocation) — both were real, both fixed, neither reported;
-* `Option<ObjectRef>` locals (`alloc_zip_entry`'s three times);
-* a `Value` parameter that happens to be an object (`al_add`'s `elem`);
-* bindings whose RHS does not allocate — the 132 above.
-
-## Gates
-
-`cargo test -p cratonvm-native-io`: 534 passed / 0 failed (unchanged).
-`regression-suite/run.sh` green.
+What it does establish is that the crate is now swept by a rule whose reach is
+measured rather than assumed, with every survivor named.
