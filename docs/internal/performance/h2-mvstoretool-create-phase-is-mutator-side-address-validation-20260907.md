@@ -55,6 +55,20 @@ The whole class, `-Xmx256m`, for the record: **HotSpot `rc=0` in 17 s**, with
 `Created in 5661 ms` — not "about four minutes", which is what the old page
 quoted from a Windows run.
 
+**And heap does not rescue it.** The class was run under G1 at **`-Xmx2g`** —
+eight times the heap the old page's arms used, on a workload whose whole live
+set the collector never even has to collect at 1 GB (§2) — with a 90-minute
+budget:
+
+```text
+rc=124 wall=5400s tag=cvm-g1-2g
+```
+
+Still a TIMEOUT, still in the create phase. That is the single most useful
+negative result on this page: it separates the two terms cleanly. If the failure
+were the collector or the footprint, 2 GB would have moved it, and it did not.
+What is left is per-operation mutator cost, which no heap size touches.
+
 ---
 
 ## 2. The three candidates, refuted by name
@@ -252,8 +266,9 @@ flat
 across the read barrier, the array accessors, the write barrier, the provenance
 bitmap and the native-dispatch glue, with no single line item above 3% once the
 validator is removed. There is no MVStore defect at the bottom of this page.
-**`TestMVStoreTool` at `-Xmx256m` will not complete on this VM until that flat
-distribution is addressed, and nothing in this page's scope will do it.**
+**`TestMVStoreTool` will not complete on this VM until that flat distribution is
+addressed, and nothing in this page's scope will do it** — not at `-Xmx256m`,
+and, as the 2 GB arm above shows, not at any heap size.
 
 Two nominations that came out of the sampling and were NOT taken, with the
 reason:
