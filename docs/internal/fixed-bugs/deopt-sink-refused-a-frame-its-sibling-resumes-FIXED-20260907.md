@@ -152,6 +152,11 @@ refused on evidence the sink can actually see. `ACC_SYNCHRONIZED` covers the
 method-level monitor the same way. What is left — `deopt_points.is_empty()` —
 describes an artifact no trap can arrive at.
 
+The two halves fit because an elided monitor *forces* `can_deopt_resume` false,
+so such a body reaches the NEW arm, where the guard is — and a body whose
+monitor was NOT elided keeps the flag, takes the old arm, and resumes exactly
+as it always did.
+
 The refusal message now names which of those declined, instead of blaming
 `can_deopt_resume` — a flag that, on an optimizing artifact, is false whatever
 anyone does, and so sends the next reader after something that is not the
