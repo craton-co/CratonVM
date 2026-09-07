@@ -272,14 +272,35 @@ enforced budget.
 
 | Kernel (N = 2²⁴)                                    | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
 |-------------------------------------------------------|------------|---------------|--------------|------------|--------------|
-| Integer div-chain (48 divs/elem)                       | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
-| Double div-chain (64 divs/elem)                        | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
-| 128 multiply-adds/elem (data-dependent multiplier)     | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
-| Dot-product reduction (int·int → long, x300/elem)      | 1,172 ms   | unimplemented | **2 ms**     | **586x**    | n/a          |
+| Integer div-chain (48 divs/elem)                       | 2,179 ms   | 27 ms         | **7 ms**     | **311x**   | **3.9x**     |
+| Double div-chain (64 divs/elem)                        | 1,784 ms   | 135 ms        | **82 ms**    | **21.8x**  | **1.6x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)     | 1,298 ms   | 26 ms         | **7 ms**     | **185x**   | **3.7x**     |
+| Dot-product reduction (int·int → long, x300/elem)      | 1,168 ms   | unimplemented | **2 ms**     | **584x**   | n/a          |
 
-Re-verified 2026-09-05 on the same box (RTX 2060, TornadoVM 4.0.1 PTX,
-N = 2²⁴). The four non-ray-tracer rows still hold and TornadoVM's integer
-div-chain reproduced exactly at 26 ms. Two things that run did change:
+**Re-measured 2026-09-07**, and this table is now that measurement rather
+than an accumulation of three vintages. Quiet host (`bench-gpu/wait-for-quiet.sh`
+gated it), `target-gpu/release/cratonvm.exe`, HotSpot Adoptium 25.0.3.9,
+TornadoVM 4.0.1-jdk25-ptx, N = 2²⁴, best of 5, warm, full
+host→device→host. Reproduce with `bash bench-gpu/rerun-table-rows.sh`.
+
+Every arm of a row was run in the same session this time, including the CPU
+baselines — which had previously been carried over from an older idle-box run.
+They reproduced almost exactly (2,179 vs 2,146; 1,784 vs 1,780; 1,298 vs 1,300;
+1,168 vs 1,172), which is the check that the setup is sound: the ratios moved
+because CratonVM got faster, not because the baseline drifted.
+
+Three rows moved against the previous table, and the double div-chain row
+finally agrees with the note that has sat under it since 2026-09-05:
+
+- **int div-chain 11 ms → 7 ms**, and **128 multiply-adds 8 ms → 7 ms.**
+- **double div-chain 95 ms → 82 ms, TornadoVM 128 ms → 135 ms.** The note
+  below said "the row now measures 81 ms against TornadoVM's 135" and the table
+  above it still said 95/128. The table was stale; it is not any more.
+- **The 128-multiply-add row needed a different harness to measure at all** —
+  see the offload-gate defect recorded below.
+
+The pre-2026-09-07 notes follow, kept because they explain how rows got where
+they are:
 
 - The **dot-product row is now 2 ms**, not 12 — the warp-shuffle reduction
   (one `red.global.add` per warp rather than per thread) landed after the
@@ -302,13 +323,70 @@ present in this tree.
 
 Notes:
 
+- **FIXED 2026-09-07: a compiled caller silently stopped offloading a kernel in
+  another class.** `bench-gpu/GpuComputeWarm.java` has `main()` call
+  `GpuCompute.heavy` in a second class. Under `--gpu --print-gpu-decisions`
+  that method never appeared in the decision log at all — not
+  `Rejected(...)`, never asked — and the row read **2,611-2,934 ms on the
+  CPU** against 7 ms on the device. The same kernel declared beside `main()`
+  (`GpuComputeWarmSelf.java`) offloaded normally, which is what made it
+  look like an analyzer problem. It was not.
+
+  Root cause: the JIT has two one-way doors for a static call site — bind it
+  directly to the callee's entry (`jit/src/lib.rs`) and inline it
+  (`jit/src/x64/bytecode_walk.rs`). Both were gated on
+  `offload_hook::is_kernel`, a lookup in a registry that `offload_jit_gate`
+  fills as a side effect of scanning callers — and that scan cannot judge a
+  target whose declaring class is not loaded yet. A caller is scanned when it
+  is admitted to the JIT, which happens **before** it runs, so a callee in
+  another class has typically never been touched at that moment. `main` here
+  fills two 2²⁴ arrays first, so it is compiled at exactly the wrong time.
+  The site was bound directly, the dispatch helper the offload hook lives
+  behind was gone, and `try_compiled_offload`'s late registration (the
+  2026-09-06 fix for the same underlying limitation) had no site left to run
+  on.
+
+  The fix is one predicate. A registry **miss** means either "not a kernel" or
+  "could not have known yet", and these doors treated the two identically while
+  making a decision that is irreversible. `offload_hook::keeps_dispatch_helper`
+  now falls back on a miss to a descriptor-only test — `)V`/`)I`/`)J` with an
+  array parameter, mirroring `target_can_ever_dispatch` — which needs no class
+  loading and no locks. Keeping a helper is reversible and cheap; binding
+  directly is neither.
+
+  Verified: `GpuComputeWarm` went 2,934 ms → **6 ms**, and the census now
+  prints `registered late, by the compiled site: GpuCompute.heavy([I[I[I)V`.
+  Across five runs each on a quiet host the two harnesses are indistinguishable
+  (cross-class 5-6 ms, same-class 5-6 ms), which is the property that was
+  broken. `test_classes/gpu/GpuForwardRef.java` passes on both arms with equal
+  checksums. `GpuHookOverheadBench`'s `base_ns_per_call` — a loop calling an
+  **ineligible** target, which is what a broader predicate would have taxed —
+  reads 7.07 ns with `--gpu` against 7.58 ns without, so the CPU side pays
+  nothing; for scale, the old caller-refusal approach cost 407.9 ns there.
+
+  `bench-gpu/rerun-table-rows.sh` now measures this row with the cross-class
+  harness on purpose, and keeps the same-class one as a control arm. If the two
+  ever diverge again, that is what regressed.
+
 - The div-chain rows are the "GPU wins big" cases: division has no
   competitive CPU-vectorized form, so raw parallelism wins at every size
   tested (2²⁰–2²⁶; the ratios hold steady across sizes).
-- CratonVM's double-division checksum is **bit-exact** with HotSpot at
-  every size (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86
-  `vdivpd`); TornadoVM's diverges slightly — its PTX backend doesn't
-  guarantee bit-exact division.
+- CratonVM's double-division **kernel output** is bit-exact with HotSpot
+  (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86 `vdivpd`): the
+  2026-09-07 run prints identical `OUT0=45.40459327514974` and
+  `OUTN=7.2490508729547125` from both.
+
+  Its **harness checksum** does not match, and the distinction matters. The
+  checksum is a serial sum of 2²⁴ doubles in the benchmark's own epilogue;
+  floating-point addition is not associative, so summing in a different order
+  gives a different but equally correct total. CratonVM reads
+  `5.928010028745152E7` against HotSpot's `5.92801002867254E7` — a relative
+  difference of 1.2e-11, the size of a reassociated sum.
+
+  TornadoVM's `5.9583712290819384E7` is 5.1e-3 away, eight orders of magnitude
+  larger, and that one *is* a division difference: its PTX backend does not
+  guarantee bit-exact division. Do not read the two divergences as the same
+  kind of thing.
 - **Root-caused: TornadoVM's `unimplemented` is a standing gap in
   mixed-type reductions, not a version/driver issue.** `TornadoSnippetReflectionProvider
   .forBoxed` (what the whole stack trace bottoms out in) is an unconditional

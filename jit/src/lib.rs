@@ -24707,8 +24707,11 @@ fn try_compile_inner(
                         //
                         // Unarmed (no `--gpu`, or nothing registered) this is
                         // one relaxed bool. See `crate::offload_hook`.
+                        // `keeps_dispatch_helper`, not `is_kernel`: a registry
+                        // miss can mean "could not have known yet", and this
+                        // decision is one-way. See its AUDIT 2026-09-07 note.
                         let site_is_gpu_kernel = is_static
-                            && crate::offload_hook::is_kernel(
+                            && crate::offload_hook::keeps_dispatch_helper(
                                 cn.as_str(),
                                 mn.as_str(),
                                 desc.as_str(),

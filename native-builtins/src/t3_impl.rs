@@ -355,18 +355,62 @@ fn jndi_put_binding(
 
     // Grow if needed
     let cap = ctx.array_length(keys_arr);
+    let mut bindings = bindings;
     if size >= cap {
         let new_cap = cap * 2;
-        let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
-        let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+    // GC: the grow path ALLOCATES, and everything it then touches is a Rust
+    // local holding a pre-allocation address — the old array it copies from,
+    // the element it stores, and the receiver it publishes into. Under a
+    // moving collector those go stale; under the Generational non-moving young
+    // sweep an object nothing else roots is ZEROED in place. Root them for the
+    // duration of the grow and re-read each one at its use. See
+    // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+        // TWO allocations here, so even `new_keys` is stale by the time
+        // `new_vals` returns.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let bindings_h = scope.root(bindings);
+        let keys_h = scope.root(keys_arr);
+        let vals_h = scope.root(vals_arr);
+        let name_h = match name {
+            Value::Object(Some(o)) => Some(scope.root(o)),
+            _ => None,
+        };
+        let value_h = match value {
+            Value::Object(Some(o)) => Some(scope.root(o)),
+            _ => None,
+        };
+        let nk = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let nk_h = scope.root(nk);
+        let nv = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let nv_h = scope.root(nv);
         for i in 0..size {
-            ctx.set_array_element(new_keys, i, ctx.get_array_element(keys_arr, i));
-            ctx.set_array_element(new_vals, i, ctx.get_array_element(vals_arr, i));
+            let ks = scope.get(&keys_h);
+            let kv = scope.get_array_element(ks, i);
+            let kd = scope.get(&nk_h);
+            scope.set_array_element(kd, i, kv);
+            let vs = scope.get(&vals_h);
+            let vv = scope.get_array_element(vs, i);
+            let vd = scope.get(&nv_h);
+            scope.set_array_element(vd, i, vv);
         }
-        ctx.set_field(bindings, 0, Value::Object(Some(new_keys)));
-        ctx.set_field(bindings, 1, Value::Object(Some(new_vals)));
-        ctx.set_array_element(new_keys, size, name);
-        ctx.set_array_element(new_vals, size, value);
+        let (b, kd, vd) = (scope.get(&bindings_h), scope.get(&nk_h), scope.get(&nv_h));
+        scope.set_field(b, 0, Value::Object(Some(kd)));
+        let b = scope.get(&bindings_h);
+        scope.set_field(b, 1, Value::Object(Some(vd)));
+        let name_now = match &name_h {
+            Some(h) => Value::Object(Some(scope.get(h))),
+            None => name,
+        };
+        let value_now = match &value_h {
+            Some(h) => Value::Object(Some(scope.get(h))),
+            None => value,
+        };
+        let kd = scope.get(&nk_h);
+        scope.set_array_element(kd, size, name_now);
+        let vd = scope.get(&nv_h);
+        scope.set_array_element(vd, size, value_now);
+        // The count store below runs after the scope closes.
+        bindings = scope.get(&bindings_h);
     } else {
         ctx.set_array_element(keys_arr, size, name);
         ctx.set_array_element(vals_arr, size, value);
