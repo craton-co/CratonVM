@@ -3553,6 +3553,16 @@ generalises to other H2 classes. The claim is load-bearing — it is why
 families" rather than "stop refusing them" — so the disjoint-class check is
 worth running before anyone leans on it harder than that.)*
 
+*And that check cannot currently be run, which is the more useful finding: **the
+instrument that produced these numbers is not in the repo.** `tools/suite-pair-ab`
+is fork-per-class JUnit only ("netty, hibernate-reactive" by its own header) and
+knows nothing about H2; the three-interleaved-run harness described above was
+ad-hoc and did not survive its session. So the measurement backing a default-OFF
+flag and a filed work item is, today, unreproducible by anyone including its
+author. Committing an H2 equivalent of `pair-ab` — same ABBA-per-unit shape, same
+same-config noise floor, same split-half check — is the prerequisite for
+re-testing any H2 throughput claim in this file, not just this one.*
+
 **So the intrinsic at those sites really is worth more than optimizing the
 method around it.** Trading an inline unboxing load or an `Atomic*` accessor for
 a generic `jit_invoke_dispatch` costs more than the surrounding body gains, and
