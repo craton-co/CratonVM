@@ -4412,6 +4412,17 @@ pub struct IrBuilder {
     /// exactly the kind of inferred join this directory's rule 6 says not to
     /// trust. Same lifetime and same flag as `invoke_labels`.
     method_label: Option<Box<str>>,
+    /// Is every body this compile SPLICED IN free of side effects?
+    ///
+    /// The second half of the interpreter's replay question (see
+    /// `replay_from_entry_is_observably_equivalent`): a spliced artifact's
+    /// abandoned attempt also ran part of a RELOCATED callee body, which the
+    /// caller's own bytecode does not describe, so the prefix test alone
+    /// cannot clear it. `lib.rs` computes this while planning the splice, and
+    /// hands it over with [`Self::set_spliced_bodies_pure`]. Vacuously `true`
+    /// for a build that splices nothing — the default, and the value every
+    /// hand-built/test graph keeps.
+    spliced_bodies_pure: bool,
     pub tdigest_scalar_kernel: bool,
     /// inc 26/35: resolved `ldc2_w` (0x14) constant values (`pc → (bits, is_double)`).
     /// Set by [`Self::set_ldc2w_info`]; an `ldc2_w` pc not present bails to
@@ -4626,6 +4637,7 @@ impl IrBuilder {
             splice_guard_seen: false,
             invoke_labels: HashMap::new(),
             method_label: None,
+            spliced_bodies_pure: true,
             tdigest_scalar_kernel: false,
             ldc2w_info: HashMap::new(),
             wide_field_long: false,
@@ -5524,8 +5536,94 @@ impl IrBuilder {
     /// [`ir_trap_census`] counts what was PLANTED by cause; the runtime side
     /// counts what is TAKEN. A cause whose taken count is not ~0 has had its
     /// coldness argument refuted, which is the falsifiable form of the claim.
-    fn plant_uncommon_trap(&mut self, pc: usize, cause: TrapCause) -> bool {
+    /// Tell the builder whether the bodies it is about to splice commit any
+    /// side effect. See [`Self::spliced_bodies_pure`]; called by `lib.rs`
+    /// alongside the combined buffer it hands to [`Self::build`].
+    pub fn set_spliced_bodies_pure(&mut self, pure: bool) {
+        self.spliced_bodies_pure = pure;
+    }
+
+    /// Would the interpreter accept a whole-method replay for a trap at `pc`?
+    ///
+    /// This is [`replay_from_entry_is_observably_equivalent`]'s rule, asked at
+    /// the producing end. It is deliberately the SAME three clauses in the
+    /// same order rather than a paraphrase, because the whole point is that a
+    /// trap this predicate admits is a trap the consumer will not refuse:
+    ///
+    ///  1. a body that commits nothing anywhere replays trivially;
+    ///  2. otherwise every spliced body must also commit nothing, since the
+    ///     caller's bytecode does not describe what a relocated body did;
+    ///  3. and then only `code[..pc]` can have committed anything, because
+    ///     every deopt point this VM emits is `REEXECUTE` — the bytecode AT
+    ///     the trap had not completed and nothing after it ran.
+    ///
+    /// `code` may be the COMBINED buffer (method body, then the spliced
+    /// bodies appended after it), so `code_len` — the original method's own
+    /// length — is what bounds clause 1. A trap inside a spliced region never
+    /// reaches this point: `plant_uncommon_trap` raises `splice_guard_seen`
+    /// for one, which refuses the graph outright.
+    fn trap_replay_is_safe(&self, code: &[u8], code_len: usize, pc: usize) -> bool {
+        let body_len = code_len.min(code.len());
+        if !crate::bytecode_commits_side_effect(code, body_len) {
+            return true;
+        }
+        if !self.spliced_bodies_pure {
+            return false;
+        }
+        if pc > body_len {
+            return false;
+        }
+        !crate::bytecode_commits_side_effect(code, pc)
+    }
+
+    fn plant_uncommon_trap(
+        &mut self,
+        code: &[u8],
+        code_len: usize,
+        pc: usize,
+        cause: TrapCause,
+    ) -> bool {
         if !ir_site_trap_enabled() {
+            return false;
+        }
+        // A trap this tier CANNOT BE RESUMED FROM is not a slow path, it is a
+        // guaranteed `InternalError`. `x64::driver` sets
+        // `can_deopt_resume = !deopt_points.is_empty() && !has_elided_monitor`
+        // for the single-pass backend, but this backend only ever sets it on
+        // the scalar-replacement path (`sr_map.is_some()`, i.e.
+        // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`) -- so on a
+        // production artifact an optimizing-tier deopt has exactly ONE
+        // fallback: the interpreter's whole-method replay from entry. That
+        // replay is refused, fatally, whenever the bytecode before the trap
+        // already committed something a re-run would duplicate.
+        //
+        // The doc comment above claims parity with the single-pass backend's
+        // indy trade. That backend takes the same trade AND carries the safety
+        // valve this one was missing: `bytecode_walk`'s 0xba arm bails the
+        // whole compile (`mark_codegen_unencodable("unresumable-indy-trap")`)
+        // when the snapshot it just built is not resumable. Copying the trade
+        // without the valve is what made `com/sun/tools/javac/code/
+        // Scope$ScopeImpl.remove` -- `Assert.check(...)` at bci 12, an
+        // `invokedynamic` at bci 21 -- die on its FIRST compiled call with
+        // `precise deoptimization unavailable ... refusing side-effecting
+        // replay`, which javac reports as a compile that failed with zero
+        // diagnostics. That is the whole 19-class Spring `TestCompiler`/AOT
+        // cluster and the `--nojit`-clears-it finding above it.
+        //
+        // Asked with the CONSUMER's own predicate
+        // (`replay_from_entry_is_observably_equivalent` in
+        // vm/src/runtime/interpreter/deopt_resume.rs) so the two ends cannot
+        // drift: whole body pure, else the prefix before the trap pure and
+        // every spliced body pure.
+        if ir_trap_replay_guard_enabled() && !self.trap_replay_is_safe(code, code_len, pc) {
+            if ir_bail_reporting() {
+                eprintln!(
+                    "[ir] site TRAP REFUSED at bytecode pc {pc} ({}) in {} --                      the code before it commits a side effect and this tier                      publishes no resumable deopt, so the trap would be a hard                      InternalError; declining the optimizing tier instead",
+                    cause.as_str(),
+                    self.method_label.as_deref().unwrap_or("<unknown>"),
+                );
+            }
+            note_trap_refused(cause);
             return false;
         }
         // Counted at the END, on the success path only -- see the increment
@@ -6945,7 +7043,12 @@ impl IrBuilder {
                         // the abstract stack keeps the depth the verifier
                         // proved, and the code that reads it is unreachable.
                         None => {
-                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedTypeCheck) {
+                            if !self.plant_uncommon_trap(
+                                code,
+                                code_len,
+                                pc,
+                                TrapCause::UnresolvedTypeCheck,
+                            ) {
                                 return ir_build_bail(line!(), pc);
                             }
                             let _obj = self.pop();
@@ -6979,7 +7082,12 @@ impl IrBuilder {
                         // Same argument as the `checkcast` arm above: an
                         // unloaded class has been reached by nothing.
                         None => {
-                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedTypeCheck) {
+                            if !self.plant_uncommon_trap(
+                                code,
+                                code_len,
+                                pc,
+                                TrapCause::UnresolvedTypeCheck,
+                            ) {
                                 return ir_build_bail(line!(), pc);
                             }
                             let _obj = self.pop();
@@ -7230,7 +7338,12 @@ impl IrBuilder {
                         // this story: it stops the retry sweep re-resolving a
                         // site that traps perfectly well.
                         None => {
-                            if !self.plant_uncommon_trap(pc, TrapCause::UnresolvedNew) {
+                            if !self.plant_uncommon_trap(
+                                code,
+                                code_len,
+                                pc,
+                                TrapCause::UnresolvedNew,
+                            ) {
                                 return ir_build_bail(line!(), pc);
                             }
                             let null = self.aconst_null();
@@ -7585,7 +7698,7 @@ impl IrBuilder {
                     let Some(&(arg_entries, ret_tag)) = self.indy_trap_sites.get(&pc) else {
                         return ir_build_bail(line!(), pc);
                     };
-                    if !self.plant_uncommon_trap(pc, TrapCause::Indy) {
+                    if !self.plant_uncommon_trap(code, code_len, pc, TrapCause::Indy) {
                         return ir_build_bail(line!(), pc);
                     }
                     for _ in 0..arg_entries {
@@ -8907,6 +9020,151 @@ mod scalar_intrinsic_recognizer_tests {
         );
     }
 
+    /// An uncommon trap is only a slow path if the interpreter can get back
+    /// to the bytecode. This tier publishes no resumable deopt on a production
+    /// artifact, so the ONLY fallback is the whole-method replay from entry —
+    /// and the interpreter refuses that, fatally, once the prefix before the
+    /// trap has committed something the replay would duplicate.
+    ///
+    /// This is the `com/sun/tools/javac/code/Scope$ScopeImpl.remove` shape,
+    /// spelled in bytecode: `Assert.check(...)` (an `invokestatic`) at bci 5,
+    /// then the `invokedynamic` the tier cannot lower at bci 8. Planting there
+    /// is what made every in-process javac compile under Spring's
+    /// `TestCompiler` die with `InternalError: precise deoptimization
+    /// unavailable ... refusing side-effecting replay` — a compile that failed
+    /// with zero diagnostics.
+    #[test]
+    fn a_trap_after_a_side_effect_is_refused() {
+        let builder = IrBuilder::new(1, 1);
+        // 0: aload_0, 1: aload_0, 2..4: invokestatic #1, 5..7: getstatic #2,
+        // 8..12: invokedynamic #3
+        let code = [
+            0x2a, 0x2a, 0xb8, 0x00, 0x01, 0xb2, 0x00, 0x02, 0xba, 0x00, 0x03, 0x00, 0x00,
+        ];
+        assert!(
+            !builder.trap_replay_is_safe(&code, code.len(), 8),
+            "an invokestatic at bci 2 is a committed side effect, so a replay             from entry would duplicate it and the interpreter refuses — the trap             at bci 8 must not be planted",
+        );
+    }
+
+    /// The other half of the same rule, and the reason it is a PREFIX test and
+    /// not "does this body commit anything anywhere". A trap reached before
+    /// the method has done anything replays harmlessly: the locals are rebuilt
+    /// from the same arguments and nothing outside the frame was written. The
+    /// side effect AFTER the trap never ran — every deopt point this VM emits
+    /// is `REEXECUTE`, so the bytecode at the trap had not completed.
+    ///
+    /// Refusing this shape too would cost the optimizing tier every method
+    /// that opens with a lambda, for a hazard it does not have.
+    #[test]
+    fn a_trap_before_any_side_effect_is_admitted() {
+        let builder = IrBuilder::new(1, 1);
+        // 0: aload_0, 1..5: invokedynamic #1, 6..8: invokestatic #2 (AFTER)
+        let code = [0x2a, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb8, 0x00, 0x02];
+        assert!(
+            builder.trap_replay_is_safe(&code, code.len(), 1),
+            "nothing before bci 1 commits anything, and the invokestatic at bci             6 never ran — this replay is observably the abandoned attempt",
+        );
+    }
+
+    /// Clause 2 of the consumer's rule, which the prefix test cannot see: a
+    /// spliced artifact's abandoned attempt also ran part of a RELOCATED
+    /// callee body, and the caller's own bytecode does not describe it. The
+    /// interpreter reads the same one number off the artifact
+    /// (`spliced_bodies_side_effect_free`), so the producer has to ask it too.
+    #[test]
+    fn an_impure_splice_refuses_a_trap_a_pure_prefix_would_admit() {
+        let code = [0x2a, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb8, 0x00, 0x02];
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_spliced_bodies_pure(false);
+        assert!(
+            !builder.trap_replay_is_safe(&code, code.len(), 1),
+            "the prefix is pure but a spliced body is not, and the replay             would re-run that body's side effects",
+        );
+        // Same bytes, same bci, only the splice answer differs — so this pair
+        // isolates the clause rather than merely exercising it.
+        let mut pure = IrBuilder::new(1, 1);
+        pure.set_spliced_bodies_pure(true);
+        assert!(pure.trap_replay_is_safe(&code, code.len(), 1));
+    }
+
+    /// A body that commits nothing ANYWHERE needs no reasoning about where the
+    /// attempt stopped — clause 1, and the one clause that answers `true` even
+    /// for a trap late in the method. It also has to hold with an impure
+    /// splice recorded, because the consumer asks it first, before it looks at
+    /// the splice answer at all; a producer that ordered the clauses the other
+    /// way would refuse traps the interpreter would have accepted.
+    ///
+    /// The body here traps on an unresolved `checkcast`, not an
+    /// `invokedynamic`, and that is the point — see
+    /// [`clause_one_can_never_fire_for_an_invokedynamic_body`].
+    #[test]
+    fn a_body_that_commits_nothing_admits_a_trap_anywhere() {
+        let mut builder = IrBuilder::new(1, 1);
+        builder.set_spliced_bodies_pure(false);
+        // 0: aload_0, 1..3: checkcast #1, 4: areturn
+        let code = [0x2a, 0xc0, 0x00, 0x01, 0xb0];
+        assert!(
+            builder.trap_replay_is_safe(&code, code.len(), 1),
+            "no store, no call, no monitor action anywhere in this body",
+        );
+    }
+
+    /// `invokedynamic` is `0xba`, and `opcode_commits_side_effect` commits the
+    /// whole `0xb6..=0xba` invoke range — so a body containing one can never
+    /// satisfy clause 1, no matter how pure the rest of it is. Every indy trap
+    /// is therefore decided by the PREFIX clause alone.
+    ///
+    /// This is worth a test of its own because it is the difference between
+    /// the rule as stated and the rule as it runs, and the first version of
+    /// the clause-1 test above got it wrong: it used an indy body, asserted
+    /// clause 1, and failed. Left as an assertion so that widening or
+    /// narrowing `opcode_commits_side_effect` says so here instead of quietly
+    /// changing which methods the optimizing tier will trap in.
+    #[test]
+    fn clause_one_can_never_fire_for_an_invokedynamic_body() {
+        // 0: aload_0, 1: pop, 2..6: invokedynamic #1, 7: return — nothing but
+        // the indy itself could commit anything.
+        let code = [0x2a, 0x57, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb1];
+        assert!(
+            crate::bytecode_commits_side_effect(&code, code.len()),
+            "the indy opcode is itself in the side-effect set",
+        );
+        let mut impure = IrBuilder::new(1, 1);
+        impure.set_spliced_bodies_pure(false);
+        assert!(
+            !impure.trap_replay_is_safe(&code, code.len(), 2),
+            "clause 1 cannot rescue it, so the impure splice decides",
+        );
+        let mut pure = IrBuilder::new(1, 1);
+        pure.set_spliced_bodies_pure(true);
+        assert!(
+            pure.trap_replay_is_safe(&code, code.len(), 2),
+            "with the splice clause satisfied the PREFIX is what admits it",
+        );
+    }
+
+    /// `code` may be the COMBINED buffer — the method body, then the spliced
+    /// bodies appended after it — while `code_len` is the method's own length.
+    /// Clause 1 has to be bounded by `code_len`, or a side effect in a
+    /// relocated callee would make the whole-body test read "impure" for a
+    /// method that is pure, and the trap would be refused for the wrong
+    /// reason. The prefix clause then still answers correctly.
+    #[test]
+    fn the_whole_body_clause_stops_at_the_methods_own_length() {
+        let builder = IrBuilder::new(1, 1);
+        // Method body is the first 8 bytes (pure); bytes 8.. are a relocated
+        // callee that stores to a static.
+        let code = [
+            0x2a, 0x57, 0xba, 0x00, 0x01, 0x00, 0x00, 0xb1, // method (len 8)
+            0x2a, 0xb3, 0x00, 0x04, 0xb1, // spliced callee: putstatic
+        ];
+        assert!(
+            builder.trap_replay_is_safe(&code, 8, 2),
+            "the relocated tail is not this method's body and must not decide             clause 1",
+        );
+    }
+
     /// The per-build counter is what carries "this build planted a trap" back
     /// to `lib.rs`, because `build(mut self, ..)` consumes the builder. It must
     /// start at zero for every build or one trapping method would register
@@ -9097,8 +9355,67 @@ static TRAPS_PLANTED: [std::sync::atomic::AtomicU64; TrapCause::COUNT] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Traps REFUSED because the trap would not have been resumable, by cause.
+///
+/// A planted count on its own cannot tell "this workload has no such site"
+/// from "every such site was declined": both read as a low number of hard
+/// failures, and only one of them means the guard is doing anything. This row
+/// is what makes the refusal falsifiable — and it is the price tag of
+/// `ir_trap_replay_guard_enabled`, since every refusal here is one optimizing
+/// body given back to the single-pass tier.
+static TRAPS_REFUSED_UNRESUMABLE: [std::sync::atomic::AtomicU64; TrapCause::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 fn note_trap_planted(cause: TrapCause) {
     TRAPS_PLANTED[cause.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn note_trap_refused(cause: TrapCause) {
+    TRAPS_REFUSED_UNRESUMABLE[cause.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(cause, refused)` for every trap cause — the companion row to
+/// [`ir_trap_census`]. See [`TRAPS_REFUSED_UNRESUMABLE`].
+pub fn ir_trap_refusal_census() -> [(&'static str, u64); TrapCause::COUNT] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        (
+            TrapCause::Indy.as_str(),
+            TRAPS_REFUSED_UNRESUMABLE[0].load(Relaxed),
+        ),
+        (
+            TrapCause::UnresolvedTypeCheck.as_str(),
+            TRAPS_REFUSED_UNRESUMABLE[1].load(Relaxed),
+        ),
+        (
+            TrapCause::UnresolvedNew.as_str(),
+            TRAPS_REFUSED_UNRESUMABLE[2].load(Relaxed),
+        ),
+    ]
+}
+
+/// Must an uncommon trap be resumable before it may be planted? **Default
+/// ON**; `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` is the kill switch and restores
+/// the pre-2026-09-07 behaviour (plant regardless, and let the interpreter's
+/// deopt sink raise `InternalError` when it cannot replay).
+///
+/// The guard exists because this backend publishes no resumable deopt on a
+/// production artifact — see [`IrBuilder::plant_uncommon_trap`] for the full
+/// argument and the javac shape that proved it. The kill switch is here so the
+/// cost of the refusal (optimizing bodies handed back to the single-pass tier)
+/// can be measured as an A/B in one binary rather than argued about.
+pub fn ir_trap_replay_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_TRAP_REPLAY_GUARD").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// `(cause, planted)` for every trap cause, always all three rows.

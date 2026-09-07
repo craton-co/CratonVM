@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-390 tokens.
+391 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -765,6 +765,7 @@ export inherited from a parent shell.
 | `deferred-new-retry-blind` | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND` |
 | `deferred-new-looks` | `CRATONVM_JIT_DEFERRED_NEW_LOOKS` |
 | `ir-site-trap` | `CRATONVM_JIT_IR_SITE_TRAP` |
+| `ir-trap-replay-guard` | `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD` |
 | `ir-scalar-intrinsics` | `CRATONVM_JIT_IR_SCALAR_INTRINSICS` |
 | `ir-aastore` | `CRATONVM_JIT_IR_AASTORE` |
 | `ir-check-elim` | `CRATONVM_JIT_IR_CHECK_ELIM` |

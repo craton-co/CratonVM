@@ -3023,6 +3023,7 @@ Seven changes, each with a kill switch and an engagement census.
 | 3a | scalar intrinsics lowered as arithmetic | **ON** | `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` |
 | 3b | uncommon trap at an `invokedynamic` site | **ON** | `CRATONVM_JIT_IR_SITE_TRAP=0` |
 | 3b' | ...at an unresolved `checkcast`/`instanceof`/`new` | **OFF** — the coldness argument was refuted; see below | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` |
+| 3b" | ...only where the trap could be RESUMED | **ON** (added 2026-09-07) | `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` |
 | 3c | `aastore` through `jit_aastore` | **ON** | `CRATONVM_JIT_IR_AASTORE=0` |
 | 4a | frequency block layout + list scheduling | **ON** | `CRATONVM_JIT_IR_HOT_LAYOUT=0`, `CRATONVM_JIT_IR_LIST_SCHED=0` |
 | 4b | branch profile window around a C2 nomination | **ON** | `CRATONVM_TIER_PGO_C2_WINDOW=0` |
@@ -3043,6 +3044,46 @@ names a class that **has never been loaded**, and a class that has never been
 loaded cannot have been touched by any path that has executed. That is a proof.
 `invokedynamic` has no such proof, and is on the list because the single-pass
 backend has made exactly this trade by default since it stopped bailing on indy.
+
+**A trap the interpreter cannot get back from is not a slow path (2026-09-07).**
+That last sentence — matching the single-pass backend's indy trade — copied the
+trade without its precondition, and the precondition is the whole thing. The
+single-pass `0xba` arm checks the snapshot it just built and bails the entire
+compile (`mark_codegen_unencodable("unresumable-indy-trap")`) when the trap
+could not be resumed. This tier needs that check MORE, not less: `x64::driver`
+sets `can_deopt_resume = !deopt_points.is_empty() && !has_elided_monitor`, while
+`ir_lower` sets it only on the scalar-replacement path, so on a production
+artifact an optimizing-tier deopt has exactly one fallback — the interpreter's
+whole-method replay from entry — and that replay is refused, fatally, once the
+bytecode before the trap has committed something a re-run would duplicate.
+
+`IrBuilder::trap_replay_is_safe` now asks the CONSUMER's own predicate
+(`replay_from_entry_is_observably_equivalent`) before planting, and a refusal
+returns `false`, which the callers already turn into `ir_build_bail` — so the
+method falls back to the single-pass backend rather than going uncompiled.
+`ir_trap_refusal_census()` counts refusals by cause beside `ir_trap_census()`'s
+plants.
+
+Note that `invokedynamic` is `0xba` and `opcode_commits_side_effect` commits the
+whole `0xb6..=0xba` invoke range, so a body containing an indy can never satisfy
+the whole-body clause: every indy trap is decided by the prefix before it.
+
+It costs nothing measurable. An indy trap is UNCONDITIONAL, so an optimizing
+body whose live path reaches one pays a deopt on every call and is strictly
+worse than the single-pass body it superseded; declining it hands the method
+back to a tier that runs it. Measured ABBA-interleaved over 24 Spring classes
+(673 test methods) on one binary: guard ON 294.9 s / 286.6 s, guard OFF
+316.4 s / 336.9 s — no overlap, and the fastest slot is the last one, so host
+drift cannot explain the ordering.
+
+Before this, every in-process javac compile under Spring's `TestCompiler` died
+with `InternalError: precise deoptimization unavailable ... refusing
+side-effecting replay` (javac catches it, prints its own banner to stderr and
+returns `false` with an empty `DiagnosticListener`, which reads as a compile
+that failed with no diagnostics), and every H2 CRASH class in the 2026-09-07
+3-arm run died the same way. See the retired
+`testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster` and
+`precise-deoptimization-unavailable-cross-suite-crash` write-ups.
 
 **The intrinsics split by what the intrinsic replaces, not by convenience.**
 Letting an unlowerable intrinsic site take an ordinary `Op::Call` is a
