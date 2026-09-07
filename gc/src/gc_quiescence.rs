@@ -1867,6 +1867,9 @@ pub static PEER_REG_CAPTURE: parking_lot::Mutex<Vec<(u32, u8, usize)>> =
 /// an address the collection vacated.
 pub static PEER_REG_STALE: AtomicU64 = AtomicU64::new(0);
 
+/// Stack words rewritten in still-frozen peers by the opt-in repair.
+pub static PEER_STACK_WORDS_REMAPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Record one frozen peer's register word. No-op unless the pairing is armed.
 pub fn record_peer_reg(os_tid: u32, reg: u8, value: usize) {
     if !peer_reg_pairing_enabled() {
