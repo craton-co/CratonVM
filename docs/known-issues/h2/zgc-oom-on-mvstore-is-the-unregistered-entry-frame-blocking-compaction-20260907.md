@@ -40,8 +40,16 @@ window, and a 32 KB array allocation fails against a heap that is 88% free.**
 The failing request is always an `ArrayList.grow` doubling, so the length
 doubles with the heap and the failure does not: `length 4096` at `-Xmx256m`,
 `8192`, `16384` at `-Xmx512m`. It fails at 100 000, 200 000 and 500 000 entries
-and at every heap size tried. More heap does not help; it just changes which
-doubling dies.
+at all three of those heap sizes.
+
+**It is heap-size dependent, though, and the threshold is above 512 MB.** At
+`-Xmx2g` ZGC runs the whole of `org.h2.test.store.TestMVStoreTool` to `rc=0` in
+848 s — the only arm of any collector that finishes that class at all (G1 times
+out at 5 400 s on the same heap). So this is a defect of the low end, not a
+wholesale failure of the collector: given enough headroom the fragmentation
+never reaches the wall, and ZGC is then the BEST collector for this workload.
+That is also why it must not be dismissed as "use a bigger heap" — 256 MB is
+what the suite runs, and it is where the default collector dies in nine seconds.
 
 ## 2. The cause matrix — two ingredients
 

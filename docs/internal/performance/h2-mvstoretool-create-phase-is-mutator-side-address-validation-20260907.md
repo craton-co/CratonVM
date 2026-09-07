@@ -7,7 +7,7 @@ between them. The profile exists now. **The answer is none of the three.**
 
 | | |
 |---|---|
-| **Status** | **Answered and priced.** One fix landed (§4), worth a measured 2.6%. The residual is named in §6 and is architectural, not an MVStore defect. |
+| **Status** | **Answered and priced.** One fix landed (§4), worth a measured 2.6%. The retired page's title ("never finishes ... every collector") is WRONG: the class runs to `rc=0` in 848 s on ZGC at `-Xmx2g` (§1). The residual is named in §6 and is architectural, not an MVStore defect. |
 | **Where** | Azure host 2 (`20.80.105.49`), Linux, dev tip `4d7108203`, H2 2.4.249 at `apps/h2database/h2`, release binaries, `perf 6.17.13`. |
 | **Reproducer** | `probes/MvsCreate.java` — the same create phase with the entry count as `argv[0]`. 13 s instead of 30 min. |
 
@@ -55,19 +55,33 @@ The whole class, `-Xmx256m`, for the record: **HotSpot `rc=0` in 17 s**, with
 `Created in 5661 ms` — not "about four minutes", which is what the old page
 quoted from a Windows run.
 
-**And heap does not rescue it.** The class was run under G1 at **`-Xmx2g`** —
-eight times the heap the old page's arms used, on a workload whose whole live
-set the collector never even has to collect at 1 GB (§2) — with a 90-minute
-budget:
+**And the class DOES finish — the retired page's title is wrong.** It is called
+*"never finishes its CREATE phase on CratonVM — every collector"*. Run at
+**`-Xmx2g`**, eight times the heap its arms used, with a 90-minute budget:
+
+| arm, whole class, `-Xmx2g` | result |
+|---|---|
+| G1 | `rc=124`, TIMEOUT at 5 400 s, still in create |
+| **ZGC** | **`rc=0` in 848 s** — every phase |
 
 ```text
-rc=124 wall=5400s tag=cvm-g1-2g
+Created in 450006 ms.      Compacted in 58972 ms.
+Compacted (compressed) in 34893 ms.    Re-compacted in 41959 ms.
+Re-compacted (compressed) in 64915 ms. Verified in 152594 ms.
+rc=0 wall=848s tag=cvm-zgc-2g
 ```
 
-Still a TIMEOUT, still in the create phase. That is the single most useful
-negative result on this page: it separates the two terms cleanly. If the failure
-were the collector or the footprint, 2 GB would have moved it, and it did not.
-What is left is per-operation mutator cost, which no heap size touches.
+So the honest statement is **"needs 2 GB and the right collector, and is then
+about 50x HotSpot"** (848 s against 17 s; 450 s against 5.7 s on create alone) —
+not "never finishes". Two things follow:
+
+* **Heap DOES move it, and the collector choice moves it more.** ZGC finishes
+  where G1 times out at the same heap; below ~512 MB ZGC instead OOMs in
+  seconds (§ the ZGC page). The collector that is unusable at 256 MB is the one
+  that passes at 2 GB.
+* **It is still the mutator that sets the floor.** 450 s of create with a
+  collector that is keeping up, against HotSpot's 5.7 s, is the same ~24x of §1
+  compounded by the phase costs — not a pause problem.
 
 ---
 
@@ -266,9 +280,9 @@ flat
 across the read barrier, the array accessors, the write barrier, the provenance
 bitmap and the native-dispatch glue, with no single line item above 3% once the
 validator is removed. There is no MVStore defect at the bottom of this page.
-**`TestMVStoreTool` will not complete on this VM until that flat distribution is
-addressed, and nothing in this page's scope will do it** — not at `-Xmx256m`,
-and, as the 2 GB arm above shows, not at any heap size.
+**`TestMVStoreTool` completes only at 2 GB on ZGC, 50x slower than HotSpot, and
+nothing in this page's scope will change that** — the flat distribution is the
+floor, and no heap size or collector reaches under it.
 
 Two nominations that came out of the sampling and were NOT taken, with the
 reason:
