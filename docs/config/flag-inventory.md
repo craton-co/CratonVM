@@ -878,6 +878,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DBG_JIT_ROOTSCAN` | DBG | `CRATONVM_DBG=jit-rootscan` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_SAFEPOINTS` | DBG | `CRATONVM_DBG=jit-safepoints` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_SCAN_PROF` | DBG | `CRATONVM_DBG=jit-scan-prof` | opt-in | off | diag | snapshot | vm |
+| `CRATONVM_DBG_JIT_SLOT_OVERLAP` | DBG | `CRATONVM_DBG=jit-slot-overlap` | opt-in | off | diag | snapshot | jit |
 | `CRATONVM_DBG_JIT_STALE_AFTER_REMAP` | DBG | `CRATONVM_DBG=jit-stale-after-remap` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_DBG_JIT_STALE_BELOW_RBP` | DBG | `CRATONVM_DBG=jit-stale-below-rbp` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_DBG_JIT_STALE_IC` | DBG | `CRATONVM_DBG=jit-stale-ic` | opt-in | off | diag | snapshot | jit |
