@@ -75,23 +75,35 @@ const SHAPES: &[(&str, &str)] = &[
         "Cannot load from int array because \
          \"cratonvm.CompiledNpeMessage.NULL_ARRAY\" is null",
     ),
+    (
+        "storeToNull",
+        "Cannot store to int array because \
+         \"cratonvm.CompiledNpeMessage.NULL_ARRAY\" is null",
+    ),
 ];
 
-/// `storeToNull` is fixture-only and DELIBERATELY not asserted here.
+/// `storeToNull` is asserted like the other two, since 2026-09-07.
 ///
-/// HotSpot raises `NullPointerException: Cannot store to int array because
-/// "cratonvm.CompiledNpeMessage.NULL_ARRAY" is null` for it. CratonVM raises no
-/// NPE at all from compiled code: the `iastore` reaches the void-return store
-/// helpers, which need a precise deopt to replay a side-effecting store, and
-/// without one the call fails with `InternalError: precise deoptimization
-/// unavailable for … at bci 21 (can_deopt_resume=false …); refusing
-/// side-effecting replay`.
+/// It was excluded before that, and the exclusion is worth keeping visible
+/// because of WHAT it excluded. CratonVM raised no NPE at all for this shape:
+/// the `iastore` needs a precise deopt to replay a side-effecting store, and
+/// the tier-up sink refused to build one, failing with `InternalError: precise
+/// deoptimization unavailable for ... at bci 21 (can_deopt_resume=false ...);
+/// refusing side-effecting replay` -- a hard abort, upstream of any message, so
+/// asserting the text here would have tied this file's fate to that bug.
 ///
-/// That is a real divergence, but a DIFFERENT one — upstream of any message,
-/// since no NullPointerException is ever constructed — so asserting it here
-/// would tie this file's fate to an unrelated bug. The fixture method stays so
-/// the exclusion is visible rather than silently absent.
-const UNASSERTED_STORE_SHAPE: &str = "storeToNull";
+/// That bug is fixed (`cratonvm_jit::deopt_sink_resume_enabled`), and it is
+/// pinned on its own terms -- the abort, not the text -- in
+/// `jit_deopt_sink_resumes_a_side_effecting_trap.rs` and its OFF arm. What is
+/// asserted HERE is only what this file has always been about: that the
+/// interpreter's re-execution after the deopt carries HotSpot's message.
+///
+/// NOTE which tier this exercises. Without the `CRATONVM_TIER_*` overrides
+/// those two files install, `storeToNull` lands at the SINGLE-PASS tier, which
+/// sets `can_deopt_resume` itself and always resumed. So this row is the
+/// message assertion for the C1 path and those files are the abort assertion
+/// for the optimizing one; neither substitutes for the other.
+const STORE_SHAPE_ASSERTED_SINCE: &str = "2026-09-07";
 
 fn test_resources_dir() -> String {
     if let Some(generated) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
@@ -288,7 +300,7 @@ fn a_compiled_null_array_deref_carries_hotspots_message_only_when_the_gate_is_on
         );
     }
 
-    let _ = UNASSERTED_STORE_SHAPE;
+    let _ = STORE_SHAPE_ASSERTED_SINCE;
     // Leave the process gate where an embedder expects it.
     cratonvm_vm::runtime::env_cache::set_show_code_details_in_exception_messages(false);
 }

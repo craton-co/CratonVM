@@ -4139,6 +4139,113 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     None
 }
 
+/// De-speculate a method whose compiled body just trapped — TAKING THE
+/// SITE-TRAP DECISION ONCE.
+///
+/// `fallback_reason` is what to record when this is NOT an IR site trap; the
+/// two callers pass different ones because they know different things.
+///
+/// # Why the two consumers of a stashed deopt frame must ask the same function
+///
+/// A trapped compiled body's frame reaches one of two sinks, depending on how
+/// the callee was entered: `try_resume_trapped_callee` (the compiled caller's
+/// dispatch helper, for a callee that already has an artifact) or `execute`'s
+/// first-call tier-up sink (`interpreter.rs`, `execute-first-call-tierup`, for
+/// the invocation that installs one). They disagreed. The helper applied the
+/// policy below; the tier-up sink passed the DEOPT POINT'S OWN reason straight
+/// to `deoptimize`, and for a body whose trapping bci carries a safepoint that
+/// reason is `TransferToInterpreter`, whose `recommend_action` is `Reinterpret`
+/// — the artifact stays live, the next call re-enters it, and it traps again,
+/// forever.
+///
+/// # The policy
+///
+/// `UnreachedCode` (the usual fallback) is the one-shot "give up immediately"
+/// reason: the trapping method is made not-compilable on the first resolution
+/// and the tiered manager stops re-queuing recompiles that would just trap.
+///
+/// EXCEPT for an IR SITE TRAP. `probes/UnresolvedTrapProbe.java` measures why:
+/// the trapped method deopts on EVERY call (200,000 of 200,000) and
+/// `MakeNotCompilable` is consulted by `compile_gate` itself, so the method
+/// loses its body on EVERY tier — including the single-pass backend, which
+/// lowers `invokedynamic` and unresolved typechecks perfectly well. Before site
+/// traps existed the IR tier simply refused such a method and C1 compiled it;
+/// blacklisting is a strict regression on that.
+///
+/// A site trap means one thing only: the OPTIMIZING tier could not lower one
+/// call site. So ban the optimizing tier for this method — the memo
+/// `try_compile_inner` already consults — and pick a reason that RECOMPILES
+/// instead of blacklisting. The recompile then goes single-pass and does not
+/// trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until the
+/// per-method deopt count crosses `max_deopts_per_method`, which keeps a
+/// backstop if the assumption above is ever wrong.
+///
+/// # Why the decision is taken ONCE, and in its OWN set
+///
+/// Everything after the first is a REPEAT of a decision already taken, and
+/// repeating it is not harmless: `SpeculationFailed` escalates on the
+/// per-method deopt COUNT, so a trapped site inside a long-running caller drives
+/// the method to `MakeNotCompilable` — the exact outcome this arm exists to
+/// avoid — purely by being reached often.
+///
+/// Why "often" is unavoidable: eviction and the epoch bump both fire on the
+/// first deopt, and `invalidate_matching` even evicts the direct CALLER
+/// transitively. But the caller may be a single in-flight invocation running a
+/// loop — measured on `probes/UnresolvedTrapProbe.java`, where one `main` frame
+/// calls the trapped callee 200,000 times through a `CALL` baked into code that
+/// is already executing. Re-binding happens (the tracer shows `main` recompiled
+/// and baking a second callee entry) but the RUNNING frame keeps the old
+/// address, and nothing short of deoptimizing the caller's frame can change
+/// that. `MakeNotEntrant` is an enum variant here with no entry-patching behind
+/// it, so there is no cheap displacement to reach for.
+///
+/// What IS in reach is not compounding the damage: take the policy decision
+/// once, and let the remaining calls resume in the interpreter — correct, and
+/// self-correcting the moment that caller frame returns and re-enters its
+/// recompiled self.
+///
+/// "Once" is `ir::claim_site_trap_decision`, a set of its own, and not
+/// `ir_evidence`'s refusal memo — see 81c9c9fd7 and the comment at the call.
+pub(crate) fn despeculate_trapped_method(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    fallback_reason: cratonvm_jit::deopt::DeoptReason,
+    bci: u32,
+) {
+    let h = cratonvm_jit::ir_method_memo_hash(class_name, method_name, descriptor);
+    let ir_site_trap = cratonvm_jit::ir::method_has_site_trap(h);
+    let mut decided = true;
+    if ir_site_trap {
+        cratonvm_jit::ir::note_site_trap_taken();
+        // A DEDICATED set, not `ir_evidence`'s refusal memo (81c9c9fd7): that
+        // memo has a second writer -- the acceptance gate marks a method
+        // refused whenever it discards an optimizing body -- so reading it here
+        // would let a gate-refused method look "already decided" on its FIRST
+        // trap, and the policy, including the eviction, would never be applied.
+        decided = cratonvm_jit::ir::claim_site_trap_decision(h);
+        cratonvm_jit::ir_evidence::note_method_refused(h);
+        if !decided {
+            cratonvm_jit::ir::note_site_trap_repeat();
+        }
+    }
+    if decided {
+        DeoptimizationController::deoptimize(
+            vm,
+            class_name,
+            method_name,
+            descriptor,
+            if ir_site_trap {
+                cratonvm_jit::deopt::DeoptReason::SpeculationFailed
+            } else {
+                fallback_reason
+            },
+            bci,
+        );
+    }
+}
+
 /// SAFETY: same contract as the surrounding dispatch helpers — `vm` live,
 /// `info` a live `JitInvokeInfo`, `thread` the current thread's exclusive
 /// borrow (passed in, NOT re-acquired via `jit_thread_mut`, because some call
@@ -4308,82 +4415,18 @@ unsafe fn try_resume_trapped_callee(
     }
 
     // De-speculate the trapping method FIRST (record + evict + escalate), so
-    // repeated traps blacklist it and future calls interpret it outright.
-    // Reason: `UnreachedCode` — the one-shot "give up immediately" policy
-    // (`recommend_action`), so the trapping method is made not-compilable on
-    // the FIRST resolution and the tiered manager stops re-queuing recompiles
-    // that would just trap again.
-    //
-    // EXCEPT for an IR SITE TRAP, which the comment this replaces called
-    // "over-blacklisted by this — acceptable". It is not acceptable, and
-    // `probes/UnresolvedTrapProbe.java` measures why: the trapped method deopts
-    // on EVERY call (200,000 of 200,000) and `MakeNotCompilable` is consulted
-    // by `compile_gate` itself, so the method loses its body on EVERY tier —
-    // including the single-pass backend, which lowers `invokedynamic` and
-    // unresolved typechecks perfectly well. Before site traps existed the IR
-    // tier simply refused such a method and C1 compiled it; blacklisting is a
-    // strict regression on that.
-    //
-    // A site trap means one thing only: the OPTIMIZING tier could not lower one
-    // call site. So ban the optimizing tier for this method — the memo
-    // `try_compile_inner` already consults — and pick a reason that RECOMPILES
-    // instead of blacklisting. The recompile then goes single-pass and does not
-    // trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until
-    // the per-method deopt count crosses `max_deopts_per_method`, which keeps a
-    // backstop if the assumption above is ever wrong.
-    // `first_site_trap` is the whole policy decision. Everything after it is a
-    // REPEAT of a decision already taken, and repeating it is not harmless:
-    // `SpeculationFailed` escalates on the per-method deopt COUNT, so a trapped
-    // site inside a long-running caller drives the method to
-    // `MakeNotCompilable` -- the exact outcome this arm exists to avoid --
-    // purely by being reached often.
-    //
-    // Why "often" is unavoidable here, and why this is the right place to stop
-    // it: eviction and the epoch bump both fire on the first deopt, and
-    // `invalidate_matching` even evicts the direct CALLER transitively. But the
-    // caller may be a single in-flight invocation running a loop -- measured on
-    // `probes/UnresolvedTrapProbe.java`, where one `main` frame calls the
-    // trapped callee 200,000 times through a `CALL` baked into code that is
-    // already executing. Re-binding happens (the tracer shows `main` recompiled
-    // and baking a second callee entry) but the RUNNING frame keeps the old
-    // address, and nothing short of deoptimizing the caller's frame can change
-    // that. `MakeNotEntrant` is an enum variant here with no entry-patching
-    // behind it, so there is no cheap displacement to reach for.
-    //
-    // What IS in reach is not compounding the damage: take the policy decision
-    // once, and let the remaining calls resume in the interpreter -- correct,
-    // and self-correcting the moment that caller frame returns and re-enters
-    // its recompiled self.
-    let h = cratonvm_jit::ir_method_memo_hash(key_class, key_method, key_desc);
-    let ir_site_trap = cratonvm_jit::ir::method_has_site_trap(h);
-    let mut decided = true;
-    if ir_site_trap {
-        cratonvm_jit::ir::note_site_trap_taken();
-        // A DEDICATED claim, not the IR refusal memo: that memo has a second
-        // writer (the acceptance gate marks a method refused whenever it
-        // discards an optimizing body), so reading it here would let a
-        // gate-refused method look "already decided" on its FIRST trap -- and
-        // the policy, including the eviction, would never be applied.
-        decided = cratonvm_jit::ir::claim_site_trap_decision(h);
-        cratonvm_jit::ir_evidence::note_method_refused(h);
-        if !decided {
-            cratonvm_jit::ir::note_site_trap_repeat();
-        }
-    }
-    if decided {
-        DeoptimizationController::deoptimize(
-            vm,
-            key_class,
-            key_method,
-            key_desc,
-            if ir_site_trap {
-                cratonvm_jit::deopt::DeoptReason::SpeculationFailed
-            } else {
-                cratonvm_jit::deopt::DeoptReason::UnreachedCode
-            },
-            bci,
-        );
-    }
+    // repeated traps stop re-entering the artifact. The policy — and the
+    // reason it is not a plain `deoptimize` call — lives in
+    // `despeculate_trapped_method`, which the tier-up sink in
+    // `interpreter.rs` asks too so the two cannot answer differently.
+    despeculate_trapped_method(
+        vm,
+        key_class,
+        key_method,
+        key_desc,
+        cratonvm_jit::deopt::DeoptReason::UnreachedCode,
+        bci,
+    );
 
     // Run the reconstructed frame to completion. The pins stay installed for
     // the duration (they root the reconstructed oops; the pushed frame roots
