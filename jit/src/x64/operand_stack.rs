@@ -135,8 +135,41 @@ impl Compiler {
         crate::note_spill_cursor(why.column(), slots as u64);
         let start = self.next_spill_offset;
         let end = self.checked_spill_range_end(start, slots)?;
+        self.dbg_note_spill_overlap(why, start, end);
         self.next_spill_offset = end;
         Some(start)
+    }
+
+    /// DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`): does this reservation
+    /// hand out a frame slot an ENCLOSING inline scope still owns?
+    ///
+    /// The live-slot clamp in `try_emit_inline_body` protects the caller's
+    /// OPERAND STACK from a rewound cursor. It says nothing about the LOCALS of
+    /// an inline scope that is still open, and those live in the same spill
+    /// area: when `processGroupResult` is spliced into `queryWindow`, its `long
+    /// offset` parameter IS a spill slot, and a splice deeper inside its body
+    /// that rewinds the cursor under it gets that slot handed to it a second
+    /// time. The enclosing scope then reads back whatever the new owner stored.
+    ///
+    /// The scope being CREATED is excluded: `try_emit_inline_body` pushes it
+    /// immediately after this reservation, so the top of the stack is only ever
+    /// this call's own range on the path that matters, and a range may of
+    /// course overlap itself.
+    fn dbg_note_spill_overlap(&self, why: SpillReason, start: i32, end: i32) {
+        if !crate::dbg_jit_slot_overlap() {
+            return;
+        }
+        for (depth, scope) in self.inline_oop_scopes.iter().enumerate() {
+            let s_start = scope.local_base;
+            let s_end = scope.local_base + (scope.num_locals as i32) * 8;
+            if start < s_end && s_start < end {
+                eprintln!(
+                    "[jit-slot-overlap] reservation {start}..{end} ({why:?}) overlaps OPEN inline                      scope #{depth} locals {s_start}..{s_end} (num_locals={}) in {}",
+                    scope.num_locals,
+                    self.method_label,
+                );
+            }
+        }
     }
 
     /// Ask-side: would this range fit? A QUESTION, with no answer that
@@ -775,6 +808,48 @@ impl Compiler {
         self.xmm_assignments.get(idx).copied().flatten()
     }
 
+    /// DIAGNOSTIC: remember that this compile LOADS `offset`, with the Rust
+    /// call site that emitted it, so `dbg_report_never_stored_slots` can name
+    /// the emitter of a read of uninitialised stack.
+    fn dbg_note_slot_load(&mut self, offset: i32) {
+        if !crate::dbg_jit_slot_overlap() {
+            return;
+        }
+        // Cheap on purpose: one push of two integers. An earlier version
+        // captured a Rust backtrace per distinct slot and that was enough to
+        // change which methods tiered up at all -- the defect this exists for
+        // did not reproduce under it.
+        let pos = self.buf.pos();
+        self.dbg_loaded_slots.push((offset, pos));
+    }
+
+    /// DIAGNOSTIC: every frame slot this compile READS and never WRITES.
+    pub(super) fn dbg_report_never_stored_slots(&self) {
+        if !crate::dbg_jit_slot_overlap() {
+            return;
+        }
+        let mut seen: Vec<i32> = Vec::new();
+        for (off, pos) in &self.dbg_loaded_slots {
+            if seen.contains(off) {
+                continue;
+            }
+            seen.push(*off);
+            match self.dbg_stored_slots.iter().find(|(o, _)| o == off) {
+                None => eprintln!(
+                    "[jit-never-stored] {} reads [rbp-{off:X}h] at buf+{pos:X} and NEVER stores it",
+                    self.method_label,
+                ),
+                // The store was EMITTED. If the finished code has no store at
+                // that address the buffer was rewound under it -- which is the
+                // question this pairing exists to answer.
+                Some((_, spos)) => eprintln!(
+                    "[jit-slot-store] {} [rbp-{off:X}h] stored at buf+{spos:X}, read at buf+{pos:X}",
+                    self.method_label,
+                ),
+            }
+        }
+    }
+
     /// MOV reg, [rbp - offset]
     ///
     /// Reload elision (see the `slot_mirror` field doc): when the immediately
@@ -793,6 +868,7 @@ impl Compiler {
                 }
             }
         }
+        self.dbg_note_slot_load(offset);
         self.rex_w_r(reg);
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
         self.modrm_rbp_disp(reg, offset);
@@ -834,6 +910,10 @@ impl Compiler {
 
     /// MOV [rbp - offset], reg
     pub(super) fn emit_store_local(&mut self, offset: i32, reg: u8) {
+        if crate::dbg_jit_slot_overlap() {
+            let pos = self.buf.pos();
+            self.dbg_stored_slots.push((offset, pos));
+        }
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.modrm_rbp_disp(reg, offset);
