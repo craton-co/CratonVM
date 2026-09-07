@@ -2,6 +2,31 @@
 
 ## Status
 
+**CAUSE FOUND 2026-09-07, and the trigger is switched off.** The deopts these
+methods cannot service are planted by the IR tier's SITE TRAPS
+(`CRATONVM_JIT_IR_SITE_TRAP`), which shipped **default ON**. A site trap is a
+deliberate deopt; when `can_deopt_resume=false` the resume path refuses, and
+this is the error.
+
+Thirty hibernate-reactive classes, one binary, one lever, back to back:
+
+```text
+  site traps ON  (the shipped default)   ok=182  failed=7  refusing-replay=36
+  site traps OFF                         ok=241  failed=0  refusing-replay=0
+```
+
+The callees named in those 36 errors are the ones tabulated below --
+`ReactiveEntityInitializerImpl.reactiveInitializeEntityInstance` and
+`UniSubscriber.onItem`. `CRATONVM_JIT_IR_SITE_TRAP` is now default OFF
+(`jit/src/ir.rs`, `ir_site_trap_enabled`), which removes the trigger.
+
+The UNDERLYING gap is still open and is what this page should be read for:
+`can_deopt_resume=false` for these methods, so ANY future deopt sited in them
+fails the same way. Turning off the one feature that was planting such deopts
+is a trigger fix, not a repair of the deopt machinery.
+
+Original text follows.
+
 **OPEN, new finding.** Confirmed reproducible and GC-independent: identical
 signature on all three collectors (Generational, G1, ZGC), same host, same
 binary, same run. Root mechanism identified from source (`can_deopt_resume`
