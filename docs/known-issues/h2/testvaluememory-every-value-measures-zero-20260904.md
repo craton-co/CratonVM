@@ -234,14 +234,89 @@ is how HotSpot's `list`/`map`/`array` rows come back at `peak` BELOW `before`:
 it elides workloads whose result is never read, so those three HotSpot cells are
 not a statement about HotSpot's collector).
 
-## Next step
+## Localised 2026-09-06: it is `System.gc()` that leaks, not the collector
 
-The generational arm first — it is the real leak, and its reproducer is now four
-lines. Two questions in order: does a young collection ever consider these
-objects at all (they die before any promotion, so they should never leave the
-nursery), and does `System.gc()` on this collector run a whole-heap mark or only
-the young path. `[GC]` logging is gated behind `--verbose:gc` (see
-`gc/src/zgc.rs`'s logging block) and is the first place to look.
+**The generational collector reclaims this garbage perfectly. It only fails
+when the collection is requested by `System.gc()`.**
+
+`NoGcChurn` is `ChurnLoop` with the `System.gc()` call removed, so collections
+happen only under allocation pressure. Round 33, `-Xmx256m`:
+
+```
+round=32 usedKb=34017
+round=33 usedKb=1632      <- a natural young collection, reclaiming everything
+round=34 usedKb=4192
+```
+
+Against the three ways of triggering it:
+
+| trigger | path taken | reclaims? |
+|---|---|---|
+| allocation pressure (natural young GC) | moving (Cheney) | **yes** — 34017 -> 1632 |
+| `System.gc()` | non-moving sweep | **no** — +2.9 MB every round |
+| `System.gc()` + `CRATONVM_DBG_FORCE_MOVING=1` | moving | **yes** — flat at 1284 |
+
+### The disjunct responsible
+
+`gen_heap.rs`'s `collect_garbage_inner`:
+
+```rust
+let divert_non_moving = (has_conservative_roots && !moving_young)
+    || unrewritable_conservative_jit_roots
+    || honor_promotion_oom_risk
+    || divert_for_incomplete_moving_coverage
+    || explicit_full_gc                       // <- major_gc_requested()
+    || gpu_relocation_forbidden;
+```
+
+`explicit_full_gc` is `gc_quiescence::major_gc_requested()`, so **every**
+`System.gc()` diverts to the non-moving sweep. On that path
+`CRATONVM_DBG_HEAP_TRACE=1` shows the sweep doing nothing at all:
+
+```
+[HEAP-TRACE] cycle=0 young_used=3513392  young_free_list=0 bytes_freed=0 objects_copied=0
+[HEAP-TRACE] cycle=5 young_used=17931872 young_free_list=0 bytes_freed=0 objects_copied=0
+```
+
+and `CRATONVM_DBG=sweep-census` prints nothing, meaning `dead_regions` is
+EMPTY — the walk classified all 125,000 dead objects as live.
+
+### This divert cannot simply be deleted
+
+Its comment states the reason: *"System.gc() requests an old-gen-inclusive
+cycle. Route that cycle through the non-moving marker so it can follow
+collection-overlay edges from live owners instead of globally rooting every
+overlay."* Removing `explicit_full_gc` from the disjunction would take the
+moving path and lose that, which is a correctness regression in exchange for a
+retention one. The fix belongs in the non-moving sweep, or in a narrower
+condition — not in dropping the term.
+
+### Ruled out, each by measurement
+
+* **The parallel sweep.** `CRATONVM_DBG=sweep-zero` disables it; the numbers are
+  byte-identical to baseline (3431/6247/9063/11879/14695 both ways).
+* **JIT frames.** `--nojit` still leaks — so this is not the
+  "conservative JIT roots force a non-moving sweep" case, even though that is
+  what the non-moving path was built for.
+* **Compact TLAB allocation.** `CRATONVM_GC=-compact-tlab-alloc` still leaks.
+
+### What is still unknown
+
+Why the non-moving walk finds nothing dead on this path. `gen_heap.rs` carries a
+purpose-built `MARKWHY` census for exactly this symptom — its comment says
+`dead_regions` empty has "exactly two ways that happens — the walk classified
+everything LIVE, or it collected spans and UNWOUND them", and its counters
+separate the two. It is gated on `young_mark_watch()` being a non-zero WATCH
+ADDRESS, so it needs a victim address from a prior run to arm. That is the next
+move, and it should answer the question in one run.
+
+A caution that census's own code carries, and that applies to the table above:
+one of its counters is written only in a later loop, so reading it early "prints
+a structural zero on every run" and that zero "was read as *this sweep reclaimed
+NOTHING* — a whole-VM reclamation failure inferred from a counter not yet
+written". The claim here does not rest on a counter: `young_used` is the arena's
+own used figure, it climbs monotonically, and the process degrades into GC
+thrash. But anyone extending this table should keep that trap in view.
 
 The default collector's metric is a separate, smaller fix: make
 `freeMemory()` answer from the live set after a collection rather than from the
