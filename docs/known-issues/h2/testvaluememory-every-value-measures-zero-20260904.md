@@ -366,6 +366,91 @@ That also explains the H2 test exactly: `TestValueMemory` Type 0 is
 `ValueNull.INSTANCE`, and its 125,000 entries are references, so the arena fills
 with small short-lived objects the sweep then refuses to parse.
 
+### 2026-09-07: one half fixed and MEASURED, the leak still open
+
+**Candidate (1) below is refuted.** `new Object()` DOES write a header; it is
+simply all zero. The predicate's own note says so — `MARK_NEUTRAL`,
+`ObjectKind::Object` and `ArrayElementType::Reference` all encode as `0`, "so a
+freshly built empty object is wholly zero". There is nothing missing at the
+allocator. Do not go looking for an elided header store.
+
+What was wrong is one condition inside the empty-object-run recovery that
+already exists for this shape (added 2026-08-12). It accepted 144 runs and
+refused 13, and every refusal was the same one:
+
+```
+young_sweep_zero_refusals: misaligned=0 live_inside=17 implausible_next=0
+```
+
+A refusal unwinds every reclaim decision since the last anchor, so one live
+object interleaved in the churn cost the whole cycle. `zero_run_verdict` now
+resumes AT that live base instead — it comes from `side_sorted`, so it is a
+marked object base by construction, more firmly on-grid than the `resume:
+run_end` the function already returned.
+
+Measured, same binary and probe:
+
+| | before | after |
+|---|---|---|
+| `zero_spans` (unwind-forcing) | 13 | **0** |
+| `live_inside` refusals | 17 | **0** (`live_resumes=10`) |
+| `bytes_freed` per cycle | **0** | 197 784 -> 883 624 -> 883 696 |
+| `young_free_list` | 0 | 197 784 -> 1 081 296 -> 1 178 448 |
+| growth per round | +2.88 MB | +2.05 MB |
+
+**Reclamation went from nothing to ~880 KB a cycle, and the leak is still
+open.** That is the honest reading: the unwind was real and is gone, but it was
+not the whole cause.
+
+### THE CHANGE WAS REVERTED. A guard test says it is unsafe, and the test is right
+
+The numbers above were real, and the change is still **not on dev**. There is a
+test written specifically to forbid it:
+
+```rust
+/// A marked object starting INSIDE the run means the run is not a sequence
+/// of whole dead objects — the walk is somewhere it should not be.
+#[test]
+fn a_live_base_inside_the_run_is_still_a_desync() { ... }
+```
+
+It failed, and its rationale is the thing this investigation had not accounted
+for. **The unwind is not about the zero run itself. It is about the STRIDES
+SINCE THE LAST ANCHOR.** A zero run is evidence that one of those strides was
+mis-sized; if it was, every reclaim decision taken in that stretch was computed
+off-grid and may name live memory. Discarding them is what makes a mis-sized
+stride cost retention instead of corruption.
+
+Resuming at the live base preserves those decisions. That is precisely what the
+unwind exists to prevent, and no measurement in this page establishes that the
+strides were sound — only that the *run* is explicable. Trading "always safe" for
+"safe on the evidence I happened to collect" is the one change in this area that
+can corrupt a heap rather than grow one, and it does not even close the leak
+(2.88 -> 2.05 MB a round). It was reverted for both reasons; the diagnosis below
+is what survives.
+
+### What a SAFE version would have to establish
+
+The open question is whether a live base inside the run is evidence of a desync
+or an ordinary live EMPTY object — because a field-less live object is itself
+wholly zero, so both readings fit the bytes. A discriminator the current code
+does not use:
+
+* **is the live base on the grid `cursor` implies?** `(live - (base + cursor)) %
+  HEADER_SIZE == 0` says the run is a whole number of slots followed by that
+  object, which is consistent with the empty-object reading and inconsistent
+  with a mis-sized stride. Off-grid, the desync verdict is simply correct.
+
+That alignment test would let the empty-object case through while leaving the
+guard's actual subject — the suspect strides — refused. It is a hypothesis, not
+a result: nothing here has measured how often the two cases occur, and the guard
+test above is the thing any attempt must satisfy rather than edit.
+
+Reclaiming the runs rather than stepping over them is a separate and larger
+step, with its own hazard: a live object may START exactly at `cursor` and
+extend into the run (the inside-check is strictly greater than `cursor`), and
+freeing from `cursor` would free it.
+
 ### The two candidate fixes, and which is which
 
 1. **At the allocator.** If a bare `new Object()` can reach the heap with no
