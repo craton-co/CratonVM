@@ -294,6 +294,11 @@ Select.queryWindow(ILorg/h2/result/LocalResult;JZ)V          clean
   (all `Push` reservations onto a `num_locals=1` scope, mostly under
   `net/bytebuddy/...`), so that hazard is real and deserves its own page — but
   none of the reports is `Select.processGroupResult`.
+  > **Superseded, 2026-09-07 — see *Residuals* §2 at the top of this page.**
+  > The count is right and the reading of it was not available yet: the detector
+  > could not say WHICH open scope it had hit, which is the whole difference
+  > between a coincidence and a miscompile. Split, it is 151 ENCLOSING (the
+  > hazard) / 157 INNERMOST (harmless), not one benign thing.
 * `Compiler::dbg_report_never_stored_slots` — the in-VM twin of the offline
   scanner.
 
@@ -563,6 +568,10 @@ installing compiled code for one of the H2 methods it observed compiling in this
 another compiled frame concurrently reading/mutating the same per-query state.
 
 ## What isn't done here
+
+*(This is the FIRST pass's closing, kept as written. The second and third
+passes above found the instruction and the emitter; the fix and its A/B are in
+*Status* at the top.)*
 
 This doc stops at "JIT-compilation-and-warm-up-dependent, not the 20260727 bug,
 mechanism narrowed to the `SelectGroups`/window-buffering call set above" rather than
