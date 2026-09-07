@@ -93,6 +93,39 @@ use crate::ir::{CmpOp, Graph, MemKind, NodeId, Op};
 use crate::ir_schedule::Schedule;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// Why the range pass declined a bounds check. Ordered from "nothing to work
+/// with" towards "one conjunct short", so the census reads as a work list: the
+/// codes near the bottom are the ones a modest extension could recover.
+pub const REFUSAL_NONE: u8 = 0;
+/// The index is never compared against ANY array length in this graph. No
+/// range pass can help; the access is not in a length-guarded region.
+pub const REFUSAL_NO_LENGTH_TEST: u8 = 1;
+/// The index IS length-tested, but only against a different array. Recovering
+/// these needs an aliasing or equal-length fact, which this tier does not have.
+pub const REFUSAL_OTHER_ARRAY: u8 = 2;
+/// Right index, right array, but the guard does not dominate the access --
+/// the test is on a path that does not reach here.
+pub const REFUSAL_NOT_DOMINATING: u8 = 3;
+/// Everything holds except `idx >= 0`, and the index is a PHI: a real loop
+/// whose induction shape the unit-stride or back-edge rule rejected. This is
+/// the bucket that relaxing those rules would recover.
+pub const REFUSAL_IV_SHAPE: u8 = 4;
+/// Everything holds except `idx >= 0`, and the index is not a phi at all --
+/// a computed index needing a value-range fact this pass does not compute.
+pub const REFUSAL_NOT_NON_NEGATIVE: u8 = 5;
+
+/// Human name for a `REFUSAL_*` code.
+pub fn refusal_name(code: u8) -> &'static str {
+    match code {
+        REFUSAL_NO_LENGTH_TEST => "no-length-test",
+        REFUSAL_OTHER_ARRAY => "other-array",
+        REFUSAL_NOT_DOMINATING => "guard-not-dominating",
+        REFUSAL_IV_SHAPE => "iv-shape-rejected",
+        REFUSAL_NOT_NON_NEGATIVE => "index-not-non-negative",
+        _ => "none",
+    }
+}
+
 /// Per-node verdicts, indexed by `NodeId`.
 #[derive(Default)]
 pub struct CheckElision {
@@ -101,6 +134,16 @@ pub struct CheckElision {
     /// `true` for a node whose `(base, index)` bounds check is provably
     /// redundant.
     bounds_check_unneeded: Vec<bool>,
+    /// Why the range pass could NOT prove this node, as a `REFUSAL_*` code.
+    /// Recorded per node and counted at EMISSION for the same reason
+    /// `bounds_by_range` is: `analyze` also runs for compiles the acceptance
+    /// gate later discards.
+    ///
+    /// It exists because "extend the range pass" is not one decision but four,
+    /// and the four have very different costs. Guessing which conjunct blocks
+    /// the remaining checks is exactly the "measure the component before
+    /// building the optimisation" mistake.
+    bounds_refusal: Vec<u8>,
     /// `true` for a node the RANGE pass proved, as opposed to the
     /// dominating-redundancy pass. Per-node rather than a running total
     /// because the process census is taken at EMISSION: `analyze` also runs
@@ -126,6 +169,16 @@ impl CheckElision {
             .get(node as usize)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Why the range pass declined `node`, as a `REFUSAL_*` code. Only
+    /// meaningful when [`Self::bounds_elided`] is false.
+    #[inline]
+    pub fn bounds_refusal(&self, node: NodeId) -> u8 {
+        self.bounds_refusal
+            .get(node as usize)
+            .copied()
+            .unwrap_or(REFUSAL_NONE)
     }
 
     /// Was the bounds check at `node` proven by the RANGE pass rather than by
@@ -199,6 +252,7 @@ pub fn analyze(graph: &Graph, schedule: &Schedule) -> CheckElision {
         null_check_unneeded: vec![false; n],
         bounds_check_unneeded: vec![false; n],
         bounds_by_range: vec![false; n],
+        bounds_refusal: vec![REFUSAL_NONE; n],
     };
     if !enabled() {
         return out;
@@ -295,15 +349,49 @@ pub fn analyze(graph: &Graph, schedule: &Schedule) -> CheckElision {
                     // dominating `idx < base.length` for the SAME array, plus
                     // `idx >= 0`. Both halves, always -- see the range notes.
                     let (base, idx) = pair;
-                    let proved = ranges.iter().any(|ub| {
-                        ub.idx == idx
-                            && ub.base == base
-                            && dominates_reflexive(schedule, b, ub.true_block)
-                            && proven_non_negative(graph, schedule, idx, ub.true_block)
-                    });
+                    // Staged rather than one `any()`, so the FIRST failing
+                    // conjunct is recorded. The stages run from "nothing to
+                    // work with" to "one step short", which makes the census
+                    // read as a work list rather than a total.
+                    let mut reason = REFUSAL_NO_LENGTH_TEST;
+                    let mut proved = false;
+                    for ub in ranges.iter().filter(|u| u.idx == idx) {
+                        if reason == REFUSAL_NO_LENGTH_TEST {
+                            reason = REFUSAL_OTHER_ARRAY;
+                        }
+                        if ub.base != base {
+                            continue;
+                        }
+                        if reason == REFUSAL_OTHER_ARRAY {
+                            reason = REFUSAL_NOT_DOMINATING;
+                        }
+                        if !dominates_reflexive(schedule, b, ub.true_block) {
+                            continue;
+                        }
+                        if !proven_non_negative(graph, schedule, idx, ub.true_block) {
+                            // Split by whether the index is a phi: a rejected
+                            // INDUCTION VARIABLE means the stride or back-edge
+                            // rule refused a real loop, which relaxing them
+                            // could recover. Anything else is a different
+                            // problem entirely.
+                            reason = if matches!(
+                                graph.nodes.get(idx as usize).map(|n| &n.op),
+                                Some(Op::Phi)
+                            ) {
+                                REFUSAL_IV_SHAPE
+                            } else {
+                                REFUSAL_NOT_NON_NEGATIVE
+                            };
+                            continue;
+                        }
+                        proved = true;
+                        break;
+                    }
                     if proved {
                         out.bounds_check_unneeded[id as usize] = true;
                         out.bounds_by_range[id as usize] = true;
+                    } else {
+                        out.bounds_refusal[id as usize] = reason;
                     }
                 }
                 local_checked.insert(pair);
@@ -659,6 +747,40 @@ static EMITTED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Record one guard-pair decision. `which` is 0 for the null check, 1 for the
 /// bounds check.
+/// Range-pass refusals by reason, counted at emission. Index is the
+/// `REFUSAL_*` code.
+static REFUSALS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Count one range-pass refusal, by reason. Called from the emitter so a
+/// discarded compile contributes nothing.
+pub fn note_range_refusal(code: u8) {
+    if let Some(c) = REFUSALS.get(code as usize) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(reason, count)` for every non-zero refusal reason, worst first.
+pub fn refusal_census() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = (1u8..6)
+        .map(|c| {
+            (
+                refusal_name(c),
+                REFUSALS[c as usize].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
+}
+
 /// Bounds checks the RANGE pass proved, counted at emission.
 static RANGE_PROVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
