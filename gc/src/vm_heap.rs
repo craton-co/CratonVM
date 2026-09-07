@@ -3742,10 +3742,14 @@ impl VmHeap {
             let z = &crate::gen_heap::ZERO_RUN_REFUSALS;
             eprintln!(
                 "[GC] young_sweep_zero_refusals: misaligned={} live_inside={} \
-                 implausible_next={}",
+                 implausible_next={} live_resumes={}",
                 z[0].load(O::Relaxed),
                 z[1].load(O::Relaxed),
                 z[2].load(O::Relaxed),
+                // Not a refusal: runs stepped over by resuming AT a live base
+                // inside them. `live_inside` above is now always 0 — a nonzero
+                // reading there means that unwind path has come back.
+                crate::gen_heap::ZERO_RUN_LIVE_RESUMES.load(O::Relaxed),
             );
             // Did the five walks that still carry the old rule even RUN? A
             // zero anomaly count above means nothing without this. Legend on
