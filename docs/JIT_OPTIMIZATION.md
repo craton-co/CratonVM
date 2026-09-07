@@ -3486,3 +3486,89 @@ share, and expected: H2's hot code is collections and MVStore rather than raw
 array loops, which is the same reason the seven-item pass measured flat there.
 
 Regression suite 91/91 on ZGC.
+
+### The remaining 57 refusals are recoverable for free, and recovering them costs 3%
+
+`CRATONVM_JIT_IR_OVER_INTRINSIC=1` already exists and already works. With it on,
+the planner stops refusing a method for containing an intrinsic call site it has
+no node for, and falls back to an ordinary `Op::Call` there:
+
+| H2 | default | `OVER_INTRINSIC=1` |
+|---|---:|---:|
+| `refused_method` | 57 | **0** |
+| bodies accepted | 569 | 614 |
+| bodies lowered | 113 | 123 |
+| fell through to single-pass | 19 | 12 |
+| `lowered_as_arithmetic` | 20 | 29 |
+| `DOD RESULT` | OK | OK |
+| regression suite | 91/91 | **91/91** |
+
+So the whole remaining work list clears, with no correctness cost. That is the
+easy half, and it is the wrong half.
+
+The refusal carries an argument rather than a measurement:
+
+> Every family that reaches here has an emitted intrinsic that replaces a LOOP
+> … or a memory form this tier has no node for … For those the intrinsic really
+> is worth more than the rest of the method's optimization, so the method-level
+> refusal stays.
+
+Earlier in this file an argument of exactly that shape — the acceptance gate's
+evidence list — was measured and turned out to be wrong by 3.4%. This one was
+measured too, and **it is right.**
+
+Three interleaved runs, order reversed on alternate rounds, the default
+configuration run TWICE as its own noise floor, paired counts:
+
+| run | host load | control (cpu / wall) | `over` beats `default` (cpu / wall) |
+|---|---|---|---|
+| 1 | 18% | 11/21, 12/21 — coin, means within 0.6% | **8/21, 8/21** |
+| 2 | high | 17/21, 16/21 — **means 6% apart** | *discarded* |
+| 3 | 31% | 9/21, 7/21 — means within 1.4% | **3/21, 2/21** |
+
+Run 2 is discarded rather than reported: the control disagreed with ITSELF by
+6% on the means, larger than the effect under test, and the absolute times
+jumped from ~2.1 s to ~2.8 s mid-run. Its treatment comparison happened to read
+as a coin, which is exactly why the rule is to discard on the control and not
+on whether the answer is convenient.
+
+Over the two valid runs `over` wins **11 of 42 on CPU and 10 of 42 on wall** —
+about 3% slower on the means, consistent in both instruments and both runs.
+
+**So the intrinsic at those sites really is worth more than optimizing the
+method around it.** Trading an inline unboxing load or an `Atomic*` accessor for
+a generic `jit_invoke_dispatch` costs more than the surrounding body gains, and
+the ~57-method refusal is paying for itself.
+
+The flag stays OFF, and its default is now measured instead of argued.
+
+#### What this makes the work list mean
+
+`refused_method` is a list of families to LOWER, not a list of refusals to lift.
+The bit-scan families above are the pattern that works: recognised in
+`try_ir_scalar_intrinsic`, lowered as real IR nodes, no call at all — both the
+intrinsic's speed and the method's optimization. Calling them instead gets the
+reach and loses the point.
+
+Ranked by how much of the current H2 refusal each family holds:
+
+| family | methods held | shape |
+|---|---:|---|
+| `System.arraycopy` | 10 | memory; a real loop-replacing intrinsic |
+| `Long.longValue` | 8 | a field load behind two header layouts |
+| `AtomicLong.get` | 7 | a volatile load (plain `MOV` on x86-64 TSO) |
+| `String.valueOf(Object)` | 5 | allocation + dispatch |
+| `String.trim` | 4 | string internals |
+| `String.isNotContinuation`, `String.<init>([BB)V` | 4 | string internals |
+| `String.isLatin1` | 3 | string internals |
+| `Integer.intValue` | 3 | as `longValue` |
+| `AtomicInteger` inc/dec, `AtomicLong.getAndAdd` | 3 | `LOCK XADD` |
+| `Math.abs(F)` / `Math.abs(D)` | 2 | `ANDPS`/`ANDPD` with a sign mask |
+| `Long.bitCount` | 1 | needs POPCNT, deliberately excluded |
+| 7 more, one method each | 7 | `String` ctor/`indexOf`/`join`/`valueOf(J)`/`startsWith`, `Arrays.equals`, `AtomicLong.<init>` |
+
+The two `Math.abs` FP forms are the cheapest real entry (a sign-mask AND, no
+memory, no guard); the unboxing and `Atomic*` accessors are the largest single
+block but need a header-shape decision — `box_unbox_intrinsic_shape` resolves a
+`value_compact_offset` AND a `value_legacy_offset`, so an IR node for them has
+to pick between two layouts or guard on one.
