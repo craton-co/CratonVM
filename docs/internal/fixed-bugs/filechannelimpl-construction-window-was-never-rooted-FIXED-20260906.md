@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | FIXED 2026-09-06 — the producer is `native_fcimpl_open`, not the collector. |
 | **Scope** | `native-io`'s `sun/nio/ch/FileChannelImpl` construction bridge. Worst under `--XX:UseGc Generational` (the non-moving young sweep ZEROES an unrooted object) but the same window is a stale-local hazard under every moving collector. |
-| **Was** | the "The defect" and "The lead" halves of `known-issues/springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md` |
+| **Was** | the "The defect" and "The lead" halves of `known-issues/springboot/generational-young-sweep-frees-an-interpreter-held-object-20260906.md` |
 | **Still open** | that page's REMAINING half — the Kafka test also fails for a reason none of these arms touched. See "What this does not fix". |
 
 ## What it was

@@ -1168,10 +1168,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-29 tokens.
+30 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `props-unrooted-receivers` | `CRATONVM_PROPS_UNROOTED_RECEIVERS` |
 | `bytebuffer-intrinsic` | `CRATONVM_BYTEBUFFER_INTRINSIC` |
 | `itr-bytecode` | `CRATONVM_ITR_BYTECODE` |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
