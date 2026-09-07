@@ -122,6 +122,27 @@ pub struct SlotOrigin {
     pub cur: usize,
 }
 
+/// One raw word in a BLOCKED peer's native stack that a cross-thread
+/// conservative scan resolved to a heap object.
+///
+/// `SlotOrigin` cannot express this: it is keyed by `(frame, idx)` into the
+/// INTERPRETER frames, and these words live in the peer's machine stack, below
+/// or between its compiled frames, named by no oop map. They are the population
+/// §12 of
+/// `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+/// measured as stale on essentially every relocating cycle.
+#[derive(Clone, Copy)]
+pub struct NativeSlotFixup {
+    /// Absolute address of the word inside the peer's own stack.
+    pub addr: usize,
+    /// Value the word held when the scan captured it. The wake write-back
+    /// refuses to store unless the word STILL reads this, which is what keeps
+    /// it off a C local the native call has since reused.
+    pub orig: usize,
+    /// The object's current address, advanced by each collection's fold.
+    pub cur: usize,
+}
+
 pub struct GcBlockState {
     /// True from `deposit_root_snapshot` (just before the thread blocks)
     /// until the end of `check_post_block_gc` (after the fixup is applied).
@@ -145,6 +166,11 @@ pub struct GcBlockState {
     /// write-back stores `cur` straight into the slot. Filled only by the
     /// flag-raising deposit; taken (and cleared) on wake.
     pub slot_origins: PLMutex<Vec<SlotOrigin>>,
+    /// Raw native-stack words this thread's blocked window had scanned out of
+    /// it by a cross-thread conservative scan. Appended by the fold, advanced
+    /// by every later fold, applied and cleared on wake. See
+    /// [`NativeSlotFixup`].
+    pub native_slots: PLMutex<Vec<NativeSlotFixup>>,
 }
 
 impl GcBlockState {
@@ -154,6 +180,7 @@ impl GcBlockState {
             java_state: AtomicU8::new(0),
             fixup: PLMutex::new(cratonvm_types::PointerMap::default()),
             slot_origins: PLMutex::new(Vec::new()),
+            native_slots: PLMutex::new(Vec::new()),
         }
     }
 }

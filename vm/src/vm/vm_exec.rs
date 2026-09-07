@@ -4434,6 +4434,71 @@ fn blocked_wake_jit_remap_enabled() -> bool {
     })
 }
 
+/// Write back the native-stack words a peer collection scanned out of this
+/// thread while it was blocked. Returns how many were stored.
+///
+/// Called from BOTH wake paths. `check_post_block_gc_refs` is the ordinary one;
+/// `apply_pending_blocked_fixups` is the leaked-blocked-region fallback. The
+/// first cut of this repair lived only in the fallback, and the engagement
+/// census said so plainly -- `captured=49916 written=0 skipped=0`.
+pub(crate) fn apply_native_slot_fixups(thread: &mut JvmThread) -> usize {
+    let slots = {
+        let mut n = thread.gc_block_state.native_slots.lock();
+        std::mem::take(&mut *n)
+    };
+    if slots.is_empty() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // THE BLOCKED-PEER NATIVE-STACK WRITE-BACK (2026-09-07).
+    //
+    // These are raw words in THIS thread's own machine stack that a peer
+    // collection scanned conservatively while we were blocked: the objects were
+    // kept alive and RELOCATED, and nothing rewrote the words, because a
+    // blocked thread skips the safepoint-resume `apply_pointer_map_to_thread`
+    // and the pin that was supposed to protect it is a no-op on a Cheney copy
+    // (`VmHeap::Generational::honours_conservative_pins()` is false).
+    //
+    // Running here is what makes the write safe from concurrency: this is the
+    // owning thread, after `leave_blocked_region_flagged` and before it can
+    // re-enter Java or compiled code.
+    //
+    // THE GUARD IS LOAD-BEARING. The scanned band spans the peer's actively
+    // running NATIVE frames, whose C locals churn while it is blocked, so a
+    // word may have been reused since the capture. Only a word that still reads
+    // `orig` is stored into; anything else is left alone. What remains is the
+    // residual every conservative scan carries -- a C value bit-identical to a
+    // young object base that moved -- and it is the same residual
+    // `remap_one_frame_register_images` accepted when it chose to WRITE the
+    // callee-saved GPR image, on the same grounds: `is_object_address` vetted
+    // the word against the arena bounds and the object-start bitmap.
+    for ns in &slots {
+        if ns.cur == ns.orig || ns.addr == 0 || ns.addr & 0x7 != 0 {
+            continue;
+        }
+        // SAFETY: `ns.addr` is a word inside this thread's own stack, recorded
+        // by the cross-thread scan while this thread was blocked, and this code
+        // runs ON that thread. The read-compare-write is not racing anything:
+        // no other thread writes this stack, and we have not resumed Java yet.
+        unsafe {
+            let p = ns.addr as *mut usize;
+            if p.read() == ns.orig {
+                p.write(ns.cur);
+                cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_WRITTEN
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                n += 1;
+            } else {
+                // The native call reused this word since the capture. Leaving
+                // it alone is the whole safety argument -- see the block
+                // comment above.
+                cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_SKIPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
     use crate::memory::gc::update_value_ref;
     let fixup = {
@@ -4444,10 +4509,10 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         let mut o = thread.gc_block_state.slot_origins.lock();
         std::mem::take(&mut *o)
     };
-    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) {
+    let mut applied = apply_native_slot_fixups(thread);
+    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) && applied == 0 {
         return 0;
     }
-    let mut applied = 0usize;
     if !fixup.is_empty() {
         applied += fixup.len();
         // THE JIT HALF, and it was missing entirely.
@@ -7190,6 +7255,9 @@ impl<'a> NativeContextImpl<'a> {
             let mut f = self.thread.gc_block_state.fixup.lock();
             std::mem::take(&mut *f)
         };
+        // The native-stack half of the same wake, and the path that actually
+        // runs: see `apply_native_slot_fixups`.
+        let _native_applied = apply_native_slot_fixups(self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,

@@ -1868,6 +1868,60 @@ pub static PEER_REG_CAPTURE: parking_lot::Mutex<Vec<(u32, u8, usize)>> =
 pub static PEER_REG_STALE: AtomicU64 = AtomicU64::new(0);
 
 /// Record one frozen peer's register word. No-op unless the pairing is armed.
+/// Default-ON. `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP=1` restores the
+/// pre-2026-09-07 behaviour, where a blocked peer resumed with its
+/// conservatively-scanned stack words still at their pre-move addresses.
+pub fn blocked_peer_stack_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP").is_none()
+    })
+}
+
+/// `(os_tid, addr, value)` for every native-stack word this cycle's
+/// cross-thread scan resolved to a heap object. Drained by
+/// `ThreadRegistry::fold_pointer_map_into_blocked_audited`, which moves each
+/// entry onto its owning blocked thread.
+static PEER_STACK_SLOTS: parking_lot::Mutex<Vec<(u32, usize, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Engagement census for the blocked-peer native-stack remap. `CAPTURED` is the
+/// denominator; `WRITTEN` is the repair actually storing a new address; and
+/// `SKIPPED` is the wake guard declining because the word no longer reads its
+/// captured value (the native call reused it). A run with `written=0` did not
+/// exercise the repair at all, and no conclusion may be drawn from its result.
+pub static PEER_STACK_SLOTS_CAPTURED: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_ADOPTED: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one scanned native-stack word and the address it lives at.
+pub fn record_peer_stack_slot(os_tid: u32, addr: usize, value: usize) {
+    if !blocked_peer_stack_remap_enabled() {
+        return;
+    }
+    let mut g = PEER_STACK_SLOTS.lock();
+    // Bounded. A runaway capture would cost the pause it is trying to make
+    // correct; the observed population is 19-91 words per cycle.
+    if g.len() < 65536 {
+        g.push((os_tid, addr, value));
+        PEER_STACK_SLOTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Drain the cycle's captures. Called once per collection by the fold.
+pub fn take_peer_stack_slots() -> Vec<(u32, usize, usize)> {
+    let mut g = PEER_STACK_SLOTS.lock();
+    std::mem::take(&mut *g)
+}
+
+/// Discard the cycle's captures without applying them -- for the paths that
+/// scan but then do not relocate, so nothing carries into the next cycle.
+pub fn clear_peer_stack_slots() {
+    let mut g = PEER_STACK_SLOTS.lock();
+    g.clear();
+}
+
 pub fn record_peer_reg(os_tid: u32, reg: u8, value: usize) {
     if !peer_reg_pairing_enabled() {
         return;
