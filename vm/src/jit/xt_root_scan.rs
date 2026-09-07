@@ -871,13 +871,32 @@ mod imp {
                     });
                     // Pairing capture, helper-window stack side. Same gate and
                     // same 0xff marker as the take-over path.
-                    if cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled() {
+                    {
+                        // The band is a COPY of `[rsp, committed_region_end)`,
+                        // so the peer's real address for word `i` is
+                        // `rsp + i*8` -- which is what the blocked-wake fixup
+                        // has to store into. `snapshot_peer` copies from `rsp`,
+                        // so the base is the context's Rsp.
+                        // SAFETY: `ctx` is a fully-initialized CONTEXT copy.
+                        let peer_rsp = unsafe {
+                            (ctx.as_ptr().add(OFF_RSP) as *const u64).read_unaligned()
+                        } as usize;
+                        let pairing = cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled();
                         for i in 0..band_len / 8 {
                             let w = unsafe {
                                 (band.as_ptr().add(i * 8) as *const usize).read_unaligned()
                             };
                             if is_obj(w).is_some() {
-                                cratonvm_gc::gc_quiescence::record_peer_reg(tid, 0xff, w);
+                                if pairing {
+                                    cratonvm_gc::gc_quiescence::record_peer_reg(tid, 0xff, w);
+                                }
+                                if peer_rsp != 0 {
+                                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(
+                                        tid,
+                                        peer_rsp + i * 8,
+                                        w,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1446,6 +1465,10 @@ mod imp {
             let w = unsafe { (p as *const usize).read_unaligned() };
             if let Some(o) = is_obj(w) {
                 cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
+                // THE REPAIR: this word lives at `p` in the peer's own stack
+                // and nothing else will ever rewrite it. Hand the address to
+                // the blocked-wake fixup.
+                cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid, p, w);
                 roots.push(o);
                 found += 1;
             }
@@ -1512,6 +1535,7 @@ mod imp {
             }
             if let Some(o) = is_obj(w) {
                 cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
+                cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid_hw, p, w);
                 candidates.push(o);
             }
             p += 8;
