@@ -1182,18 +1182,32 @@ summary is that it closes a demonstrated stale-reference channel whose last
 observed *symptom* had already been closed by other means.
 ## 14. An ALTERNATIVE repair, SUPERSEDED by §13 — kept for what it measured
 
-> **§13 is the fix; this is not.** It landed while this was being written and is
-> the better design: it writes the scanned words back **when the blocked peer
-> wakes**, through the `GcBlockState::fixup` chain the blocked-region protocol
-> already maintains, so it holds nobody and ships ON. What follows held peers
-> suspended across the copy instead — a bigger hammer with a deadlock surface
-> §13 does not have. Both switches here stay OPT-IN and OFF, and nothing should
-> be defaulted to them.
+> **§13 is the fix; this was not, and its code has since been REMOVED.**
+> `CRATONVM_GC_HOLD_HELPER_PEERS` and `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS`,
+> the held-peer list, the repair and its per-platform stubs are all gone from
+> the tree. The numbers below were real when taken; the switches that produced
+> them no longer exist.
 >
-> It is kept because three things it measured stand on their own: WHICH peers
-> own the stale words (§14.1), that holding blocked peers across a copy did not
-> deadlock in 28 runs (§14.3), and what a conservative rewrite actually costs
-> (§14.5).
+> **Why it was withdrawn rather than kept as a dormant option.** §13 writes the
+> scanned words back **when the blocked peer wakes**, through the
+> `GcBlockState::fixup` chain the blocked-region protocol already maintains, so
+> it holds nobody and ships ON. This one suspended every helper-window peer for
+> the length of a copy to reach the same words — a strictly larger hammer, with
+> a deadlock surface §13 does not have, for a defect §13 already closes. Two
+> mechanisms for one bug is a maintenance liability, and the weaker one should
+> not be the survivor.
+>
+> **It also cost another session a build break.** `gc_and_alloc.rs` called the
+> repair unconditionally while only Windows and the `not(any(windows, linux))`
+> arm had it, so Linux x86-64 — the CI and build host — failed to compile, and
+> somebody else had to write the missing stub. `cfg`-gated code is not
+> type-checked for the other host, and nothing on Windows could see it. That is
+> the cost side of carrying a platform-specific opt-in nobody uses.
+>
+> **The measurements below are kept** because three of them stand on their own
+> and do not depend on the removed code: WHICH peers own the stale words
+> (§14.1), that holding blocked peers across a copy did not deadlock in 28 runs
+> (§14.3), and what a conservative rewrite actually costs (§14.5).
 
 §11 named the home. This is the attempt to fix it, and the result is genuinely
 three-part: the mechanism works, the feared hazard did not appear, and the
