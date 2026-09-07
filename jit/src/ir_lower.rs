@@ -11,7 +11,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroU32;
 
 use super::ir::{
-    Graph, InlineScopeTable, IrType, MemKind, NodeId, Op, SafepointSnapshot,
+    Graph, InlineScopeTable, IrType, MemKind, NodeId, Op, SafepointSnapshot, ScalarOp,
     MAX_INLINE_SCOPE_DEPTH, NO_NODE,
 };
 use super::ir_schedule::Schedule;
@@ -532,6 +532,15 @@ struct Lowerer<'a> {
     /// its first argument, which is why `scan_frame_needs` marks a reference
     /// store `needs_context`.
     putfield_object: usize,
+    /// `jit_aastore(vm_ptr, array_ptr, index, val)` -- the reference-array
+    /// store, covariance check and both barriers included. See the
+    /// `Op::ArrayStore(MemKind::Ref)` arm for the three obligations its call
+    /// site owes.
+    aastore: usize,
+    /// Which array accesses have a PROVEN-unnecessary null or bounds check.
+    /// Empty (every answer `false`) when `CRATONVM_JIT_IR_CHECK_ELIM=0`, which
+    /// is byte-for-byte the emission before the pass existed.
+    check_elision: crate::ir_check_elim::CheckElision,
     /// COV-03 — `jit_putfield_{long,float,double}`, the compact-layout-correct
     /// wide-field stores. Same `(obj_ptr, field_index, bits)` ABI as
     /// `putfield_int`, no context argument; the value rides a GPR as raw bits
@@ -1423,6 +1432,8 @@ impl<'a> Lowerer<'a> {
             getfield: helpers.getfield,
             putfield_int: helpers.putfield_int,
             putfield_object: helpers.putfield_object,
+            aastore: helpers.aastore,
+            check_elision: crate::ir_check_elim::CheckElision::default(),
             putfield_long: helpers.putfield_long,
             putfield_float: helpers.putfield_float,
             putfield_double: helpers.putfield_double,
@@ -7388,6 +7399,194 @@ impl<'a> Lowerer<'a> {
             // result = (a > b) − (a < b), using signed SETcc on a 64-bit CMP, then
             // sign-extended to 64 bits so a 32- or 64-bit consumer both read it
             // correctly (the typical consumer is an `if<cond>` against 0).
+            // A call-site intrinsic lowered as arithmetic rather than as a
+            // call. See `ir::Op::ScalarIntrinsic` for why this exists and why
+            // it is one op with a sub-enum.
+            //
+            // WIDTH CONVENTION, and it is the thing to get right here: an `Int`
+            // slot in this backend holds a 32-bit result with the upper half
+            // ZEROED, which is what `Op::Add`'s `ADD EAX, ECX; store_rax`
+            // produces, and every consumer of an `Int` slot reads only the low
+            // 32 bits. So the 32-bit families leave their answer in EAX and do
+            // not sign-extend. `CompareL` is the exception that proves the rule
+            // rather than an inconsistency: it takes LONG operands and returns
+            // an `int`, so its `CMP` is 64-bit while its result is not -- which
+            // is exactly why `ScalarOp::operands_are_long` exists separately
+            // from `ScalarOp::result_type`. Sizing the compare from the result
+            // type would compare the low halves of two longs.
+            Op::ScalarIntrinsic(sop) => {
+                let sop = *sop;
+                let slot = self.alloc_slot(id);
+                let w = sop.operands_are_long();
+                self.gp_load_value(RAX, node.inputs[0]); // a
+                match sop {
+                    ScalarOp::MinI | ScalarOp::MaxI | ScalarOp::MinL | ScalarOp::MaxL => {
+                        self.gp_load_value(RCX, node.inputs[1]); // b
+                        if w {
+                            self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                        } else {
+                            self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                        }
+                        // MIN takes b when a > b (CMOVG); MAX takes b when
+                        // a < b (CMOVL). Both are signed, which is what
+                        // `Math.min`/`max` on `int`/`long` specify.
+                        let cc = if matches!(sop, ScalarOp::MinI | ScalarOp::MinL) {
+                            0x4F // CMOVG
+                        } else {
+                            0x4C // CMOVL
+                        };
+                        // CMOVcc EAX, ECX -- ModRM C1 (mod=11 reg=EAX rm=ECX).
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
+                        } else {
+                            self.buf.emit(&[0x0F, cc, 0xC1]);
+                        }
+                    }
+                    ScalarOp::AbsI => {
+                        // Branchless: t = x >> 31 (arithmetic); (x ^ t) - t.
+                        // At `Integer.MIN_VALUE` this yields MIN_VALUE, which
+                        // is what JLS 15.15.4 specifies -- the negation wraps.
+                        // A `CMOV` form written from `x < 0 ? -x : x` agrees
+                        // only because its negation wraps too; this one is
+                        // shorter and has no flag dependency to schedule
+                        // around.
+                        self.buf.emit(&[0x89, 0xC2]); // MOV EDX, EAX
+                        self.buf.emit(&[0xC1, 0xFA, 0x1F]); // SAR EDX, 31
+                        self.buf.emit(&[0x31, 0xD0]); // XOR EAX, EDX
+                        self.buf.emit(&[0x29, 0xD0]); // SUB EAX, EDX
+                    }
+                    ScalarOp::AbsL => {
+                        self.buf.emit(&[0x48, 0x89, 0xC2]); // MOV RDX, RAX
+                        self.buf.emit(&[0x48, 0xC1, 0xFA, 0x3F]); // SAR RDX, 63
+                        self.buf.emit(&[0x48, 0x31, 0xD0]); // XOR RAX, RDX
+                        self.buf.emit(&[0x48, 0x29, 0xD0]); // SUB RAX, RDX
+                    }
+                    // -- Bit-scan families ------------------------------
+                    //
+                    // BSR and BSF leave the DESTINATION UNDEFINED when the
+                    // source is zero, and set ZF. So each sequence below reads
+                    // ZF before anything clobbers the flags; the `MOV` that
+                    // sits between the scan and the `CMOVZ`/`SETZ` is chosen
+                    // because MOV does not touch flags, and swapping it for
+                    // anything that does is a wrong answer on zero only.
+                    ScalarOp::NlzI | ScalarOp::NlzL => {
+                        // BSR gives the index of the highest set bit, so
+                        // nlz = (width-1) - index. The zero case is folded in
+                        // by moving the index to -1 first, which makes
+                        // (width-1) - (-1) = width without a branch.
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xBD, 0xC8]); // BSR RCX, RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xBD, 0xC8]); // BSR ECX, EAX
+                        }
+                        self.buf.emit(&[0xBA]); // MOV EDX, imm32 (flags untouched)
+                        self.buf.emit(&(-1i32).to_le_bytes());
+                        self.buf.emit(&[0x0F, 0x44, 0xCA]); // CMOVZ ECX, EDX
+                        self.buf.emit(&[0xB8]); // MOV EAX, imm32
+                        self.buf
+                            .emit(&(if w { 63i32 } else { 31i32 }).to_le_bytes());
+                        self.buf.emit(&[0x29, 0xC8]); // SUB EAX, ECX
+                    }
+                    ScalarOp::NtzI | ScalarOp::NtzL => {
+                        // BSF gives the index of the lowest set bit, which IS
+                        // the answer; only the zero case needs the width.
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xBC, 0xC8]); // BSF RCX, RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xBC, 0xC8]); // BSF ECX, EAX
+                        }
+                        self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                        self.buf
+                            .emit(&(if w { 64i32 } else { 32i32 }).to_le_bytes());
+                        self.buf.emit(&[0x0F, 0x44, 0xCA]); // CMOVZ ECX, EDX
+                        self.buf.emit(&[0x89, 0xC8]); // MOV EAX, ECX
+                    }
+                    ScalarOp::ReverseBytesI | ScalarOp::ReverseBytesL => {
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xC8]); // BSWAP RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xC8]); // BSWAP EAX
+                        }
+                    }
+                    ScalarOp::LowestOneBitI | ScalarOp::LowestOneBitL => {
+                        // x & -x. No scan, so no undefined register and no
+                        // zero edge: -0 is 0 and 0 & 0 is 0.
+                        if w {
+                            self.buf.emit(&[0x48, 0x89, 0xC1]); // MOV RCX, RAX
+                            self.buf.emit(&[0x48, 0xF7, 0xD9]); // NEG RCX
+                            self.buf.emit(&[0x48, 0x21, 0xC8]); // AND RAX, RCX
+                        } else {
+                            self.buf.emit(&[0x89, 0xC1]); // MOV ECX, EAX
+                            self.buf.emit(&[0xF7, 0xD9]); // NEG ECX
+                            self.buf.emit(&[0x21, 0xC8]); // AND EAX, ECX
+                        }
+                    }
+                    ScalarOp::HighestOneBitI | ScalarOp::HighestOneBitL => {
+                        // 1 << bsr(x), and 0 when x is 0. The shift CLOBBERS
+                        // the flags, so ZF is captured into DL by SETZ first
+                        // and turned into an all-ones/all-zero mask; the shift
+                        // itself runs on an undefined count in the zero case
+                        // and its garbage is masked away.
+                        if w {
+                            self.buf.emit(&[0x48, 0x0F, 0xBD, 0xC8]); // BSR RCX, RAX
+                        } else {
+                            self.buf.emit(&[0x0F, 0xBD, 0xC8]); // BSR ECX, EAX
+                        }
+                        self.buf.emit(&[0x0F, 0x94, 0xC2]); // SETZ DL
+                        self.buf.emit(&[0xB8]); // MOV EAX, 1
+                        self.buf.emit(&1i32.to_le_bytes());
+                        if w {
+                            self.buf.emit(&[0x48, 0xD3, 0xE0]); // SHL RAX, CL
+                        } else {
+                            self.buf.emit(&[0xD3, 0xE0]); // SHL EAX, CL
+                        }
+                        self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                        self.buf.emit(&[0xFF, 0xCA]); // DEC EDX  (0 -> -1, 1 -> 0)
+                        if w {
+                            self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX, EDX
+                            self.buf.emit(&[0x48, 0x21, 0xD0]); // AND RAX, RDX
+                        } else {
+                            self.buf.emit(&[0x21, 0xD0]); // AND EAX, EDX
+                        }
+                    }
+                    ScalarOp::RotateLeftI
+                    | ScalarOp::RotateLeftL
+                    | ScalarOp::RotateRightI
+                    | ScalarOp::RotateRightL => {
+                        // The DISTANCE is an `int` at both widths -- see
+                        // `ScalarOp::input_ty`. x86 masks CL to 5 bits for a
+                        // 32-bit rotate and 6 for a 64-bit one, which is
+                        // exactly the `distance & 31` / `& 63` the JLS
+                        // specifies, negative distances included.
+                        self.gp_load_value(RCX, node.inputs[1]);
+                        let left =
+                            matches!(sop, ScalarOp::RotateLeftI | ScalarOp::RotateLeftL);
+                        let modrm = if left { 0xC0 } else { 0xC8 };
+                        if w {
+                            self.buf.emit(&[0x48, 0xD3, modrm]); // ROL/ROR RAX, CL
+                        } else {
+                            self.buf.emit(&[0xD3, modrm]); // ROL/ROR EAX, CL
+                        }
+                    }
+                    ScalarOp::CompareI | ScalarOp::CompareL => {
+                        // Byte for byte the `Op::LCmp` sequence below, which is
+                        // `Long.compare`'s specification already: SETG minus
+                        // SETL is exactly {-1, 0, 1}.
+                        self.gp_load_value(RCX, node.inputs[1]); // b
+                        if w {
+                            self.buf.emit(&[0x48, 0x39, 0xC8]); // CMP RAX, RCX
+                        } else {
+                            self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                        }
+                        self.buf.emit(&[0x0F, 0x9F, 0xC0]); // SETG AL
+                        self.buf.emit(&[0x0F, 0x9C, 0xC2]); // SETL DL
+                        self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
+                        self.buf.emit(&[0x0F, 0xB6, 0xD2]); // MOVZX EDX, DL
+                        self.buf.emit(&[0x29, 0xD0]); // SUB EAX, EDX
+                    }
+                }
+                self.store_rax(slot);
+            }
             Op::LCmp => {
                 let slot = self.alloc_slot(id);
                 self.gp_load_value(RAX, node.inputs[0]); // a
@@ -7803,7 +8002,7 @@ impl<'a> Lowerer<'a> {
                 if !matches!(kind, MemKind::Float | MemKind::Double) {
                     self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
-                    self.emit_array_null_bounds_guards(bci);
+                    self.emit_array_null_bounds_guards_for(bci, id);
                     self.emit_gpr_array_elem_load(*kind);
                     self.store_rax(slot);
                     return;
@@ -7811,7 +8010,7 @@ impl<'a> Lowerer<'a> {
                 let is_d = matches!(kind, MemKind::Double);
                 self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                 self.gp_load_value(RCX, node.inputs[3]); // index → RCX
-                self.emit_array_null_bounds_guards(bci);
+                self.emit_array_null_bounds_guards_for(bci, id);
                 // MOVSS/MOVSD XMM0, [RAX + RCX*{4,8} + HEADER_SIZE]. ModRM 0x44
                 // (mod=01, reg=XMM0, r/m=SIB); SIB 0x88 (*4) / 0xC8 (*8), idx=RCX,
                 // base=RAX; disp8 = HEADER_SIZE.
@@ -7841,18 +8040,94 @@ impl<'a> Lowerer<'a> {
                 // emit a barrier-less reference store.
                 if !matches!(kind, MemKind::Float | MemKind::Double) {
                     if matches!(kind, MemKind::Ref) {
-                        self.latch_bailout(Bailout::with_context(
-                            BailoutReason::UnsupportedShape(
-                                "ir_lower: ArrayStore(Ref) needs the SATB + card write barriers",
-                            ),
-                            format!("n{id} is an aastore; the IR tier emits no store barrier"),
-                        ));
+                        // `aastore`. This tier emits no inline reference-array
+                        // store, and deliberately does not try to: the sequence
+                        // owes a JVMS 6.5 covariance check, an SATB pre-barrier
+                        // and a card mark, and `x64/objects.rs`'s
+                        // `inline_card_mark_available` is hard-`false` precisely
+                        // so no emitter takes the remembered-set contract into
+                        // itself.
+                        //
+                        // What it does instead is the escape hatch the
+                        // single-pass backend already uses for the same opcode
+                        // under the ZGC barrier gate: call `jit_aastore`, which
+                        // owns all three. Before this, `Op::ArrayStore(Ref)`
+                        // failed closed and the method was refused -- **35
+                        // methods on the H2 JDBC workload**, the second-largest
+                        // build refusal there. A helper call is worse than the
+                        // single-pass inline sequence and far better than no
+                        // optimizing body at all.
+                        //
+                        // Three obligations, each of which is a silent bug if
+                        // skipped:
+                        //
+                        // * `jit_aastore` ALLOCATES (it builds an
+                        //   `ArrayStoreException` on the covariance-refusal
+                        //   path), so the call is a GC point and needs an oop
+                        //   map published at it -- the same bracketing
+                        //   `Op::New`'s stub and the safepoint poll use.
+                        // * it takes the VM context as arg0, so
+                        //   `scan_frame_needs` must set `needs_context` for
+                        //   this node, exactly as it does for
+                        //   `Op::Store(MemKind::Ref)`.
+                        // * it returns `()`, so RAX is UNDEFINED on return and
+                        //   NO deopt-sentinel compare may be emitted after it.
+                        //   Its exceptions travel by the pending-signal channel
+                        //   the interpreter drains on return. This is the same
+                        //   note `x64/bytecode_walk.rs`'s arm carries, and for
+                        //   the same reason.
+                        if self.aastore == 0 || !ir_aastore_enabled() {
+                            self.latch_bailout(Bailout::with_context(
+                                BailoutReason::UnsupportedShape(
+                                    "ir_lower: ArrayStore(Ref) needs the aastore helper",
+                                ),
+                                format!(
+                                    "n{id} is an aastore; helper={} gate={}",
+                                    self.aastore,
+                                    ir_aastore_enabled(),
+                                ),
+                            ));
+                            return;
+                        }
+                        // ORDER IS LOAD-BEARING, and getting it wrong is how
+                        // this arm SIGSEGV'd on the H2 workload the first time:
+                        // the map goes FIRST, the arguments SECOND.
+                        //
+                        // `emit_safepoint_map` reaches `emit_shadow_push`,
+                        // which clobbers RAX/RCX/R10/R11 and CALLS
+                        // `get_current_thread` -- and a call clobbers every
+                        // volatile register, which on Win64 is exactly
+                        // `CALL_ARG_REGS` (RCX, RDX, R8, R9). Marshalling
+                        // first and mapping second therefore handed
+                        // `jit_aastore` four destroyed arguments, the first of
+                        // which it dereferences as a `SharedVm`.
+                        //
+                        // Mapping first is safe and is what the safepoint poll
+                        // already does: this backend homes every live value in
+                        // a frame slot, so the map is a set of frame offsets
+                        // that does not depend on any register, and the
+                        // residency file is callee-saved (RBX, R12-R15) so it
+                        // survives the shadow push's call by the ABI.
+                        let mapped = Self::ir_gc_point_maps_enabled()
+                            && self.emit_safepoint_map_if_enabled();
+                        // (vm_ptr, array_ptr, index, val), loaded in ARG order
+                        // so no load clobbers a later one's source.
+                        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off);
+                        self.gp_load_value(CALL_ARG_REGS[1], node.inputs[2]);
+                        self.gp_load_value(CALL_ARG_REGS[2], node.inputs[3]);
+                        self.gp_load_value(CALL_ARG_REGS[3], node.inputs[4]);
+                        self.emit_mov_reg_imm64(RAX, self.aastore as u64);
+                        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+                        if mapped {
+                            self.emit_shadow_reload();
+                        }
+                        note_ir_aastore_lowered();
                         return;
                     }
                     self.gp_load_value(RDX, node.inputs[4]); // value → RDX
                     self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                     self.gp_load_value(RCX, node.inputs[3]); // index → RCX
-                    self.emit_array_null_bounds_guards(bci);
+                    self.emit_array_null_bounds_guards_for(bci, id);
                     self.emit_gpr_array_elem_store(*kind);
                     // RAX still holds the array pointer -- the store above
                     // addresses through it. See `crate::gpu_barrier`.
@@ -7863,7 +8138,7 @@ impl<'a> Lowerer<'a> {
                 self.fp_load_value(XMM0, node.inputs[4], is_d); // value → XMM0
                 self.gp_load_value(RAX, node.inputs[2]); // array → RAX
                 self.gp_load_value(RCX, node.inputs[3]); // index → RCX
-                self.emit_array_null_bounds_guards(bci);
+                self.emit_array_null_bounds_guards_for(bci, id);
                 // MOVSS/MOVSD [RAX + RCX*{4,8} + HEADER_SIZE], XMM0 (opcode 0x11).
                 let prefix = if is_d { 0xF2 } else { 0xF3 };
                 let sib = if is_d { 0xC8 } else { 0x88 };
@@ -9350,24 +9625,51 @@ impl<'a> Lowerer<'a> {
     /// FP-slot resume — Slice C — reconstructs any live FP value precisely).
     /// Uses R10 as scratch for the length (the IR lowering never homes a value
     /// there). A non-faulting access continues with RAX/RCX unchanged.
+    /// The array access guard pair, with each half skipped when
+    /// [`crate::ir_check_elim`] has PROVEN it unnecessary at this node.
+    ///
+    /// `node` is the `ArrayLoad`/`ArrayStore` being emitted; passing `NO_NODE`
+    /// asks for the unconditional pair, which is what every caller did before
+    /// the analysis existed and what the kill switch restores.
+    ///
+    /// Both halves are counted, elided AND emitted, always. A count of
+    /// elisions on its own says nothing: it cannot distinguish a working pass
+    /// from a workload with no array accesses in this tier, and that
+    /// distinction has produced wrong conclusions in this file before.
+    fn emit_array_null_bounds_guards_for(&mut self, bci: usize, node: NodeId) {
+        let elide_null = node != NO_NODE && self.check_elision.null_elided(node);
+        let elide_bounds = node != NO_NODE && self.check_elision.bounds_elided(node);
+        crate::ir_check_elim::note_check(0, elide_null);
+        crate::ir_check_elim::note_check(1, elide_bounds);
+        if elide_bounds && self.check_elision.bounds_range_proved(node) {
+            crate::ir_check_elim::note_range_proved();
+        }
+        if !elide_null {
+            // Null check: TEST RAX,RAX → ZF=1 iff array == null. Continue on JNZ.
+            self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+            self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+        }
+        if !elide_bounds {
+            // Bounds check: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET] (zero-extends
+            // to R10), then CMP ECX, R10D. An UNSIGNED `index < length` (JB,
+            // CF=1) continues; otherwise (index >= length, OR a negative index
+            // whose unsigned value is huge) deopt → AIOOBE.
+            self.buf.emit(&[
+                0x44,
+                0x8B,
+                0x50,
+                // Compile-time checked: a layout constant past 127 would encode
+                // a NEGATIVE disp8 and read before the object.
+                crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
+            ]); // MOV R10D,[RAX+12]
+            self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
+            self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
+        }
+    }
+
+    /// The unconditional pair, for callers that have no node to ask about.
     fn emit_array_null_bounds_guards(&mut self, bci: usize) {
-        // Null check: TEST RAX,RAX → ZF=1 iff array == null. Continue on JNZ.
-        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
-        self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
-        // Bounds check: MOV R10D, [RAX + ARRAY_LENGTH_OFFSET] (zero-extends to
-        // R10), then CMP ECX, R10D. An UNSIGNED `index < length` (JB, CF=1)
-        // continues; otherwise (index >= length, OR a negative index whose
-        // unsigned value is huge) deopt → AIOOBE.
-        self.buf.emit(&[
-            0x44,
-            0x8B,
-            0x50,
-            // Compile-time checked: a layout constant past 127 would encode a
-            // NEGATIVE disp8 and read before the object.
-            crate::x64::disp::disp8_const(ARRAY_LENGTH_OFFSET as i64) as u8,
-        ]); // MOV R10D,[RAX+12]
-        self.buf.emit(&[0x44, 0x39, 0xD1]); // CMP ECX, R10D
-        self.emit_deopt_unless(0x82, bci, DeoptReason::BoundsCheck); // JB continue
+        self.emit_array_null_bounds_guards_for(bci, NO_NODE);
     }
 
     /// COV-02 — the integral / reference element **load**, with the array
@@ -10421,6 +10723,14 @@ fn scan_frame_needs(graph: &Graph, helpers: &JitRuntimeHelpers) -> FrameNeeds {
         if matches!(n.op, Op::Store(MemKind::Ref)) {
             needs_context = true;
         }
+        // `jit_aastore` takes the VM context as arg0, exactly like
+        // `jit_putfield_object` above -- and for exactly the same reason the
+        // line above exists: without the reservation the lowering loads arg0
+        // from an unreserved `context_slot_off` and hands the helper a stack
+        // address to dereference as a `SharedVm`.
+        if matches!(n.op, Op::ArrayStore(MemKind::Ref)) {
+            needs_context = true;
+        }
         if matches!(n.op, Op::New { .. }) {
             needs_context = true;
         }
@@ -10661,6 +10971,7 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::ConstF(_)
             | Op::Param(_)
             | Op::Phi
+            | Op::ScalarIntrinsic(_)
             | Op::Add
             | Op::Sub
             | Op::Mul
@@ -12090,7 +12401,7 @@ fn ir_alu_imm_enabled() -> bool {
 /// dropped home with no register describing it, and refuses the compile —
 /// exactly as it does today. Nothing is taken away; a case is added in which
 /// the net is provably not needed.
-fn ir_drop_unreachable_homes_enabled() -> bool {
+pub fn ir_drop_unreachable_homes_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => false,
@@ -12151,8 +12462,31 @@ fn op_cannot_deopt(op: &Op) -> bool {
             // itself. The allowlist failing safe is the intended direction;
             // this is the cost of that direction, paid once.
             | Op::Return
+            // Pure arithmetic with no control edge, no memory edge and no
+            // trapping form -- see `Op::ScalarIntrinsic`. `Math.min`,
+            // `Math.max`, `Math.abs` and the two `compare`s cannot throw, which
+            // is the whole reason they are expressible as arithmetic here.
+            | Op::ScalarIntrinsic(_)
             | Op::Dead
     )
+}
+
+/// Can NOTHING in this graph transfer to the interpreter?
+///
+/// The graph-side half of the `graph_trap_free` prediction, lifted out of
+/// `lower_inner` so `ir_optimize` can ask the same question BEFORE lowering --
+/// which is where the unroller needs it. `op_cannot_deopt` is an allowlist, so
+/// an op nobody has classified counts as trapping and the answer is `false`.
+///
+/// This is a PREDICTION and is treated as one everywhere it is used: the
+/// consumers that act on it are backed by a check against the emission that
+/// actually happened, and a disagreement refuses the compile rather than
+/// producing a body whose frame states are wrong.
+pub fn graph_cannot_deopt(graph: &Graph) -> bool {
+    graph
+        .nodes
+        .iter()
+        .all(|n| n.op == Op::Dead || op_cannot_deopt(&n.op))
 }
 
 fn op_reads_rax_then_rcx(op: &Op) -> bool {
@@ -12173,6 +12507,34 @@ fn op_reads_rax_then_rcx(op: &Op) -> bool {
             | Op::I2L
             | Op::L2I
     )
+}
+
+/// May the optimizing tier lower `aastore` through the `jit_aastore` helper?
+/// **Default ON** since 2026-09-06; `CRATONVM_JIT_IR_AASTORE=0` restores the
+/// fail-closed refusal, which refuses the whole method.
+pub fn ir_aastore_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_AASTORE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// `aastore` sites this tier lowered, process-wide.
+static IR_AASTORE_LOWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_ir_aastore_lowered() {
+    IR_AASTORE_LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many `aastore` sites the optimizing tier emitted. A zero says the
+/// workload compiles none in this tier, which is not the same as the arm being
+/// broken -- the distinction this file has been burned by repeatedly.
+pub fn ir_aastore_census() -> u64 {
+    IR_AASTORE_LOWERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn op_home_is_one_store_rax(op: &Op) -> bool {
@@ -12197,8 +12559,63 @@ fn op_home_is_one_store_rax(op: &Op) -> bool {
             | Op::D2I
             | Op::D2L
             | Op::ArrayLength
+            // 2026-09-06, and both entries carry the SAME argument the FP
+            // exclusion above rests on: the arm has one `store_rax(slot)` with
+            // RAX holding the value, and any other path it has produces a type
+            // `value_home_droppable` refuses.
+            //
+            // A pure arithmetic node with no control edge, no memory edge and
+            // no trap. The safest member of this list.
+            | Op::ScalarIntrinsic(_)
+            // The integral element load. Its FP path returns through
+            // `fp_store_value`, and its `MemKind::Ref` path produces an
+            // `IrType::Ref` -- `value_home_droppable` admits only `Int` and
+            // `Long`, so neither is reachable for a dropped home, exactly as
+            // for `Op::Div`/`Rem`/`Neg`. The guards it emits before the load
+            // deopt BEFORE the value is defined, so no frame state can name a
+            // home that was going to be written and was not.
+            | Op::ArrayLoad(_)
     )
 }
+
+/// The ops this allowlist deliberately does NOT claim, and why -- written down
+/// because the mechanical test (`every_droppable_op_writes_its_home_once_
+/// through_store_rax`) admits all of them, so a reader who runs the scan will
+/// find twelve candidates and needs to know which ten were considered.
+///
+/// * `Op::Cmp`, `Op::LCmp`, `Op::FCmp` -- the home write is CONDITIONAL on a
+///   fusion decision `lower_terminator` makes: a comparison feeding a branch
+///   that fuses emits no arm at all. The source scan sees the unfused path and
+///   counts one store; the fused path stores nothing.
+/// * `Op::New`, `Op::NewArray`, `Op::ConstString`, `Op::ConstClass`,
+///   `Op::LambdaIntToDouble` -- `IrType::Ref` results. A reference may not be
+///   register-resident at a safepoint at all (the GC root walk reads frame
+///   slots through RBP and `OopMapEntry` names slots only), which is the same
+///   reason `plan_register_residency` refuses the type.
+/// * `Op::InstanceOf` -- an `Int` result, and mechanically eligible. Excluded
+///   because it is a HELPER CALL with a sentinel-return path, which is the
+///   shape `Op::Call` is excluded for; nobody has checked whether the sentinel
+///   path leaves RAX holding the value.
+/// * `Op::ConstF` -- FP, refused by `value_home_droppable` like every other FP
+///   type, so claiming it would be inert rather than wrong.
+///
+/// Two of these are worth revisiting and one is not: the comparisons need the
+/// fusion decision to be visible at the arm, which is a real change; the
+/// reference results need the deopt register image to be able to name a `Ref`,
+/// which is a GC contract change and not a lowering one.
+#[cfg(test)]
+const DELIBERATELY_NOT_DROPPABLE: [&str; 10] = [
+    "Cmp",
+    "LCmp",
+    "FCmp",
+    "New",
+    "NewArray",
+    "ConstString",
+    "ConstClass",
+    "LambdaIntToDouble",
+    "InstanceOf",
+    "ConstF",
+];
 
 /// Emit an OSR entry stub for every bci this body can safely be entered at --
 /// **default ON** since 2026-09-05; `CRATONVM_JIT_IR_OSR_ENTRY=0` is the kill
@@ -14667,6 +15084,12 @@ pub(crate) fn lower_inner_with_scopes(
         inline_scopes,
     );
 
+    // Null-check and bounds-check elimination. Runs on the SCHEDULED graph
+    // because both facts are dominance facts and dominance is over the block
+    // CFG the scheduler built -- so it must be after `schedule` and before any
+    // array site is emitted, which is exactly here.
+    lowerer.check_elision = crate::ir_check_elim::analyze(graph, schedule);
+
     // Gap B: only `abi_regs.len()` integer registers carry incoming args (4 on
     // Win64, 6 on SysV), and a `needs_context` method (one containing an
     // `Op::Call`) spends the first of them on the hidden VM pointer. Anything
@@ -14942,6 +15365,26 @@ pub(crate) fn lower_inner_with_scopes(
     // native-offset-keyed DeoptimizationPoints before the buffer is consumed.
     // Emit-and-discard: nothing reads these yet, so codegen is unchanged.
     let deopt_points = lowerer.build_deopt_points(osr_sentinel_free);
+    // The unroller's net. It relaxed its safepoint refusal on the strength of
+    // the GRAPH being trap-free; that is only sound while the points it
+    // orphaned are never built. If they were built, the killed body nodes now
+    // resolve to `FrameValue::Undefined` and a deopt would silently lose
+    // interpreter locals -- so refuse the compile and let the single-pass
+    // backend take the method, which is what happened before the relaxation.
+    //
+    // Read unconditionally, and read ONCE: `take_` clears it, so a compile that
+    // did not use the relaxation cannot inherit a previous one's flag.
+    if crate::ir_optimize::take_unroll_used_unreachable_frames() && !deopt_points.is_empty() {
+        return refuse(Bailout::with_context(
+            BailoutReason::UnsupportedShape(
+                "ir_lower: the unroller relied on unreachable frame states and points were built",
+            ),
+            format!(
+                "{} deopt point(s) built for a graph the unroller treated as trap-free",
+                deopt_points.len()
+            ),
+        ));
+    }
     let deopt_boxes = std::mem::take(&mut lowerer.deopt_boxes);
     // Gap B: a method containing an `Op::Call` takes the VM context pointer as a
     // hidden first arg, so it must be invoked via `try_call_with_context`.
@@ -18573,6 +19016,268 @@ mod tests {
         assert_eq!(result, 7, "Should return 7 after constant folding");
     }
 
+    /// Build `f(a, b) = <sop>(a, b)` (or `f(a) = <sop>(a)`) as a graph, lower
+    /// it, and return the compiled body. Direct graph construction rather than
+    /// bytecode, because reaching `Op::ScalarIntrinsic` from bytecode needs the
+    /// invoke planner and a constant pool -- machinery that is tested where it
+    /// lives (`ir::try_ir_scalar_intrinsic`), and that would make this a test
+    /// of the planner rather than of the emitted instructions.
+    fn compile_scalar_intrinsic(sop: ScalarOp) -> CompiledMethod {
+        let n = sop.arity();
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let a = graph.add(Op::Param(0), sop.input_ty(0), vec![start], None);
+        let mut inputs = vec![a];
+        if n == 2 {
+            // `input_ty(1)`, not `input_ty(0)`: a rotate takes a `long` value
+            // and an `int` distance, and typing the distance as a `long` here
+            // would make this harness disagree with the builder.
+            let b = graph.add(Op::Param(1), sop.input_ty(1), vec![start], None);
+            inputs.push(b);
+        }
+        let v = graph.add(Op::ScalarIntrinsic(sop), sop.result_type(), inputs, Some(0));
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, v], Some(1));
+        let schedule = ir_schedule::schedule(&graph);
+        lower(&graph, &schedule, n, n, &no_helpers()).expect("the intrinsic body must lower")
+    }
+
+
+
+    /// The emitted sequences, EXECUTED, against the answers the JLS specifies.
+    ///
+    /// The edges are the point. `Math.abs(Integer.MIN_VALUE)` is
+    /// `Integer.MIN_VALUE` (JLS 15.15.4) because the negation wraps, and the
+    /// branchless `(x ^ (x>>31)) - (x>>31)` reproduces that exactly -- a reader
+    /// who "fixes" it to saturate would be introducing a bug, not removing one.
+    /// `Math.min`/`max` are SIGNED, so a pair straddling zero separates them
+    /// from an unsigned compare, which is the mistake a `CMOVA`/`CMOVB` typo
+    /// would make and which no same-sign test could catch.
+    #[test]
+    fn the_scalar_intrinsic_sequences_execute_to_the_specified_answers() {
+        let cases_i: &[(ScalarOp, i64, i64, i64)] = &[
+            (ScalarOp::MinI, 3, 7, 3),
+            (ScalarOp::MinI, 7, 3, 3),
+            (ScalarOp::MinI, -5, 5, -5),
+            (ScalarOp::MinI, 5, -5, -5),
+            (ScalarOp::MinI, i32::MIN as i64, i32::MAX as i64, i32::MIN as i64),
+            (ScalarOp::MaxI, 3, 7, 7),
+            (ScalarOp::MaxI, 7, 3, 7),
+            (ScalarOp::MaxI, -5, 5, 5),
+            (ScalarOp::MaxI, 5, -5, 5),
+            (ScalarOp::MaxI, i32::MIN as i64, i32::MAX as i64, i32::MAX as i64),
+            (ScalarOp::CompareI, 3, 7, -1),
+            (ScalarOp::CompareI, 7, 3, 1),
+            (ScalarOp::CompareI, 7, 7, 0),
+            // The pair that separates a SIGNED compare from an unsigned one:
+            // as unsigned 32-bit values, -1 is the largest there is.
+            (ScalarOp::CompareI, -1, 1, -1),
+            (ScalarOp::CompareI, i32::MIN as i64, i32::MAX as i64, -1),
+        ];
+        for &(sop, a, b, want) in cases_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: the body takes two integer arguments, builds and tears
+            // down its own frame, and calls nothing.
+            let got = unsafe { cm.try_call(&[a, b]) }.expect("the body runs");
+            // The `Int` slot convention zero-extends, so compare the low half.
+            assert_eq!(
+                got as i32,
+                want as i32,
+                "{}({a}, {b})",
+                sop.as_str(),
+            );
+        }
+
+        let cases_l: &[(ScalarOp, i64, i64, i64)] = &[
+            (ScalarOp::MinL, 3, 7, 3),
+            (ScalarOp::MinL, -5, 5, -5),
+            (ScalarOp::MinL, i64::MIN, i64::MAX, i64::MIN),
+            (ScalarOp::MaxL, 3, 7, 7),
+            (ScalarOp::MaxL, 5, -5, 5),
+            (ScalarOp::MaxL, i64::MIN, i64::MAX, i64::MAX),
+        ];
+        for &(sop, a, b, want) in cases_l {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[a, b]) }.expect("the body runs");
+            assert_eq!(got, want, "{}({a}, {b})", sop.as_str());
+        }
+
+        // `Long.compare` returns an INT from LONG operands -- the case that
+        // catches sizing the CMP from the result type, which would compare the
+        // low halves and answer 0 for these.
+        for &(a, b, want) in &[
+            (1i64 << 40, 1i64, 1i64),
+            (1i64, 1i64 << 40, -1),
+            (i64::MIN, i64::MAX, -1),
+            (0x1_0000_0000i64, 0i64, 1),
+        ] {
+            let cm = compile_scalar_intrinsic(ScalarOp::CompareL);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[a, b]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "Long.compare({a}, {b})");
+        }
+
+        for &(sop, x, want) in &[
+            (ScalarOp::AbsI, 5i64, 5i64),
+            (ScalarOp::AbsI, -5, 5),
+            (ScalarOp::AbsI, 0, 0),
+            // JLS 15.15.4: abs(MIN_VALUE) == MIN_VALUE.
+            (ScalarOp::AbsI, i32::MIN as i64, i32::MIN as i64),
+            (ScalarOp::AbsI, i32::MAX as i64, i32::MAX as i64),
+        ] {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: one integer argument; as above.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "Math.abs({x})");
+        }
+
+        for &(x, want) in &[
+            (5i64, 5i64),
+            (-5, 5),
+            (0, 0),
+            (i64::MIN, i64::MIN),
+            (i64::MAX, i64::MAX),
+        ] {
+            let cm = compile_scalar_intrinsic(ScalarOp::AbsL);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got, want, "Math.abs({x}L)");
+        }
+    }
+
+    /// The bit-scan sequences, EXECUTED, against the answers `java.lang.Integer`
+    /// and `java.lang.Long` specify.
+    ///
+    /// ZERO is the case every one of these has and the one a reader is most
+    /// likely to break: `BSR`/`BSF` leave their destination UNDEFINED on a zero
+    /// source, so a sequence that reads the destination without first
+    /// consulting ZF returns whatever the register happened to hold. Each
+    /// family is therefore tested at zero, and `highestOneBit` — whose shift
+    /// runs on that undefined count and is masked away afterwards — is tested
+    /// at zero on both widths.
+    ///
+    /// The other trap is width. `Long.numberOfLeadingZeros` takes a `long` and
+    /// returns an `int`, so a sequence that sized its scan from the RESULT type
+    /// would scan the low half and answer 32 for every value above 2^32; the
+    /// `1 << 40` cases catch exactly that.
+    #[test]
+    fn the_bit_scan_sequences_execute_to_the_specified_answers() {
+        // (op, input, expected) — 32-bit families, compared on the low half.
+        let unary_i: &[(ScalarOp, i64, i64)] = &[
+            (ScalarOp::NlzI, 0, 32),
+            (ScalarOp::NlzI, 1, 31),
+            (ScalarOp::NlzI, -1, 0),
+            (ScalarOp::NlzI, i32::MIN as i64, 0),
+            (ScalarOp::NlzI, 0x0000_FFFF, 16),
+            (ScalarOp::NtzI, 0, 32),
+            (ScalarOp::NtzI, 1, 0),
+            (ScalarOp::NtzI, -1, 0),
+            (ScalarOp::NtzI, i32::MIN as i64, 31),
+            (ScalarOp::NtzI, 0x0001_0000, 16),
+            (ScalarOp::ReverseBytesI, 0x0102_0304, 0x0403_0201),
+            (ScalarOp::ReverseBytesI, 0, 0),
+            (ScalarOp::LowestOneBitI, 0, 0),
+            (ScalarOp::LowestOneBitI, 0x0000_00FF, 1),
+            (ScalarOp::LowestOneBitI, i32::MIN as i64, i32::MIN as i64),
+            (ScalarOp::HighestOneBitI, 0, 0),
+            (ScalarOp::HighestOneBitI, 0x0000_00FF, 0x80),
+            (ScalarOp::HighestOneBitI, -1, i32::MIN as i64),
+            (ScalarOp::HighestOneBitI, 1, 1),
+        ];
+        for &(sop, x, want) in unary_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: one integer argument; the body builds and tears down its
+            // own frame and calls nothing.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "{}({x})", sop.as_str());
+        }
+
+        // 64-bit input families whose ANSWER is an `int`.
+        let unary_l_to_i: &[(ScalarOp, i64, i64)] = &[
+            (ScalarOp::NlzL, 0, 64),
+            (ScalarOp::NlzL, 1, 63),
+            (ScalarOp::NlzL, -1, 0),
+            (ScalarOp::NlzL, i64::MIN, 0),
+            // The case that separates a 64-bit scan from a 32-bit one.
+            (ScalarOp::NlzL, 1i64 << 40, 23),
+            (ScalarOp::NtzL, 0, 64),
+            (ScalarOp::NtzL, 1, 0),
+            (ScalarOp::NtzL, i64::MIN, 63),
+            (ScalarOp::NtzL, 1i64 << 40, 40),
+        ];
+        for &(sop, x, want) in unary_l_to_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "{}({x})", sop.as_str());
+        }
+
+        // 64-bit input AND answer.
+        let unary_l: &[(ScalarOp, i64, i64)] = &[
+            (ScalarOp::ReverseBytesL, 0x0102_0304_0506_0708, 0x0807_0605_0403_0201),
+            (ScalarOp::ReverseBytesL, 0, 0),
+            (ScalarOp::LowestOneBitL, 0, 0),
+            (ScalarOp::LowestOneBitL, 0x00FF_0000_0000_0000, 1i64 << 48),
+            (ScalarOp::LowestOneBitL, i64::MIN, i64::MIN),
+            (ScalarOp::HighestOneBitL, 0, 0),
+            (ScalarOp::HighestOneBitL, 0x0000_00FF, 0x80),
+            (ScalarOp::HighestOneBitL, -1, i64::MIN),
+            (ScalarOp::HighestOneBitL, 1i64 << 40, 1i64 << 40),
+        ];
+        for &(sop, x, want) in unary_l {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, 0]) }.expect("the body runs");
+            assert_eq!(got, want, "{}({x})", sop.as_str());
+        }
+
+        // Rotates. A NEGATIVE distance is the case the JLS defines by masking
+        // and x86 implements by masking, so it is the one that proves the two
+        // agree rather than merely both being plausible.
+        let rot_i: &[(ScalarOp, i64, i64, i64)] = &[
+            (ScalarOp::RotateLeftI, 1, 1, 2),
+            (ScalarOp::RotateLeftI, i32::MIN as i64, 1, 1),
+            (ScalarOp::RotateLeftI, 1, 32, 1),
+            (ScalarOp::RotateLeftI, 1, -1, i32::MIN as i64),
+            (ScalarOp::RotateRightI, 1, 1, i32::MIN as i64),
+            (ScalarOp::RotateRightI, 1, -1, 2),
+            (ScalarOp::RotateRightI, 0x0000_00FF, 4, 0xF000_000F_u32 as i32 as i64),
+        ];
+        for &(sop, x, d, want) in rot_i {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: two integer arguments; as above.
+            let got = unsafe { cm.try_call(&[x, d]) }.expect("the body runs");
+            assert_eq!(got as i32, want as i32, "{}({x}, {d})", sop.as_str());
+        }
+
+        let rot_l: &[(ScalarOp, i64, i64, i64)] = &[
+            (ScalarOp::RotateLeftL, 1, 1, 2),
+            (ScalarOp::RotateLeftL, i64::MIN, 1, 1),
+            (ScalarOp::RotateLeftL, 1, 64, 1),
+            (ScalarOp::RotateLeftL, 1, -1, i64::MIN),
+            (ScalarOp::RotateRightL, 1, 1, i64::MIN),
+            (ScalarOp::RotateRightL, 1, -1, 2),
+            // Distances 32 and 40 separate a 64-bit rotate from a 32-bit one.
+            (ScalarOp::RotateLeftL, 1, 40, 1i64 << 40),
+            (ScalarOp::RotateLeftL, 1, 32, 1i64 << 32),
+        ];
+        for &(sop, x, d, want) in rot_l {
+            let cm = compile_scalar_intrinsic(sop);
+            // SAFETY: as above.
+            let got = unsafe { cm.try_call(&[x, d]) }.expect("the body runs");
+            assert_eq!(got, want, "{}({x}, {d})", sop.as_str());
+        }
+    }
+
     #[test]
     fn test_lower_add_params() {
         // int f(int a, int b) { return a + b; }
@@ -21359,6 +22064,7 @@ mod tests {
             | Op::ConstF(_)
             | Op::Param(_)
             | Op::Phi
+            | Op::ScalarIntrinsic(_)
             | Op::Add
             | Op::Sub
             | Op::Mul
@@ -21424,6 +22130,7 @@ mod tests {
             ("ConstF", Op::ConstF(0)),
             ("Param", Op::Param(0)),
             ("Phi", Op::Phi),
+            ("ScalarIntrinsic", Op::ScalarIntrinsic(ScalarOp::MaxI)),
             ("Add", Op::Add),
             ("Sub", Op::Sub),
             ("Mul", Op::Mul),
@@ -21555,6 +22262,62 @@ mod tests {
         out
     }
 
+    /// The `aastore` arm must publish its safepoint map BEFORE it marshals the
+    /// helper's arguments, and this test exists because getting it the other
+    /// way round SIGSEGV'd the H2 JDBC workload.
+    ///
+    /// `emit_safepoint_map` reaches `emit_shadow_push`, which clobbers
+    /// RAX/RCX/R10/R11 and CALLS `get_current_thread` -- and a call clobbers
+    /// every volatile register, which on Win64 is exactly `CALL_ARG_REGS`
+    /// (RCX, RDX, R8, R9). Marshalling first therefore handed `jit_aastore`
+    /// four destroyed arguments, the first of which it dereferences as a
+    /// `SharedVm`. The reverse order is safe because this backend homes every
+    /// live value in a frame slot, so the map depends on no register, and the
+    /// residency file is callee-saved.
+    ///
+    /// A source scan rather than a behavioural test, for the same reason the
+    /// other audits in this module are: reaching this arm at run time needs a
+    /// live heap and a real reference array, and the property is about the
+    /// ORDER of two emissions, which a disassembly of a hand-built graph would
+    /// not distinguish from a coincidence.
+    #[test]
+    fn the_aastore_arm_maps_before_it_marshals() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let arm = src
+            // Anchored on a string unique to THIS arm. `if matches!(kind,
+            // MemKind::Ref) {` is not: the `Op::Store` (putfield) arm opens
+            // the same way and comes FIRST, so splitting on it scans the
+            // wrong code and the test fails for a reason that has nothing
+            // to do with the property.
+            .split("ir_lower: ArrayStore(Ref) needs the aastore helper")
+            .nth(1)
+            .expect("the ArrayStore(Ref) arm is in this file")
+            .split("\n                    }")
+            .next()
+            .expect("the arm ends");
+        let map_at = arm
+            .find("emit_safepoint_map_if_enabled()")
+            .expect("the arm must publish an oop map: `jit_aastore` allocates");
+        let marshal_at = arm
+            .find("CALL_ARG_REGS[0]")
+            .expect("the arm must marshal the helper's arguments");
+        assert!(
+            map_at < marshal_at,
+            "the safepoint map must be emitted BEFORE the arguments are loaded \
+             into CALL_ARG_REGS -- `emit_shadow_push` calls `get_current_thread`, \
+             and a call clobbers every volatile register, which on Win64 is \
+             exactly the argument registers. This ordering SIGSEGV'd H2.",
+        );
+        // And the call itself comes last, or the marshalling is pointless.
+        let call_at = arm
+            .find("self.aastore as u64")
+            .expect("the arm must call the helper");
+        assert!(
+            marshal_at < call_at,
+            "arguments must be marshalled before the CALL",
+        );
+    }
+
     /// `op_home_is_one_store_rax` claims a property of SOURCE the compiler
     /// cannot check, and it is the whole safety argument for dropping the home
     /// word of a value that is not a phi: the arm writes its result home
@@ -21650,6 +22413,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every op the mechanical scan finds eligible for a dropped home is
+    /// either CLAIMED by `op_home_is_one_store_rax` or named in
+    /// `DELIBERATELY_NOT_DROPPABLE` with a reason.
+    ///
+    /// The test above proves the claimed ones are safe. This one closes the
+    /// other direction, which is the one that quietly costs an optimization:
+    /// an op whose arm already has the right shape and that nobody has looked
+    /// at reads, from the scan, exactly like an op that was considered and
+    /// rejected. Twelve candidates were eligible when this was written and ten
+    /// of them are rejections; without this test the eleventh would be
+    /// indistinguishable from an oversight.
+    #[test]
+    fn every_eligible_op_is_claimed_or_explicitly_rejected() {
+        let src = include_str!("ir_lower.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn lower_data_node(&mut self, id: NodeId) {")
+            .nth(1)
+            .expect("lower_data_node is in this file")
+            .split("\n    fn ")
+            .next()
+            .expect("the function ends");
+        let mut arms: Vec<(std::collections::BTreeSet<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let opens = line.starts_with("            Op::");
+            let continues = line.starts_with("            | Op::");
+            if continues {
+                if let Some(last) = arms.last_mut() {
+                    collect_op_names(line, &mut last.0);
+                    continue;
+                }
+            }
+            if opens {
+                let mut names = std::collections::BTreeSet::new();
+                collect_op_names(line, &mut names);
+                arms.push((names, String::new()));
+                continue;
+            }
+            if let Some(last) = arms.last_mut() {
+                last.1.push_str(line);
+                last.1.push('\n');
+            }
+        }
+        assert!(!arms.is_empty(), "the arm scan found nothing");
+
+        let claimed_src = src
+            .split("fn op_home_is_one_store_rax(op: &Op) -> bool {")
+            .nth(1)
+            .expect("op_home_is_one_store_rax is in this file")
+            .split("\n}")
+            .next()
+            .expect("the function ends");
+        let mut claimed = std::collections::BTreeSet::new();
+        collect_op_names(claimed_src, &mut claimed);
+
+        let rejected: std::collections::BTreeSet<String> = super::DELIBERATELY_NOT_DROPPABLE
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        let mut unexplained: Vec<String> = Vec::new();
+        for (names, arm) in &arms {
+            let stores = arm.matches("self.store_rax(slot);").count();
+            let reaches_home_elsewhere = ["gp_store_value(", "emit_store_frame_imm32("]
+                .iter()
+                .any(|f| arm.contains(f));
+            if stores != 1 || reaches_home_elsewhere {
+                continue;
+            }
+            for n in names {
+                if !claimed.contains(n) && !rejected.contains(n) {
+                    unexplained.push(n.clone());
+                }
+            }
+        }
+        assert!(
+            unexplained.is_empty(),
+            "these ops have an arm shaped for a dropped home and are neither \
+             claimed by `op_home_is_one_store_rax` nor listed in \
+             `DELIBERATELY_NOT_DROPPABLE`: {unexplained:?}. Add them to one or \
+             the other -- an unexamined candidate reads exactly like a \
+             considered rejection, which is how this optimization stays \
+             narrower than it needs to be.",
+        );
     }
 
     /// `op_reads_rax_then_rcx` is the consumer half of the carry contract, and

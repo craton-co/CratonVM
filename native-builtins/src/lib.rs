@@ -28357,6 +28357,23 @@ fn printstream_autoflush(ctx: &mut dyn NativeContext, args: &[Value]) {
 }
 
 fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
+    // THE RECEIVER STAYS ROOTED, exactly as in `stream_writeln_inner` and for
+    // exactly the reason the LOCK-SCOPE note below already gives: these
+    // helpers "recursively interpret Java bytecode". That bytecode allocates,
+    // so it can collect, so it can RELOCATE this stream — and `args` is a
+    // pre-call snapshot that no collection rewrites. See
+    // [`args_with_live_receiver`].
+    //
+    // This is the `print` twin of the `println` defect that made
+    // `bench-gpu/residency-gc.sh` red on 2026-09-06. It is fixed here on the
+    // strength of being the same code shape rather than a second reproducer:
+    // `stream_fd` at the bottom dereferences the snapshot after two
+    // Java-interpreting helpers have run, which is the crashing sequence.
+    let mut scope = NativeHandleScope::new(ctx);
+    let recv = match args.first() {
+        Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+        _ => None,
+    };
     // LOCK-SCOPE (2026-07-21): `surefire_forwarding_write` and
     // `route_write_through_out` recursively interpret Java bytecode
     // (`invoke_virtual`); running them under the global stdio print mutex
@@ -28364,27 +28381,31 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     // themselves be blocked on this mutex (live gdb capture: WildFly boot
     // wedge at parallel-extension-add, 2026-07-20). Only the raw fd write
     // is serialized.
-    if printstream_refuse_if_closed(ctx, args) {
+    if printstream_refuse_if_closed(&mut *scope, args) {
         return;
     }
-    if surefire_forwarding_write(ctx, args, text, false) {
+    if surefire_forwarding_write(&mut *scope, args, text, false) {
         return;
     }
-    let encoded = printstream_encode(ctx, args, text);
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    let encoded = printstream_encode(&mut *scope, args, text);
     let bytes: &[u8] = encoded.as_deref().unwrap_or_else(|| text.as_bytes());
-    if route_write_through_out(ctx, args, bytes) {
-        printstream_autoflush(ctx, args);
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    if route_write_through_out(&mut *scope, args, bytes) {
+        let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+        printstream_autoflush(&mut *scope, args);
         return;
     }
-    if let Some(fd) = stream_fd(ctx, args) {
-        let ok = with_stdio_print_lock(|| ctx.fd_table().write_bytes(fd, bytes));
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    if let Some(fd) = stream_fd(&mut *scope, args) {
+        let ok = with_stdio_print_lock(|| scope.fd_table().write_bytes(fd, bytes));
         // RECORDED since W7-64. The fd IS this stream's `out` — a console
         // `PrintStream` has no Java sink object — so a host write failure here
         // is exactly the `IOException` `PrintStream`'s private `write(String)`
         // catches with `trouble = true`.
         // W7-64-printstream-trouble-and-errormanager.md
         if let Some(Value::Object(Some(this))) = args.first().copied() {
-            cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+            cratonvm_native_api::print_error_state::record_host_io_failure(&*scope, this, ok);
         }
         return;
     }
@@ -28410,10 +28431,11 @@ fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     // The sink FIELD separates them, which is why both `close()` natives now
     // null it. MEASURED — `CloseFlushSwallowProbe`'s
     // `psRouteErrorWriteDidNotRecordTrouble` and its `pw` twin.
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
     if let Some(Value::Object(Some(this))) = args.first().copied() {
-        let has_sink = matches!(ctx.get_field_by_name(this, "out"), Value::Object(Some(_)));
+        let has_sink = matches!(scope.get_field_by_name(this, "out"), Value::Object(Some(_)));
         if !has_sink {
-            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+            cratonvm_native_api::print_error_state::set_trouble(&*scope, this);
         }
     }
 }
@@ -28487,47 +28509,118 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
-    stream_writeln_inner(ctx, args, text);
-    printwriter_autoflush_if_needed(ctx, args);
+    // The same hazard one level up: `stream_writeln_inner` re-enters Java, so
+    // `args` can name the receiver's pre-call address by the time the
+    // autoflush dereferences it. See [`args_with_live_receiver`].
+    let mut scope = NativeHandleScope::new(ctx);
+    let recv = match args.first() {
+        Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+        _ => None,
+    };
+    stream_writeln_inner(&mut *scope, args, text);
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    printwriter_autoflush_if_needed(&mut *scope, args);
+}
+
+/// Rebuild a native argument snapshot with its RECEIVER at the address it has
+/// now, reading it back out of the handle that kept it rooted.
+///
+/// `args` is a Rust-side snapshot taken before the native was entered.
+/// `vm_exec::safe_native_call_impl` pins every argument — so nothing is ever
+/// collected out from under a native — but it rebuilds the snapshot from those
+/// pins only for a collection it ran ITSELF, at one of the three hooks BEFORE
+/// the callback. Its own comment says why they live there: the native
+/// allocation wrappers "must stay GC-free mid-callback, since their callers
+/// hold unrooted local `ObjectRef`s".
+///
+/// A native that re-enters Java breaks that premise. The bytecode it invokes
+/// allocates and can drive a young collection, and a Generational young
+/// collection RELOCATES — by Cheney copy on the moving path, and by selective
+/// promotion even on the non-moving one. The object survives at its new
+/// address; the caller's snapshot keeps naming the old one.
+///
+/// Reading a field through that stale address lands in the inactive semi-space
+/// or, with `CRATONVM_GEN_UNCOMMIT` on (the default since 2026-09-05), in a
+/// DECOMMITTED page — `EXCEPTION_ACCESS_VIOLATION` inside
+/// `gen_heap::get_field`. With uncommit off the same read finds a zeroed
+/// header, decodes as `ClassId(0)` / `java.lang.Object` with no slots, and the
+/// field guard drops it with a warning: the same defect, surviving only
+/// because the page happened to still be mapped.
+///
+/// See `known-issues/gc/native-arg-snapshot-stale-across-java-reentry-20260906.md`.
+fn args_with_live_receiver(
+    scope: &NativeHandleScope<'_>,
+    args: &[Value],
+    recv: Option<&cratonvm_native_api::registry::NativeHandle>,
+) -> Vec<Value> {
+    let mut out = args.to_vec();
+    if let (Some(h), Some(slot)) = (recv, out.first_mut()) {
+        *slot = Value::Object(Some(scope.get(h)));
+    }
+    out
 }
 
 fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
+    // THE RECEIVER STAYS ROOTED FOR THE WHOLE BODY, and the argument snapshot
+    // is rebuilt after every step that can re-enter Java. `printstream_encode`
+    // runs the JDK charset encoder and `route_write_through_out` runs
+    // `Writer.write`; both are bytecode, both allocate, and either can drive a
+    // young collection that relocates this stream. Before this scope existed,
+    // `stream_fd` below dereferenced the PRE-CALL address and took a SIGSEGV
+    // in `gen_heap::get_field` — the reproducer was `GpuResidencyGc` under
+    // `-XX:+UseGenerationalGC` with the JIT on, which is what made
+    // `bench-gpu/residency-gc.sh` red on 2026-09-06. See
+    // [`args_with_live_receiver`].
+    let mut scope = NativeHandleScope::new(ctx);
+    let recv = match args.first() {
+        Some(Value::Object(Some(o))) => Some(scope.root(*o)),
+        _ => None,
+    };
     // LOCK-SCOPE (2026-07-21): see `stream_write` — the Java-interpreting
     // helpers must not run under the stdio print mutex; only the fd write
     // pair (text + separator) stays atomic.
-    let sep = host_line_separator(ctx);
-    if printstream_refuse_if_closed(ctx, args) {
+    let sep = host_line_separator(&mut *scope);
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    if printstream_refuse_if_closed(&mut *scope, args) {
         return;
     }
-    if surefire_forwarding_write(ctx, args, text, true) {
+    if surefire_forwarding_write(&mut *scope, args, text, true) {
         return;
     }
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
     // User/Tee streams: write text+separator as one buffer through `out`.
     // The SEPARATOR is encoded with the same charset as the text — it is
     // ASCII in every charset this reaches, but encoding the pair together is
     // what keeps a stateful encoder (a UTF-16 stream's BOM, say) consistent.
     let line = format!("{text}{sep}");
-    let encoded = printstream_encode(ctx, args, &line);
+    let encoded = printstream_encode(&mut *scope, args, &line);
     let buf: Vec<u8> = match encoded {
         Some(b) => b,
         None => line.as_bytes().to_vec(),
     };
-    if route_write_through_out(ctx, args, &buf) {
-        printstream_autoflush(ctx, args);
+    // The JDK encoder just ran.
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    if route_write_through_out(&mut *scope, args, &buf) {
+        let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+        printstream_autoflush(&mut *scope, args);
         return;
     }
-    if let Some(fd) = stream_fd(ctx, args) {
+    // `route_write_through_out` runs `Writer.write` on the path that returns
+    // FALSE too — it can attempt a sink and be refused — so the snapshot is
+    // rebuilt here as well. This is the read that crashed.
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
+    if let Some(fd) = stream_fd(&mut *scope, args) {
         let ok = with_stdio_print_lock(|| {
             // Both writes are attempted regardless, as before — `and` keeps
             // the first failure without turning the pair into a short-circuit
             // that would drop the separator after a partial text write.
-            let text_written = ctx.fd_table().write_bytes(fd, &buf);
+            let text_written = scope.fd_table().write_bytes(fd, &buf);
             let sep_written = Ok(());
             text_written.and(sep_written)
         });
         // RECORDED since W7-64 — see `stream_write`.
         if let Some(Value::Object(Some(this))) = args.first().copied() {
-            cratonvm_native_api::print_error_state::record_host_io_failure(&*ctx, this, ok);
+            cratonvm_native_api::print_error_state::record_host_io_failure(&*scope, this, ok);
         }
         return;
     }
@@ -28553,10 +28646,11 @@ fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str)
     // The sink FIELD separates them, which is why both `close()` natives now
     // null it. MEASURED — `CloseFlushSwallowProbe`'s
     // `psRouteErrorWriteDidNotRecordTrouble` and its `pw` twin.
+    let args = &args_with_live_receiver(&scope, args, recv.as_ref());
     if let Some(Value::Object(Some(this))) = args.first().copied() {
-        let has_sink = matches!(ctx.get_field_by_name(this, "out"), Value::Object(Some(_)));
+        let has_sink = matches!(scope.get_field_by_name(this, "out"), Value::Object(Some(_)));
         if !has_sink {
-            cratonvm_native_api::print_error_state::set_trouble(&*ctx, this);
+            cratonvm_native_api::print_error_state::set_trouble(&*scope, this);
         }
     }
 }

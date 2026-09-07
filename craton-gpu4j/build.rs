@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-// Build script for craton-gpu.
+// Build script for craton-gpu4j.
 //
 // Compiles the Java annotation source files using `javac` when available
 // and packages them into a jar with `jar` when available.
 //
 // The `.java` sources are not shipped inside this crate. They live in an
-// external standalone Maven project, the craton-gpu-java repo. The source
-// tree is located at build time via, in priority order: the
-// `$CRATON_GPU_JAVA_SRC` env override, a `craton-gpu-java` checkout beside
-// the CratonVM workspace, or on Windows only, the `C:/craton/...` default
+// external standalone Maven project, the gpu4j repo (formerly
+// craton-gpu-java). The source tree is located at build time via, in
+// priority order: the
+// `$CRATON_GPU_JAVA_SRC` env override, a `gpu4j` checkout beside the
+// CratonVM workspace, or on Windows only, the `C:/craton/...` default
 // install. When no source tree is found the build degrades gracefully to an
 // empty annotations directory plus a `cargo:warning=`; it never fails.
 //
@@ -41,20 +42,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Java sources moved to a standalone Maven project, the craton-gpu-java
-    // repo. They are not shipped inside this crate. Locate them via, in
-    // priority order:
+    // Java sources moved to a standalone Maven project, the gpu4j repo
+    // (formerly craton-gpu-java). They are not shipped inside this crate.
+    // Locate them via, in priority order:
     //   1. $CRATON_GPU_JAVA_SRC env var (full absolute path to a directory
     //      containing `craton/gpu/*.java`); a set-but-invalid value is
     //      diagnosed via cargo:warning and then ignored,
-    //   2. craton-gpu-java/src/main/java beside the CratonVM workspace
-    //      checkout (portable sibling checkout; tried on every platform),
-    //   3. C:/craton/gpu-java/src/main/java, then
-    //      C:/craton/craton-gpu-java/src/main/java (Windows-only defaults;
-    //      never consulted on Linux/macOS).
-    // Each checkout root is probed in both source layouts: the current
-    // aggregator one (<repo>/craton-gpu/src/main/java) and the pre-0.3.0
-    // flat one (<repo>/src/main/java). See `first_existing_layout`.
+    //   2. gpu4j/src/main/java (then craton-gpu-java/...) beside the
+    //      CratonVM workspace checkout (portable sibling checkout; tried
+    //      on every platform),
+    //   3. C:/craton/gpu4j, then C:/craton/gpu-java, then
+    //      C:/craton/craton-gpu-java (Windows-only defaults; never
+    //      consulted on Linux/macOS).
+    // Each checkout root is probed in every source layout the project has
+    // had: the current <repo>/gpu4j-core/src/main/java, the 2026-08-28
+    // aggregator <repo>/craton-gpu/src/main/java, and the pre-0.3.0 flat
+    // <repo>/src/main/java. See `first_existing_layout`.
     // If none exists, the build script emits empty paths and a warning. The
     // build never fails.
     println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
@@ -191,10 +194,11 @@ fn main() {
 /// 1. `$CRATON_GPU_JAVA_SRC`, treated as an absolute path to a directory
 ///    containing `craton/gpu/*.java`. A set-but-invalid value is diagnosed via
 ///    `cargo:warning=` and then ignored.
-/// 2. `craton-gpu-java/src/main/java` beside the CratonVM workspace checkout.
-///    This is portable and tried on every platform.
-/// 3. `C:/craton/craton-gpu-java/src/main/java`, a default install path
-///    consulted only on Windows.
+/// 2. A `gpu4j` (or legacy `craton-gpu-java`) checkout beside the CratonVM
+///    workspace. This is portable and tried on every platform.
+/// 3. `C:/craton/gpu4j`, `C:/craton/gpu-java` or
+///    `C:/craton/craton-gpu-java`, default install paths consulted only on
+///    Windows.
 ///
 /// Returns the first path that exists. If none exists, returns a
 /// platform-appropriate fallback; the caller discovers the absence and emits a
@@ -217,7 +221,7 @@ fn resolve_java_root() -> PathBuf {
     // AUDIT 2026-09-02: say when the build depended on a path that is
     // true of one machine.
     //
-    // Candidate 3 is an absolute install path — `C:/craton/gpu-java`,
+    // Candidate 3 is an absolute install path — `C:/craton/gpu4j`,
     // named in `platform_fallback_java_root` after the box it was
     // written on. When it is what resolved, the annotation classes in
     // this build came from a directory nothing in this repository
@@ -234,7 +238,7 @@ fn resolve_java_root() -> PathBuf {
     if resolution.used_absolute_fallback && resolution.path.is_dir() {
         println!(
             "cargo:warning=craton-gpu: annotation sources resolved from the machine-specific \
-             install path {}. This build is not reproducible elsewhere — the craton-gpu-java \
+             install path {}. This build is not reproducible elsewhere — the gpu4j \
              revision is not pinned by this repository. Set $CRATON_GPU_JAVA_SRC, or check the \
              project out beside the workspace, to make the source explicit.",
             resolution.path.display()
@@ -302,28 +306,58 @@ fn resolve_java_root_from(
     }
 }
 
+/// Every name the Java project's checkout directory has had, newest
+/// first. Tried as siblings of the workspace and, on Windows, under the
+/// absolute install root — see [`platform_fallback_java_root`].
+///
+/// 2026-09-06: the repository was renamed from `craton-gpu-java` to
+/// `gpu4j`. The old name stays here for the same reason the old source
+/// layouts stay in [`first_existing_layout`]: a checkout of either
+/// vintage has to keep resolving, because failing to resolve is silent.
+const CHECKOUT_NAMES: [&str; 2] = ["gpu4j", "craton-gpu-java"];
+
 fn documented_sibling_java_root(manifest_dir: &Path) -> PathBuf {
     let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
     let workspace_parent = workspace_root.parent().unwrap_or(workspace_root);
-    let checkout = workspace_parent.join("craton-gpu-java");
-    first_existing_layout(&checkout)
+    for name in CHECKOUT_NAMES {
+        let candidate = first_existing_layout(&workspace_parent.join(name));
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    // Nothing resolved: name the path a current checkout would use, so the
+    // `cargo:warning` points somewhere actionable.
+    first_existing_layout(&workspace_parent.join(CHECKOUT_NAMES[0]))
 }
 
-/// Both source layouts a craton-gpu-java checkout can have, newest first.
+/// Every source layout a gpu4j (formerly craton-gpu-java) checkout can
+/// have, newest first.
 ///
-/// 2026-08-28: that repo became a Maven aggregator, so its Java sources
-/// moved from `<repo>/src/main/java` down into
-/// `<repo>/craton-gpu/src/main/java`. Both are accepted, because this
-/// build script has to keep working against a checkout of either
-/// vintage — and because the failure it would otherwise produce is
-/// invisible. When no candidate resolves, the build does not fail: it
-/// emits an empty annotations directory and a `cargo:warning`, which is
-/// easy to miss and leaves a VM that silently recognises no
+/// Three vintages, and this build script has to keep working against a
+/// checkout of any of them, because the failure it would otherwise
+/// produce is invisible: when no candidate resolves the build does not
+/// fail, it emits an empty annotations directory and a `cargo:warning`,
+/// which is easy to miss and leaves a VM that silently recognises no
 /// `@GpuKernel` at all.
 ///
-/// Returns the aggregator layout when neither exists, so the
-/// `cargo:warning` names the path a current checkout would use.
+/// * `<repo>/gpu4j-core/src/main/java` — since 2026-09-06, when the
+///   repository and its modules were renamed to gpu4j.
+/// * `<repo>/craton-gpu/src/main/java` — from 2026-08-28, when that repo
+///   became a Maven aggregator.
+/// * `<repo>/src/main/java` — before that, when the repository root was
+///   itself the module.
+///
+/// Returns the newest layout when none exists, so the `cargo:warning`
+/// names the path a current checkout would use.
 fn first_existing_layout(checkout: &Path) -> PathBuf {
+    let current = checkout
+        .join("gpu4j-core")
+        .join("src")
+        .join("main")
+        .join("java");
+    if current.is_dir() {
+        return current;
+    }
     let aggregator = checkout
         .join("craton-gpu")
         .join("src")
@@ -336,16 +370,20 @@ fn first_existing_layout(checkout: &Path) -> PathBuf {
     if flat.is_dir() {
         return flat;
     }
-    aggregator
+    current
 }
 
 fn platform_fallback_java_root(sibling: PathBuf, is_windows: bool) -> PathBuf {
     if is_windows {
-        // The real checkout lives at C:/craton/gpu-java (not
-        // craton-gpu-java) on this box; the differently-named path is kept
-        // as a second candidate. Each is tried in both source layouts —
-        // see `first_existing_layout` for why there are two.
-        for root in ["C:/craton/gpu-java", "C:/craton/craton-gpu-java"] {
+        // The real checkout lives at C:/craton/gpu-java on this box — a
+        // directory name that matches neither the old repository name nor
+        // the new one — so it is kept as a candidate alongside both. Each
+        // root is tried in every source layout; see `first_existing_layout`.
+        for root in [
+            "C:/craton/gpu4j",
+            "C:/craton/gpu-java",
+            "C:/craton/craton-gpu-java",
+        ] {
             let candidate = first_existing_layout(&PathBuf::from(root));
             if candidate.is_dir() {
                 return candidate;
@@ -353,7 +391,7 @@ fn platform_fallback_java_root(sibling: PathBuf, is_windows: bool) -> PathBuf {
         }
         // Nothing resolved: name the path a current checkout would use, so
         // the `cargo:warning` points somewhere actionable.
-        return first_existing_layout(&PathBuf::from("C:/craton/gpu-java"));
+        return first_existing_layout(&PathBuf::from("C:/craton/gpu4j"));
     }
     sibling
 }

@@ -329,11 +329,29 @@ fn cached(
     }
 }
 
+/// This harness is about ROUTING and about the two backends AGREEING. The
+/// C1->C2 acceptance gate is a POLICY layered on top of that, and every probe
+/// here is a handful of bytecodes that by construction applies no transform the
+/// baseline tier lacks -- so under the default policy the gate refuses the IR
+/// body, `try_compile` falls back to single-pass, and this harness compares
+/// single-pass against itself.
+///
+/// That is not a weaker differential test, it is one that CANNOT FAIL: both
+/// arms are the same backend. On 2026-09-06 it turned 17 of these tests green
+/// for the wrong reason and red for the right one, which is how it was found.
+///
+/// Every compile helper in this file calls this first. Idempotent, and
+/// deliberately one-way -- see `force_accept_always_for_this_process`.
+fn routing_not_policy() {
+    cratonvm_jit::ir_evidence::force_accept_always_for_this_process();
+}
+
 fn compile_opt(
     cm: &CachedBytecodeMethod,
     helpers: &JitRuntimeHelpers,
     optimize: bool,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
         optimize, false, false, false, false, false, None,
@@ -386,6 +404,7 @@ fn compile_long_opt(
     helpers: &JitRuntimeHelpers,
     optimize: bool,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
         optimize, false, false, true, false, false, None,
@@ -400,6 +419,7 @@ fn compile_fp_opt(
     helpers: &JitRuntimeHelpers,
     optimize: bool,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
         optimize, false, false, false, false, true, None,
@@ -766,6 +786,7 @@ fn compile_ldc(
     fp: bool,
     ldc: &dyn Fn(u16) -> Option<cratonvm_jit::JitLdcConstant>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -1648,6 +1669,7 @@ fn compile_opt_fields(
     field_resolver: &dyn Fn(u16) -> Option<(usize, u8)>,
     optimize: bool,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     // No registered CompactLayout for this test's synthetic buffers -- None
     // (not a fabricated (0, false)) is the correct "no compact slot" value;
     // see cp_field_resolver's Option<(u32, bool)> contract in jit/src/lib.rs.
@@ -2375,6 +2397,7 @@ fn compile_with_dispatch(
     helpers: &JitRuntimeHelpers,
     invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -2408,6 +2431,7 @@ fn compile_with_dispatch_fp(
     helpers: &JitRuntimeHelpers,
     invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -4473,6 +4497,7 @@ fn compile_with_direct_callee(
     invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
     callee_compiler: &dyn Fn(&str, &str, &str) -> Option<(usize, bool)>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -5573,6 +5598,7 @@ fn compile_getstatic(
     optimize: bool,
     statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -5942,6 +5968,7 @@ fn compile_wide_getstatic(
     optimize: bool,
     statics: &dyn Fn(u16) -> Option<(u32, usize, u8, bool)>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -6242,6 +6269,7 @@ fn compile_with_dispatch_and_new(
     new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
     elidable_init_resolver: &dyn Fn(u16) -> bool,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         None,
@@ -6796,6 +6824,7 @@ fn compile_instanceof(
     new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
     name_resolver: &dyn Fn(u16) -> Option<String>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     try_compile(
         cm,
         Some(name_resolver),
@@ -6925,9 +6954,21 @@ fn ir_vs_singlepass_instanceof_not_yet_loaded_refuses_ir() {
     let name_resolver = name_resolver_for("pkg/Sub");
     let sp = compile_instanceof(&cm, &helpers, true, &deferred_resolver, &name_resolver)
         .expect("not-yet-loaded target must still compile, via single-pass fallback");
-    assert!(
-        !sp.used_ir_backend,
-        "cov-05: a not-yet-loaded instanceof target must refuse IR admission"
+    // 2026-09-06: this assertion was INVERTED, deliberately. A `instanceof`
+    // whose target class is not loaded is now replaced by an uncommon trap and
+    // the rest of the method compiles -- the class has never been loaded, so no
+    // path that has ever executed reached this site, which is a proof of
+    // coldness rather than a guess. `CRATONVM_JIT_IR_SITE_TRAP=0` restores the
+    // refusal, and that is what this asserts against rather than a constant.
+    // The unresolved-class trap is OPT-IN and off by default, and THIS TEST is
+    // why: it executes the very path the trap would sit on, so with the trap
+    // planted the compiled body returns the deopt sentinel instead of the
+    // object -- forever, on every call. See
+    // `ir::ir_unresolved_class_trap_enabled`.
+    assert_eq!(
+        sp.used_ir_backend,
+        cratonvm_jit::ir::ir_unresolved_class_trap_enabled(),
+        "by default a not-yet-loaded instanceof still refuses IR admission for the          whole method; the trap is reachable only under the opt-in"
     );
     let buf = make_object(&[1]);
     let obj = buf.as_ptr() as i64;
@@ -7004,6 +7045,7 @@ fn compile_checkcast(
     new_resolver: &dyn Fn(u16) -> Option<cratonvm_jit::JitNewSite>,
     name_resolver: &dyn Fn(u16) -> Option<String>,
 ) -> Option<CompiledMethod> {
+    routing_not_policy();
     compile_instanceof(cm, helpers, optimize, new_resolver, name_resolver)
 }
 
@@ -7085,9 +7127,21 @@ fn ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir() {
     let name_resolver = name_resolver_for("pkg/Sub");
     let sp = compile_checkcast(&cm, &helpers, true, &deferred_resolver, &name_resolver)
         .expect("not-yet-loaded target must still compile, via single-pass fallback");
-    assert!(
-        !sp.used_ir_backend,
-        "cov-05: a not-yet-loaded checkcast target must refuse IR admission"
+    // 2026-09-06: this assertion was INVERTED, deliberately. A `checkcast`
+    // whose target class is not loaded is now replaced by an uncommon trap and
+    // the rest of the method compiles -- the class has never been loaded, so no
+    // path that has ever executed reached this site, which is a proof of
+    // coldness rather than a guess. `CRATONVM_JIT_IR_SITE_TRAP=0` restores the
+    // refusal, and that is what this asserts against rather than a constant.
+    // The unresolved-class trap is OPT-IN and off by default, and THIS TEST is
+    // why: it executes the very path the trap would sit on, so with the trap
+    // planted the compiled body returns the deopt sentinel instead of the
+    // object -- forever, on every call. See
+    // `ir::ir_unresolved_class_trap_enabled`.
+    assert_eq!(
+        sp.used_ir_backend,
+        cratonvm_jit::ir::ir_unresolved_class_trap_enabled(),
+        "by default a not-yet-loaded checkcast still refuses IR admission for the          whole method; the trap is reachable only under the opt-in"
     );
     let buf = make_object(&[1]);
     let obj = buf.as_ptr() as i64;

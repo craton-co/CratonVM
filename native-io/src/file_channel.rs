@@ -652,7 +652,7 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     // `closer` is the `Cleanable` `register` just returned — one more freshly
     // allocated object held only in a Rust local, and `set_field_by_name`
-    // resolves a field name and can allocate. Root it for the one store.
+    // is the reference this stores. Root it for the store.
     let closer_h = match closer {
         Value::Object(Some(o)) => Some(scope.root(o)),
         _ => None,

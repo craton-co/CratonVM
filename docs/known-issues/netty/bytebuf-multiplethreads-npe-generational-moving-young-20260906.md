@@ -1,6 +1,6 @@
 # 19 netty classes fail on **Generational only** — the moving young cycle corrupts a live object
 
-**Status:** OPEN, but **currently MASKED on dev — see §0.** Found by a
+**Status:** OPEN, does not currently reproduce. **§0: my dev-movement attribution and bisect are RETRACTED; the credible root cause is another session's independent fix.** Found by a
 per-collector sweep of the full netty suite.
 **This is a correctness defect, not a throughput one**, and it is invisible to
 every run that uses the shipped default collector.
@@ -22,86 +22,124 @@ frame home. §7 has the amplifier that reproduces it 3/3.
 
 ---
 
-## 0. It no longer reproduces on dev, and that is NOT a fix (2026-09-06, late)
+## 0. SUPERSEDED BY §10 — read that first
 
-Re-checked on dev `da44c949a`, 80 commits after the binary this page was
-written against. Four of the 19 classes, 3 reps each, concurrent, plain
-`-XX:+UseGenerationalGC` — no amplifier, no verifier, the configuration a user
-would actually run:
+> **Everything in §0 was written before §10, and §10.4 has since found a
+> reproducer that needs no unsafe flag.** Specifically, §0.3's conclusion that
+> engagement is uncontrolled and that no lever should be tested against this
+> family is **WRONG AS OF §10.4**: `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` on
+> `io.netty.handler.ipfilter.UniqueIpFilterTest` gives ~30 relocating cycles a
+> run and SIGSEGV 3/13 on the merged tip. §0.1's pointer to the independent fix
+> and §0.2's retraction of my bisect both still stand; §0.3 does not. Use
+> §10.4's repro, and read §10.10 before trusting §7.
 
-| class | NPE | timeouts | moving cycles |
-|---|---:|---:|---:|
-| `DuplicatedByteBufTest` | 0 | 0 | 1 |
-| `BigEndianHeapByteBufTest` | 0 | 0 | 1 |
-| `SimpleLeakAwareByteBufTest` | 0 | 0 | 0 |
-| `SlicedByteBufTest` | 0 | 0 | 0 |
+## 0. It no longer reproduces (AS MEASURED THEN) — attribution RETRACTED
 
-**12 runs, zero failures.** And the reason is in the last column: **the moving
-young cycle has stopped running on this workload.** This morning the same
-workload took 9-24 moving cycles per run across four separately-built binaries;
-it now takes 0-1, and the collector says why:
+Two things happened after this page was first written, and they point opposite
+ways.
 
-```
-histogram: moving=0 non_moving=314 nonmoving-conservative-jit-roots=15
-                                   nonmoving-coverage-incomplete=299
-reason=unregistered-jit-frame-on-stack   (12 of 14 sampled)
-```
+### 0.1 The likely real fix, found independently
 
-Relocation is necessary for this defect (§3, §4). Relocation no longer happens,
-so the defect no longer fires. **Nothing here shows the corruption was fixed —
-it shows it is no longer exercised.**
+The internal fixed-bugs tree gained
+**`a-compiled-frame-keeps-a-young-reference-the-collector-moved-FIXED-20260906.md`**
+(commit `70c486744`, 10:07 on 2026-09-06) while this investigation was running.
+It describes this defect: a peer thread's compiled frames discharged from the
+cross-thread coverage obligation by PINNING their conservative roots, on the
+generational Cheney collector, which cannot honour a pin — so the object is kept
+alive at a NEW address with nothing having rewritten the peer's frame. Its
+stated scope is **Generational only, JIT only, multi-threaded only; G1 and ZGC
+never affected**, which is this family exactly (§1, §2), and its mechanism is a
+stale reference in a **compiled frame, outside the heap** — where §6's verifier
+dichotomy independently pointed. That page carries its own A/B (H2, 4/5 → 0/5,
+and 5/5 again with `CRATONVM_XT_PINNED_PEER_UNPINNABLE=1`).
 
-That has a specific and uncomfortable consequence. The refusal now dominating
-the histogram is the SAME mechanism the DoHead page documents as a
-Generational-only *throughput collapse* and dismisses as "not a correctness
-bug". On this workload that throughput bug is currently the only thing standing
-between the user and this correctness bug. **Whoever repairs moving-young
-engagement — the obvious and desirable performance fix — re-exposes this.** The
-green above is conditional on a collector declining to do its job.
+**Treat that as the credible root cause.** It is their evidence, not this
+page's.
 
-Not bisected: the shift is consistent across four binaries built today on one
-host, so it is attributed to dev movement rather than host state, but no arm
-rebuilt the old commit to confirm it. Two commits in this exact machinery landed
-in the window (`70c486744` peer pin credit, `65e7bffc2` peer pins G1-only).
+### 0.2 My own attribution is RETRACTED — the measurement is not stable
 
-### The obligation/flag mismatch, resolved — and what it exposes
+I tried to confirm that the netty family stopped reproducing because of dev
+movement, by building `8d83c7585` and running it interleaved against dev on one
+host. First attempt, 4 pairs:
 
-The decision line reads `unproven_obligation=unregistered-jit-frame-on-stack`
-while the live flag in the SAME line reads `unregistered_jit_frame=false`. It
-was filed here as a possible stale obligation. **It is not.** Both are set
-together at one site (`conservative_roots.rs`, the unregistered-frame branch),
-and both are reset once per collection. The reason they disagree is that they
-have **different scopes**:
+| binary | NPE | moving cycles |
+|---|---:|---:|
+| `8d83c7585` | 11 | 64 (15/19/17/13) |
+| dev | 0 | 1 |
 
-```rust
-#[cfg(not(test))] static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool   // PROCESS-GLOBAL
-#[cfg(not(test))] static MOVING_YOUNG_INCOMPLETE_REASON:   AtomicUsize  // PROCESS-GLOBAL
-                  thread_local! { UNREGISTERED_JIT_FRAME: Cell<bool> }  // PER-THREAD
-```
+That looked decisive, and a `git bisect run` over the 80 commits between them
+converged on `70c486744`. **Both results are withdrawn.** Re-running the SAME
+interleaved A/B, same binaries, same host, later the same evening, 6 pairs:
 
-The verdict and its reason are process-global first-wins atomics; the flag is
-the collecting thread's own. So the line is reporting a reason **some other
-thread** recorded next to a flag that only ever describes this one. Nothing is
-stale; two differently-scoped facts are printed as though they were one.
+| binary | NPE | moving cycles |
+|---|---:|---:|
+| `8d83c7585` | 0 | 4 (0/1/2/1/0/0) |
+| dev | 0 | 1 |
 
-**The substantive consequence.** `refresh_moving_young_coverage_for_current_thread`
-runs on every mutator at its root-snapshot deposit, and a mutator whose own
-frames are unproven sets the GLOBAL verdict. **One thread failing its own proof
-therefore refuses relocation process-wide for that cycle** — on a workload with
-many event-loop threads, that needs only one. This is the same blanket
-"any peer in JIT means unproven" behaviour the cross-thread handshake was built
-to replace (§7), re-entering through a different door: not the peer ledger, but
-the global verdict every thread can set. It is a plausible mechanism for the
-moving-cycle collapse in the table above, and it is fail-closed, so it costs
-throughput rather than correctness.
+The old binary now behaves like the new one. So:
 
-**And a coverage gap worth fixing on its own.** Under `#[cfg(test)]` those same
-two statics become `thread_local!` cells. The stated reason is sound — stop one
-test's deliberate "incomplete" from diverting another's collection — but the
-effect is that **every unit test of this decision path exercises per-thread
-semantics that production does not have.** No test in this machinery can
-observe one thread refusing another's cycle, which is precisely the behaviour
-that matters in a multi-threaded collector.
+* **the endpoint difference is not a property of the binaries** — the same old
+  binary gives 64 and then 4;
+* **the bisect is void.** Each step voted `bad` on `moving <= 2` over two reps,
+  and a breadth check confirmed the OLD binary reaches `moving=0-2` on five of
+  six classes unprompted. Most steps could be false verdicts, and the
+  convergence is an artifact of which step happened to catch a high reading.
+  Only `e24ff3173`'s 31 and the first A/B's 64 were ever unambiguous.
+
+### 0.3 What drives engagement — FIVE hypotheses tested, all refuted
+
+A deliberate hunt for a reliable trigger, each arm reporting the moving-cycle
+count. Every one came back empty:
+
+| hypothesis | test | moving cycles |
+|---|---|---:|
+| workload concurrency | 4 concurrent netty VMs | 0 |
+| the post-evacuation verifier | `MOVING_YOUNG_VERIFY=1` on/off | 0 vs 0 |
+| machine state from compiling | measured DURING a `cargo build --release -j 8` | **0** (3/3 runs reported) |
+| …and its control | quiet before the same build | 0 (3/3 reported) |
+| …and its other control | quiet after | **UNMEASURED — see below** |
+| heap size (the suite uses 1500m, probes used 1g) | `--Xmx 1500m`, `--Xmx 2g` | 0 / 0 |
+
+**The quiet-after control never ran.** Its three runs died with
+`timeout: failed to run command ... No such file or directory` because a cleanup
+step of mine deleted the binary while the arm was still executing. It is
+recorded as unmeasured rather than as a zero, because a run that could not start
+is not evidence about the collector — that distinction has already produced one
+wrong reading on this page. The quiet-vs-under-build comparison is unaffected:
+both those arms reported 3/3.
+
+(An earlier tally of mine put the quiet arm at 1 moving cycle. That was a glob
+bug — `quiet-*` also matched `quiet-after-*`. The harness's own figure, 0 across
+3/3, is the correct one.)
+
+The build-load arm is the one that hurts, because it was the best hypothesis:
+every run that reproduced today was interleaved with heavy build or suite
+activity, and every quiet run was not. Tested directly, that correlation is
+worth nothing — nine runs across quiet/under-build/quiet-again produced one
+moving cycle between them.
+
+**So the variance is UNEXPLAINED.** The same binary, same class, same heap, same
+two-VM interleaved design gave 64 moving cycles at 16:21 and 4 at 17:30 on one
+evening. Nothing tested since reproduces the high state.
+
+**SUPERSEDED — §10.4 solved this.** The conclusion drawn here was "do not test
+another lever until engagement is controllable", and the reasoning still holds
+for every arm in §0-§9: a green arm on a run that never relocated means "the
+collector did not relocate", not "the defect is gone". But the premise is no
+longer true. §10.1 identified the mask (`unrewritable_conservative_jit_roots`)
+and its kill switch, and §10.4 turned that into a repro needing no unsafe flag.
+
+Two things are worth keeping from the failed hunt anyway. The five refuted
+hypotheses above are still refuted, so nobody need re-run them. And the reason
+they all failed is instructive: I was varying the MACHINE, while the thing that
+gates relocation turned out to be a **flag-reachable divert inside the
+collector**. A trigger hunt that never reads the code it is trying to trigger
+searches the wrong space.
+
+**Consequence for anyone picking this up: you cannot currently reproduce this
+family on demand, and until you can, no lever tested against it means
+anything.** Establishing a reliable trigger for a moving young cycle on this
+workload is the prerequisite for every other question on this page.
 
 ## 1. The measurement that found it
 
@@ -660,3 +698,323 @@ Next measurement, replacing §8's list:
 2. Pair the census with the fault per CYCLE rather than per run.
 3. Do **not** re-run the widening arm; §10.8 is 113 VM launches and the answer
    is null.
+
+### 10.9 Correction to §10.8: the scalar/LICM zero is VACUOUS, and `unclassified` means something else
+
+§10.8 said the `region=unclassified` words are the surviving lead because
+`FrameLayout::region_name` "cannot place them, which is exactly how a
+scalar-replacement or LICM hoist slot would present". **Both halves of that are
+wrong, and the correction points somewhere different.**
+
+**`region_name` already classifies all three.** Its ladder names
+`scalar-replaced-field`, `licm-ref-hoist` and `licm-arith` before it reaches
+anything else. So an unnamed word is not an unnamed scalar/hoist slot; those
+have names and would have used them.
+
+**And their zero is vacuous, which is worse.** Across every log this branch
+produced — 8 naming-probe reps plus every other armed run — the tally is:
+
+```
+13064 region=operand-spill
+ 6071 region=safepoint-gpr-spill-image
+ 5620 region=callee-saved-gpr-image      (these are [jit-register-image-remap]
+ 4829 region=outgoing-args-or-deopt-regs  lines, i.e. the 2026-08-23 repair
+  315 region=java-local                   doing its job, not stale words)
+   21 region=unclassified
+```
+
+`scalar-replaced-field`, `licm-ref-hoist`, `licm-arith` and
+`reserved-locals-tail`: **zero occurrences, in either stream.** That is not
+evidence they are clean. `x64/frames.rs` builds `scalar_lo/scalar_hi` from
+`self.scalar_replaced` and `ref_hoist_lo/ref_hoist_hi` from
+`self.hoist_offsets`, both of which are `(0, 0)` when the optimisation produced
+no slots — and `region_name`'s `hit()` requires `hi > lo`. **On a frame where
+scalar replacement and LICM did not fire, those regions do not exist and no word
+can land in one.** A zero from a region with no extent says nothing about the
+region; it says the optimisation did not run.
+
+So §8's two surviving candidates are **untested on this workload, not
+eliminated**, and the prerequisite for testing them is an engagement census —
+does scalar replacement or LICM hoisting produce any slots at all in the netty
+methods live at the fault? `moving-young-corruption-rootcause.md` hit the same
+wall from the other side: its `BinTreesClassic.bottomUpTree` frame was
+`FrameLayout { scalar_lo: 0, scalar_hi: 0, ref_hoist_lo: 0, ref_hoist_hi: 0 }`,
+which is why that page's §3 verdict was right in shape and wrong in mechanism
+for that benchmark.
+
+**What `unclassified` actually is.** Reading the ladder rather than guessing at
+it: the final `else if self.reg_spill_hi > 0 && off >= self.reg_spill_hi`
+catches everything past the safepoint spill, so `unclassified` is only reachable
+when **`reg_spill_hi == 0`** — a frame `x64/frames.rs` built with
+`reg_spill_base == 0 || !safepoint_reg_spill`, i.e. one with no safepoint
+register spill at all — at an offset past the spill area. 21 such words across 8
+reps, in three methods:
+
+```
+io/netty/channel/DefaultChannelPromise.setSuccess:()L…;                 off=448
+io/netty/channel/ChannelInitializer.initChannel:(L…;)Z                  off=528
+io/netty/channel/AbstractChannelHandlerContext.findContextInbound:(I)L…; off=544
+```
+
+That is a real and much narrower question — *why does a live compiled frame have
+no safepoint register spill, and what is in its tail?* — but it is a different
+question from §8's, and it should not be filed under §8's heading.
+
+**Method note.** This is the same engagement trap the rest of this page is
+careful about, one level further down: §10.8 read a zero from a census without
+first asking whether the thing being counted could occur. The check is one
+question — *does this region have a non-empty extent in the frames I am
+measuring?* — and it costs nothing to ask before the count is believed.
+
+### 10.10 §7's "the ledger never accepts" is STALE — and that makes §8 testable for the first time
+
+§7 states, and §10.2 repeated: *"on this workload it never accepts: 0
+`accounted=true` out of 750 decisions"*, from which §10.2 concluded that every
+failure ever measured came from relocating under peers that proved nothing, and
+that "the precise maps are incomplete" had therefore never been tested.
+
+**On current dev the ledger accepts, and it is not close.**
+`CRATONVM_DBG_XT_COVERAGE=1` under the §10.4 repro, six reps:
+
+```
+@@PEERTOTAL proven=144 accounted_true=237 peer_decision_lines=650 crashes=2/6
+```
+
+**237 of 650 peer decisions accept.** And they accept on genuine proofs, not on
+the pin credit this branch closed — every accepting line has `pinned=0` and
+`proven` equal to `peer_depth`:
+
+```
+29 x  [xt-coverage] peer_depth=1 proven=1 pinned=0 pins_honoured=false accounted=true
+ 7 x  [xt-coverage] peer_depth=2 proven=2 pinned=0 pins_honoured=false accounted=true
+ 3 x  [xt-coverage] peer_depth=3 proven=3 pinned=0 pins_honoured=false accounted=true
+ 1 x  [xt-coverage] peer_depth=4 proven=4 pinned=0 pins_honoured=false accounted=true
+```
+
+**And the accepting cycles are the relocating cycles.** Across two four-rep
+arms, `accounted_true` tracks `moving-jit-coverage-proven` almost exactly —
+205 vs 207, and 148 vs 154. The cycles that relocate are the cycles whose peers
+deposited a proof.
+
+So the configuration that crashes is: **peers proved their own frames
+rewritable, the collector relocated on that proof, and the heap was corrupted
+anyway.** That is §8's hypothesis with an arm under it, and it removes the
+confound §10.2 raised. Precise-only under-coverage is now the live reading, and
+for the first time it is being tested rather than bypassed.
+
+**Two readings that are NOT safe to take from the numbers above.**
+
+* `proven=0` on the two crashed reps is an **artifact**, not a zero: a SIGSEGV
+  skips the exit trailer, and those logs contain zero `[GC]` lines at all.
+  Only the four completed reps contribute a `proven` count.
+* Why §7's number was 0 and this one is 237 is **not established**. My
+  hypothesis was the A5 residue filter — it screens a false positive in
+  `refresh_moving_young_coverage_for_current_thread`, which is the very function
+  each peer runs in `publish_peer_jit_coverage_for_stw` before depositing, so
+  fixing the peer's own proof should make peers start depositing. **Refuted on
+  its own kill switch:** `CRATONVM_JIT_A5_RESIDUE_FILTER=0` gives
+  `accounted_true=148/378` against `205/508` with it on — 39 % vs 40 %, no
+  effect. Something else between §7's binary and dev opened the ledger, and this
+  page should not guess at it a second time.
+
+**What this changes about where to look.** The stale reference is held by a
+frame whose peer proof SUCCEEDED. The remap covers the oop-map slots and the
+callee-saved GPR image; §10.8 measured that rewriting the entire remaining
+unverifiable tail changes nothing. So the surviving candidates are not frame-band
+memory at all — they are the channels the proof asserts and the remap does not
+walk: a resumed register that is reloaded from somewhere other than the
+callee-saved image, or the shadow stack. That is the next measurement, and it is
+a different one from §8's screens.
+
+### 10.11 92 of 109 relocating cycles ran with a peer whose registers the codebase says are not rewritable
+
+`vm/src/threading/thread_state.rs` assigns every `ThreadExecState` a
+`RelocationRule`, and one of them carries an explicit obligation:
+
+```rust
+// Registers and JIT spill slots are not rewritable, so a
+// collection that contributes a frozen peer's conservative roots
+// must call `gc_quiescence::mark_moving_young_coverage_incomplete_because`
+// (or pin the peer's G1 regions).
+ThreadExecState::CompiledUninterruptible => RelocationRule::Forbidden,
+```
+
+`ThreadStateCensus::relocation_blockers()` exists to state the same thing —
+"a non-zero answer is the shadow-side statement of the
+`mark_moving_young_coverage_incomplete_because` obligation". **Nothing outside
+`thread_state.rs` consults `relocation_rule()`**; it has exactly one caller, in
+its own file. So the obligation is discharged, or not, by unrelated code, and
+nothing pairs the two.
+
+`CRATONVM_DBG_RELOCATION_BLOCKERS=1` (added with this section) prints the
+per-state census at the site that decides. Under the §10.4 repro, four reps:
+
+| | relocating cycles | with a `CompiledUninterruptible` peer |
+|---|---:|---:|
+| `coverage_proven=true` | 109 | **92 (84 %)** |
+| `coverage_proven=false` | 205 | 83 (40 %) |
+
+A representative relocating line:
+
+```
+[reloc-blockers] coverage_proven=true blockers=1 (java=0 vm=0 native=0 deopt=0
+                 compiled_uninterruptible=1 parked=1 blocked=2)
+                 moving_young=true osr_fallback=false incomplete=false
+```
+
+`java=0 vm=0`, so the blocker is **not the initiator** — it is a peer thread
+inside compiled code, uninterruptibly. And `incomplete=false`: no caller marked
+the cycle. **The obligation that state's own comment states was not discharged,
+and the collection relocated.**
+
+Note the direction of the association: a relocating cycle is *more* likely to
+have such a peer (84 %) than a non-relocating one (40 %), which is the opposite
+of what the contract asks for.
+
+**Why this fits every constraint this page has accumulated**, where the
+frame-coverage story does not:
+
+* it needs **peers** — every failing test is a `*MultipleThreads` one (§2);
+* the stale reference is **outside the heap** — §6's verifier reads ~0 missed
+  heap rewrites, and a peer's REGISTERS and JIT spill slots are not heap and not
+  frame-band memory;
+* rewriting frame-band memory **does not help** — §10.8, the whole unverifiable
+  tail rewritten, 2/32 vs 11/81, no effect. A register in a thread the collector
+  never walks is not reachable from any of those passes;
+* **G1 and ZGC are unaffected** (§1) — the comment's own parenthesis says why:
+  "or pin the peer's G1 regions". They pin; a Cheney copy cannot
+  (`honours_conservative_pins() == false`), which is §10.1's finding one level
+  up;
+* the **pin credit made it worse** (§10.3) — it manufactured `accounted=true` on
+  exactly these cycles;
+* and `unrewritable_conservative_jit_roots` (§10.1) **refuses precisely this
+  population**, which is why the current default is green and why §0's warning
+  that repairing engagement re-exposes the bug is exactly right.
+
+**What is NOT claimed.** No per-cycle pairing between a `CompiledUninterruptible`
+peer and the fault has been taken — these four reps did not crash, and 84 % is an
+association, not a demonstration that this cycle corrupted that object. The next
+measurement is that pairing: record the peer's register file at the park, and
+after the collection check whether any of its words is a `pointer_map` key.
+`scan_peer_shadow_window` and the helper-window pass already capture a frozen
+peer's GPRs for G1's pin set, so the capture exists and only the comparison is
+missing.
+
+**And a correction to the diagnostic itself, made in the same commit.** Its first
+form printed only `relocation_blockers()` and read `blockers=1` on all 452
+decisions, relocating and not, never 0 — a constant that discriminates nothing.
+That is because `JavaRunning`/`VmRunning` are also `Forbidden`, so on many cycles
+the count is just some running thread. The per-state breakdown is what separates
+"a peer is uninterruptibly in compiled code" from "somebody is running", and
+`relocation_blockers()` on its own should not be used as the obligation oracle
+its doc describes.
+
+## 11. The pairing §10.11 asked for: it is the SPILL SLOTS, not the registers
+
+§10.11 left this explicitly open — *"no per-cycle pairing between a
+`CompiledUninterruptible` peer and the fault has been taken … the next
+measurement is that pairing: record the peer's register file at the park, and
+after the collection check whether any of its words is a `pointer_map` key."*
+Taken, on Windows, with §10.4's repro.
+
+**`CRATONVM_DBG_PEER_REG_PAIRING=1`** (added here) captures a frozen peer's
+words while it is suspended — both freeze paths, `scan_context` for the
+take-over and the helper-window band — and `gen_heap` intersects them with
+`pointer_map` after the Cheney copy. `pointer_map` is exactly the set of
+from-space addresses the cycle relocated, so an intersection is a thread that
+resumes holding a vacated address.
+
+### 11.1 §10.4 reproduces on Windows
+
+Six reps, `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`, plain
+`-XX:+UseGenerationalGC --Xmx 1g`: **1 hard crash, 202 relocating cycles over 5
+reported reps (~40 a run).** The face is the same as their Linux SIGSEGV:
+
+```
+EXCEPTION_ACCESS_VIOLATION (0xC0000005) at pc=0x0000027D36440F01
+Faulting access: read at address 0x0000027CEC5286AF     <- unaligned
+thread: "pool-1-thread-1"                               <- a PEER
+gc young-gen actual: 27 moving cycle(s), 21 diverted
+jit: guarded compiled frames live process-wide: YES
+```
+
+The pc is outside the exe module: compiled code on a worker thread reading a
+malformed address. **This also finally settles §0.3** — engagement is
+controllable, by a flag, exactly as §10.1 found by reading the collector.
+
+### 11.2 The registers are CLEAN
+
+First cut captured the GPR block only — every word, before any root filter,
+since pre-filtering with the predicate the collector already trusts would beg
+the question:
+
+| reps | relocating cycles | captured register words | **stale** |
+|---:|---:|---:|---:|
+| 3 (one crashed) | ~176 | 32–80 per cycle | **0** |
+
+**Zero, on runs including one that crashed with the instrument armed.** That
+refutes the half of the `CompiledUninterruptible` contract everyone would have
+bet on — it is the half §10.11's 84 % association pointed at, and the half the
+register scan was originally written for ("the truncated-r10 SIGSEGV
+signature").
+
+### 11.3 The SPILL SLOTS are where the stale references are
+
+The state's comment names two things: *"registers **and JIT spill slots** are
+not rewritable"*. Spill slots are on the peer's stack, which the same freeze
+path already copies for its conservative scan. Capturing those too:
+
+| rep | relocating cycles | captured | **stale words** | crashed |
+|---:|---:|---:|---:|---|
+| 1 | 58 | 2194 | **684** | no |
+| 2 | — | 3243 | **276** | **YES** |
+| 3 | — | 2314 | **84** | **YES** |
+| 4 | 52 | 4243 | **600** | no |
+
+**Every hit is on the stack side; none on the register side.** A representative
+line, from a rep that crashed:
+
+```
+[peer-reg-stale] os_tid=6648 reg=r255 holds 0x20169a19940 -> RELOCATED to
+                 0x20151ae0000 (java/util/concurrent/FutureTask)
+                 -- this thread resumes with a vacated address
+```
+
+(`r255` is the marker for the stack side; registers are r0–r15.)
+
+So the chain is closed end to end, and every link is measured rather than
+inferred:
+
+1. the cycle relocates a live `FutureTask` from `0x20169a19940` to
+   `0x20151ae0000` and records the move in `pointer_map`;
+2. a peer thread is frozen in `CompiledUninterruptible`, and its **JIT spill
+   slot still holds the old address**;
+3. **nothing rewrites it** — a spill slot is not heap (§6's verifier reads ~0
+   missed heap rewrites on exactly these cycles), not frame-band memory
+   (§10.8 rewrote the whole unverifiable tail to no effect), and no pass in
+   this collector walks a frozen peer's stack to update it;
+4. the peer resumes and eventually dereferences it →
+   `EXCEPTION_ACCESS_VIOLATION` at a JIT pc, reading an unaligned address.
+
+### 11.4 What is NOT claimed
+
+**Hundreds of stale words per run, and only some runs crash.** A stale spill
+slot is necessary but not sufficient: the peer must go on to actually
+dereference that particular slot. So this demonstrates the mechanism, and does
+NOT claim that any specific one of the 684 caused any specific fault — the
+per-word link to the faulting address is a further measurement.
+
+The stack capture is gated on the collector's own `is_obj` while the register
+capture was not. That is defensible for this question — a `pointer_map` key is
+by construction an object the collector considered live, so `is_obj` accepts it
+— but it means the stack figures are "words the collector would treat as
+objects", not every word.
+
+### 11.5 What this says about the fix
+
+§10.1's `unrewritable_conservative_jit_roots` divert is the current default and
+refuses exactly this population, which is why the tip is green. The measurement
+above says that refusal is not conservatism — **the cycles it declines really do
+leave vacated addresses in resumed peers' spill slots.** Any work to restore
+moving-young engagement has to rewrite those slots (or pin, as G1 and ZGC do and
+Cheney structurally cannot), not merely re-prove the frames.

@@ -114,7 +114,7 @@ Measured 2026-09-06 with the command above, one directory at a time.
 |-------|----:|-------|----:|
 | `native-builtins` | 742,000 | `native-awt` | 18,000 |
 | `vm` | 472,000 | `types` | 43,000 |
-| `jit` | 249,000 | `native-api` | 36,000 |
+| `jit` | 262,000 | `native-api` | 36,000 |
 | `gc` | 184,000 | `reader` | 17,000 |
 | `native-collections` | 86,000 | `jfr` | 20,000 |
 | `native-io` | 82,000 | `jit-cuda` | 14,000 |

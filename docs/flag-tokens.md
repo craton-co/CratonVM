@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-530 tokens.
+533 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -217,6 +217,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `peer-reg-pairing` | `CRATONVM_DBG_PEER_REG_PAIRING` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
 | `markclear` | `CRATONVM_DBG_MARKCLEAR` |
@@ -379,6 +380,7 @@ export inherited from a parent shell.
 | `monenter` | `CRATONVM_DBG_MONENTER` |
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
 | `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
+| `relocation-blockers` | `CRATONVM_DBG_RELOCATION_BLOCKERS` |
 | `jit-remap-all-unverifiable` | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
@@ -398,6 +400,7 @@ export inherited from a parent shell.
 | `nocode` | `CRATONVM_DBG_NOCODE` |
 | `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
 | `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
+| `null-field-provenance` | `CRATONVM_DBG_NULL_FIELD_PROVENANCE` |
 | `npe-none` | `CRATONVM_DBG_NPE_NONE` |
 | `npe-match` | `CRATONVM_DBG_NPE_MATCH` |
 | `a5-engagement` | `CRATONVM_DBG_A5_ENGAGEMENT` |
@@ -596,7 +599,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-376 tokens.
+389 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -756,6 +759,18 @@ export inherited from a parent shell.
 | `call-frame-dedupe` | `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `deferred-new-retry-blind` | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND` |
+| `deferred-new-looks` | `CRATONVM_JIT_DEFERRED_NEW_LOOKS` |
+| `ir-site-trap` | `CRATONVM_JIT_IR_SITE_TRAP` |
+| `ir-scalar-intrinsics` | `CRATONVM_JIT_IR_SCALAR_INTRINSICS` |
+| `ir-aastore` | `CRATONVM_JIT_IR_AASTORE` |
+| `ir-check-elim` | `CRATONVM_JIT_IR_CHECK_ELIM` |
+| `ir-bce-range` | `CRATONVM_JIT_IR_BCE_RANGE` |
+| `ir-hot-layout` | `CRATONVM_JIT_IR_HOT_LAYOUT` |
+| `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
+| `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `c2-accept` | `CRATONVM_C2_ACCEPT` |
+| `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
+| `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |
 | `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `ir-param-copy` | `CRATONVM_JIT_IR_PARAM_COPY` |
 | `ir-rpo-layout` | `CRATONVM_JIT_IR_RPO_LAYOUT` |
@@ -923,6 +938,7 @@ export inherited from a parent shell.
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
 | `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
+| `tier-pgo-c2-window` | `CRATONVM_TIER_PGO_C2_WINDOW` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |

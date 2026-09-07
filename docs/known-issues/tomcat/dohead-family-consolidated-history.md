@@ -24,9 +24,10 @@ Every one of these was found, root-caused, and fixed against DoHead-family repro
 | 07-14 (found) / 07-15 (fixed) | `dohead-residual-http2-midrun-hang-FIXED.md` | **A:** `ThreadRegistry` resolved `Thread` mirrors by raw pointer; a recycled dead-thread address aliased a live new `Thread`, producing spurious `IllegalThreadStateException`/lost wakeups. **B:** `DirtyBufferGuard::drop` on thread exit discarded a dying thread's buffered old→young card-table edges — conflating "no live stack roots" with "no live heap edges the thread's writes created," corrupting the static `FastHttpDateFormat`→`ConcurrentLinkedQueue` chain used for HTTP Date headers. | **A:** identity re-keyed on `Thread.tid`. **B:** "retain-and-reap" — a dying thread's non-empty card buffer stays registered and gets drained by the next STW `flush_all` instead of being dropped. |
 | 07-15 → 07-21 (many checkpoints, C17-C46) | `dohead-post-fix-sporadic-residuals-FIXED.md` | A long tail of distinct bugs surfaced only after the bigger ones above stopped masking them: zero-slot `HashMap$Node` allocations in `HttpURLConnection.getHeaderFields()`/`System.getenv()`; an HTTP/2 selector interest-change race (Linux); **an OSR/exception-table gap** — `compile_osr_artifact()` only bailed OSR on a direct `athrow`, not on any non-empty exception table, so OSR-compiled callers silently lost real try/catch for callee-thrown exceptions; unpinned `ObjectRef` locals in `native_map_remove_pinned` across a GC-capable `equals()` call, corrupting the response header map; **unpinned `this` in `native_bos_flush_locked`/`_write_locked`/`_write_bulk_locked`** (`BufferedOutputStream`) across `invoke_virtual` — identified as the root cause of most of what had been miscategorized as "environmental flakiness" since 07-15. | `eda677f45`→`62693f104` (RBC.6b OSR exception-table bail); `955031d30`→`bb266fb8e` (pin/refresh map chain nodes); `1360cd9ab` (pin `this` across the BOS native calls). |
 | 07-21 → 07-23 | `dohead-environmental-transport-flake-FIXED.md` | The residual ~1-2% flakiness left after the above turned out to be more instances of the *same* unpinned-`ObjectRef`-across-allocation shape, scattered across native I/O receivers, JULI/`LogManager`, `MessageBytes`, `HttpURLConnection`, `HashSet`/`HashMap.remove` in `ThreadPoolExecutor.processWorkerExit`, a `ClassLoader` OOB field probe, `Objects.hash(Object[])`, and a stale pre-park `Reference`/`ReferenceQueue` snapshot. Also, separately: a JIT compiler defect in JUnit's own `TestClass.collectAnnotatedMethodValues` (a compiled enhanced-for iterator local going null). | Root every native-held `ObjectRef` across allocating/collecting boundaries; keep only the one JUnit iterator helper interpreted. 64/64 PASS, no-JIT and JIT, at closure. |
+| 09-05 (found) / 09-06 (fixed) | `gen-atomicreference-getandset-null-receiver-doheadhttp2-FIXED-20260906.md` | `native_atomic_ref_get_and_set` opened `unsafe_obj(args, 0).unwrap()`, as did 14 sibling `Atomic{Long,Reference}` natives, so a receiver arriving as `Value::Object(None)` — or an `args` slice with no receiver slot — panicked inside the native instead of raising NPE. Reported on Azure as three `CRASH` classes; the process survived every one, and the harness's `panicked at` grep filed them beside real `rc=139` segfaults. The page's own hypothesis (a marshalling defect at the JIT call site) is REFUTED: every dispatch door raises NPE for a null receiver before any native runs, so the receiver was already null in the field it came from — i.e. one face of the live-reference loss in Parts 2/5, not a separate defect. | `atomic_receiver` on all 15 sites: raises the `NullPointerException` JVMS `invokevirtual` specifies and prints args, the Java stack and (under `RUST_BACKTRACE`) the Rust one. The unwrap no longer exists, so the reported crash cannot recur; a lost receiver is now REPORTED rather than fatal, and fired zero times across 65 Generational class-runs on two platforms. Harness fixed on Azure: `panic` is its own results.csv column and a JUnit summary decides `status`. |
 | (unresolved) | `dohead1023-http2-index0-socketexception-likely-host-contention.md` | One single sub-test, `TestHttpServletDoHeadInvalidWrite1023ValidWrite1023`'s `testDoHeadHttp2[0]`: a `SocketException: Connection aborted (WSAECONNABORTED)` on the very first HTTP/2 preface read. Never confirmed as a CratonVM bug or refuted — best guess is Windows scheduler starvation under heavy shared-host load. **Left open, low-confidence, not chased further.** A sibling failure in the same original log (`testDoHeadHttp2[25]`, a `Thread.setPriority()` NPE) *was* a confirmed bug and was fixed separately (`populate_real_thread_holder`, `3e7f4a30`/`34faddd9`) — not the subject of this doc. | — |
 
-**Net effect of Part 1:** by 2026-07-23, the DoHead family was passing 64/64 clean, both JIT and no-JIT, 3,509 native-lib tests green. Every bug above is closed. None of them explains what's described in Part 2.
+**Net effect of Part 1:** the 09-06 row is a later addition — the eight rows above it closed by 2026-07-23, when the DoHead family was passing 64/64 clean, both JIT and no-JIT, 3,509 native-lib tests green. Every bug above is closed. None of them explains what's described in Part 2.
 
 ## Part 2 — the mechanism that's still open: `[moving-young] fallback`, Generational-only
 
@@ -63,7 +64,7 @@ Ran the complete 651-class Tomcat suite under all three GC backends in parallel 
 
 ## Where this leaves things
 
-- **No action needed on the correctness front.** Part 1's eight bug classes are all closed and don't need revisiting.
+- ~~**No action needed on the correctness front.**~~ **STALE — see Parts 4 and 5.** Part 1's bug classes are indeed closed, but this bullet generalised from them to the whole family and that no longer holds: on a fast host these classes FINISH and FAIL rather than hang, with reference fields reading null. Part 5 measures the correctness residual and what its disappearance is and is not worth.
 - **The Generational-only throughput collapse is understood, not mysterious, and not new.** It's the same `[moving-young] fallback` mechanism already root-caused architecturally (`moving-young-corruption-rootcause.md`) and already observed at exactly this scale on 08-10. This page adds: it survives a 3000s budget too, and it is cleanly GC-specific (G1 and ZGC both pass the same classes without triggering the mechanism at all).
 - **This is already mitigated at the product level**: ZGC has been the shipped default since 2026-08-10 specifically because it cannot exhibit this class of fallback. Anyone hitting this is doing so under an explicit `-XX:+UseGenerationalGC`.
 - **A real fix, if ever undertaken, is the same one named throughout Part 2**: precise oop maps or a shadow stack for compiled frames, so `moving_young_coverage_complete()` can actually certify what it currently has to assume. That is a substantially larger undertaking than anything in Part 1, and nothing in this investigation's history suggests a smaller intervention (timeout increases, isolated fallback-reason fixes like `innermost_frame_method`) will clear the DoHead family specifically — the Spring Boot investigation already found that two of its four classes needed a collector switch, not a fix, for exactly this reason.
@@ -155,3 +156,119 @@ premise this page's verdict leans on — "falling back to non-moving is
 safety-first" — no longer holds unconditionally project-wide, and that is
 worth knowing before treating any future DoHead-family symptom as "just
 throughput" without checking.
+
+## Part 5 — 2026-09-06: the CORRECTNESS residual, and what "does not reproduce" is worth
+
+Part 4 above asks how much of today's full-suite total is the moving-young
+mechanism versus host contention. This part answers the neighbouring question
+for the CORRECTNESS half — the `ReentrantLock.sync` NPE, not the timeouts —
+and it reaches Part 4's observation by a different route: Part 4 saw
+`no collection has run yet`, i.e. relocation had stopped; the measurements
+below quantify exactly that and then divide it out.
+
+### The interleaved control, and why its raw run counts could not settle it
+
+Interleaved control -- one box, the same minutes, 4-way parallelism, arms
+alternated round by round, 900 s cap on both so a hang cannot pass as a pass:
+
+| arm | runs | OK | non-OK | truncated | NPE lines |
+|---|---:|---:|---:|---:|---:|
+| the binary that measured 5/24 earlier today | 24 | 22 | **2** | 0 | 2 |
+| current `dev` | 24 | **24** | **0** | 0 | 0 |
+
+Both surviving failures on the old binary are this residual's exact signature
+(`Http2TestBase$TestInput.fill:1094`). Mean completed-run duration is
+equivalent -- 101.1 s old, 99.0 s new -- so the newer binary is not passing by
+running slower or by dying early, and neither arm truncated. Counting an
+earlier plain-vs-instrumented sweep on the same build, current `dev` is
+**0 failures in 72 runs** — subject to the masking caveat below, which is
+the first thing to read here.
+
+**MASKED, NOT FIXED — and this is the load-bearing caveat.** This defect
+REQUIRES young relocation (`CRATONVM_NO_MOVING_YOUNG=1` took it to 0/24). Young
+relocation is currently being refused on this workload: every
+`[moving-young]` line in BOTH arms of the run above is a `fallback` with
+`reason=unregistered-jit-frame-on-stack` (217 old, 216 new), and a
+`CRATONVM_GC_STATS=1` census shows the surviving moving cycles are not equal
+between the arms either:
+
+| arm | moving young cycles | non-moving |
+|---|---:|---:|
+| old binary | 7 and 3 (two runs) | 14, 23 |
+| current dev | 1 and 3 (two runs) | 25, 22 |
+
+Small sample (two runs per arm), but the direction is unambiguous and it is
+confounded with the result: the arm that failed relocated ~2.5x more than the
+arm that did not. **A relocation-gated defect not firing in the arm that
+relocates less is not evidence of a repair.**
+
+`docs/known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+reaches the same conclusion independently for its own 19 classes, and states the
+consequence plainly: the refusal now suppressing relocation is the SAME
+`[moving-young] fallback` this page's Part 2 documents as a *throughput*
+problem, so **whoever repairs moving-young engagement re-exposes this
+correctness bug**. The green is conditional on the collector declining to do its
+job.
+
+**Also a REPRODUCTION result, not a root cause.** Two further limits:
+
+* The old binary's rate TODAY is 2/24 (~8%) against 5/24 (~21%) when this
+  residual was characterised. The host is less sensitive than it was, so 72
+  clean runs prove less than 72 runs at the earlier sensitivity would.
+* **No commit is credited.** `dev` took many GC commits in the interval,
+  including one that landed a moving-young root cause and was then WITHDRAWN by
+  its author. Attributing the disappearance to any of them would be a guess.
+
+**The shape to look for if it returns**, since the characterisation cost more
+than the disappearance did: the victim is
+`java.util.concurrent.locks.ReentrantLock.sync` -- null at `unlock()` and
+non-null at `lock()`, so the slot is live entering the critical section and zero
+leaving it, while the owning thread is blocked INSIDE it. Seen on two unrelated
+instances and paths (`NioSocketImpl.readLock` on the HTTP/2 client read,
+`LinkedBlockingQueue.takeLock` under `TaskQueue.take` on a worker). Gated on
+young relocation, and Generational-specific rather than moving-young-generic:
+G1 relocates young objects and never exhibited it.
+
+**Instruments that make this findable again**, because the default symptom names
+the wrong object: JUnit sees only a messageless NPE at `TestInput.fill:1094`,
+which reads as a zeroed `private final InputStream` and is not.
+`CRATONVM_DBG_NPE_NONE=1` shows the raise is Rust-side with `fill` as the
+DEEPEST Java frame; `CRATONVM_DBG_STTRACE=1` recovers the compiled frames that
+already left the stack, whose deepest is `ReentrantLock.unlock`; and
+`ReentrantLock.unlock()` is `sync.release(1)`. Without the STTRACE snapshot the
+six JDK frames holding the answer are invisible.
+
+#### Resolved by normalising on relocation exposure
+
+The masking caveat above was the right question and the wrong answer. Current
+dev *does* relocate less — but that does not account for the green, and the way
+to show it is to stop counting runs and count the gated event.
+
+The defect fires only on a MOVING young collection, so failures per moving
+cycle is the rate that means anything. `CRATONVM_GC_STATS=1` in both arms,
+interleaved, 3 rounds, 8 classes:
+
+| arm | runs | non-OK | moving cycles | failures per 100 moving cycles |
+|---|---:|---:|---:|---:|
+| the binary that showed the defect | 24 | **5** | 73 | **6.85** |
+| current `dev` | 24 | **0** | 44 | **0.00** |
+
+Current dev relocates at 0.60x the old binary's rate over identical runs — the
+masking effect is REAL and is why the raw run counts could not settle this. But
+pooling every measured current-dev moving cycle from this and the amplifier run
+gives **0 failures in 137 moving cycles**, where the old binary's rate predicts
+**9.4**. P(observing zero | rate unchanged) ≈ **8.4e-5**.
+
+So the improvement is not explained by reduced relocation. Both things are true:
+dev relocates less, AND its failure rate per relocation is genuinely lower.
+
+**Still not a root cause, and still no commit credited.** The mechanism was
+never found; dev took many GC commits in the window, including a moving-young
+root cause that landed and was WITHDRAWN. This says the defect no longer fires
+at a measurable rate per unit of the exposure it needs — nothing about why.
+
+**The amplifier does not work on this workload**, which is worth recording so
+nobody re-runs it: `CRATONVM_XT_JIT_COVERAGE_ASSUME=1` is the netty page's lever
+for forcing relocation (1 -> 14-24 cycles there), and here it measured 43 moving
+cycles against a plain arm's 50. Exposure on these classes cannot be forced
+level, only measured and divided out.

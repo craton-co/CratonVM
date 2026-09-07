@@ -19,11 +19,11 @@ publish = false
 cratonvm-reader = { path = "../reader", version = "0.3.0" }
 cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
-# `craton-gpu` is pulled in purely so cargo schedules its build script
+# `craton-gpu4j` is pulled in purely so cargo schedules its build script
 # BEFORE ours and exposes the `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*`
 # env vars (via its `links = "craton-gpu-annotations"` declaration) to
 # our build.rs. The Rust code in this crate does not call into it.
-craton-gpu = { path = "../craton-gpu", version = "0.3.0", package = "cratonvm-gpu" }
+craton-gpu = { path = "../craton-gpu4j", version = "0.3.0", package = "cratonvm-gpu" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

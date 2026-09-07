@@ -3895,7 +3895,13 @@ impl VmHeap {
         // `collector_decision_report` appends the `[GC] g1 root coverage:` rate
         // — which is what makes "was this pause's root set complete?" a
         // question a log answers instead of a crash dump.
-        eprintln!("{}", crate::gc_metrics::collector_decision_report());
+        //
+        // NOT PRINTED HERE, and that is the fix rather than an omission.
+        // `vm-cli`'s `maybe_dump_shutdown_reports` emits the decision report on
+        // BOTH exit arms and this function is now reached from that same hook,
+        // so printing it here as well put the whole report on stderr TWICE on
+        // the normal-return arm. The report is the one census that must survive
+        // a `System.exit`, so the hook keeps it and this function does not.
         // Card / remembered-set costs, raw and normalized per allocated object
         // and per live byte.
         eprintln!("{}", crate::gc_metrics::gc_metrics_report());
