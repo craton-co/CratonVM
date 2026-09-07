@@ -415,6 +415,16 @@ struct Compiler {
     /// Number of locals mapped to callee-saved registers.
     num_reg_locals: usize,
     /// Per-local register assignment from graph-coloring allocator.
+    /// DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`): frame offsets this
+    /// compile has emitted a STORE to, and the offsets it has emitted a LOAD
+    /// from together with the emitting Rust backtrace.
+    ///
+    /// A load from an offset nothing ever stores to is a read of uninitialised
+    /// stack. `Select.processGroupResult` reloaded its `long offset` local from
+    /// exactly such a slot on the loop back edge, which is how a window query's
+    /// rows came to be dropped as if they were an OFFSET clause.
+    pub(super) dbg_stored_slots: Vec<(i32, usize)>,
+    pub(super) dbg_loaded_slots: Vec<(i32, usize)>,
     /// `local_assignments[i] = Some(reg)` means local i is in that register.
     local_assignments: Vec<Option<u8>>,
     /// Which register-homed locals a GC-capable safepoint actually has to
@@ -2723,6 +2733,8 @@ impl Compiler {
             num_locals,
             num_params,
             num_reg_locals,
+            dbg_stored_slots: Vec::new(),
+            dbg_loaded_slots: Vec::new(),
             local_assignments,
             // Built by `compile_with_param_slots` (it has `code`/`param_oop_mask`,
             // which this constructor does not). `None` = conservative fallback.

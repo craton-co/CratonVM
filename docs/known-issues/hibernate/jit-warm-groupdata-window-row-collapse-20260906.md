@@ -1,13 +1,254 @@
-# A JIT-warm-up-dependent race collapses H2 `GROUP BY`/window row counts — not the 2026-07-27 `groupData` bug recurring
+# The IR lowerer published a phi from a home word it never wrote — H2 `GROUP BY`/window row counts collapse
+
+*(Titled "A JIT-warm-up-dependent race …" for its first two passes. It is not a
+race: it is deterministic per compiled body, and the warm-up requirement is just
+what it takes to reach the optimizing tier. The old title is kept here so a
+search for it still lands.)*
 
 ## Status
 
-**OPEN, newly discovered 2026-09-06.** Confirmed real, confirmed CratonVM-specific
-(HotSpot clean), confirmed **not** a regression of the `ExpressionColumn.getValue`
-`groupData` delegation fix from 20260727 (that fix's own code is verified correct
-below). Root cause narrowed to "JIT-compilation-dependent, requires prior warm-up in
-the same process" but not pinned to a specific miscompiled method — see "What isn't
-done here" at the end.
+**FIXED 2026-09-07** (`CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD`, default ON).
+
+The optimizing IR lowerer published a phi from a home frame word it had
+deliberately decided never to write. `Select.processGroupResult`'s `long offset`
+phi came back as uninitialised stack, and the loop's `quickOffset && offset > 0`
+arm then dropped result rows as if the query carried an `OFFSET` clause.
+
+Same binary, one switch, `CriteriaWindowFunctionTest`:
+
+| arm | verdict | the compiled body |
+|---|---|---|
+| guard ON (default), 3 runs | **11/11** | **clean** |
+| `..._GUARD=0`, 3 runs | 9/11, `expected: <5> but was: <3>` | `reads-but-never-writes: rbp-0B0h` |
+
+and independently on finding 1's class, `OracleInlineMutationStrategyIdTest`:
+**6/6** with the guard against 5/6 (`expected: 1100`) without.
+
+Engagement across the whole `CriteriaWindowFunctionTest` run: 327 methods
+reported phi copies, **one** engaged the guard, skipping **3** publishes — which
+is exactly the three `[rbp-0B0h]` reads in the disassembly — and **zero**
+compiles were refused, so nothing lost the optimizing tier.
+
+**Finding 3 (`ASTParserLoadingTest`) is NOT verified.** That class discovers 106
+tests and starts none on this host (10 s, `found=106 started=0`, VM exits
+normally), so there is no local arm to read. Its symptom is the same loop in the
+same method with `withHaving` true, so the same fix should cover it, but that
+sentence is an inference and not a measurement.
+
+## The defect
+
+The IR lowerer may DROP a phi's home word: `phi_home_droppable` clears a
+register-resident phi whose register is exclusively its own, and `emit_copy_op`
+then skips the home store because "its register is the only location anyone
+reads".
+
+`emit_phi_copies`'s trailing residency loop is the reader that did not get that
+memo:
+
+```rust
+for c in &gathered {
+    if published.contains(&c.phi) { continue; }
+    if self.assigned_gpr(c.phi).is_some() {
+        self.publish_gp_from_slot(c.phi, c.dst);   // loads [rbp - c.dst]
+    }
+}
+```
+
+`published` holds the phis `emit_copy_op` published register-to-register. A phi
+is absent from it in two ways, and only one of them is safe:
+
+* it was **deferred** (`defer_publish`) — `emit_copy_op` keeps the home store
+  for exactly this reason, so the load is correct and must stay;
+* its copy was **dropped by `resolve_parallel_copy` as a self-copy** — the
+  value is already where it belongs, so `emit_copy_op` never ran at all for it,
+  neither storing the word nor publishing the register. The loop then loads a
+  word nothing has ever written.
+
+The second is what `Select.processGroupResult` hit. `offset` is decremented only
+inside a branch that these queries never take, so on the back edge the phi's
+copy is a self-copy, its home was dropped, and the publish read uninitialised
+stack — three times in one body, zero writes.
+
+The guard: a non-deferred phi whose home was dropped publishes nothing when its
+register is already live (the premise of dropping the home), and REFUSES the
+compile when it is not — the same refusal `emit_copy_op` already makes for the
+mirror case one screen away, rather than emitting a read of a word nothing
+wrote.
+
+### How the door was found
+
+The disassembly header now names the BACKEND as well as the door
+(`full/ir` rather than `full`), because `CompiledMethod::used_ir_backend` had
+recorded it all along and nothing printed it. That one word is what said the
+body came from the optimizing IR pipeline and not from `x64::compile` — which is
+why the never-stored reporter added in the second pass, hanging off
+`x64::driver`'s finish, produced no line for the method at all.
+
+`CRATONVM_JIT_IR_DROP_PHI_HOME=0` was then the first switch to remove BOTH the
+symptom and the machine-code signature, which named the home-drop as the owner.
+For the record, `CRATONVM_JIT_IR_DROP_HOME=0` also passed 11/11 while the
+never-written read REMAINED in the body — a passing arm that still carries the
+defect, and a reminder that on this page an outcome alone is not evidence.
+
+### The regression guard
+
+`every_phi_home_publish_site_is_guarded_against_a_dropped_home` pins the READER
+SET: exactly three phi publish sites, each in an allowlist, plus the guard's own
+text. A source scan rather than a lowering fixture, deliberately — the defect
+needed an 11 KB body with heavy inlining to appear at all and every small Java
+probe written for it read clean, so what can be pinned is that a fourth reader
+cannot be added without someone looking at the guard. It earned its keep
+immediately: the first version scanned every `publish_*_from_slot` call and
+found a site I had not looked at (the value-definition publishes, which
+`store_rax` the word first and are safe).
+
+## Second pass — how the instruction was found
+
+### The local repro
+
+```
+cd C:/craton/CratonVM1/apps/hib-suite-runner
+cratonvm.exe --java-home <jdk25> --Xmx 1500m @common.args -Dcraton.batch=1 \
+  CratonRunner org.hibernate.orm.test.query.criteria.CriteriaWindowFunctionTest
+# @@RESULT ... found=11 ok=9 failed=2   (~35 s, every run)
+# org.opentest4j.AssertionFailedError: expected: <5> but was: <3>
+```
+
+That fixture's `common.args` carries a stale classpath root (two spellings of a
+`CratonVM/apps` directory that no longer exists); repoint both at
+`CratonVM1/apps` and all 243 entries resolve. The collapse SIZE varies per run
+(`<3>` locally, `<1>` on Azure) — that is how many rows the garbage `offset`
+happened to skip, not a second defect.
+
+### Which method
+
+One binary, one arm per run, `CRATONVM_JIT_DENY` (a substring match on
+`Class.method`):
+
+| denied | result |
+|---|---|
+| `org/h2/` | **11/11** |
+| `org/h2/command/` | **11/11** |
+| `org/h2/command/query/Select.` | **11/11** |
+| `org/h2/command/query/Select.processGroupResult` | **11/11** |
+| `org/h2/command/query/Select.queryWindow` | **11/11** |
+| `org/h2/expression/`, `org/h2/result/`, `org/h2/value/` | 9/11 |
+| `SelectGroups`, `gatherGroup`, `queryGroupWindow`, `constructGroupResultRow`, `rowForResult`, `isHavingNullOrFalse`, `initGroupData`, `finishResult`, `queryWithoutCache`, `updateAgg`, `isConditionMet` | 9/11 |
+
+Exactly two denials fix it, and they are the caller and the callee of one call.
+
+### Where the rows go
+
+`processGroupResult`'s loop has three `continue`s and one `addRow`. Instrumenting
+`Select` ITSELF makes the defect disappear, so both counts below were taken from
+OTHER classes, in runs that still failed 2/11:
+
+* `SelectGroups$Plain.next()`, patched to report at exhaustion, served **5 of 5**
+  groups on every query — the iteration is complete;
+* `LocalResult.addRow`, patched to count calls and printed from `SelectGroups`,
+  was called **3** times for those same 5 groups.
+
+Two iterations therefore took a `continue`. For these queries `withHaving` is
+`false` and `qualifyIndex` is `-1`, which leaves exactly one reachable arm:
+`quickOffset && offset > 0`.
+
+A canary run (four `int` locals with known values, plus counters) caught it
+directly, in a run that then passed:
+
+```
+[PGR-BAD] iters=5 added=5 dHaving=0 dQualify=0 dOffset=-2
+          c0=5a5a5a5a c1=11112222 c2=33334444 c3=55556666
+          withHaving=false quickOffset=false offset=1769123620440 qualifyIndex=-1
+```
+
+The canaries are intact, so this is not a wild store over the frame. The `long
+offset` parameter, which is `0` for these queries, reads back as
+**1 769 123 620 440**.
+
+### The instruction
+
+`CRATONVM_DBG_JIT_DISASM=Select.processGroupResult`, one failing run, 11 591
+bytes of compiled body:
+
+```
+    262: mov rax,[rbp-20h]        ; the `offset` parameter, as the prologue stored it
+    266: mov [rbp-150h],rax
+    2a4: mov rax,[rbp-150h]
+    2ab: mov rbx,rax              ; offset -> RBX for the loop
+    2ae: jmp 2b3                  ; loop head
+    ...
+    a17: mov rax,rbx              ; offset
+    a1a: sub rax,1                ; offset--
+    a20: mov [rbp-128h],rax
+    ...
+   131a: mov rbx,[rbp-0B0h]       ; <-- loop-carried offset restored...
+   1321: jmp 2b3                  ; <-- ...on the back edge
+```
+
+**`[rbp-0B0h]` is read three times in the whole body and written zero times.**
+Every value a compiled body reads from its own frame is one it put there, so that
+is a read of uninitialised stack — which is where the timestamp-shaped
+`1769123620440` comes from, and why the collapse size varies between runs.
+
+`tools/jit/frame-slot-scan.py` finds it from a dump, with no instrumentation:
+
+```
+$ python tools/jit/frame-slot-scan.py dump.err
+Select.processGroupResult(ILorg/h2/result/LocalResult;JZZ)V  reads-but-never-writes: rbp-0B0h
+Select.queryWindow(ILorg/h2/result/LocalResult;JZ)V          clean
+```
+
+### Ruled out, each arm actually run
+
+* **The callee-saved GPR local homes.**
+  `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=0` still fails 2/11 **and the
+  never-written read survives it**, so RBX is not holding `offset` as a local
+  home.
+* **The single-pass inline IC cascade** — `CRATONVM_JIT_SP_INLINE_PIC=0`,
+  `_MIC=0`, `_MEGA=0`: all still fail.
+* **The optimizing OSR paths** — `CRATONVM_JIT_OSR_OPTIMIZING=0`,
+  `CRATONVM_JIT_OSR_OPTIMIZING_MEMO=0`: still fail.
+* **LICM** — `CRATONVM_DISABLE_ARITH_LICM=1`,
+  `CRATONVM_JIT_NO_LICM_READ_HOIST=1`, `CRATONVM_DISABLE_AALOAD_LICM=1`: all
+  still fail.
+* **A long-parameter slot-mapping error at the call** — probed directly with a
+  `(int, Object, long, boolean, boolean)` callee invoked from a hot caller with a
+  literal `false`: 10 000 000 iterations, zero drops.
+
+### What the second pass could not do, and the two traps
+
+**Which compile door emits the unmatched reload.** Two detectors landed behind
+`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`:
+
+* `Compiler::dbg_note_spill_overlap` — a spill reservation that hands out a frame
+  slot an OPEN inline scope still owns. It fires **325 times** on this workload
+  (all `Push` reservations onto a `num_locals=1` scope, mostly under
+  `net/bytebuddy/...`), so that hazard is real and deserves its own page — but
+  none of the reports is `Select.processGroupResult`.
+* `Compiler::dbg_report_never_stored_slots` — the in-VM twin of the offline
+  scanner.
+
+The second **produces no line for `processGroupResult` at all** — not "the slot
+was stored", no line. It is called from `x64::driver`'s finish, so the failing
+body came from a different compile door. **Answered in the third pass above:**
+the door is the eager full-compile door and the backend is the optimizing IR
+pipeline, which is why an `x64::driver` reporter could never see it.
+
+Two traps, both paid for here:
+
+* **Any instrumentation inside `Select` hides it.** Counters, a `println`, the
+  canaries — each re-allocates the method's registers and it passes. Instrument a
+  DIFFERENT class; that is why the two counts above come from `SelectGroups` and
+  `LocalResult`.
+* **A Rust backtrace in the emitter hides it too.** The first
+  `dbg_note_slot_load` captured `Backtrace::force_capture()` per distinct slot;
+  that alone changed which methods tiered up and the run passed 11/11 with zero
+  reports. It records a buffer position now.
+
+No fix was proposed at the end of the second pass, on the grounds that without
+the emitter one would be guessing. The third pass found the emitter.
+
+## First pass — triage, and why this is not the 2026-07-27 bug
 
 ## Why this doc exists
 
@@ -85,6 +326,9 @@ plain row-count assertion — `insertCount` (the number of rows the bulk
 exception at all. Different mechanism, same test method — which is what made it look
 like a recurrence.
 
+> **Second pass:** `20 instead of 1100` is the same shape as `3 instead of 5` —
+> rows dropped by `processGroupResult`'s offset arm, at a different scale.
+
 ### Ruling out the `groupData` fix
 
 `entityCount()` is 1100 for this class. Hibernate's real SQL for `testInsertSelect`
@@ -137,6 +381,9 @@ swapping in any other single sibling test (`testUpdate`) does not. `testInsert`
 exercises the identical `HTE_Engineer` temp-table machinery at 1-row scale (with an
 explicit `rn_=1` literal, no `row_number()`) before `testInsertSelect` runs the same
 machinery at 1100-row scale with a real `row_number() over()`.
+
+> **Second pass:** this IS the warm-up requirement — `testInsert` is what makes
+> `processGroupResult` hot enough to compile.
 
 ## Finding 2 in detail — `CriteriaWindowFunctionTest`
 
@@ -228,7 +475,13 @@ Controls on the same binary/host:
 The catch rate (1/9) means this specific tight-loop shape is **not** a reliable
 standalone repro — it is far less consistent than the underlying Hibernate-driven
 failures, which reproduced 100% of the time in every rerun performed for this triage
-(the class-level and `MethodRunner`-isolated runs above). That the one debug-flag
+(the class-level and `MethodRunner`-isolated runs above).
+
+> **Second pass:** use the `CriteriaWindowFunctionTest` local repro at the top of
+> this page instead — 35 s, 100%. And `CRATONVM_DBG_JIT_COMPILED=1` did NOT hide
+> the defect on the second pass (2/11 failures with it on), so reading that arm as
+> "the debug flag perturbs the window" was over-drawn. What reliably hides it is
+> instrumentation inside `Select` itself. That the one debug-flag
 instrumented pair of attempts (`CRATONVM_DBG_JIT_COMPILED=1`, which logs every method
 as it gets JIT-compiled) both came back clean is itself a data point: the debug
 instrumentation appears to perturb whatever timing window the race needs, which is

@@ -3273,7 +3273,11 @@ pub(super) fn compile_osr_artifact(
     }
     if !osr_reused {
         crate::jit::disasm::maybe_dump(
-            "osr",
+            // The DOOR and the BACKEND are different questions and only the
+            // first was ever printed. `used_ir_backend` has recorded the
+            // second all along; a reader chasing a miscompiled body needs both
+            // to know which emitter to go and read.
+            if compiled.used_ir_backend { "osr/ir" } else { "osr/sp" },
             &class_name_arc,
             &method_name_arc,
             &descriptor_arc,
@@ -3663,7 +3667,7 @@ pub(super) fn try_osr(
             // and the disassembly said it had not; the disassembly was of
             // another artifact.
             crate::jit::disasm::maybe_dump(
-                "osr-optimizing",
+                if c.used_ir_backend { "osr-optimizing/ir" } else { "osr-optimizing/sp" },
                 &class_name_arc,
                 &method_name_arc,
                 &descriptor_arc,
@@ -6496,7 +6500,7 @@ pub(super) fn compile_optimizing_artifact(
             );
         }
         crate::jit::disasm::maybe_dump_annotated(
-            "callee",
+            if compiled.used_ir_backend { "callee/ir" } else { "callee/sp" },
             &callee_cached.class_name,
             &callee_cached.method_name,
             &callee_cached.method_descriptor,
@@ -6965,7 +6969,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "upgrade",
+        if compiled_arc.used_ir_backend { "upgrade/ir" } else { "upgrade/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -8500,7 +8504,7 @@ pub(super) fn try_jit_compile_callee_slow(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "full",
+        if compiled.used_ir_backend { "full/ir" } else { "full/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,

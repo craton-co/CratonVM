@@ -2582,6 +2582,16 @@ impl ThreadRegistry {
         // integer compares, so the audit is affordable unconditionally and does
         // not need a flag to have been set before the run that reproduces.
         let vacated = heap.and_then(|h| h.young_inactive_semispace_range());
+        // This cycle's cross-thread conservative scan of BLOCKED peers' native
+        // stacks, as `(os_tid, addr, value)`. Drained once here and bucketed by
+        // owner below: these words live in a peer's machine stack, are named by
+        // no oop map, and are the population §12 of
+        // `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+        // measured stale on essentially every relocating cycle. Draining
+        // unconditionally matters as much as using it -- a capture left behind
+        // by a cycle that did not fold would be applied against the WRONG
+        // pointer map later.
+        let scanned_stack_slots = cratonvm_gc::gc_quiescence::take_peer_stack_slots();
         let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -2643,6 +2653,36 @@ impl ThreadRegistry {
                     // SAFETY: `new` comes from the GC pointer map and points
                     // at the relocated object's header.
                     *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
+            }
+            // THE BLOCKED-PEER NATIVE-STACK REPAIR (2026-09-07).
+            //
+            // Adopt this cycle's captures for this thread, then advance every
+            // entry -- new and inherited -- through this collection's pointer
+            // map. Same shape as `slot_origins` below, and for the same reason:
+            // an exact per-map lookup cannot strand an entry on a missed chain
+            // seed. The difference is only that these are keyed by a RAW
+            // ADDRESS in the peer's stack rather than by `(frame, idx)`.
+            if cratonvm_gc::gc_quiescence::blocked_peer_stack_remap_enabled() {
+                let os_tid = self.os_tid_of(*tid);
+                let mut ns = entry.gc_block_state.native_slots.lock();
+                if let Some(mine) = os_tid {
+                    for &(t, addr, value) in &scanned_stack_slots {
+                        if t == mine {
+                            ns.push(crate::threading::jvm_thread::NativeSlotFixup {
+                                addr,
+                                orig: value,
+                                cur: value,
+                            });
+                            cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_ADOPTED
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                for e in ns.iter_mut() {
+                    if let Some(&new) = pointer_map.get(&e.cur) {
+                        e.cur = new;
+                    }
                 }
             }
             // cceres3 FIX: advance the exact per-slot tracker through THIS

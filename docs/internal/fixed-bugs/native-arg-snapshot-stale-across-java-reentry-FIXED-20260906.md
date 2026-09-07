@@ -175,8 +175,58 @@ that closing it found 40 of the 48 sites in the 2026-08-25 audit. This is the
 same lesson one level further out: rule 2 is blind to the ARGUMENT SLICE, which
 is how a native holds the reference it is most likely to hold.
 
-Extending it is a Python-only change with no rebuild, and it belongs to the lane
-that owns the script rather than to this fix.
+### Followed up 2026-09-07: the rule already existed, and four fifths of it was dead
+
+`--opt` was written for exactly this tranche — its `--help` advertised
+"Option<ObjectRef> / &[Value] / Value parameters". It matched almost none of
+them, and the reason is one character:
+
+```python
+PARAM_OPT = re.compile(
+    r"([a-z_][a-z_0-9]*)\s*:\s*"
+    r"(?:Option\s*<\s*…ObjectRef\s*>"
+    r"|&\s*\[\s*…ObjectRef\s*\]"
+    r"|Vec\s*<\s*…ObjectRef\s*>"
+    r"|&\s*\[\s*Value\s*\]"
+    r"|Value)"          # ← this
+)
+```
+
+Four of the five alternatives end in `>` or `]`. A trailing `` after a
+NON-word character asserts that the next character IS a word character, and in
+a parameter list the next character is `,` or `)`. So `Option<ObjectRef>`,
+`&[ObjectRef]`, `Vec<ObjectRef>` and `&[Value]` could never match, and `--opt`
+scanned only the bare `Value` arm while reporting a total that looked like
+coverage.
+
+That is why this page's table above shows 76 candidates before AND after the
+fix: the run was not missing the rule, it was running a rule that had been
+inert since it landed. The paragraph in the script's own header saying the
+`&[Value]` shape "cannot be seen" was true, and true for the wrong reason.
+
+Corrected to `(?![A-Za-z_0-9])` — "the type ends here", which holds after `]`
+and `>` and still stops `Value` matching `ValueRef`. Guarded by
+`assert_param_opt_alternatives_live()`, which runs on every invocation and
+aborts naming any alternative that matches its own representative signature no
+longer: a regex whose job is to match a shape now proves it still does, every
+run. Reintroducing the `` makes the script exit with all five named.
+
+**Controls.** On the PRE-FIX `native-builtins/src/lib.rs` the corrected rule
+names `stream_write`, `stream_writeln` and `stream_writeln_inner` — all three
+of the functions that crashed. On the current file it names none of them.
+
+**Population.** `slice_ref_use` gates the tranche, because "the statement
+mentions `args`" is a native's own argument list rather than a defect: only a
+`Value::Object` destructured out of the slice, or the slice handed whole to a
+callee that will do it, can be stale. Unfiltered 598 across the native crates,
+gated 500, and depth-INSENSITIVE (53 vs 55 in `native-io` between `--depth 1`
+and `--depth 6`), so it is not an artifact of transitive reachability.
+
+Spot-checked, the shape is real. `aio_asc_is_open` runs `drain_completions`,
+`flush_pending_array_writes_inner` and `flush_pending_field_resets` — three
+GC-capable calls — and only then pulls its receiver out of the pre-call
+snapshot and dereferences it. Reading 500 sites is the sweep, not this change;
+what changed is that the population exists to be read.
 
 ## What this does NOT close
 

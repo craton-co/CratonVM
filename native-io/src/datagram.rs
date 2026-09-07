@@ -179,7 +179,13 @@ fn encode_isa(ctx: &mut dyn NativeContext, addr: SocketAddr) -> Option<ObjectRef
         Value::Object(Some(o)) => o,
         _ => return None,
     };
+    // GC: `create_string` allocates and `isa_obj` is read afterwards and
+    // returned. Released before every exit — this helper runs once per
+    // datagram receive.
+    let isa_pin = ctx.pin_native_root(isa_obj);
     let host = ctx.create_string(&addr.ip().to_string());
+    let isa_obj = ctx.read_native_pin(isa_pin, isa_obj);
+    ctx.unpin_native_roots(isa_pin);
     if ctx.object_num_fields(isa_obj) >= 2 {
         ctx.set_field(isa_obj, 0, Value::Object(Some(host)));
         ctx.set_field(isa_obj, 1, Value::Int(addr.port() as i32));
@@ -325,6 +331,9 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let fd = dc_fd_of(ctx, this).ok_or_else(|| io_error("join: channel has no UDP socket"))?;
     let group_obj = arg_obj(args, 1).ok_or_else(|| io_error("join: null group"))?;
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let group_obj_pin = ctx.pin_native_root(group_obj);
     let group = parse_inet_address(ctx, group_obj)
         .ok_or_else(|| io_error("join: cannot parse group address"))?;
     // Optional NetworkInterface — try to extract an IP from it; default
@@ -376,6 +385,7 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         MK_PRIVATE_SLOTS,
     );
     let (mk, base) = (minted.obj, minted.base);
+    let group_obj = ctx.read_native_pin(group_obj_pin, group_obj);
     ctx.set_field(mk, base + MK_FIELD_GROUP, Value::Object(Some(group_obj)));
     ctx.set_field(
         mk,

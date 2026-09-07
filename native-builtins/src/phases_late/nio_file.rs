@@ -6613,29 +6613,55 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileChannel",
         "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
+            // `args` IS A PRE-CALL SNAPSHOT. `safe_native_call_impl` pins every
+            // argument, so nothing here can be collected — but it rebuilds the
+            // snapshot from those pins only for a collection it runs itself,
+            // BEFORE the callback. `p57_read_path` allocates, and any other
+            // thread can request a collection at any safepoint, so by the time
+            // `args.get(2)` is read below the option set may have MOVED and the
+            // slice still names its old address. Reading it here, before the
+            // first allocation, and keeping it in a handle is what makes the
+            // two `set` dereferences below safe.
+            //
+            // Same family as the FileDescriptor construction further down, and
+            // as the print natives fixed on 2026-09-06 — see
+            // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
             let path_obj = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/READ/
-            // TRUNCATE_EXISTING via toString.
-            let set_obj = match args.get(2) {
+            let set_obj_at_entry = match args.get(2) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,
             };
             let (mut writable, mut create, mut append, mut read_opt, mut truncate) =
                 (false, false, false, false, false);
-            if let Some(set) = set_obj {
-                // Try to iterate by calling toString() on the Set first (cheap & robust)
-                if let Ok(Some(Value::Object(Some(s)))) =
-                    ctx.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
-                {
-                    let s = ctx.read_string(s).unwrap_or_default();
-                    writable = s.contains("WRITE") || s.contains("APPEND");
-                    create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
-                    append = s.contains("APPEND");
-                    read_opt = s.contains("READ");
-                    truncate = s.contains("TRUNCATE_EXISTING");
+            let (p, set_obj) = {
+                let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+                let path_h = scope.root(path_obj);
+                let set_h = set_obj_at_entry.map(|o| scope.root(o));
+                let path_now = scope.get(&path_h);
+                let p = p57_read_path(&mut *scope, path_now);
+                // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/
+                // READ/TRUNCATE_EXISTING via toString.
+                if let Some(h) = set_h.as_ref() {
+                    let set = scope.get(h);
+                    // Try to iterate by calling toString() on the Set first
+                    // (cheap & robust)
+                    if let Ok(Some(Value::Object(Some(s)))) =
+                        scope.invoke_virtual(set, "toString", "()Ljava/lang/String;", &[])
+                    {
+                        let s = scope.read_string(s).unwrap_or_default();
+                        writable = s.contains("WRITE") || s.contains("APPEND");
+                        create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
+                        append = s.contains("APPEND");
+                        read_opt = s.contains("READ");
+                        truncate = s.contains("TRUNCATE_EXISTING");
+                    }
                 }
-            }
+                // `toString` ran interpreted bytecode; re-read the set for the
+                // `fsp_scan_open_options` call below rather than handing it the
+                // address it had before.
+                let set_now = set_h.as_ref().map(|h| scope.get(h));
+                (p, set_now)
+            };
             // JDK FileChannel.open contract: a channel with neither READ nor
             // WRITE is read-only; WRITE without READ is write-only.
             let readable = read_opt || !writable;
@@ -6724,17 +6750,49 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // FileChannelImpl.open(fd, path, readable, writable, sync, direct,
             //   parent) — mirrors FileOutputStream.getChannel's call shape.
             let real_channel = (|| -> Option<Value> {
-                let fd_obj = match ctx.new_object("java/io/FileDescriptor").ok()?? {
-                    Value::Object(Some(o)) => o,
-                    _ => return None,
+                // GC DISCIPLINE. The `FileDescriptor` and the path `String`
+                // below are freshly allocated and NOTHING in Java refers to
+                // either until `FileChannelImpl.open` stores them, so a Rust
+                // local is each one's only reference — across `create_string`,
+                // which allocates, and `ensure_class_initialized`, which runs
+                // `FileChannelImpl`'s class initializer, i.e. arbitrary
+                // bytecode. Under a moving collector the locals go stale;
+                // under the Generational collector's NON-MOVING young sweep an
+                // unreachable object is ZEROED IN PLACE, and a zeroed
+                // `FileDescriptor` reads its `fd`/`handle` back as 0.
+                //
+                // That is the shape of
+                // `known-issues/springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md`,
+                // whose symptom is `FileChannel.map: invalid fd` from a
+                // channel that opened cleanly. `native_fcimpl_open` and
+                // `new_native_thread_set` in `native-io` were converted on
+                // 2026-09-06; this site is the same construction one provider
+                // layer up and was missed, because it lives in a CLOSURE
+                // registered inside `register_phase57_nio_file` and both
+                // shipped audits index by top-level `fn`.
+                //
+                // Local reproducer: `test_classes/gc/NioChannelChurn.java`.
+                let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+                let fd_h = {
+                    let o = match scope.new_object("java/io/FileDescriptor").ok()?? {
+                        Value::Object(Some(o)) => o,
+                        _ => return None,
+                    };
+                    scope.root(o)
                 };
                 // `handle` is the Windows fd slot fd_from_descriptor prefers;
                 // also set `fd` for the POSIX read path.
-                ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
-                ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
-                let path_str = ctx.create_string(&p);
-                ctx.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
-                match ctx.invoke(
+                let fd_obj = scope.get(&fd_h);
+                scope.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+                let fd_obj = scope.get(&fd_h);
+                scope.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
+                let path_h = {
+                    let o = scope.create_string(&p);
+                    scope.root(o)
+                };
+                scope.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
+                let (fd_obj, path_str) = (scope.get(&fd_h), scope.get(&path_h));
+                match scope.invoke(
                     "sun/nio/ch/FileChannelImpl",
                     "open",
                     "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",

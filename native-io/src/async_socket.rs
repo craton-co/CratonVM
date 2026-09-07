@@ -3029,10 +3029,16 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Some(o) => o,
         None => return Err(ioex("read: null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let bb = match obj_or_none(args, 1) {
         Some(o) => o,
         None => return Err(ioex("read: null ByteBuffer")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let bb_pin = ctx.pin_native_root(bb);
     // Two shapes share this native: the untimed
     // `read(ByteBuffer, A, CompletionHandler)` and the timed
     // `read(ByteBuffer, long, TimeUnit, A, CompletionHandler)` — Tomcat's
@@ -3054,6 +3060,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         // separate native registered elsewhere).
         None => return Ok(Some(Value::Object(None))),
     };
+    let this = ctx.read_native_pin(this_pin, this);
     dbg_aio!(
         "HREAD dispatch (handler-form) this_fields={}",
         ctx.object_num_fields(this)
@@ -3110,6 +3117,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             return Ok(Some(Value::Object(None)));
         }
     };
+    let bb = ctx.read_native_pin(bb_pin, bb);
 
     let (_, _, _, length) = decode_buffer(ctx, bb);
     if length <= 0 {
@@ -3377,6 +3385,9 @@ fn aio_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let opt_name = match obj_or_none(args, 1) {
         Some(o) => ctx
             .invoke_virtual(o, "name", "()Ljava/lang/String;", &[])
@@ -3397,6 +3408,7 @@ fn aio_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             Some(Value::Int(v)) => *v != 0,
             _ => true,
         };
+        let this = ctx.read_native_pin(this_pin, this);
         if let Some(id) = read_aio_id(ctx, this) {
             if (id as i64) < AIO_REG_BASE {
                 let _ = ctx.fd_table().tcp_set_nodelay(id as u32, on);
@@ -3467,6 +3479,9 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(o) => o,
         None => return Err(ioex("bind: null channel")),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let sa = match obj_or_none(args, 1) {
         Some(o) => o,
         None => return Err(ioex("bind: null SocketAddress")),
@@ -3481,6 +3496,7 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Arc::new(Mutex::new(listener)),
         local_addr,
     ));
+    let this = ctx.read_native_pin(this_pin, this);
     if aio_has(ctx, this, F_REG_ID) {
         aio_set(ctx, this, F_REG_ID, Value::Int(id));
     }

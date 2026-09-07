@@ -2657,6 +2657,10 @@ non_escaping_new={nen:?} scalar_new={news:?} field_ops={fops:?} init_skips={skip
     // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
     // into the artifact (which partially moves `compiler`).
     let frame_layout = compiler.frame_layout();
+    // DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`), here because this is the
+    // last point at which the whole compile is still in one piece: every frame
+    // slot this body READS and never WRITES. A no-op unless the flag is set.
+    compiler.dbg_report_never_stored_slots();
     let method_label = compiler.method_label.clone();
     // Taken before `compiler.buf` moves into the artifact. Registration waits
     // until `cm` exists, so a compile that bails before that registers

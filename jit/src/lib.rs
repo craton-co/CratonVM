@@ -19038,6 +19038,17 @@ pub fn private_invokevirtual_pinned() -> u64 {
 /// smaller feature set: entries here are substrings of `Class.method`, so an
 /// exact `org/h2/mvstore/MVStore.commit` pins one method and a bare
 /// `org/keycloak/` pins a whole package.
+/// `CRATONVM_DBG_JIT_SLOT_OVERLAP=1` — report a spill reservation that hands
+/// out a frame slot an OPEN inline scope still owns. See
+/// `Compiler::dbg_note_spill_overlap`.
+pub(crate) fn dbg_jit_slot_overlap() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SLOT_OVERLAP").is_some()
+    })
+}
+
 fn jit_deny_filter() -> Option<&'static Vec<String>> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
