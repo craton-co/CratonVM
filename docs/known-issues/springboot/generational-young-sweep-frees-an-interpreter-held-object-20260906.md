@@ -147,6 +147,64 @@ The crash-site census above is why: 4 of 5 crashes are not in that file. They
 are landed on their own merit, with this null result stated rather than a
 mechanism asserted — see `internal/fixed-bugs/`.
 
+## The corruption is LOAD-GATED, and that governs every arm
+
+Collected across 2026-09-06/07, `--nojit`, same reproducer:
+
+| host load | SIGSEGV |
+|---|---|
+| ~1.3 | **0/4** |
+| 3-6 | 2/5, 2/6 |
+| 6-11 | 5/6, 4/6 |
+| 20-35 | 3/3 |
+
+**A quiet host reads zero.** Any arm measured below load ~3 is vacuous, in
+either direction — which is also why the JIT arm above "passes" there.
+
+**Do NOT amplify with CPU burners.** Six spin loops reach load 11 and the
+broker then cannot start at all: 12/12 `rc=124`, stalled at
+`BROKER_REGISTRATION ... node 0 disconnected`, zero crashes. That starves the
+workload instead of exposing the defect, so the arm says nothing. The loads in
+the table above came from other real work on the shared host, which is a
+different kind of contention.
+
+## Why `CRATONVM_DBG_SWEEP_ZERO` is silent here — and it is NOT the unmapping
+
+The obvious explanation was that `CRATONVM_GEN_UNCOMMIT` unmaps the span, so
+the detector's read of the zeroed header faults instead of returning zeros.
+**Tested and refuted**: with `CRATONVM_GEN_UNCOMMIT=0` (span mapped, and the
+crash gone), `RECLAIMED-LIVE` is still **0 in 12 runs**.
+
+The real reason is structural, and it is a coverage gap rather than a bug:
+
+* the sweep-zero ring records the **YOUNG sweep only** (`gen_heap.rs`'s own
+  comment says so), and
+* its consumer fires only when a zeroed object turns up as the receiver of an
+  **interpreter INVOKE** with an all-zero header (`interpreter/invoke.rs`).
+
+This page's victims fault inside a NATIVE (`native_object_hash_code`) and
+inside `get_array_element`. Neither is that check, so the probe is blind here
+by construction. Do not read its zero as evidence that nothing was reclaimed.
+
+## A probe that can answer: `CRATONVM_DBG_DEADRECV`
+
+Added 2026-09-07. At `identity_hash_code` it asks the two ALWAYS-ON
+reclamation rings (`old_freed_lookup_covering`, `young_freed_lookup`) whether
+the receiver is an address this process already freed — **before the first
+dereference**, which is what no existing consumer does: a failed `checkcast`
+reads the class id, the sweep-zero consumer reads the header, so neither can
+speak when the read itself faults. Both lookups are keyed on the ADDRESS and
+touch no heap memory, so they answer whether or not the page is still mapped.
+On a hit it reports through `reclaim_guard` — original class, which sweep
+freed the block, and which live object still holds the address — and returns
+0 so one run names many victims instead of dying at the first.
+
+**IT HAS NOT YET FIRED, and it has not yet had a fair chance.** Every run of it
+so far either sat on a quiet host (0/4, nothing to catch) or under burner load
+(12/12 broker-registration timeouts). It is landed because the instrument is
+the blocker, not because it has produced a result. The next attempt wants real
+mixed load on the host and enough reps to catch the 4-in-10 band.
+
 ## Next
 
 The receiver is dead on entry to a native with the interpreter as the only

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-535 tokens.
+536 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -165,6 +165,7 @@ export inherited from a parent shell.
 | `diag-jca` | `CRATONVM_DIAG_JCA` |
 | `diag-method-invoke-null` | `CRATONVM_DIAG_METHOD_INVOKE_NULL` |
 | `diag-properties` | `CRATONVM_DIAG_PROPERTIES` |
+| `deadrecv` | `CRATONVM_DBG_DEADRECV` |
 | `diag-serviceloader` | `CRATONVM_DIAG_SERVICELOADER` |
 | `dispatch-tally` | `CRATONVM_DBG_DISPATCH_TALLY` |
 | `dopriv` | `CRATONVM_DBG_DOPRIV` |
