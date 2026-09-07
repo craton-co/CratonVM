@@ -560,6 +560,62 @@ family used to appear within a couple of minutes and a few hundred pauses.
   fixes there are no reports left to classify. It stays open against the
   Tomcat-side reports, which this page's own census collected.
 
+## RE-TAKEN 2026-09-07: `word0` is an arena pointer on 0 of 25, not 19 of 19
+
+This page's physical claim -- "the `class_id`/`shape` dword pair IS the object's
+first eight bytes, and recombining them gives a pointer into the collector's own
+arena", evidenced by `word0_plausible_ptr` TRUE on 19 of 19 -- does not survive
+re-measurement.
+
+**A config that reproduces N/N first.** The marginal 1-in-6 rate made every
+lever look decisive, so the parameters were swept before anything was concluded
+from them:
+
+| config (all `RESUME_DEST=0`) | outcome | corrupt | arena refusals |
+|---|---|---:|---:|
+| `-Xmx2g`, default workers | PASS, PASS | 0, 0 | 0, 0 |
+| `-Xmx1g`, default workers | PASS, PASS | 0, 10 | 0, 0 |
+| `-Xmx768m`, default workers | PASS, PASS | 0, 0 | 0, 0 |
+| **`-Xmx1g`, `CRATONVM_G1_WORKERS=16`** | **SIGSEGV, SIGSEGV** | 0, 15 | 8, 14 |
+
+Worker count is the lever, not heap size -- which is what the mechanism
+predicts, since each worker claims its own region per pause and that is what
+drains the free pool into the failure path.
+
+**The re-take.** Six runs at that config with BOTH refusal screens stood down,
+so holders are REPORTED rather than refused (with the screens on, the surviving
+population is selected by the very predicate under test). 25 holders carried
+both readings:
+
+| `word0_plausible_ptr` | `word0_arena_test` | holders |
+|---|---|---:|
+| False | False | 23 |
+| **True** | **False** | **2** |
+| any | **True** | **0** |
+
+**Zero of 25.** And the two disagreements are the same value,
+`word0=0x0000001200000040`, which is `(18<<32)|64` -- an ordinary
+`class_id=64 / num_slots=18` header. Against the arena bounds the VM now prints
+on the same line, `[0x22d5ec70000, 0x22d9ec70000)`, a 1.00 GiB span containing
+the holder itself, that word sits **2157 GiB below `arena_base`**.
+
+So `word0_plausible_ptr` has a false-positive class, confirmed against printed
+bounds rather than inferred from address magnitude, and it is the field this
+page's 19-of-19 rests on.
+
+### what this does and does not overturn
+
+* It does NOT say the header corruption is imaginary. The same runs refused 8
+  and 14 holders whose first word genuinely IS an arena pointer, by the test
+  that fires a refusal. That population is real.
+* It DOES say the two populations were conflated. The corrupt-cell HOLDERS
+  measured here are sound-headed objects with corrupt BODY cells -- `word0`
+  arena-pointer on 0 of 25 -- and they are not the same objects as the
+  arena-pointer holders the screens refuse.
+* The 19-of-19 was therefore a statistic about one population taken with a
+  field that misreports on the other. It should not be quoted again without
+  the arena test beside it.
+
 ## ANSWERED 2026-09-07: the reports are REAL CORRUPTION, and the grid proves it
 
 The question this page could not settle -- are the corrupt-cell reports evidence
