@@ -4147,12 +4147,23 @@ pub fn execute(
                                     // sink resumes exactly this stash, with
                                     // exactly this builder, and has never
                                     // consulted that flag.
+                                    //
+                                    // STRICTLY ADDITIVE. The `resume_gate_ok` arm is
+                                    // the pre-2026-09-07 condition, unchanged: when the
+                                    // backend set `can_deopt_resume` it has ALREADY
+                                    // vouched that no monitor was elided, so hanging the
+                                    // new guards on that arm too would turn a resume
+                                    // that works today - a single-pass body with a real
+                                    // `synchronized` block, trapping where no lock is
+                                    // held - into the very abort this change exists to
+                                    // remove. The guards belong to the NEW arm, the one
+                                    // running without the backend's word for it.
                                     let resume_allowed = key_matches
                                         && (resume_gate_ok
-                                            || cratonvm_jit::deopt_sink_resume_enabled())
-                                        && !is_synchronized
-                                        && !body_holds_monitor
-                                        && bci_in_code;
+                                            || (cratonvm_jit::deopt_sink_resume_enabled()
+                                                && !is_synchronized
+                                                && !body_holds_monitor
+                                                && bci_in_code));
                                     let mut materialize_failed = false;
                                     if resume_allowed {
                                         let cached =
@@ -4327,13 +4338,18 @@ pub fn execute(
                                         // resume was switched off, so naming it
                                         // bare would send the next reader after
                                         // a flag that is not the cause.
-                                        let why = if is_synchronized {
+                                        // The monitor and bci refusals belong to the NEW arm
+                                        // only, so ask them only when that arm was in play:
+                                        // with `resume_gate_ok` set the resume was attempted
+                                        // regardless, and naming one of them would describe a
+                                        // decision that never happened.
+                                        let why = if !resume_gate_ok && is_synchronized {
                                             "the method is ACC_SYNCHRONIZED, so a resumed frame \
                                          would not hold the method monitor"
-                                        } else if body_holds_monitor {
+                                        } else if !resume_gate_ok && body_holds_monitor {
                                             "the body enters a monitor and the IR frame states \
                                          record none"
-                                        } else if !bci_in_code {
+                                        } else if !resume_gate_ok && !bci_in_code {
                                             "the resume bci is past this method's code"
                                         } else if materialize_failed {
                                             // Asked BEFORE the switch: a resume that was

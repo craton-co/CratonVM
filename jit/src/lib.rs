@@ -22362,11 +22362,19 @@ pub fn bytecode_holds_monitor(code: &[u8], code_len: usize) -> bool {
 /// see the elided-monitor section below for the one thing it did carry, and
 /// what carries it now.
 ///
-/// The sink keeps three refusals the reconstructed frame genuinely cannot
+/// The new arm keeps three refusals the reconstructed frame genuinely cannot
 /// answer, and they are the same three the helper makes or the emission side
 /// names: an `ACC_SYNCHRONIZED` method, a body that takes a monitor
 /// ([`bytecode_holds_monitor`] — the IR frame states record none), and a resume
 /// bci past the method's code.
+///
+/// They hang on the NEW arm and nothing else. The old `can_deopt_resume`
+/// condition is left exactly as it was, because a backend that SET that flag
+/// has already vouched that no monitor was elided — so applying these guards
+/// there too would refuse a single-pass body with an ordinary `synchronized`
+/// block that resumes correctly today, turning a working path into the very
+/// abort this exists to remove. The change is strictly additive by
+/// construction.
 ///
 /// # The one thing `can_deopt_resume` was protecting, and what now protects it
 ///

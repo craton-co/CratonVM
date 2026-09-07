@@ -118,9 +118,16 @@ not. `build_deopt_frame_inner` is self-guarding: it returns `None` on an
 inlined caller chain, an identity mismatch, a `u32::MAX` bci, an unmappable
 slot, or a malformed monitor, and the sink still refuses on a `None`.
 
-Three refusals stay, and they are the ones the reconstructed frame genuinely
-cannot answer — the same three the sibling sink makes or the emission side
-names:
+The change is **strictly additive**: the old `can_deopt_resume` condition is
+left exactly as it was, and the new behaviour is a second arm beside it. That
+matters, because a backend that SET that flag has already vouched no monitor
+was elided — hanging the new guards on that arm too would refuse a single-pass
+body with an ordinary `synchronized` block that resumes correctly today,
+turning a working path into the very abort this removes.
+
+Three refusals govern the NEW arm, and they are the ones the reconstructed
+frame genuinely cannot answer — the same three the sibling sink makes or the
+emission side names:
 
 * an **`ACC_SYNCHRONIZED`** method — the method monitor is not in the frame
   (`try_resume_trapped_callee` refuses this shape too, for this reason);
