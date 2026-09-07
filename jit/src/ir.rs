@@ -4546,6 +4546,24 @@ pub fn note_site_trap_taken() {
     SITE_TRAPS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Site traps taken AFTER the policy for that method was already decided.
+///
+/// These cost an interpreter resume each and buy nothing: the method is already
+/// IR-banned and recompiled. A large number means a trapped site sits inside a
+/// long-running caller whose in-flight frame still holds a baked CALL to the
+/// old body -- see `try_resume_trapped_callee`.
+static SITE_TRAP_REPEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one site trap taken after the decision was already made.
+pub fn note_site_trap_repeat() {
+    SITE_TRAP_REPEATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Site traps that re-fired after their method's policy was already applied.
+pub fn site_trap_repeats() -> u64 {
+    SITE_TRAP_REPEATS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many planted site traps have actually fired.
 pub fn site_traps_taken() -> u64 {
     SITE_TRAPS_TAKEN.load(std::sync::atomic::Ordering::Relaxed)

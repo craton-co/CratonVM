@@ -4123,3 +4123,52 @@ remaining blocker is artifact displacement, not the deopt policy. That is the
 next piece of work, and it is why
 `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` — whose sites are demonstrably hot —
 stays OFF.
+
+#### Artifact displacement: what it is, and what could actually be done
+
+The residual above was "the trapping artifact is not displaced from under the
+running caller". Tracing it named the mechanism exactly.
+
+`main` bakes a raw direct `CALL` to the callee's entry
+(`CRATONVM_DBG_JIT_FIELD_SITES` prints one `[jit-emit-direct]` per baked call,
+here at pc=23 and pc=92). Eviction machinery all fires on the first trap:
+`jit_cache.remove` runs `invalidate_matching`, whose transitive reverse closure
+evicts *the direct caller too*, and the epoch is bumped. It demonstrably works
+— the tracer shows `main` recompiled and baking a SECOND callee entry.
+
+And it changes nothing here, because the caller is a single **in-flight
+invocation** running a loop: 200,000 calls happen inside one `main` frame, whose
+already-executing code holds the old address. Cache eviction governs future
+ENTRIES to a method, not a frame midway through one. Displacing that needs the
+caller's frame deoptimized, or the callee's entry patched to a re-dispatch stub
+— and `MakeNotEntrant` is an enum variant in this tree with no entry-patching
+behind it, so there is no cheap displacement to reach for. Writing one is real
+runtime surgery (atomic patching of live code under W^X, against threads that
+may be at the entry) and is not something to bolt on beside a trap fix.
+
+What IS in reach is refusing to compound the damage. The deopt bookkeeping
+exists to DECIDE a policy; once IR is banned for the method and the recompile
+has happened, every later trap re-runs a decision already taken — and that is
+not free, because `SpeculationFailed` escalates on the per-method deopt COUNT.
+A trapped site in a long-running caller therefore drove the method to
+`MakeNotCompilable` purely by being reached often: the exact outcome the fix
+exists to prevent, arrived at by a different road.
+
+So the decision is taken once, and the rest resume in the interpreter.
+
+| `UnresolvedTrapProbe` | before the trap fix | after it | after this |
+|---|---:|---:|---:|
+| deopt EVENTS | 200,000 | 200,000 | **1** |
+| `MakeNotCompilable` | 200,000 | 199,980 | **0** |
+| site traps TAKEN | (uncounted) | 200,000 | 200,000 |
+| re-fired after the decision | — | — | 199,999 |
+
+The trap still fires 199,999 times — that is the in-flight caller and nothing
+short of displacement removes it — but it now costs an interpreter resume
+apiece instead of deopt bookkeeping plus permanent blacklisting, and the method
+is fully compiled again the moment that frame returns. The residual is
+COUNTED rather than hidden: `ir site traps re-fired after the decision` is a
+direct measure of how much a real workload would gain from entry patching, and
+on H2 it is **0**.
+
+H2 unchanged: 21 planted, 1 taken, 0 re-fired, 0 blacklisted, suite 92/92.

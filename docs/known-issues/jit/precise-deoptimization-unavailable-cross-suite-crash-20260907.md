@@ -1,9 +1,9 @@
-# `internal error: precise deoptimization unavailable ... refusing side-effecting replay` — cross-suite crash, all 6 of today's H2 CRASHes + at least 1 Spring Framework crash
+# `internal error: precise deoptimization unavailable ... refusing side-effecting replay` — cross-suite crash, every H2 CRASH + at least 1 Spring Framework crash
 
 | | |
 |---|---|
 | **Status** | OPEN. High severity — hard process abort (`InternalError`), not a catchable exception. |
-| **Scope** | 6 of 6 H2 CRASH classes in the 2026-09-07 full 218-class 3-GC-arm run (`TestKillProcessWhileWriting`, `TestFreeSpace`, `TestReorderWrites`, `TestFunctions`, `TestTriggersConstraints`, `TestAlterSchemaRename`), plus at least one Spring Framework class (`TestKillProcessWhileWriting`'s log shows the identical mechanism firing inside `TestKillProcessWhileWriting.main` itself, and the same wording appears in a Spring Framework JIT error captured separately today). |
+| **Scope** | All 8 distinct CRASH classes across the 2026-09-07 full 218-class 3-GC-arm H2 run's three completed arms (Generational CRASH=8, G1 CRASH=8, ZGC CRASH=5 — 8 unique classes total, listed below), plus at least one Spring Framework class from the same day's run. **This is the entire H2 CRASH population for this run — no other crash mechanism was found.** |
 
 ## Symptom
 
@@ -17,17 +17,26 @@ Exception in thread "main" java/lang/InternalError: JIT dispatch into
   reason TransferToInterpreter); refusing side-effecting replay
 ```
 
-Confirmed instances today:
+Confirmed instances today (all 8 CRASH classes, final complete 3-arm data):
 
-| class | trapping method |
-|---|---|
-| `org.h2.test.store.TestKillProcessWhileWriting` | `org/h2/store/fs/FilePathWrapper.wrap(Lorg/h2/store/fs/FilePath;)Lorg/h2/store/fs/FilePathWrapper;` |
-| `org.h2.test.store.TestFreeSpace` | `org/h2/test/store/FreeSpaceList$BlockRange.toString()Ljava/lang/String;` |
-| `org.h2.test.poweroff.TestReorderWrites` | `org/h2/test/utils/FileReorderWrites$FileWriteOperation.toString()Ljava/lang/String;` |
-| `org.h2.test.db.TestFunctions` | `com/sun/tools/javac/code/Scope$ScopeImpl.remove(Lcom/sun/tools/javac/code/Symbol;)V` (**inside H2's own in-process javac**, via `SourceCompiler.javaxToolsJavac` compiling a `CREATE ALIAS ... AS $$ ... $$` function body) |
-| `org.h2.test.db.TestTriggersConstraints` | same javac method |
-| `org.h2.test.db.TestAlterSchemaRename` | same javac method |
+| class | trapping method | arms hit |
+|---|---|---|
+| `org.h2.test.store.TestKillProcessWhileWriting` | `org/h2/store/fs/FilePathWrapper.wrap(Lorg/h2/store/fs/FilePath;)Lorg/h2/store/fs/FilePathWrapper;` | Gen, G1, ZGC |
+| `org.h2.test.store.TestFreeSpace` | `org/h2/test/store/FreeSpaceList$BlockRange.toString()Ljava/lang/String;` | Gen, G1, ZGC |
+| `org.h2.test.poweroff.TestReorderWrites` | `org/h2/test/utils/FileReorderWrites$FileWriteOperation.toString()Ljava/lang/String;` | Gen, G1, ZGC |
+| `org.h2.test.unit.TestSampleApps` | `com/sun/tools/javac/code/Scope$ScopeImpl.remove(Lcom/sun/tools/javac/code/Symbol;)V` (same javac method as below) | Gen, G1, ZGC |
+| `org.h2.test.db.TestFunctions` | `com/sun/tools/javac/code/Scope$ScopeImpl.remove(Lcom/sun/tools/javac/code/Symbol;)V` (**inside H2's own in-process javac**, via `SourceCompiler.javaxToolsJavac` compiling a `CREATE ALIAS ... AS $$ ... $$` function body) | Gen, G1, ZGC |
+| `org.h2.test.db.TestTriggersConstraints` | same javac method | Gen, G1 only |
+| `org.h2.test.db.TestAlterSchemaRename` | same javac method | Gen, G1 only |
+| `org.h2.test.unit.TestBnf` | same javac method (confirmed) | Gen, G1 only |
 
+Collector-independence is not clean here — 3 classes (`TestTriggersConstraints`,
+`TestAlterSchemaRename`, `TestBnf`) crashed on Generational and G1 but passed
+on ZGC in this run. Given the trap is timing/JIT-warmup-sensitive (it only
+fires once a specific method gets hot enough to reach the optimizing tier),
+this is consistent with the same underlying bug being probabilistic across
+runs rather than evidence of a second, GC-specific mechanism — not confirmed
+either way in this session.
 **All 6 of today's H2 CRASH classes share this one mechanism** — there is no
 separate H2 crash cluster to triage, just this one bug hitting 6 different
 call sites (three application-level `toString()`/`wrap()` methods, three via
@@ -60,14 +69,26 @@ admission for methods whose deopt-guarded opcode sits **inside a protected
 falling back to the single-pass backend, which never needs a precise resume
 at all (it throws directly through the exception table).
 
-**Today's six crashes are not necessarily inside a protected range** — none
-of the three application methods (`wrap`, two `toString()`s) are obviously
+**Today's crashes are not necessarily inside a protected range** — none
+of the application methods (`wrap`, two `toString()`s) are obviously
 try/catch bodies, and the message's own "no deopt points, **or an elided
 monitor**" wording names a second cause the 2026-08-18 fix's admission gate
 does not obviously address. Whether these are the "elided monitor" branch, a
 different unresumable-trap shape entirely, or a scenario the existing
 `ir_unresumable_protected_trap` check should catch but doesn't, was **not
 determined in this session**.
+
+## Full 3-arm H2 run totals, for context
+
+| arm | PASS | FAIL | CRASH | HANG | wall |
+|---|---:|---:|---:|---:|---|
+| Generational | 145 | 18 | 8 | 47 | 5h44m |
+| G1 | 146 | 19 | 8 | 45 | 5h32m |
+| ZGC | 150 | 17 | 5 | 46 | 5h32m |
+
+Every CRASH in every arm is one of the 8 classes above — this single JIT
+defect is the entire H2 CRASH story for this run, not a sample of a larger
+unexplained population.
 
 ## Cross-suite: also seen in Spring Framework today
 

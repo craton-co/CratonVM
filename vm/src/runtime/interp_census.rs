@@ -201,6 +201,12 @@ pub fn report_at_exit() {
             "[c2-supersede] ir site traps planted: {trap_line} | TAKEN at runtime: {}",
             cratonvm_jit::ir::site_traps_taken(),
         );
+        let repeats = cratonvm_jit::ir::site_trap_repeats();
+        if repeats > 0 {
+            eprintln!(
+                "[c2-supersede] ir site traps re-fired after the decision: {repeats} (a caller frame still holds a baked CALL to the trapping body)"
+            );
+        }
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
         eprintln!(
             "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"
