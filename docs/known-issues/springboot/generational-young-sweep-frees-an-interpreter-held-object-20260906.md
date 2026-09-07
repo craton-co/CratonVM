@@ -8,32 +8,35 @@
 | **Dominant site** | `native_object_hash_code` → `identity_hash_code` on a receiver whose header is in a span the collector proved dead |
 | **Detector** | `CRATONVM_GEN_UNCOMMIT` (default ON since `dadef6dbd`, 14:39) — it decommits the dead span, so the stale read FAULTS instead of silently succeeding |
 
-## FIRST: every measurement below predates `14d9a50f4`, and that may be the bug
+## RULED OUT: the stale argument snapshot (`14d9a50f4`)
 
-While this revision was being measured, another session root-caused a defect
-with a mechanism that fits the dominant crash here exactly:
+The obvious candidate was another session's same-day fix:
 
 > a native that re-enters Java holds its ARGUMENT SNAPSHOT across the
 > collection that re-entry can trigger. `safe_native_call_impl` pins every
-> argument, so nothing is collected, but it rebuilds the snapshot from those
-> pins only for a collection it runs ITSELF, before the callback. A young
-> collection inside the callback relocates the object and the snapshot keeps
-> naming the old address.
+> argument but rebuilds the snapshot from those pins only for a collection it
+> runs ITSELF, before the callback.
 >
 > — `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`
-> (`14d9a50f4`, 20:42)
 
-**The binary every arm below was measured on was built at 19:39 and does not
-contain it.** "The receiver is dead on ENTRY, straight out of `args`" is what
-a stale argument snapshot looks like from inside the callee, so the crash-site
-census here may be describing a defect that is now fixed. Re-measure on a tip
-that includes `14d9a50f4` before acting on any of it — the arms are cheap now
-(§ Repro: 10-30 s each), which is the one thing this revision definitely
-improves over the last.
+"The receiver is dead on ENTRY, straight out of `args`" is exactly what that
+looks like from inside the callee, and the first revision of these arms was
+measured on a binary built at 19:39, an hour before that fix landed at 20:42.
+**It is not it.** Interleaved, one arm at a time, same host:
 
-That session's reproducer is also cheaper than a Kafka broker start:
-`GpuResidencyGc 0 1024 800` under `-XX:+UseGenerationalGC`, ~20 s, no GPU and
-no Azure. Calibrate against it first.
+| binary | `--nojit` SIGSEGV, x8 |
+|---|---:|
+| dev tip, WITH `14d9a50f4` | **6** |
+| the 19:39 binary, without it | 3 |
+
+The defect survives the fix, so the census below is current. (Do not read the
+6-vs-3 as a regression: this arm ran 2/5, 4/6 and 5/6 across the evening at
+loads from 3 to 35. It is one workload's rate, not a controlled comparison of
+the two commits.)
+
+Re-censused on the tip binary under `gdb`, three crashes: two
+`native_object_hash_code`, one `get_array_element` — same family, same
+conclusion as the five below.
 
 ## What changed on this page
 
