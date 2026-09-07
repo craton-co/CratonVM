@@ -22356,9 +22356,11 @@ pub fn bytecode_holds_monitor(code: &[u8], code_len: usize) -> bool {
 /// production, with no `can_deopt_resume` anywhere in its conditions. Both build
 /// the frame with the same `build_deopt_frame_inner`, which bails to `None` on
 /// an inlined chain, an identity mismatch, an out-of-range bci, an unmappable
-/// slot and a malformed monitor. `can_deopt_resume` gates a DIFFERENT consumer
-/// (`resume_real_ir_deopt`'s scalar-replacement materialisation); asking it here
-/// refused a resume nothing else needed it for.
+/// slot and a malformed monitor. `can_deopt_resume` mostly gates a DIFFERENT
+/// consumer (`resume_real_ir_deopt`'s scalar-replacement materialisation);
+/// asking it here refused a resume almost nothing needed it for. Almost:
+/// see the elided-monitor section below for the one thing it did carry, and
+/// what carries it now.
 ///
 /// The sink keeps three refusals the reconstructed frame genuinely cannot
 /// answer, and they are the same three the helper makes or the emission side

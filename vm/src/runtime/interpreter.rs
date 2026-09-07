@@ -4132,10 +4132,14 @@ pub fn execute(
                                     );
                                     let bci_in_code =
                                         (rframe_for_despec.bci as usize) < code_attr.code.len();
-                                    // `can_deopt_resume` is NOT the question
-                                    // this sink has to ask, and asking it is
-                                    // what turned an ordinary trap into a hard
-                                    // process abort - see
+                                    // `can_deopt_resume` is very nearly not
+                                    // the question this sink has to ask, and
+                                    // asking it is what turned an ordinary
+                                    // trap into a hard process abort. "Nearly"
+                                    // because its elided-monitor conjunct DOES
+                                    // carry weight on the single-pass side --
+                                    // which is why `body_holds_monitor` above
+                                    // replaces it rather than dropping it. See
                                     // `cratonvm_jit::deopt_sink_resume_enabled`
                                     // for the whole argument and the measured
                                     // population. The frame is already

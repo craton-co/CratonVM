@@ -4,7 +4,7 @@
 
 **FIXED 2026-09-07** (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON).
 
-This page carries the mechanism and the fix. The three known-issue pages it
+This page carries the mechanism and the fix. The two known-issue pages it
 closes kept their own evidence and moved here beside it:
 
 * `precise-deoptimization-unavailable-cross-suite-crash-20260907-FIXED.md` —
@@ -13,9 +13,10 @@ closes kept their own evidence and moved here beside it:
 * `jit-precise-deopt-refused-transfer-to-interpreter-hibreactive-20260907-FIXED.md`
   — the hibernate-reactive population (7 classes, 17 occurrences, GC-independent
   across all three collectors).
-* `inline-trap-inside-a-protected-range-FIXED-20260818.md` — the earlier,
-  narrower fix in the same family, which this one does not replace; see
-  *Relationship to the 2026-08-18 fix* below.
+
+A third page, `inline-trap-inside-a-protected-range-FIXED-20260818.md`, is the
+earlier and narrower fix in the same family. This one does not replace it; see
+*Relationship to the 2026-08-18 fix* below.
 
 ## The symptom
 
@@ -42,8 +43,9 @@ depends only on how the callee was entered:
 
 Same stash. Same builder. Opposite verdicts.
 
-And `can_deopt_resume` is the wrong question for either of them to ask. It is
-finalized two different ways:
+And `can_deopt_resume` is close to the wrong question for this sink to ask —
+close, because it does carry weight on one path, which the fix below replaces
+rather than discards. It is finalized two different ways:
 
 * the **single-pass** backend sets it honestly —
   `!cm.deopt_points.is_empty() && !compiler.has_elided_monitor`
