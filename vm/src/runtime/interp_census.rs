@@ -193,7 +193,14 @@ pub fn report_at_exit() {
             .map(|(cause, n)| format!("{cause}={n}"))
             .collect::<Vec<_>>()
             .join(" ");
-        eprintln!("[c2-supersede] ir site traps planted: {trap_line}");
+        // TAKEN, beside PLANTED. The planting doc promised this half and did
+        // not have it: "a cause whose taken count is not ~0 has had its
+        // coldness argument refuted". A non-zero number means a trap sat on a
+        // LIVE path, which is the falsifiable form of that claim.
+        eprintln!(
+            "[c2-supersede] ir site traps planted: {trap_line} | TAKEN at runtime: {}",
+            cratonvm_jit::ir::site_traps_taken(),
+        );
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
         eprintln!(
             "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"

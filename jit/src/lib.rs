@@ -17746,6 +17746,22 @@ pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str)
 /// Mark the method as permanently bail-listed.  Called when the heavy
 /// `x64::compile` path returns None (typically because of an unsupported
 /// backend pattern that won't change on retry).
+/// The key the IR-tier memos are hashed under.
+///
+/// The same `ClassId::new(0)` sentinel `mark_jit_bail_listed` and
+/// `try_compile_inner`'s `ir_method_hash` use, exposed so the runtime can look
+/// a method up in `ir::method_has_site_trap` and `ir_evidence`'s refusal memo
+/// without the raw hash function becoming public. Three callers agreeing on a
+/// hash is exactly the kind of thing that silently stops agreeing.
+pub fn ir_method_memo_hash(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    )
+}
+
 pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
     let h = compute_jit_key_hash(
         class_name,
@@ -25115,6 +25131,13 @@ fn try_compile_inner(
         // is: everything past it is relocated callee code, unreachable from pc
         // 0 and walked only through a splice.
         let built = builder.build(ir_combined.as_deref().unwrap_or(code), code_len);
+        // Record that this method's optimizing body carries a site trap, so a
+        // trap TAKEN at runtime can be told apart from genuinely unreachable
+        // code. `build` consumes the builder, so the count comes back through
+        // the same per-build thread-local `reset_string_access_sites` uses.
+        if ir::site_traps_planted_this_build() > 0 {
+            ir::register_site_trap_method(ir_method_hash);
+        }
         drop(metrics_build);
         // ── the String-access expansion's two loads get their compact rows ──
         //

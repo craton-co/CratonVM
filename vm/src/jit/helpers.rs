@@ -4312,15 +4312,45 @@ unsafe fn try_resume_trapped_callee(
     // Reason: `UnreachedCode` — the one-shot "give up immediately" policy
     // (`recommend_action`), so the trapping method is made not-compilable on
     // the FIRST resolution and the tiered manager stops re-queuing recompiles
-    // that would just trap again. (A guard-bail stash reaching this arm is
-    // over-blacklisted by this — acceptable: it reverts to the interpreter,
-    // which is always correct.)
+    // that would just trap again.
+    //
+    // EXCEPT for an IR SITE TRAP, which the comment this replaces called
+    // "over-blacklisted by this — acceptable". It is not acceptable, and
+    // `probes/UnresolvedTrapProbe.java` measures why: the trapped method deopts
+    // on EVERY call (200,000 of 200,000) and `MakeNotCompilable` is consulted
+    // by `compile_gate` itself, so the method loses its body on EVERY tier —
+    // including the single-pass backend, which lowers `invokedynamic` and
+    // unresolved typechecks perfectly well. Before site traps existed the IR
+    // tier simply refused such a method and C1 compiled it; blacklisting is a
+    // strict regression on that.
+    //
+    // A site trap means one thing only: the OPTIMIZING tier could not lower one
+    // call site. So ban the optimizing tier for this method — the memo
+    // `try_compile_inner` already consults — and pick a reason that RECOMPILES
+    // instead of blacklisting. The recompile then goes single-pass and does not
+    // trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until
+    // the per-method deopt count crosses `max_deopts_per_method`, which keeps a
+    // backstop if the assumption above is ever wrong.
+    let ir_site_trap = {
+        let h = cratonvm_jit::ir_method_memo_hash(key_class, key_method, key_desc);
+        if cratonvm_jit::ir::method_has_site_trap(h) {
+            cratonvm_jit::ir::note_site_trap_taken();
+            cratonvm_jit::ir_evidence::note_method_refused(h);
+            true
+        } else {
+            false
+        }
+    };
     DeoptimizationController::deoptimize(
         vm,
         key_class,
         key_method,
         key_desc,
-        cratonvm_jit::deopt::DeoptReason::UnreachedCode,
+        if ir_site_trap {
+            cratonvm_jit::deopt::DeoptReason::SpeculationFailed
+        } else {
+            cratonvm_jit::deopt::DeoptReason::UnreachedCode
+        },
         bci,
     );
 

@@ -4483,6 +4483,74 @@ pub struct IrBuilder {
     string_layout: Option<crate::StringFieldLayout>,
 }
 
+thread_local! {
+    /// IR site traps planted by the build currently running on this thread.
+    ///
+    /// Read back by `lib.rs` the moment `build()` returns, the same idiom
+    /// `reset_string_access_sites` uses -- `build(mut self, ..)` consumes the
+    /// builder, so a getter on it is not available afterwards.
+    static SITE_TRAPS_THIS_BUILD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn reset_site_traps_this_build() {
+    SITE_TRAPS_THIS_BUILD.with(|c| c.set(0));
+}
+
+/// How many IR site traps the build that just returned planted.
+pub fn site_traps_planted_this_build() -> usize {
+    SITE_TRAPS_THIS_BUILD.with(|c| c.get())
+}
+
+/// Methods whose IR body carries at least one planted site trap, by
+/// `compute_jit_key_hash(class, method, desc, ClassId::new(0))`.
+///
+/// The runtime consults this when a trapped callee resumes, to tell an IR SITE
+/// TRAP apart from genuinely unreachable code. The two want opposite actions:
+/// unreachable code should blacklist the method, whereas a site trap means only
+/// that the OPTIMIZING tier could not lower one call site -- the single-pass
+/// backend lowers `invokedynamic` and unresolved typechecks perfectly well, and
+/// blacklisting takes that body away too.
+fn trapped_methods() -> &'static std::sync::RwLock<rustc_hash::FxHashSet<u64>> {
+    static M: std::sync::OnceLock<std::sync::RwLock<rustc_hash::FxHashSet<u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Cap, for the same reason the refusal memo has one: a pathological program
+/// must not turn a diagnostic into unbounded retained memory.
+const MAX_TRAPPED_METHOD_MEMOS: usize = 8192;
+
+/// Record that `hash`'s IR body carries a planted site trap.
+pub fn register_site_trap_method(hash: u64) {
+    let mut set = trapped_methods().write().unwrap();
+    if set.len() < MAX_TRAPPED_METHOD_MEMOS {
+        set.insert(hash);
+    }
+}
+
+/// Does this method's compiled IR body carry a planted site trap?
+pub fn method_has_site_trap(hash: u64) -> bool {
+    trapped_methods().read().unwrap().contains(&hash)
+}
+
+/// Site traps actually TAKEN at runtime.
+///
+/// `ir_trap_census` counts what was planted; this is the other half the
+/// planting doc promised and did not have. A cause whose taken count is not
+/// ~0 has had its coldness argument refuted -- which is exactly what happened
+/// to the unresolved-class cause, and the number that says so.
+static SITE_TRAPS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one site trap taken at runtime.
+pub fn note_site_trap_taken() {
+    SITE_TRAPS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many planted site traps have actually fired.
+pub fn site_traps_taken() -> u64 {
+    SITE_TRAPS_TAKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl IrBuilder {
     /// Create a new builder for a method with `num_params` parameter slots
     /// and `num_locals` total local variable slots.
@@ -5442,6 +5510,9 @@ impl IrBuilder {
         if !ir_site_trap_enabled() {
             return false;
         }
+        // Counted at the END, on the success path only -- see the increment
+        // just before `true` is returned. A refused plant must not make the
+        // runtime think this method carries a trap.
         // The unresolved-class causes are opt-in and off by default; see
         // `ir_unresolved_class_trap_enabled` for the argument that was refuted.
         if matches!(
@@ -5485,6 +5556,7 @@ impl IrBuilder {
             Some(pc),
         );
         note_trap_planted(cause);
+        SITE_TRAPS_THIS_BUILD.with(|c| c.set(c.get() + 1));
         if ir_bail_reporting() {
             eprintln!(
                 "[ir] site TRAP planted at bytecode pc {pc} ({}) in {} -- the rest of the method still compiles",
@@ -5796,6 +5868,7 @@ impl IrBuilder {
         // returns, to install the compact-field rows the String-access
         // expansion's two loads need. See `string_access_site_pcs`.
         reset_string_access_sites();
+        reset_site_traps_this_build();
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
@@ -8773,6 +8846,67 @@ mod scalar_intrinsic_recognizer_tests {
     /// which reads, from the outside, exactly like a workload that has no such
     /// call site.
     #[test]
+    /// The site-trap registry is what lets the runtime tell an IR SITE TRAP
+    /// apart from genuinely unreachable code, and the two want OPPOSITE
+    /// actions: unreachable code should blacklist the method, a site trap must
+    /// not -- `MakeNotCompilable` is consulted by `compile_gate` itself, so it
+    /// takes away the single-pass body too, and single-pass lowers the very
+    /// opcodes the trap was planted for.
+    ///
+    /// Measured before the split existed: `MVStore.getMapId` on H2 trapped
+    /// once and lost its body on every tier.
+    #[test]
+    fn a_registered_site_trap_method_is_distinguishable_from_unreachable_code() {
+        // The registry is PROCESS-GLOBAL and this binary runs thousands of
+        // tests, some of which compile real fixtures and register real methods;
+        // the memo key is a hash, so an unlucky collision is possible too. So
+        // this asserts the DISCRIMINATION -- registering one method changes
+        // that method's answer and nothing else's -- rather than asserting the
+        // registry starts empty, which is not this test's to control. A first
+        // draft asserted the precondition and failed in whichever of the two
+        // feature configurations happened to run a colliding fixture first.
+        let h = crate::ir_method_memo_hash(
+            "cratonvm/test/SiteTrapRegistryProbe",
+            "trapping",
+            "()V",
+        );
+        let other = crate::ir_method_memo_hash(
+            "cratonvm/test/SiteTrapRegistryProbe",
+            "untrapped",
+            "()V",
+        );
+        assert_ne!(h, other, "distinct methods must not share a memo key");
+        let other_before = method_has_site_trap(other);
+        register_site_trap_method(h);
+        assert!(
+            method_has_site_trap(h),
+            "a registered method must be recognisable -- this is what stops the              runtime blacklisting it on every tier",
+        );
+        assert_eq!(
+            method_has_site_trap(other),
+            other_before,
+            "registering one method must not implicate another: the runtime              uses this answer to choose between recompiling and blacklisting",
+        );
+    }
+
+    /// The per-build counter is what carries "this build planted a trap" back
+    /// to `lib.rs`, because `build(mut self, ..)` consumes the builder. It must
+    /// start at zero for every build or one trapping method would register
+    /// every method compiled after it on the same thread.
+    #[test]
+    fn the_per_build_trap_count_starts_at_zero() {
+        reset_site_traps_this_build();
+        assert_eq!(site_traps_planted_this_build(), 0);
+        SITE_TRAPS_THIS_BUILD.with(|c| c.set(3));
+        assert_eq!(site_traps_planted_this_build(), 3);
+        reset_site_traps_this_build();
+        assert_eq!(
+            site_traps_planted_this_build(),
+            0,
+            "a stale count would register a method that planted nothing",
+        );
+    }
+
     fn every_declared_family_is_recognised() {
         // Driven off an EXHAUSTIVE match rather than a hand-kept list. The
         // previous version was a list of tuples, which could not catch the one

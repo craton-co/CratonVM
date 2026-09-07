@@ -3716,6 +3716,20 @@ fn native_loader_load_module_by_identifier(
             .into());
         }
     };
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `ctx.invoke` runs `getName()` bytecode and `create_string` below
+    // allocates, so `args[0]` — the loader this forwards to the sibling
+    // native — names a pre-call address by the time the new argument vector
+    // is built.
+    let arg0_pin = match args.first() {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     // ModuleIdentifier has `String getName()` — call it.
     let name_val = ctx.invoke(
         "org/jboss/modules/ModuleIdentifier",
@@ -3734,7 +3748,11 @@ fn native_loader_load_module_by_identifier(
         .into());
     }
     let name_str = ctx.create_string(&name);
-    let new_args: Vec<Value> = vec![args[0], Value::Object(Some(name_str))];
+    let arg0 = match arg0_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => args[0],
+    };
+    let new_args: Vec<Value> = vec![arg0, Value::Object(Some(name_str))];
     native_loader_load_module(ctx, &new_args)
 }
 
