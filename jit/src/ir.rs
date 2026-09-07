@@ -4520,8 +4520,29 @@ fn trapped_methods() -> &'static std::sync::RwLock<rustc_hash::FxHashSet<u64>> {
 /// must not turn a diagnostic into unbounded retained memory.
 const MAX_TRAPPED_METHOD_MEMOS: usize = 8192;
 
+/// Set once any method is registered, so the common case -- a VM that has
+/// planted no site trap at all -- costs one relaxed load instead of a hash and
+/// a lock acquisition.
+///
+/// `try_resume_trapped_callee` runs on EVERY deopt resume, not only trapped
+/// ones, so the lookup it performs is on a path that has nothing to do with
+/// site traps for most workloads.
+static ANY_SITE_TRAP_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has any method in this process been registered as carrying a site trap?
+///
+/// A `false` here is authoritative: the flag is set BEFORE the set insert, and
+/// only ever goes false -> true, so a reader that sees `false` cannot be racing
+/// a registration whose method it is about to be asked about -- the registering
+/// compile has not published its artifact yet.
+pub fn any_site_trap_registered() -> bool {
+    ANY_SITE_TRAP_REGISTERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record that `hash`'s IR body carries a planted site trap.
 pub fn register_site_trap_method(hash: u64) {
+    ANY_SITE_TRAP_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut set = trapped_methods().write().unwrap();
     if set.len() < MAX_TRAPPED_METHOD_MEMOS {
         set.insert(hash);
@@ -9204,6 +9225,25 @@ pub fn ir_trap_census() -> [(&'static str, u64); TrapCause::COUNT] {
 /// an `invokedynamic`, 34 for a `checkcast`/`instanceof` on an unloaded class,
 /// and 13 for a `new` of one -- 100 methods, none of which had anything wrong
 /// with the code the optimizing tier would actually have run.
+///
+/// THIS WAS BRIEFLY FLIPPED OFF ON 2026-09-07 AND THE FLIP WAS WRONG. Thirty
+/// hibernate-reactive classes then read `ok=182 failed=7` with traps on against
+/// `ok=241 failed=0` with them off, and 36 `InternalError: ... refusing
+/// side-effecting replay` -- so the trap looked like the defect. It was only the
+/// TRIGGER. The cause was a deopt SINK that aborted on a trapped frame its
+/// sibling sink resumed, fixed the same day by another session
+/// (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON). Re-measured on a binary
+/// carrying that fix:
+///
+/// ```text
+///   site traps ON  + sink fix    ok=239  failed=0  InternalError=0
+///   site traps OFF + sink fix    ok=241  failed=0  InternalError=0
+/// ```
+///
+/// Zero errors either way, so there is nothing here to switch off. The lesson
+/// kept is about the measurement, not the flag: an A/B with ONE lever proves
+/// that lever is on the path to the failure, and says nothing about whether it
+/// is the defect. A trigger and a cause both answer to a kill switch.
 pub fn ir_site_trap_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -9217,6 +9257,18 @@ pub fn ir_site_trap_enabled() -> bool {
 
 /// May an UNRESOLVED-CLASS site (`checkcast`, `instanceof`, `new`) become a
 /// trap? **Default OFF**; `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` opts in.
+///
+/// The reason it is off CHANGED on 2026-09-07 and the old reason is retracted.
+/// It read "200,000 deopts on `UnresolvedTrapProbe`, every call, permanently
+/// not-compilable", and every one of those numbers was a broken deopt sink
+/// measured through this switch (see `ir_site_trap_enabled`). On a binary with
+/// `CRATONVM_JIT_DEOPT_SINK_RESUME` in it, 30 hibernate-reactive classes with
+/// this switch ON read `ok=241 failed=0` with **112 traps taken and zero**
+/// `refusing side-effecting replay` -- identical to the default arm.
+///
+/// It stays off because turning it on was always a THROUGHPUT argument (+13
+/// accepted bodies, +11 lowered on H2) and that has never been measured. Not
+/// because it is harmful.
 ///
 /// # Why this is separate from the indy trap, and why it ships off
 ///
