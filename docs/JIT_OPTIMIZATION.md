@@ -4401,3 +4401,30 @@ breaks, and the residual re-fire counter reads 0 on both real workloads. Nothing
 here is asking for live-code patching, which in this tree means atomic surgery
 under W^X with no safepoint hook and no existing patch site to copy. It is not
 being built, and this is the measurement that says why.
+
+#### The split-half check, so the next run catches this itself
+
+The reversal above took a day and a second deliberate sample to find. It should
+not have: the evidence was inside the FIRST run, in the classes it had already
+measured. `pair-ab.sh` now scores its own two halves and prints them:
+
+```text
+sign test on the paired count: z = +2.85  (consistent, p < 0.05)
+split-half   : first 20 classes z = +4.02 | last 20 classes z = -0.45
+  ** THE HALVES DISAGREE IN SIGN. ...
+VERDICT: UNMEASURABLE (SPLIT-HALF DISAGREEMENT). A wins 29 of 40
+         overall, but the two halves of this run point OPPOSITE ways.
+```
+
+The discriminating case is the pair the self-test is built on: two runs with the
+IDENTICAL pooled count — 29 of 40, z = +2.85 — where one has halves at
++1.79/+1.79 and the other +4.02/-0.45. The first is reported as SMALL BUT
+CONSISTENT; the second is refused. A check that could not separate those two
+would be doing nothing, which is why the self-test asserts the pooled counts
+match before asserting the verdicts differ.
+
+`tools/suite-pair-ab/selftest.sh` runs the real awk out of `pair-ab.sh` rather
+than a copy, so the two cannot drift, and it was verified to FAIL when the
+detector is disabled. Its own first draft had the bug this file keeps meeting:
+the "same pooled count" assertion compared two EMPTY strings and reported `ok`
+when the summary had not run at all.
