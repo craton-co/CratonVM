@@ -55,24 +55,70 @@ Rule 1's own calibration (`native_fcimpl_open`, 7/7 before `3950eed48` and 0
 after) is unchanged by this addition: `--loops` is a separate mode, not a
 widening of the default.
 
-## The 123 rows, and what the first triage says
+## Two rule corrections the triage forced, and 132 -> 84
 
-Two rows read by hand, one of each kind:
+Reading the rows changed the rule twice, both times because it was reporting
+one question as many:
 
-* **False positive, a family the `native-io` page already names.**
-  `native_process_wait_for_timeout` refreshes through
-  `end_blocking_region_refs(&mut held)` and then `this = updated;` — the
-  refresh goes through an ARRAY, not through the name, so no name-based scan
-  can follow it. That page lists 7 rows of exactly this kind. It is also why
-  `native-io` scores 1: the crate has just been swept, and its residue is
-  documented.
-* **Real candidate.** `native_collections::native_lbq_put_blocking` binds
-  `this` from `args`, calls `ctx.monitor_enter(this)`, then loops on
-  `ctx.get_field(this, LBQ_FIELD_SIZE)` around a `monitor_wait` — which is
-  GC-capable — with no refresh anywhere in the body.
+* **Only the LAST binding of a name before the loop.** `register_s2_bytebuffer`
+  re-`let`s `this` ten times on the way down; exactly one of those is live when
+  a loop is entered. Reporting all ten against three loop spans turned one
+  question into **30 rows in one file** and buried the rest.
+* **The loop HEADER is not the body.** `for x in helper(ctx, this)` evaluates
+  `helper` ONCE, before the body — it is not a per-iteration GC point. Counting
+  it made every `for .. in helper(ctx, this)` a row.
 
-103 of the 123 are in `native-builtins`, the crate the 2026-08-25 pass covered
-with the weak rule. That is the tranche to read.
+`native-builtins` 132 -> **67**, `native-collections` 19 -> **16**,
+`native-io` **1**, `native-api` 0.
+
+## Triage of the 67 `native-builtins` rows
+
+Classified by the shape of the use, with six read by hand. **This is a
+classification, not 67 individual verdicts** — the buckets are named so the
+next reader can start from the shape rather than the row.
+
+| bucket | rows | verdict |
+|---|---:|---|
+| `ctx.invoke*` on the carried reference | 26 | real |
+| passed to a local helper that can GC | ~26 | real, same defect one call down |
+| `monitor_wait` / `monitor_wait_release` loop | 4 | real |
+| iterator loop (`hasNext`/`next` on a carried `it`) | 3 | real |
+| rebound by the reporting statement itself | 3 | false positive |
+| a pin is handed to the callee alongside the name | 3 | false positive |
+
+The "passed to a local helper" bucket is the classifier's `needs reading` pile:
+`sha1prng_next(ctx, this, ..)`, `java_list_get(ctx, list, ..)`,
+`native_es_add(ctx, ..)`, `store_property_in_sidetable(ctx, wrapper, ..)`,
+`lucene_data_output_write_byte_direct(ctx, this, ..)`,
+`IoFutureInner::fire_notifier(ctx, this, ..)`. Same defect, one frame down.
+
+**The rule is a LOWER BOUND, and the triage proved it.** It requires the
+GC-capable statement to NAME the binding. In `drain_to_lbq_bounded` the loop is
+
+```rust
+let elem = ctx.get_array_element(arr, i);                 // uses `arr`
+ctx.invoke_virtual(coll, "add", .., &[elem])?;            // GCs, names `coll`
+```
+
+`arr` is just as stale on the next iteration and is **not reported**, because
+no GC-capable statement mentions it. Widening to "any GC in the body stales
+every reference the body carries in" is correct and would raise the count
+substantially; it is not done here because the narrow form is what the
+calibration above measures.
+
+## Fixed here: the two `letsgo_compat` drains
+
+`drain_to_lbq_bounded` and `drain_to_abq_bounded` carry `coll`, `arr` AND
+`this` across a loop whose body runs `invoke_virtual(coll, "add", ..)`; `this`
+is used after the loop as well. All three are now pinned before the loop and
+re-read — the re-reads shadow inside the body, so the outer bindings are
+untouched. No unpin: both are native entry points and `safe_native_call`
+truncates the pin stack to its entry floor on return.
+
+They are `#[cfg(feature = "synthetic-jdk")]`, so `cargo check -p
+cratonvm-native-builtins` does not type-check them at all without
+`--features synthetic-jdk`. That is the same trap that had dev unbuildable on
+Linux the same morning; the check was run with the feature on.
 
 ## What this does NOT establish
 

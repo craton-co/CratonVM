@@ -733,19 +733,28 @@ def scan_loops(fn, allocfns):
     params = list(PARAM_REF.findall(sig))
     hits = []
     for (a, b) in loop_spans(fn.body):
-        inner = [st for st in stmts if a <= st.line <= b]
+        # EXCLUDE THE HEADER. `for x in f(ctx, this)` evaluates `f` ONCE,
+        # before the body — it is not a per-iteration GC point, and counting it
+        # made every `for .. in helper(ctx, this)` a row.
+        inner = [st for st in stmts if a < st.line < b]
         if not inner:
             continue
         inner_txt = " ".join(st.text for st in inner)
         # Candidates: declared `ObjectRef` parameters, plus locals bound BEFORE
         # the loop. A binding made inside the loop is fresh each iteration.
-        pre = []
+        # ONLY THE LAST binding of each name before the loop. A name that is
+        # re-`let` several times on the way down (`register_s2_bytebuffer`
+        # shadows `this` ten times) has exactly one live binding when the loop
+        # is entered; reporting all of them turned one question into thirty
+        # rows and buried the two real ones in the same file.
+        pre_map = {}
         for st in stmts:
             if st.line >= a:
                 break
             m = LET.match(st.text)
             if m and m.group(1) != "_":
-                pre.append((m.group(1), st))
+                pre_map[m.group(1)] = st
+        pre = list(pre_map.items())
         cands = [(p, None) for p in params] + pre
         for name, bind in cands:
             # A handle is not an ObjectRef; that is the point of a handle scope.
