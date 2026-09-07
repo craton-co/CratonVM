@@ -255,15 +255,23 @@ fn parse_inet_address(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Option<Ip
     // A non-InetAddress argument (`join`'s `NetworkInterface`) has no such
     // method; the call fails and we fall through, which is exactly what the
     // caller's "default to the wildcard interface" path expects.
+    // GC: `getHostAddress()` runs Java, which allocates — it builds the very
+    // String it returns — and the slot-probing fallback below reads `addr`
+    // again afterwards. The caller's `args` slot is a root and is remapped;
+    // this copy is not.
+    let pin = ctx.pin_native_root(addr);
     if let Ok(Some(Value::Object(Some(s)))) =
         ctx.invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
     {
         if let Some(text) = ctx.read_string(s) {
             if let Ok(ip) = text.parse::<IpAddr>() {
+                ctx.unpin_native_roots(pin);
                 return Some(ip);
             }
         }
     }
+    let addr = ctx.read_native_pin(pin, addr);
+    ctx.unpin_native_roots(pin);
     // Fallback: IP text at slot 1 (what net.rs encodes), then slot 0.
     let text = match ctx.get_field(addr, 1) {
         Value::Object(Some(s)) => ctx.read_string(s),

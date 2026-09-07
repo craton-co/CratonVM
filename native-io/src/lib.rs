@@ -779,12 +779,43 @@ const AL_FIELD_SIZE: usize = 1;
 const AL_DEFAULT_CAPACITY: usize = 10;
 
 fn al_init(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // GC: `this` is a bare `ArrayList` the CALLER just allocated and has NOT
+    // rooted — `native_files_read_all_lines` does `alloc_object` and comes
+    // straight here — so the array allocation below can move it, and under the
+    // Generational non-moving young sweep can find it unreachable and zero it
+    // in place. Same window that reclaimed a live `FileChannelImpl`; see
+    // `internal/fixed-bugs/filechannelimpl-construction-window-was-never-rooted-FIXED-20260906.md`.
+    let pin = ctx.pin_native_root(this);
     let buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
+    let this = ctx.read_native_pin(pin, this);
     ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
+    ctx.unpin_native_roots(pin);
 }
 
 fn al_add(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
+    // GC: THREE references have to survive the growth allocation below, and
+    // the caller runs this once per element —
+    //
+    //   let list = ctx.alloc_object(..);        // never rooted
+    //   al_init(ctx, list);
+    //   for line in &lines {
+    //       let line_str = ctx.create_string(line);   // allocates, per line
+    //       al_add(ctx, list, Value::Object(Some(line_str)));
+    //   }
+    //
+    // so `this` (the unrooted list), the current backing array, and `elem`
+    // itself — an object in the common case, and a String allocated one line
+    // earlier — are all live-but-unnamed across `new_ref_array`. `elem` is a
+    // `Value`, which the audit's parameter rule cannot see at all.
+    //
+    // Released before returning rather than left to the native-call boundary:
+    // one pin per element is a pin per LINE of the file.
+    let base = ctx.pin_native_root(this);
+    let elem_pin = match elem {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let size = match ctx.get_field(this, AL_FIELD_SIZE) {
         Value::Int(s) => s as usize,
         _ => 0,
@@ -793,25 +824,37 @@ fn al_add(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
         Value::Object(Some(a)) => a,
         _ => {
             let new_buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
+            let this = ctx.read_native_pin(base, this);
             ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
             new_buf
         }
     };
+    let buf_pin = ctx.pin_native_root(buf);
     let cap = ctx.array_length(buf);
     let buf = if size >= cap {
         let new_cap = (cap * 2).max(size + 1);
         let new_buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
+        // `new_buf` is fresh and nothing below it allocates, so only the OLD
+        // array and `this` need reading back.
+        let buf = ctx.read_native_pin(buf_pin, buf);
         for i in 0..size {
             let v = ctx.get_array_element(buf, i);
             ctx.set_array_element(new_buf, i, v);
         }
+        let this = ctx.read_native_pin(base, this);
         ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
         new_buf
     } else {
-        buf
+        ctx.read_native_pin(buf_pin, buf)
+    };
+    let elem = match elem_pin {
+        Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        None => elem,
     };
     ctx.set_array_element(buf, size, elem);
+    let this = ctx.read_native_pin(base, this);
     ctx.set_field(this, AL_FIELD_SIZE, Value::Int((size + 1) as i32));
+    ctx.unpin_native_roots(base);
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,13 +1833,20 @@ fn fis_ensure_fd_object(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         return Some(fd_obj);
     }
-    match ctx.new_object("java/io/FileDescriptor") {
+    // GC: `new_object` allocates, so the `this` this function was handed is
+    // an address from before the call. The caller's ARGUMENT slot is a root
+    // and gets remapped; this copy of it is not.
+    let pin = ctx.pin_native_root(this);
+    let made = match ctx.new_object("java/io/FileDescriptor") {
         Ok(Some(Value::Object(Some(fd_obj)))) => {
+            let this = ctx.read_native_pin(pin, this);
             ctx.set_field_by_name(this, "fd", Value::Object(Some(fd_obj)));
             Some(fd_obj)
         }
         _ => None,
-    }
+    };
+    ctx.unpin_native_roots(pin);
+    made
 }
 
 fn fis_backfill_constructor_fields(
@@ -1804,8 +1854,16 @@ fn fis_backfill_constructor_fields(
     this: ObjectRef,
     path_obj: Option<ObjectRef>,
 ) {
+    // GC: two allocations here — the `FileDescriptor` and the `closeLock`
+    // Object — and every store afterwards goes through `this`. `path_obj` is
+    // an `Option<ObjectRef>` parameter held across the first of them, which is
+    // a shape the audit's parameter rule does not match at all.
+    let base = ctx.pin_native_root(this);
+    let path_pin = path_obj.map(|p| (ctx.pin_native_root(p), p));
     let _ = fis_ensure_fd_object(ctx, this);
-    if let Some(path_obj) = path_obj {
+    let this = ctx.read_native_pin(base, this);
+    if let Some((h, p)) = path_pin {
+        let path_obj = ctx.read_native_pin(h, p);
         ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
     }
     if !matches!(
@@ -1813,10 +1871,13 @@ fn fis_backfill_constructor_fields(
         Value::Object(Some(_))
     ) {
         if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            let this = ctx.read_native_pin(base, this);
             ctx.set_field_by_name(this, "closeLock", Value::Object(Some(lock)));
         }
     }
+    let this = ctx.read_native_pin(base, this);
     ctx.set_field_by_name(this, "closed", Value::Int(0));
+    ctx.unpin_native_roots(base);
 }
 
 fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1868,8 +1929,15 @@ fn fis_open_path(
     // `<init>(String)` fallback, those fields are still unset; populate them so
     // the public real bytecode (`read(...) -> readBytes`, `getFD`, `close`) sees
     // the same shape as HotSpot rather than an empty/closed stream.
+    // GC: the doc comment above already says the receiver is pinned as a
+    // native ARG and that the collector remaps the pin but not a bare copy of
+    // it — and then holds a bare copy across the backfill, which allocates a
+    // `FileDescriptor` and possibly a `closeLock`. Awareness is not coverage.
+    let pin = ctx.pin_native_root(this);
     fis_backfill_constructor_fields(ctx, this, path_obj);
+    let this = ctx.read_native_pin(pin, this);
     fis_set_fd(ctx, this, fd);
+    ctx.unpin_native_roots(pin);
     Ok(None)
 }
 
@@ -4382,25 +4450,36 @@ fn native_baos_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn baos_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) -> ObjectRef {
+    // GC: `this` and the old `data` array both have to survive the growth
+    // allocation. Every exit releases the pins — this runs on the write path
+    // of a `ByteArrayOutputStream`, i.e. potentially per write() call.
+    let base = ctx.pin_native_root(this);
     let data = match ctx.get_field(this, BAOS_FIELD_DATA) {
         Value::Object(Some(arr)) => arr,
         _ => {
             let buf = ctx.new_array(ArrayElementType::Byte, needed.max(BAOS_DEFAULT_CAPACITY));
+            let this = ctx.read_native_pin(base, this);
             ctx.set_field(this, BAOS_FIELD_DATA, Value::Object(Some(buf)));
+            ctx.unpin_native_roots(base);
             return buf;
         }
     };
     let cap = ctx.array_length(data);
     if needed <= cap {
+        ctx.unpin_native_roots(base);
         return data;
     }
+    let data_pin = ctx.pin_native_root(data);
     let new_cap = (cap * 2).max(needed);
     let new_buf = ctx.new_array(ArrayElementType::Byte, new_cap);
+    let data = ctx.read_native_pin(data_pin, data);
     for i in 0..cap {
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_buf, i, v);
     }
+    let this = ctx.read_native_pin(base, this);
     ctx.set_field(this, BAOS_FIELD_DATA, Value::Object(Some(new_buf)));
+    ctx.unpin_native_roots(base);
     new_buf
 }
 
@@ -12963,9 +13042,13 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
         ctx.set_array_element(holder, 0, Value::Int(count as i32));
         return;
     }
+    // GC: the holder array is allocated first and stored into `this` after.
+    let pin = ctx.pin_native_root(this);
     let holder = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
+    let this = ctx.read_native_pin(pin, this);
     ctx.set_array_element(holder, 0, Value::Int(count as i32));
     ctx.set_field(this, SW_FIELD_COUNT, Value::Object(Some(holder)));
+    ctx.unpin_native_roots(pin);
 }
 
 // JDK-ONLY-CLASSIFY: stub — `java.io.StringReader` and `java.io.StringWriter`
@@ -13534,13 +13617,19 @@ fn sw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usiz
     let cap = ctx.array_length(buf);
     let count = sw_count(ctx, this);
     if count + needed > cap {
+        // GC: `this` and the old buffer both cross the growth allocation.
+        let base = ctx.pin_native_root(this);
+        let buf_pin = ctx.pin_native_root(buf);
         let new_cap = (cap * 2).max(count + needed);
         let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
+        let buf = ctx.read_native_pin(buf_pin, buf);
         for i in 0..count {
             let v = ctx.get_array_element(buf, i);
             ctx.set_array_element(new_buf, i, v);
         }
+        let this = ctx.read_native_pin(base, this);
         ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(new_buf)));
+        ctx.unpin_native_roots(base);
     }
 }
 
@@ -17402,8 +17491,14 @@ fn caw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
     if needed <= cap {
         return;
     }
+    // GC: `this` is read again for the count and written at the end, and the
+    // old buffer is copied out — both across the growth allocation.
+    let base = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
     let new_cap = std::cmp::max(needed, cap * 2);
     let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
+    let this = ctx.read_native_pin(base, this);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
         Value::Int(v) => v as usize,
         _ => 0,
@@ -17413,6 +17508,7 @@ fn caw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
         ctx.set_array_element(new_buf, i, v);
     }
     ctx.set_field(this, CAW_FIELD_BUF, Value::Object(Some(new_buf)));
+    ctx.unpin_native_roots(base);
 }
 
 fn native_caw_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17807,9 +17903,17 @@ fn bos_side_write_bulk(
         });
         state.capacity
     };
+    // GC: `bos_side_flush` re-enters Java (it calls `write` on the wrapped
+    // stream), so both `this` and the caller's `src` array are pre-call
+    // addresses from here down. An error return leaves the pins to
+    // `safe_native_call`, which truncates to the native-call floor.
+    let base = ctx.pin_native_root(this);
+    let src_pin = ctx.pin_native_root(src);
     if len >= capacity {
         bos_side_flush(ctx, this, out_slot, false)?;
+        let this = ctx.read_native_pin(base, this);
         if let Some(inner) = bos_inner(ctx, this, out_slot) {
+            let src = ctx.read_native_pin(src_pin, src);
             ctx.invoke_virtual(
                 inner,
                 "write",
@@ -17821,6 +17925,7 @@ fn bos_side_write_bulk(
                 ],
             )?;
         }
+        ctx.unpin_native_roots(base);
         return Ok(None);
     }
 
@@ -17835,7 +17940,9 @@ fn bos_side_write_bulk(
     }
 
     let mut bytes = vec![0u8; len];
+    let src = ctx.read_native_pin(src_pin, src);
     ctx.read_byte_array_into(src, off, &mut bytes);
+    ctx.unpin_native_roots(base);
     let mut bufs = bos_side_buffers().lock();
     let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
         bytes: Vec::with_capacity(capacity),
@@ -17986,6 +18093,15 @@ fn bis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<i32, MethodC
         _ => return Ok(0),
     };
     let buf_len = ctx.array_length(buf) as i32;
+    // GC: every `invoke_virtual` below runs the wrapped stream's Java, which
+    // allocates and can collect — and the single-byte fallback does it once
+    // per byte. `this`, the buffer being filled and the inner stream are all
+    // held across those calls, so all three are pinned and read back.
+    let base = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let inner_pin = ctx.pin_native_root(inner);
+    let mut buf = buf;
+    let mut inner = inner;
     // Try bulk read into our buffer
     let n = ctx.invoke_virtual(
         inner,
@@ -18000,9 +18116,11 @@ fn bis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<i32, MethodC
             // This handles streams that only implement read()I
             let mut filled = 0i32;
             while filled < buf_len {
+                inner = ctx.read_native_pin(inner_pin, inner);
                 let r = ctx.invoke_virtual(inner, "read", "()I", &[])?;
                 match r {
                     Some(Value::Int(b)) if b >= 0 => {
+                        buf = ctx.read_native_pin(buf_pin, buf);
                         ctx.set_array_element(buf, filled as usize, Value::Int(b));
                         filled += 1;
                         // After first byte, only continue if more data available
@@ -18010,6 +18128,7 @@ fn bis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<i32, MethodC
                             continue; // always read at least 1 byte
                         }
                         // Check if inner stream has more data available
+                        inner = ctx.read_native_pin(inner_pin, inner);
                         let avail = ctx.invoke_virtual(inner, "available", "()I", &[])?;
                         match avail {
                             Some(Value::Int(a)) if a > 0 => continue,
@@ -18020,15 +18139,19 @@ fn bis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<i32, MethodC
                 }
             }
             if filled == 0 {
+                let this = ctx.read_native_pin(base, this);
                 ctx.set_field(this, BIS_FIELD_POS, Value::Int(0));
                 ctx.set_field(this, BIS_FIELD_COUNT, Value::Int(0));
+                ctx.unpin_native_roots(base);
                 return Ok(0);
             }
             filled
         }
     };
+    let this = ctx.read_native_pin(base, this);
     ctx.set_field(this, BIS_FIELD_POS, Value::Int(0));
     ctx.set_field(this, BIS_FIELD_COUNT, Value::Int(bytes_read));
+    ctx.unpin_native_roots(base);
     Ok(bytes_read)
 }
 
@@ -24490,11 +24613,18 @@ fn watch_event_kind_bit(ctx: &mut dyn NativeContext, kind: ObjectRef) -> i32 {
     // Real kind (or anything else implementing the interface): ask for the
     // name. Fall back to reading the receiver as a String for the legacy
     // synthetic surface that handed out bare name Strings.
+    // GC: `name()` runs Java, and the `or_else` fallback reads `kind` back —
+    // the closure runs AFTER that call returns. Not reported by the audit's
+    // parameter rule, which asks whether the use is in a LATER statement, and
+    // this one shares a statement with the call it follows.
+    let pin = ctx.pin_native_root(kind);
     let name = match ctx.invoke_virtual(kind, "name", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
         _ => None,
-    }
-    .or_else(|| ctx.read_string(kind));
+    };
+    let kind = ctx.read_native_pin(pin, kind);
+    let name = name.or_else(|| ctx.read_string(kind));
+    ctx.unpin_native_roots(pin);
     match name.as_deref() {
         Some("ENTRY_CREATE") => EVENT_CREATE,
         Some("ENTRY_DELETE") => EVENT_DELETE,
