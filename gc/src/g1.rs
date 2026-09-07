@@ -328,7 +328,16 @@ fn for_each_flat_object_reference_capped(
             if cratonvm_types::cell_census::decoded() != census_before {
                 census_before = cratonvm_types::cell_census::decoded();
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 8 {
+                // Same rate limit as the report below, NOT `n <= 8` alone: `n` is a
+                // RUN-GLOBAL counter, so `n <= 8` samples only the first eight
+                // corrupt cells a run ever sees. If those are pushed before any
+                // drain runs -- which is exactly what happened on the Tomcat
+                // class, where the drain was wired to the serial bodies only --
+                // they sit in the list, nothing further is ever sampled, and a
+                // crash before the next drain loses the whole run. Refilling on
+                // the power-of-two samples keeps the instrument alive for the
+                // rest of the run at the same bounded cost.
+                if n <= 8 || n.is_power_of_two() {
                     let mut pend = PENDING_CORRUPT_HOLDERS.lock();
                     if pend.len() < 8 {
                         pend.push((
@@ -8839,6 +8848,20 @@ impl G1Collector {
         if gc_flags().g1_retire_forwards_late {
             self.retire_forwards(&pointer_map);
         }
+
+        // WIRED INTO THE PARALLEL DRIVERS TOO (2026-09-07). The drain and the
+        // forward verifier were on the three SERIAL bodies only, so on a
+        // workload that takes the parallel arm -- which is the DEFAULT -- they
+        // never ran. Measured cost of that gap: the Tomcat class this family is
+        // named for produced 14 corrupt-cell reports across two runs and ZERO
+        // grid verdicts, while H2 emitted 8 a run, and the difference was read
+        // as a property of the workload until the wiring was checked.
+        //
+        // Unconditional rather than inside the `retire_forwards_late` arm: with
+        // that flag OFF the retire happens early inside `parallel_evacuate`,
+        // and the holders still need draining here.
+        self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         // Phase 5: free evacuated regions.
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
@@ -9137,6 +9160,20 @@ impl G1Collector {
         if gc_flags().g1_retire_forwards_late {
             self.retire_forwards(&pointer_map);
         }
+
+        // WIRED INTO THE PARALLEL DRIVERS TOO (2026-09-07). The drain and the
+        // forward verifier were on the three SERIAL bodies only, so on a
+        // workload that takes the parallel arm -- which is the DEFAULT -- they
+        // never ran. Measured cost of that gap: the Tomcat class this family is
+        // named for produced 14 corrupt-cell reports across two runs and ZERO
+        // grid verdicts, while H2 emitted 8 a run, and the difference was read
+        // as a property of the workload until the wiring was checked.
+        //
+        // Unconditional rather than inside the `retire_forwards_late` arm: with
+        // that flag OFF the retire happens early inside `parallel_evacuate`,
+        // and the holders still need draining here.
+        self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a

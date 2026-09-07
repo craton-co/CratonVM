@@ -123,7 +123,16 @@ pub fn alloc_concrete(
 ///     fields. A later `base_for_class` on that receiver would answer `nfields`
 ///     and disagree with the 0 the allocator used; the width check sends it
 ///     back to 0, which is the base that was actually used.
-pub fn concrete_base(ctx: &mut dyn NativeContext, this: ObjectRef, nfields: usize) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
+/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
+/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+pub fn concrete_base(ctx: &dyn NativeContext, this: ObjectRef, nfields: usize) -> usize {
     cratonvm_native_api::appended_slots::base_for_object(ctx, this, nfields)
 }
 

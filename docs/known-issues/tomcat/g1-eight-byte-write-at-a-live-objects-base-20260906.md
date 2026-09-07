@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | **The corrupt-header family no longer reproduces on H2** as of dev's 2026-09-06 evacuation fixes: ablating the four of them together brings it back (7 arena-pointer holders and a SIGSEGV in ~400 checkpoints, against 0 in ~36 000 with them on) -- see the 2026-09-07 section. Which of the four, and whether the Tomcat-side reports were corruption or a desynced walk, are both still open. The producer was never identified directly, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
-| **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. **Amended 2026-09-07, and the two halves went opposite ways.** The `TestMVStoreTool` THROUGHPUT face is now measured and is not this defect at all -- it is mutator-side address validation plus the VM's general helper-bound execution, 24x HotSpot on a run in which the collector never executes once (`docs/internal/performance/h2-mvstoretool-create-phase-is-mutator-side-address-validation-20260907.md`). The `BufferOverflowException` face went the other way: H2's arithmetic on that path cannot overflow and both halves of the `ByteBuffer` contract under it are now proven sound by probes, so the only producer left is a reference naming memory that is not the object the check measured -- i.e. THIS page's family (`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstoretool-bufferoverflow-is-not-a-nio-defect-RESOLVED-20260907.md`). Absorb that one; leave the throughput one alone. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
+| **Status** | **OPEN, and now known to be TWO defects.** The reports are REAL corruption, not a desynced walk: `grid_closes_on_cursor=true` on 11 of 11, the walk stepping 8623 whole objects onto the exact region cursor (2026-09-07 section). One run produced BOTH a body-cell population (6 sound `class_id=64` objects, corrupt slots) and a header population (8 arena-pointer holders), at disjoint addresses. `word0_plausible_ptr` has a false-positive class, so this page's 19-of-19 statistic needs re-taking. The corrupt-header family no longer reproduces on H2 as of dev's 2026-09-06 evacuation fixes: ablating the four of them together brings it back (7 arena-pointer holders and a SIGSEGV in ~400 checkpoints, against 0 in ~36 000 with them on) -- see the 2026-09-07 section. Which of the four, and whether the Tomcat-side reports were corruption or a desynced walk, are both still open. The producer was never identified directly, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
+| **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. **Amended 2026-09-07, and the two halves went opposite ways.** The `TestMVStoreTool` THROUGHPUT face is now measured and is not this defect at all -- it is mutator-side address validation plus the VM's general helper-bound execution, 24x HotSpot on a run in which the collector never executes once (`docs/internal/performance/h2-mvstoretool-create-phase-is-mutator-side-address-validation-20260907.md`), and the ZGC OOM is a refused compactor with 88% of the heap free (`docs/known-issues/h2/zgc-oom-on-mvstore-is-the-unregistered-entry-frame-blocking-compaction-20260907.md`). The `BufferOverflowException` face went the other way: H2's arithmetic on that path cannot overflow and both halves of the `ByteBuffer` contract under it are now proven sound by probes, so the only producer left is a reference naming memory that is not the object the check measured -- i.e. THIS page's family (`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstoretool-bufferoverflow-is-not-a-nio-defect-RESOLVED-20260907.md`). Absorb that one; leave the other two alone. |
 | **Left behind by** | `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens` (2026-09-05), whose own "What is NOT closed" section names this class. |
 
 ## The faces are one defect
@@ -559,6 +559,66 @@ family used to appear within a couple of minutes and a few hundred pauses.
   (`grid_closes_on_cursor`, added for it) never got an answer, because after the
   fixes there are no reports left to classify. It stays open against the
   Tomcat-side reports, which this page's own census collected.
+
+## ANSWERED 2026-09-07: the reports are REAL CORRUPTION, and the grid proves it
+
+The question this page could not settle -- are the corrupt-cell reports evidence
+of corruption, or artefacts of a walk that lost the object boundaries? --
+is answered. `grid_closes_on_cursor`, run on THIS class:
+
+| | |
+|---|---:|
+| verdicts with `grid_closes_on_cursor=true` | **11** |
+| verdicts with `grid_closes_on_cursor=false` | **0** |
+
+and the closure is not marginal:
+
+```
+grid_closes_on_cursor=true  grid_walked=8623  grid_ended=0xc27f0
+source=r115/Survivor/off=0x92ff0/cursor=0xc27f0
+grid=OBJECT-START idx=5357
+```
+
+The walk stepped **8623 whole objects** from the region base and ended at
+`0xc27f0`, which IS the region cursor, exactly. A walk that had crossed a wrong
+size could not land there. So the boundaries are the allocator's, the holder is
+a real object start, and every `grid=OBJECT-START` on this page can now be read
+at face value rather than as a possible tautology.
+
+### and the corruption is in object BODIES, not only headers
+
+All six distinct holders in that run are `class_id=64 num_slots=18`,
+`gc_age=6` -- sound, long-lived objects, in a region whose grid closes
+perfectly. Their HEADERS are fine (`header_word0=0x0000001200000040` is just
+`(18<<32)|64`). What is corrupt is a CELL in the body, `slot_index=6` of 18,
+read by `SharedEvac::process_object`.
+
+That is a DIFFERENT population from the arena-pointer header corruption, and
+the same run produced both: 11 corrupt body cells in 6 sound objects, and 8
+holders refused because their first word IS an arena pointer -- disjoint
+addresses. This page has treated them as one defect. They are two, they
+co-occur, and only the second is a header write.
+
+### `word0_plausible_ptr` has a false-positive class
+
+The field reports `true` for `header_word0=0x0000001200000040`, which is an
+ordinary `class_id=64 / num_slots=18` header and not a pointer into anything.
+
+Verified rather than eyeballed: `holder_word0_arena_pointer` computes the SAME
+predicate over the SAME arena bounds in the SAME run, and it did not refuse
+that holder -- while it did refuse eight others. Two independent computations
+of one predicate disagree on this input, so the field is wrong here.
+
+**This page cites `word0_plausible_ptr` TRUE on 19 of 19 holders as its
+evidence that the first word is a pointer.** That statistic needs re-taking
+against the arena test that fires a refusal, not against this field.
+
+### reproduction rate, for whoever runs it next
+
+1 run in 6 on an idle host (fat LTO). Three earlier runs on a thin-LTO build of
+the same tree gave 0, which is consistent with the ~1-in-3 rate this page
+already records and is NOT evidence that thin LTO masks it. Budget six or more
+reps before reading a zero as anything.
 
 ## The next step
 
