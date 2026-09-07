@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | **OPEN.** The producer is not identified. What this page adds is that the several Java-visible faces are ONE thing, that the thing is an eight-byte write at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
-| **Scope** | G1 only. Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
+| **Status** | **The corrupt-header family no longer reproduces on H2** as of dev's 2026-09-06 evacuation fixes: ablating the four of them together brings it back (7 arena-pointer holders and a SIGSEGV in ~400 checkpoints, against 0 in ~36 000 with them on) -- see the 2026-09-07 section. Which of the four, and whether the Tomcat-side reports were corruption or a desynced walk, are both still open. The producer was never identified directly, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
+| **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
 | **Left behind by** | `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens` (2026-09-05), whose own "What is NOT closed" section names this class. |
 
 ## The faces are one defect
@@ -323,27 +323,311 @@ default for throughput reasons, this is one class on one host, and switching
 collectors' arms on the strength of nine runs would be trading a measured
 defect for an unmeasured regression everywhere else.
 
+## The H2 population says it is NOT an eight-byte write
+
+The `word0_plausible_ptr` test above was applied to the OTHER workload this
+family is on record from -- `org.h2.test.store.TestMVStoreTool`, `-Xmx256m`,
+`CRATONVM_G1_JIT_MARK_DRIVER=1` -- over **118 distinct corrupt holders from 13
+runs** (deduplicated on `(holder, class_id, num_slots, mark)`; a holder is
+counted once however many of its cells the walk rejected). "Arena pointer"
+here is: 8-byte aligned, same 4 GiB window as the holder, within 1 GiB of it.
+
+| what the 16-byte header holds | holders |
+|---|---:|
+| **BOTH words are arena pointers** | **53** |
+| `word0` only -- the shape this page describes | 25 |
+| `mark` only | 7 |
+| `mark` is a SELF-forward (`holder` tagged 3) | 11 |
+| neither | 22 |
+
+**The mark word is not untouched.** This page's central inference --
+
+> An eight-byte write at the base, with the mark word untouched, is a much
+> narrower statement than "the header is corrupt": a sixteen-byte legacy
+> `Value` write would have taken the mark word out too.
+
+-- holds for 25 of 118 holders here. In the largest population the write took
+**both** words out, which is the case that inference excludes. On the Tomcat
+class the mark survived 19 of 19 times; on H2 it survives 25 of 118. Two
+workloads, opposite majorities, so "eight bytes" is a property of the Tomcat
+sample and not of the defect.
+
+That matters because the eight-byte framing is what narrows the suspect list to
+the two eight-byte reference writes in the next-step section. If sixteen bytes
+go in half the population, a whole-body overwrite is back on it.
+
+### and the body is foreign too
+
+The strongest evidence for a bulk overwrite was already in this tree, recorded
+in `for_each_flat_object_reference_capped`'s own comment and never connected to
+the header question: for one corrupt holder the cells the walk then read were
+`raw0=0x6f57206f6c6c6548` and `raw1=0x3532363620646c72` -- `"Hello Wo"` and
+`"rld 6625"`, the payload of a Java string.
+
+A holder whose HEADER is two foreign pointers and whose BODY is a foreign
+string's characters was not hit by a write of eight bytes, or of sixteen. A run
+of foreign bytes landed on it, header first. The two header words read as
+pointers because they are the source's first two body words; they read as a
+plausible quartet and an incrementing `gc_age` in the Tomcat sample for the
+same reason -- those are whatever the source had there.
+
+### the deltas, for whoever instruments this next
+
+Over the 53 both-pointer holders, `mark[0:48] - word0` is small in 24 cases and
+takes exactly three values there -- `+0x28` (x11), `+0x18` (x9), `+0x50` (x4)
+-- with 22 larger and 7 negative. Small object sizes, i.e. two adjacent fields
+naming consecutively-allocated objects, which is what the first two reference
+fields of a copied body usually are. It is consistent with the bulk-overwrite
+reading; it does not on its own prove it, and 29 of 53 are not small.
+
+**What was checked and is NOT the mechanism.** `SharedEvac::evacuate` copies
+`obj_size` bytes to a block `tlab_alloc` returned for exactly `obj_size`
+(`new_off <= tlab.len`), so an oversized header cannot make that copy run past
+its destination -- it exhausts the pool one region per attempt and returns
+`None`, which is this page's OOM, not an overwrite. Whatever writes the run of
+bytes, it is not that call site overrunning.
+
+## The walks are READERS: screening them moves the reports, it does not stop them
+
+Measured 2026-09-06 on H2 (`TestMVStoreTool`, -Xmx256m, G1, mark driver on),
+one binary, one kill switch, 5 interleaved pairs. Arm A ablates a new
+word0-is-an-arena-pointer holder refusal on the serial evacuator and on the
+Phase-4 fixup; arm B has it on.
+
+| arm | corrupt per rep | serial refusals | phase-4 refusals |
+|---|---|---|---|
+| A | 13, 13, 0, 0, 21 | 0 | 0 |
+| B | 16, 0, 13, 0, 19 | 10, 4, 0, 9, 9 | 12, 11, 11, 14, 12 |
+
+47 against 48, and 8 of 10 runs SIGSEGV in both arms. The screens **engage** --
+this is not a vacuous arm -- and the family survives them.
+
+**Where the reports went is the whole result.** `#[track_caller]` on the same
+runs:
+
+* `A-1` -- 13 of 13 at `scan_and_evacuate_refs` (the walk arm B screens);
+* `B-1` -- 15 of 16 at `scan_source_region_for_cset_refs`, which has no screen;
+* `A-5` -- 19 of 21 at `update_object_refs`;
+* `B-4` -- spread across five different walks.
+
+Screening one reader moved the population to the next one. There are **six**
+flat-walk sites, not the three this page's `#[track_caller]` census found:
+`scan_and_evacuate_refs`, `scan_source_region_for_cset_refs`,
+`collect_outgoing_cross_region_edges`, `note_humongous_targets_in_region`,
+`update_object_refs`, `seed_source_region`.
+
+### what that settles about the producer
+
+A holder that is already corrupt when six independent walks read it was not
+corrupted by any of them. This page's search has been aimed at the walks; the
+walks are readers.
+
+The write they perform past a holder's end is real and worth stopping on its
+own terms -- `update_object_refs` reaches
+`for_each_flat_object_reference_trusting_header`, whose own doc says it "bounds
+it by nothing", and one refusal in these runs names a holder declaring 102736
+legacy slots: a 1.6 MB body in a 1 MiB region, rewritten cell by cell with
+forwarding addresses. But it is an AMPLIFIER. It explains why corruption
+arrives in bursts within one second and why victims' first two words are two
+arena pointers one object-size apart. It does not explain the first one.
+
+**The origin is upstream of every walk on this page and is still unfound.**
+
+### and the copy watch says it is not the copy either
+
+`CopyWatch` (`CRATONVM_G1_EVAC_COPY_WATCH=1`), run on H2 for the first time:
+**zero** first-word rewrites over ~700k to-space copies, at all three of its
+checkpoints -- before the pause, after the parallel closure, after the serial
+drain -- in runs that reported 13 and 17 corrupt holders. So the victims are
+not sound to-space copies overwritten after the copy, which is the inference
+the top of this page rests on.
+
+## CLOSED 2026-09-07: dev's four evacuation fixes close the corrupt-header family
+
+One binary, all four of dev's 2026-09-06 evacuation fixes default-ON and
+individually ablatable, interleaved ABBA on H2 `TestMVStoreTool` (-Xmx256m, G1,
+mark driver on, copy watch on):
+
+* **A** -- `PARALLEL_EVAC_RESUME_DEST=0 RETIRE_FORWARDS_LATE=0 REEVAC_GUARD=0
+  PARALLEL_EVAC_SHARED_DEST=0`
+* **B** -- default
+
+| arm | reps | copy-watch checkpoints | holders with `word0` an ARENA POINTER | crashes |
+|---|---:|---|---:|---:|
+| A (fixes off) | 3 | 151, 133, 121 | **7** | 1 SIGSEGV at 37 s |
+| B (default) | 3 | 12301, 12064, 11905 | **0** | 0 |
+
+The refused holders in A are the genuine shape, not the array false-positive
+class -- `holder=0x252662c9cf0 paired=0x000002525cd7d290`,
+`holder=0x2114fe1ac60 paired=0x000002114040ba70`, both `paired` values landing
+in that run's arena. A-2 refused the SAME `paired=0x2525cd7d290` under two
+holders at `gc_age=1` and `gc_age=2`: one corrupted object, copied by two
+successive evacuations, which is the pattern this page recorded from the start.
+
+### which of the four: `PARALLEL_EVAC_RESUME_DEST`, alone
+
+Per-flag ablation, one flag off per arm, everything else default, two
+repetitions, same binary and workload:
+
+| flag turned OFF | rep 1 | rep 2 | arena-pointer holders |
+|---|---|---|---:|
+| **`CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST`** | **died at 32 s** | **SIGSEGV at 63 s** | **11, 15** |
+| `CRATONVM_G1_RETIRE_FORWARDS_LATE` | timeout 420 s | timeout 420 s | 0, 0 |
+| `CRATONVM_G1_REEVAC_GUARD` | timeout 420 s | timeout 420 s | 0, 0 |
+| `CRATONVM_G1_PARALLEL_EVAC_SHARED_DEST` | timeout 420 s | timeout 420 s | 0, 0 |
+| none (control) | timeout 420 s | timeout 420 s | 0, 0 |
+
+2 of 2 with `RESUME_DEST` off, 0 of 2 for each of the other three and for the
+control. One variable.
+
+### confirmed on THIS class, not just on H2
+
+The attribution above was measured on H2. Re-run here, jar-first classpath,
+`-Xmx2g -XX:+UseG1GC`, `CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST=0`:
+
+| rep | outcome | corrupt cells | arena-pointer holders |
+|---|---|---:|---:|
+| 1 | SIGSEGV at 256 s | 1 | 1 |
+| 2 | timeout at 901 s | 13 | 1 |
+
+and the refused holder has the H2 population-A shape exactly --
+`holder=0x1ddddc57228 word0=0x1ddb62a0e58 mark=0x…1ddb62a0e78`: BOTH header
+words are arena pointers, 0x20 apart. Same defect, same shape, both workloads,
+same single flag.
+
+### the grid-closure question is still open HERE, and that is an instrument gap
+
+`grid_closes_on_cursor` was added to settle whether these reports are corruption
+or a desynced walk. It produced **0 verdicts in both runs above**, against 14
+corrupt cells. The drain that emits it is wired into three pause bodies, and
+this class's reports arrive from five walks --
+`SharedEvac::process_object`, `seed_source_region`,
+`collect_outgoing_cross_region_edges`, `verify_no_dangling_into_cset_within`
+and one attributed to `is_collectable_region_type` -- on a pause path that does
+not reach the drain at `-Xmx2g`.
+
+So the question this page most needs answered is unanswered on the workload
+whose evidence it rests on, and the reason is the instrument, not the defect.
+On H2 the same drain emits 8 verdicts a run. Wiring it into the remaining pause
+paths is the next step for anyone picking this up; it is small, and it is the
+LAST thing between this page and knowing whether its census was corruption at
+all.
+
+### so the producer is the EVACUATION-FAILURE path
+
+`RESUME_DEST` is what lets a parallel worker bump into an existing non-CSet Old
+region instead of only ever claiming a fresh one from `pool`. With it off,
+`tlab_alloc` returns `None` as soon as the pool is gone -- **while to-space is
+still free**, which is the "forty-eight byte promotion failing with 2017 usable
+regions" this page already measured -- and `None` is the evacuation-FAILURE
+signal: self-forward, keep the CSet region, `retry_after_evacuation_failure`.
+
+That is the fragile machine this page called out and never connected to the
+corruption. The corrupt headers are produced there, not by any walk, not by the
+copy, and not by `SharedEvac`'s normal path -- which is why the copy watch was
+clean at every checkpoint while holders kept appearing, and why corrupt holders
+and implausible CANDIDATES never co-occurred.
+
+The fix is already default-ON. What is NOT done is hardening the failure path
+itself: it is still reachable under genuine exhaustion, and it still produces
+this shape when it runs.
+
+### why the depth difference does not void this
+
+The A arm is ~100x shallower, because with the fixes off the collector dies
+fast -- normally the "control that dies early" shape that invalidates an
+arm. It does not here, because **the asymmetry runs the right way**: the arm
+with far FEWER opportunities produced ALL of the defects. Fixes off, 7 corrupted
+headers and a SIGSEGV in ~400 checkpoints; fixes on, zero in ~36 000. A control
+that dies early can only manufacture a false NEGATIVE, and the negative is in
+the arm that ran 100x longer.
+
+Corroborating, on the default arm before the ablation: four reps at 7959, 7094,
+1394 and 4749 pauses, **0 corrupt cells and 0 refusals** in every one. The
+family used to appear within a couple of minutes and a few hundred pauses.
+
+### what this does NOT say
+
+* **Not which of the four.** They were ablated together; a per-flag ablation is
+  what attributes it.
+* **Not that the workload passes.** Every default-arm rep is a TIMEOUT, not a
+  pass. Under G1 with the mark driver this class does ~7959 pauses in 30 minutes
+  and never finishes its CREATE phase; HotSpot completes the whole class in
+  about 4 minutes, and the same binary without the driver OOMs at 84 s. That is
+  a throughput defect and it is not this page's.
+* **Not that the reports were corruption rather than misparse.** That question
+  (`grid_closes_on_cursor`, added for it) never got an answer, because after the
+  fixes there are no reports left to classify. It stays open against the
+  Tomcat-side reports, which this page's own census collected.
+
 ## The next step
 
-**Find the eight-byte write.** Everything above narrows it to: parallel-evacuator
-code, during a pause, at the base of an object already copied into to-space.
+Everything this section used to say has been measured and closed. Kept as a
+list of what NOT to re-run:
 
-**Start inside `SharedEvac`** — the kill switch above says the writer is there.
-The candidates worth instrumenting, in order:
+* ~~"Start inside `SharedEvac`"~~ -- the copy watch clears it on both
+  workloads, 0 rewritten of ~374k/401k (Tomcat) and ~700k (H2) copies at three
+  checkpoints. See the CORRECTION section.
+* ~~`write_flat_object_reference(.., compact = true)`~~ and ~~the array arm's
+  `ptr::write`~~ -- these are in the WALKS, and the walks are readers: screening
+  two of them moves the reports to the other four at an unchanged rate (47 vs
+  48, screens engaging). See the READERS section.
+* ~~a to-space write-watch~~ -- built (`CopyWatch`), run, reported above.
+* ~~the OOM~~ -- closed separately: the parallel evacuator took a whole fresh
+  Old region per worker per pause, so Old grew by the worker count whatever was
+  promoted.
 
-1. `write_flat_object_reference(.., compact = true)` — the only eight-byte
-   reference write in the walk, now bounded by the layout but not by the
-   holder's ALLOCATED extent (a layout resolved for the wrong
-   `(class_id, field_count)` is still free to land anywhere inside its own
-   declared body);
-2. the array arm's `std::ptr::write(slot_ptr as *mut u64, …)` — also eight
-   bytes, and bounded only by the REGION, so an array whose `array_length` or
-   `element_type` is wrong stamps pointers across its neighbours without ever
-   leaving the region;
-3. a to-space write-watch: record `(addr, class_id, num_slots)` for every fresh
-   copy in a small ring, and on the first corrupt holder report whether it was
-   sound when copied. That converts "the corruption happens inside a pause"
-   from an inference into a timestamp.
+### the question that now comes FIRST
+
+**Are the corrupt-cell reports evidence of corruption at all?**
+
+This page has treated every report as a corrupted object. One sample says that
+needs proving, not assuming:
+
+    0xb0530  prev header (cid=689, slots=3, compact, size=0x28)
+    0xb0548  0x00000e800111e5c8   hi=0xe80   <- inside prev's BODY
+    0xb0558  0x00000e8001121d48   hi=0xe80   <- the "holder"'s first word
+    0xb0568  0x00000003000002b1   cid=689 slots=3   <- a NORMAL header
+
+Two 16-byte pairs of the same shape 16 bytes apart, one of them inside a sound
+object's body, both first words sharing the high dword `0xe80` -- which is 3712,
+the very `num_slots` the "holder" reports -- and an ordinary header 16 bytes
+later. That is what Java DATA looks like to a walk that has already lost the
+object boundaries, and `locate_in_object_grid`'s own doc says its verdict cannot
+tell the two apart: it strides each object by the size THAT OBJECT'S header
+declares, so `grid=OBJECT-START` reports where the walk ARRIVED. One wrong size
+upstream misparses every boundary after it and still lands on an "object start"
+each time. The doc even names the shape it has seen -- `class_id=0x65676170`,
+the ASCII bytes `page`, from an H2 MVStore chunk header.
+
+`grid_closes_on_cursor` (added 2026-09-06) settles it per report: it walks the
+region independently and says whether the walk lands EXACTLY on the cursor
+having stepped only whole objects.
+
+* **closes** -- the sizes it strode were consistent, the boundaries are the
+  allocator's, and the holder really is a corrupted object. The producer hunt
+  continues, upstream of every walk.
+* **does not close** -- the grid desynced before reaching the address, the
+  "header" is a neighbour's data, and that report is an artefact. If this is
+  where the population lands, the defect to find is whatever desynced the walk,
+  and much of the evidence on this page needs re-reading rather than extending.
+
+Run it before adding anything further to this page. A verdict quoted without it
+cannot be believed, including the ones already quoted above.
+
+### if the grid DOES close
+
+Then the remaining unmeasured window is the one nothing here has instrumented:
+the object between its allocation and the pause that first walks it. The copy
+path is cleared, the walks are cleared, and the header is stable from walk time
+to end of pause (measured: the walk-time pairing and the drain-time word at the
+holder are bit-identical). What is left is a write that happens while the
+mutator runs, to an object no pause has copied -- which `CopyWatch` cannot see,
+because it only records copies.
+
+`copied_this_pause=` on each corrupt-holder report is the split: YES sends the
+search to the from-space source, `no` says nothing copied that object and the
+evacuator is not involved at all.
 
 ## Reproduction
 

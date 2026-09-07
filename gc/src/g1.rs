@@ -328,6 +328,17 @@ fn for_each_flat_object_reference_capped(
             if cratonvm_types::cell_census::decoded() != census_before {
                 census_before = cratonvm_types::cell_census::decoded();
                 let n = FLAT_WALK_CORRUPT_CELL_HOLDER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 {
+                    let mut pend = PENDING_CORRUPT_HOLDERS.lock();
+                    if pend.len() < 8 {
+                        pend.push((
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            header.num_slots(),
+                            header.mark_word.load(Ordering::Relaxed),
+                        ));
+                    }
+                }
                 if n <= 8 || n.is_power_of_two() {
                     // WHICH WALK, and WHAT the header's first word actually is.
                     //
@@ -401,6 +412,19 @@ pub static PARALLEL_TLAB_POOL_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
 /// Rate-limit counter for the corrupt-cell holder report above.
 static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 
+/// Corrupt-cell holders awaiting a GRID VERDICT, drained once per pause by
+/// [`G1Collector::report_pending_corrupt_holders`].
+///
+/// The report in `for_each_flat_object_reference_capped` can name the holder's
+/// header but not whether that address is a REAL OBJECT START, because it is a
+/// free function with no collector and no region table. That one field is the
+/// whole question: `grid=OBJECT-START` says an allocator put an object there
+/// and something later wrote over its header, so there is a writer to find;
+/// `grid=INTERIOR` says the address was never an object start, the words read
+/// as a header are a neighbour's slots, and there is no header writer at all.
+/// Bounded, because the answer does not get truer after the eighth sample.
+static PENDING_CORRUPT_HOLDERS: Mutex<Vec<(usize, u32, u32, u64)>> = Mutex::new(Vec::new());
+
 /// How many holders the parallel reference scan refused because their first
 /// header word is a pointer into the collector's own arena.
 ///
@@ -408,6 +432,33 @@ static FLAT_WALK_CORRUPT_CELL_HOLDER: AtomicUsize = AtomicUsize::new(0);
 /// object's base DURING a pause — the holder was a sound object when
 /// `evacuate` copied it onto this queue.
 pub static PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders the SERIAL reference scan refused for the same reason.
+///
+/// Expected to be ZERO. Split from the parallel counter on purpose: the two
+/// arms are reached by different pauses, and one number for both cannot say
+/// which walk a run's corruption came through.
+pub static SERIAL_SCAN_HOLDER_WORD0_IS_POINTER: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders the serial reference scan refused because their declared
+/// legacy body is larger than a whole region.
+///
+/// Expected to be ZERO. Measured as the residual of the word0 screen on H2,
+/// 2026-09-06: 20 of 20 reports in two runs were one `num_slots=65536` holder.
+pub static SERIAL_SCAN_HOLDER_BODY_TOO_BIG: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders the PHASE-4 fixup refused, by either impossibility test.
+///
+/// Expected to be ZERO. Separate from the evacuation-time counters because
+/// Phase 4 runs after them: a non-zero count here with zeros there means a
+/// header went bad between evacuation and the fixup, which is a different
+/// window from the one the evacuation screens close.
+pub static PHASE4_HOLDER_REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// Forwards still set after `retire_forwards`, across the run.
+///
+/// Expected ZERO. `CRATONVM_G1_VERIFY_FORWARDS_RETIRED=1` only.
+pub static UNRETIRED_FORWARDS: AtomicUsize = AtomicUsize::new(0);
 
 /// How many compact reference-field offsets were skipped because the resolved
 /// layout places them past the body that same layout declares.
@@ -1009,6 +1060,17 @@ struct CopyWatch {
     reported: AtomicUsize,
 }
 
+/// The one [`CopyWatch`] a run has, hoisted to module scope so the corrupt-cell
+/// drain can ASK IT a question the checkpoints cannot answer: was this holder
+/// a copy THIS pause made at all?
+///
+/// The checkpoints prove a copy's first word does not change after the copy.
+/// They are blind to two things, and those two are now the whole search: a
+/// SOURCE that was already corrupt when it was copied (the copy faithfully
+/// reproduces it and nothing 'changes'), and an object never copied at all
+/// (never in the ledger, so no checkpoint ever looks at it).
+static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
+
 impl CopyWatch {
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1029,6 +1091,23 @@ impl CopyWatch {
     /// Drop every recorded entry. The cross-pause checkpoint verifies the
     /// PREVIOUS pause's copies and then starts again, so one pause's worth of
     /// entries is the most this ever holds.
+    /// Was `addr` a to-space copy THIS pause made, and if so what did its
+    /// header look like at the instant of the copy, and where did it come from?
+    ///
+    /// This is the split the checkpoints cannot make. A corrupt holder that IS
+    /// in the ledger was copied from `src` with the recorded `class_id`/`shape`;
+    /// if those match what the walk later read, the SOURCE was already corrupt
+    /// and the search moves to from-space. A corrupt holder that is NOT in the
+    /// ledger was never evacuated this pause, so no copy path touched it and the
+    /// writer reached a resident object in place.
+    fn lookup(&self, addr: usize) -> Option<(usize, u32, u32)> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.0 == addr)
+            .map(|e| (e.1, e.2, e.3))
+    }
+
     fn clear(&self) {
         self.entries.lock().clear();
     }
@@ -2200,11 +2279,7 @@ impl<'a> SharedEvac<'a> {
         // to-space holder is legitimately ABOVE its region's cursor for the
         // whole dispatch. This test needs no cursor.
         if gc_flags().g1_parallel_evac_screen {
-            let paired = (header.class_id.as_u32() as u64)
-                | ((header.num_slots() as u64) << 32);
-            let base = self.collector.arena_base;
-            let end = self.collector.arena_end;
-            if end > base && (paired as usize) >= base && (paired as usize) < end {
+            if let Some(paired) = self.collector.holder_word0_arena_pointer(header) {
                 let n = PARALLEL_SCAN_HOLDER_WORD0_IS_POINTER.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
                     tracing::warn!(
@@ -6855,6 +6930,8 @@ impl G1Collector {
         // a kept region's stale forward outlive the pause). See
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
+        self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
@@ -7364,6 +7441,8 @@ impl G1Collector {
         // a kept region's stale forward outlive the pause). See
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
+        self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -7940,6 +8019,8 @@ impl G1Collector {
         // a kept region's stale forward outlive the pause). See
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
+        self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -8186,7 +8267,6 @@ impl G1Collector {
         // measured 0 of 374k and 0 of 401k copies rewritten, so the interval
         // that matters is the one BETWEEN pauses: if a copy this pause made is
         // corrupt when the next pause starts, the writer is not the collector.
-        static COPY_WATCH: std::sync::OnceLock<CopyWatch> = std::sync::OnceLock::new();
         let copy_watch: Option<&CopyWatch> = gc_flags()
             .g1_evac_copy_watch
             .then(|| COPY_WATCH.get_or_init(CopyWatch::default));
@@ -9348,6 +9428,67 @@ impl G1Collector {
     /// claiming to be a zero-slot plain object.
     ///
     /// Must run AFTER Phase 4 (which resolves forwards) and BEFORE Phase 5.
+    /// Count objects still carrying a FORWARDED mark after [`Self::retire_forwards`].
+    ///
+    /// `CRATONVM_G1_VERIFY_FORWARDS_RETIRED=1` only, and a COUNTER rather than a
+    /// repair on purpose. `retire_forwards` clears every key of the pointer map,
+    /// so a forward can only survive it by never reaching that map — which is a
+    /// shape this file has fixed three times (the parallel driver's own retire
+    /// ordering, Phase 3.5's forwards, and the CAS-loser arm that did not record
+    /// its adopted forward). A survivor in a KEPT region outlives the pause and
+    /// is read as a header by the next one.
+    ///
+    /// Measure before repairing: a default-ON sweep that neutralises marks is a
+    /// write to every CSet region, and this branch has already shipped one
+    /// default-ON screen whose refusals were all healthy objects. If this
+    /// counter is non-zero the repair is justified and the count says how much
+    /// it is worth; if it is zero the failure path leaks nothing and the repair
+    /// would be unmeasured risk for no benefit.
+    fn count_unretired_forwards(&self, regions: &[G1Region], cset: &RegionSet) -> usize {
+        if !gc_flags().g1_verify_forwards_retired {
+            return 0;
+        }
+        let mut found = 0usize;
+        for i in cset.iter() {
+            let Some(r) = regions.get(i) else { continue };
+            let base = r.data.as_ptr() as usize;
+            let cursor = r.cursor();
+            let mut off = 0usize;
+            while off < cursor {
+                // SAFETY: below the region's own cursor, under the regions lock,
+                // and Phase 5 has not run.
+                let h = unsafe { &*((base + off) as *const ObjectHeader) };
+                let m = h.mark_word.load(Ordering::Relaxed);
+                // The quartet survives retirement, so the size is readable
+                // whether or not the mark is still forwarded.
+                let size = object_total_size(h);
+                if ObjectHeader::is_forwarded_mark(m) {
+                    found += 1;
+                    if found <= 4 {
+                        tracing::warn!(
+                            "[g1] UNRETIRED FORWARD (#{found}): obj=0x{:x} region={i} \
+                             off=0x{off:x} mark={m:#018x} target=0x{:x} class_id={} \
+                             -- still FORWARDED after `retire_forwards`, so it never \
+                             reached the pointer map. If this region is kept, the next \
+                             pause reads this word as a header.",
+                            base + off,
+                            ObjectHeader::forwarding_target(m) as usize,
+                            h.class_id.as_u32(),
+                        );
+                    }
+                }
+                if size == 0 || size > cursor - off {
+                    break;
+                }
+                off += size;
+            }
+        }
+        if found > 0 {
+            UNRETIRED_FORWARDS.fetch_add(found, Ordering::Relaxed);
+        }
+        found
+    }
+
     fn retire_forwards(&self, pointer_map: &cratonvm_types::PointerMap) {
         for &k in pointer_map.keys() {
             // SAFETY: `k` is a from-space object address forwarded this pause;
@@ -9652,6 +9793,87 @@ impl G1Collector {
     /// every rejection so far named the holder after it had already been
     /// copied into a Survivor region, so the carve that produced it was two
     /// moves behind.
+    /// The holder's FIRST EIGHT BYTES, when they are a pointer into this
+    /// collector's own arena rather than a `class_id`/`shape` pair.
+    ///
+    /// `ObjectHeader` is `class_id`(4) + `shape`(4) + `mark_word`(8), so the
+    /// two dwords ARE one word at the object's base. Recombined, a real header
+    /// is a small class id beside a small slot count; a corrupted one is a heap
+    /// address. The test needs BOTH dwords to conspire, which is why it cannot
+    /// go stale the way an assumption about the class-id space did.
+    ///
+    /// Shared deliberately. This screen was written for the parallel arm on
+    /// 2026-09-06 and the serial arm did not get it -- the twin-pair divergence
+    /// this file already has defects from. A holder refused by one evacuator and
+    /// walked by the other is not a screen, it is a coin flip on which arm the
+    /// pause happened to take.
+    /// The holder's declared legacy body, when it CANNOT FIT IN A REGION.
+    ///
+    /// A legacy object occupies `HEADER_SIZE + num_slots * SLOT_SIZE`. If that
+    /// exceeds the region size, no allocator ever placed such an object here and
+    /// the count is not a count. Independent of [`Self::holder_word0_arena_pointer`]:
+    /// this catches the shape MEASURED as that screen's residual on H2
+    /// (2026-09-06, `class_id=0 num_slots=65536` -> a 1 MiB body), whose two
+    /// header dwords are not a pointer and so pass the word0 test.
+    ///
+    /// Not screened on `class_id == 0` alone: id 0 is a legitimate class id in
+    /// this tree (`is_zeroed` needs four fields to agree, and the allocator
+    /// tests use it), so it is the SIZE that is impossible, not the id.
+    /// Is `addr` inside a HUMONGOUS span? Such an object legitimately spans
+    /// more than one region, so "its size exceeds a region" says nothing about
+    /// it and must not be read as a refusal.
+    fn addr_is_in_humongous_region(&self, regions: &[G1Region], addr: usize) -> bool {
+        self.lookup_region_for_addr(addr)
+            .and_then(|i| regions.get(i))
+            .is_some_and(|r| {
+                matches!(
+                    r.region_type,
+                    RegionType::HumongousStart | RegionType::HumongousContinuation
+                )
+            })
+    }
+
+    fn holder_body_cannot_fit_a_region(&self, header: &ObjectHeader) -> Option<usize> {
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return None;
+        }
+        // `object_total_size`, NOT `num_slots * SLOT_SIZE`. The hand-rolled
+        // legacy formula this used to carry is wrong for the two shapes that
+        // actually appear here, and `object_total_size`'s own comment says so:
+        // it "OVER-sizes" a COMPACT instance (whose true body size lives in
+        // `array_length`), and for an ARRAY the body is
+        // `array_length * element_size`, nothing to do with `num_slots`.
+        //
+        // MEASURED CONSEQUENCE, 2026-09-06 (this is a bug this screen HAD, not
+        // a hypothetical): every refusal in two H2 runs — 15 and 14 of them —
+        // was `kind=Array`, `elem=Byte`/`Int`, lengths 82180..1048576. Ordinary
+        // large primitive arrays, refused as impossible because their length
+        // was multiplied by the 16-byte legacy slot stride. Phase 4 then
+        // skipped their rset-edge collection.
+        //
+        // A size of 0 is `object_total_size`'s own "implausible array header"
+        // signal and is left to the caller's existing guards rather than
+        // turned into a refusal here.
+        let size = object_total_size(header);
+        if size > region_size {
+            Some(size)
+        } else {
+            None
+        }
+    }
+
+    fn holder_word0_arena_pointer(&self, header: &ObjectHeader) -> Option<u64> {
+        let paired =
+            (header.class_id.as_u32() as u64) | ((header.num_slots() as u64) << 32);
+        let (base, end) = (self.arena_base, self.arena_end);
+        if end > base && (paired as usize) >= base && (paired as usize) < end {
+            Some(paired)
+        } else {
+            None
+        }
+    }
+
     fn note_implausible_legacy_header(
         &self,
         regions: &[G1Region],
@@ -10407,6 +10629,45 @@ impl G1Collector {
     /// span" means the address is in memory no object grid covers; "the walk
     /// desynced before reaching it" means the region's own grid is broken and
     /// the address is a symptom rather than the cause.
+
+    /// Does this region's object grid CLOSE -- does the linear walk land
+    /// exactly on the cursor, having stepped only whole objects?
+    ///
+    /// This is the check [`Self::locate_in_object_grid`]'s own doc says is
+    /// missing. That function strides each object by the size ITS OWN header
+    /// declares, so `grid=OBJECT-START` reports where the walk ARRIVED, not
+    /// that an allocator put an object there: one wrong size upstream misparses
+    /// every boundary after it and still lands on an "object start" each time.
+    ///
+    /// A walk that ends exactly at the cursor stepped a consistent set of
+    /// sizes, so the boundaries it printed are the allocator's. A walk that
+    /// OVERSHOOTS crossed at least one wrong size, and every verdict it gave
+    /// for that region is an artefact of the misparse rather than evidence
+    /// about the address asked about. Without this, the two cases are
+    /// indistinguishable in the log -- which is how `grid=OBJECT-START` came to
+    /// be read as proof of a real object start.
+    fn grid_closes_on_cursor(&self, region: &G1Region) -> (bool, usize, usize) {
+        let base = region.data.as_ptr() as usize;
+        let cursor = region.cursor();
+        let jit_skips = self.jit_tlab_skip_spans();
+        let (mut offset, mut objects) = (0usize, 0usize);
+        while offset < cursor {
+            let obj_ptr = (base + offset) as *mut u8;
+            if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                offset += skip;
+                continue;
+            }
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let obj_size = object_total_size(header);
+            if obj_size == 0 || obj_size > cursor.saturating_sub(offset) {
+                return (false, objects, offset);
+            }
+            offset += obj_size;
+            objects += 1;
+        }
+        (offset == cursor, objects, offset)
+    }
+
     fn locate_in_object_grid(&self, region: &G1Region, addr: usize) -> String {
         let base = region.data.as_ptr() as usize;
         if addr < base {
@@ -10494,6 +10755,69 @@ impl G1Collector {
         format!("grid=PAST-CURSOR walked={objects} objects to 0x{offset:x} {prev}")
     }
 
+    /// Drain [`PENDING_CORRUPT_HOLDERS`] and answer the one question the
+    /// walk-site report cannot: is the holder at a REAL object start?
+    ///
+    /// Called once per pause with the region table still held, so
+    /// `locate_in_object_grid` and `hexdump_around` are available. The two
+    /// verdicts have different fixes and nothing else separates them:
+    ///
+    ///  * `grid=OBJECT-START` -- an allocator really put an object there, so
+    ///    its header was overwritten after the fact and there is a WRITER to
+    ///    find. The `bytes[...]` dump then shows what landed on it. Measured
+    ///    2026-09-06 over 118 distinct H2 holders: 53 have BOTH header words
+    ///    holding arena pointers, 25 word0 only, 7 the mark only, 11 a
+    ///    SELF-forward -- so this is not the single eight-byte write at the
+    ///    base that the Tomcat page infers from a clean mark word.
+    ///  * `grid=INTERIOR` (or any desync verdict) -- the address was never an
+    ///    object start, the words read as a header are a neighbour's slots,
+    ///    and no header writer exists. The bug is then whatever put that
+    ///    address on a walk, which is the family
+    ///    `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens`
+    ///    already names.
+    fn report_pending_corrupt_holders(&self, regions: &[G1Region]) {
+        let drained: Vec<(usize, u32, u32, u64)> =
+            std::mem::take(&mut *PENDING_CORRUPT_HOLDERS.lock());
+        for (addr, cid, slots, mark) in drained {
+            // THE SPLIT. See `CopyWatch::lookup`: in-ledger means the source was
+            // already corrupt (the checkpoints prove the copy did not change it),
+            // not-in-ledger means nothing copied this object this pause.
+            let provenance = COPY_WATCH
+                .get()
+                .and_then(|w| w.lookup(addr))
+                .map(|(src, was_cid, was_shape)| {
+                    format!(
+                        "copied_this_pause=YES src={src:#x} was(class_id={was_cid} \
+                         shape={was_shape}) source_was_already_corrupt={}",
+                        was_cid == cid && was_shape == slots,
+                    )
+                })
+                .unwrap_or_else(|| "copied_this_pause=no".to_string());
+            let where_from = self
+                .lookup_region_for_addr(addr)
+                .and_then(|i| regions.get(i).map(|r| (i, r)))
+                .map(|(i, r)| {
+                    let base = r.data.as_ptr() as usize;
+                    let off = addr.wrapping_sub(base);
+                    let (closes, walked, ended) = self.grid_closes_on_cursor(r);
+                    format!(
+                        "r{i}/{:?}/off={off:#x}/cursor={:#x}/reuse_epoch={} grid_closes_on_cursor={closes} grid_walked={walked} grid_ended={ended:#x} {} {}",
+                        r.region_type,
+                        r.cursor(),
+                        r.reuse_epoch,
+                        self.locate_in_object_grid(r, addr),
+                        hexdump_around(r.data.as_ptr() as *mut u8, r.cursor(), off),
+                    )
+                })
+                .unwrap_or_else(|| "r?".to_string());
+            tracing::warn!(
+                "[g1] CORRUPT-CELL HOLDER GRID VERDICT: holder={addr:#x} class_id={cid} \
+                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} source={where_from} {provenance}",
+                (mark >> 56) & 0xF,
+            );
+        }
+    }
+
     fn scan_and_evacuate_refs(
         &self,
         regions: &mut Vec<G1Region>,
@@ -10549,6 +10873,76 @@ impl G1Collector {
                 );
             }
             return;
+        }
+        // THE SAME HOLDER SCREEN THE PARALLEL ARM GOT, on the arm that produced
+        // every corrupt-cell report measured on H2 (2026-09-06,
+        // `org.h2.test.store.TestMVStoreTool` -Xmx256m G1 with the mark driver:
+        // 16/16, 14/22, 13/20, 20/20, 22/24, 19/27 reports named THIS walk).
+        //
+        // The screen above is not this one and cannot stand in for it: it is
+        // cursor-based, it is behind `CRATONVM_G1_VERIFY_HOLDERS`, and with that
+        // flag ON it rejected ZERO holders in 4 of 4 runs while the parallel
+        // arm's word0 test refused 2-10 in the same runs. An ablation on a screen
+        // that never fires is a vacuous arm, which is what that A/B produced.
+        //
+        // Why this walk is a WRITER and not just a reader: the loops below
+        // rewrite the cells they visit with forwarding addresses. The bound they
+        // carry, `holder_walkable_slots`, is the REGION -- so a holder claiming
+        // 448 slots strides 448 16-byte cells (7 KB) over the objects that FOLLOW
+        // it in its own region and rewrites every span that decodes as a CSet
+        // reference. That is one corrupted header manufacturing the next, and it
+        // is why the victims' first two words read as two arena pointers one
+        // object-size apart while their bodies read as a neighbour's payload.
+        //
+        // The comment above argues it is safe to skip a holder screen because
+        // `holder_walkable_slots` stops the walk leaving the REGION. That is one
+        // region too weak: it protects the next region, not the next OBJECT in
+        // this one, and this walk writes.
+        if gc_flags().g1_serial_evac_holder_screen {
+            if let Some(paired) = self.holder_word0_arena_pointer(header) {
+                let n = SERIAL_SCAN_HOLDER_WORD0_IS_POINTER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] serial ref-scan REFUSED a HOLDER whose first word is an \
+                         ARENA POINTER (#{n}): holder=0x{:x} class_id={} num_slots={} \
+                         paired=0x{paired:016x} mark=0x{:016x} gc_age={} -- `class_id`+`shape` \
+                         IS the header's first word, so this is not a header. Walking it \
+                         would stride {} cells over its neighbours and REWRITE them. \
+                         Skipped; the pause continues.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        header.mark_word.load(Ordering::Relaxed),
+                        header.gc_age(),
+                        header.num_slots(),
+                    );
+                }
+                return;
+            }
+            if let Some(declared) = self
+                .holder_word0_arena_pointer(header)
+                .is_none()
+                .then(|| self.holder_body_cannot_fit_a_region(header))
+                .flatten()
+                .filter(|_| !self.addr_is_in_humongous_region(regions, obj_ptr as usize))
+            {
+                let n = SERIAL_SCAN_HOLDER_BODY_TOO_BIG.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::warn!(
+                        "[g1] serial ref-scan REFUSED a HOLDER whose declared body cannot \
+                         FIT IN A REGION (#{n}): holder=0x{:x} class_id={} num_slots={} \
+                         declared_body={declared} region_size={} mark=0x{:016x} -- no \
+                         allocator placed an object this size here, so the count is not a \
+                         count. Walking it would rewrite the rest of the region. Skipped.",
+                        obj_ptr as usize,
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        self.config.region_size,
+                        header.mark_word.load(Ordering::Relaxed),
+                    );
+                }
+                return;
+            }
         }
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
@@ -11385,18 +11779,61 @@ impl G1Collector {
                     );
                 }
 
-                if rewrite {
-                    update_object_refs(obj_ptr, header, &forwards);
-                }
-                self.collect_outgoing_cross_region_edges(
-                    regions,
-                    i,
-                    obj_ptr,
-                    header,
-                    &mut new_rset_edges,
-                    &mut seen_targets,
-                    want_census.then_some(&mut census),
+                // PHASE 4 WALKS THE SAME HEADER, TWICE, WITH NO BOUND AND NO
+                // SCREEN. Both calls below reach
+                // `for_each_flat_object_reference_trusting_header`, whose own doc
+                // says it "bounds it by nothing" -- and `update_object_refs`
+                // WRITES every slot it visits. Measured on H2 2026-09-06: with the
+                // evacuation-time screens on, corrupt-cell reports moved to
+                // exactly these two callers (`collect_outgoing_cross_region_edges`
+                // and `update_object_refs`), carrying the same arena-pointer
+                // holders the evacuator had just refused.
+                //
+                // Screening here rather than inside the two walks is what covers
+                // both with one test: this is the only caller of either, and it is
+                // the only place that holds the region geometry the test needs.
+                // A HUMONGOUS object legitimately spans more than one region,
+                // so "bigger than a region" is not evidence about it. Only the
+                // non-humongous case can use that test.
+                let region_is_humongous = matches!(
+                    regions[i].region_type,
+                    RegionType::HumongousStart | RegionType::HumongousContinuation
                 );
+                let refuse = gc_flags().g1_serial_evac_holder_screen
+                    && (self.holder_word0_arena_pointer(header).is_some()
+                        || (!region_is_humongous
+                            && self.holder_body_cannot_fit_a_region(header).is_some()));
+                if refuse {
+                    let n = PHASE4_HOLDER_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n.is_power_of_two() {
+                        tracing::warn!(
+                            "[g1] Phase-4 fixup REFUSED a HOLDER (#{n}): holder=0x{:x} \
+                             class_id={} num_slots={} mark=0x{:016x} region={i} -- its \
+                             header is not a header, and BOTH walks below trust the \
+                             count. `update_object_refs` would rewrite the rest of the \
+                             region with forwarding addresses. Skipped; the walk \
+                             advances by this object's own size.",
+                            obj_ptr as usize,
+                            header.class_id.as_u32(),
+                            header.num_slots(),
+                            header.mark_word.load(Ordering::Relaxed),
+                        );
+                    }
+                }
+                if !refuse {
+                    if rewrite {
+                        update_object_refs(obj_ptr, header, &forwards);
+                    }
+                    self.collect_outgoing_cross_region_edges(
+                        regions,
+                        i,
+                        obj_ptr,
+                        header,
+                        &mut new_rset_edges,
+                        &mut seen_targets,
+                        want_census.then_some(&mut census),
+                    );
+                }
                 offset += obj_size;
             }
         }
