@@ -74,10 +74,64 @@ CRATES = ["native-builtins", "native-collections", "native-io", "native-api",
 # Level 0: primitives that can move the heap. `ctx.invoke*` counts because it
 # dispatches interpreted Java, which allocates freely.
 ALLOC0 = re.compile(
+    # LEVEL-0 ALLOCATORS. Three tokens in the first version of this list
+    # matched NOTHING in the tree -- `ctx.new_string`, `ctx.intern` and
+    # `ctx.box_`, zero occurrences each -- while the single commonest
+    # allocator in these crates was absent: `ctx.create_string`, 2496 uses.
+    # `ctx.new_object` (634), `ctx.new_ref_array` (283) and
+    # `ctx.get_class_mirror` (214) were missing too. A name list is only as
+    # good as its liveness, and a dead token looks exactly like a clean tree
+    # -- which is the same failure the `--selftest` step exists to catch, so
+    # every entry below now has a selftest case asserting it still matches.
     r"\balloc_ref_array\b|\btry_alloc_synthetic\b|\bctx\.alloc_object\b"
-    r"|\bctx\.new_array\b|\bctx\.new_string\b|\bctx\.alloc_"
+    r"|\bctx\.new_array\b|\bctx\.alloc_"
     r"|\bctx\.invoke[a-z_0-9]*\s*\("
-    r"|\bctx\.ensure_class_initialized\b|\bctx\.intern\b|\bctx\.box_")
+    r"|\bctx\.ensure_class_initialized[a-z_0-9]*\b"
+    r"|\bctx\.create_string[a-z_0-9]*\b|\bctx\.init_string_from_units\b"
+    r"|\bctx\.new_object[a-z_0-9]*\b"
+    r"|\bctx\.new_ref_array\b|\bctx\.try_new_[a-z_0-9]*array\b"
+    r"|\bctx\.get_class_mirror\b|\bctx\.primitive_class_mirror\b"
+    r"|\bctx\.load_class\b|\bctx\.initialize_class\b"
+    r"|\bctx\.define_class[a-z_0-9]*\b"
+    # A PEER thread's collection runs to completion while this one is
+    # explicitly not cooperating, and `end_blocking_region` does NOT rewrite
+    # native locals -- `end_blocking_region_refs` exists because the plain
+    # form does not. For an I/O crate this is the important one.
+    r"|\bctx\.begin_blocking_region\b|\bctx\.begin_timed_blocking_region\b"
+    r"|\bctx\.end_blocking_region\b"
+    r"|\bctx\.force_gc\b|\bctx\.capture_stack_trace\b")
+# One EXAMPLE per alternative of `ALLOC0`, asserted by `--selftest` on every
+# run. This exists because three of this list's original tokens
+# (`ctx.new_string`, `ctx.intern`, `ctx.box_`) matched NOTHING in the tree for
+# months: an alternation branch that never fires still contributes to a total
+# and reads as coverage, and the selftest asserted the DETECTOR rather than the
+# alternatives. A token that stops matching is now a red job, not a quiet one.
+ALLOC0_EXAMPLES = [
+    "let a = alloc_ref_array(ctx, 4);",
+    "let a = try_alloc_synthetic(ctx, \"java/lang/Object\", 1)?;",
+    "let a = ctx.alloc_object(cid, 2);",
+    "let a = ctx.new_array(ArrayElementType::Byte, 8);",
+    "let a = ctx.alloc_ref_array(cid, 2);",
+    "let a = ctx.invoke_virtual(o, \"m\", \"()V\", &[]);",
+    "let a = ctx.ensure_class_initialized(\"java/lang/Object\");",
+    "let a = ctx.create_string(\"x\");",
+    "let a = ctx.init_string_from_units(&u);",
+    "let a = ctx.new_object(\"java/lang/Object\");",
+    "let a = ctx.new_ref_array(cid, 2);",
+    "let a = ctx.try_new_ref_array(cid, 2);",
+    "let a = ctx.get_class_mirror(cid);",
+    "let a = ctx.primitive_class_mirror(cid);",
+    "let a = ctx.load_class(\"java/lang/Object\");",
+    "let a = ctx.initialize_class(cid);",
+    "let a = ctx.define_class_from_bytes(&b);",
+    "ctx.begin_blocking_region();",
+    "ctx.begin_timed_blocking_region();",
+    "ctx.end_blocking_region();",
+    "ctx.force_gc();",
+    "let a = ctx.capture_stack_trace(0);",
+]
+
+
 FNDEF = re.compile(r"^(pub(\([a-z ]+\))? )?(async )?(unsafe )?fn ([a-z_][a-z_0-9]*)")
 CALL = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\(\s*ctx\s*,\s*([a-z_][a-z_0-9]*)\s*\)")
 # Every `name(` that is not a method call -- the callee edge of the call graph.
@@ -252,6 +306,18 @@ fn caller_only_comments(ctx: &mut dyn NativeContext, this: ObjectRef) {
             if not cond:
                 fails = 1
 
+        # Every ALLOC0 alternative still matches its own example. A dead
+        # token reads exactly like a clean tree, so this is checked BEFORE the
+        # tree is judged.
+        for ex in ALLOC0_EXAMPLES:
+            ck(ALLOC0.search(ex) is not None, "ALLOC0 matches: %s" % ex.strip())
+        # And the alternation carries no branch without an example: count the
+        # top-level `|` alternatives in the pattern and require one example
+        # each, so adding a token without a case is itself a failure.
+        alts = ALLOC0.pattern.count("|") + 1
+        ck(len(ALLOC0_EXAMPLES) >= alts,
+           "every ALLOC0 alternative has an example (%d alts, %d examples)"
+           % (alts, len(ALLOC0_EXAMPLES)))
         ck("allocs" in alloc and alloc["allocs"] == 0, "a direct allocator is depth 0")
         ck("only_a_comment" not in alloc,
            "ctx.alloc_object in a COMMENT is not an allocation")

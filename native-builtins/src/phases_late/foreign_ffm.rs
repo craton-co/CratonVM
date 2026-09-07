@@ -1323,7 +1323,7 @@ pub(crate) fn p67_segment_check_scope(
     ctx: &mut dyn NativeContext,
     segment: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if let Value::Object(Some(scope)) = ctx.get_field_by_name(*segment, "scope") {
+    if let Value::Object(Some(mut scope)) = ctx.get_field_by_name(*segment, "scope") {
         if p67_session_is_real(ctx, scope) {
             // The one GC point in this function. Pin across it and hand the
             // caller the forwarded reference; every other branch below only
@@ -1346,7 +1346,7 @@ pub(crate) fn p67_segment_check_scope(
         // unconditionally here was a second fail-open: the one shape that
         // resolves a session was the one shape that skipped the check.
         if p67_session_modelled(ctx, scope) {
-            p67_session_check_valid(ctx, scope)?;
+            p67_session_check_valid(ctx, &mut scope)?;
             return Ok(());
         }
         // Neither — so this is not a scope at all, and accepting it would be a
@@ -1360,9 +1360,9 @@ pub(crate) fn p67_segment_check_scope(
     // `p67_receiver_session`, which mints a fresh (always-open) session when it
     // finds nothing — that would make every check trivially pass.
     if ctx.object_num_fields(*segment) > P67_SEGMENT_ARENA {
-        if let Value::Object(Some(owner)) = ctx.get_field(*segment, P67_SEGMENT_ARENA) {
-            if let Some(session) = p67_arena_session(ctx, owner) {
-                p67_session_check_valid(ctx, session)?;
+        if let Value::Object(Some(mut owner)) = ctx.get_field(*segment, P67_SEGMENT_ARENA) {
+            if let Some(mut session) = p67_arena_session(ctx, owner) {
+                p67_session_check_valid(ctx, &mut session)?;
             } else if crate::panama::pe_session_modelled(ctx, owner) {
                 // G19-1: the slot's third tenant — the session ITSELF, which is
                 // what `panama::pe_segment_slice` stamps onto a slice and what
@@ -1375,7 +1375,7 @@ pub(crate) fn p67_segment_check_scope(
                 // in `p67_receiver_session`: the local `p67_session_modelled`
                 // would accept slot 2's OTHER tenant, an `ofArray` mirror's
                 // backing array, and read an element as a state word.
-                p67_session_check_valid(ctx, owner)?;
+                p67_session_check_valid(ctx, &mut owner)?;
             }
         }
     }
@@ -1449,13 +1449,15 @@ fn p67_wrong_thread(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// wrong thread reports the thread error even once it has been closed.
 fn p67_session_check_valid(
     ctx: &mut dyn NativeContext,
-    session: ObjectRef,
+    session: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
-    if !p67_session_modelled(ctx, session) {
+    // `&mut` receiver: see `ks_require_loaded` in `tls.rs` for why this is the
+    // shape rather than a proof about today's callers.
+    if !p67_session_modelled(ctx, *session) {
         return Ok(());
     }
-    let slots = p67_session_slots(ctx, session);
-    let owner = match ctx.get_field(session, slots.owner) {
+    let slots = p67_session_slots(ctx, *session);
+    let owner = match ctx.get_field(*session, slots.owner) {
         Value::Object(Some(owner)) => Some(owner),
         _ => None,
     };
@@ -1464,7 +1466,7 @@ fn p67_session_check_valid(
             return Err(p67_wrong_thread(ctx));
         }
     }
-    if p67_session_state(ctx, session) == 0 {
+    if p67_session_state(ctx, *session) == 0 {
         return Err(RuntimeError::IllegalStateException {
             message: "Already closed".to_string(),
         }
@@ -1475,13 +1477,13 @@ fn p67_session_check_valid(
 
 fn p67_session_acquire(
     ctx: &mut dyn NativeContext,
-    session: ObjectRef,
+    session: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     p67_session_check_valid(ctx, session)?;
-    if p67_session_modelled(ctx, session) {
-        let count = p67_session_acquires(ctx, session);
-        let slots = p67_session_slots(ctx, session);
-        ctx.set_field(session, slots.acquires, Value::Int(count.saturating_add(1)));
+    if p67_session_modelled(ctx, *session) {
+        let count = p67_session_acquires(ctx, *session);
+        let slots = p67_session_slots(ctx, *session);
+        ctx.set_field(*session, slots.acquires, Value::Int(count.saturating_add(1)));
     }
     Ok(())
 }
@@ -1582,21 +1584,21 @@ fn p67_session_run_close_actions(
 /// running the resource list — `close()` is `justClose()` plus the cleanup run.
 fn p67_session_just_close(
     ctx: &mut dyn NativeContext,
-    session: ObjectRef,
+    session: &mut ObjectRef,
 ) -> Result<(), MethodCallFailed> {
     p67_session_check_valid(ctx, session)?;
-    if !p67_session_modelled(ctx, session) {
+    if !p67_session_modelled(ctx, *session) {
         return Ok(());
     }
-    let acquired = p67_session_acquires(ctx, session);
+    let acquired = p67_session_acquires(ctx, *session);
     if acquired > 0 {
         return Err(RuntimeError::IllegalStateException {
             message: format!("Session is acquired by {acquired} clients"),
         }
         .into());
     }
-    let slots = p67_session_slots(ctx, session);
-    ctx.set_field(session, slots.state, Value::Int(0));
+    let slots = p67_session_slots(ctx, *session);
+    ctx.set_field(*session, slots.state, Value::Int(0));
     Ok(())
 }
 
@@ -1610,8 +1612,8 @@ fn p67_session_add_action_synthetic(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    p67_session_check_valid(ctx, this)?;
+    let mut this = obj_arg(args, 0)?;
+    p67_session_check_valid(ctx, &mut this)?;
     let Some(Value::Object(Some(action))) = args.get(1) else {
         return Ok(None);
     };
@@ -3203,8 +3205,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             // the session's IllegalStateException rather than silently
             // re-clearing the flag, and the cleanups have to run while the
             // arena is still open.
-            if let Some(session) = p67_arena_session(ctx, this) {
-                p67_session_just_close(ctx, session)?;
+            if let Some(mut session) = p67_arena_session(ctx, this) {
+                p67_session_just_close(ctx, &mut session)?;
                 p67_session_run_close_actions(ctx, session)?;
             }
             ctx.set_field(this, slots.open, Value::Int(0));
@@ -3333,8 +3335,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "acquire0", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_acquire(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_acquire(ctx, &mut this)?;
         Ok(None)
     });
     r.register(
@@ -3347,13 +3349,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             {
                 return real;
             }
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let action = obj_arg(args, 1)?;
             // The acquire count is what keeps the session alive across the
             // callback: a nested `close()` sees a non-zero count and refuses,
             // exactly as the JDK's `whileAlive` does. Released even when the
             // action throws, or the session could never be closed afterwards.
-            p67_session_acquire(ctx, this)?;
+            p67_session_acquire(ctx, &mut this)?;
             let this_pin = ctx.pin_native_root(this);
             let result = ctx.invoke_virtual(action, "run", "()V", &[]);
             let this = ctx.read_native_pin(this_pin, this);
@@ -3419,16 +3421,16 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "checkValidStateRaw", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_check_valid(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_check_valid(ctx, &mut this)?;
         Ok(None)
     });
     r.register(session, "checkValidState", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "checkValidState", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_check_valid(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_check_valid(ctx, &mut this)?;
         Ok(None)
     });
     r.register(
@@ -3465,8 +3467,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "close", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_just_close(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_just_close(ctx, &mut this)?;
         p67_session_run_close_actions(ctx, this)?;
         Ok(None)
     });
@@ -3474,8 +3476,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         if let Some(real) = p67_session_delegate(ctx, args, "justClose", "()V") {
             return real;
         }
-        let this = obj_arg(args, 0)?;
-        p67_session_just_close(ctx, this)?;
+        let mut this = obj_arg(args, 0)?;
+        p67_session_just_close(ctx, &mut this)?;
         Ok(None)
     });
 
