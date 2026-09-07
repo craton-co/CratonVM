@@ -1782,7 +1782,11 @@ fn fire_lifecycle_event(
             return;
         }
     };
+    let event_obj_pin = ctx.pin_native_root(event_obj);
+    let mirror_pin = ctx.pin_native_root(mirror);
     for l in listeners {
+        let event_obj = ctx.read_native_pin(event_obj_pin, event_obj);
+        let mirror = ctx.read_native_pin(mirror_pin, mirror);
         if msc_dbg() {
             eprintln!("[msc] fire {event} id={id} listener={:?}", l.as_ptr());
         }

@@ -242,6 +242,108 @@ precede the use on any path that reaches it. Both drops are correct.
 Both calibration controls still hold, and the eight functions fixed on
 2026-09-07 remain unreported.
 
+## The transitive tranche, triaged 2026-09-07
+
+443 rows called "transitive" is not 443 decisions. A transitive row is a claim
+about a CALLEE, and callees repeat — so the population reduces to a handful of
+questions, each of the form "does this function actually allocate or re-enter
+Java on a reachable path".
+
+### It is not one bucket — it is a depth distribution
+
+| depth the callee was marked at | rows |
+|---|---|
+| 0 — the callee's own body matches `ALLOC0` | **296** |
+| 1 | 126 |
+| 2 | 65 |
+| 3 | 56 |
+| 4–6 | 20 |
+
+Depth 0 is not a guess: the statement calls a function that itself allocates.
+Those 296 are as strong as a direct hit and were never the weak half. The
+weakness the word "transitive" implies belongs to the ~140 rows at depth 2 and
+beyond.
+
+### Clustering by ROOT, not by immediate callee
+
+`watch_base`, `aio_base` and `afc_base` are three one-line wrappers over one
+function. Walking each row down to the depth-0 function it reaches — and to the
+`ALLOC0` token inside it — gives the real decision points:
+
+| rows | root | via |
+|---|---|---|
+| 65 | `drop` | `end_blocking_region` |
+| 45 | `base_for_class` | `ensure_class_initialized` |
+| 42 | `try_alloc_concurrent_synthetic` | `ensure_class_initialized` |
+| 28 | `foreign_nio_delegate` | `invoke_virtual_bytecode_only` |
+| 16 | `lk_member_access_flags`, `uri_has_synthetic_layout` | `declared_fields` |
+| 14 | `collect_entries_any` | `invoke` |
+| 31 | the four `make_*_stream` / `make_collector` | `try_alloc_synthetic` |
+
+### Two of those roots were wrong, and both are now fixed
+
+**`drop` — 65 rows from a NAME COLLISION.** `allocating()` keys the call graph
+on the bare identifier before `(`, so all **forty** `fn drop(&mut self)` bodies
+in these crates collapse into one node — and one of them, the TLS guard in
+`t27_tls.rs`, calls `end_blocking_region`. That made the node `drop` a depth-0
+allocator, and every `drop(guard)` / `drop(map)` / `drop(registry)` in the tree
+inherited it. Sampled, the statements are mutex guards and hash maps, not the
+blocking guard.
+
+Excluding these names is sound and not merely convenient: a blocking region's
+hazard is the window BETWEEN `begin_blocking_region` and `end_blocking_region`,
+and the audit matches both tokens wherever they appear directly; the `drop` that
+closes the guard is the end of a window it has already reported.
+`UNRESOLVABLE_BY_NAME` holds the trait and std method names that cannot resolve
+to one function. `get`, `new`, `build`, `finish` and `call` are deliberately NOT
+in it — they collide too, but in these crates they are also the names of real
+allocating helpers, and dropping them would trade a false positive for a false
+negative.
+
+**`declared_fields` and its three neighbours — 16 rows.** All four
+(`declared_fields`, `declared_methods`, `class_annotations`,
+`record_components`) are `&self` methods on `vm_exec` that take the
+class-manager read lock and build a Rust `Vec` of metadata. No Java object, no
+bytecode. Removed from `ALLOC0` — the same class of error as
+`capture_stack_trace` and `get_ascii_case_string_cached`, which is now four
+getters-named-like-producers found in one file.
+
+### The big roots are REAL, and that is the finding
+
+`base_for_class` reaches `ensure_class_initialized`, which runs `<clinit>` —
+arbitrary bytecode. Every private-slot accessor in `native-io` is built on it
+(`afc_get`, `aio_get`, `ws_get`, and their `_set` twins all call a `*_base`
+wrapper), so **a plain-looking private field read in these crates is a GC
+point**. That is 45 rows here and an architectural fact worth knowing
+independently of this audit: it also means a cheaper `base_for_class` — one
+that resolves an already-loaded class without initializing it — would remove a
+real hazard from a large family at once. Not attempted here; it is a
+behavioural change to a load-bearing path and needs its own measurement.
+
+`try_alloc_concurrent_synthetic` (42), the `foreign_*_delegate` family (59
+across four spellings) and the `make_*` stream constructors (31) are all
+genuinely allocating or genuinely re-entering Java. Those rows stand.
+
+### Effect
+
+| tranche | base | `--opt` |
+|---|---|---|
+| `native-builtins/src` | 548 → 526 | 718 → 685 |
+| `native-builtins/src/phases_late` | 73 → 70 | 84 → 81 |
+| `native-collections/src` | 83 → 82 | 228 → 227 |
+| `native-io/src`, `native-api/src` | unchanged | unchanged |
+
+Base rows move again, and again they were spot-checked rather than assumed:
+`alloc_instance_var_handle`'s window was `vh_has_synthetic_layout`, which is
+GC-capable only through `declared_fields`. Correct drop.
+
+### One more real site, found while triaging
+
+`native_loader_load_module` — the sibling the function fixed earlier delegates
+into — builds its receiver in a `_` arm that ALLOCATES and does not return, then
+reads the name argument out of the pre-call `args`. `this` was already pinned
+for a different window; the name was not. Fixed the same way.
+
 ## Still noisy
 
 The four `native_stream_*` rows this page listed as surviving the returning-arm

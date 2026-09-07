@@ -6486,7 +6486,9 @@ fn native_jasper_jdtcompiler_accept_result(
             "()[Lorg/eclipse/jdt/core/compiler/CategorizedProblem;",
             &[],
         )? {
+            let errors_pin = ctx.pin_native_root(errors);
             for i in 0..ctx.array_length(problems) {
+                let errors = ctx.read_native_pin(errors_pin, errors);
                 let Value::Object(Some(problem)) = ctx.get_array_element(problems, i) else {
                     continue;
                 };
@@ -34722,7 +34724,9 @@ fn cb_await_inner(
     // trip, break, or time out.
     cb_set(ctx, state, CB_H_COUNT, new_count);
     let arrival_index = (parties - new_count) as i32;
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         if cb_get(ctx, state, CB_H_BROKEN_GEN) == my_gen {
             ctx.monitor_exit(this);
             return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
@@ -38611,7 +38615,9 @@ pub(crate) fn interrupt_executor_workers_filtered(
     };
     let mut interrupted = 0;
     // Bound defensively; the worker set is tiny in practice.
+    let it_pin = ctx.pin_native_root(it);
     for _ in 0..4096 {
+        let it = ctx.read_native_pin(it_pin, it);
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,

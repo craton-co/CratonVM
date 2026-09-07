@@ -3230,7 +3230,9 @@ pub(crate) fn native_surefire_system_property_manager_load_properties(
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(placeholder))])
     {}
     ctx.set_field_by_name(wrapper, "properties", Value::Object(Some(placeholder)));
+    let wrapper_pin = ctx.pin_native_root(wrapper);
     for (k, v) in &parsed {
+        let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
         crate::properties_sidetable::store_property_in_sidetable(ctx, wrapper, k, v);
         // `PropertiesWrapper.getProperty` is compiled as `this.properties.get(key)`.
         // If dispatch hits the real `HashMap` instead of our sidetable-backed
@@ -3387,7 +3389,9 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
         "org/apache/maven/surefire/booter/spi/SurefireMasterProcessChannelProcessorFactory",
         "org/apache/maven/surefire/booter/spi/LegacyMasterProcessChannelProcessorFactory",
     ];
+    let conn_obj_pin = ctx.pin_native_root(conn_obj);
     for class_name in candidates {
+        let conn_obj = ctx.read_native_pin(conn_obj_pin, conn_obj);
         let Some(factory) = instantiate_factory(ctx, class_name)? else {
             continue;
         };
@@ -3412,7 +3416,9 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
     }
     // If capability checks are unreliable, at least require connect() to accept
     // the normalized transport string before returning.
+    let conn_obj_pin = ctx.pin_native_root(conn_obj);
     for class_name in candidates {
+        let conn_obj = ctx.read_native_pin(conn_obj_pin, conn_obj);
         let Some(factory) = instantiate_factory(ctx, class_name)? else {
             continue;
         };

@@ -1104,7 +1104,9 @@ fn java_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Op
 fn java_string_list_contains(ctx: &mut dyn NativeContext, list: ObjectRef, key: ObjectRef) -> bool {
     let key_text = ctx.read_string(key);
     if let Some(size) = java_list_size(ctx, list) {
+        let list_pin = ctx.pin_native_root(list);
         for index in 0..size {
+            let list = ctx.read_native_pin(list_pin, list);
             let Some(item) = java_list_get(ctx, list, index) else {
                 continue;
             };
