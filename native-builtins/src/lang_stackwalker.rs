@@ -847,10 +847,22 @@ pub(crate) fn native_fetch_stack_frames(
         written += 1;
         new_cursor += 1;
     }
+    // `populate_sfi` allocates a StackFrameInfo per frame, so the receiver
+    // read out of `args` below is a pre-loop address. `buffer` was already
+    // pinned for the same reason; `args` was not. Read it BEFORE releasing
+    // `buf_pin`, which truncates the pin stack.
+    let this_pinned = match args.first() {
+        Some(Value::Object(Some(o))) => {
+            let p = ctx.pin_native_root(*o);
+            let refreshed = ctx.read_native_pin(p, *o);
+            Some(refreshed)
+        }
+        _ => None,
+    };
     ctx.unpin_native_roots(buf_pin);
     // Persist the new cursor back into `this.anchor` so a subsequent
     // `fetchStackFrames` call resumes from the next trace frame.
-    if let Some(Value::Object(Some(this_ref))) = args.first() {
+    if let Some(this_ref) = this_pinned.as_ref() {
         if let Some(idx) =
             ctx.resolve_field_index("java/lang/StackStreamFactory$AbstractStackWalker", "anchor")
         {

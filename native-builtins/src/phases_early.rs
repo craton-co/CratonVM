@@ -7990,7 +7990,25 @@ fn exchanger_do_exchange(
     let deadline = timeout_ms
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64));
 
+    // GC: this loop BLOCKS in `monitor_wait`, and a blocked thread is exactly
+    // where a PEER thread's collection runs. Both the receiver and the value
+    // being exchanged are Rust locals that no collection rewrites, and the
+    // loop dereferences both on the next turn. That makes this the widest
+    // window in the tranche — every other site needs a collection to land in a
+    // short call, this one waits for one. Pin both and re-read at the top of
+    // each turn. See `internal/audits/wide-tranche-triage-20260907.md`.
+    let this_pin = ctx.pin_native_root(this);
+    let my_val_pin = match my_val {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
+        let my_val = match my_val_pin {
+            Some((pin, obj)) => Value::Object(Some(ctx.read_native_pin(pin, obj))),
+            None => my_val,
+        };
         ctx.monitor_enter(this);
         let state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
 
