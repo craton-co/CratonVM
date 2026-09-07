@@ -2,7 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | OPEN. High severity — hard process abort (`InternalError`), not a catchable exception. |
+| **Status** | **FIXED 2026-09-07** (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON). Was: OPEN, high severity — hard process abort (`InternalError`), not a catchable exception. |
+| **The fix** | `deopt-sink-refused-a-frame-its-sibling-resumes-FIXED-20260907.md` carries the mechanism, the A/B and the in-repo witness. This page keeps the H2 + Spring population that found it. |
 | **Scope** | All 8 distinct CRASH classes across the 2026-09-07 full 218-class 3-GC-arm H2 run's three completed arms (Generational CRASH=8, G1 CRASH=8, ZGC CRASH=5 — 8 unique classes total, listed below), plus at least one Spring Framework class from the same day's run. **This is the entire H2 CRASH population for this run — no other crash mechanism was found.** |
 
 ## Symptom
@@ -147,3 +148,43 @@ JDK25=<jdk25> CRATONVM_BIN=<cratonvm> ./run-h2-suite.sh run \
   reason.
 - `jit-mode-explains-most-of-todays-56-class-fail-cluster-20260907.md` — the
   Spring Framework side of today's finding.
+
+## Answered (2026-09-07)
+
+The "Not done in this session" list above is closed by
+`deopt-sink-refused-a-frame-its-sibling-resumes-FIXED-20260907.md`:
+
+* **Protected range, or the "elided monitor" disjunct, or something else?**
+  **Something else, and the question was the wrong one.** Neither disjunct
+  applies. `can_deopt_resume` is false on EVERY optimizing-tier artifact in a
+  production build, for a reason that has nothing to do with either the deopt
+  points or a monitor: `ir_lower` sets it only inside a condition requiring
+  `sr_map.is_some()`, and `sr_map` is populated only under
+  `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL`. The message's parenthetical
+  named two causes, and the actual cause was neither — which is why chasing
+  the disjunction would not have converged. The refusal message now says which
+  gate actually declined.
+* **Does `--nojit` clear these?** Necessarily. The whole path is JIT-only: no
+  compiled body, no trap, no stash, no sink.
+* **`Scope$ScopeImpl.remove` as a repeat offender across three H2 classes.**
+  Exactly as suspected — a hot, commonly-compiled method inside any workload
+  that runs H2's in-process javac. It needed no narrower mitigation; it is the
+  same one gap, hit from three call sites.
+
+The trapping methods are also explained rather than merely listed: all three
+application-level entries (`FilePathWrapper.wrap`, two `toString()`s) and the
+javac ones reach an optimizing-tier body that traps — for a `toString()` built
+by string concatenation, at the `invokedynamic makeConcatWithConstants` the
+optimizing tier plants an unconditional uncommon trap at
+(`ir::ir_site_trap_enabled`, default ON). That is why the trap is not rare: it
+fires the first time the compiled body reaches the site.
+
+## Also answered: the ZGC asymmetry
+
+Three classes crashed on Generational and G1 and passed on ZGC, and this page
+declined to call that GC-independence. It is not GC-dependence: the trap fires
+only once a method reaches the optimizing tier, and which methods get there by
+a given point in a run is timing-sensitive. The hibernate-reactive population
+(`jit-precise-deopt-refused-transfer-to-interpreter-hibreactive-20260907-FIXED.md`)
+saw the identical signature on all three collectors in the same run, same host,
+same binary — which is the cleaner reading of the same mechanism.

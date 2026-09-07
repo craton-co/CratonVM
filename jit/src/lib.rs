@@ -22287,6 +22287,102 @@ pub fn bytecode_commits_side_effect(code: &[u8], code_len: usize) -> bool {
     false
 }
 
+/// Does this method body enter or exit a monitor anywhere?
+///
+/// Asked by the deopt sinks, not by the compiler. Every `FrameState` the
+/// optimizing IR lowerer builds hard-codes `monitors: Vec::new()` — an empty
+/// list by construction, not a measurement — so a frame reconstructed from a
+/// body that had taken a lock before it trapped describes a frame that believes
+/// it holds none. `build_deopt_frame_inner` re-acquires exactly the monitors the
+/// frame names, which for such a body is nothing, and the resumed interpreter
+/// frame then runs a `monitorexit` against a lock its own bookkeeping never
+/// recorded.
+///
+/// `ir_lower`'s own comment says the same thing from the emission side ("the
+/// interpreter's own sink refuses a frame that holds monitors — but it cannot
+/// fire on information that was never recorded, so the omission defeats the
+/// guard rather than tripping it"). This is the predicate that lets the sink
+/// fire on something it CAN see: the callee's bytecode.
+///
+/// Whole-body and conservative, for the reason
+/// [`ir_unresumable_protected_trap`]'s side-effect scan is: pc order is not
+/// execution order, and a lock taken at a lower pc can still be held at the
+/// trap. A walk that loses instruction sync answers `true`.
+pub fn bytecode_holds_monitor(code: &[u8], code_len: usize) -> bool {
+    let mut pc = 0;
+    while pc < code_len {
+        // monitorenter / monitorexit
+        if matches!(code[pc], 0xc2 | 0xc3) {
+            return true;
+        }
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return true;
+        }
+        pc += len;
+    }
+    false
+}
+
+/// May a deopt sink resume a trapped compiled body from its reconstructed
+/// frame even when `can_deopt_resume` is false? **Default ON**;
+/// `CRATONVM_JIT_DEOPT_SINK_RESUME=0` restores the pre-2026-09-07 behaviour.
+///
+/// # What the old behaviour was, and why it was a hard abort
+///
+/// `execute`'s first-call tier-up sink (`vm/src/runtime/interpreter.rs`,
+/// `execute-first-call-tierup`) attempted a precise resume only under
+/// `compiled.can_deopt_resume`, and raised
+/// `InternalError: precise deoptimization unavailable ... refusing
+/// side-effecting replay` when it could not. On an optimizing-tier artifact
+/// that flag is false by construction — `ir_lower` only ever sets it under
+/// `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` — so EVERY trap taken in an
+/// IR body reaching that sink, in a body that commits any side effect (any
+/// store, any call), was a hard uncatchable abort.
+///
+/// That is not a theoretical shape. The optimizing tier PLANTS an unconditional
+/// uncommon trap at every `invokedynamic` it cannot lower
+/// ([`ir::ir_site_trap_enabled`], default ON), so the trap is not a rare
+/// mis-speculation — it fires the first time the compiled body reaches that
+/// site. Measured population on 2026-09-07: every one of the 8 CRASH classes in
+/// the full 3-arm H2 suite run, 7 hibernate-reactive classes across 3 GC arms,
+/// and at least one Spring Framework class, all with the identical message.
+///
+/// # Why resuming is the right answer and not a relaxation
+///
+/// The frame is already reconstructed and stashed, and the sibling consumer of
+/// that same stash — `vm::jit::helpers::try_resume_trapped_callee`, the path a
+/// compiled caller's dispatch helper takes — resumes it PRECISELY, in
+/// production, with no `can_deopt_resume` anywhere in its conditions. Both build
+/// the frame with the same `build_deopt_frame_inner`, which bails to `None` on
+/// an inlined chain, an identity mismatch, an out-of-range bci, an unmappable
+/// slot and a malformed monitor. `can_deopt_resume` gates a DIFFERENT consumer
+/// (`resume_real_ir_deopt`'s scalar-replacement materialisation); asking it here
+/// refused a resume nothing else needed it for.
+///
+/// The sink keeps three refusals the reconstructed frame genuinely cannot
+/// answer, and they are the same three the helper makes or the emission side
+/// names: an `ACC_SYNCHRONIZED` method, a body that takes a monitor
+/// ([`bytecode_holds_monitor`] — the IR frame states record none), and a resume
+/// bci past the method's code.
+///
+/// # The OFF arm
+///
+/// Off, the sink asks `can_deopt_resume` again and aborts as before. It is a
+/// measurement lever for what the resume costs against the abort, not a
+/// configuration anyone should ship: on a workload that trips a planted site
+/// trap it turns a completed run into a dead process.
+pub fn deopt_sink_resume_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEOPT_SINK_RESUME").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 fn ir_unresumable_protected_trap(
     code: &[u8],
     code_len: usize,

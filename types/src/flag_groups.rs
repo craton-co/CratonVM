@@ -1146,6 +1146,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "real-new-site-flags", on_key: Some("CRATONVM_JIT_REAL_NEW_SITE_FLAGS"), off_key: None, off_word: None, since: "2026-08-17" },
     E { group: Group::JIT, token: "deny", on_key: Some("CRATONVM_JIT_DENY"), off_key: None, off_word: None, since: "2026-07-03" },
     E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: None, since: "2026-06-17" },
+    // The tier-up deopt sink's precise resume. Default-ON with a `0` opt-out:
+    // off, the sink asks `can_deopt_resume` again and raises the hard
+    // `InternalError: ... refusing side-effecting replay` an optimizing-tier
+    // artifact could never avoid. Measurement lever, not a configuration.
+    E { group: Group::JIT, token: "deopt-sink-resume", on_key: Some("CRATONVM_JIT_DEOPT_SINK_RESUME"), off_key: None, off_word: Some("0"), since: "2026-09-07" },
     E { group: Group::JIT, token: "direct-callee-calls", on_key: Some("CRATONVM_JIT_DIRECT_CALLEE_CALLS"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::JIT, token: "dispatch-cache-direct-entry", on_key: Some("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY"), off_key: None, off_word: None, since: "2026-07-22" },
     E { group: Group::JIT, token: "dispatch-cache-virtual-direct-entry", on_key: Some("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY"), off_key: None, off_word: None, since: "2026-07-25" },
