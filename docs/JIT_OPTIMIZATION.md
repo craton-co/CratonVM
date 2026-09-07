@@ -3649,3 +3649,86 @@ than the pass rate.
 hibernate-reactive was not run. The netty arm alone took ~50 minutes of host
 time in a three-arm shape, and a second suite would have added nothing the
 control did not already invalidate.
+
+### The per-class alternating harness, and what it says about the host
+
+The section above ended with what it would take to price IR inlining properly:
+"a harness that alternates the lever per CLASS rather than per run so drift
+cancels pairwise". That is `tools/suite-pair-ab/pair-ab.sh`.
+
+It is generic over the lever (`--lever CRATONVM_X --on 1 --off 0`) and over the
+suite, because nothing in it is netty-specific beyond the runner directory it is
+pointed at.
+
+#### The design, and why each piece is load-bearing
+
+**ABBA, not AB.** Each class is measured as four runs, `A B B A` (and `B A A B`
+on odd classes, so the block asymmetry cancels across the list). ABBA cancels
+LINEAR drift exactly: the mean timestamp of the two A runs equals the mean
+timestamp of the two B runs, so a host steadily getting busier contributes
+equally to both arms. Plain alternation does not have that property.
+
+**The within-arm noise floor.** `|A1-A2|` and `|B1-B2|` are two runs of the SAME
+configuration, so they measure the host and not the lever. This is the piece the
+per-run shape could not have at any repetition count, and it is what lets the
+harness say **UNMEASURABLE** instead of reporting a number. A harness that
+cannot decline will eventually assert something false.
+
+The two floors are deliberately asymmetric and the pessimistic one is used: in
+ABBA the B runs are adjacent (positions 2, 3) while the A runs are separated by
+them (1, 4), so `|B1-B2|` understates the noise and `|A1-A2|` overstates it. The
+reported floor is `max(A, B)`, because the failure being defended against is
+claiming an effect that is really drift.
+
+**The same-work gate.** A pair counts only when all four runs report identical
+`found/ok/failed/skipped/aborted`. Two runs that executed different numbers of
+tests have incomparable `ms=`, and without this gate a flaky class contributes a
+work difference disguised as a timing difference. Classes with `ok=0`, any
+failure, or any abort are dropped for the same reason — on the 24-class
+validation slice that dropped 13 of 24, which is the gate working, not a defect.
+
+**Strictly sequential.** No shards. Sharded forks compete with each other, so
+the two members of a pair would see different contention — the exact thing the
+design exists to remove.
+
+#### What it measured, which is the host
+
+24 netty classes, `CRATONVM_JIT_IR_INLINE` on vs off, host load 11-13 with
+another session building throughout:
+
+```
+A faster than B in 7 of 11 classes  (fair coin under no effect)
+median per-class delta : +1.0%
+median within-arm noise: 11.6%   (SAME config, two runs)
+  of the 2 classes whose own delta beats their own noise: A faster in 1
+VERDICT: UNMEASURABLE.
+```
+
+Read naively that is "inlining wins 7 of 11 and is 1.0% faster". The harness
+refuses it, and it is right to: **two runs of the identical configuration differ
+by 11.6%**, eleven times the effect. Only two of eleven classes had a delta
+larger than their own noise, and those two split 1-1.
+
+That number is the useful output. It quantifies, for the first time, why the
+three-arm per-run A/B could not work on this host — not "the arms were 17
+minutes apart" as a hypothesis, but **11.6% same-config variance measured
+back-to-back on the same class**. Any per-run design was doomed by a wide
+margin, and so is this one at this load.
+
+Two individual classes are worth recording because the per-run shape could never
+surface them: `AdaptiveLittleEndianHeapByteBufTest` came in at -3.9% against a
+1.6% floor (inlining SLOWER) while `AdaptiveBigEndianHeapByteBufTest` read
++12.9% against 11.6%. Whatever the aggregate turns out to be, IR inlining is not
+uniformly good or bad across classes, and a single suite-wide number would hide
+that.
+
+#### How to get the number
+
+Run it on a quiet host. The floor is a property of the machine, not the harness:
+on the 12-class smoke run earlier the same day, individual classes reported 1%
+and 3% floors, so a quiet box should resolve effects in the low single digits.
+`--min-ms` drops classes too short for the JIT to matter, and `--count` /
+`--start` shard the list across sessions.
+
+The verdict line is the contract: if it says UNMEASURABLE, the run has produced
+a noise measurement and no throughput claim, and the honest report is the floor.
