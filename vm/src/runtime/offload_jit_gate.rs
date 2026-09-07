@@ -314,7 +314,7 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
     // ask [`target_is_dispatchable_kernel`] about the targets this scan could
     // not judge. A run without `--gpu` never gets here and still pays one
     // relaxed bool per compiled static dispatch.
-    cratonvm_jit::offload_hook::arm();
+    cratonvm_jit::offload_hook::arm(shared.config.gpu_min_work);
 
     // AUDIT 2026-09-02: with `--nojit` there is nothing to admit, so
     // there is nothing to decide — and nothing to trade away either.
