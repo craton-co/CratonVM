@@ -958,6 +958,11 @@ struct Lowerer<'a> {
     /// non-zero here is the wrong-code hazard being taken off the table, not a
     /// missed optimization: the value is still published, one word-load later.
     phi_copy_publish_deferred: usize,
+    /// Trailing residency publishes SKIPPED because the phi's home word was
+    /// dropped and its register already holds the value, and the same site
+    /// REFUSED because neither location was readable. See `emit_phi_copies`.
+    phi_home_publish_skipped: usize,
+    phi_home_publish_refused: usize,
     /// The value `lower_data_node` is currently emitting, so `store_rax` can
     /// tell the one store that writes a value's OWN home word from the many
     /// that write an argument stage word, a shadow-stack word, or somebody
@@ -1523,6 +1528,8 @@ impl<'a> Lowerer<'a> {
             phi_copy_reg_reads: 0,
             phi_copy_reg_publishes: 0,
             phi_copy_publish_deferred: 0,
+            phi_home_publish_skipped: 0,
+            phi_home_publish_refused: 0,
             cur_def: None,
             cur_def_published: false,
             reg_publishes_at_def: 0,
@@ -2719,6 +2726,54 @@ impl<'a> Lowerer<'a> {
         if ir_phi_residency_enabled() {
             for c in &gathered {
                 if published.contains(&c.phi) {
+                    continue;
+                }
+                // A PHI WHOSE HOME WAS DROPPED HAS NO WORD TO PUBLISH FROM.
+                //
+                // `emit_copy_op` drops the home store for a non-deferred phi
+                // that `phi_home_droppable` cleared, on the grounds that its
+                // register is the only location anyone reads. This loop is the
+                // one reader that did not get that memo: it reaches a phi that
+                // `published` does not contain -- which includes every phi
+                // whose copy `resolve_parallel_copy` dropped as a SELF-COPY,
+                // where `emit_copy_op` never ran at all and so neither stored
+                // the word nor published the register -- and loads the home
+                // word regardless.
+                //
+                // That is a read of uninitialised stack, and it is not
+                // theoretical: `org.h2.command.query.Select.processGroupResult`
+                // reloaded its `long offset` phi from `[rbp-0B0h]`, a slot the
+                // 11,591-byte body reads three times and writes zero times, on
+                // the loop back edge. The garbage came back large and positive
+                // and the loop's `quickOffset && offset > 0` arm dropped result
+                // rows as if the query had an OFFSET clause -- H2 window and
+                // GROUP BY queries returning 3 rows of 5. See
+                // `known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
+                //
+                // A DEFERRED phi is exempt and must stay exempt: `emit_copy_op`
+                // keeps its home store precisely so this loop can read it.
+                if ir_phi_home_publish_guard_enabled()
+                    && !defer_publish.contains(&c.phi)
+                    && self.home_dropped.get(c.phi as usize).copied().unwrap_or(false)
+                {
+                    if self.resident_gpr(c.phi).is_some() {
+                        // The register already holds it -- which is the whole
+                        // premise of dropping the home. Nothing to publish.
+                        self.phi_home_publish_skipped += 1;
+                    } else {
+                        // Neither location is readable. REFUSE, exactly as
+                        // `emit_copy_op` refuses the mirror case, rather than
+                        // emit a read of a word nothing wrote.
+                        self.phi_home_publish_refused += 1;
+                        self.latch_bailout(Bailout::with_context(
+                            BailoutReason::UnallocatedValue { node: c.phi },
+                            format!(
+                                "n{}'s home was dropped and its register is not live at a publish edge",
+                                c.phi
+                            ),
+                        ));
+                        return;
+                    }
                     continue;
                 }
                 if self.assigned_gpr(c.phi).is_some() {
@@ -12123,6 +12178,18 @@ const IR_LOWER_SAVED_GPRS: &[u8] = crate::regalloc::xmm_roles::IR_GP_PROLOGUE_SA
 /// This is the payoff the register image exists for, and it is a CONJUNCTION:
 /// see [`Lowerer::phi_home_droppable`], which will not drop a home unless every
 /// reader of that home has somewhere else to read from.
+/// Refuse to publish a phi from a home word that was DROPPED — **default ON**;
+/// `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD=0` restores the pre-fix read of an
+/// unwritten frame word, so the miscompile can be A/B'd on ONE binary.
+///
+/// See the block comment at the guard in `emit_phi_copies`.
+fn ir_phi_home_publish_guard_enabled() -> bool {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 fn ir_drop_phi_home_enabled() -> bool {
     // 2026-09-05: DEFAULT ON. `=0` is the kill switch.
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_PHI_HOME") {
@@ -15516,13 +15583,20 @@ pub(crate) fn lower_inner_with_scopes(
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some()
         && (lowerer.phi_copy_reg_reads > 0
             || lowerer.phi_copy_reg_publishes > 0
-            || lowerer.phi_copy_publish_deferred > 0)
+            || lowerer.phi_copy_publish_deferred > 0
+            || lowerer.phi_home_publish_skipped > 0
+            || lowerer.phi_home_publish_refused > 0)
     {
+        // `home_publish_skipped` is the engagement census for the dropped-home
+        // publish guard, and `home_publish_refused` the compiles it turned into
+        // an interpreter fallback rather than a read of an unwritten word.
         eprintln!(
-            "[ir-ls] phi copies: reg_reads={} reg_publishes={} publish_deferred={}",
+            "[ir-ls] phi copies: reg_reads={} reg_publishes={} publish_deferred={} home_publish_skipped={} home_publish_refused={}",
             lowerer.phi_copy_reg_reads,
             lowerer.phi_copy_reg_publishes,
             lowerer.phi_copy_publish_deferred,
+            lowerer.phi_home_publish_skipped,
+            lowerer.phi_home_publish_refused,
         );
     }
     if ls_active
@@ -15962,6 +16036,66 @@ fn ir_inline_tlab_enabled() -> bool {
 // property is "this module is about x86-64", not a per-test accident.
 #[cfg(target_arch = "x86_64")]
 mod tests {
+
+    /// EVERY reader of a phi's HOME WORD must know the home may not exist.
+    ///
+    /// `phi_home_droppable` lets `emit_copy_op` skip the home store for a
+    /// register-resident phi, on the grounds that its register is the only
+    /// location anyone reads. `publish_gp_from_slot` / `publish_fp_from_slot`
+    /// are the sites that read it anyway, and one of them did: the trailing
+    /// residency loop in `emit_phi_copies` published a phi from a word nothing
+    /// had written, which put a garbage `long offset` into
+    /// `Select.processGroupResult`'s loop and dropped H2 window-query result
+    /// rows (`jit-warm-groupdata-window-row-collapse-20260906`).
+    ///
+    /// A source scan rather than a lowering fixture, and deliberately: the
+    /// defect needed an 11 KB body with heavy inlining to appear at all, and
+    /// every small Java probe written for it read clean. What CAN be pinned is
+    /// the reader set — so a third publish site cannot be added without this
+    /// test making its author look at the guard.
+    #[test]
+    fn every_phi_home_publish_site_is_guarded_against_a_dropped_home() {
+        let src = include_str!("ir_lower.rs");
+        let body = src.split("
+mod tests {").next().unwrap_or(src);
+        assert!(
+            body.contains("fn publish_gp_from_slot"),
+            "the scanned region no longer contains the publish helpers — the              test module boundary moved"
+        );
+        assert!(
+            body.contains("ir_phi_home_publish_guard_enabled()")
+                && body.contains("self.home_dropped.get(c.phi as usize)"),
+            "the dropped-home publish guard is gone from `emit_phi_copies`; a              phi whose home was dropped would be published from a word nothing              wrote"
+        );
+        // The PHI publishes only. Every other `publish_*_from_slot` call in
+        // this file is a value's own definition site and is immediately
+        // preceded by `store_rax(slot)` — the word it reads is one it just
+        // wrote, which is the property a phi publish does NOT have.
+        let calls: Vec<String> = body
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| {
+                (l.contains("publish_gp_from_slot(c.phi") || l.contains("publish_fp_from_slot(c.phi"))
+                    && !l.starts_with("//")
+                    && !l.contains("/// ")
+            })
+            .collect();
+        let allowed = [
+            "self.publish_gp_from_slot(c.phi, c.dst);",
+            "self.publish_fp_from_slot(c.phi, c.dst, is_double);",
+        ];
+        for line in &calls {
+            assert!(
+                allowed.contains(&line.as_str()),
+                "new read of a phi's home word: {line} — it must first ask                  whether `home_dropped` says the word exists"
+            );
+        }
+        assert_eq!(
+            calls.len(),
+            3,
+            "the phi publish sites are the residency loop's GP and FP arms and              the non-residency deferral arm. A fourth needs the dropped-home              guard too; found {calls:?}"
+        );
+    }
     use super::*;
     use crate::ir::IrBuilder;
     use crate::ir_optimize;

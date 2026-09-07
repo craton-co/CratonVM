@@ -3474,7 +3474,7 @@ pub fn execute(
                             );
                         }
                         crate::jit::disasm::maybe_dump_annotated(
-                            "first",
+                            if c.used_ir_backend { "first/ir" } else { "first/sp" },
                             &class_name_arc,
                             &method_name_arc,
                             &descriptor_arc,
