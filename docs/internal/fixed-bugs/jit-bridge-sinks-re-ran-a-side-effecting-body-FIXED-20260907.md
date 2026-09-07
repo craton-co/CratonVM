@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **FIXED 2026-09-07** (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON — the same switch as the tier-up sink's fix). |
+| **Status** | **FIXED 2026-09-07** (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON — the same switch as the tier-up sink's fix). Residual measured the same day and found empty across 27 547 traps; see *The residual, measured*. |
 | **Was** | OPEN, filed by reading while fixing the sibling sink, with no witness. |
 | **Severity** | A silent wrong answer — a duplicated side effect. Worse than the abort the tier-up sink used to raise, because nothing said it happened. |
 
@@ -144,27 +144,123 @@ headers because the next person will hit them too:
    because the subject is what the sinks do with an optimizing artifact, not
    which methods deserve one.
 
-## What is still open
+## The residual, measured
 
-The re-run fallback itself. When the frame genuinely cannot be rebuilt —
-`build_deopt_frame_inner` returning `None` for an inlined caller chain, an
-unmappable slot, a malformed monitor — these sinks still re-run from entry, and
-for a side-effecting body that is still a duplicated side effect. The tier-up
-sink refuses instead, loudly.
+The re-run fallback survives this fix: when the frame genuinely cannot be
+rebuilt, these sinks still re-enter the method at bci 0. That was left as one
+phrase covering NINE distinct causes, none of them counted — so it could be
+described and not sized, and nobody could say whether a workload hits it at
+all, or which cause to attack first. `try_resume_trapped_callee` had already
+written the lesson down: *"a refusal that cannot be named cannot be counted."*
 
-Not made consistent here, deliberately: the tier-up sink has ALWAYS had that
-abort, whereas adding one to these three would be a new way for a working
-workload to die. The residual is now narrow — the resume has to actually FAIL,
-not merely be ungated, which is the difference this fix makes.
+`DeoptFrameBail` names all nine and counts them, and every decline traces under
+`CRATONVM_DBG_DEOPT`:
 
-For the lambda door it is also already counted: `site_unresumable` in the
-lambda-site census line is exactly "a deopted body the direct arm could not
-resume, so the generic path re-ran it from entry, side effects and all". What
-does NOT exist is a test asserting it is zero — `lambda_site_deopt_outcomes()`,
-the accessor written for that and documented as *"the metric a regression test
-asserts is zero"*, has no caller anywhere in the tree. Wiring it up is the next
-thing to pick up; the two sinks that are not lambda doors have no equivalent
-counter at all.
+| | |
+|---|---|
+| `inlined-caller-chain` | the stash names an inlined chain; `resume_from_ir_deopt` handles those, this builder does not |
+| `identity-mismatch` | the frame belongs to a different method |
+| `superseded-guard-sentinel` | `bci == u32::MAX` |
+| `deopt-verify-failed` | `CRATONVM_DEOPT_VERIFY` found a broken invariant |
+| `synchronized-with-virtual-objects` | the method monitor may have been elided under scalar replacement |
+| `virtual-object-materialise-failed` | re-materialising the object graph failed |
+| `unmappable-local-slot` / `unmappable-stack-slot` | a slot the mapper has no representation for |
+| `held-monitor-not-an-object` | a monitor that is not a resolved reference |
+| `operand-stack-did-not-fit` | the rebuilt stack overflowed the frame |
+
+**On every workload measured, the residual is empty:**
+
+| workload | optimizing bodies | traps TAKEN | frames that could not be rebuilt |
+|---|---:|---:|---:|
+| the witness (`DeoptRerunProbe`) | 1 | 1 | **0** |
+| `CriteriaWindowFunctionTest` | — | 1 | **0** |
+| `ASTParserLoadingTest` | — | 1 972 | **0** |
+| `ASTParserLoadingTest`, `CRATONVM_C2_ACCEPT=always` | 1 859 | **27 547** | **0** |
+
+That last row is the point: forcing the acceptance gate to keep every
+optimizing body it builds produces 1 859 of them and **27 547 traps taken at
+runtime**, and every one of them was resumed precisely. The residual is not
+"rare on the workloads we tried" — it did not occur once in 27 547 opportunities
+on the most trap-dense arm available.
+
+### It is reported, not just counted
+
+A non-zero count is a **silent wrong answer**, so it is NOT behind a debug flag:
+`report_unrebuildable_frames` warns at exit whenever the total is non-zero,
+naming the reasons. A clean run prints nothing. The zero-confirmation line stays
+behind `CRATONVM_DBG_JITC`, so a diagnostic run can tell "the residual is empty"
+apart from "the census is not wired up" — which are otherwise the same silence.
+
+Everything else in `interp_census.rs` is a diagnostic you switch on because you
+are already looking. This one is not that, and gating it would have left the
+residual exactly as invisible as the defect was.
+
+### And it is asserted
+
+`vm/tests/jit_bridge_sink_resumes_instead_of_rerunning.rs` now asserts
+`deopt_frame_bail_total() == 0` beside the delta, so a future change that starts
+declining rebuilds fails the test rather than silently re-running methods.
+
+It also asserts `lambda_site_deopt_outcomes().1 == 0`. That accessor's own doc
+called `unresumable` *"the metric a regression test asserts is zero"* and it had
+**no caller anywhere in the tree**; this is that caller, and it covers the third
+sink (`resume_deopted_body`), which the fixture does not otherwise reach.
+
+## Field validation, one binary and one switch
+
+`ASTParserLoadingTest` on the fixed binary, default config against
+`CRATONVM_JIT_DEOPT_SINK_RESUME=0`:
+
+| arm | result |
+|---|---|
+| default | **106/106** |
+| `..._RESUME=0` | 104 ok / 2 failed — and 0 started in a second run, dead during setup |
+
+The OFF arm's failures are the abort, on ordinary Hibernate ORM code:
+
+```
+InternalError: ... EntityEntryImpl.isNullifiable ... at bci 46
+  (can_deopt_resume=false (no deopt points, or an elided monitor)
+   and CRATONVM_JIT_DEOPT_SINK_RESUME=0, ... reason TransferToInterpreter);
+  refusing side-effecting replay
+InternalError: ... SessionImpl.instantiate ... at bci 12    [same shape]
+```
+
+**Read this arm precisely.** The switch governs BOTH 2026-09-07 sink fixes, and
+those two messages are the TIER-UP sink's, so what this A/B demonstrates is that
+the tier-up fix is load-bearing for this class on real application code. The
+`jit_bridge` half is carried by its own evidence: the witness (delta 2 → 1) and
+the 27 547-trap census above. One switch cannot separate them, and this page
+does not pretend it does.
+
+Which arm loses which tests also varies between runs (104/2 once, 0 started
+once) — the trap only fires once a given method reaches the optimizing tier, so
+WHICH methods are compiled when the input arrives is timing-sensitive. The
+direction does not vary.
+
+### An observation this page does NOT attribute
+
+`ASTParserLoadingTest` measured `ok=101 failed=5` this morning, on a binary
+built before any of today's deopt work, with the five failures identical across
+two arms (deterministic, not flaky). It is 106/106 now. The intervening `dev`
+range contains both of today's sink fixes AND a substantial amount of unrelated
+work from other branches, and the OFF arm above does not reproduce the original
+five — so this session has no evidence for what cleared them, and claims none.
+`jit-warm-groupdata-window-row-collapse-20260906-FIXED.md` names those five as
+not-this-defect; that statement stands, and they are no longer failing.
+
+## What is genuinely still open
+
+Nothing measured. The re-run fallback is still reachable in principle — the nine
+causes above are real code paths — but it did not fire once across every
+workload run here, including the 27 547-trap arm. If it ever does, the warning
+line says so and names the cause.
+
+The one asymmetry left is deliberate: where these three sinks cannot rebuild a
+frame they re-run, whereas the tier-up sink refuses loudly. Making them
+consistent would mean adding an abort to three paths that have never had one —
+a new way for a working workload to die, to fix something with zero measured
+occurrences. Not worth it on this evidence; revisit if the warning ever fires.
 
 ## Related
 

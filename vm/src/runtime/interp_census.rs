@@ -147,7 +147,45 @@ fn dump(label: &str, c: &Census, top: usize) {
 
 /// Print both censuses. Called from `vm-cli`'s exit report block; a census
 /// that was never armed prints nothing.
+/// A trapped compiled frame the sinks could not rebuild re-ran its method FROM
+/// ENTRY — side effects included. Say so, always.
+///
+/// # Why this one is not behind a debug flag
+///
+/// Everything else in this file is a diagnostic: you turn it on because you are
+/// already looking. This is not that. It is a silent WRONG ANSWER — a store, a
+/// call or a monitor action that happened twice because a deopt could not be
+/// resumed and the sink re-entered the method at bci 0
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`). The
+/// 2026-09-07 fix resumes wherever the frame CAN be rebuilt, which is the
+/// common case; what is left is this, and leaving it behind
+/// `CRATONVM_DBG_JITC` would keep the residual exactly as invisible as the
+/// defect was.
+///
+/// One line, only when the count is non-zero, naming the reasons. A clean run
+/// prints nothing.
+fn report_unrebuildable_frames() {
+    let bails = crate::runtime::interpreter::deopt_frame_bail_counts();
+    let total: u64 = bails.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        return;
+    }
+    let detail = bails
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(why, n)| format!("{why}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[cratonvm] WARNING: {total} trapped compiled frame(s) could not be rebuilt and their \
+         methods RE-RAN FROM ENTRY, repeating any side effect committed before the trap: \
+         {detail}. See internal/fixed-bugs/\
+         jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md."
+    );
+}
+
 pub fn report_at_exit() {
+    report_unrebuildable_frames();
     dump("interp-frames", interp_census(), 60);
     dump("tierup-decline", decline_census(), 60);
     // C1→C2 supersede engagement. `unchanged`/`first-publish` are the two
@@ -205,6 +243,18 @@ pub fn report_at_exit() {
         if repeats > 0 {
             eprintln!(
                 "[c2-supersede] ir site traps re-fired after the decision: {repeats} (a caller frame still holds a baked CALL to the trapping body)"
+            );
+        }
+        // Trapped frames the sinks could NOT rebuild, confirmed at zero.
+        //
+        // The non-zero case is reported unconditionally by
+        // `report_unrebuildable_frames` above and is NOT repeated here; this
+        // line exists so a diagnostic run can tell "the residual is empty"
+        // apart from "the census is not wired up", which are the same silence.
+        if crate::runtime::interpreter::deopt_frame_bail_total() == 0 {
+            eprintln!(
+                "[c2-supersede] trapped frames that could not be rebuilt: 0 (every trap this \
+                 run resumed precisely)"
             );
         }
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
