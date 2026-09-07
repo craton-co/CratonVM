@@ -2061,6 +2061,24 @@ mod imp {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use imp::{helper_window_pass, resume, take_over_pass};
+
+/// Not implemented on Linux -- the same answer, and for the same reason, as
+/// the `remap_frozen_peer_stacks` stub documented directly below: holding a
+/// helper-window peer across the copy needs the platform freeze mechanism, and
+/// only the Windows path is written and measured.
+///
+/// THIS STUB IS THE FIX FOR A BUILD BREAK, not a new capability. The Windows
+/// arm re-exports `imp::resume_held_helper_peers` and the
+/// `not(any(windows, linux-x86_64))` arm has a zero stub -- Linux x86-64, the
+/// platform this project's CI and build host actually use, had NEITHER, while
+/// `gc_and_alloc.rs` calls it unconditionally. `cargo build` on Linux failed
+/// with `cannot find function ... in module crate::jit::xt_root_scan`, and
+/// nothing on Windows could see it: `cfg`-gated code is not type-checked for
+/// the other host.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn resume_held_helper_peers() -> usize {
+    0
+}
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 /// Not implemented off Windows.
 ///
