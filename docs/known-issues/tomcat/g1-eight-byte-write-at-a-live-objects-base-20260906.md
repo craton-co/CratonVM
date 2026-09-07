@@ -480,6 +480,39 @@ repetitions, same binary and workload:
 2 of 2 with `RESUME_DEST` off, 0 of 2 for each of the other three and for the
 control. One variable.
 
+### confirmed on THIS class, not just on H2
+
+The attribution above was measured on H2. Re-run here, jar-first classpath,
+`-Xmx2g -XX:+UseG1GC`, `CRATONVM_G1_PARALLEL_EVAC_RESUME_DEST=0`:
+
+| rep | outcome | corrupt cells | arena-pointer holders |
+|---|---|---:|---:|
+| 1 | SIGSEGV at 256 s | 1 | 1 |
+| 2 | timeout at 901 s | 13 | 1 |
+
+and the refused holder has the H2 population-A shape exactly --
+`holder=0x1ddddc57228 word0=0x1ddb62a0e58 mark=0x…1ddb62a0e78`: BOTH header
+words are arena pointers, 0x20 apart. Same defect, same shape, both workloads,
+same single flag.
+
+### the grid-closure question is still open HERE, and that is an instrument gap
+
+`grid_closes_on_cursor` was added to settle whether these reports are corruption
+or a desynced walk. It produced **0 verdicts in both runs above**, against 14
+corrupt cells. The drain that emits it is wired into three pause bodies, and
+this class's reports arrive from five walks --
+`SharedEvac::process_object`, `seed_source_region`,
+`collect_outgoing_cross_region_edges`, `verify_no_dangling_into_cset_within`
+and one attributed to `is_collectable_region_type` -- on a pause path that does
+not reach the drain at `-Xmx2g`.
+
+So the question this page most needs answered is unanswered on the workload
+whose evidence it rests on, and the reason is the instrument, not the defect.
+On H2 the same drain emits 8 verdicts a run. Wiring it into the remaining pause
+paths is the next step for anyone picking this up; it is small, and it is the
+LAST thing between this page and knowing whether its census was corruption at
+all.
+
 ### so the producer is the EVACUATION-FAILURE path
 
 `RESUME_DEST` is what lets a parallel worker bump into an existing non-CSet Old
