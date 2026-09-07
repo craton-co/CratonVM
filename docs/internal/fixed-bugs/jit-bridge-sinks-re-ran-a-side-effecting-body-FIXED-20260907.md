@@ -262,6 +262,31 @@ consistent would mean adding an abort to three paths that have never had one —
 a new way for a working workload to die, to fix something with zero measured
 occurrences. Not worth it on this evidence; revisit if the warning ever fires.
 
+## Added afterwards: the same claim across the whole guard family
+
+`probes/DeoptRerunProbe.java` above proves the fix on ONE guard — `idiv`
+(`emit_deopt_if_zero`) with an `iastore` side effect. The optimizing tier has
+four guard emitters, not one, and a regression in any of the others would be
+invisible to it. `probes/DeoptTrapProbe.java` (added 2026-09-07, after this
+page) widens the same measurement to all of them: array load, array store,
+`arraylength`, `getfield`, `putfield`, `idiv`, `ldiv` and `irem`, ten trapping
+arms, each method with no exception table and a field store before the guarded
+opcode, and a single counter that must gain exactly 10.
+
+Against the fixed tree, on `dev` at `2f8d55657`:
+
+| arm | `Holder.n` added by 10 arms | rc |
+|---|---:|---:|
+| default acceptance policy | 10 | 0 |
+| `CRATONVM_C2_ACCEPT=always` | **10** | 0 |
+| `CRATONVM_C2_ACCEPT=always` + `CRATONVM_JIT_DEOPT_SINK_RESUME=0` | **19** | 1 |
+
+Row 2 is the fix holding for the seven emitters this page did not exercise;
+row 3 is the engagement proof in the same binary — with the resume switched
+off, **nine of the ten arms replay their store**. Row 1 restates this page's
+own point about the acceptance gate: without `=always` the probe never reaches these
+sinks at all, and passes vacuously.
+
 ## Related
 
 * `deopt-sink-refused-a-frame-its-sibling-resumes-FIXED-20260907.md` — the

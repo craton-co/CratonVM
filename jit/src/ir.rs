@@ -8912,13 +8912,6 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
 mod scalar_intrinsic_recognizer_tests {
     use super::*;
 
-    /// Every family the recognizer claims must actually be recognised.
-    ///
-    /// A table rather than a spot check, because the failure this catches is a
-    /// family added to `ScalarOp` and its lowering but forgotten in the match —
-    /// which reads, from the outside, exactly like a workload that has no such
-    /// call site.
-    #[test]
     /// The site-trap registry is what lets the runtime tell an IR SITE TRAP
     /// apart from genuinely unreachable code, and the two want OPPOSITE
     /// actions: unreachable code should blacklist the method, a site trap must
@@ -9021,6 +9014,20 @@ mod scalar_intrinsic_recognizer_tests {
         );
     }
 
+    // RESTORED 2026-09-07. The site-trap tests above were inserted between
+    // this test's doc comment and its `fn`, which orphaned the comment onto
+    // the first of them and left this function with NO `#[test]` attribute —
+    // so the one check that a `ScalarOp` family cannot be added without its
+    // recognizer signature had silently stopped running, and
+    // `cargo clippy --workspace --all-targets -- -D warnings` was red on
+    // `duplicated attribute` for everyone.
+    /// Every family the recognizer claims must actually be recognised.
+    ///
+    /// A table rather than a spot check, because the failure this catches is a
+    /// family added to `ScalarOp` and its lowering but forgotten in the match —
+    /// which reads, from the outside, exactly like a workload that has no such
+    /// call site.
+    #[test]
     fn every_declared_family_is_recognised() {
         // Driven off an EXHAUSTIVE match rather than a hand-kept list. The
         // previous version was a list of tuples, which could not catch the one
