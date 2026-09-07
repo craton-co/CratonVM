@@ -18502,19 +18502,32 @@ impl G1Collector {
     pub fn is_addr_in_live_region(&self, addr: usize) -> bool {
         // Fast lock-free arena-bounds gate. `[arena_base, arena_end)` is
         // immutable for the collector's lifetime (single contiguous `Box<[u8]>`,
-        // never moved/resized), so the test needs no atomics and no lock. This
-        // is the hot path: `is_addr_in_live_region` is called per candidate word
-        // by the conservative JIT/native root scan
-        // (`scan_active_jit_frames` / `update_root_snapshot`), which runs on
-        // every object-returning native call. The overwhelming majority of those
-        // words (return addresses, ints, native-stack addresses) lie OUTSIDE the
-        // heap arena and are rejected here without touching `regions.lock()` or
-        // scanning any region. The previous implementation took the regions
-        // mutex and linearly scanned all ~`num_regions` regions for EVERY word,
-        // which made JIT-on, deep-stack workloads (e.g. Spring Boot buildSrc
-        // JUnit annotation walks) run for minutes / appear hung under G1 while
-        // serial GC — whose `gen_heap` adopted exactly this lock-free gate —
-        // finished in seconds.
+        // never moved/resized), so the test needs no atomics and no lock. The
+        // gate was added for the conservative JIT/native root scan
+        // (`scan_active_jit_frames` / `update_root_snapshot`), whose candidate
+        // words -- return addresses, ints, native-stack addresses -- mostly lie
+        // OUTSIDE the arena and are rejected here without touching
+        // `regions.read()` or scanning any region. The implementation before it
+        // took the regions mutex and linearly scanned all ~`num_regions` regions
+        // for EVERY word, which made JIT-on, deep-stack workloads (e.g. Spring
+        // Boot buildSrc JUnit annotation walks) run for minutes / appear hung
+        // under G1 while serial GC -- whose `gen_heap` adopted exactly this
+        // lock-free gate -- finished in seconds.
+        //
+        // **The root scan is NOT what makes this hot on every workload, and
+        // saying so sent one investigation to the wrong place.** Measured
+        // 2026-09-07 on `org.h2.test.store.TestMVStoreTool`'s create phase
+        // (`probes/MvsCreate.java`), where this function is the #1 self-time
+        // symbol of the whole profile at 14%: `CRATONVM_DBG_JIT_SCAN_PROF=1`
+        // reports `scans=0 cache_hits=0 band_scans=0 band_words=0` beside
+        // `jit_entries=1617960` -- the band scan never ran. A sampled-backtrace
+        // build attributed the 495 M `is_object_address` calls of that run
+        // 57% to `VmHeap::load_and_forward` (the software read barrier, one
+        // walk per reference field/array access through `get_field`,
+        // `set_field`, `get_array_element`, `set_array_element`) and 17% to
+        // `autobox_payload`'s reference-array unbox screen. On a workload like
+        // that the candidate is an in-arena address 99.997% of the time, so
+        // every call takes the WHOLE body below, not the bounds rejection.
         if addr < self.arena_base || addr >= self.arena_end {
             return false;
         }
@@ -18529,7 +18542,31 @@ impl G1Collector {
         if region_size == 0 {
             return false;
         }
-        let idx = (addr - self.arena_base) / region_size;
+        // F-09, second half. `lookup_region_for_addr` and
+        // `classify_candidate_header_view` were converted from `/ region_size`
+        // to `>> region_shift` because the divisor is a runtime value and `/`
+        // therefore compiles to a real 64-bit `div` -- tens of cycles,
+        // unpipelined. THIS site was missed, and it is the hottest of the
+        // three: `is_addr_in_live_region` is the whole body of `is_heap_addr`
+        // and the gate of `is_object_address`, so every conservative root-scan
+        // word, every JIT native-dispatch argument and every typecheck
+        // receiver paid one divide. Measured on `org.h2.test.store.
+        // TestMVStoreTool`'s create phase (see
+        // `docs/internal/fixed-suite-bugs/h2-suite-bugs/`): 240 M calls in a
+        // 12 s run, with `is_addr_in_live_region` the #1 self-time symbol of
+        // the whole profile at 14%.
+        //
+        // `region_shift` is `config.region_size.trailing_zeros()` taken in
+        // `new` AFTER `normalize_region_size` rounded the size up to a power of
+        // two, so the shift and the divide agree by construction; the
+        // `region_size == 0` guard above is what keeps a 64-wide shift
+        // unreachable.
+        let idx = (addr - self.arena_base) >> self.region_shift;
+        debug_assert_eq!(
+            idx,
+            (addr - self.arena_base) / region_size,
+            "region_shift disagrees with config.region_size"
+        );
         // Per-thread POSITIVE memo, checked before the lock. See
         // `live_region_memo` for the soundness argument; the epoch is read
         // BEFORE the lock below so a recycle concurrent with this call can only

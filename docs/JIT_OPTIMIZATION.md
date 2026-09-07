@@ -4262,3 +4262,142 @@ family in this same session, where failures under load turned out to be
 whole-machine contention during a `cargo test` that was also compiling. The
 recorded rate is not supported either way, and the residual should say so rather
 than carry a number nothing reproduces.
+
+### The hibernate inlining result REVERSES on a disjoint sample — there is no positive throughput result
+
+This file said, earlier today:
+
+> **This is the first positive throughput result for IR inlining on real code
+> in this document** […] 26 of 37 is not something a fair coin does.
+
+It was tested on the rest of the suite and it does not hold. Same binary (one
+`mtime`, both runs on it), same harness, same lever, disjoint classes:
+
+| sample | classes | A (inline ON) faster | median delta | median noise | z |
+|---|---:|---:|---:|---:|---:|
+| hibernate, classes 0-39 | 37 | 26 (70%) | +0.3% | 6.9% | **+2.47** |
+| hibernate, classes 40-119 | 78 | 28 (36%) | **-0.4%** | **2.7%** | **-2.49** |
+| **hibernate pooled** | **115** | **54 (47%)** | — | — | **-0.65** |
+| netty | 46 | 19 (41%) | — | — | -1.18 |
+| **every inline pair taken** | **161** | **73 (45%)** | — | — | **-1.18** |
+
+Two disjoint halves of ONE suite, each "consistent, p < 0.05", pointing in
+OPPOSITE directions, with z-scores that are near mirror images. Pooled, the
+whole thing is a coin — and so is every inlining pair ever taken here, 73 of
+161.
+
+The second sample is the better one on every axis that matters: twice the
+classes, and a median within-arm noise of 2.7% against the first's 6.9%. If
+either were to be believed it would be the one saying inlining is SLOWER. The
+honest reading is that neither is: **IR inlining has no measurable throughput
+effect on hibernate**, and the earlier claim is withdrawn.
+
+#### What went wrong, and what the harness now has to say
+
+The design was right about the thing it was built for — a per-class ABBA pairing
+does remove the drift that made a per-run comparison useless, and the noise
+floor it reports is real. The error was in the inference laid on top: a sign
+test over classes assumes the per-class deltas differ only by the lever plus
+symmetric noise. They do not. Classes carry their own systematic
+differences — how much of the run is JIT-visible at all, how much is MySQL
+round-trips — and slicing a null effect into two class subsets can hand you a
+significant count in either direction. Which is exactly what it did.
+
+So a paired count is evidence about THE CLASSES IT WAS TAKEN OVER, and a
+significant z is a reason to take a SECOND, disjoint sample — not a result.
+This is the same lesson as the census drift recorded above, one level up: there
+the trap was comparing runs across time, here it is generalising from a sample
+to the suite.
+
+`pair-ab.sh` prints the count, the z and the noise floor and it printed them
+correctly both times. The verdict line is what over-reached, and it now says so:
+SMALL BUT CONSISTENT requires a confirming disjoint sample before it means
+anything.
+
+### A one-lever A/B found the TRIGGER and I called it the defect
+
+The question was whether `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` could default ON
+now that firing no longer blacklists a method. H2 said yes emphatically — 48
+traps planted, **none taken**, `accepted` 579 -> 592, `lowered` 116 -> 127, no
+blacklists. Thirty hibernate-reactive classes said the opposite, and the control
+arm is where the interesting number was:
+
+| arm (binary WITHOUT the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| unresolved-class trap ON | 64 | 33 | 120 | 102 |
+| the shipped default (indy trap ON) | 182 | 7 | 4 | **36** |
+| all site traps OFF | **241** | **0** | 0 | **0** |
+
+The third arm only got run because the second — the *control* — had 36 hard
+errors sitting in it. One lever, 241/0/0 against 182/7/36, and the conclusion
+looked inescapable: the default-ON `invokedynamic` trap was costing 59 passing
+tests and 36 `InternalError`s in the stock configuration. The callees named in
+those errors were exactly the ones tabulated on the `TransferToInterpreter`
+known-issue page filed that morning. So site traps were switched to default OFF.
+
+**That was wrong, and the check that caught it was re-reading dev before
+pushing.** Another session had spent the same afternoon on the same family from
+the other end and found the actual defect: one deopt SINK aborted on a trapped
+frame that its sibling sink resumed (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default
+ON). Re-measured on a binary carrying their fix:
+
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| site traps ON | 239 | 0 | 7 | **0** |
+| site traps OFF | 241 | 0 | 0 | **0** |
+
+Zero errors either way. The trap was never the defect — it was the thing that
+*produced the deopts* the broken sink then mishandled. Traps fire (`TAKEN=7`)
+and nothing breaks. The default-OFF flip is reverted.
+
+And the arm that started all this reverses too. The unresolved-class trap, the
+one that read `ok=64 failed=33` and looked destructive, on the fixed binary:
+
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` | **241** | **0** | **112** | **0** |
+| the shipped default | 241 | 0 | 9 | 0 |
+
+One hundred and twelve traps fired, no failures, no errors, the same pass count
+as the default. Every number this file has ever recorded against that switch —
+"200,000 deopts", "traps forever", "craters hibernate" — was measuring a broken
+deopt sink through it.
+
+So the CORRECTNESS objection to `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` is gone.
+It stays OFF anyway, because the case for turning it ON was always throughput
+(+13 accepted bodies and +11 lowered on H2) and that has never been measured —
+and the inlining reversal recorded above is a fresh demonstration of how hard
+that measurement is to get right here. What has changed is the reason: it is no
+longer "this is harmful", it is "this is unmeasured".
+
+#### The methodological point, which is the part worth keeping
+
+A single-lever A/B is airtight about one thing and silent about another. Turning
+site traps off removed the errors, and that PROVED the trap is on the causal path
+to the failure. It said nothing about whether the trap or something downstream of
+it was the defect — and a kill switch answers identically in both cases. Every
+feature that produces deopts would have "fixed" this bug by being switched off.
+
+The tell was available and I read past it: the failing arm's errors named
+`can_deopt_resume=false`, a property of the METHOD and the SINK, not of the trap.
+A lever that removes a symptom by removing its input is a bisection step, not a
+diagnosis.
+
+Two further notes. `TAKEN` undercounts on the pre-fix binary by construction:
+the counter sits in the resume path past the point where the resume succeeded,
+so a trap whose resume was REFUSED never reached it — `TAKEN=4` beside 36 errors
+was 4 traps that resumed and 36 that could not, and that discrepancy was itself
+a signal the trap was not the whole story. And H2 remains unable to see any of
+this: it plants traps and fires none, so its census reads as pure gain either
+way. A lever whose entire risk is what happens when a trap FIRES has to be
+measured where traps fire.
+
+#### What this does retire
+
+The case for artifact displacement — entry patching, a real `MakeNotEntrant`.
+Its premise was that a trap on a HOT path needs the trapping artifact displaced
+to be survivable. With the sink fixed, traps fire on hibernate and nothing
+breaks, and the residual re-fire counter reads 0 on both real workloads. Nothing
+here is asking for live-code patching, which in this tree means atomic surgery
+under W^X with no safepoint hook and no existing patch site to copy. It is not
+being built, and this is the measurement that says why.
