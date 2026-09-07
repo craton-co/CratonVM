@@ -9218,51 +9218,57 @@ pub fn ir_trap_census() -> [(&'static str, u64); TrapCause::COUNT] {
 }
 
 /// May a site this tier cannot lower become an uncommon trap, instead of
-/// refusing the whole method? **Default OFF since 2026-09-07**;
-/// `CRATONVM_JIT_IR_SITE_TRAP=1` opts back in.
+/// refusing the whole method? **Default ON**; `CRATONVM_JIT_IR_SITE_TRAP=0` is
+/// the kill switch and restores the method-level refusal at every caller.
 ///
-/// It was default ON, on this argument: measured on the H2 JDBC workload before
-/// it existed, 53 methods were refused for an `invokedynamic`, 34 for a
-/// `checkcast`/`instanceof` on an unloaded class and 13 for a `new` of one --
-/// 100 methods with nothing wrong with the code the optimizing tier would
-/// actually have run.
+/// Measured on the H2 JDBC workload before this existed: 53 methods refused for
+/// an `invokedynamic`, 34 for a `checkcast`/`instanceof` on an unloaded class,
+/// and 13 for a `new` of one -- 100 methods, none of which had anything wrong
+/// with the code the optimizing tier would actually have run.
 ///
-/// THE ARGUMENT WAS ABOUT COMPILE-TIME REFUSALS AND THE COST IS AT RUN TIME.
-/// A site trap is a DELIBERATE deopt, and precise deoptimization is
-/// unavailable for many real methods (`can_deopt_resume=false` -- no deopt
-/// points, or an elided monitor). The resume path then REFUSES rather than
-/// replay a side-effecting call, and the caller gets
-/// `InternalError: ... refusing side-effecting replay`.
-///
-/// Thirty hibernate-reactive classes, one binary, one lever:
+/// THIS WAS BRIEFLY FLIPPED OFF ON 2026-09-07 AND THE FLIP WAS WRONG. Thirty
+/// hibernate-reactive classes then read `ok=182 failed=7` with traps on against
+/// `ok=241 failed=0` with them off, and 36 `InternalError: ... refusing
+/// side-effecting replay` -- so the trap looked like the defect. It was only the
+/// TRIGGER. The cause was a deopt SINK that aborted on a trapped frame its
+/// sibling sink resumed, fixed the same day by another session
+/// (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON). Re-measured on a binary
+/// carrying that fix:
 ///
 /// ```text
-///   site traps ON (the old default)   ok=182  failed=7   InternalError=36
-///   site traps OFF                    ok=241  failed=0   InternalError=0
+///   site traps ON  + sink fix    ok=239  failed=0  InternalError=0
+///   site traps OFF + sink fix    ok=241  failed=0  InternalError=0
 /// ```
 ///
-/// Fifty-nine passing tests, seven failures and thirty-six hard errors, bought
-/// with a compile-time refusal count. The callees named in those errors --
-/// `ReactiveEntityInitializerImpl.reactiveInitializeEntityInstance`,
-/// `UniSubscriber.onItem` -- are the ones on the `TransferToInterpreter`
-/// known-issue page, which is how that family is reached.
-///
-/// H2 cannot see this: it plants traps and never fires one, so its census
-/// reads as pure gain. A lever whose whole risk is what happens when a trap
-/// FIRES has to be measured where traps fire.
+/// Zero errors either way, so there is nothing here to switch off. The lesson
+/// kept is about the measurement, not the flag: an A/B with ONE lever proves
+/// that lever is on the path to the failure, and says nothing about whether it
+/// is the defect. A trigger and a cause both answer to a kill switch.
 pub fn ir_site_trap_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SITE_TRAP").as_deref(),
-            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
         )
     })
 }
 
 /// May an UNRESOLVED-CLASS site (`checkcast`, `instanceof`, `new`) become a
 /// trap? **Default OFF**; `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` opts in.
+///
+/// The reason it is off CHANGED on 2026-09-07 and the old reason is retracted.
+/// It read "200,000 deopts on `UnresolvedTrapProbe`, every call, permanently
+/// not-compilable", and every one of those numbers was a broken deopt sink
+/// measured through this switch (see `ir_site_trap_enabled`). On a binary with
+/// `CRATONVM_JIT_DEOPT_SINK_RESUME` in it, 30 hibernate-reactive classes with
+/// this switch ON read `ok=241 failed=0` with **112 traps taken and zero**
+/// `refusing side-effecting replay` -- identical to the default arm.
+///
+/// It stays off because turning it on was always a THROUGHPUT argument (+13
+/// accepted bodies, +11 lowered on H2) and that has never been measured. Not
+/// because it is harmful.
 ///
 /// # Why this is separate from the indy trap, and why it ships off
 ///

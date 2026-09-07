@@ -4214,8 +4214,15 @@ pub(crate) fn despeculate_trapped_method(
     fallback_reason: cratonvm_jit::deopt::DeoptReason,
     bci: u32,
 ) {
-    let h = cratonvm_jit::ir_method_memo_hash(class_name, method_name, descriptor);
-    let ir_site_trap = cratonvm_jit::ir::method_has_site_trap(h);
+    // Cheap negative first: both sinks call this on EVERY trapped-frame
+    // despeculation, and a VM that planted no site trap at all must not pay a
+    // hash and a lock read for it. Doubly so now that site traps are opt-in.
+    let (ir_site_trap, h) = if cratonvm_jit::ir::any_site_trap_registered() {
+        let h = cratonvm_jit::ir_method_memo_hash(class_name, method_name, descriptor);
+        (cratonvm_jit::ir::method_has_site_trap(h), h)
+    } else {
+        (false, 0)
+    };
     let mut decided = true;
     if ir_site_trap {
         cratonvm_jit::ir::note_site_trap_taken();

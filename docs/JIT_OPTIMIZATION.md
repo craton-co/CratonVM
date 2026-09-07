@@ -4314,74 +4314,90 @@ correctly both times. The verdict line is what over-reached, and it now says so:
 SMALL BUT CONSISTENT requires a confirming disjoint sample before it means
 anything.
 
-### The unresolved-class trap CRATERS hibernate-reactive — and H2 could never have shown it
+### A one-lever A/B found the TRIGGER and I called it the defect
 
-With firing no longer a permanent blacklist, the obvious question was whether
-`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` could finally default ON. H2 said yes,
-emphatically: 48 traps planted, **none taken**, `accepted` 579 -> 592,
-`lowered` 116 -> 127, no blacklists, `DOD RESULT OK`.
+The question was whether `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` could default ON
+now that firing no longer blacklists a method. H2 said yes emphatically — 48
+traps planted, **none taken**, `accepted` 579 -> 592, `lowered` 116 -> 127, no
+blacklists. Thirty hibernate-reactive classes said the opposite, and the control
+arm is where the interesting number was:
 
-Thirty hibernate-reactive classes, same binary, two arms back to back:
+| arm (binary WITHOUT the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| unresolved-class trap ON | 64 | 33 | 120 | 102 |
+| the shipped default (indy trap ON) | 182 | 7 | 4 | **36** |
+| all site traps OFF | **241** | **0** | 0 | **0** |
 
-| arm | tests ok | failed | planted | TAKEN | re-fired | `refusing side-effecting replay` |
-|---|---:|---:|---:|---:|---:|---:|
-| unresolved trap ON | 64 | 33 | 465 | 120 | 76 | **102** |
-| unresolved trap OFF (the old default, indy trap still ON) | 182 | 7 | 0 | 4 | 0 | 36 |
-| **ALL site traps OFF** | **241** | **0** | 0 | 0 | 0 | **0** |
+The third arm only got run because the second — the *control* — had 36 hard
+errors sitting in it. One lever, 241/0/0 against 182/7/36, and the conclusion
+looked inescapable: the default-ON `invokedynamic` trap was costing 59 passing
+tests and 36 `InternalError`s in the stock configuration. The callees named in
+those errors were exactly the ones tabulated on the `TransferToInterpreter`
+known-issue page filed that morning. So site traps were switched to default OFF.
 
-Passing tests fall by two thirds and hard InternalErrors nearly triple. But the
-third arm is the one that matters, and it was only run because the second arm's
-"control" had 36 errors in it: **the DEFAULT configuration was already losing 59
-passing tests, 7 classes and 36 hard errors to the `invokedynamic` trap, which
-ships ON.** Turning site traps off entirely is a clean sweep -- 241 ok, 0
-failed, 0 InternalErrors.
+**That was wrong, and the check that caught it was re-reading dev before
+pushing.** Another session had spent the same afternoon on the same family from
+the other end and found the actual defect: one deopt SINK aborted on a trapped
+frame that its sibling sink resumed (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default
+ON). Re-measured on a binary carrying their fix:
 
-So `CRATONVM_JIT_IR_SITE_TRAP` is now **default OFF**, and the unresolved-class
-opt-in stays off underneath it.
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| site traps ON | 239 | 0 | 7 | **0** |
+| site traps OFF | 241 | 0 | 0 | **0** |
 
-#### Why, and it is not throughput
+Zero errors either way. The trap was never the defect — it was the thing that
+*produced the deopts* the broken sink then mishandled. Traps fire (`TAKEN=7`)
+and nothing breaks. The default-OFF flip is reverted.
 
-The failure is the one the `TransferToInterpreter` known-issue page describes:
-precise deoptimization is unavailable for many real methods
-(`can_deopt_resume=false` — no deopt points, or an elided monitor), and the
-resume path then REFUSES rather than replay a side-effecting call:
+And the arm that started all this reverses too. The unresolved-class trap, the
+one that read `ok=64 failed=33` and looked destructive, on the fixed binary:
 
-```
-java.lang.InternalError: JIT dispatch into <callee> failed: internal error:
-  precise deoptimization unavailable for <callee> at bci <N>
-  (can_deopt_resume=false ...); refusing side-effecting replay
-```
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` | **241** | **0** | **112** | **0** |
+| the shipped default | 241 | 0 | 9 | 0 |
 
-A site trap is a DELIBERATE deopt. Planting one in a method that cannot be
-precisely resumed converts a compile-time refusal into a run-time hard failure.
-On H2 that never showed because no unresolved-class trap ever fired; on
-hibernate 120 fired and 102 InternalErrors followed.
+One hundred and twelve traps fired, no failures, no errors, the same pass count
+as the default. Every number this file has ever recorded against that switch —
+"200,000 deopts", "traps forever", "craters hibernate" — was measuring a broken
+deopt sink through it.
 
-`TAKEN` UNDERCOUNTS on purpose-built accident: the counter lives in
-`try_resume_trapped_callee` past the point where the resume has succeeded, so a
-trap whose resume is REFUSED never reaches it. `TAKEN=4` beside 36 errors is
-not a contradiction -- it is 4 traps that resumed and 36 that could not.
+So the CORRECTNESS objection to `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` is gone.
+It stays OFF anyway, because the case for turning it ON was always throughput
+(+13 accepted bodies and +11 lowered on H2) and that has never been measured —
+and the inlining reversal recorded above is a fresh demonstration of how hard
+that measurement is to get right here. What has changed is the reason: it is no
+longer "this is harmful", it is "this is unmeasured".
 
-#### What this retires
+#### The methodological point, which is the part worth keeping
 
-The reason to want artifact displacement — entry patching, a real
-`MakeNotEntrant` — was to make a trap on a HOT path survivable. That premise is
-gone. Traps do not fail on real code because the trapping artifact stays
-installed; they fail because the deopt they force is not available in the first
-place. Entry patching would not have changed one of these 102 errors. It is not
-being built, and this is the measurement that says why — a better reason than
-the "0 re-fires on H2" that was standing in for one.
+A single-lever A/B is airtight about one thing and silent about another. Turning
+site traps off removed the errors, and that PROVED the trap is on the causal path
+to the failure. It said nothing about whether the trap or something downstream of
+it was the defect — and a kill switch answers identically in both cases. Every
+feature that produces deopts would have "fixed" this bug by being switched off.
 
-#### The sampling lesson, twice in one day
+The tell was available and I read past it: the failing arm's errors named
+`can_deopt_resume=false`, a property of the METHOD and the SINK, not of the trap.
+A lever that removes a symptom by removing its input is a bisection step, not a
+diagnosis.
 
-H2 was not a weak signal in the right direction; it was silent. A workload
-where **no trap ever fires** cannot say anything about a workload where 120 do,
-and "48 planted, 0 taken, +13 accepted bodies" reads as encouragement only if
-you forget that `planted` is a compile-time count and `TAKEN` is the one that
-measures anything. The engagement census existed and was reported; the
-inference drawn from it was still wrong.
+Two further notes. `TAKEN` undercounts on the pre-fix binary by construction:
+the counter sits in the resume path past the point where the resume succeeded,
+so a trap whose resume was REFUSED never reached it — `TAKEN=4` beside 36 errors
+was 4 traps that resumed and 36 that could not, and that discrepancy was itself
+a signal the trap was not the whole story. And H2 remains unable to see any of
+this: it plants traps and fires none, so its census reads as pure gain either
+way. A lever whose entire risk is what happens when a trap FIRES has to be
+measured where traps fire.
 
-Same shape as the inlining reversal recorded above: a result measured on one
-sample, generalised to a suite that behaves differently. There the fix was a
-disjoint confirming sample. Here it is: **a lever whose whole risk is what
-happens when a trap FIRES must be measured on a workload where traps fire.**
+#### What this does retire
+
+The case for artifact displacement — entry patching, a real `MakeNotEntrant`.
+Its premise was that a trap on a HOT path needs the trapping artifact displaced
+to be survivable. With the sink fixed, traps fire on hibernate and nothing
+breaks, and the residual re-fire counter reads 0 on both real workloads. Nothing
+here is asking for live-code patching, which in this tree means atomic surgery
+under W^X with no safepoint hook and no existing patch site to copy. It is not
+being built, and this is the measurement that says why.
