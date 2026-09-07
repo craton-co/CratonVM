@@ -130,11 +130,27 @@ pub fn base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
 /// [`base_for_class`] for a caller that already holds the resolved class id.
 ///
 /// Takes `&dyn`, not `&mut dyn`, and that is the point rather than an
-/// incidental tightening: every method it calls is `&self`, so the signature is
-/// a compile-time statement that **no GC can run inside it**. An edit that
-/// later reached for `ensure_class_initialized`, `alloc_object` or any Java
-/// re-entry would fail to borrow — the only kind of guarantee that survives
-/// this file being read by someone who has not read this comment.
+/// incidental tightening: an edit that later reached for
+/// `ensure_class_initialized`, `alloc_object`, `create_string` or any other
+/// Java re-entry would **fail to borrow**. That is the only kind of guarantee
+/// which survives this file being read by someone who has not read this
+/// comment, and it is what closes the `<clinit>` door for good.
+///
+/// # The exact scope of that guarantee
+///
+/// `&dyn` blocks every `&mut self` method, which is where `<clinit>` and Java
+/// re-entry live. It does NOT block a `&self` method that uses interior
+/// mutability, and one of the three called here is such a method:
+/// `is_class_synthetic_stub` is implemented on the VM as
+/// `load_class_concurrent`, which can LOAD a class.
+///
+/// It still cannot run `<clinit>`, and it cannot run a `ClassFileTransformer`
+/// either — that needs a Java thread, which is why `vm_init` splits
+/// `load_class_transformed` off for callers that have one. And on this path the
+/// name always comes from an already-loaded class id (the caller got it from
+/// `class_id_of_object`), so the load is a read-lock hit. But that last part is
+/// an argument, not a type. Do not upgrade the claim to "nothing can allocate
+/// here" without re-checking it.
 ///
 /// # Why an id-taking form is safe where the removed name-taking one was not
 ///

@@ -22067,9 +22067,12 @@ pub const AFC_ABSTRACT_IMPL: &str = "sun/nio/ch/AsynchronousFileChannelImpl";
 /// collapses the base to 0 for any receiver this crate did not allocate, so a
 /// real `Impl` built by JDK bytecode reads the slots it read before.
 ///
-/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
-/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
-/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
 /// and therefore `<clinit>`, so an ordinary private field read was a Java
 /// re-entry that could move — or under the generational young sweep zero — every
 /// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
@@ -22785,9 +22788,12 @@ const WE_IMPLS: &[&str] = &["sun/nio/fs/AbstractWatchKey$Event"];
 /// `probes/W4Abstract.java` is the assertion that found this; JVMS §6.5 is why
 /// it is a defect with no oracle run required.
 ///
-/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
-/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
-/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
 /// and therefore `<clinit>`, so an ordinary private field read was a Java
 /// re-entry that could move — or under the generational young sweep zero — every
 /// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`

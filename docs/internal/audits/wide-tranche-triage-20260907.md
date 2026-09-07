@@ -408,15 +408,76 @@ documented at `native-io/src/lib.rs` is right for these four. The new
 already-loaded arm covers them at run time regardless — the audit simply cannot
 see through the fallback.
 
-### Not done, and why
+### The JCA copies — done, and TWO of the reasons for doing it were WRONG
 
-The four private `synthetic_base_offset` copies in `native-builtins/src/jca/`
-(21 rows, `ensure_class_initialized`) are the same defect and are named in
-`appended_slots`' own header as the copies that **ratchet** in synthetic-JDK
-mode — they ask `class_num_total_fields` unconditionally, with no stub arm.
-Converting them to `appended_slots::base_for_class` is the right move and would
-take the rows with it, but it changes JCA slot layout in synthetic mode and
-needs its own reproducers. Left as the next unit rather than folded in here.
+They were deferred here with two claims attached: that they **ratchet** in
+synthetic-JDK mode, and that converting them would take 21 audit rows with it.
+Both were written from reading the code. Measured, **neither holds**, and that
+record is worth more than the deferral was.
+
+There are also FOUR of them, not three: `synthetic_base_offset` in
+`signature.rs`, `key_factory.rs` and `kem.rs`, plus `base_offset` in
+`key_agreement.rs`. A grep for the first name finds three.
+
+**The ratchet did not reproduce.** The predicted mechanism was: base 0 →
+allocator asks `try_alloc_concurrent_synthetic(name, 0 + width)` → the `Err` arm
+calls `try_ensure_synthetic_class(name, width)`, which fabricates a class
+*declaring `width` fields* → the next `ensure_class_initialized` succeeds and
+reads `width` back as the new base. A probe computing both the current answer
+and the `base_for_class` answer on every call says otherwise:
+
+    [JCABASE] first java/security/KeyPairGenerator: old=0 new=0
+    [JCABASE] first java/security/KeyFactory:       old=0 new=0
+    [JCABASE] first javax/crypto/KeyAgreement:      old=0 new=0
+
+No value ever changed. These JDK classes are **pre-stubbed** in synthetic mode,
+so `ensure_class_initialized` SUCCEEDS, `class_num_total_fields` answers 0, and
+`alloc_object` never alters a class's declared count — the
+fabricate-at-the-requested-width branch that would ratchet is never taken. The
+header's claim is a fair reading of the code and is not reproducible for these
+four classes.
+
+**The 21 rows do not drop.** Checked rather than asserted: the transitive total
+is **342 before and 342 after**. The rows move from `synthetic_base_offset` to
+`base_for_class` (4 → 26), because `base_for_class` still contains
+`ensure_class_initialized` in its cold fallback and the tool cannot see that the
+warm path skips it. That follows from how `allocating()` builds its graph and
+should have been predicted before the number was offered.
+
+**What the conversion is actually worth**, both headline claims gone: it removes
+a real `<clinit>` door from every JCA private-slot read — the same hazard class
+as the `native-io` family above — and collapses four private re-implementations
+into forwarders to the one helper, which `appended_slots`' header asks for by
+name. The stub arm comes along defensively even though nothing here could make
+it matter.
+
+**Behaviour-preserving, measured.** The probe found the two shapes identical on
+every class either mode reached — real-JDK `KeyPairGenerator` 2, `Signature` 4,
+`KeyFactory` 5, `KeyAgreement` 6, `KEM` 4; synthetic-JDK all 0 — with no value
+moving between calls. `test_classes/jca/JcaSlotFamilies.java` (new) signs and
+verifies with ECDSA rather than introspecting, because most JCA engine state is
+mirrored into side tables the accessors consult FIRST, so a fixture built on
+`getAlgorithm()` passes straight through a wrong slot read. `SIG_OFF_KEYOBJ` is
+the one slot with no side table behind it. A tampered-message negative control
+keeps a constant `true` from satisfying it, and it passes on HotSpot 25.0.3
+first.
+
+Real-JDK, 5 rounds, `failures=0 skipped=0` on Generational, ZGC and G1, before
+and after. Synthetic-JDK unchanged before and after: 4 `NoSuchMethodError`, 0
+FAILs.
+
+**A fixture caveat worth keeping.** The ECDSA round trip does NOT exercise
+`SIG_OFF_KEYOBJ` in synthetic mode — that slot is populated only on the
+`route_ec_to_real` SunEC drive path, which needs real EC classes that mode does
+not have. `signature()` ran cleanly there for that reason, not because the slots
+were proven good, which is why the base was measured directly rather than
+inferred from the round trip.
+
+**Found in passing, unrelated and unowned:** synthetic-JDK mode has no stub for
+`java.security.spec.X509EncodedKeySpec` or `sun.security.ec.ECDHKeyAgreement`
+(both `NoSuchMethodError`, "class not found on any classpath entry"). That is
+the feature-gate rot `zgc-production-implementation-plan.md` R4 warns about, and
+it belongs with the roadmap's open `P4-B — run --synthetic-jdk MODE`.
 
 ### Measurement
 
