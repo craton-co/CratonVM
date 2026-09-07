@@ -239,6 +239,71 @@ impl Compiler {
             .unwrap_or(i32::MIN)
     }
 
+    /// Does an OPEN inline scope still publish any of the locals in
+    /// `[start, end)` as a GC ROOT at or after the pc it is stopped at?
+    ///
+    /// This is the "prove liveness" half the known-issue page asked for, and it
+    /// is deliberately named for what it actually proves. `InlineOopScope`'s
+    /// `masks` are a MUST-be-oop dataflow: bit `k` set at a reachable pc means
+    /// that on EVERY path to that pc the callee's local `k` holds a reference.
+    /// So a set bit at some reachable pc at or after `cur_pc` says the enclosing
+    /// scope will name that local as a reference root in the oop map of every
+    /// safepoint in the rest of its body.
+    ///
+    /// That is a stronger claim than "the local is read again", and a worse
+    /// hazard than the wrong-value one the page was written about: a second
+    /// owner storing a primitive into that word leaves the collector reading a
+    /// non-pointer as a pointer. `InlineOopScope` exists precisely because
+    /// locals "named by nothing" produced a miscompile once already.
+    ///
+    /// What a `false` does NOT mean is "safe". The dataflow constrains
+    /// REFERENCES, not liveness, so a local holding a live `int` reads as `0`
+    /// here. `false` is "not proven to be a root", which leaves the ordinary
+    /// wrong-value hazard the page describes entirely intact.
+    ///
+    /// `None` means the scope cannot answer -- an unsupported local count
+    /// (`compute_local_oop_masks` returns empty above 64 locals) or a range
+    /// covering none of its slots. That is the same refusal `mask_at_cur`
+    /// returns, and it is not an empty mask.
+    fn scope_publishes_overlapped_local_as_root(
+        scope: &InlineOopScope,
+        start: i32,
+        end: i32,
+    ) -> Option<bool> {
+        if scope.masks.is_empty() || scope.num_locals == 0 || scope.num_locals > 64 {
+            return None;
+        }
+        // Which of the callee's local slots the reservation actually covers.
+        // Slot `k` occupies `[local_base + k*8, local_base + (k+1)*8)`.
+        let first = usize::try_from((start - scope.local_base).max(0) / 8).ok()?;
+        let past = end - scope.local_base;
+        if past <= 0 {
+            return None;
+        }
+        let last_exclusive =
+            usize::try_from(past.div_euclid(8) + i32::from(past.rem_euclid(8) != 0)).ok()?;
+        let last_exclusive = last_exclusive.min(scope.num_locals);
+        if first >= last_exclusive {
+            return None;
+        }
+        let mut covered: u64 = 0;
+        for k in first..last_exclusive {
+            covered |= 1u64 << k;
+        }
+        // Any REACHABLE pc at or after the one this scope is stopped at.
+        // `cur_pc` is the invoke that opened the splice below it, so this is
+        // exactly "the rest of the enclosing callee's body".
+        for pc in scope.cur_pc..scope.masks.len() {
+            if !scope.reached.get(pc).copied().unwrap_or(false) {
+                continue;
+            }
+            if scope.masks[pc] & covered != 0 {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     /// DIAGNOSTIC (`CRATONVM_DBG_JIT_SLOT_OVERLAP=1`): does this reservation
     /// hand out a frame slot an ENCLOSING inline scope still owns?
     ///
@@ -296,10 +361,26 @@ impl Compiler {
                 } else {
                     "ENCLOSING (its body continues after this call - LIVE locals)"
                 };
+                // For an ENCLOSING scope, say whether the overlapped local is
+                // still published as a GC ROOT in the rest of that callee's
+                // body. `oop-root-after=yes` is the strong case: the word is
+                // named in the oop map of every later safepoint, so a second
+                // owner storing a primitive there hands the collector a
+                // non-pointer to relocate. `no` is NOT "safe" -- see
+                // `scope_publishes_overlapped_local_as_root`.
+                let root = if depth == innermost {
+                    "n/a"
+                } else {
+                    match Self::scope_publishes_overlapped_local_as_root(scope, start, end) {
+                        Some(true) => "yes",
+                        Some(false) => "no",
+                        None => "unknown",
+                    }
+                };
                 eprintln!(
                     "[jit-slot-overlap] reservation {start}..{end} ({why:?}) overlaps OPEN \
                      inline scope #{depth}/{} {which} locals {s_start}..{s_end} (num_locals={}) \
-                     in {}",
+                     oop-root-after={root} in {}",
                     self.inline_oop_scopes.len(),
                     scope.num_locals,
                     self.method_label,

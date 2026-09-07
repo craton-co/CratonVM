@@ -4,7 +4,8 @@
 |---|---|
 | **Status** | **FIXED** 2026-09-07. `Compiler::open_inline_locals_floor`, enforced in `reserve_spill_slots`. |
 | **Origin** | `jit-warm-groupdata-window-row-collapse-20260906-FIXED.md` left a bare count of 325 spill overlaps as "that hazard is real and deserves its own page". The page that produced classified the count; this is that page with the fix. |
-| **Never observed to produce a wrong answer.** | The workload that exposes it is 11/11 before and after. What is fixed is the hazard, not a failing test — see "Why nothing was visibly broken", which is unchanged and is still not a defence. |
+| **Never observed to produce a wrong answer.** | The workload that exposes it is 11/11 before and after. What is fixed is the hazard, not a failing test. |
+| **The hazard is worse than this page originally said.** | 147 of the 151 overlaps land on a word the enclosing splice publishes to the collector as a **rewritable GC root**, on the DEFAULT configuration. See "How bad each of the 151 was". |
 
 ## The defect
 
@@ -114,19 +115,21 @@ live-slot scan documents, and is bounded the same way: `checked_spill_range_end`
 fails the compile and falls back to the interpreter rather than emitting a wrong
 body. No compile hit that bound.
 
-## Why nothing was visibly broken (unchanged from the open page)
+## Why nothing was visibly broken
 
-The workload was 11/11 throughout. Two reasons it can be quiet, and neither is a
-defence:
+The workload was 11/11 throughout. The open page offered two reasons it can be
+quiet; the measurement below retires the first and leaves the second:
 
-* the clobbered local may be dead from that point in the enclosing body (the
-  common case for a `num_locals=1` scope whose single local is `this`, already
-  copied into a register);
+* ~~the clobbered local may be dead from that point in the enclosing body~~ —
+  **retired.** Deadness is no defence against the GC channel: the oop map names
+  the slot because the dataflow says it holds a reference, not because anything
+  reads it. See "How bad each of the 151 was".
 * the value written may be the same object the local held, when the inner call
   returns its own receiver — very common in bytebuddy's `describe`/`of`/`wrap`
-  chains, which is where 39 of the 44 affected methods came from.
+  chains, which is where 39 of the 44 affected methods came from. This one
+  stands, and is what the workload was actually relying on.
 
-Neither was enforced anywhere, so both were luck. That is what changed: the
+Neither was enforced anywhere, so it was luck. That is what changed: the
 invariant is now enforced rather than hoped for, and the detector proves the
 population is empty.
 
@@ -150,21 +153,59 @@ the defect lives in the spill-slot simulation, and the descent that reaches an
 enclosing scope's locals needs a three-deep splice in an 11 KB bytebuddy body to
 occur naturally.
 
-## What is still open
+## How bad each of the 151 was
 
-**A witness at the Java level.** The open page asked for "a case where the
-enclosing callee READS the clobbered local after the inner call, with a value
-that differs", and this fix does not produce one — it removes the hazard without
-ever demonstrating a wrong answer from it. The 151 reports are gone; whether any
-of them would ever have been load-bearing is not answered and now cannot be from
-this workload.
+The open page asked for this and called it Option 1: use `InlineOopScope`'s
+per-pc local oop masks to turn "151 maybe" into a number of "definitely".
+`dbg_note_spill_overlap` now does it, and reports it per overlap as
+`oop-root-after=`. Measured against the PRE-fix arm
+(`CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1`), which is why the switch exists:
 
-Option 1 from the open page is the way in if it is ever wanted:
-`InlineOopScope` already carries the per-pc local oop masks (`masks`,
-`reached`), so a diagnostic could say whether the overlapped local is still read
-at or after the enclosing scope's `cur_pc`. That would turn "151 maybe" into a
-number of "definitely" — against the PRE-fix binary, which the switch still
-provides.
+| of the 151 ENCLOSING overlaps | |
+|---|---:|
+| `oop-root-after=yes` | **147** |
+| `oop-root-after=no` | 4 |
+| `oop-root-after=unknown` | 0 |
+
+`yes` means: at some REACHABLE pc at or after the point the enclosing scope is
+stopped at, its must-be-oop dataflow has the overlapped local's bit set. That is
+not "the callee reads it again" — it is stronger and worse. `collect_live_oop_homes`
+publishes exactly `scope.local_base + k*8` as a `ShadowHome::Frame` for every set
+bit, so the word is handed to the collector as a **rewritable reference root**:
+relocation reads it as a pointer and writes the new address back.
+
+So a second owner storing a primitive into that word is not merely a wrong value
+in the enclosing callee. It is a non-pointer handed to the collector as a root,
+whose relocation then also corrupts the second owner's value. And this is the
+DEFAULT path, not a corner: `GcFlags::moving_young` is default-on
+(`CRATONVM_NO_MOVING_YOUNG` is the opt-out) and `complete` in
+`collect_live_oop_homes` is exactly that flag.
+
+**This retires the first of the two "why nothing is visibly broken"
+explanations.** That bullet read "the clobbered local may be dead from that
+point in the enclosing body (the common case for a `num_locals=1` scope whose
+single local is `this`)". Deadness is no defence against this channel: the oop
+map names the slot because the dataflow says it holds a reference, whether or
+not any Java bytecode reads it again. A `num_locals=1` scope holding `this` is
+the WORST case here, not the most benign one — `this` is a must-oop at every pc,
+which is why 147 of 151 answer `yes`.
+
+The second explanation stands and is what this workload was actually relying
+on: bytebuddy's `describe`/`of`/`wrap` chains return their own receiver, so the
+word usually held a valid oop either way.
+
+### What this still does not prove
+
+A witness. `yes` says a later reachable pc names the local; it does not say a
+safepoint was emitted at such a pc after the clobber, nor that the value stored
+by the second owner was a primitive. Both are needed for an actual miscompile,
+and neither is measured. What changed is the size of the gap: the hazard is no
+longer "the enclosing callee might read a wrong value", it is "the collector may
+be handed a non-pointer as a rewritable root", 147 times in a 20-second run, on
+the default configuration.
+
+The pre-fix arm remains reachable through the switch, so anyone who wants the
+witness can go after it with the instrument already in place.
 
 ## Related
 
