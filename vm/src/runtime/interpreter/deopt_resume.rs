@@ -1043,6 +1043,84 @@ pub(crate) fn build_deopt_frame_inner(
     Some(frame)
 }
 
+/// May a deopt sink resume this trapped body from its reconstructed frame
+/// WITHOUT the backend's `can_deopt_resume` vouching for it?
+///
+/// # One predicate, asked at every sink
+///
+/// Four sinks consume a stashed IR deopt frame, and which one a trap reaches
+/// depends only on how the callee was entered. Until 2026-09-07 they gave three
+/// different answers to the same event:
+///
+/// * `try_resume_trapped_callee` (`jit/helpers.rs`) resumed it precisely;
+/// * `execute`'s tier-up sink (`interpreter.rs`) raised a hard `InternalError`
+///   — fixed 2026-09-07;
+/// * `execute_jit_call` (`jit-callsite-a`), `execute_jit_call_decoded`
+///   (`jit-callsite-b`) and [`resume_deopted_body`] re-ran the whole method from
+///   entry, with no side-effect check — so a body that had already committed a
+///   store committed it a second time, silently.
+///
+/// A deopt sentinel does NOT mean "nothing happened": the compiled body ran up
+/// to `bci` and stopped. Re-entering at bci 0 re-executes everything before it.
+/// [`resume_deopted_body`]'s own doc says exactly that, and names what it cost —
+/// the hibernate-reactive `reactiveRemove`-fires-twice defect, one
+/// `ArrayLoop.next()` dispatch and two deletes. The fix for THAT added the
+/// resume call this predicate now makes reachable: it was gated on
+/// `can_deopt_resume`, which an optimizing-tier artifact never has, so it could
+/// not fire on the tier the defect actually needs.
+///
+/// # The three refusals
+///
+/// They are what the reconstructed frame genuinely cannot describe, and they
+/// are the same three `try_resume_trapped_callee` makes or the emission side
+/// names:
+///
+/// * an **`ACC_SYNCHRONIZED`** method — the method monitor is not in the frame;
+/// * a body that **takes a monitor at all**. Every `FrameState` `ir_lower`
+///   builds hard-codes `monitors: Vec::new()`, so a resumed frame for such a
+///   body believes it holds no lock. That is also what covers the one thing
+///   `can_deopt_resume` really protected: an elided monitor FORCES the flag
+///   false, so such a body reaches this predicate — and eliding is a codegen
+///   decision, not a bytecode rewrite, so the ops are still there to see;
+/// * a **resume bci past the method's code**.
+///
+/// # Additive by construction
+///
+/// Every caller ORs this beside its existing `can_deopt_resume` arm rather than
+/// replacing it. A backend that SET that flag has already vouched no monitor
+/// was elided, so applying these guards there too would refuse a single-pass
+/// body with an ordinary `synchronized` block that resumes correctly today.
+pub(crate) fn sink_precise_resume_allowed(
+    code: &[u8],
+    code_len: usize,
+    is_synchronized: bool,
+    bci: u32,
+) -> bool {
+    cratonvm_jit::deopt_sink_resume_enabled()
+        && !is_synchronized
+        && !cratonvm_jit::bytecode_holds_monitor(code, code_len)
+        && (bci as usize) < code_len
+}
+
+/// [`sink_precise_resume_allowed`] for a sink holding a `CachedBytecodeMethod`
+/// rather than a raw `Code` attribute.
+///
+/// `cached.code` is `padded_bytecode`, i.e. the real body followed by zero
+/// bytes. That is safe for both readers: `0x00` is `nop`, so the monitor walk
+/// runs off the end finding nothing, and the bci bound is the one
+/// `try_resume_trapped_callee` already applies against the same padded length.
+pub(crate) fn sink_precise_resume_allowed_for(
+    cached: &Arc<CachedBytecodeMethod>,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) -> bool {
+    sink_precise_resume_allowed(
+        &cached.code,
+        cached.code.len(),
+        cached.is_synchronized,
+        rframe.bci,
+    )
+}
+
 /// real-frame-deopt Step 4 — RESUME a real (Object-bearing) deopt at the trapping
 /// bci instead of re-running the whole method from entry (the payoff that kills
 /// the side-effect double-execution).
@@ -2038,7 +2116,14 @@ pub(super) fn real_frame_deopt_resume_and_despeculate(
     // de-spec'd there and never reaches whole-method give-up. The limit mirrors
     // HotSpot's `PerBytecodeTrapLimit`. Skipped for the superseded-artifact
     // sentinel (`bci == u32::MAX`), whose failing site was already counted on the
-    // pre-supersession deopts. Inert in production (this sink is deopt-real-only).
+    // pre-supersession deopts.
+    //
+    // NO LONGER inert in production. This sink was `deopt-real`-only when that
+    // sentence was written; since 2026-09-07 the three `jit_bridge` sinks reach
+    // it through `sink_precise_resume_allowed` too, so per-bci de-spec now fires
+    // on ordinary runs. That is the intended direction — one pathological
+    // speculation site gets suppressed on the next compile and the method stays
+    // compiled, instead of the whole method being given up.
     const PER_BCI_DESPEC_LIMIT: usize = 4;
     if rframe.bci != u32::MAX {
         let bci_deopts = shared
