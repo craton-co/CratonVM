@@ -692,6 +692,94 @@ def leaves(text):
 CLOSURE_BIND = re.compile(r"^\s*let\s+(?:mut\s+)?[a-z_][a-z_0-9]*\s*(?::[^=]*)?=\s*(?:move\s+)?\|")
 
 
+EXITS = re.compile(r"^(?:return\b|continue\b|break\b)")
+
+
+def stmt_depths(body, stmts):
+    """Brace depth at the START and at the END of each statement.
+
+    `statements()` already tore the body apart on `;` and on bare braces, so a
+    block's contents are SEPARATE statements from the `if` that opened it. That
+    is why the returning-arm rule cannot reach this case: there is no single
+    statement to blank. Depth is what recovers the nesting.
+
+    BOTH ends are needed, and the first version had only starts. A statement
+    that is just `}` starts at the INNER depth, so a walk looking for "the
+    depth came back down" never saw the block close and concluded the use was
+    inside it — `native_printstream_flush` kept reporting, matched against a
+    `return`ing block three levels up. The END depth is where a block closes."""
+    depth_at_line, d = [], 0
+    for l in body:
+        depth_at_line.append(d)
+        d += l.count("{") - l.count("}")
+    depth_at_line.append(d)
+    starts, ends = [], []
+    for i, st in enumerate(stmts):
+        a = st.line
+        b = stmts[i + 1].line if i + 1 < len(stmts) else len(body)
+        starts.append(depth_at_line[a] if a < len(depth_at_line) else 0)
+        ends.append(depth_at_line[b] if b < len(depth_at_line) else depth_at_line[-1])
+    return starts, ends
+
+
+def dominates(stmts, depths, k, j):
+    """Does statement `k` run on every path that reaches statement `j`?
+
+    Only one shape is answered NO, and only when it is structurally certain:
+    `k` sits inside a block DEEPER than `j`, that block closes before `j`, and
+    its last statement is an unconditional exit.
+
+        if cond {
+            let s = ctx.create_string(..);   <- k, depth 1
+            return Ok(None);                 <- the block LEAVES
+        }
+        let x = args.get(1);                 <- j, depth 0
+
+    `native_printstream_flush`, `native_class_for_name` and
+    `native_printwriter_write_string` are all this, and all three were reported
+    on a Java re-entry the reporting path cannot reach.
+
+    Everything else answers YES, including a block that merely MIGHT exit — a
+    confident dismissal is the dangerous kind, and this file's own history says
+    so twice."""
+    starts, ends = depths
+    dk, dj = starts[k], starts[j]
+    if dk == 0:
+        return True
+    # Walk OUTWARD from `k`'s own innermost block, one level at a time, asking
+    # each enclosing block whether it exits before `j`. The first version
+    # scanned the whole span from `k` down to `j`'s level in one go, which
+    # swept in SIBLING blocks: `native_printstream_flush`'s allocation sits in
+    # a block that returns, but two later sibling blocks do not, and their last
+    # statement is what the scan found. Only the blocks that CONTAIN `k` decide
+    # whether `k` reaches `j`.
+    # DEPTH ALONE CANNOT COMPARE SIBLINGS. `native_class_for_name`'s allocation
+    # and its use are BOTH at depth 2 — in two different blocks, one of which
+    # returns — so a `dk <= dj` shortcut answered "reaches" on a path that does
+    # not exist. What decides it is whether a block CONTAINING `k` closes
+    # before `j`, at any depth, and whether that block exits.
+    pos, cur = k, dk
+    while cur > 0:
+        m = pos
+        while m < j and ends[m] >= cur:
+            m += 1
+        if m >= j:
+            # This block is still open at the use, so `j` is inside it and `k`
+            # precedes it on the same path.
+            return True
+        last = None
+        for t in range(pos, m + 1):
+            txt = stmts[t].text.strip()
+            if not txt or txt in ("{", "}"):
+                continue
+            if starts[t] >= cur:
+                last = txt
+        if last and EXITS.match(last):
+            return False
+        pos, cur = m, ends[m]
+    return True
+
+
 def gc_capable(text, allocfns):
     if CLOSURE_BIND.match(text):
         return False
@@ -806,6 +894,81 @@ def scan_loops(fn, allocfns):
     return hits
 
 
+# `dominates` DISMISSES, which is the dangerous direction, so it proves itself
+# on every run — both halves. A rule that only demonstrated the dismissal would
+# pass while dismissing everything, and this file's own history records exactly
+# that failure mode ("a rule that dismisses confidently is worse than one that
+# is noisy").
+#
+# Each case is a function body; the assertion names the statement that
+# allocates and the statement that uses, and says whether the first reaches the
+# second.
+DOMINANCE_CASES = [
+    # The block that allocates RETURNS: it cannot reach the later statement.
+    ("if-returns", False, [
+        "fn f(ctx: &mut dyn NativeContext, args: &[Value]) {",
+        "    if let Some(x) = args.first() {",
+        "        let s = ctx.create_string(\"x\");",
+        "        return;",
+        "    }",
+        "    let y = args.get(1);",
+        "}",
+    ]),
+    # The same block WITHOUT the return falls through: it does reach it.
+    ("if-falls-through", True, [
+        "fn f(ctx: &mut dyn NativeContext, args: &[Value]) {",
+        "    if let Some(x) = args.first() {",
+        "        let s = ctx.create_string(\"x\");",
+        "    }",
+        "    let y = args.get(1);",
+        "}",
+    ]),
+    # SIBLING blocks at the SAME depth: the allocation returns, the use is in a
+    # later block. Depth comparison alone answers this one wrong.
+    ("sibling-blocks", False, [
+        "fn f(ctx: &mut dyn NativeContext, args: &[Value]) {",
+        "    if a {",
+        "        let s = ctx.create_string(\"x\");",
+        "        return;",
+        "    }",
+        "    if b {",
+        "        let y = args.get(1);",
+        "    }",
+        "}",
+    ]),
+    # Straight line, no blocks at all: always reaches.
+    ("straight-line", True, [
+        "fn f(ctx: &mut dyn NativeContext, args: &[Value]) {",
+        "    let s = ctx.create_string(\"x\");",
+        "    let y = args.get(1);",
+        "}",
+    ]),
+]
+
+
+def assert_dominance_both_ways():
+    for name, want, body in DOMINANCE_CASES:
+        stmts = statements(body)
+        if stmts and FNDEF.match(stmts[0].text):
+            stmts = stmts[1:]
+        depths = stmt_depths(body, stmts)
+        k = next((i for i, st in enumerate(stmts) if "create_string" in st.text), None)
+        j = next((i for i, st in enumerate(stmts) if "args.get(1)" in st.text), None)
+        if k is None or j is None or not k < j:
+            raise SystemExit(
+                "dominance self-test %r no longer has an alloc before a use — the "
+                "case has rotted and proves nothing" % name)
+        got = dominates(stmts, depths, k, j)
+        if got != want:
+            raise SystemExit(
+                "dominance self-test %r: expected reaches=%s, got %s. `dominates` "
+                "decides whether a reported window can exist; a wrong NO hides a "
+                "real defect." % (name, want, got))
+
+
+assert_dominance_both_ways()
+
+
 def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
     stmts = statements(fn.body)
     # DROP THE SIGNATURE. It reassembles as one statement, and `gc_capable`
@@ -816,6 +979,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
     # reported `this` AFTER the commit that pinned it.
     if stmts and FNDEF.match(stmts[0].text):
         stmts = stmts[1:]
+    depths = stmt_depths(fn.body, stmts)
     hits = []
 
     if want_params:
@@ -825,7 +989,11 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
             params += [(p, "wide") for p in PARAM_OPT.findall(sig)
                        if p not in {n for (n, _) in params}]
         for p, shape in params:
-            gc_at, gc_cond, rooted_elsewhere = None, False, False
+            # CANDIDATES, not "the first one". A GC-capable statement that sits
+            # in a block which returns does not reach the use, so the use has
+            # to pick the first candidate that DOMINATES it rather than being
+            # matched against whichever came first. See [`dominates`].
+            gc_cands, rooted_elsewhere = [], False
             for k, st in enumerate(stmts):
                 t = st.text
                 if ROOT.search(t):
@@ -845,9 +1013,23 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
                     break
                 if REBIND(p).search(t):
                     break
-                if gc_at is None:
+                # USE FIRST, then record. A statement can both allocate
+                # and name the parameter, and it is a USE only against
+                # candidates STRICTLY BEFORE it — its own call's arguments are
+                # evaluated before that call runs, which is this file's
+                # "STATEMENTS, NOT LINES" rule. Recording it afterwards keeps
+                # it available to the statements that follow.
+                use_hit = names(p, t)
+                if use_hit:
+                    gc_at = next((g for g in gc_cands
+                                  if dominates(stmts, depths, g, k)), None)
+                    if gc_at is None:
+                        use_hit = False
+                    else:
+                        gc_cond = branchy(stmts[gc_at].text)
+                if not use_hit:
                     if gc_capable(t, allocfns) and not leaves(t):
-                        gc_at, gc_cond = k, branchy(t)
+                        gc_cands.append(k)
                     continue
                 if names(p, t):
                     # For the `wide` tranche the mention has to REACH a
@@ -890,8 +1072,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
             continue
         if scalar_binding(st.text) and not ref_use(name, "\n".join(fn.body)):
             continue
-        gc_at = None
-        gc_cond = False
+        gc_cands = []
         rooted_elsewhere = False
         for k in range(i + 1, len(stmts)):
             t = stmts[k].text
@@ -915,13 +1096,18 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
                 break
             if REBIND(name).search(t):
                 break
-            if gc_at is None:
-                # A GC on a path that LEAVES does not precede what follows it,
-                # so keep looking rather than latching. This is not a
-                # branch-exclusivity guess: the statements below are reached
-                # only when that branch did not run.
+            # USE FIRST, then record — see the parameter loop above.
+            use_hit = names(name, t)
+            if use_hit:
+                gc_at = next((g for g in gc_cands
+                              if dominates(stmts, depths, g, k)), None)
+                if gc_at is None:
+                    use_hit = False
+                else:
+                    gc_cond = branchy(stmts[gc_at].text)
+            if not use_hit:
                 if gc_capable(t, allocfns) and not leaves(t):
-                    gc_at, gc_cond = k, branchy(t)
+                    gc_cands.append(k)
                 continue
             if names(name, t):
                 kind = "local"
