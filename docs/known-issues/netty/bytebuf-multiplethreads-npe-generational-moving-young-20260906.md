@@ -1018,3 +1018,80 @@ above says that refusal is not conservatism — **the cycles it declines really 
 leave vacated addresses in resumed peers' spill slots.** Any work to restore
 moving-young engagement has to rewrite those slots (or pin, as G1 and ZGC do and
 Cheney structurally cannot), not merely re-prove the frames.
+## 12. Independent LINUX replication of §11, with the control §11 does not have
+
+§11 took the pairing on **Windows** and concluded it is the spill slots, not the
+registers. This is the same question asked independently on **Azure Linux**,
+with a different capture path and a different reporting site, before §11 was
+visible on `dev`. It agrees on every point, and it adds the negative control.
+
+The instrument is now ONE flag with two arms:
+`CRATONVM_DBG_PEER_REG_PAIRING` feeds `gc_quiescence::record_peer_reg` from the
+Windows `imp` (§11) **and**, as of this section, from the Linux `imp`'s
+`scan_slot_with_regions` and `classify_slot_helper_window` — register words with
+their index, stack words as `0xff`, exactly §11's convention. The duplicate
+buffer, flag registration and report this session had built alongside it were
+dropped in favour of §11's, which pairs inside `gen_heap` and names the
+relocated object's class.
+
+### 12.1 The result, `UniqueIpFilterTest`, 8 reps, `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`
+
+| rep | relocating cycles | cycles with stale peer words | stale words |
+|---:|---:|---:|---:|
+| 1 | 53 | **53** | 1003 |
+| 2 | 58 | **58** | 1173 |
+| 3 | 58 | **58** | 1106 |
+| 4 | 51 | **51** | 2604 |
+| 5 | 56 | **56** | 1133 |
+| 6 | 58 | **58** | 1102 |
+| 7 | 59 | **60** | 1124 |
+| 8 | 58 | **58** | 1102 |
+
+**Essentially every relocating cycle leaves stale words in a peer's stack**,
+19–91 per cycle, e.g.
+`tid:4085684 0x782e10739208 -> 0x782df8809948`.
+
+### 12.2 The control §11 does not report
+
+| arm | relocating cycles | peer stack words scanned | stale |
+|---|---:|---:|---:|
+| divert at its shipped default | 0 | 45347 / 42829 / 45336 / 36793 | **0 / 2 / 0 / 0** |
+| `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` | 51–59 | ~50000 | **1003–2604** |
+
+The **same ~40–50k peer stack words are scanned either way**. The stale count is
+zero when nothing relocates and ~1100 when it does. That rules out the reading
+in which the instrument is merely counting words that resemble moved addresses:
+the population is identical and only relocation changes.
+
+### 12.3 Where Linux differs from §11, and it matters for the fix
+
+§11 attributes the capture to a **frozen** peer (`CompiledUninterruptible`,
+taken over at the OS level). On Linux that is not what happens on this workload:
+
+```
+[GC] xt_peer_scan: taken_over=0 xt_roots=0 helper_windows=46 hw_pinned=45 hw_refused=1
+```
+
+**`taken_over=0`** — no thread is ever forcibly frozen here, so
+`stw_take_over_and_wait`'s "frozen peers keep the sweep non-moving" never
+engages. The 46 windows a run are **blocked** peers, and `hw_pinned=45` of them
+are *pinned* — on the collector whose `honours_conservative_pins()` is `false`
+(§10.1). Same defect, reached through the helper-window path rather than the
+takeover path, and the same reason it is unprotected: **the pin is a no-op on a
+Cheney copy.**
+
+The register arm agrees with §11.2 from the other direction: peer registers held
+**0** heap words across ~3200 reads (~190 slots x 17 GPRs) — because a blocked
+peer sits in a native call with C values in its registers and its Java
+references on its stack. §11.2's "zero, on runs including one that crashed" and
+this zero have different causes and the same consequence.
+
+### 12.4 A vacuous first cut, recorded so it is not repeated
+
+The first Linux pairing reported `captured=0` and was **not** read as a negative
+result: with no denominator it cannot distinguish "no peer was scanned" from "a
+peer was scanned through the register loop I did not patch" — there are two, and
+I had patched one. Adding `slots_scanned` and `stack_words` made the zero
+attributable, and the answer then changed sign. A zero from an instrument that
+cannot say what it inspected is not evidence, which is the same lesson §10.9
+records one level up.
