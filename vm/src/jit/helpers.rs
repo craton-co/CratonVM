@@ -4331,28 +4331,56 @@ unsafe fn try_resume_trapped_callee(
     // trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until
     // the per-method deopt count crosses `max_deopts_per_method`, which keeps a
     // backstop if the assumption above is ever wrong.
-    let ir_site_trap = {
-        let h = cratonvm_jit::ir_method_memo_hash(key_class, key_method, key_desc);
-        if cratonvm_jit::ir::method_has_site_trap(h) {
-            cratonvm_jit::ir::note_site_trap_taken();
-            cratonvm_jit::ir_evidence::note_method_refused(h);
-            true
-        } else {
-            false
+    // `first_site_trap` is the whole policy decision. Everything after it is a
+    // REPEAT of a decision already taken, and repeating it is not harmless:
+    // `SpeculationFailed` escalates on the per-method deopt COUNT, so a trapped
+    // site inside a long-running caller drives the method to
+    // `MakeNotCompilable` -- the exact outcome this arm exists to avoid --
+    // purely by being reached often.
+    //
+    // Why "often" is unavoidable here, and why this is the right place to stop
+    // it: eviction and the epoch bump both fire on the first deopt, and
+    // `invalidate_matching` even evicts the direct CALLER transitively. But the
+    // caller may be a single in-flight invocation running a loop -- measured on
+    // `probes/UnresolvedTrapProbe.java`, where one `main` frame calls the
+    // trapped callee 200,000 times through a `CALL` baked into code that is
+    // already executing. Re-binding happens (the tracer shows `main` recompiled
+    // and baking a second callee entry) but the RUNNING frame keeps the old
+    // address, and nothing short of deoptimizing the caller's frame can change
+    // that. `MakeNotEntrant` is an enum variant here with no entry-patching
+    // behind it, so there is no cheap displacement to reach for.
+    //
+    // What IS in reach is not compounding the damage: take the policy decision
+    // once, and let the remaining calls resume in the interpreter -- correct,
+    // and self-correcting the moment that caller frame returns and re-enters
+    // its recompiled self.
+    let h = cratonvm_jit::ir_method_memo_hash(key_class, key_method, key_desc);
+    let ir_site_trap = cratonvm_jit::ir::method_has_site_trap(h);
+    let mut decided = true;
+    if ir_site_trap {
+        cratonvm_jit::ir::note_site_trap_taken();
+        // The memo doubles as the "already decided" flag: it is set exactly
+        // when this method has had its site-trap policy applied.
+        decided = !cratonvm_jit::ir_evidence::method_already_refused(h);
+        cratonvm_jit::ir_evidence::note_method_refused(h);
+        if !decided {
+            cratonvm_jit::ir::note_site_trap_repeat();
         }
-    };
-    DeoptimizationController::deoptimize(
-        vm,
-        key_class,
-        key_method,
-        key_desc,
-        if ir_site_trap {
-            cratonvm_jit::deopt::DeoptReason::SpeculationFailed
-        } else {
-            cratonvm_jit::deopt::DeoptReason::UnreachedCode
-        },
-        bci,
-    );
+    }
+    if decided {
+        DeoptimizationController::deoptimize(
+            vm,
+            key_class,
+            key_method,
+            key_desc,
+            if ir_site_trap {
+                cratonvm_jit::deopt::DeoptReason::SpeculationFailed
+            } else {
+                cratonvm_jit::deopt::DeoptReason::UnreachedCode
+            },
+            bci,
+        );
+    }
 
     // Run the reconstructed frame to completion. The pins stay installed for
     // the duration (they root the reconstructed oops; the pushed frame roots
