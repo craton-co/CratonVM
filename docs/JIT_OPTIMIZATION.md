@@ -3572,3 +3572,80 @@ memory, no guard); the unboxing and `Atomic*` accessors are the largest single
 block but need a header-shape decision — `box_unbox_intrinsic_shape` resolves a
 `value_compact_offset` AND a `value_legacy_offset`, so an IR node for them has
 to pick between two layouts or guard on one.
+
+### netty and IR inlining: the pass rate is clean, and the throughput number could not be taken
+
+`CRATONVM_JIT_IR_INLINE` ships default ON as of this branch, and every number
+justifying that came from H2. The debt this section pays is the one named above:
+"netty and hibernate are where the IR-inlining soak measured 8% and 15–26%, and
+those are the arms that would price item 1 on its own terms."
+
+200 netty test classes on the Azure host, fork-per-class, 4 shards, 180 s
+per-class cap. ONE binary, one lever, three arms — `on`, `off`, and `on` AGAIN,
+because that box is shared and two arms cannot separate an inlining effect from
+the machine getting busier between them.
+
+| arm | `IR_INLINE` | wall | `sum_class_ms` | PASS | FAIL | ABORTED | HANG | `[ir] spliced` |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| on (1st) | 1 | 977 s | 2,279,174 | 111 | 57 | 18 | 2 | 2802 |
+| off | 0 | 1061 s | 2,374,963 | 110 | 57 | 18 | 3 | **0** |
+| on (2nd) | 1 | 1083 s | 2,693,458 | 111 | 57 | 18 | 2 | 2836 |
+
+#### The engagement census, first
+
+`spliced` is 2802 and 2836 on the two `on` arms and **0** on the `off` arm.
+That is what makes the rest of the table readable at all: the lever demonstrably
+moves the thing it names, on this workload, in this binary. A soak without that
+row is not a soak, and netty is exactly the workload where IR inlining has
+something to chew on — 6600 inline-plan sites against H2's handful.
+
+#### The pass rate: no regression
+
+Across 200 classes the `on` and `off` arms differ in **exactly one class**:
+
+```
+only in the INLINE=1 arm:  io.netty.buffer.AdaptiveByteBufAllocatorGrowthTest ok=400 failed=0
+only in the INLINE=0 arm:  (none)
+```
+
+Every other class reports identical `ok=` and `failed=`. `FAIL=57`,
+`ABORTED=18` and `NOTESTS=12` are byte-identical in all three arms, and the two
+`on` arms agree exactly (111/57/18/2/12). The one class that differs completed
+400 tests with inlining and hit the flat 180 s cap without it — which is a
+HANG-vs-PASS at a timeout on a host under load 10–20, not a demonstration that
+inlining rescued it.
+
+**So the default-ON flip does not regress netty.** That is the claim worth
+making and it is the one the run supports.
+
+#### The throughput number: NOT measured, and not reported as if it were
+
+The naive reading of the table is that `on` beats `off` by 7.9% on wall and 4.0%
+on `sum_class_ms`, comfortably in line with the 8% this section owed. That
+reading is wrong, and the third arm is what says so:
+
+* wall: the two IDENTICAL arms are 977 s and 1083 s — **10.8% apart**, against a
+  7.9% on-vs-off difference.
+* `sum_class_ms`: 2,279,174 and 2,693,458 — **18% apart**, against 4.0%.
+
+**The control disagrees with itself by more than the effect**, in both
+instruments, so no throughput conclusion is available. Host load ran between
+2 and 21 over the three arms (another session was building with `-j 6`
+throughout), and the arms are necessarily sequential because the harness is
+fork-per-class rather than interleaved.
+
+This is the third time in this document that rule has fired — the acceptance
+gate's discarded run, the over-intrinsic run 2, and now this one. It keeps
+firing because the tempting number and the invalid control arrive together: had
+the third arm been skipped, this section would have reported "8% confirmed on
+netty" and been believed.
+
+What it would take to price it properly: a quiet host, or an interleaved harness
+that alternates the lever per CLASS rather than per run so drift cancels
+pairwise. The per-class `@@RESULT ms=` values make the second one cheap to
+build, and that is the right next step for anyone who wants the number rather
+than the pass rate.
+
+hibernate-reactive was not run. The netty arm alone took ~50 minutes of host
+time in a three-arm shape, and a second suite would have added nothing the
+control did not already invalidate.
