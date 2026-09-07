@@ -6,7 +6,7 @@
 | **Scope** | `-XX:+UseGenerationalGC` **and** `--gpu` **and** the JIT **and** an offload that actually happens. ZGC, G1, `--nojit`, and `--gpu` with the threshold raised out of reach all pass. |
 | **Reproducer** | one local fixture, ~10 seconds |
 | **Found** | 2026-09-06, while re-verifying the battery for two unrelated GPU pages |
-| **Probably** | the same open defect as [the Generational non-moving young sweep zeroing a live `FileChannelImpl`](../springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md) — see "Why this is probably not a new defect", and the one thing that does not fit |
+| **Probably** | the same open defect as [the Generational young sweep freeing an interpreter-held object](../springboot/generational-young-sweep-frees-an-interpreter-held-object-20260906.md) — see "Why this is probably not a new defect", and the one thing that does not fit |
 
 ## The defect
 
@@ -112,7 +112,7 @@ array-writing method is compiled.
 ## Why this is probably not a new defect
 
 Every scope line matches the OPEN page
-[`generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md`](../springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md):
+[`generational-young-sweep-frees-an-interpreter-held-object-20260906.md`](../springboot/generational-young-sweep-frees-an-interpreter-held-object-20260906.md):
 Generational with the JIT on fails; HotSpot, ZGC and Generational `--nojit` all
 pass; and the mechanism it names is the non-moving young sweep reclaiming an
 object whose only reference "was a register/native-stack root the marker
