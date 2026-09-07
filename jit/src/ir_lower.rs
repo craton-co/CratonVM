@@ -2748,7 +2748,7 @@ impl<'a> Lowerer<'a> {
                 // and the loop's `quickOffset && offset > 0` arm dropped result
                 // rows as if the query had an OFFSET clause -- H2 window and
                 // GROUP BY queries returning 3 rows of 5. See
-                // `known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
+                // `internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`.
                 //
                 // A DEFERRED phi is exempt and must stay exempt: `emit_copy_op`
                 // keeps its home store precisely so this loop can read it.

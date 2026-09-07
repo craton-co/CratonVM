@@ -14,7 +14,7 @@
 > `groupData.is_some()` delegation check below was independently re-verified
 > correct at this exact 1100-row scale via a Hibernate-free JDBC probe. This is a
 > newly discovered, unrelated JIT-warm-up-dependent defect — see
-> `docs/known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
+> `docs/internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`.
 
 One CratonVM defect. It was filed as **seven separate OPEN docs** in
 `docs/known-issues/hibernate/`, several of which correctly suspected a single shared
