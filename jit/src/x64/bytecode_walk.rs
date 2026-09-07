@@ -6467,8 +6467,11 @@ impl Compiler {
                         // SAFETY: `invoke_info` owns every pointer it hands
                         // out for the life of this compile.
                         let info = unsafe { &*(ip as *const crate::JitInvokeInfo) };
+                        // `keeps_dispatch_helper`, not `is_kernel`: inlining is
+                        // one-way, and a registry miss can mean "could not have
+                        // known yet". See its AUDIT 2026-09-07 note.
                         info.invoke_kind == 3
-                            && crate::offload_hook::is_kernel(
+                            && crate::offload_hook::keeps_dispatch_helper(
                                 info.class_name,
                                 info.method_name,
                                 info.descriptor,
