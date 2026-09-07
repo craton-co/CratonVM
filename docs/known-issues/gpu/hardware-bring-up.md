@@ -23,7 +23,7 @@ Enrolment (step 5) is still not done.
 | GPU | any CUDA device the driver enumerates; the gates are correctness-and-checksum, not throughput-tiered |
 | CUDA | **12.6** — `cudarc` is pinned `features = ["driver", "cuda-12060"]` in `../../../cuda-bridge/Cargo.toml` |
 | JDK | a real JDK 21+ (`JDK=…`); HotSpot from the same JDK is the differential oracle |
-| `GPU_JAR` | **the `craton-gpu` annotations jar, which is NOT in this repository.** Several bench scripts open with `GPU_JAR="${GPU_JAR:?set GPU_JAR to the craton-gpu annotations jar}"`. The `craton.gpu` API classes (`GpuExecutor`, `GpuFuture`, …) live in that jar — `find` for `GpuExecutor.java` in this tree returns nothing, which has misled at least one investigation into concluding the API did not exist. |
+| `GPU_JAR` | **the annotations jar, which is NOT in this repository.** Several bench scripts open with `GPU_JAR="${GPU_JAR:?set GPU_JAR to the craton-gpu annotations jar}"`. The `craton.gpu` API classes (`GpuExecutor`, `GpuFuture`, …) live in the [gpu4j](https://github.com/craton-co/gpu4j) repo and its `gpu4j-core` jar — `find` for `GpuExecutor.java` in this tree returns nothing, which has misled at least one investigation into concluding the API did not exist. (The Java *package* is still `craton.gpu`: CratonVM's native registry binds it by exact name, so the 2026-09-06 rename changed the repo and the artefacts but not the packages.) |
 
 ### Which backend
 
