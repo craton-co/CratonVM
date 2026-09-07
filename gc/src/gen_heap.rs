@@ -19972,10 +19972,6 @@ pub enum ZeroRunVerdict {
 /// Refusals by [`ZeroRunVerdict`], index = discriminant order minus the
 /// accepting variant: `0` Misaligned, `1` LiveInside, `2` ImplausibleNext.
 /// Printed beside the chunk-bail split; see `PAR_CHUNK_BAILS`.
-///
-/// `[1]` is now always ZERO by construction: a live base inside the run is
-/// resumed AT rather than refused (see `zero_run_verdict`). It is kept, rather
-/// than removed, because a nonzero reading would mean that path had come back.
 /// Entries to each young from-space walk that still treats an all-zero run as
 /// a desync (the five `zero_run_end` callers left over after the 2026-08-13
 /// work). A zero anomaly count means one of two opposite things — the walk ran
@@ -20020,13 +20016,6 @@ pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
 pub static ZERO_RUN_REFUSALS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Zero runs the walk stepped over by resuming at a LIVE base inside them,
-/// instead of refusing and unwinding the cycle's reclaim decisions. This is an
-/// ACCEPTANCE, so it is deliberately not an entry in [`ZERO_RUN_REFUSALS`] —
-/// counting it there would have printed it under a `refusals=` label and made
-/// the fix look like the defect it removes.
-pub static ZERO_RUN_LIVE_RESUMES: AtomicU64 = AtomicU64::new(0);
-
 fn zero_run_verdict(
     base: usize,
     cursor: usize,
@@ -20069,43 +20058,13 @@ fn zero_run_verdict(
         ZERO_RUN_REFUSALS[0].fetch_add(1, Ordering::Relaxed);
         return ZeroRunVerdict::Misaligned;
     }
-    // A marked base strictly inside `(cursor, run_end)` used to end this
-    // predicate: the run was declared `LiveInside` and the caller unwound every
-    // reclaim decision taken since the last anchor.
-    //
-    // **Resume AT that base instead.** It comes from `side_sorted`, this
-    // collection's live set, so it is a marked object BASE by construction —
-    // the one thing in the arena that is on-grid without having to be
-    // rediscovered. Landing the cursor there is therefore at least as safe as
-    // the `resume: run_end` this function already returns, which lands on an
-    // address proved only by the next header parsing plausibly. The span
-    // `[cursor, live)` is stepped over and RETAINED, exactly as an accepted
-    // empty run is — over-retention, never a free — and the decisions already
-    // collected survive.
-    //
-    // Measured on `ChurnLoop` (125k field-less `new Object()` a round,
-    // `System.gc()` each round, `-XX:+UseGenerationalGC`): every zero-run
-    // refusal was this one — `misaligned=0 live_inside=17 implausible_next=0`
-    // against `zero_empty_runs=144` accepted — and each refusal discarded the
-    // cycle's whole reclamation (`dead_pushed=294`, `unwound_entries=295`,
-    // `dead_regions_final=0`, `bytes_swept=0`). A field-less object is wholly
-    // zero (`MARK_NEUTRAL`, `ObjectKind::Object` and
-    // `ArrayElementType::Reference` are all 0, per the note above), so a run of
-    // them is indistinguishable from free space by content; interleave one live
-    // object and the whole cycle reclaimed nothing. See
-    // `known-issues/h2/testvaluememory-every-value-measures-zero-20260904.md`.
-    //
-    // The FIRST base above `cursor` is the resume point, not the last one below
-    // `run_end`: resuming at the last would step over any live objects between
-    // them, and those are exactly the objects the walk must visit.
+    // No marked base strictly inside `(cursor, run_end)`. `side_sorted` is
+    // ascending, so the only candidate is the last entry below `run_end`.
     let hi = base + run_end;
     let i = side_sorted.partition_point(|&a| a < hi);
-    let j = side_sorted.partition_point(|&a| a <= base + cursor);
-    if j < i {
-        ZERO_RUN_LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
-        let live = side_sorted[j];
-        debug_assert!(live > base + cursor && live < hi);
-        return ZeroRunVerdict::EmptyObjects { resume: live - base };
+    if i > 0 && side_sorted[i - 1] > base + cursor {
+        ZERO_RUN_REFUSALS[1].fetch_add(1, Ordering::Relaxed);
+        return ZeroRunVerdict::LiveInside;
     }
     if run_end >= used {
         return ZeroRunVerdict::EmptyObjects { resume: run_end };

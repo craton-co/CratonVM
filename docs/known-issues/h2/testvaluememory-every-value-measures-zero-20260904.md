@@ -402,28 +402,54 @@ Measured, same binary and probe:
 open.** That is the honest reading: the unwind was real and is gone, but it was
 not the whole cause.
 
-### What is left, and the hazard in it
+### THE CHANGE WAS REVERTED. A guard test says it is unsafe, and the test is right
 
-The accepted empty-object run is **stepped over and RETAINED**, by design —
-`cursor = resume; continue;` frees nothing. The churn is ~2.88 MB a round of
-exactly that shape, so retaining it is the remaining 2.05 MB.
+The numbers above were real, and the change is still **not on dev**. There is a
+test written specifically to forbid it:
 
-Reclaiming those runs is the rest of the fix, and it is not a one-liner:
+```rust
+/// A marked object starting INSIDE the run means the run is not a sequence
+/// of whole dead objects — the walk is somewhere it should not be.
+#[test]
+fn a_live_base_inside_the_run_is_still_a_desync() { ... }
+```
 
-* the span is bounded below by `cursor`, which is on-grid, and above by a marked
-  live base — no live base lies strictly between, which the predicate checks;
-* but a live object may START exactly at `cursor` and extend into the run. The
-  check is `side_sorted[j] > base + cursor`, strictly greater, so a live base AT
-  `cursor` is not "inside" — and freeing from `cursor` would free that live
-  object. A field-less live object is itself wholly zero, so this is not a
-  hypothetical shape;
-* `!vouched_live` at the call site rules out the run being inside a vouched live
-  object, which is a different guarantee from the one above.
+It failed, and its rationale is the thing this investigation had not accounted
+for. **The unwind is not about the zero run itself. It is about the STRIDES
+SINCE THE LAST ANCHOR.** A zero run is evidence that one of those strides was
+mis-sized; if it was, every reclaim decision taken in that stretch was computed
+off-grid and may name live memory. Discarding them is what makes a mis-sized
+stride cost retention instead of corruption.
 
-So the reclaim must start after any live base at `cursor`, and wants its own
-guard (`live_in_dead` already exists and is the right tripwire). "Over-retention
-is always safe" is why the current code retains; trading that for a free is the
-one change here that can corrupt a heap rather than grow one.
+Resuming at the live base preserves those decisions. That is precisely what the
+unwind exists to prevent, and no measurement in this page establishes that the
+strides were sound — only that the *run* is explicable. Trading "always safe" for
+"safe on the evidence I happened to collect" is the one change in this area that
+can corrupt a heap rather than grow one, and it does not even close the leak
+(2.88 -> 2.05 MB a round). It was reverted for both reasons; the diagnosis below
+is what survives.
+
+### What a SAFE version would have to establish
+
+The open question is whether a live base inside the run is evidence of a desync
+or an ordinary live EMPTY object — because a field-less live object is itself
+wholly zero, so both readings fit the bytes. A discriminator the current code
+does not use:
+
+* **is the live base on the grid `cursor` implies?** `(live - (base + cursor)) %
+  HEADER_SIZE == 0` says the run is a whole number of slots followed by that
+  object, which is consistent with the empty-object reading and inconsistent
+  with a mis-sized stride. Off-grid, the desync verdict is simply correct.
+
+That alignment test would let the empty-object case through while leaving the
+guard's actual subject — the suspect strides — refused. It is a hypothesis, not
+a result: nothing here has measured how often the two cases occur, and the guard
+test above is the thing any attempt must satisfy rather than edit.
+
+Reclaiming the runs rather than stepping over them is a separate and larger
+step, with its own hazard: a live object may START exactly at `cursor` and
+extend into the run (the inside-check is strictly greater than `cursor`), and
+freeing from `cursor` would free it.
 
 ### The two candidate fixes, and which is which
 
