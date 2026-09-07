@@ -410,6 +410,9 @@ fn open_and_register(
     if io_flags().dbg_jar {
         eprintln!("[JAR] open handle={handle} table_len={table_len} path={validated_path:?}");
     }
+    // GC: `create_string` allocates and the store that follows goes through
+    // `this`.
+    let pin = ctx.pin_native_root(this);
     set_jar_handle(ctx, this, handle);
     // Recovery key for `get_jar_handle` when the object has no writable handle
     // slot (plain ZipFile): map its identity hash → handle.
@@ -418,7 +421,9 @@ fn open_and_register(
     }
     // Also store the name on the parent ZipFile's `name` field if present.
     let name_str = ctx.create_string(path_str);
+    let this = ctx.read_native_pin(pin, this);
     ctx.set_field_by_name(this, "name", Value::Object(Some(name_str)));
+    ctx.unpin_native_roots(pin);
     Ok(None)
 }
 
