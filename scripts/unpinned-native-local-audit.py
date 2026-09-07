@@ -166,6 +166,36 @@ REF_RHS = re.compile(
 )
 
 
+# An `invoke_*` RHS can bind a SCALAR just as easily as a reference, and the
+# `invoke` branch of REF_RHS admitted both. Seven of the twelve false positives
+# in the `native-io` local tranche were this: `let limit = match
+# ctx.invoke_virtual(target, "limit", "()I", ..) { Ok(Some(Value::Int(v))) => v,
+# .. }` is an `i32`, and `let flushed = ctx.invoke_virtual(..).map(|_| ())` is a
+# `Result<(), _>`.
+#
+# The discriminator is what the binding DESTRUCTURES. A statement that names a
+# scalar `Value` variant and never names `Value::Object` cannot be binding a
+# reference. A statement that names NEITHER (`ctx.invoke(..).ok().flatten()`)
+# is left alone deliberately — that shape was a real defect in the positive
+# control and no use-site test can see it.
+# Match the DESTRUCTURING ARM, not any occurrence of a `Value` variant: the
+# call's own arguments routinely carry `Value::Object(Some(buf))`, which made a
+# whole-statement test useless — `let n = match ctx.invoke_virtual(inner,
+# "read", "([BII)I", &[Value::Object(Some(buf)), ..]) { Ok(Some(Value::Int(n)))
+# => n, .. }` binds an `i32` and mentions `Value::Object` in the same breath.
+SCALAR_BIND = re.compile(
+    r"(?:Ok\s*\(\s*)?Some\s*\(\s*"
+    r"Value::(?:Int|Long|Float|Double|Char|Short|Byte|Boolean)\s*\([a-z_][a-z_0-9]*\)"
+    r"\s*\)\s*\)?\s*(?:if[^=]*)?=>"
+    r"|\.map\s*\(\s*\|_\|\s*\(\s*\)\s*\)"
+)
+REF_BIND = re.compile(r"(?:Ok\s*\(\s*)?Some\s*\(\s*Value::Object")
+
+
+def scalar_binding(text):
+    return SCALAR_BIND.search(text) is not None and REF_BIND.search(text) is None
+
+
 def ref_use(name, text):
     n = re.escape(name)
     return re.search(
@@ -181,6 +211,15 @@ def ref_use(name, text):
         r"|\b" + n + r"\s*\.\s*as_ptr\s*\(",
         text,
     ) is not None
+
+
+def names(name, text):
+    """Does `text` name this binding — as itself, not as someone's FIELD?
+
+    `process_scan_exception` binds a local `detail` and later builds an error
+    from `err.detail`, a Rust struct field of a completely different value. A
+    bare word-boundary match read that as a use of the local."""
+    return re.search(r"(?<![.\w])" + re.escape(name) + r"\b", text) is not None
 
 
 def REBIND(name):
@@ -263,6 +302,18 @@ def strip_comments(lines):
     return out
 
 
+def is_test_file(lines):
+    """A whole file gated by an INNER `#![cfg(test)]`.
+
+    `test_spans` only recognises the OUTER attribute forms, so
+    `native-io/src/test_support.rs` — a mock `NativeContext` whose whole point
+    is that it has no GC — was scanned as production code and reported."""
+    for l in lines[:40]:
+        if l.strip().startswith("#![cfg(test)]"):
+            return True
+    return False
+
+
 def test_spans(lines):
     """Line ranges under `#[cfg(test)]` / `mod tests` / `#[test]`.
 
@@ -317,6 +368,7 @@ def index(paths):
         raw = io.open(f, encoding="utf-8", errors="replace", newline="").read().split("\n")
         lines = strip_comments(raw)
         tspans = test_spans(lines)
+        whole_file_is_test = is_test_file(lines)
         idx = [i for i, l in enumerate(lines) if FNDEF.match(l)]
         ends = {i: fn_end(lines, i) for i in idx}
         for i in idx:
@@ -328,7 +380,7 @@ def index(paths):
                 if i < k <= ends[i]:
                     for m in range(k - i, min(ends[k] + 1, ends[i] + 1) - i):
                         body[m] = ""
-            is_test = any(a <= i <= b for (a, b) in tspans)
+            is_test = whole_file_is_test or any(a <= i <= b for (a, b) in tspans)
             fns.append(Fn(FNDEF.match(lines[i]).group(1), f, i + 1, body, is_test))
     return fns
 
@@ -425,7 +477,7 @@ def gc_capable(text, allocfns):
     return False
 
 
-def scan(fn, allocfns, want_params, want_opt=False):
+def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
     stmts = statements(fn.body)
     # DROP THE SIGNATURE. It reassembles as one statement, and `gc_capable`
     # reads the function's OWN NAME in it as a call — so every recursive-looking
@@ -439,11 +491,11 @@ def scan(fn, allocfns, want_params, want_opt=False):
 
     if want_params:
         sig = signature(fn)
-        names = [(p, "param") for p in PARAM_REF.findall(sig)]
+        params = [(p, "param") for p in PARAM_REF.findall(sig)]
         if want_opt:
-            names += [(p, "wide") for p in PARAM_OPT.findall(sig)
-                      if p not in {n for (n, _) in names}]
-        for p, shape in names:
+            params += [(p, "wide") for p in PARAM_OPT.findall(sig)
+                       if p not in {n for (n, _) in params}]
+        for p, shape in params:
             gc_at, gc_cond, rooted_elsewhere = None, False, False
             for k, st in enumerate(stmts):
                 t = st.text
@@ -468,7 +520,7 @@ def scan(fn, allocfns, want_params, want_opt=False):
                     if gc_capable(t, allocfns):
                         gc_at, gc_cond = k, branchy(t)
                     continue
-                if re.search(r"\b" + re.escape(p) + r"\b", t):
+                if names(p, t):
                     kind = shape
                     if gc_cond:
                         kind += "~"
@@ -485,7 +537,14 @@ def scan(fn, allocfns, want_params, want_opt=False):
         name = m.group(1)
         if name == "_":
             continue
-        if not gc_capable(st.text, allocfns):
+        # DEFAULT: the binding's own RHS must be GC-capable. That is not the
+        # defect's definition — it is a proxy for "this local names a fresh
+        # object" — and it costs real recall: `fd_obj` in the pre-fix
+        # `native_fcimpl_open`, bound by `match args.first()`, is one of the
+        # seven references that fix had to root, and this line is why the rule
+        # reports six. `--any-binding` drops the requirement; the type filter
+        # below still applies.
+        if not any_binding and not gc_capable(st.text, allocfns):
             continue
         # A binding whose RHS ROOTS something is a HANDLE (an opaque slot), not
         # an `ObjectRef`. Handles are exactly what cannot go stale — that is the
@@ -494,7 +553,10 @@ def scan(fn, allocfns, want_params, want_opt=False):
             continue
         if not REF_RHS.search(st.text) and not ref_use(name, "\n".join(fn.body)):
             continue
+        if scalar_binding(st.text) and not ref_use(name, "\n".join(fn.body)):
+            continue
         gc_at = None
+        gc_cond = False
         rooted_elsewhere = False
         for k in range(i + 1, len(stmts)):
             t = stmts[k].text
@@ -520,10 +582,14 @@ def scan(fn, allocfns, want_params, want_opt=False):
                 break
             if gc_at is None:
                 if gc_capable(t, allocfns):
-                    gc_at = k
+                    gc_at, gc_cond = k, branchy(t)
                 continue
-            if re.search(r"\b" + re.escape(name) + r"\b", t):
-                kind = "local*" if rooted_elsewhere else "local"
+            if names(name, t):
+                kind = "local"
+                if gc_cond:
+                    kind += "~"
+                if rooted_elsewhere:
+                    kind += "*"
                 hits.append((fn.line + st.line, name, fn.line + stmts[k].line, kind))
                 break
     return hits
@@ -536,6 +602,8 @@ def main():
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--tests", action="store_true", help="include test bodies")
     ap.add_argument("--only", default=None)
+    ap.add_argument("--any-binding", action="store_true", dest="any_binding",
+                    help="rule 1: do not require the BINDING statement to be GC-capable")
     ap.add_argument("--opt", action="store_true",
                     help="also scan Option<ObjectRef> / &[Value] / Value parameters")
     a = ap.parse_args()
@@ -548,7 +616,7 @@ def main():
             continue
         if a.only and fn.name != a.only:
             continue
-        for (ln, nm, use, kind) in scan(fn, allocfns, True, a.opt):
+        for (ln, nm, use, kind) in scan(fn, allocfns, True, a.opt, a.any_binding):
             rows.append((os.path.basename(fn.file), ln, fn.name, nm, use, kind))
     per = collections.Counter(r[0] for r in rows)
     print("functions indexed: %d (test bodies skipped: %d) ; reachable-allocating: %d"

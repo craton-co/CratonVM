@@ -2493,14 +2493,22 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .ok_or_else(|| ioex("socket: could not allocate Socket"))?;
     // Safety net: the bare Socket skipped <init>, so seed `socketLock` with a
     // live monitor object so any `synchronized (socketLock)` method doesn't NPE.
+    //
+    // GC: the monitor's own allocation can move `sock`, which is then both
+    // stored through and returned.
+    let sock_pin = ctx.pin_native_root(sock);
+    let mut sock = sock;
     if !matches!(
         ctx.get_field_by_name(sock, "socketLock"),
         Value::Object(Some(_))
     ) {
         if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            sock = ctx.read_native_pin(sock_pin, sock);
             ctx.set_field_by_name(sock, "socketLock", Value::Object(Some(lock)));
         }
     }
+    sock = ctx.read_native_pin(sock_pin, sock);
+    ctx.unpin_native_roots(sock_pin);
     Ok(Some(Value::Object(Some(sock))))
 }
 
@@ -5648,7 +5656,12 @@ fn ssc_accept_impl(
     cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
     cf_set(ctx, child, F_CONNECTED, Value::Int(1));
     cf_set(ctx, child, F_LOCAL_PORT, Value::Int(local_port));
+    // GC: `create_string` allocates, and `child` is stored through and then
+    // returned to the acceptor.
+    let child_pin = ctx.pin_native_root(child);
     let host_str = ctx.create_string(&peer.ip().to_string());
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.unpin_native_roots(child_pin);
     cf_set(ctx, child, F_REMOTE, Value::Object(Some(host_str)));
     cf_set(ctx, child, F_REMOTE_PORT, Value::Int(peer.port() as i32));
 
@@ -5793,7 +5806,12 @@ fn ssc_accept_unix(
     cf_set(ctx, child, F_CONNECTED, Value::Int(1));
     cf_set(ctx, child, F_LOCAL_PORT, Value::Int(0));
     cf_set(ctx, child, F_FAMILY, Value::Int(FAMILY_UNIX));
+    // GC: as in the TCP twin — `create_string` allocates and `child` is stored
+    // through and returned afterwards.
+    let child_pin = ctx.pin_native_root(child);
     let path_str = ctx.create_string(&path);
+    let child = ctx.read_native_pin(child_pin, child);
+    ctx.unpin_native_roots(child_pin);
     cf_set(ctx, child, F_UDS_PATH, Value::Object(Some(path_str)));
 
     Ok(Some(Value::Object(Some(child))))
