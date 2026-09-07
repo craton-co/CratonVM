@@ -17809,7 +17809,9 @@ pub(crate) fn native_class_get_type_parameters(
     // the `build_mirror_array` contract.
     let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
     let arr_pin = ctx.pin_native_root(arr);
+    let this_pin = ctx.pin_native_root(this);
     for (i, tp) in class_sig.type_params.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
         // `Class.getTypeParameters()` must return the SAME TypeVariable
         // objects across repeated calls, exactly like HotSpot's
         // `Class.getGenericInfo()` soft-reference cache. Building a fresh
@@ -18342,7 +18344,9 @@ pub(crate) fn native_method_get_type_parameters(
                 // allocating-fill pattern as `native_class_get_type_parameters`.
                 let mut arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
                 let arr_pin = ctx.pin_native_root(arr);
+                let this_pin = ctx.pin_native_root(this);
                 for (i, tp) in method_sig.type_params.iter().enumerate() {
+                    let this = ctx.read_native_pin(this_pin, this);
                     // genericDeclaration = the declaring Method/Constructor (`this`).
                     let tv =
                         crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));

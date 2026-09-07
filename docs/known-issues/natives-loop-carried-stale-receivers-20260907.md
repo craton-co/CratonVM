@@ -134,6 +134,64 @@ them (7 vs 6 SIGSEGVs in 10). Fixing a loop-carried stale receiver is right
 whether or not a workload currently reaches it; it is not a claim that the 123
 are live bugs.
 
+## Swept 2026-09-07: 52 sites pinned and re-read
+
+| crate | before | after |
+|---|---:|---:|
+| `native-builtins` | 63 | **27** |
+| `native-collections` | 16 | **2** |
+
+The insertion is uniform — `let X_pin = ctx.pin_native_root(X);` before the
+loop and `let X = ctx.read_native_pin(X_pin, X);` as the first statement of the
+body, so the re-read SHADOWS inside the body and the outer binding is
+untouched. No unpin: every function it was allowed to touch is reached from a
+native entry point, and `safe_native_call` truncates the pin stack to its entry
+floor on return.
+
+**The tool decides nothing.** It emits those two lines; every exclusion is a
+hand-written list, and four of them were written by reading a compiler error
+rather than the source:
+
+* **6 rows the compiler rejected** — the binding is declared INSIDE the loop
+  (a pin before it is out of scope), or the name is not an `ObjectRef` at all
+  (`generic_type_mirrors` is a `Vec`).
+* **`let mut` where the body needs it** — an immutable shadow makes both
+  `this = ..` and `&mut this` a compile error. Read off the body text.
+* **Two names sharing one loop interleaved** and put one re-read OUTSIDE the
+  body. One insertion pass per loop anchor fixed it.
+* **`rooted_across(ctx, &mut [&mut x, ..], |ctx| ..)` is already the correct
+  fix** and the rule would have applied a second on top — the exact damage the
+  `native-io` page names ("a rule that cannot see a correct fix will fix it
+  again"). Those loops are skipped.
+
+### The 29 survivors, by cause
+
+| cause | rows |
+|---|---:|
+| the binding is inside the loop, or is not an `ObjectRef` | 6 |
+| `rooted_across` — already correct | 2 |
+| a `macro_rules` body (`register_s2_bytebuffer`) | 3 |
+| the pin is handed to the callee beside the name | 3 |
+| rebound every iteration (`pd_gather_*`) | 4 |
+| receiver is already `&mut ObjectRef`, or already re-read | 4 |
+| refresh via `end_blocking_region_refs` (through an array) | 1 |
+| helper whose `ctx` is `&dyn`, so it cannot pin | 2 |
+| already pinned elsewhere in the function | 4 |
+
+None is a defect left standing; each is named so the next reader does not
+re-derive it.
+
+### Gates
+
+`cargo test -p cratonvm-native-builtins -p cratonvm-native-collections` —
+**4214 passed, 0 failed** plus every integration target. `cargo check` clean on
+BOTH the default features and `--features synthetic-jdk` (two of the fixed
+functions are `cfg`-gated behind it and are not type-checked at all without
+it). `regression-suite/run.sh` **92 of 92**.
+
+Still no dynamic proof, as above: this is a sweep of a shape with one proven
+instance, not 52 observed failures.
+
 ## Next
 
 * Read the 103 `native-builtins` rows. The mechanical

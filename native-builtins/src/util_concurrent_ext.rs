@@ -3763,7 +3763,9 @@ pub(crate) fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let tid = ctx.thread_id() as i64;
     let key = rl_key(ctx, this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         // Atomically claim (or reentrantly re-claim) the lock under the
         // side-table mutex. `claimed` is true iff this call now holds it.
         let claimed = rl_with(key, |st| {
@@ -3893,7 +3895,9 @@ pub(crate) fn native_rl_try_lock_timeout(
     }
     let key = rl_key(ctx, this);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         let claimed = rl_with(key, |st| {
             if st.owner == RL_UNOWNED || st.owner == tid {
                 st.owner = tid;
@@ -4620,7 +4624,9 @@ fn sem_acquire_blocking(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) ->
     // Install the holder up-front (re-binding `this` across the possible
     // allocation) so no allocation happens inside the monitor section.
     let mut this = sem_prepare(ctx, this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let mut this = ctx.read_native_pin(this_pin, this);
         // GC-SAFEPOINT FIX (STW cross-thread JIT-takeover barrier deadlock,
         // same class as native_cdl_await's fix in commit 51a508e1): a raw
         // `ctx.monitor_enter` never marks this thread GC-blocked, so a
@@ -5475,7 +5481,9 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ord).max(0) as u64;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         let done = match ctx.get_field(this, FUT_FIELD_DONE) {
             Value::Int(d) => d,
             _ => 0,

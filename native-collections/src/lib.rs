@@ -6642,7 +6642,9 @@ fn collect_via_real_iterator(
         Ok(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
+    let it_pin = ctx.pin_native_root(it);
     loop {
+        let it = ctx.read_native_pin(it_pin, it);
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
             Err(e) => return Err(e),
@@ -8752,7 +8754,9 @@ fn native_sli_for_each_remaining(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Bounded by the size read at entry, re-read each round: the consumer can
     // legally mutate nothing here, but a shrinking view must end the loop
     // rather than index past it.
+    let consumer_pin = ctx.pin_native_root(consumer);
     loop {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
         let Some((view, cursor, _)) = sli_state(&*ctx, this) else {
             return Ok(None);
         };
@@ -18506,7 +18510,9 @@ pub fn make_hashset_with_elements(
             let mut existing_head = ctx.get_array_element(buckets, idx);
             let mut dup = false;
             let mut probe = existing_head;
+            let key_obj_pin = ctx.pin_native_root(key_obj);
             while let Value::Object(Some(probe_obj)) = probe {
+                let key_obj = ctx.read_native_pin(key_obj_pin, key_obj);
                 let probe_hash = match ctx.get_field(probe_obj, n_hash) {
                     Value::Int(hash) => hash,
                     _ => 0,
@@ -38768,7 +38774,9 @@ fn native_hashmap_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         &[Value::Object(Some(oos)), Value::Int(size)],
     )?;
     // internalWriteEntries: key then value for each mapping.
+    let oos_pin = ctx.pin_native_root(oos);
     for (key, value) in entries {
+        let oos = ctx.read_native_pin(oos_pin, oos);
         ctx.invoke(
             oos_cls,
             "writeObject",
@@ -51589,7 +51597,9 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this_out: &mut ObjectRe
     // Now insert each entry through the array path. The fast-mode check
     // in `native_tm_put` will skip because `tm_force_array_set` is set
     // before we get here (caller's responsibility).
+    let this_pin = ctx.pin_native_root(this);
     for (k, v) in boxed {
+        let this = ctx.read_native_pin(this_pin, this);
         let _ = native_tm_put(ctx, &[Value::Object(Some(this)), k, v]);
     }
     *this_out = this;
@@ -56417,7 +56427,11 @@ fn native_ts_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ts_install_backing_array(ctx, this, (size as usize).max(TS_DEFAULT_CAPACITY));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, comparator);
+    let ois_pin = ctx.pin_native_root(ois);
+    let this_pin = ctx.pin_native_root(this);
     for _ in 0..size {
+        let ois = ctx.read_native_pin(ois_pin, ois);
+        let this = ctx.read_native_pin(this_pin, this);
         let e = ctx
             .invoke(
                 ois_cls,
@@ -64693,7 +64707,9 @@ fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // text rather than dispatching back to JDK Properties for parity —
     // the previous implementation silently truncated/corrupted any
     // real-world `.properties` file with escapes or continuations.
+    let this_pin = ctx.pin_native_root(this);
     for (key, value) in props_parse_logical_lines(&text) {
+        let this = ctx.read_native_pin(this_pin, this);
         if key.is_empty() {
             continue;
         }
@@ -66821,7 +66837,9 @@ fn native_unmod_entry_set_for_each(
         Some(Value::Object(Some(i))) => i,
         _ => return Ok(None),
     };
+    let itr_pin = ctx.pin_native_root(itr);
     loop {
+        let itr = ctx.read_native_pin(itr_pin, itr);
         let has_next = matches!(
             ctx.invoke_virtual(itr, "hasNext", "()Z", &[])?,
             Some(Value::Int(n)) if n != 0
@@ -68704,7 +68722,9 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => i32::MAX,
     };
     ctx.monitor_enter(this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
@@ -68732,7 +68752,9 @@ fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Object(None))),
     };
     ctx.monitor_enter(this);
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
@@ -72901,7 +72923,9 @@ fn native_cowal_bulk_remove_predicate(
     };
 
     let mut survivors: Vec<Value> = Vec::with_capacity(n);
+    let pred_pin = ctx.pin_native_root(pred);
     for i in 0..n {
+        let pred = ctx.read_native_pin(pred_pin, pred);
         let elem = ctx.get_array_element(arr, i);
         let remove = match ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[elem]) {
             Ok(Some(Value::Int(1))) => true,
@@ -72958,7 +72982,9 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         };
         let n = ctx.array_length(arr_obj);
         let mut any_added = 0i32;
+        let this_pin = ctx.pin_native_root(this);
         for i in 0..n {
+            let this = ctx.read_native_pin(this_pin, this);
             let elem = ctx.get_array_element(arr_obj, i);
             if matches!(
                 ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem]),
@@ -74163,7 +74189,9 @@ fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
         }
     };
     let mut n = 0;
+    let it_pin = ctx.pin_native_root(it);
     for _ in 0..4096 {
+        let it = ctx.read_native_pin(it_pin, it);
         match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,
