@@ -1,0 +1,123 @@
+# =============================================================================
+# known-benign-aborts.tsv — classes whose ABORTED status is confirmed benign
+#
+# THIS FILE IS TRACKED IN GIT ON PURPOSE (same reason as class-overrides.tsv —
+# `apps/` is gitignored wholesale (.gitignore:12), and this exact category of
+# fixture file has already been silently lost twice; see class-overrides.tsv's
+# header). run-hib.sh is force-added (`git add -f`) past the apps/ ignore, and
+# this file must be force-added the same way so it survives a truncation or
+# stale-backup restore as a normal `git status` modification instead of
+# disappearing invisibly.
+#
+# WHAT THIS IS FOR
+#
+# A handful of Hibernate test classes report class-level ABORTED not because
+# of a CratonVM bug, but because the test itself calls JUnit
+# `Assumptions.assumeTrue/assumeFalse/abort(...)` and the assumption is
+# false-by-construction for this class's fixed configuration (a dialect
+# check, a queue-type check, an eager/lazy enhancement-context check, ...).
+# These are self-skips baked into the test by design — HotSpot aborts the
+# identical sub-tests for the identical reason on the identical classpath.
+#
+# `run-hib.sh categorize` rebuilds passed.txt/others.txt from a fresh full
+# run by literal status: PASS -> passed.txt, everything else (including
+# ABORTED) -> others.txt. That is correct in general (ABORTED usually DOES
+# mean "look at this"), but it means these confirmed-benign classes get
+# re-flagged into others.txt every single time categorize runs, forever,
+# costing a fresh investigation each time. This table lets categorize treat
+# them as pass-equivalent instead.
+#
+# SAFETY: EXACT-COUNT MATCH, NOT NAME MATCH
+#
+# categorize does NOT reclassify a class just because its name is listed
+# here. It only does so when the class's found/ok/aborted counts from the
+# fresh run match the three count columns below EXACTLY. If a class's abort
+# profile ever changes — a new failure appears, the number of self-skips
+# shifts because the assumption logic itself changed — the class is left in
+# others.txt like any other residual, so this table cannot mask a real
+# regression on a class it lists. (A `failed` count above 0 is never
+# reclassified regardless of the other columns: run-hib.sh's own status
+# derivation marks the class FAIL, not ABORTED, before this table is even
+# consulted.)
+#
+# Check the table is actually live with:  run-hib.sh benign-aborts
+#
+# -----------------------------------------------------------------------------
+# FORMAT — tab-separated, four columns. `#` comments and blank lines ignored.
+#
+#   <fully.qualified.TestClass>  <expected found>  <expected ok>  <expected aborted>
+#
+# All three counts must match the fresh run's @@RESULT line exactly (failed
+# is implicitly required to be 0, since a nonzero failed count changes the
+# row's status away from ABORTED before this table is consulted).
+# -----------------------------------------------------------------------------
+
+# bytecode.enhancement.basic.{InheritedTest,MappedSuperclassTest} —
+# extendedEnhancementTest()'s own assumeTrue(...isAssignableFrom...), false by
+# construction under each class's eager (non-lazy-loading)
+# @CustomEnhancementContext. found=4 ok=3 aborted=1 on both CratonVM and
+# HotSpot. See docs/known-issues/hibernate/README.md "Audited, not a bug"
+# and fixed-suite-bugs/hibernate/
+# hib-bytecode-enhancement-loader-faithful-linking-FIXED.md (RE-VERIFICATION
+# 2026-07-31 section).
+org.hibernate.orm.test.bytecode.enhancement.basic.InheritedTest	4	3	1
+org.hibernate.orm.test.bytecode.enhancement.basic.MappedSuperclassTest	4	3	1
+
+# manytomanyassociationclass.surrogateid.generated.ManyToManyAssociationClassGeneratedIdTest —
+# 3 overridden test methods each call assumeFalse(queueType == QueueType.GRAPH, ...),
+# which self-skips under Hibernate's (now-restored) upstream GRAPH default.
+# found=6 ok=3 aborted=3 on both VMs. See docs/known-issues/hibernate/README.md
+# "Audited, not a bug" §2, and fixed-suite-bugs/hibernate/
+# hib-bytebuddy-20260730-FIXED.md §8 +
+# actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md.
+org.hibernate.orm.test.manytomanyassociationclass.surrogateid.generated.ManyToManyAssociationClassGeneratedIdTest	6	3	3
+
+# type.temporal.InstantTests — dialect/precision Assumptions self-skips.
+# found=204 ok=112 aborted=92, 0 typeNamePattern / IllegalThreadStateException
+# / H2 <local4> / NoSuchMethodError signatures — this is the class's own
+# fully-fixed clean baseline. See fixed-suite-bugs/hibernate/
+# hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md (final runs
+# 0 and 1, both found=204 ok=112 aborted=92).
+org.hibernate.orm.test.type.temporal.InstantTests	204	112	92
+
+# type.temporal.LocalDateTimeTest — same family of dialect/precision
+# Assumptions self-skips. found=162 ok=90 aborted=72, 0 DST/H2/typeNamePattern/
+# IllegalThreadStateException/NoSuchMethodError signatures — the class's own
+# fully-fixed clean baseline (4 runs for 4 after the DST/H2 <local4> fix). See
+# fixed-suite-bugs/hibernate/
+# hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md.
+org.hibernate.orm.test.type.temporal.LocalDateTimeTest	162	90	72
+
+# type.temporal.OffsetTimeTest — same family as InstantTests/LocalDateTimeTest
+# above. found=396 ok=176 aborted=88 (skipped=132) confirmed byte-identical
+# against real HotSpot on 2026-08-04 (isolated CratonRunner re-run, same JDK,
+# same classpath, no CratonVM in the loop): HotSpot reports
+# found=396 started=264 ok=176 failed=0 aborted=88 skipped=132, matching
+# CratonVM's 2026-08-04 run-20260804-113511-custom result exactly (only
+# wall-clock ms differs, as expected). Not written up as its own doc since
+# the finding is "confirmed benign, matches sibling temporal classes",
+# not a new defect.
+org.hibernate.orm.test.type.temporal.OffsetTimeTest	396	176	88
+
+# `OffsetDateTimeTest` — same shape as its three temporal siblings above.
+# Confirmed 2026-08-05 by a direct real-HotSpot `CratonRunner` re-run on the
+# identical classpath: found=488 started=488 ok=324 failed=0 aborted=164, byte
+# for byte. The class only became observable at all once the JIT site-memo
+# staleness crash was fixed — before that it died in JUnit discovery. See
+# fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md
+org.hibernate.orm.test.type.temporal.OffsetDateTimeTest	488	324	164
+
+# `ZonedDateTimeTest` — the fifth and last of the temporal family, and the only
+# one never observable long enough to be listed: until 2026-08-11 it was killed
+# at its 900s floor on every full-suite run and recorded HANG with no counts at
+# all. The cause was not the class — it was the ZGC conservative-root scan
+# resolving every interior-pointer probe with an O(arena-span) walk of the
+# object-start bitmap (`perf record`: 80.7% of all CPU samples in
+# `VmHeap::is_heap_addr`), fixed by the backwards bit scan in gc/src/zgc.rs. It
+# now finishes in 381s with found=608 ok=404 failed=0 aborted=204 — the same
+# counts the real-HotSpot control recorded (found=608 ok=404 failed=0
+# aborted=204, ms=17051), byte for byte. Its 900s floor in class-overrides.tsv
+# stays: this entry stops `categorize` re-flagging the aborts, the floor stops
+# the flat 300s cap re-flagging the runtime. See fixed-suite-bugs/hibernate/
+# hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811-FIXED.md
+org.hibernate.orm.test.type.temporal.ZonedDateTimeTest	608	404	204

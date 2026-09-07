@@ -12454,6 +12454,41 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        // DBG (`CRATONVM_DBG_DEADRECV`): is this receiver an address the
+        // collector already reclaimed?
+        //
+        // ASKED BEFORE THE FIRST DEREFERENCE, and that is the whole point.
+        // Every other consumer of the reclamation rings asks AFTER something
+        // has already read the object -- a failed `checkcast` reads the class
+        // id, the sweep-zero consumer reads an all-zero header -- so none of
+        // them can answer when the read ITSELF faults, which is what happens
+        // once `CRATONVM_GEN_UNCOMMIT` has unmapped the span. Both lookups
+        // below are pure ring probes keyed on the ADDRESS and touch no heap
+        // memory, so they answer whether or not the page is still mapped.
+        //
+        // This site because it is where the Generational `--nojit` failure
+        // lands: 4 of 5 crashes on the 2026-09-06 Kafka reproducer are
+        // `native_object_hash_code` -> here, faulting on the mark word.
+        //
+        // Returns 0 rather than walking into the fault, so one run names MANY
+        // victims instead of dying at the first. That makes the flag
+        // behaviour-changing -- a 0 identity hash is otherwise impossible, see
+        // the C28 note below -- which is why it is opt-in and named DBG.
+        if dbg_deadrecv() {
+            let addr = obj.as_ptr() as usize;
+            if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
+                || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
+            {
+                crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+                    &self.shared,
+                    addr,
+                    "identity_hash_code",
+                    "java/lang/Object",
+                    0,
+                );
+                return 0;
+            }
+        }
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
         // asserts non-zero ("hash must be nonzero").
@@ -19135,6 +19170,19 @@ pub(super) fn convert_element_value(
 // Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
 // a `String` per call, so it is a diagnosis tool, not something to leave on.
 #[cold]
+/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask the reclamation rings
+/// whether the receiver is an address this process already freed, BEFORE the
+/// first dereference, and report it through `reclaim_guard` instead of
+/// faulting on it.
+///
+/// Opt-in and behaviour-changing: a hit returns 0, which `identity_hash_code`
+/// otherwise never does (C28). That is deliberate, so one run names many
+/// victims rather than dying at the first.
+fn dbg_deadrecv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEADRECV").is_some())
+}
+
 pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
     dispatch_tally::record(site, class_name, method_name, descriptor);
 }
