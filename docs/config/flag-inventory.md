@@ -1415,6 +1415,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_IR_PARAM_COPY` | JIT | `CRATONVM_JIT=ir-param-copy` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_PHI_COPY_REGS` | JIT | `CRATONVM_JIT=ir-phi-copy-regs` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` | JIT | `CRATONVM_JIT=ir-phi-edge-interfere` | default-on | on | behaviour | snapshot | jit |
+| `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD` | JIT | `CRATONVM_JIT=ir-phi-home-publish-guard` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_PHI_RESIDENCY` | JIT | `CRATONVM_JIT=ir-phi-residency` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_PUBLISH_AT_DEF` | JIT | `CRATONVM_JIT=ir-publish-at-def` | default-on | on | behaviour | snapshot | jit |
 | `CRATONVM_JIT_IR_RECEIVER_GUARD_CSE` | JIT | `CRATONVM_JIT=ir-receiver-guard-cse` | default-on | on | behaviour | snapshot | jit |
