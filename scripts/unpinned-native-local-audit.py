@@ -684,6 +684,103 @@ def gc_capable(text, allocfns):
     return _gc_tokens(text, allocfns)
 
 
+
+# ---------------------------------------------------------------------------
+# LOOP RULE (`--loops`)
+#
+# The straight-line scan asks "is there a GC between the binding and the use",
+# in STATEMENT ORDER. Inside a loop body that order is a lie: the last
+# statement precedes the first on the next iteration, so a GC anywhere in the
+# body stales every reference the body carries in from outside — including one
+# used EARLIER in the text, and including one used in the very statement that
+# does the allocating.
+#
+# That last case is the one that matters, because the straight-line rule
+# deliberately excludes it: a use inside the same statement as the call is an
+# ARGUMENT, evaluated before the call runs. True for one iteration. On the
+# next, the argument is a pre-GC address.
+#
+# MEASURED: the 2026-09-06 `properties_sidetable.rs` defects were exactly this
+# --  `for (k, v) in &snapshot { put_kv_units(ctx, this, k, v); }`, where
+# `put_kv_units` reads the receiver's identity hash and so inflates a monitor.
+# The default and `--any-binding` rules report 18 rows on that file before the
+# fix and NONE of them is one of the four.
+LOOPHEAD = re.compile(r"^\s*(?:\}\s*)?(?:for\b|while\b|loop\s*\{)")
+REREAD = re.compile(r"read_native_pin|handle_get|scope\s*\.\s*get|end_blocking_region_refs")
+
+
+def loop_spans(body):
+    """(first, last) line index of each `for`/`while`/`loop` body. Nested loops
+    yield overlapping spans, which is correct: each is its own window."""
+    spans = []
+    for i, l in enumerate(body):
+        if not LOOPHEAD.search(l) or "{" not in l:
+            continue
+        depth = 0
+        for j in range(i, len(body)):
+            depth += body[j].count("{") - body[j].count("}")
+            if j > i and depth <= 0:
+                spans.append((i, j))
+                break
+    return spans
+
+
+def scan_loops(fn, allocfns):
+    stmts = statements(fn.body)
+    if stmts and FNDEF.match(stmts[0].text):
+        stmts = stmts[1:]
+    sig = signature(fn)
+    params = list(PARAM_REF.findall(sig))
+    hits = []
+    for (a, b) in loop_spans(fn.body):
+        inner = [st for st in stmts if a <= st.line <= b]
+        if not inner:
+            continue
+        inner_txt = " ".join(st.text for st in inner)
+        # Candidates: declared `ObjectRef` parameters, plus locals bound BEFORE
+        # the loop. A binding made inside the loop is fresh each iteration.
+        pre = []
+        for st in stmts:
+            if st.line >= a:
+                break
+            m = LET.match(st.text)
+            if m and m.group(1) != "_":
+                pre.append((m.group(1), st))
+        cands = [(p, None) for p in params] + pre
+        for name, bind in cands:
+            # A handle is not an ObjectRef; that is the point of a handle scope.
+            if bind is not None and re.search(
+                    r"(?:scope\s*\.\s*root|handle_root|pin_native_root)\s*\(", bind.text):
+                continue
+            if bind is not None and not REF_RHS.search(bind.text) and not ref_use(
+                    name, chr(10).join(fn.body)):
+                continue
+            # Refreshed or rebound INSIDE the body: this is the correct form.
+            refreshed = False
+            for st in inner:
+                if REREAD.search(st.text) and names(name, st.text):
+                    refreshed = True
+                    break
+                m2 = LET.match(st.text)
+                if m2 and m2.group(1) == name:
+                    refreshed = True
+                    break
+                if REBIND(name).search(st.text):
+                    refreshed = True
+                    break
+            if refreshed:
+                continue
+            for st in inner:
+                if not gc_capable(st.text, allocfns) or leaves(st.text):
+                    continue
+                if not names(name, st.text):
+                    continue
+                hits.append((fn.line + (bind.line if bind else 0), name,
+                             fn.line + st.line, "loop"))
+                break
+    return hits
+
+
 def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
     stmts = statements(fn.body)
     # DROP THE SIGNATURE. It reassembles as one statement, and `gc_capable`
@@ -821,6 +918,8 @@ def main():
     ap.add_argument("--only", default=None)
     ap.add_argument("--any-binding", action="store_true", dest="any_binding",
                     help="rule 1: do not require the BINDING statement to be GC-capable")
+    ap.add_argument("--loops", action="store_true",
+                    help="a GC anywhere in a loop body stales every reference carried in")
     ap.add_argument("--opt", action="store_true",
                     help="also scan Option<ObjectRef> / &[ObjectRef] / Vec<ObjectRef> / &[Value] / Value parameters (`wide`). `args: &[Value]` is the shape of every registered native, so this is the tranche that covers native ENTRY "
                     "points rather than their helpers.")
@@ -834,7 +933,11 @@ def main():
             continue
         if a.only and fn.name != a.only:
             continue
-        for (ln, nm, use, kind) in scan(fn, allocfns, True, a.opt, a.any_binding):
+        if a.loops:
+            found = scan_loops(fn, allocfns)
+        else:
+            found = scan(fn, allocfns, True, a.opt, a.any_binding)
+        for (ln, nm, use, kind) in found:
             rows.append((os.path.basename(fn.file), ln, fn.name, nm, use, kind))
     per = collections.Counter(r[0] for r in rows)
     print("functions indexed: %d (test bodies skipped: %d) ; reachable-allocating: %d"
