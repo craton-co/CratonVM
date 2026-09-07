@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-532 tokens.
+533 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -380,6 +380,7 @@ export inherited from a parent shell.
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
 | `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
 | `relocation-blockers` | `CRATONVM_DBG_RELOCATION_BLOCKERS` |
+| `peer-reg-pairing` | `CRATONVM_DBG_PEER_REG_PAIRING` |
 | `jit-remap-all-unverifiable` | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |

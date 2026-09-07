@@ -140,6 +140,90 @@ pub static XT_PEER_SHADOW_SLOTS: AtomicU64 = AtomicU64::new(0);
 pub static XT_PEER_SHADOW_ROOTS: AtomicU64 = AtomicU64::new(0);
 pub static XT_PEER_SHADOW_UNTRUSTED: AtomicU64 = AtomicU64::new(0);
 
+/// `CRATONVM_DBG_PEER_REG_PAIRING=1` -- record every heap address a FROZEN
+/// peer held in a REGISTER, so `memory::gc::update_all_roots` can pair it
+/// against the pointer map the same collection produced.
+///
+/// Diagnostic only, default off, and deliberately registers ONLY -- a peer's
+/// stack words are equally un-rewritten but the register file is the claim
+/// under test (`ThreadExecState::CompiledUninterruptible`'s rule comment says
+/// "Registers and JIT spill slots are not rewritable").
+pub fn peer_reg_pairing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PEER_REG_PAIRING").is_some()
+    })
+}
+
+/// `(os_tid, word)` for every register word this cycle's takeover resolved to a
+/// heap object. Drained by the pairing check; cleared when a takeover begins so
+/// a cycle that never reaches a pointer map cannot leak into the next one.
+static PEER_REG_WORDS: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Peer STACK words this process resolved to a heap object, the companion
+/// denominator to [`PEER_SLOTS_SCANNED`]. A blocked peer is inside a native
+/// call, so its Java references are on its stack and its registers hold C
+/// values -- the register arm measured 0 of ~3200 reads for exactly that
+/// reason, and a zero there says nothing about the stack.
+pub static PEER_STACK_WORDS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Record one frozen-peer register word. No-op unless the flag is on.
+pub fn record_peer_reg_word(os_tid: u32, word: usize) {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    if let Ok(mut v) = PEER_REG_WORDS.lock() {
+        // Bounded: a runaway capture must not become the memory problem it is
+        // diagnosing. 17 GPRs x a few peers per cycle is far under this.
+        if v.len() < 4096 {
+            v.push((os_tid, word));
+        }
+    }
+}
+
+/// Frozen-peer register FILES inspected this process. The denominator for the
+/// capture: `captured=0` with `slots_scanned=0` means no peer was ever frozen,
+/// which is a different statement from "a frozen peer held no heap word".
+pub static PEER_SLOTS_SCANNED: AtomicU64 = AtomicU64::new(0);
+
+/// Count one frozen-peer register file inspected.
+pub fn note_peer_slot_scanned() {
+    PEER_SLOTS_SCANNED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one peer STACK word that resolved to a heap object. Same buffer as
+/// the register arm -- the pairing question ("did this collection move it?") is
+/// identical; only the storage class differs, and `PEER_STACK_WORDS_SEEN`
+/// separates the two denominators.
+pub fn record_peer_stack_word(os_tid: u32, word: usize) {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    PEER_STACK_WORDS_SEEN.fetch_add(1, Ordering::Relaxed);
+    record_peer_reg_word(os_tid, word);
+}
+
+/// Start a fresh per-cycle capture.
+pub fn clear_peer_reg_capture() {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    if let Ok(mut v) = PEER_REG_WORDS.lock() {
+        v.clear();
+    }
+}
+
+/// Drain this cycle's capture.
+pub fn take_peer_reg_capture() -> Vec<(u32, usize)> {
+    if !peer_reg_pairing_enabled() {
+        return Vec::new();
+    }
+    match PEER_REG_WORDS.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Scan a frozen blocked peer's SHADOW STACK, appending every heap address it
 /// names to `out`.
 ///
@@ -1382,9 +1466,16 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut found = 0usize;
+        let pair_tid = slot.tid.load(Ordering::Acquire);
+        super::note_peer_slot_scanned();
         for reg in &slot.regs {
             let v = reg.load(Ordering::Acquire);
             if let Some(o) = is_obj(v) {
+                // The pairing capture: this word is a heap object address held
+                // in a FROZEN peer's register at the moment of the takeover.
+                // Nothing rewrites a register, so if the collection moves the
+                // object, the peer resumes naming evacuated space.
+                super::record_peer_reg_word(pair_tid, v);
                 roots.push(o);
                 found += 1;
             }
@@ -1401,6 +1492,7 @@ mod imp {
         while p + 8 <= end {
             let w = unsafe { (p as *const usize).read_unaligned() };
             if let Some(o) = is_obj(w) {
+                super::record_peer_stack_word(pair_tid, w);
                 roots.push(o);
                 found += 1;
             }
@@ -1439,12 +1531,18 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut has_jit = false;
+        // Same capture as `scan_slot_with_regions`: this is the other
+        // register loop over a frozen peer's slot, and a zero that cannot
+        // say which loop ran is not a measurement.
+        super::note_peer_slot_scanned();
+        let pair_tid_hw = slot.tid.load(Ordering::Acquire);
         for reg in &slot.regs {
             let v = reg.load(Ordering::Acquire);
             if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                 has_jit = true;
             }
             if let Some(o) = is_obj(v) {
+                super::record_peer_reg_word(pair_tid_hw, v);
                 candidates.push(o);
             }
         }
@@ -1463,6 +1561,7 @@ mod imp {
                 has_jit = true;
             }
             if let Some(o) = is_obj(w) {
+                super::record_peer_stack_word(pair_tid_hw, w);
                 candidates.push(o);
             }
             p += 8;

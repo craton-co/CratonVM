@@ -758,6 +758,10 @@ pub const INVENTORY: &[E] = &[
     // relocation_blockers()`, which is the codebase's own statement of the
     // `mark_moving_young_coverage_incomplete_because` obligation. Off by default.
     E { group: Group::DBG, token: "relocation-blockers", on_key: Some("CRATONVM_DBG_RELOCATION_BLOCKERS"), off_key: None, off_word: None, since: "2026-09-06" },
+    // Pairs a FROZEN peer's captured register file against the pointer map the
+    // same collection produced -- the per-cycle confirmation for the
+    // `CompiledUninterruptible` association. Off by default.
+    E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
     // Diagnostic widening of the register-image remap to the whole unverifiable
     // frame tail, to TEST the four-region partition in `conservative_roots`'s
     // module comment rather than continue to argue it. Off by default; see

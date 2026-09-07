@@ -780,6 +780,46 @@ pub fn update_all_roots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &cratonvm_types::PointerMap,
 ) {
+    // `CRATONVM_DBG_PEER_REG_PAIRING=1` -- see
+    // `jit::xt_root_scan::record_peer_reg_word`. Every collection's pointer map
+    // passes through here, so this is the one place that sees both halves.
+    //
+    // A recorded word that is a KEY of this map with a DIFFERENT value is an
+    // object the collection relocated while a frozen peer's register named its
+    // old address. Nothing rewrites registers, so that peer resumes holding a
+    // pointer into evacuated space.
+    if crate::jit::xt_root_scan::peer_reg_pairing_enabled() {
+        let captured = crate::jit::xt_root_scan::take_peer_reg_capture();
+        if !captured.is_empty() || !pointer_map.is_empty() {
+            let mut stale = 0usize;
+            let mut example = None;
+            for (tid, word) in &captured {
+                if let Some(&new) = pointer_map.get(word) {
+                    if new != *word {
+                        stale += 1;
+                        if example.is_none() {
+                            example = Some((*tid, *word, new));
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[peer-reg-pairing] slots_scanned={} stack_words={} captured={} map_entries={} STALE_PEER_WORDS={}{}",
+                crate::jit::xt_root_scan::PEER_SLOTS_SCANNED
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                crate::jit::xt_root_scan::PEER_STACK_WORDS_SEEN
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                captured.len(),
+                pointer_map.len(),
+                stale,
+                match example {
+                    Some((tid, old, new)) =>
+                        format!(" example=tid:{tid} 0x{old:x}->0x{new:x}"),
+                    None => String::new(),
+                }
+            );
+        }
+    }
     let __fx_guard = rootfixup_census_on().then(|| {
         struct C(std::time::Instant, usize);
         impl Drop for C {

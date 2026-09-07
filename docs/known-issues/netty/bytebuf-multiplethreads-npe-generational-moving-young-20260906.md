@@ -908,3 +908,107 @@ the count is just some running thread. The per-state breakdown is what separates
 "a peer is uninterruptibly in compiled code" from "somebody is running", and
 `relocation_blockers()` on its own should not be used as the obligation oracle
 its doc describes.
+
+### 10.12 The per-cycle pairing: a BLOCKED peer's stack words name objects this collection moved
+
+§10.11 measured an association and said so. This is the pairing that confirms a
+mechanism — and it corrects §10.11's guess about which storage class, because
+the register arm came back empty.
+
+`CRATONVM_DBG_PEER_REG_PAIRING=1` records every word a peer's conservative scan
+resolved to a heap object, then at `memory::gc::update_all_roots` — the one
+choke point every collection's pointer map passes through — asks whether any
+recorded word is a KEY of that map with a different value. A key with a
+different value is an object that MOVED while the peer still names its old
+address.
+
+**Result, `UniqueIpFilterTest` under the §10.4 repro, 8 reps:**
+
+| rep | relocating cycles | cycles with stale peer words | stale words |
+|---:|---:|---:|---:|
+| 1 | 53 | **53** | 1003 |
+| 2 | 58 | **58** | 1173 |
+| 3 | 58 | **58** | 1106 |
+| 4 | 51 | **51** | 2604 |
+| 5 | 56 | **56** | 1133 |
+| 6 | 58 | **58** | 1102 |
+| 7 | 59 | **60** | 1124 |
+| 8 | 58 | **58** | 1102 |
+
+**Essentially every relocating cycle leaves stale words in a peer's stack**, 19
+to 91 of them per cycle, with instances named:
+
+```
+[peer-reg-pairing] slots_scanned=8 stack_words=1903 captured=783 map_entries=2044
+                   STALE_PEER_WORDS=19 example=tid:4085684 0x782e10739208->0x782df8809948
+```
+
+**The control, same instrument, same binary, divert at its shipped default:**
+
+| arm | relocating cycles | peer stack words scanned | stale |
+|---|---:|---:|---:|
+| default (relocation refused) | 0 | 45347 / 42829 / 45336 / 36793 | **0 / 2 / 0 / 0** |
+| `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` | 51–59 | ~50000 | **1003–2604** |
+
+The same ~40–50k words are scanned either way. The stale count is zero when
+nothing relocates and ~1100 when it does, so the instrument is tracking
+relocation and not merely counting look-alike words.
+
+#### The mechanism, end to end
+
+1. A **blocked** peer — inside a native call — has its register file and stack
+   conservatively scanned by the helper-window pass. The census reads
+   `helper_windows=46 hw_pinned=45` per run.
+2. Those words become **roots**, so the collector keeps the objects alive and,
+   on a moving cycle, **relocates** them.
+3. The peer's own stack words are **never rewritten**. `gc_and_alloc.rs` says so
+   in its own words: the deposited snapshot's entries "are merged into the
+   collection roots (which keeps the objects ALIVE and rewrites the merged
+   copies), but the peer's actual frame slots are never remapped: it skips the
+   safepoint-resume `apply_pointer_map_to_thread`."
+4. The stated protection is a **PIN** — "Pinning the referenced regions keeps
+   those slots valid". And on this backend the pin is a **no-op**:
+   `VmHeap::Generational::honours_conservative_pins()` is `false`, because a
+   Cheney copy reclaims from-space wholesale (§10.1).
+
+So the guarantee the blocked-peer path depends on is exactly the one the
+generational collector cannot provide, and the result is a blocked peer resuming
+with stack words pointing into evacuated space.
+
+#### What this corrects in §10.11, and what it leaves open
+
+* **The register hypothesis is REFUTED.** Peer registers held **0** heap words
+  across ~3200 reads (~190 slots x 17 GPRs), and the census explains why:
+  `taken_over=0` — no thread is ever forcibly FROZEN on this workload, so
+  `stw_take_over_and_wait`'s "frozen peers keep the sweep non-moving" never
+  engages, and the peers that do exist are BLOCKED ones whose registers hold C
+  values while their Java references sit on the stack. §10.11's
+  `CompiledUninterruptible` association is real but it is not the storage class.
+* **The first pairing run was vacuous and was not read as a result.** It
+  reported `captured=0` with no denominator, which cannot distinguish "no peer
+  was scanned" from "a peer was scanned through the register loop I did not
+  patch". Adding `slots_scanned` and `stack_words` is what made the zero
+  attributable — and then non-zero.
+* **Still open: liveness.** These are words a CONSERVATIVE scan accepted, so a
+  dead stack slot holding a stale address counts here and harms nobody. What
+  makes them more than slop is that the collector itself treated them as roots
+  and moved the objects underneath them. Proving one is subsequently READ needs
+  the fault paired to a specific word; the population is now small and named
+  (19–91 per cycle, with tid and address), which is what that measurement needs.
+
+#### Where the repair goes
+
+Not in the frame bands (§10.8 eliminated those), and not in the precise oop maps
+(§8) — the words in question belong to a thread that is not at a safepoint and
+whose stack no map describes. The three candidates, in the order the code
+suggests them:
+
+1. **Remap the blocked peer's scanned words**, the way a cooperatively-parked
+   peer's are remapped on resume. `check_post_block_gc` already exists as the
+   blocked-thread wake hook and already composes `fixup` / `slot_origins`; the
+   helper-window words are not in that set.
+2. **Refuse the cycle**, which is what `unrewritable_conservative_jit_roots`
+   already does and why the shipped default is green — at the cost of
+   compaction under any live compiled frame.
+3. **Make the pin real**, which a Cheney copy cannot do without a
+   withhold-and-forward mechanism it does not have.
