@@ -272,14 +272,35 @@ enforced budget.
 
 | Kernel (N = 2²⁴)                                    | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
 |-------------------------------------------------------|------------|---------------|--------------|------------|--------------|
-| Integer div-chain (48 divs/elem)                       | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
-| Double div-chain (64 divs/elem)                        | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
-| 128 multiply-adds/elem (data-dependent multiplier)     | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
-| Dot-product reduction (int·int → long, x300/elem)      | 1,172 ms   | unimplemented | **2 ms**     | **586x**    | n/a          |
+| Integer div-chain (48 divs/elem)                       | 2,179 ms   | 27 ms         | **7 ms**     | **311x**   | **3.9x**     |
+| Double div-chain (64 divs/elem)                        | 1,784 ms   | 135 ms        | **82 ms**    | **21.8x**  | **1.6x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)     | 1,298 ms   | 26 ms         | **7 ms**     | **185x**   | **3.7x**     |
+| Dot-product reduction (int·int → long, x300/elem)      | 1,168 ms   | unimplemented | **2 ms**     | **584x**   | n/a          |
 
-Re-verified 2026-09-05 on the same box (RTX 2060, TornadoVM 4.0.1 PTX,
-N = 2²⁴). The four non-ray-tracer rows still hold and TornadoVM's integer
-div-chain reproduced exactly at 26 ms. Two things that run did change:
+**Re-measured 2026-09-07**, and this table is now that measurement rather
+than an accumulation of three vintages. Quiet host (`bench-gpu/wait-for-quiet.sh`
+gated it), `target-gpu/release/cratonvm.exe`, HotSpot Adoptium 25.0.3.9,
+TornadoVM 4.0.1-jdk25-ptx, N = 2²⁴, best of 5, warm, full
+host→device→host. Reproduce with `bash bench-gpu/rerun-table-rows.sh`.
+
+Every arm of a row was run in the same session this time, including the CPU
+baselines — which had previously been carried over from an older idle-box run.
+They reproduced almost exactly (2,179 vs 2,146; 1,784 vs 1,780; 1,298 vs 1,300;
+1,168 vs 1,172), which is the check that the setup is sound: the ratios moved
+because CratonVM got faster, not because the baseline drifted.
+
+Three rows moved against the previous table, and the double div-chain row
+finally agrees with the note that has sat under it since 2026-09-05:
+
+- **int div-chain 11 ms → 7 ms**, and **128 multiply-adds 8 ms → 7 ms.**
+- **double div-chain 95 ms → 82 ms, TornadoVM 128 ms → 135 ms.** The note
+  below said "the row now measures 81 ms against TornadoVM's 135" and the table
+  above it still said 95/128. The table was stale; it is not any more.
+- **The 128-multiply-add row needed a different harness to measure at all** —
+  see the offload-gate defect recorded below.
+
+The pre-2026-09-07 notes follow, kept because they explain how rows got where
+they are:
 
 - The **dot-product row is now 2 ms**, not 12 — the warp-shuffle reduction
   (one `red.global.add` per warp rather than per thread) landed after the
@@ -302,13 +323,39 @@ present in this tree.
 
 Notes:
 
+- **The offload gate only analyses the entry class, and says nothing when it
+  skips one.** `bench-gpu/GpuComputeWarm.java` has `main()` call
+  `GpuCompute.heavy` in another class; run it under `--gpu
+  --print-gpu-decisions` and `GpuCompute.heavy` never appears in the decision
+  log at all — not `Rejected(...)`, never considered — and the row reads
+  2,611-2,934 ms on the CPU. Move the identical kernel into the class that owns
+  `main()` (`bench-gpu/GpuComputeWarmSelf.java`) and the same run reports
+  `Eligible`, takes 7 ms, and produces a bit-identical checksum. The published
+  8 ms was always real; the harness the 2026-09-02 note recommended for it
+  cannot reproduce it on this build. Filed as a defect — a silently-skipped
+  kernel is worse than a rejected one, because `--print-gpu-decisions` is the
+  documented way to find out why something did not offload and it shows nothing
+  here.
+
 - The div-chain rows are the "GPU wins big" cases: division has no
   competitive CPU-vectorized form, so raw parallelism wins at every size
   tested (2²⁰–2²⁶; the ratios hold steady across sizes).
-- CratonVM's double-division checksum is **bit-exact** with HotSpot at
-  every size (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86
-  `vdivpd`); TornadoVM's diverges slightly — its PTX backend doesn't
-  guarantee bit-exact division.
+- CratonVM's double-division **kernel output** is bit-exact with HotSpot
+  (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86 `vdivpd`): the
+  2026-09-07 run prints identical `OUT0=45.40459327514974` and
+  `OUTN=7.2490508729547125` from both.
+
+  Its **harness checksum** does not match, and the distinction matters. The
+  checksum is a serial sum of 2²⁴ doubles in the benchmark's own epilogue;
+  floating-point addition is not associative, so summing in a different order
+  gives a different but equally correct total. CratonVM reads
+  `5.928010028745152E7` against HotSpot's `5.92801002867254E7` — a relative
+  difference of 1.2e-11, the size of a reassociated sum.
+
+  TornadoVM's `5.9583712290819384E7` is 5.1e-3 away, eight orders of magnitude
+  larger, and that one *is* a division difference: its PTX backend does not
+  guarantee bit-exact division. Do not read the two divergences as the same
+  kind of thing.
 - **Root-caused: TornadoVM's `unimplemented` is a standing gap in
   mixed-type reductions, not a version/driver issue.** `TornadoSnippetReflectionProvider
   .forBoxed` (what the whole stack trace bottoms out in) is an unconditional

@@ -8896,6 +8896,56 @@ impl GenerationalHeap {
         // separately rather than leaving the difference to be inferred.
         let bytes_copied = young_to.used();
 
+        // ----- THE PAIRING: does a frozen peer hold an address we moved? -----
+        //
+        // §10.11 established that 84 % of relocating cycles run with a peer in
+        // `CompiledUninterruptible`, whose `RelocationRule` is `Forbidden`
+        // because "registers and JIT spill slots are not rewritable". That is
+        // an ASSOCIATION. This is the demonstration it asked for: the peer's
+        // whole GPR block was captured while it was frozen, and `pointer_map`
+        // is exactly the set of from-space addresses this cycle RELOCATED, so
+        // an intersection is a register that will be read after resume and no
+        // longer names its object.
+        //
+        // A register is not heap, not frame-band memory, and no pass in this
+        // collector rewrites one — which is why the heap verifier below reads
+        // zero on the very cycles that corrupt (§6).
+        if crate::gc_quiescence::peer_reg_pairing_enabled() {
+            let captured = crate::gc_quiescence::take_peer_reg_capture();
+            let mut hits = 0usize;
+            let mut reported = 0usize;
+            for (tid, reg, val) in captured.iter().copied() {
+                let Some(&new_addr) = pointer_map.get(&val) else {
+                    continue;
+                };
+                hits += 1;
+                if reported < 12 {
+                    reported += 1;
+                    // Name the object by its NEW header: the old one is a
+                    // forwarding word by now.
+                    let cls = {
+                        let h = unsafe { &*(new_addr as *const ObjectHeader) };
+                        crate::gc::resolve_class_info(h.class_id.as_u32())
+                            .map(|(name, _)| name)
+                            .unwrap_or_else(|| format!("cid#{}", h.class_id.as_u32()))
+                    };
+                    eprintln!(
+                        "[peer-reg-stale] os_tid={tid} reg=r{reg} holds 0x{val:x} -> RELOCATED to \
+                         0x{new_addr:x} ({cls}) -- this thread resumes with a vacated address",
+                    );
+                }
+            }
+            if hits > 0 {
+                crate::gc_quiescence::PEER_REG_STALE.fetch_add(hits as u64, Ordering::Relaxed);
+            }
+            eprintln!(
+                "[peer-reg-stale] cycle summary: captured_words={} stale={} pointer_map={}",
+                captured.len(),
+                hits,
+                pointer_map.len(),
+            );
+        }
+
         if moving_young_dangling_verify_enabled() {
             let mut missed_young = 0usize;
             let mut missed_old = 0usize;

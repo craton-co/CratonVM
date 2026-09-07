@@ -756,6 +756,14 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // slots for pure-synthetic-jdk mode.
     let real_n = ctx.class_num_total_fields(cid);
     let buf = ctx.alloc_object(cid, real_n.max(8));
+    // GC: `buf` is the buffer this native RETURNS, and nothing in Java refers
+    // to it yet. Below it are two `ensure_class_initialized` calls (each of
+    // which can load a class and run its `<clinit>`) and two `alloc_object`s,
+    // and `buf` is read after all of them — for `discover_reference`, which
+    // registers it as a Cleaner referent, and for the return value itself.
+    // `ByteBuffer.allocateDirect` is the NIO/netty hot path.
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut buf = buf;
     ctx.set_field_by_name(buf, "address", Value::Long(addr as i64));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap as i32));
     ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
@@ -773,6 +781,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // already HAD (that one wrote `bigEndian` and not `nativeByteOrder`). Same
     // crate as the helper, so a plain `crate::` path, not a cross-crate one.
     crate::seed_buffer_byte_order(ctx, buf);
+    buf = ctx.read_native_pin(buf_pin, buf);
     // NIO-DIRECTBUFFER FIX (2026-06-04): the fixed-slot writes below assume a
     // layout (position@0/limit@1/capacity@2/mark@3) that does NOT match the real
     // `java.nio.Buffer` layout (mark@0/position@1/limit@2/capacity@3/address@4/
@@ -821,6 +830,9 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .ensure_class_initialized("jdk/internal/ref/BucketDirectBufferDeallocator")
             .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
         let dealloc = ctx.alloc_object(dealloc_cid, 2);
+        // `dealloc` has to survive the class initialization and allocation of
+        // the Cleanable below, which is where it is finally stored.
+        let dealloc_pin = ctx.pin_native_root(dealloc);
         // field 0 = cleaner_id (Int) — matches our `bucket_dealloc_run` ABI
         // field 1 = addr (Long) — diagnostics
         ctx.set_field(dealloc, 0, Value::Int(cleaner_id));
@@ -830,6 +842,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .ensure_class_initialized("java/lang/ref/Cleaner$Cleanable")
             .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
         let cleanable = ctx.alloc_object(cleanable_cid, 3);
+        let dealloc = ctx.read_native_pin(dealloc_pin, dealloc);
         ctx.set_field(cleanable, 0, Value::Object(Some(dealloc))); // action
         ctx.set_field(cleanable, 1, Value::Int(0)); // cleaned
         ctx.set_field(cleanable, 2, Value::Int(-1)); // ref id
@@ -839,9 +852,12 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // `buf` (the referent) becomes unreachable; `cleaner_thread` then
         // drains, and `interpreter::run_cleaner_actions` invokes
         // `BucketDirectBufferDeallocator.run()V` to fire the cleaner.
+        buf = ctx.read_native_pin(buf_pin, buf);
         ctx.discover_reference(3, cleanable, buf, None);
     }
 
+    buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.unpin_native_roots(buf_pin);
     Ok(Some(Value::Object(Some(buf))))
 }
 

@@ -468,18 +468,38 @@ jobs:
       # regardless of the baseline — there is no known-acceptable hang.
       #
       # `ubuntu-latest` only, exactly like the bridge ratchet and for the same
-      # reason: `25-linux` is the only committed key, and on the windows leg the
-      # gate would (correctly) refuse with exit 2 rather than look green.
+      # LINUX AND WINDOWS. It was `ubuntu-latest` only, because `25-linux` was
+      # the only committed key and the windows leg would (correctly) refuse with
+      # exit 2 rather than look green. `scripts/baselines/jdk-only-strict-corpus-25-windows.txt`
+      # now exists, measured on a real Windows host against HotSpot 25, so the
+      # leg adjudicates instead of refusing. Two mode-independent defects had to
+      # be fixed before it could: `KeyStore.setEntry(SecretKeyEntry)` stored
+      # nothing at all, and the Windows attach provider's `tempPath()` had no
+      # bridge, so `VirtualMachine.list()` threw `UnsatisfiedLinkError`. Neither
+      # was visible to any Linux leg, which is the whole argument for this one.
+      #
+      # macOS stays out: there is no `25-macos` key, and minting one needs a run
+      # on that platform, not a copied file.
+      #
+      # IF THE WINDOWS LEG GOES RED ON THE JNI FIXTURE, READ THIS FIRST. The
+      # script builds `apps/probes/jdkonly_jni_probe.c` with `cc -shared -fPIC`,
+      # and falls back to MSVC (located through the versionless `vswhere.exe`
+      # path, then `vcvars64.bat`) when no `cc` is on PATH. If BOTH fail, the
+      # jni section reports `lib=absent` in all three arms, the arms agree
+      # vacuously, and the script REFUSES (exit 2) rather than calling that a
+      # pass. Fix the fixture; declaring it with `ALLOW_DEGRADED_FIXTURES` turns
+      # the one gate that covers the JNI boundary under `--jdk-only` back off.
       #
       # Prerequisites are already met by earlier steps: `Set up JDK 25` exports
-      # JAVA_HOME, and `Build` leaves target/debug/cratonvm. The script needs a
-      # C compiler and `jar` for its two fixtures; both are present on the
-      # runner, and it degrades to `lib=absent` / `agent=absent` in EVERY arm if
-      # they are not, so the arms still agree and the gate stays honest.
+      # JAVA_HOME, and `Build` leaves target/debug/cratonvm. `jar` comes from
+      # that JDK.
       - name: Strict corpus ratchet (three arms vs a HotSpot control)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os != 'macos-latest'
         shell: bash
-        run: CV=target/debug/cratonvm TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
+        run: |
+          CV=target/debug/cratonvm
+          [ -x "$CV" ] || CV=target/debug/cratonvm.exe
+          CV="$CV" TIMEOUT=600 bash scripts/jdk-only-strict-probes.sh
 
       # A `--jdk-only` refusal is only a RETIREMENT when nothing already owns
       # the triple. `register` is last-write-wins and its JdkOnly arm returns
@@ -1600,9 +1620,10 @@ jobs:
       # It refuses (exit 2) rather than passing when there is no baseline for
       # this matrix leg's `<feature>-<os>`. That is deliberate: a baseline from
       # another key cannot adjudicate this one, and "no baseline" must never
-      # read as "nothing diverged". Only `25-linux` is committed today, so the
-      # other three legs refuse and say so — same posture, and the same reason,
-      # as the bridge ratchet being `ubuntu-latest` only.
+      # read as "nothing diverged". `25-linux` and `25-windows` are committed,
+      # so those two legs adjudicate; the two JDK 21 legs refuse and say so —
+      # same posture, and the same reason, as the bridge ratchet being
+      # `ubuntu-latest` only. A 21 key can only be minted by a run on 21.
       #
       # The script self-tests its own ratchet hermetically before touching a VM
       # — it asserts that an injected new section IS flagged and a baselined one

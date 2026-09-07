@@ -12,6 +12,17 @@
 > The historical investigation below is preserved as written; note that its own
 > root-cause speculation (a generic iteration/GC defect in shared substrate) was
 > wrong — CratonVM does intercept H2 at this call.
+>
+> **2026-09-06 note.** `CriteriaWindowFunctionTest` (this doc's own class,
+> previously verified 11/11) showed 2 failures again in a 2026-09-06 suite run —
+> `#testCountAsWindowFunctionWithFilter` and `#testNthValue`, both
+> `expected: <5> but was: <1>` (a wrong **row count**, not a wrong value or the
+> "unreachable" fallback exception this doc describes). This is a different,
+> newly discovered JIT-warm-up-dependent defect, not a regression of the
+> `groupData` delegation fix — it only reproduces after other tests warm up the
+> JIT in the same process, never in a fresh single-method process or under
+> `--nojit`. See
+> `docs/known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
 
 **Status: OPEN, genuine CratonVM bug.** Confirmed via HotSpot diff (fails on CratonVM,
 100% clean on real HotSpot JDK 25, byte-identical SQL text and bound parameters both

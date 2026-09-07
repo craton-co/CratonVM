@@ -1848,6 +1848,118 @@ pub fn set_watched_referents(addrs: &[usize]) {
 /// continuously in compiled code that is the one door to the moving arm that
 /// no ledger guards, so it has to be countable separately from an accepted
 /// handshake.
+/// Register words captured from a FROZEN peer, for the stale-register pairing.
+///
+/// `(os_tid, register index, value)`. The whole GPR block is recorded, not just
+/// the words a root filter accepted: the question is whether a peer resumes
+/// holding an address the collector MOVED, and pre-filtering with the same
+/// predicate the collector already trusts would beg it.
+///
+/// Empty and untouched unless `CRATONVM_DBG_PEER_REG_PAIRING` is set.
+pub static PEER_REG_CAPTURE: parking_lot::Mutex<Vec<(u32, u8, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Peer register words that turned out to name a RELOCATED object.
+///
+/// The counter behind the pairing §10.11 asked for: a frozen peer's registers
+/// are not heap, not frame-band memory, and are never rewritten by a Cheney
+/// copy, so a non-zero reading is a thread that will resume with a pointer to
+/// an address the collection vacated.
+pub static PEER_REG_STALE: AtomicU64 = AtomicU64::new(0);
+
+/// Stack words rewritten in still-frozen peers by the opt-in repair.
+pub static PEER_STACK_WORDS_REMAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one frozen peer's register word. No-op unless the pairing is armed.
+/// Default-ON. `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP=1` restores the
+/// pre-2026-09-07 behaviour, where a blocked peer resumed with its
+/// conservatively-scanned stack words still at their pre-move addresses.
+pub fn blocked_peer_stack_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP").is_none()
+    })
+}
+
+/// `(os_tid, addr, value)` for every native-stack word this cycle's
+/// cross-thread scan resolved to a heap object. Drained by
+/// `ThreadRegistry::fold_pointer_map_into_blocked_audited`, which moves each
+/// entry onto its owning blocked thread.
+static PEER_STACK_SLOTS: parking_lot::Mutex<Vec<(u32, usize, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Engagement census for the blocked-peer native-stack remap. `CAPTURED` is the
+/// denominator; `WRITTEN` is the repair actually storing a new address; and
+/// `SKIPPED` is the wake guard declining because the word no longer reads its
+/// captured value (the native call reused it). A run with `written=0` did not
+/// exercise the repair at all, and no conclusion may be drawn from its result.
+pub static PEER_STACK_SLOTS_CAPTURED: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_ADOPTED: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+pub static PEER_STACK_SLOTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one scanned native-stack word and the address it lives at.
+pub fn record_peer_stack_slot(os_tid: u32, addr: usize, value: usize) {
+    if !blocked_peer_stack_remap_enabled() {
+        return;
+    }
+    let mut g = PEER_STACK_SLOTS.lock();
+    // Bounded. A runaway capture would cost the pause it is trying to make
+    // correct; the observed population is 19-91 words per cycle.
+    if g.len() < 65536 {
+        g.push((os_tid, addr, value));
+        PEER_STACK_SLOTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Drain the cycle's captures. Called once per collection by the fold.
+pub fn take_peer_stack_slots() -> Vec<(u32, usize, usize)> {
+    let mut g = PEER_STACK_SLOTS.lock();
+    std::mem::take(&mut *g)
+}
+
+/// Discard the cycle's captures without applying them -- for the paths that
+/// scan but then do not relocate, so nothing carries into the next cycle.
+pub fn clear_peer_stack_slots() {
+    let mut g = PEER_STACK_SLOTS.lock();
+    g.clear();
+}
+
+pub fn record_peer_reg(os_tid: u32, reg: u8, value: usize) {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    let mut g = PEER_REG_CAPTURE.lock();
+    // Bounded: a runaway capture would change the timing it is measuring.
+    if g.len() < 65536 {
+        g.push((os_tid, reg, value));
+    }
+}
+
+/// Drop the previous cycle's capture. Called where the collection begins, so a
+/// hit is always attributable to the cycle that relocated.
+pub fn clear_peer_reg_capture() {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    PEER_REG_CAPTURE.lock().clear();
+}
+
+/// Take the capture for comparison against this cycle's pointer map.
+pub fn take_peer_reg_capture() -> Vec<(u32, u8, usize)> {
+    let mut g = PEER_REG_CAPTURE.lock();
+    std::mem::take(&mut *g)
+}
+
+/// `CRATONVM_DBG_PEER_REG_PAIRING` — arm the frozen-peer register capture and
+/// the post-evacuation comparison against the pointer map.
+pub fn peer_reg_pairing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PEER_REG_PAIRING").is_some()
+    })
+}
+
 pub static PEER_DEPTH_ZERO_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// The subset of [`PEER_DEPTH_ZERO_TOTAL`] where the process-wide JIT depth

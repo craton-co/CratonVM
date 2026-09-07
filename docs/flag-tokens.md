@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-531 tokens.
+536 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -165,6 +165,7 @@ export inherited from a parent shell.
 | `diag-jca` | `CRATONVM_DIAG_JCA` |
 | `diag-method-invoke-null` | `CRATONVM_DIAG_METHOD_INVOKE_NULL` |
 | `diag-properties` | `CRATONVM_DIAG_PROPERTIES` |
+| `deadrecv` | `CRATONVM_DBG_DEADRECV` |
 | `diag-serviceloader` | `CRATONVM_DIAG_SERVICELOADER` |
 | `dispatch-tally` | `CRATONVM_DBG_DISPATCH_TALLY` |
 | `dopriv` | `CRATONVM_DBG_DOPRIV` |
@@ -217,6 +218,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `peer-reg-pairing` | `CRATONVM_DBG_PEER_REG_PAIRING` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
 | `markclear` | `CRATONVM_DBG_MARKCLEAR` |
@@ -246,6 +248,7 @@ export inherited from a parent shell.
 | `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
 | `fmt-wrongtype` | `CRATONVM_DBG_FMT_WRONGTYPE` |
 | `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
+| `young-mark-watch` | `CRATONVM_DBG_YOUNG_MARK_WATCH` |
 | `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
 | `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
 | `hm-trace` | `CRATONVM_HM_TRACE` |
@@ -289,6 +292,7 @@ export inherited from a parent shell.
 | `jit-code-free` | `CRATONVM_DBG_JIT_CODE_FREE` |
 | `jit-compiled` | `CRATONVM_DBG_JIT_COMPILED` |
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
+| `jit-slot-overlap` | `CRATONVM_DBG_JIT_SLOT_OVERLAP` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
 | `jit-borrow-sites` | `CRATONVM_DBG_JIT_BORROW_SITES` |
@@ -379,6 +383,7 @@ export inherited from a parent shell.
 | `monenter` | `CRATONVM_DBG_MONENTER` |
 | `monexit` | `CRATONVM_DBG_MONEXIT` |
 | `moving-young-band-dbg` | `CRATONVM_MOVING_YOUNG_BAND_DBG` |
+| `relocation-blockers` | `CRATONVM_DBG_RELOCATION_BLOCKERS` |
 | `jit-remap-all-unverifiable` | `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` |
 | `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
 | `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
@@ -597,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-376 tokens.
+390 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -710,6 +715,7 @@ export inherited from a parent shell.
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-phi-home-publish-guard` | `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD` |
 | `ir-phi-edge-interfere` | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
@@ -757,6 +763,18 @@ export inherited from a parent shell.
 | `call-frame-dedupe` | `CRATONVM_JIT_NO_CALL_FRAME_DEDUPE` |
 | `strict-install-epoch` | `CRATONVM_JIT_STRICT_INSTALL_EPOCH` |
 | `deferred-new-retry-blind` | `CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND` |
+| `deferred-new-looks` | `CRATONVM_JIT_DEFERRED_NEW_LOOKS` |
+| `ir-site-trap` | `CRATONVM_JIT_IR_SITE_TRAP` |
+| `ir-scalar-intrinsics` | `CRATONVM_JIT_IR_SCALAR_INTRINSICS` |
+| `ir-aastore` | `CRATONVM_JIT_IR_AASTORE` |
+| `ir-check-elim` | `CRATONVM_JIT_IR_CHECK_ELIM` |
+| `ir-bce-range` | `CRATONVM_JIT_IR_BCE_RANGE` |
+| `ir-hot-layout` | `CRATONVM_JIT_IR_HOT_LAYOUT` |
+| `ir-list-sched` | `CRATONVM_JIT_IR_LIST_SCHED` |
+| `ir-unroll-unreachable-frames` | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES` |
+| `c2-accept` | `CRATONVM_C2_ACCEPT` |
+| `c2-accept-memo` | `CRATONVM_C2_ACCEPT_MEMO` |
+| `ir-unresolved-class-trap` | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` |
 | `ir-ls-loop-weight` | `CRATONVM_JIT_IR_LS_LOOP_WEIGHT` |
 | `ir-param-copy` | `CRATONVM_JIT_IR_PARAM_COPY` |
 | `ir-rpo-layout` | `CRATONVM_JIT_IR_RPO_LAYOUT` |
@@ -924,6 +942,7 @@ export inherited from a parent shell.
 | `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
 | `tier-pgo` | `CRATONVM_TIER_PGO` |
 | `tier-pgo-receivers` | `CRATONVM_TIER_PGO_RECEIVERS` |
+| `tier-pgo-c2-window` | `CRATONVM_TIER_PGO_C2_WINDOW` |
 | `tiered` | `CRATONVM_TIER_ENABLED` |
 | `tlab-zero-elision` | `CRATONVM_NO_JIT_TLAB_ZERO_ELISION` |
 | `trivial-getter` | `CRATONVM_TRIVIAL_GETTER` |
@@ -980,7 +999,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-168 tokens.
+171 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -992,6 +1011,8 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
+| `remap-frozen-peer-stacks` | `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS` |
+| `hold-helper-peers` | `CRATONVM_GC_HOLD_HELPER_PEERS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
@@ -1001,6 +1022,7 @@ export inherited from a parent shell.
 | `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `zgc-jit-blanket-refusal` | `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` |
 | `blocked-wake-jit-remap` | `CRATONVM_BLOCKED_WAKE_JIT_REMAP` |
+| `blocked-peer-stack-remap` | `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP` |
 | `zgc-unrewritable-peer-refuses` | `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
@@ -1155,10 +1177,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-29 tokens.
+30 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `props-unrooted-receivers` | `CRATONVM_PROPS_UNROOTED_RECEIVERS` |
 | `bytebuffer-intrinsic` | `CRATONVM_BYTEBUFFER_INTRINSIC` |
 | `itr-bytecode` | `CRATONVM_ITR_BYTECODE` |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |

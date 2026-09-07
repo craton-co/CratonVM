@@ -422,6 +422,12 @@ mod frame_trace_request_tests {
 /// the frozen peers' reserved tails to walk and free-list.
 fn retire_skip_spans_and_resume(shared: &SharedVm, taken: crate::jit::xt_root_scan::TakenOver) {
     shared.mem.heap.clear_jit_tlab_skip_regions();
+    // Helper-window peers held across the copy (opt-in) are released here too.
+    // This is the paired retire for the SECOND freeze population, and it lives
+    // in the same function for the same reason the skip-span clear does: a
+    // handle left suspended is a thread that never runs again, and nine exits
+    // each remembering it independently is how the ninth one forgot.
+    crate::jit::xt_root_scan::resume_held_helper_peers();
     crate::jit::xt_root_scan::resume(taken);
 }
 
@@ -1578,6 +1584,13 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // tails. A resumed peer that immediately requests the next
                 // GC blocks until `complete_gc` anyway (the barrier is still
                 // closed here), so the reorder introduces no new window.
+                // OPT-IN repair, and it must precede the resume: this is the
+                // only window in which the peers are still frozen AND the
+                // pointer map is complete. See
+                // `xt_root_scan::remap_frozen_peer_stacks` for why it is
+                // opt-in rather than default -- it writes conservatively-read
+                // words, which is a different assertion from reading them.
+                crate::jit::xt_root_scan::remap_frozen_peer_stacks(&taken, &result.pointer_map);
                 retire_skip_spans_and_resume(shared, taken);
                 // Signal all threads with the pointer map
                 shared.mem.gc_barrier.complete_gc(result.pointer_map);
@@ -1893,6 +1906,8 @@ pub(super) fn maybe_gc_forced_at(
             crate::runtime::ec_watch::remap(shared.vm_identity, &result.pointer_map);
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
+            // OPT-IN repair; must precede the resume (see site A above).
+            crate::jit::xt_root_scan::remap_frozen_peer_stacks(&taken, &result.pointer_map);
             retire_skip_spans_and_resume(shared, taken);
             shared.mem.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
@@ -2194,6 +2209,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
+            // OPT-IN repair; must precede the resume (see site A above).
+            crate::jit::xt_root_scan::remap_frozen_peer_stacks(&taken, &result.pointer_map);
             retire_skip_spans_and_resume(shared, taken);
             shared.mem.gc_barrier.complete_gc(result.pointer_map);
         } else {

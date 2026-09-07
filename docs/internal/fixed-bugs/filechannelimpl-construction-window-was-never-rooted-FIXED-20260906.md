@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | FIXED 2026-09-06 — the producer is `native_fcimpl_open`, not the collector. |
 | **Scope** | `native-io`'s `sun/nio/ch/FileChannelImpl` construction bridge. Worst under `--XX:UseGc Generational` (the non-moving young sweep ZEROES an unrooted object) but the same window is a stale-local hazard under every moving collector. |
-| **Was** | the "The defect" and "The lead" halves of `known-issues/springboot/generational-non-moving-sweep-zeroes-a-live-filechannel-20260906.md` |
+| **Was** | the "The defect" and "The lead" halves of `known-issues/springboot/generational-young-sweep-frees-an-interpreter-held-object-20260906.md` |
 | **Still open** | that page's REMAINING half — the Kafka test also fails for a reason none of these arms touched. See "What this does not fix". |
 
 ## What it was
@@ -37,6 +37,68 @@ Generational collector's NON-MOVING young sweep it is worse: an unreachable
 object is not moved, it is **zeroed in place**, and the channel comes back with
 `fd` 0 — `FileChannel.map: invalid fd`.
 
+## A SECOND, independent instance of the same window, one layer up
+
+`native_fcimpl_open` is not the only unrooted `FileChannelImpl` construction.
+`FileSystemProvider.newFileChannel` — the native `FileChannel.open` dispatches
+to, registered in `native-builtins/src/phases_late/nio_file.rs` — had BOTH
+halves of the family in one closure, and survived the 34-site sweep in
+`a189643cc`:
+
+* it allocated a `java.io.FileDescriptor`, then allocated a path `String`, then
+  ran `FileChannelImpl`'s class initializer, and only then passed the
+  descriptor into `FileChannelImpl.open` — the same unrooted window this page
+  describes, with the same victim class;
+* and it read `args.get(2)` (the `Set<OpenOption>`) AFTER `p57_read_path`
+  allocated, then dereferenced it twice — the argument-snapshot shape from
+  `native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+
+### Why the audit missed THIS one, which is a different reason
+
+This page's answer is scope: `native-io/src` was outside the 2026-08-25 run.
+That does not explain this site, which is in `native-builtins/src` and so was
+inside both that run and `a189643cc`'s.
+
+The reason is structural: it is a **closure registered inside
+`register_phase57_nio_file`**, and both `scripts/unpinned-native-local-audit.py`
+and `scripts/stale-receiver-audit.py` index by top-level `fn`. Everything in a
+13,000-line `register_*` function is attributed to that one name. The audit's
+own docs already record the symptom from the other direction — "23 `#[test]`
+bodies in lang_string.rs were reported under `register_phase52_string_buffer`" —
+but the consequence for REGISTERED NATIVES, which is where most of them live,
+was not drawn. Any rule that indexes by `fn` sees a fraction of this tree's
+natives.
+
+### A local reproducer, no Kafka and no Azure
+
+`test_classes/gc/NioChannelChurn.java` opens a `FileChannel` in a loop while
+background threads allocate. The concurrency is load-bearing: a single-threaded
+loop only collects where it itself allocates, and this window is inside the
+native — which is why the original report needed a broker and this needs 30
+seconds.
+
+```bash
+cratonvm --java-home <jdk25> -cp test_classes/gc -Xmx32m     -XX:+UseGenerationalGC NioChannelChurn 300 200 4
+```
+
+| arm | before | after |
+|---|---|---|
+| Generational | 4/5 crash | **0/5** |
+| Generational `--nojit` | 5/5 crash | **0/5** |
+| `OpenCloseOnly` (no `size()`/`read()`), Gen `--nojit` | 5/5 crash | **0/5** |
+| `ChurnOnly` — same allocations, same threads, NO file I/O | 0/5 | 0/5 |
+| ZGC, G1, HotSpot | pass | pass |
+
+`ChurnOnly` is the control that attributes the crash to the file path rather
+than to the churn. The two halves were landed and measured separately: the
+allocation half alone took Generational from 4/5 to 1/5 and left `--nojit` at
+5/5, which is what said a second producer was still there.
+
+**This does not close the Kafka test either** — `3d8c8edd8` ruled the
+argument-snapshot mechanism out for it at 6/8 on the tip, and these producers
+fail under `--nojit`, where that test passes. Same family, same path, same
+symptom; a different failure.
+
 ## Why the audit missed it
 
 The `unpinned-native-locals-audit-48-fixed-20260825` write-up defines this exact
@@ -57,7 +119,7 @@ Both functions now use `NativeHandleScope`, the discipline `NativeContext`
 documents for this: a handle is an opaque slot rather than an `ObjectRef`, so
 the pre-GC local cannot be read back by mistake, and `handle_slots` is scanned
 as a root set by `roots.rs`. Every handle is re-read immediately before each use
-— `set_field_by_name` resolves a field name and can itself allocate. The two
+— uniformly, rather than reasoning per store about which calls can collect. The two
 ad-hoc `pin_native_root`/`read_native_pin` pairs are gone; the scope subsumes
 them.
 
@@ -67,6 +129,23 @@ line stores.
 
 Re-running the audit's rule over the patched file reports no unrooted binding
 that survives an allocating call.
+
+## A claim in the first version of this page was wrong
+
+It said the handles are re-read before each use because "`set_field_by_name`
+resolves a field name and can itself allocate". **It cannot.**
+`NativeContextImpl::set_field_by_name` takes `&self`, resolves a field index out
+of the class store under a read lock, and stores through `heap.set_field`. It
+neither allocates nor runs Java.
+
+The re-reads are still there and are still correct — re-reading a handle costs a
+slot load and removes the need to be right about which of the trait's ~600
+methods can collect — but the reason given for them was false, and a later
+reader sizing a window around "field stores can collect" would have got it
+wrong. The `native-io` audit that followed depends on the opposite fact:
+`set_field_by_name` is deliberately NOT in its GC-capable set, which is what
+keeps the window between an allocation and the stores that follow it small
+enough to read.
 
 ## Measurement
 

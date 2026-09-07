@@ -278,10 +278,11 @@ ALL RUNTIME STRESS SCENARIOS PASSED
 6/6 (it gained a gate), `jit-writer-stale.sh` is 5/5, and
 `cargo test -p cratonvm-vm --features gpu-offload --lib` is 2717 passed.
 
-`residency-gc.sh` is RED, and not for anything on this page — see
-[a new page](../../known-issues/gpu/residency-gc-generational-sigsegv-20260906.md).
-It is deterministic rather than intermittent, it needs the JIT and OSR,
-and it reproduces identically with this page's subsystem untouched.
+`residency-gc.sh` was RED, and not for anything on this page: a stale native
+argument snapshot across a Java re-entry, fixed the same day — see
+[native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md](../fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md).
+It needed neither the GPU nor this page's subsystem: plain Generational with
+the JIT on reproduces it with no `--gpu` anywhere.
 
 ## The shape, restated because it earned it
 

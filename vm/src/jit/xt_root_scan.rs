@@ -562,7 +562,12 @@ mod imp {
 
     /// Conservatively scan a frozen peer's integer registers and used stack,
     /// pushing every value that resolves to a live object onto `roots`.
-    unsafe fn scan_context<F>(ctx: &[u8; CTX_SIZE], is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    unsafe fn scan_context<F>(
+        ctx: &[u8; CTX_SIZE],
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        os_tid: u32,
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -572,6 +577,15 @@ mod imp {
         let mut off = OFF_GPR_LO;
         while off <= OFF_GPR_HI {
             let v = *(ctx.as_ptr().add(off) as *const u64) as usize;
+            // Pairing capture: EVERY word, before any root filter. These
+            // registers are not heap and not frame-band memory, and a Cheney
+            // copy never rewrites them, so if one names an object this cycle
+            // relocates, the peer resumes holding a vacated address.
+            cratonvm_gc::gc_quiescence::record_peer_reg(
+                os_tid,
+                ((off - OFF_GPR_LO) / 8) as u8,
+                v,
+            );
             if let Some(o) = is_obj(v) {
                 roots.push(o);
                 found += 1;
@@ -590,6 +604,17 @@ mod imp {
             // and the peer is frozen, so the words are stable for this read.
             let w = *(p as *const usize);
             if let Some(o) = is_obj(w) {
+                // Pairing capture, STACK side -- the JIT spill slots the
+                // `CompiledUninterruptible` comment names alongside registers.
+                // Gated on `is_obj` rather than taking every word: a
+                // `pointer_map` key is by construction an object this cycle
+                // relocated, so the collector's own object test accepts it,
+                // and the alternative is millions of words per peer. Register
+                // 0xff marks the stack side.
+                // 0xfe = TAKE-OVER stack (peer held frozen for the whole
+                // collection); 0xff = helper window (suspended and resumed
+                // inside root gathering, before anything relocates).
+                cratonvm_gc::gc_quiescence::record_peer_reg(os_tid, 0xfe, w);
                 roots.push(o);
                 found += 1;
             }
@@ -715,7 +740,7 @@ mod imp {
         let in_jit = ranges.iter().any(|&(e, end)| rip >= e && rip < end);
         if in_jit {
             // Pure JIT instruction stream → holds no VM lock → safe to freeze.
-            let found = scan_context(&ctx.0, is_obj, roots);
+            let found = scan_context(&ctx.0, is_obj, roots, tid);
             Some((h, found)) // keep suspended; caller records the handle
         } else {
             // Interpreter / native / already parked → let it arrive cooperatively.
@@ -828,6 +853,12 @@ mod imp {
                         // byte-aligned.
                         let v = unsafe { (ctx.as_ptr().add(off) as *const u64).read_unaligned() }
                             as usize;
+                        // Pairing capture -- see the take-over path.
+                        cratonvm_gc::gc_quiescence::record_peer_reg(
+                            tid,
+                            ((off - OFF_GPR_LO) / 8) as u8,
+                            v,
+                        );
                         if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                             has_jit = true;
                         }
@@ -841,6 +872,37 @@ mod imp {
                     let words = (0..band_len / 8).map(|i| unsafe {
                         (band.as_ptr().add(i * 8) as *const usize).read_unaligned()
                     });
+                    // Pairing capture, helper-window stack side. Same gate and
+                    // same 0xff marker as the take-over path.
+                    {
+                        // The band is a COPY of `[rsp, committed_region_end)`,
+                        // so the peer's real address for word `i` is
+                        // `rsp + i*8` -- which is what the blocked-wake fixup
+                        // has to store into. `snapshot_peer` copies from `rsp`,
+                        // so the base is the context's Rsp.
+                        // SAFETY: `ctx` is a fully-initialized CONTEXT copy.
+                        let peer_rsp = unsafe {
+                            (ctx.as_ptr().add(OFF_RSP) as *const u64).read_unaligned()
+                        } as usize;
+                        let pairing = cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled();
+                        for i in 0..band_len / 8 {
+                            let w = unsafe {
+                                (band.as_ptr().add(i * 8) as *const usize).read_unaligned()
+                            };
+                            if is_obj(w).is_some() {
+                                if pairing {
+                                    cratonvm_gc::gc_quiescence::record_peer_reg(tid, 0xff, w);
+                                }
+                                if peer_rsp != 0 {
+                                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(
+                                        tid,
+                                        peer_rsp + i * 8,
+                                        w,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     has_jit |=
                         classify_helper_window_words(words, &ranges, is_obj, &mut candidates);
                     if has_jit {
@@ -986,8 +1048,14 @@ mod imp {
                 // frozen, so the copy reads stable memory; the destination
                 // capacity was checked above.
                 core::ptr::copy_nonoverlapping(rsp as *const u8, band.as_mut_ptr(), len);
-                ResumeThread(h);
-                CloseHandle(h);
+                if hold_helper_peers_enabled() {
+                    // Keep it frozen: its spill slots are repaired after the
+                    // copy, and `resume_held_helper_peers` releases it.
+                    HELD_HELPER_PEERS.lock().push(h);
+                } else {
+                    ResumeThread(h);
+                    CloseHandle(h);
+                }
                 // SAFETY: `len` bytes were just initialized above.
                 band.set_len(len);
                 return Some((ctx.0, len));
@@ -1002,6 +1070,168 @@ mod imp {
 
     /// Resume + close every taken-over peer. Called after the collection has
     /// completed and the heap is consistent again.
+    /// Helper-window peers deliberately LEFT SUSPENDED across the copy.
+    ///
+    /// The default protocol resumes each helper-window peer inside
+    /// `snapshot_peer`, as soon as its stack has been copied — long before
+    /// anything relocates. That is why §11's stale words are unreachable: by
+    /// the time `pointer_map` exists, those threads are running again, and
+    /// every one of the 588-684 stale words a run belongs to them (take-over
+    /// peers contribute ZERO).
+    ///
+    /// **This is a protocol change, and the risk is DEADLOCK, not latency.**
+    /// `take_over_pass` holds a peer across the collection only when its `Rip`
+    /// is in a JIT code range, on the stated grounds that a pure JIT
+    /// instruction stream "holds no VM lock — safe to freeze". A helper-window
+    /// peer is the opposite case by construction: it is blocked in a native
+    /// with compiled frames below it. If one owns a lock the collection needs
+    /// while it is copying — class metadata, the arena, an allocation lock —
+    /// the collector blocks forever on a thread it suspended itself, inside a
+    /// stop-the-world where no watchdog will fire.
+    ///
+    /// The argument that it is safe is that a thread in a blocked region is
+    /// already GC-safe and has published its state. That is an argument, not a
+    /// proof, which is why this is opt-in
+    /// (`CRATONVM_GC_HOLD_HELPER_PEERS=1`) and why a HANG in its A/B counts as
+    /// a failure of the change and not as noise.
+    static HELD_HELPER_PEERS: parking_lot::Mutex<Vec<isize>> = parking_lot::Mutex::new(Vec::new());
+
+    /// `CRATONVM_GC_HOLD_HELPER_PEERS` — keep helper-window peers suspended
+    /// from their snapshot until after the copy, so their spill slots can be
+    /// repaired. See [`HELD_HELPER_PEERS`] for the deadlock hazard.
+    fn hold_helper_peers_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_GC_HOLD_HELPER_PEERS").is_some()
+        })
+    }
+
+    /// Resume + close every helper-window peer held across the copy.
+    ///
+    /// MUST run on every exit from a collection that ran `helper_window_pass`,
+    /// including the error paths: a handle left here is a thread that never
+    /// runs again.
+    pub fn resume_held_helper_peers() -> usize {
+        let mut g = HELD_HELPER_PEERS.lock();
+        let n = g.len();
+        for &h in g.iter() {
+            // SAFETY: each handle was opened and suspended by `snapshot_peer`
+            // and has not been closed since.
+            unsafe {
+                ResumeThread(h);
+                CloseHandle(h);
+            }
+        }
+        g.clear();
+        if n > 0 && dbg() {
+            eprintln!("[xt-jit-roots] resumed {n} held helper-window peer(s)");
+        }
+        n
+    }
+
+    /// Rewrite a still-frozen peer's stack words that name objects this
+    /// collection RELOCATED.
+    ///
+    /// §11 measured the defect this repairs: the peer's JIT spill slots hold
+    /// 84-684 vacated addresses a run, nothing in the collector rewrites them,
+    /// and the peer resumes and dereferences one. The window is exactly here —
+    /// after the copy has produced a complete `pointer_map`, and before
+    /// `resume` lets the peer read its own stack again.
+    ///
+    /// **SOUNDNESS, stated plainly, because this is the whole problem.** A
+    /// frozen peer is not at a safepoint, so no precise oop map exists for its
+    /// pc; that is *why* its roots are conservative. Reading such a word as a
+    /// root only asserts "this MIGHT be a pointer, so keep the target alive",
+    /// which over-retains at worst. Writing it asserts "this IS a pointer",
+    /// and a `usize` that merely happens to equal a relocated object's address
+    /// — a length, a hash, an index — is silently corrupted instead.
+    ///
+    /// So this is not the free repair it looks like. It trades a certain
+    /// use-after-free for a rare wrong value, and it is OPT-IN
+    /// (`CRATONVM_GC_REMAP_FROZEN_PEER_STACKS=1`) for that reason. The sound
+    /// repairs are the two the architecture already names: refuse the cycle
+    /// (`unrewritable_conservative_jit_roots`, today's default) or pin the
+    /// object, which G1 and ZGC do and a Cheney copy structurally cannot.
+    ///
+    /// Registers are deliberately NOT rewritten. §11 measured zero stale
+    /// register words over ~176 relocating cycles, so there is nothing there
+    /// to repair, and `SetThreadContext` would need an access right this
+    /// handle was not opened with.
+    ///
+    /// Returns `(peers_visited, words_rewritten)`.
+    pub fn remap_frozen_peer_stacks(
+        taken: &TakenOver,
+        map: &cratonvm_types::PointerMap,
+    ) -> (usize, usize) {
+        if map.is_empty() || !remap_frozen_stacks_enabled() {
+            return (0, 0);
+        }
+        if taken.handles.is_empty() && HELD_HELPER_PEERS.lock().is_empty() {
+            return (0, 0);
+        }
+        let mut peers = 0usize;
+        let mut words = 0usize;
+        // Take-over peers AND any helper-window peers held across the copy.
+        // §11 measured every stale word in the second group, so a repair that
+        // walks only the first is the one that reported zero.
+        let held = HELD_HELPER_PEERS.lock().clone();
+        let all: Vec<isize> = taken.handles.iter().copied().chain(held).collect();
+        for (i, &h) in all.iter().enumerate() {
+            // SAFETY: the peer is still suspended (resume has not run), so its
+            // context and stack are stable for the duration of this walk.
+            unsafe {
+                #[repr(C, align(16))]
+                struct Ctx([u8; CTX_SIZE]);
+                let mut ctx = Ctx([0u8; CTX_SIZE]);
+                *(ctx.0.as_mut_ptr().add(OFF_FLAGS) as *mut u32) = CONTEXT_CONTROL_INTEGER;
+                if GetThreadContext(h, ctx.0.as_mut_ptr()) == 0 {
+                    continue;
+                }
+                let rsp = *(ctx.0.as_ptr().add(OFF_RSP) as *const u64) as usize;
+                if rsp == 0 || rsp & 0x7 != 0 {
+                    continue;
+                }
+                peers += 1;
+                let end = committed_region_end(rsp);
+                let mut q = rsp;
+                while q + 8 <= end {
+                    let w = *(q as *const usize);
+                    if let Some(&new) = map.get(&w) {
+                        // Same-process write to a frozen thread's stack.
+                        *(q as *mut usize) = new;
+                        words += 1;
+                    }
+                    q += 8;
+                }
+                let _ = i;
+            }
+        }
+        if dbg() {
+            // Printed even at zero, and with the population size: a silent
+            // zero cannot distinguish "nothing was stale" from "this repair
+            // never saw the threads that are".
+            eprintln!(
+                "[xt-jit-roots] remap: takeover={} held_helper={} peers_walked={peers} \
+                 words={words} map={}",
+                taken.handles.len(),
+                HELD_HELPER_PEERS.lock().len(),
+                map.len(),
+            );
+        }
+        cratonvm_gc::gc_quiescence::PEER_STACK_WORDS_REMAPPED
+            .fetch_add(words as u64, std::sync::atomic::Ordering::Relaxed);
+        (peers, words)
+    }
+
+    /// `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS` — opt-in; see
+    /// [`remap_frozen_peer_stacks`] for why this is not on by default.
+    fn remap_frozen_stacks_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_GC_REMAP_FROZEN_PEER_STACKS").is_some()
+        })
+    }
+
     pub fn resume(taken: TakenOver) {
         for &h in &taken.handles {
             unsafe {
@@ -1019,7 +1249,10 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{helper_window_pass, resume, take_over_pass};
+pub use imp::{
+    helper_window_pass, remap_frozen_peer_stacks, resume, resume_held_helper_peers,
+    take_over_pass,
+};
 
 // ---------------------------------------------------------------------------
 // Linux x86-64 implementation (signal rendezvous)
@@ -1382,9 +1615,13 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut found = 0usize;
-        for reg in &slot.regs {
+        let pair_tid = slot.tid.load(Ordering::Acquire);
+        for (ri, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if let Some(o) = is_obj(v) {
+                // LINUX arm of `CRATONVM_DBG_PEER_REG_PAIRING` (§11 built the
+                // Windows one). Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, ri as u8, v);
                 roots.push(o);
                 found += 1;
             }
@@ -1401,6 +1638,11 @@ mod imp {
         while p + 8 <= end {
             let w = unsafe { (p as *const usize).read_unaligned() };
             if let Some(o) = is_obj(w) {
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
+                // THE REPAIR: this word lives at `p` in the peer's own stack
+                // and nothing else will ever rewrite it. Hand the address to
+                // the blocked-wake fixup.
+                cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid, p, w);
                 roots.push(o);
                 found += 1;
             }
@@ -1439,12 +1681,15 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut has_jit = false;
-        for reg in &slot.regs {
+        let pair_tid_hw = slot.tid.load(Ordering::Acquire);
+        for (ri_hw, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                 has_jit = true;
             }
             if let Some(o) = is_obj(v) {
+                // Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, ri_hw as u8, v);
                 candidates.push(o);
             }
         }
@@ -1463,6 +1708,8 @@ mod imp {
                 has_jit = true;
             }
             if let Some(o) = is_obj(w) {
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
+                cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid_hw, p, w);
                 candidates.push(o);
             }
             p += 8;
@@ -1814,6 +2061,21 @@ mod imp {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use imp::{helper_window_pass, resume, take_over_pass};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Not implemented off Windows.
+///
+/// The repair needs the peer's stack rewritten while it is still frozen, and
+/// the freeze mechanism differs per platform (a signal handler on Linux, a
+/// suspend/`GetThreadContext` on Windows). Only the Windows path is written and
+/// measured, so the others return `(0, 0)` rather than pretend. A caller that
+/// gets zeros on Linux is getting the truth: nothing was repaired there.
+pub fn remap_frozen_peer_stacks(
+    _taken: &TakenOver,
+    _map: &cratonvm_types::PointerMap,
+) -> (usize, usize) {
+    (0, 0)
+}
+
 
 // ---------------------------------------------------------------------------
 // Non-Windows stubs (the OS-suspend primitive is Windows-only here)
@@ -1829,6 +2091,21 @@ where
 
 #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn resume(_taken: TakenOver) {}
+
+/// Not implemented on this platform -- see the Linux stub for why zeros here
+/// are the honest answer rather than a no-op that reads as success.
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn resume_held_helper_peers() -> usize {
+    0
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
+pub fn remap_frozen_peer_stacks(
+    _taken: &TakenOver,
+    _map: &cratonvm_types::PointerMap,
+) -> (usize, usize) {
+    (0, 0)
+}
 
 #[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn helper_window_pass<F>(

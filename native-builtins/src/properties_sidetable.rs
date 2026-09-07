@@ -48,7 +48,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::BuildHasherDefault;
 use std::sync::OnceLock;
 
-use cratonvm_native_api::registry::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::registry::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -2152,15 +2152,40 @@ fn native_properties_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if let (Some(ks), Some(vs)) = (ks_opt.as_ref(), vs_opt.as_ref()) {
         if !ks.is_empty() {
             // String→String: store in side-table AND CHM (existing path).
-            let prev = get_kv_units(ctx, this, ks);
-            put_kv_units(ctx, this, ks, vs);
-            mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
-            if is_system_props(ctx, this) {
-                let _ = ctx.set_system_property(&ks.to_lossy(), &vs.to_lossy());
+            //
+            // THE RECEIVER IS ROOTED ACROSS THIS BLOCK, and it held nothing
+            // before — this function had no pin at all. Two of the four calls
+            // below allocate: `put_kv_units` inflates a monitor to read the
+            // receiver's identity hash, and
+            // `mirror_loaded_entries_to_properties_backend` runs real `put`
+            // bytecode. So the receiver can be moved or freed between them,
+            // and everything after `put_kv_units` — the mirror, the
+            // system-props test — was reading a pre-GC address. The side-table
+            // key is DERIVED from that identity (`key_for`), so the two
+            // outcomes are a dereference of a dead header and an entry
+            // scattered across two keys, whichever the collector gets to
+            // first. `get_kv_units`, `read_java_text` and `is_system_props`
+            // take `&dyn NativeContext` and are not GC points; the refreshes
+            // are placed for the two that are.
+            let mut scope = NativeHandleScope::new(ctx);
+            let this_h = scope.root(this);
+            let unrooted = props_unrooted_receivers();
+            let at = if unrooted { this } else { scope.get(&this_h) };
+            let prev = get_kv_units(&*scope, at, ks);
+            put_kv_units(&mut *scope, at, ks, vs);
+            let at = if unrooted { this } else { scope.get(&this_h) };
+            mirror_loaded_entries_to_properties_backend(
+                &mut *scope,
+                at,
+                &[(ks.clone(), vs.clone())],
+            );
+            let at = if unrooted { this } else { scope.get(&this_h) };
+            if is_system_props(&*scope, at) {
+                let _ = scope.set_system_property(&ks.to_lossy(), &vs.to_lossy());
             }
             return Ok(Some(match prev {
                 Some(p) => {
-                    let s = create_property_string(ctx, &p);
+                    let s = create_property_string(&mut *scope, &p);
                     Value::Object(Some(s))
                 }
                 None => Value::Object(None),
@@ -3529,26 +3554,35 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// Collect this Properties object's own String keys (side-table + CHM-exclusive
 /// non-String-valued entries), de-duplicating into `seen`/`out`. Mirrors the
 /// key set `native_properties_keys` exposes for a single object.
+/// `this` is `&mut` for the reason [`ordered_snapshot_kv`] states on its own
+/// parameter: this function re-enters Java twice and the receiver can be moved
+/// or freed under it, so the refresh has to reach the CALLER's variable. It
+/// used to take `ObjectRef` by value and shadow it (`let mut this = this;`),
+/// which satisfied that `&mut` with a COPY and threw the refreshed address away
+/// at the return — while its one caller went on to read `defaults` out of the
+/// pre-GC address. That was a SIGSEGV in `gen_heap::get_field`.
 fn collect_own_property_names(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
     seen: &mut std::collections::HashSet<JavaText>,
     out: &mut Vec<JavaText>,
 ) {
-    let mut this = this;
-    for (k, _v) in ordered_snapshot_kv(ctx, &mut this) {
+    for (k, _v) in ordered_snapshot_kv(ctx, this) {
         if seen.insert(k.clone()) {
             out.push(k);
         }
     }
-    let side = side_key_set(ctx, this);
-    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+    let side = side_key_set(ctx, *this);
+    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, *this, &side) {
         if let Some(s) = kstr {
             if seen.insert(s.clone()) {
                 out.push(s);
             }
         }
     }
+    // `chm_extra_entries` is the second GC point and nothing here uses the
+    // receiver after it, so `*this` is left as `ordered_snapshot_kv` refreshed
+    // it. The caller does not rely on that: it re-reads its own handle.
 }
 
 /// Native `Properties.propertyNames()Ljava/util/Enumeration;` — unlike
@@ -3562,6 +3596,22 @@ fn collect_own_property_names(
 /// lost `defaults`-supplied entries). Walk the receiver then recurse through
 /// `defaults`, de-duplicating by name. `getProperty` already honours the same
 /// chain via `props_defaults`.
+/// `CRATONVM_PROPS_UNROOTED_RECEIVERS`: carry a pre-GC receiver across a GC
+/// point again, the way four sites in this file did until 2026-09-06 —
+/// `propertyNames`' `defaults` walk, both batched-store loops in `putAll`, and
+/// `put`'s mirror/system-props tail.
+///
+/// A BISECTION LEVER, not a tuning knob: what it restores is a
+/// use-after-collect, so that the before and after of its fix are two runs of
+/// ONE binary. Measured on the Kafka reproducer this page names, `--nojit`
+/// under the Generational collector.
+fn props_unrooted_receivers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_PROPS_UNROOTED_RECEIVERS").is_some()
+    })
+}
+
 fn native_properties_property_names(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3579,12 +3629,36 @@ fn native_properties_property_names(
     let mut out: Vec<JavaText> = Vec::new();
     // Walk the receiver and its defaults chain. A depth cap guards against a
     // pathological self-referential `defaults` field (the JDK chain is acyclic).
+    // EVERY CHAIN NODE IS ROOTED, AND RE-READ BEFORE EVERY USE.
+    //
+    // Both calls in this loop body re-enter Java: `props_first_non_string_key`
+    // and `collect_own_property_names` each reach `chm_extra_entries`, which
+    // invokes `entrySet`/`iterator`/`next`. So each is a GC point, and a bare
+    // `ObjectRef` loop variable carried across one is a pre-GC address. Under
+    // the Generational collector that is fatal in BOTH directions, and both
+    // were measured: the Cheney cycle can MOVE the node, and the non-moving
+    // young sweep can FREE it outright — a `defaults` link is often the only
+    // reference to the node this walk is standing on, and the walk's own
+    // variable is not a root. The `defaults` read at the bottom of the loop
+    // then dereferenced a vacated or dead header: SIGSEGV in
+    // `gen_heap::get_field` at `header.kind()`, reached from
+    // `Properties.propertyNames()`.
+    //
+    // The handle is the authority, re-read at each use rather than carried.
+    // That is what makes this correct independently of what a callee does with
+    // its own parameter — `collect_own_property_names` looked like it handled
+    // this and did not, because it took the receiver BY VALUE and refreshed
+    // only its copy (see the `&mut` contract `ordered_snapshot_kv` documents).
     let mut cur = Some(this);
     let mut depth = 0;
+    let mut scope = NativeHandleScope::new(ctx);
     while let Some(p) = cur {
         if depth > 64 {
             break;
         }
+        let node = scope.root(p);
+        // The lever: `p` is the pre-GC address the old code carried.
+        let unrooted = props_unrooted_receivers();
         // `Properties.enumerate` is `h.put((String) e.getKey(), e.getValue())`,
         // and that cast is the contract, not a formality: a `Properties`
         // holding a non-String key is already outside the class's invariant,
@@ -3596,14 +3670,19 @@ fn native_properties_property_names(
         // NOT the same rule as `stringPropertyNames`, which filters BY DESIGN
         // (`enumerateStringProperties` skips a non-String key AND a non-String
         // value) and which this file already gets right.
-        if let Some(cname) = props_first_non_string_key(ctx, p) {
-            return Err(props_key_cast_failure(ctx, &cname));
+        let at_node = if unrooted { p } else { scope.get(&node) };
+        if let Some(cname) = props_first_non_string_key(&mut *scope, at_node) {
+            let failure = props_key_cast_failure(&mut *scope, &cname);
+            return Err(failure);
         }
-        collect_own_property_names(ctx, p, &mut seen, &mut out);
-        cur = props_defaults(ctx, p);
+        let mut at_node = if unrooted { p } else { scope.get(&node) };
+        collect_own_property_names(&mut *scope, &mut at_node, &mut seen, &mut out);
+        let at_node = if unrooted { p } else { scope.get(&node) };
+        cur = props_defaults(&*scope, at_node);
         depth += 1;
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)?))))
+    let names = build_enumeration(&mut *scope, out)?;
+    Ok(Some(Value::Object(Some(names))))
 }
 
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
@@ -5154,7 +5233,20 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     this = ctx.read_native_pin(this_pin, this);
     if !snapshot.is_empty() || !other_chm_extra.is_empty() {
         for (k, v) in &snapshot {
+            // REFRESH INSIDE THE LOOP, not merely around it. `put_kv_units`
+            // reaches `key_for` -> `identity_hash_code` ->
+            // `identity_hash_via_monitor`, which INFLATES A MONITOR and so
+            // allocates: every iteration is a GC point. This function refreshes
+            // `this` after each of its other calls and did not refresh here, so
+            // from the second iteration on it handed `put_kv_units` a pre-GC
+            // address and the identity-hash read dereferenced a freed header.
+            if !props_unrooted_receivers() {
+                this = ctx.read_native_pin(this_pin, this);
+            }
             put_kv_units(ctx, this, k, v);
+        }
+        if !props_unrooted_receivers() {
+            this = ctx.read_native_pin(this_pin, this);
         }
         // Mirror into `this`'s real `map` CHM backing too, so the destination
         // stays consistent for generic Map walkers (cf. native_properties_put).
@@ -5292,8 +5384,18 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         ctx.unpin_native_roots(entry_pin);
     }
+    // Refresh inside the loop, for the reason the sibling loop above states:
+    // `put_kv_units` inflates a monitor to read the identity hash, so every
+    // iteration is a GC point and the receiver is pinned precisely so it can be
+    // re-read here.
     for (k, v) in &str_collected {
+        if !props_unrooted_receivers() {
+            this = ctx.read_native_pin(this_pin, this);
+        }
         put_kv_units(ctx, this, k, v);
+    }
+    if !props_unrooted_receivers() {
+        this = ctx.read_native_pin(this_pin, this);
     }
     mirror_loaded_entries_to_properties_backend(ctx, this, &str_collected);
     ctx.unpin_native_roots(this_pin);

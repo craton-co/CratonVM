@@ -3273,7 +3273,11 @@ pub(super) fn compile_osr_artifact(
     }
     if !osr_reused {
         crate::jit::disasm::maybe_dump(
-            "osr",
+            // The DOOR and the BACKEND are different questions and only the
+            // first was ever printed. `used_ir_backend` has recorded the
+            // second all along; a reader chasing a miscompiled body needs both
+            // to know which emitter to go and read.
+            if compiled.used_ir_backend { "osr/ir" } else { "osr/sp" },
             &class_name_arc,
             &method_name_arc,
             &descriptor_arc,
@@ -3663,7 +3667,7 @@ pub(super) fn try_osr(
             // and the disassembly said it had not; the disassembly was of
             // another artifact.
             crate::jit::disasm::maybe_dump(
-                "osr-optimizing",
+                if c.used_ir_backend { "osr-optimizing/ir" } else { "osr-optimizing/sp" },
                 &class_name_arc,
                 &method_name_arc,
                 &descriptor_arc,
@@ -6496,7 +6500,7 @@ pub(super) fn compile_optimizing_artifact(
             );
         }
         crate::jit::disasm::maybe_dump_annotated(
-            "callee",
+            if compiled.used_ir_backend { "callee/ir" } else { "callee/sp" },
             &callee_cached.class_name,
             &callee_cached.method_name,
             &callee_cached.method_descriptor,
@@ -6965,7 +6969,7 @@ pub(super) fn try_jit_upgrade_with_gate(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "upgrade",
+        if compiled_arc.used_ir_backend { "upgrade/ir" } else { "upgrade/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -8500,7 +8504,7 @@ pub(super) fn try_jit_compile_callee_slow(
         );
     }
     crate::jit::disasm::maybe_dump(
-        "full",
+        if compiled.used_ir_backend { "full/ir" } else { "full/sp" },
         &cached.class_name,
         &cached.method_name,
         &cached.method_descriptor,
@@ -8616,6 +8620,48 @@ pub(super) fn try_jit_compile_callee_slow(
     let receiver_key: std::sync::Arc<str> = std::sync::Arc::from(class_name);
     let method_name_key = cached.method_name.clone();
     let method_desc_key = cached.method_descriptor.clone();
+    // A supersede the acceptance gate refused publishes NOTHING.
+    //
+    // The gate discards the optimizing body and `try_compile_inner` falls
+    // through to the single-pass backend, so what reaches this point is an
+    // equivalent of the body already in the cache. Publishing it replaces a C1
+    // body with an equal one AND bumps the process-wide supersede epoch, which
+    // stales every cached invoke target in every thread -- 1,558 evictions on
+    // one H2 run. That is the entire cost the gate exists to avoid, paid in
+    // full by a gate that refused.
+    //
+    // Measured before this: with the gate refusing 571 bodies,
+    // `CRATONVM_C2_SUPERSEDE=0` was still ~5% faster in mean CPU on H2 against
+    // a control pair agreeing to 0.04%.
+    //
+    // Both halves of the condition matter. A REFUSED verdict alone is not
+    // enough: at the eager first-call door there is no predecessor, and
+    // skipping the publish there would leave the method interpreted. `None`
+    // means the method never reached the optimizing pipeline, which is an
+    // absence of opinion rather than a refusal.
+    let refused_supersede = cratonvm_jit::ir_evidence::take_last_verdict() == Some(false)
+        && {
+            let jit_cache = shared.jit.jit_cache.read();
+            jit_cache
+                .get(
+                    &receiver_key,
+                    &method_name_key,
+                    &method_desc_key,
+                    callee_class_id,
+                )
+                .is_some()
+        };
+    if refused_supersede {
+        cratonvm_jit::ir_evidence::note_supersede_abandoned();
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] supersede ABANDONED {}.{}{} -- the optimizing body carried no evidence and a baseline body is already published",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+        return None;
+    }
+
     stamp_compilation_epoch(
         shared,
         &receiver_key,

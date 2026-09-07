@@ -4434,6 +4434,71 @@ fn blocked_wake_jit_remap_enabled() -> bool {
     })
 }
 
+/// Write back the native-stack words a peer collection scanned out of this
+/// thread while it was blocked. Returns how many were stored.
+///
+/// Called from BOTH wake paths. `check_post_block_gc_refs` is the ordinary one;
+/// `apply_pending_blocked_fixups` is the leaked-blocked-region fallback. The
+/// first cut of this repair lived only in the fallback, and the engagement
+/// census said so plainly -- `captured=49916 written=0 skipped=0`.
+pub(crate) fn apply_native_slot_fixups(thread: &mut JvmThread) -> usize {
+    let slots = {
+        let mut n = thread.gc_block_state.native_slots.lock();
+        std::mem::take(&mut *n)
+    };
+    if slots.is_empty() {
+        return 0;
+    }
+    let mut n = 0usize;
+    // THE BLOCKED-PEER NATIVE-STACK WRITE-BACK (2026-09-07).
+    //
+    // These are raw words in THIS thread's own machine stack that a peer
+    // collection scanned conservatively while we were blocked: the objects were
+    // kept alive and RELOCATED, and nothing rewrote the words, because a
+    // blocked thread skips the safepoint-resume `apply_pointer_map_to_thread`
+    // and the pin that was supposed to protect it is a no-op on a Cheney copy
+    // (`VmHeap::Generational::honours_conservative_pins()` is false).
+    //
+    // Running here is what makes the write safe from concurrency: this is the
+    // owning thread, after `leave_blocked_region_flagged` and before it can
+    // re-enter Java or compiled code.
+    //
+    // THE GUARD IS LOAD-BEARING. The scanned band spans the peer's actively
+    // running NATIVE frames, whose C locals churn while it is blocked, so a
+    // word may have been reused since the capture. Only a word that still reads
+    // `orig` is stored into; anything else is left alone. What remains is the
+    // residual every conservative scan carries -- a C value bit-identical to a
+    // young object base that moved -- and it is the same residual
+    // `remap_one_frame_register_images` accepted when it chose to WRITE the
+    // callee-saved GPR image, on the same grounds: `is_object_address` vetted
+    // the word against the arena bounds and the object-start bitmap.
+    for ns in &slots {
+        if ns.cur == ns.orig || ns.addr == 0 || ns.addr & 0x7 != 0 {
+            continue;
+        }
+        // SAFETY: `ns.addr` is a word inside this thread's own stack, recorded
+        // by the cross-thread scan while this thread was blocked, and this code
+        // runs ON that thread. The read-compare-write is not racing anything:
+        // no other thread writes this stack, and we have not resumed Java yet.
+        unsafe {
+            let p = ns.addr as *mut usize;
+            if p.read() == ns.orig {
+                p.write(ns.cur);
+                cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_WRITTEN
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                n += 1;
+            } else {
+                // The native call reused this word since the capture. Leaving
+                // it alone is the whole safety argument -- see the block
+                // comment above.
+                cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_SKIPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
     use crate::memory::gc::update_value_ref;
     let fixup = {
@@ -4444,10 +4509,10 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
         let mut o = thread.gc_block_state.slot_origins.lock();
         std::mem::take(&mut *o)
     };
-    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) {
+    let mut applied = apply_native_slot_fixups(thread);
+    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) && applied == 0 {
         return 0;
     }
-    let mut applied = 0usize;
     if !fixup.is_empty() {
         applied += fixup.len();
         // THE JIT HALF, and it was missing entirely.
@@ -7190,6 +7255,9 @@ impl<'a> NativeContextImpl<'a> {
             let mut f = self.thread.gc_block_state.fixup.lock();
             std::mem::take(&mut *f)
         };
+        // The native-stack half of the same wake, and the path that actually
+        // runs: see `apply_native_slot_fixups`.
+        let _native_applied = apply_native_slot_fixups(self.thread);
         crate::runtime::interpreter::remap_trace_push(
             self.shared,
             self.thread,
@@ -12386,6 +12454,41 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        // DBG (`CRATONVM_DBG_DEADRECV`): is this receiver an address the
+        // collector already reclaimed?
+        //
+        // ASKED BEFORE THE FIRST DEREFERENCE, and that is the whole point.
+        // Every other consumer of the reclamation rings asks AFTER something
+        // has already read the object -- a failed `checkcast` reads the class
+        // id, the sweep-zero consumer reads an all-zero header -- so none of
+        // them can answer when the read ITSELF faults, which is what happens
+        // once `CRATONVM_GEN_UNCOMMIT` has unmapped the span. Both lookups
+        // below are pure ring probes keyed on the ADDRESS and touch no heap
+        // memory, so they answer whether or not the page is still mapped.
+        //
+        // This site because it is where the Generational `--nojit` failure
+        // lands: 4 of 5 crashes on the 2026-09-06 Kafka reproducer are
+        // `native_object_hash_code` -> here, faulting on the mark word.
+        //
+        // Returns 0 rather than walking into the fault, so one run names MANY
+        // victims instead of dying at the first. That makes the flag
+        // behaviour-changing -- a 0 identity hash is otherwise impossible, see
+        // the C28 note below -- which is why it is opt-in and named DBG.
+        if dbg_deadrecv() {
+            let addr = obj.as_ptr() as usize;
+            if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
+                || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
+            {
+                crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+                    &self.shared,
+                    addr,
+                    "identity_hash_code",
+                    "java/lang/Object",
+                    0,
+                );
+                return 0;
+            }
+        }
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
         // asserts non-zero ("hash must be nonzero").
@@ -19067,6 +19170,19 @@ pub(super) fn convert_element_value(
 // Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
 // a `String` per call, so it is a diagnosis tool, not something to leave on.
 #[cold]
+/// `CRATONVM_DBG_DEADRECV`: at `identity_hash_code`, ask the reclamation rings
+/// whether the receiver is an address this process already freed, BEFORE the
+/// first dereference, and report it through `reclaim_guard` instead of
+/// faulting on it.
+///
+/// Opt-in and behaviour-changing: a hit returns 0, which `identity_hash_code`
+/// otherwise never does (C28). That is deliberate, so one run names many
+/// victims rather than dying at the first.
+fn dbg_deadrecv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEADRECV").is_some())
+}
+
 pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
     dispatch_tally::record(site, class_name, method_name, descriptor);
 }

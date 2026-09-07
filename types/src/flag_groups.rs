@@ -433,6 +433,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "diag-jca", on_key: Some("CRATONVM_DIAG_JCA"), off_key: None, off_word: None, since: "2026-06-02" },
     E { group: Group::DBG, token: "diag-method-invoke-null", on_key: Some("CRATONVM_DIAG_METHOD_INVOKE_NULL"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "diag-properties", on_key: Some("CRATONVM_DIAG_PROPERTIES"), off_key: None, off_word: None, since: "2026-05-20" },
+    E { group: Group::DBG, token: "deadrecv", on_key: Some("CRATONVM_DBG_DEADRECV"), off_key: None, off_word: None, since: "2026-09-07" },
+    E { group: Group::REAL, token: "props-unrooted-receivers", on_key: Some("CRATONVM_PROPS_UNROOTED_RECEIVERS"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "diag-serviceloader", on_key: Some("CRATONVM_DIAG_SERVICELOADER"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "dispatch-tally", on_key: Some("CRATONVM_DBG_DISPATCH_TALLY"), off_key: None, off_word: None, since: "2026-07-28" },
     E { group: Group::DBG, token: "dopriv", on_key: Some("CRATONVM_DBG_DOPRIV"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -500,6 +502,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "peer-pin-divert", on_key: None, off_key: Some("CRATONVM_GC_NO_PEER_PIN_DIVERT"), off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "conditional-tlab-skip-publish", on_key: Some("CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::GC, token: "frame-trace-span-retire", on_key: None, off_key: Some("CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE"), off_word: None, since: "2026-09-06" },
+    E { group: Group::DBG, token: "peer-reg-pairing", on_key: Some("CRATONVM_DBG_PEER_REG_PAIRING"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::GC, token: "remap-frozen-peer-stacks", on_key: Some("CRATONVM_GC_REMAP_FROZEN_PEER_STACKS"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::GC, token: "hold-helper-peers", on_key: Some("CRATONVM_GC_HOLD_HELPER_PEERS"), off_key: None, off_word: None, since: "2026-09-06" },
     // Coverage oracle for the slot list `static-root-slots` builds: after the
     // fast path has patched the recorded slots, re-walk every static the slow
     // way and report any that still names a moved address. A miss there is not
@@ -564,6 +569,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "heap-stale", on_key: Some("CRATONVM_DBG_HEAP_STALE"), off_key: None, off_word: None, since: "2026-06-02" },
     E { group: Group::DBG, token: "fmt-wrongtype", on_key: Some("CRATONVM_DBG_FMT_WRONGTYPE"), off_key: None, off_word: None, since: "2026-08-22" },
     E { group: Group::DBG, token: "heap-trace", on_key: Some("CRATONVM_DBG_HEAP_TRACE"), off_key: None, off_word: None, since: "2026-07-25" },
+    E { group: Group::DBG, token: "young-mark-watch", on_key: Some("CRATONVM_DBG_YOUNG_MARK_WATCH"), off_key: None, off_word: None, since: "2026-09-07" },
     E { group: Group::DBG, token: "heapcopy", on_key: Some("CRATONVM_DBG_HEAPCOPY"), off_key: None, off_word: None, since: "2026-06-05" },
     E { group: Group::DBG, token: "heartbeat", on_key: Some("CRATONVM_DBG_HEARTBEAT"), off_key: None, off_word: None, since: "2026-07-25" },
     E { group: Group::DBG, token: "hm-trace", on_key: Some("CRATONVM_HM_TRACE"), off_key: None, off_word: None, since: "2026-05-20" },
@@ -615,6 +621,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "jit-code-free", on_key: Some("CRATONVM_DBG_JIT_CODE_FREE"), off_key: None, off_word: None, since: "2026-07-28" },
     E { group: Group::DBG, token: "jit-compiled", on_key: Some("CRATONVM_DBG_JIT_COMPILED"), off_key: None, off_word: None, since: "2026-07-27" },
     E { group: Group::DBG, token: "jit-disasm", on_key: Some("CRATONVM_DBG_JIT_DISASM"), off_key: None, off_word: None, since: "2026-06-11" },
+    E { group: Group::DBG, token: "jit-slot-overlap", on_key: Some("CRATONVM_DBG_JIT_SLOT_OVERLAP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::DBG, token: "jit-dispatch", on_key: Some("CRATONVM_DBG_JIT_DISPATCH"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "jit-entry", on_key: Some("CRATONVM_DBG_JIT_ENTRY"), off_key: None, off_word: None, since: "2026-05-20" },
     E { group: Group::DBG, token: "jit-borrow-sites", on_key: Some("CRATONVM_DBG_JIT_BORROW_SITES"), off_key: None, off_word: None, since: "2026-08-18" },
@@ -754,6 +761,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None, since: "2026-06-11" },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None, since: "2026-07-11" },
     E { group: Group::DBG, token: "moving-young-band-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_BAND_DBG"), off_key: None, off_word: None, since: "2026-07-26" },
+    // Pairs the per-cycle relocation verdict with `ThreadStateCensus::
+    // relocation_blockers()`, which is the codebase's own statement of the
+    // `mark_moving_young_coverage_incomplete_because` obligation. Off by default.
+    E { group: Group::DBG, token: "relocation-blockers", on_key: Some("CRATONVM_DBG_RELOCATION_BLOCKERS"), off_key: None, off_word: None, since: "2026-09-06" },
     // Diagnostic widening of the register-image remap to the whole unverifiable
     // frame tail, to TEST the four-region partition in `conservative_roots`'s
     // module comment rather than continue to argue it. Off by default; see
@@ -1290,6 +1301,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "ir-const-imm", on_key: Some("CRATONVM_JIT_IR_CONST_IMM"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-phi-residency", on_key: Some("CRATONVM_JIT_IR_PHI_RESIDENCY"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
     E { group: Group::JIT, token: "ir-phi-copy-regs", on_key: Some("CRATONVM_JIT_IR_PHI_COPY_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
+    E { group: Group::JIT, token: "ir-phi-home-publish-guard", on_key: Some("CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD"), off_key: None, off_word: Some("0"), since: "2026-09-07" },
     E { group: Group::JIT, token: "ir-phi-edge-interfere", on_key: Some("CRATONVM_JIT_IR_PHI_EDGE_INTERFERE"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-skip-republish", on_key: Some("CRATONVM_JIT_IR_SKIP_REPUBLISH"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-deopt-regs", on_key: Some("CRATONVM_JIT_IR_DEOPT_REGS"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
@@ -1477,6 +1489,18 @@ pub const INVENTORY: &[E] = &[
     // offenders, which is exactly how the count creeps back up.
     E { group: Group::JIT, token: "strict-install-epoch", on_key: Some("CRATONVM_JIT_STRICT_INSTALL_EPOCH"), off_key: None, off_word: Some("0"), since: "2026-08-01" },
     E { group: Group::JIT, token: "deferred-new-retry-blind", on_key: Some("CRATONVM_JIT_DEFERRED_NEW_RETRY_BLIND"), off_key: None, off_word: None, since: "2026-09-03" },
+    E { group: Group::JIT, token: "deferred-new-looks", on_key: Some("CRATONVM_JIT_DEFERRED_NEW_LOOKS"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-site-trap", on_key: Some("CRATONVM_JIT_IR_SITE_TRAP"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-scalar-intrinsics", on_key: Some("CRATONVM_JIT_IR_SCALAR_INTRINSICS"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-aastore", on_key: Some("CRATONVM_JIT_IR_AASTORE"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-check-elim", on_key: Some("CRATONVM_JIT_IR_CHECK_ELIM"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-bce-range", on_key: Some("CRATONVM_JIT_IR_BCE_RANGE"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-hot-layout", on_key: Some("CRATONVM_JIT_IR_HOT_LAYOUT"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-list-sched", on_key: Some("CRATONVM_JIT_IR_LIST_SCHED"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-unroll-unreachable-frames", on_key: Some("CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "c2-accept", on_key: Some("CRATONVM_C2_ACCEPT"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "c2-accept-memo", on_key: Some("CRATONVM_C2_ACCEPT_MEMO"), off_key: None, off_word: None, since: "2026-09-06" },
+    E { group: Group::JIT, token: "ir-unresolved-class-trap", on_key: Some("CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "ir-ls-loop-weight", on_key: Some("CRATONVM_JIT_IR_LS_LOOP_WEIGHT"), off_key: None, off_word: None, since: "2026-09-03" },
     E { group: Group::JIT, token: "ir-param-copy", on_key: Some("CRATONVM_JIT_IR_PARAM_COPY"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "ir-rpo-layout", on_key: Some("CRATONVM_JIT_IR_RPO_LAYOUT"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
@@ -1860,6 +1884,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "tier-osr-threshold", on_key: Some("CRATONVM_TIER_OSR_THRESHOLD"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-pgo", on_key: Some("CRATONVM_TIER_PGO"), off_key: None, off_word: None, since: "2026-06-22" },
     E { group: Group::JIT, token: "tier-pgo-receivers", on_key: Some("CRATONVM_TIER_PGO_RECEIVERS"), off_key: None, off_word: Some("0"), since: "2026-09-02" },
+    E { group: Group::JIT, token: "tier-pgo-c2-window", on_key: Some("CRATONVM_TIER_PGO_C2_WINDOW"), off_key: None, off_word: None, since: "2026-09-06" },
     E { group: Group::JIT, token: "tiered", on_key: Some("CRATONVM_TIER_ENABLED"), off_key: None, off_word: Some("0"), since: "2026-06-22" },
     E { group: Group::JIT, token: "tlab-zero-elision", on_key: None, off_key: Some("CRATONVM_NO_JIT_TLAB_ZERO_ELISION"), off_word: None, since: "2026-07-30" },
     // Interpreter-side, but it lives with the execution-engine knobs like
@@ -1911,6 +1936,12 @@ pub const INVENTORY: &[E] = &[
     // longer decides it and `=0` has to be able to turn it off.
     E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
     E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: Some("CRATONVM_BLOCKED_WAKE_JIT_REMAP"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON kill switch, hence `off_key` only: a blocked peer's
+    // conservatively-scanned native-stack words are written back on wake. The
+    // objects were kept alive AND relocated while it slept, nothing else
+    // rewrites those words, and the pin that nominally protected them is a
+    // no-op on a Cheney copy.
+    E { group: Group::GC, token: "blocked-peer-stack-remap", on_key: None, off_key: Some("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP"), off_word: None, since: "2026-09-07" },
     E { group: Group::JIT, token: "xt-keep-unrewritable-on-discharge", on_key: Some("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "zgc-unrewritable-peer-refuses", on_key: Some("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: None, since: "2026-09-04" },

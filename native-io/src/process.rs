@@ -1256,6 +1256,9 @@ fn enum_ordinal(ctx: &mut dyn NativeContext, enum_obj: ObjectRef) -> Option<i32>
 }
 
 fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -> StdioRedirect {
+    // GC: `type()` runs Java, and every branch below reads `redirect_obj`
+    // again — `file()`, and for WRITE/APPEND `append()` as well.
+    let pin = ctx.pin_native_root(redirect_obj);
     let type_obj = match ctx.invoke_virtual(
         redirect_obj,
         "type",
@@ -1263,10 +1266,14 @@ fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -
         &[],
     ) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return StdioRedirect::Pipe,
+        _ => {
+            ctx.unpin_native_roots(pin);
+            return StdioRedirect::Pipe;
+        }
     };
     let ordinal = enum_ordinal(ctx, type_obj).unwrap_or(0);
-    match ordinal {
+    let redirect_obj = ctx.read_native_pin(pin, redirect_obj);
+    let out = match ordinal {
         // Redirect.Type.PIPE
         0 => StdioRedirect::Pipe,
         // Redirect.Type.INHERIT
@@ -1282,11 +1289,14 @@ fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -
         // JDK's null file, so this path also handles Redirect.DISCARD.
         3 | 4 => match ctx.invoke_virtual(redirect_obj, "file", "()Ljava/io/File;", &[]) {
             Ok(Some(Value::Object(Some(file)))) => {
+                // `file` must survive `append()`, which runs Java too.
+                let file_pin = ctx.pin_native_root(file);
                 let append = ordinal == 4
                     || matches!(
                         ctx.invoke_virtual(redirect_obj, "append", "()Z", &[]),
                         Ok(Some(Value::Int(v))) if v != 0
                     );
+                let file = ctx.read_native_pin(file_pin, file);
                 file_path_of(ctx, file)
                     .map(|path| StdioRedirect::WriteFile { path, append })
                     .unwrap_or(StdioRedirect::Null)
@@ -1294,7 +1304,9 @@ fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -
             _ => StdioRedirect::Null,
         },
         _ => StdioRedirect::Pipe,
-    }
+    };
+    ctx.unpin_native_roots(pin);
+    out
 }
 
 fn read_process_redirects(ctx: &mut dyn NativeContext, builder: ObjectRef) -> ProcessRedirects {
@@ -1307,21 +1319,28 @@ fn read_process_redirects(ctx: &mut dyn NativeContext, builder: ObjectRef) -> Pr
         return redirects;
     }
     let len = ctx.array_length(arr);
+    // GC: `read_process_redirect` runs the Redirect's Java (`type()`, `file()`,
+    // `append()`), and the array is indexed again for each of the three slots.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
     if len > 0 {
         if let Value::Object(Some(r)) = ctx.get_array_element(arr, 0) {
             redirects.stdin = read_process_redirect(ctx, r);
         }
     }
     if len > 1 {
+        arr = ctx.read_native_pin(arr_pin, arr);
         if let Value::Object(Some(r)) = ctx.get_array_element(arr, 1) {
             redirects.stdout = read_process_redirect(ctx, r);
         }
     }
     if len > 2 {
+        arr = ctx.read_native_pin(arr_pin, arr);
         if let Value::Object(Some(r)) = ctx.get_array_element(arr, 2) {
             redirects.stderr = read_process_redirect(ctx, r);
         }
     }
+    ctx.unpin_native_roots(arr_pin);
     redirects
 }
 
@@ -1356,8 +1375,16 @@ fn read_process_environment(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
     };
+    // GC: every `invoke_virtual` in this loop runs the map's Java, so the
+    // iterator does not survive its own `hasNext`/`next` pair and an entry does
+    // not survive `getKey()` before `getValue()` reads it again. The pin is
+    // released on every exit — `read_process_environment` runs once per
+    // `ProcessBuilder.start()`, but the loop below is bounded at 100_000.
+    let iter_pin = ctx.pin_native_root(iter);
+    let mut iter = iter;
     let mut out = Vec::new();
     for _ in 0..100_000 {
+        iter = ctx.read_native_pin(iter_pin, iter);
         let has_next = matches!(
             ctx.invoke_virtual(iter, "hasNext", "()Z", &[]),
             Ok(Some(Value::Int(v))) if v != 0
@@ -1365,18 +1392,23 @@ fn read_process_environment(
         if !has_next {
             break;
         }
+        iter = ctx.read_native_pin(iter_pin, iter);
         let entry = match ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => break,
         };
+        let entry_pin = ctx.pin_native_root(entry);
         let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => object_to_string(ctx, o),
             _ => None,
         };
+        let entry = ctx.read_native_pin(entry_pin, entry);
+        ctx.unpin_native_roots(entry_pin);
         let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => object_to_string(ctx, o),
             _ => None,
         };
+        iter = ctx.read_native_pin(iter_pin, iter);
         if let (Some(k), Some(v)) = (key, value) {
             out.push((k, v));
         }
@@ -3716,10 +3748,14 @@ fn native_process_destroy_forcibly(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     if !is_vm_process(ctx, this) {
         // `Process.destroyForcibly()` is `destroy(); return this;` — and
         // `destroy()` is abstract, so this reaches the subclass's override.
         ctx.invoke_virtual(this, "destroy", "()V", &[])?;
+        let this = ctx.read_native_pin(this_pin, this);
         return Ok(Some(Value::Object(Some(this))));
     }
     let handle = handle_of(ctx, this);
@@ -4076,6 +4112,9 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .into())
         }
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     // `descendants()` is CONCRETE on `java.lang.Process` and — unlike
     // `isAlive`, `pid`, `toHandle`, `destroyForcibly` and
     // `waitFor(long, TimeUnit)` — it was never given the [`is_vm_process`]
@@ -4118,6 +4157,7 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         };
         return ctx.invoke_virtual(handle, "descendants", "()Ljava/util/stream/Stream;", &[]);
     }
+    let this = ctx.read_native_pin(this_pin, this);
     let pid = match ctx.get_field(this, PROC_FIELD_PID) {
         Value::Long(p) => p,
         _ => -1,
@@ -4139,9 +4179,15 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         })
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    // GC: nothing in Java refers to `list` yet, and `<init>`, one
+    // `build_process_handle` per descendant and one `add` per descendant all
+    // run Java between here and the `stream()` call that consumes it.
+    let list_pin = ctx.pin_native_root(list);
+    let mut list = list;
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
     for cpid in descendant_pids {
         let handle = build_process_handle(ctx, cpid)?;
+        list = ctx.read_native_pin(list_pin, list);
         ctx.invoke(
             al_class,
             "add",
@@ -4149,6 +4195,8 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             &[Value::Object(Some(list)), Value::Object(Some(handle))],
         )?;
     }
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     ctx.invoke(
         al_class,
         "stream",
@@ -4381,6 +4429,9 @@ fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(-1))),
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     if !is_vm_process(ctx, this) {
         // `Process.pid()` is `return toHandle().pid();`, so the
         // `UnsupportedOperationException` from the default `toHandle()`
@@ -4395,6 +4446,7 @@ fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         };
         return Ok(ctx.invoke_virtual(handle, "pid", "()J", &[])?);
     }
+    let this = ctx.read_native_pin(this_pin, this);
     let handle = handle_of(ctx, this);
     if handle == 0 {
         // Stub Process — fall back to whatever's in field 4.
@@ -4429,6 +4481,10 @@ fn wrap_fd_in_stream(
     };
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+    // GC: the stream's own constructor runs Java, and BOTH the descriptor and
+    // the stream are read again below — the descriptor is deliberately
+    // re-seeded after construction, which is exactly the window.
+    let fd_pin = ctx.pin_native_root(fd_obj);
     let stream = match ctx.new_object_initialized(
         stream_class,
         "(Ljava/io/FileDescriptor;)V",
@@ -4445,6 +4501,8 @@ fn wrap_fd_in_stream(
     // Some real-JDK stream constructors touch the descriptor during
     // initialization. Re-seed the descriptor after construction so the
     // fd-table id remains recoverable when the stream is later written/read.
+    let fd_obj = ctx.read_native_pin(fd_pin, fd_obj);
+    ctx.unpin_native_roots(fd_pin);
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
 
@@ -5656,6 +5714,9 @@ pub fn native_process_builder_start(
             .into())
         }
     };
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
 
     // --- Field 0: command (List<String> or String[]) ---
     let cmd_val = ctx.get_field(this, 0);
@@ -5749,6 +5810,10 @@ pub fn native_process_builder_start(
     if pb_debug_enabled() {
         eprintln!("[PB-CMD] {:?}", cmd_strings);
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
 
     // --- Field 1: directory (File) ---
     // B5: read the File's path string BY NAME (`path`) — a real-JDK
@@ -5769,9 +5834,14 @@ pub fn native_process_builder_start(
 
     // --- Spawn ---
     let env_vars = read_process_environment(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    // GC: rooted across the call below; `safe_native_call` releases
+    // the pin stack to its entry floor on return.
+    let this_pin = ctx.pin_native_root(this);
     let redirects = read_process_redirects(ctx, this);
     let program = cmd_strings[0].clone();
     let rest: Vec<String> = cmd_strings.into_iter().skip(1).collect();
+    let this = ctx.read_native_pin(this_pin, this);
     // Honor ProcessBuilder.redirectErrorStream(true) (`2>&1`).
     let redirect_err = matches!(
         ctx.get_field_by_name(this, "redirectErrorStream"),

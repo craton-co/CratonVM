@@ -16614,59 +16614,29 @@ impl G1Collector {
     /// no-op when no collection has run. Emitted at VM shutdown when GC stats
     /// are requested — see `VmHeap::print_gc_summary`.
     pub fn print_gc_summary(&self) {
-        // Unconditional, and BEFORE the early return below: a run with no
-        // recorded pause summary can still have rejected a candidate, and a
-        // counter that only prints alongside something else is a counter that
-        // reads as zero when it never ran.
-        let rejected = evacuation_refs_rejected();
-        let (holder_rejected, holder_clamped) = evacuation_holder_counts();
-        eprintln!(
-            "[GC] g1 evac_ref_rejected={rejected} (torn={}) evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
-            evacuation_refs_rejected_torn(),
-            evacuation_source_walk_desyncs(),
-        );
-        // The remaining two "expected to be ZERO" guard counters, on the same
-        // terms and for the same reason. Both had public accessors and no
-        // consumer anywhere in the tree, which makes their zero unciteable: a
-        // run cannot be quoted as evidence for a guard that nothing prints. See
-        // `FLAT_WALK_REFUSED_ARRAY` and `KEPT_SEED_REJECTED`.
-        eprintln!(
-            "[GC] g1 non_object_roots_skipped={}",
-            non_object_roots_skipped(),
-        );
-        // Which evacuator actually ran. See `G1_YOUNG_PARALLEL`: without this
-        // pair, an A/B over `CRATONVM_GC_PAR_THREADS` measures an unknown, and
-        // the nearest-looking counter belongs to a different collector.
-        {
-            let (par, ser, workers) = g1_young_evac_counts();
-            eprintln!(
-                "[GC] g1 young evacuation: parallel={par} serial={ser} workers_last={workers}"
-            );
-        }
-        eprintln!(
-            "[GC] g1 implausible_legacy_headers={} copy_shape_drift={}",
-            evacuation_implausible_class0_copies(),
-            evacuation_copy_shape_drifts(),
-        );
-        eprintln!(
-            "[GC] g1 flat_walk_refused_array={} kept_seed_rejected={}",
-            flat_walks_refused_for_array(),
-            kept_seeds_rejected(),
-        );
-        // NOT here: the promotion-destination counters ride on
-        // `gc_metrics::collector_decision_report` instead. Everything printed
-        // in THIS function is on the normal-return arm only -- `vm-cli`'s
-        // teardown calls it, and `System.exit` never unwinds Rust frames -- so
-        // for every JUnit workload in the suites (`junit.textui.TestRunner`
-        // exits) not one of these lines has ever been emitted. The decision
-        // report is the one shutdown census wired to BOTH arms; see the note
-        // above `maybe_dump_shutdown_reports` in `vm-cli/src/main.rs`, which
-        // records the same discovery for the same reason.
+        // THE PROCESS-STATIC GUARD COUNTERS ARE NOT HERE ANY MORE.
+        //
+        // `evac_ref_rejected`, `non_object_roots_skipped`, the
+        // `young evacuation: parallel=/serial=` pair,
+        // `implausible_legacy_headers`, `copy_shape_drift`,
+        // `flat_walk_refused_array` and `kept_seed_rejected` moved to
+        // `gc_metrics::collector_decision_report`, which is emitted on BOTH
+        // shutdown arms. They used to be printed here with comments saying
+        // they were "unconditional ... before the early return" so that a zero
+        // could be cited -- and on every JUnit workload in the suites the zero
+        // was never printed at all, because this function is reached only from
+        // `vm-cli`'s normal-return teardown and `JUnitCore` ends in
+        // `System.exit`, which never unwinds Rust frames. See the note above
+        // `maybe_dump_shutdown_reports` in `vm-cli/src/main.rs`.
+        //
+        // What is left below needs `&self`, so it stays -- and the SAME hook
+        // now reaches it through a `Weak<SharedVm>` stashed at VM
+        // construction, guarded so the normal arm cannot print it twice.
         // F-15 / F-16 / F-18 — the state the three adaptive policies ended the
-        // run in. Unconditional and before the early return, for the reason
-        // stated above: a policy whose state nothing prints cannot be cited,
-        // and each of these is a decision the collector made on its own that an
-        // operator would otherwise have to infer from the outcome.
+        // run in. Unconditional and before the `pause_summary` early return: a
+        // policy whose state nothing prints cannot be cited, and each of these
+        // is a decision the collector made on its own that an operator would
+        // otherwise have to infer from the outcome.
         eprintln!(
             "[GC] g1 heap: reserved={} committed={} backing={}",
             self.reserved_bytes(),
@@ -32799,6 +32769,45 @@ mod tests {
         assert!(text.contains("young=MOVING"), "{text}");
         assert!(text.contains("[GC] g1 cycle"), "{text}");
         assert!(text.contains("kind=young"), "{text}");
+    }
+
+    /// The evacuator census reaches the report with the VALUE the collector
+    /// put in it, not a constant.
+    ///
+    /// `the_decision_report_carries_the_g1_guard_counters_with_no_collection`
+    /// asserts the lines are present; this asserts one of them is wired to the
+    /// counter behind it. `G1_YOUNG_PARALLEL` / `G1_YOUNG_SERIAL` are process
+    /// statics that only go up, and a pause bumps exactly one of them, so
+    /// `parallel + serial` after a real collection is non-zero however the
+    /// rest of this binary's tests are scheduled -- which is the only
+    /// assertion about a shared static that is not really an assertion about
+    /// test ordering.
+    #[test]
+    fn the_report_carries_the_evacuator_census_the_collector_recorded() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        let mut roots = vec![obj];
+        gc.collect_garbage(&stw(), &mut roots, &NoopMonitors);
+
+        let text = crate::gc_metrics::collector_decision_report();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("[GC] g1 young evacuation:"))
+            .unwrap_or_else(|| panic!("no evacuator census in the report: {text}"));
+        let field = |key: &str| -> usize {
+            let rest = line
+                .split_once(key)
+                .unwrap_or_else(|| panic!("`{key}` missing from `{line}`"))
+                .1;
+            rest.split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("`{key}` is not a number in `{line}`"))
+        };
+        assert!(
+            field("parallel=") + field("serial=") > 0,
+            "a pause ran, so one of the two evacuator counters must have moved: `{line}`"
+        );
     }
     // -----------------------------------------------------------------------
     // The flat 16-byte-slot walk refuses an ARRAY header (option D of
