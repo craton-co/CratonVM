@@ -4359,9 +4359,12 @@ unsafe fn try_resume_trapped_callee(
     let mut decided = true;
     if ir_site_trap {
         cratonvm_jit::ir::note_site_trap_taken();
-        // The memo doubles as the "already decided" flag: it is set exactly
-        // when this method has had its site-trap policy applied.
-        decided = !cratonvm_jit::ir_evidence::method_already_refused(h);
+        // A DEDICATED claim, not the IR refusal memo: that memo has a second
+        // writer (the acceptance gate marks a method refused whenever it
+        // discards an optimizing body), so reading it here would let a
+        // gate-refused method look "already decided" on its FIRST trap -- and
+        // the policy, including the eviction, would never be applied.
+        decided = cratonvm_jit::ir::claim_site_trap_decision(h);
         cratonvm_jit::ir_evidence::note_method_refused(h);
         if !decided {
             cratonvm_jit::ir::note_site_trap_repeat();
