@@ -49,11 +49,14 @@ the class alone with a large `--one-to`.
 * RSS reached ~6.1 GB during the long run, on a 31 GB host with no swap
   pressure — so this is not the 2026-08-02..05 heap-exhaustion shape, which
   died rather than finished.
-* The three other classes that historically shared this budget
-  (`AotIntegrationTests`, `TestContextAotGeneratorIntegrationTests`,
-  `ApplicationContextAotGeneratorTests`) all complete inside the 180 s cap in
-  the same run, so whatever this is, it is specific to the 10001-definition
-  case rather than to Spring AOT generation generally.
+* `TestContextAotGeneratorIntegrationTests` and
+  `ApplicationContextAotGeneratorTests` complete inside the 180 s cap in the
+  same run, so whatever this is, it is not Spring AOT generation generally.
+  `AotIntegrationTests` sits between the two: 334 s alone (`OK`, 4 found /
+  2 succ / 2 skip, matching HotSpot), inside the cap on a quiet host and over
+  it under load. It is the same "a `TIMEOUT` row carries `found=0` and reads
+  like a class that could not start" reporting problem, at a tenth the
+  magnitude.
 
 ## Next steps
 

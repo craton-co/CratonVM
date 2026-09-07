@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-391 tokens.
+392 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -653,6 +653,7 @@ export inherited from a parent shell.
 | `real-new-site-flags` | `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` |
 | `deny` | `CRATONVM_JIT_DENY` |
 | `deopt-real` | `CRATONVM_DEOPT_REAL` |
+| `deopt-sink-resume` | `CRATONVM_JIT_DEOPT_SINK_RESUME` |
 | `direct-callee-calls` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` |
 | `dispatch-cache-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` |
 | `dispatch-cache-virtual-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` |
@@ -1000,7 +1001,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-171 tokens.
+169 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1012,8 +1013,6 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
-| `remap-frozen-peer-stacks` | `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS` |
-| `hold-helper-peers` | `CRATONVM_GC_HOLD_HELPER_PEERS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |

@@ -159,12 +159,37 @@ impl Compiler {
         if !crate::dbg_jit_slot_overlap() {
             return;
         }
+        let innermost = self.inline_oop_scopes.len().saturating_sub(1);
         for (depth, scope) in self.inline_oop_scopes.iter().enumerate() {
             let s_start = scope.local_base;
             let s_end = scope.local_base + (scope.num_locals as i32) * 8;
             if start < s_end && s_start < end {
+                // WHICH scope decides whether this is a hazard or a
+                // coincidence, and the first version of this line could not
+                // say. The INNERMOST scope is the splice that is RETURNING:
+                // the `xreturn` arm has already loaded the value into RAX, so
+                // that callee's locals are dead at this instruction and the
+                // wrapper pops the scope a few lines later. Landing the return
+                // value on its own local 0 is what `caller_post_pop_spill ==
+                // callee_local_base` means, and it is harmless.
+                //
+                // An ENCLOSING scope is the real hazard: that callee's body
+                // CONTINUES after the inner call returns, so its locals are
+                // live and the inner result overwrites one of them. Measured
+                // 2026-09-07 on `CriteriaWindowFunctionTest`: 151 of 308
+                // reports are that half, not the harmless one. Its own page:
+                // `known-issues/jit/inline-splice-return-value-lands-on-an-
+                //  enclosing-callees-live-local-20260907.md` (one path, wrapped).
+                let which = if depth == innermost {
+                    "INNERMOST (the splice that is returning; its locals are dead here)"
+                } else {
+                    "ENCLOSING (its body continues after this call - LIVE locals)"
+                };
                 eprintln!(
-                    "[jit-slot-overlap] reservation {start}..{end} ({why:?}) overlaps OPEN inline                      scope #{depth} locals {s_start}..{s_end} (num_locals={}) in {}",
+                    "[jit-slot-overlap] reservation {start}..{end} ({why:?}) overlaps OPEN \
+                     inline scope #{depth}/{} {which} locals {s_start}..{s_end} (num_locals={}) \
+                     in {}",
+                    self.inline_oop_scopes.len(),
                     scope.num_locals,
                     self.method_label,
                 );

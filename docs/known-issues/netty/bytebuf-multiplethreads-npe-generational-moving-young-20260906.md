@@ -1182,18 +1182,32 @@ summary is that it closes a demonstrated stale-reference channel whose last
 observed *symptom* had already been closed by other means.
 ## 14. An ALTERNATIVE repair, SUPERSEDED by §13 — kept for what it measured
 
-> **§13 is the fix; this is not.** It landed while this was being written and is
-> the better design: it writes the scanned words back **when the blocked peer
-> wakes**, through the `GcBlockState::fixup` chain the blocked-region protocol
-> already maintains, so it holds nobody and ships ON. What follows held peers
-> suspended across the copy instead — a bigger hammer with a deadlock surface
-> §13 does not have. Both switches here stay OPT-IN and OFF, and nothing should
-> be defaulted to them.
+> **§13 is the fix; this was not, and its code has since been REMOVED.**
+> `CRATONVM_GC_HOLD_HELPER_PEERS` and `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS`,
+> the held-peer list, the repair and its per-platform stubs are all gone from
+> the tree. The numbers below were real when taken; the switches that produced
+> them no longer exist.
 >
-> It is kept because three things it measured stand on their own: WHICH peers
-> own the stale words (§14.1), that holding blocked peers across a copy did not
-> deadlock in 28 runs (§14.3), and what a conservative rewrite actually costs
-> (§14.5).
+> **Why it was withdrawn rather than kept as a dormant option.** §13 writes the
+> scanned words back **when the blocked peer wakes**, through the
+> `GcBlockState::fixup` chain the blocked-region protocol already maintains, so
+> it holds nobody and ships ON. This one suspended every helper-window peer for
+> the length of a copy to reach the same words — a strictly larger hammer, with
+> a deadlock surface §13 does not have, for a defect §13 already closes. Two
+> mechanisms for one bug is a maintenance liability, and the weaker one should
+> not be the survivor.
+>
+> **It also cost another session a build break.** `gc_and_alloc.rs` called the
+> repair unconditionally while only Windows and the `not(any(windows, linux))`
+> arm had it, so Linux x86-64 — the CI and build host — failed to compile, and
+> somebody else had to write the missing stub. `cfg`-gated code is not
+> type-checked for the other host, and nothing on Windows could see it. That is
+> the cost side of carrying a platform-specific opt-in nobody uses.
+>
+> **The measurements below are kept** because three of them stand on their own
+> and do not depend on the removed code: WHICH peers own the stale words
+> (§14.1), that holding blocked peers across a copy did not deadlock in 28 runs
+> (§14.3), and what a conservative rewrite actually costs (§14.5).
 
 §11 named the home. This is the attempt to fix it, and the result is genuinely
 three-part: the mechanism works, the feared hazard did not appear, and the
@@ -1280,3 +1294,42 @@ G1 and ZGC do and a Cheney copy structurally cannot.
 
 Windows only. Linux and the fallback return zeros with a comment saying so,
 rather than a silent no-op that would read as success.
+
+## 15. The 19 classes at FORCED engagement: zero NPEs, and how much that is worth
+
+The original question, finally asked under conditions that could answer it.
+
+§0 reported four of the family clean and said at the time that the reading was
+vacuous: relocation had collapsed to 0-1 moving cycles, so nothing was
+exercised. §13's kill-switch A/B is void for a related reason — the §10.4
+SIGSEGV no longer reproduces with the fix OFF either. Neither settles whether
+the family that opened this page still fails.
+
+`CRATONVM_GC_NO_PEER_PIN_DIVERT=1` makes relocation reachable, so this measures
+the symptom that OPENED the page — the `NullPointerException` in JUnit's
+`ValidatingInvocation` — on all 19 classes, 2 reps each, current dev.
+
+**Total: NPE=0, crashes=0.** And the engagement column, which is why that
+number needs qualifying:
+
+| class | moving cycles (2 reps) |
+|---|---:|
+| `UniqueIpFilterTest` | 104 |
+| `ReadOnlyDirectByteBufferBufTest` | 70 |
+| `LittleEndianCompositeByteBufTest` | 7 |
+| 14 further classes | 1–4 |
+| `NioEventLoopTest` | **0 — proves nothing** |
+
+**Two classes were meaningfully exercised and were clean.** The other
+seventeen relocated between zero and 3.5 times a run, against the 9–24 a run
+the family originally failed under, so for those this is a weak test rather
+than a clean bill. `DuplicatedByteBufTest` makes the point: 58 moving cycles a
+run under §11's pairing instrumentation, 1 a run here, same flag, same class.
+Engagement on this workload still varies by more than an order of magnitude for
+reasons §0.3's five refuted hypotheses did not find.
+
+**What can honestly be said:** the family shows no NPEs at the tip, and the two
+classes where relocation genuinely ran are clean. **What cannot:** that the
+remaining seventeen are fixed rather than under-exercised. Closing this page
+properly needs those classes driven to comparable engagement first — and
+nobody yet knows what drives it.

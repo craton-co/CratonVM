@@ -1867,9 +1867,6 @@ pub static PEER_REG_CAPTURE: parking_lot::Mutex<Vec<(u32, u8, usize)>> =
 /// an address the collection vacated.
 pub static PEER_REG_STALE: AtomicU64 = AtomicU64::new(0);
 
-/// Stack words rewritten in still-frozen peers by the opt-in repair.
-pub static PEER_STACK_WORDS_REMAPPED: AtomicU64 = AtomicU64::new(0);
-
 /// Record one frozen peer's register word. No-op unless the pairing is armed.
 /// Default-ON. `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP=1` restores the
 /// pre-2026-09-07 behaviour, where a blocked peer resumed with its

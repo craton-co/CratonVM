@@ -88,3 +88,109 @@ yet. Treat them as two entries in one family until an arm links them.
 * `CRATONVM_DBG_SWEEP_ZERO` is blind here for the reason the springboot page
   records: it rings the young sweep but its consumer only fires at an
   interpreter INVOKE on an all-zero header.
+
+## Addendum 2026-09-07: the symptom is the instrument, the defect is two objects
+
+Re-measured against `005ceb951` on an idle-ish host (load ~2-8), round-robin
+interleaved so neither arm owns a stretch of the machine.
+
+### The `ConcurrentModificationException` is produced by `CRATONVM_DBG_DEADRECV`
+
+| arm | runs | rc=1 | CME |
+|---|---|---|---|
+| `GpuResidencyGc 0 1024 800`, Generational, **no flag** | 5 | **0** | 0 |
+| the same **plus `CRATONVM_DBG_DEADRECV=1`** | 7 | **7** | 7 |
+
+The repro block at the top of this page carries `CRATONVM_DBG_DEADRECV=1`, so
+every one of its 6/6 was armed and the unarmed arm was never run. That flag's
+own doc comment says why this happens:
+
+> Opt-in and **behaviour-changing**: a hit returns 0, which
+> `identity_hash_code` otherwise never does (C28).
+
+`GpuResidencyGc.churn` keys a hash structure on identity; an
+`identity_hash_code` of 0 puts the entry in the wrong bucket, and the next
+traversal raises `ConcurrentModificationException` at the line this page
+names. **The pass/fail oracle was manufactured by the diagnostic.** The
+`--nojit` "rc=0, 6/6" comparison inherits the same problem.
+
+This does NOT retract the page. It moves the evidence: the guard's own hit
+reports, which are read from the always-on reclamation rings BEFORE any
+dereference, are independent of the return-0 behaviour and are what the rest
+of this addendum uses as the metric.
+
+### "8 hits" is 8 DEREFERENCES of 2 objects
+
+Stable across 5 armed runs:
+
+```
+reports=8   distinct objs=2   free_seq=[48, 336]   sweep_cycle=[0]
+```
+
+Seven of the eight name **one address** (`…170e8`, `freed_span=<base>+0xe0`,
+`free_seq=48`) at `class_id_of_object` / `identity_hash_code`; the eighth is a
+single other address with `free_seq=336`. The guard reports per dereference,
+not per victim, so "eight reclaimed-receiver hits" reads as a population and is
+a report count. **Two objects are being freed, both in the FIRST sweep cycle.**
+
+`interior_off` is also not uniformly 0 as stated above: the `free_seq=336`
+record has `interior_off=4974048` into a `0x643900` span. Only the
+seven-times-dereferenced victim sits at its span base.
+
+### `root_coverage="NEVER-LOOKED"` cannot answer the question this page asks it
+
+The "Next" item asking why coverage is `NEVER-LOOKED` "on a sweep that is about
+to free a JIT-reachable object" is chasing a counter that structurally cannot
+speak to it. `xt::take_over_pass` skips `self_tid`:
+
+```rust
+for tid in list_thread_tids() {
+    if tid == self_tid || taken.contains(tid) { continue; }
+```
+
+so `xt_passes` / `xt_taken_over` / `xt_unclassified` describe **peers only**. On
+a probe with no threads there are none, and `NEVER-LOOKED` is the correct and
+uninformative answer. `stw_takeover_should_scan`'s own comment says the gating
+hint "is a single process-global depth and cannot distinguish 'a peer is in JIT'
+from 'I am'". Whatever covers the COLLECTING thread's frames, it is not this.
+
+### Mechanisms ruled out — 7 ablations, all `hits=8`
+
+Each run armed, one variable changed, deterministic metric:
+
+| lever | hits |
+|---|---|
+| baseline | 8 |
+| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE=2^40` (collapses the anchor list below the `len() > 2` gate, forcing the sequential sweep) | 8 |
+| `CRATONVM_DBG_NO_JIT_ROOT_SCAN=1` (disables the conservative JIT frame scan **entirely**) | 8 |
+| `CRATONVM_JIT_A5_RESIDUE_FILTER=0` | 8 |
+| `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE=1` | 8 |
+| `CRATONVM_GC_NO_TLAB_SKIP=1` | 8 |
+| `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` | 8 |
+| `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH=1` | 8 |
+| **`--nojit`** | **0** |
+
+The positive control is the third row and it is the informative one:
+**turning the conservative JIT root scan off changes nothing**, while removing
+the JIT removes the defect. So the victims are not objects the JIT root scan
+fails to find — that scan's presence or absence is irrelevant to them. The
+off-grid sweep-anchor guard (`gen_heap.rs:13122`, "a chunk beginning here can
+parse phantom objects and reclaim every live object they subsume") was the most
+promising candidate on paper and is refuted by row 2: the walk shape does not
+matter, which is consistent with the two objects being genuinely UNMARKED
+rather than mis-parsed.
+
+Also checked: the precise-oop-map suppression, which does drop the conservative
+roots it gathered when the proof holds (`memory/roots.rs:1415-1439`), is
+**opt-in** behind `CRATONVM_GC_PRECISE_ONLY_ROOTS=1` and off by default here —
+so `scan_active_jit_frames` runs on every default young collection and no
+suppression is in play.
+
+### Where that leaves it
+
+Two objects, freed in `sweep_cycle=0` at `free_seq` 48 and ~336, deterministic,
+present only with the JIT on, and not attributable to the root scan, the TLAB
+skip spans, the anchor list, or the precise-only suppression. Naming them is
+still the first move — the page's own suggestion — but for a sharper reason
+than before: with exactly two victims and a stable `free_seq`, the a2dbg
+allocation ring should identify them outright rather than bounding them.

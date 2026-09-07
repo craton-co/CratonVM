@@ -2,37 +2,75 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **FIXED 2026-09-07.** All 56 classes now pass under JIT-on, bar one that fails identically on HotSpot and one that is correct but slow. The `--nojit` lever is no longer needed. |
-| **Root cause** | ONE defect, not the two mechanisms this page originally described: the optimizing (IR) tier planted an unresumable uncommon trap at an `invokedynamic`, in methods that had already committed a side effect. See the retired `testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster` write-up for the full derivation. |
-| **Fix** | `IrBuilder::trap_replay_is_safe` (`jit/src/ir.rs`). Kill switch `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0`. |
+| **Status** | ✅ **FIXED 2026-09-07.** All 56 classes pass under JIT-on, bar one that fails identically on HotSpot and one that is correct but slow. The `--nojit` lever is no longer needed. |
+| **Root cause** | ONE defect, not the two mechanisms this page originally described: the optimizing (IR) tier planted an unresumable uncommon trap at an `invokedynamic`, in methods that had already committed a side effect. |
+| **Fix** | Two changes landed the same day from two lanes — the deopt sink now resumes the frame instead of aborting, and the trap is no longer planted at all. Full derivation in `testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster-FIXED-20260907.md`. |
 | **Scope** | The 56 classes common to all three GC arms of the 2026-09-07 full 2848-class run (`gc3-{gen,g1,zgc}-jit-real-all-20260907-*`). |
 | **Measured** | Azure host `20.80.105.49`, worktree `/data/wt-l6-spring`, real JDK 25. |
 
-## Result
+## Evidence
 
-The 56-class list was recomputed from the three arms' `results.tsv`
-(`status == FAIL` in all three; the 66-class three-way intersection of
-*non-OK* includes 9 `LOADERR` and 1 `TIMEOUT` that are not this cluster) and
-re-run on one binary, twice, with only the guard's kill switch varying:
+### On the merged tree — the sink fix alone is not enough
 
-| arm | OK | FAIL | TIMEOUT | test-methods |
-|---|---:|---:|---:|---|
-| guard ON (the fix) | **54** | 1 | 1 | found=1670 passed=1653 failed=6 |
-| `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | 0 | **56** | 0 | found=1684 passed=950 failed=723 |
+The sink fix closes the abort. It does **not** close the silent replay, and
+that is what most of these 56 classes were actually dying of. One binary
+carrying both changes, the 56-class list, one variable:
 
-Same binary, same host, same classpath, back to back. Nothing else varied.
+| arm | OK | FAIL | TIMEOUT | test-methods failed |
+|---|---:|---:|---:|---:|
+| default (this change) | **53** | 1 | 2 | **6** of 1666 |
+| `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | 34 | **21** | 1 | **302** of 1670 |
 
-The two non-OK rows in the fixed arm:
+Twenty classes separate the arms. The families are exactly the ones this page
+grouped under Spring's `"Post-processing of merged bean definition failed"`
+wrapper plus the reactive/WebSocket set: `cache.config.EnableCachingTests`
+(27 of 74 without the guard), `cache.jcache.*`, `cache.aspectj.*`, the
+`web.reactive.result.method.annotation.*` group, `WebSocketIntegrationTests`,
+`StompWebSocketIntegrationTests`, `ResourceHttpRequestHandlerIntegrationTests`.
+
+Those two arms ran back to back on a shared host, so they were confirmed
+ABBA-interleaved over six of the affected classes:
+
+| slot | arm | classes | passed | failed |
+|---:|---|---|---:|---:|
+| 1 | default | OK=6 | 315 | 0 |
+| 2 | `…GUARD=0` | FAIL=6 | 133 | 182 |
+| 3 | `…GUARD=0` | FAIL=6 | 133 | 182 |
+| 4 | default | OK=6 | 315 | 0 |
+
+Byte-identical between repeats of each arm — 133/182 twice, 315/0 twice. That
+is deterministic, not host load.
+
+### The two non-OK rows in the fixed arm
 
 * `aot.nativex.FileNativeConfigurationWriterTests` — `FAIL 9/3/6`, and
   **HotSpot fails it identically** (`FAIL 9/3/6`, re-measured today). Already
   recorded in `not-cratonvm-bugs-consolidated.md`; unchanged by this fix and
   not a CratonVM bug.
-* `beans.factory.aot.BeanRegistrationsAotContributionTests` — `TIMEOUT` only
-  at the suite's default 180 s per-class cap. Run alone with `--one-to 2400`
-  it is **`OK found=14 succ=14 fail=0`, matching HotSpot's 14/14** — in 1067 s
-  against HotSpot's 10.7 s. The correctness half is fixed; the throughput gap
-  is its own open page, `beanregistrations-verylarge-throughput-20260907.md`.
+* `beans.factory.aot.BeanRegistrationsAotContributionTests` and
+  `test.context.aot.AotIntegrationTests` — `TIMEOUT` at the suite's default
+  180 s per-class cap, not failures. Both were re-run alone with
+  `--one-to 2400`:
+
+  | class | status | found | succ | fail | skip | wall |
+  |---|---|---:|---:|---:|---:|---:|
+  | `BeanRegistrationsAotContributionTests` | OK | 14 | 14 | 0 | 0 | 1067 s |
+  | `AotIntegrationTests` | OK | 4 | 2 | 0 | 2 | 334 s |
+
+  Both match HotSpot's own result for the class (14/14, and 4 found / 2 succ /
+  2 skip). HotSpot runs the first in 10.7 s, which is the gap tracked at
+  `beanregistrations-verylarge-throughput-20260907.md`; `AotIntegrationTests`
+  is only just over the cap and crosses it under host load.
+
+### Before the sink fix — the refusal on its own
+
+Measured on a binary built from `dev` @ `e90fa0274` plus this change only, so
+this pair isolates the refusal from the sink fix:
+
+| arm | OK | FAIL | TIMEOUT | test-methods |
+|---|---:|---:|---:|---|
+| refusal ON | **54** | 1 | 1 | found=1670 passed=1653 failed=6 |
+| `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | 0 | **56** | 0 | found=1684 passed=950 failed=723 |
 
 ## The two "mechanisms" were one
 
@@ -86,9 +124,10 @@ The reason the five sampled clusters generalised to all 56 is now clear: the
 trigger is not a Spring construct at all, it is any sufficiently hot method
 that has committed a side effect before reaching a lambda or string-concat
 call site. Spring's AOT, reactive config, caching, Groovy and classpath-index
-code all have that shape, and so does javac, and so — as the retired
-`precise-deoptimization-unavailable-cross-suite-crash` write-up shows — does
-H2, in three application methods with no javac anywhere near them.
+code all have that shape, and so does javac, and so — as
+`../../fixed-bugs/precise-deoptimization-unavailable-cross-suite-crash-20260907-FIXED.md`
+shows — does H2, in three application methods with no javac anywhere near
+them.
 
 ## Reproducing (historical)
 
@@ -96,14 +135,13 @@ H2, in three application methods with no javac anywhere near them.
 cd apps/spring-suite-runner
 JDK25=<jdk25> CRATONVM_BIN=<cratonvm> ./run-suite.sh run \
   --only 'GlobalCorsConfigIntegrationTests$' --tag repro
-# CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0 restores the failure on a fixed binary.
 ```
 
 ## Related
 
-- The retired `testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster`
-  write-up — the full root-cause derivation and the fix's evidence.
-- The retired `precise-deoptimization-unavailable-cross-suite-crash` write-up
+- `testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster-FIXED-20260907.md`
+  — the full root-cause derivation, both fixes, and the throughput measurement.
+- `../../fixed-bugs/precise-deoptimization-unavailable-cross-suite-crash-20260907-FIXED.md`
   — the same defect's H2 half (8 crash classes, all closed).
 - `../../../known-issues/spring/not-cratonvm-bugs-consolidated.md` —
   `FileNativeConfigurationWriterTests`.

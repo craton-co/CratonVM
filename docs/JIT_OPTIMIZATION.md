@@ -4213,3 +4213,93 @@ direct measure of how much a real workload would gain from entry patching, and
 on H2 it is **0**.
 
 H2 unchanged: 21 planted, 1 taken, 0 re-fired, 0 blacklisted, suite 92/92.
+
+### A census number is only comparable to one taken BACK TO BACK
+
+Several deltas in this file were quoted from runs taken minutes or hours apart —
+`refused_method 57 -> 45` for the `Math.abs` work most recently. That is not a
+valid delta, and this section is the measurement that says so.
+
+Twenty-four runs of the same workload on the same binary, no lever changed:
+
+| batch | `accepted` | `refused_method` | `lowered_as_arithmetic` | `bounds_emitted` |
+|---|---|---|---|---|
+| A (7 runs) | 527-585 | 43-54 | 19-24 | 129-164 |
+| B (5 runs) | 526-582 | 44-54 | 19-24 | 130-166 |
+| C (12 runs) | 560-578 | — | — | — |
+
+Across all 24, `accepted` spans **526 to 585 — 11%**. Within a contiguous batch
+it is roughly ±1%. The between-batch spread is an order of magnitude larger
+than the within-batch spread.
+
+An intermediate reading of the first twelve runs looked cleanly BIMODAL — nine
+at ~529 and two at ~584, well separated and internally tight — and that reading
+was wrong. The third batch sat at 570-578, between the two supposed modes, which
+no two-mode model produces. Twelve samples were enough to fit a story and not
+enough to test it.
+
+What survives is simpler and more useful: **the census drifts with ambient
+machine state**, and the drift dwarfs most of the effects being reported. The
+cause is not chased here — background compilation is a race between the
+compiler threads and the workload's own progress, and which methods cross their
+thresholds depends on how the machine feels — but the consequence is concrete:
+
+> A census delta is only meaningful between runs taken **back to back**, in one
+> batch, on one binary, with one lever changed. Exactly the discipline the
+> timing work already uses; it applies to deterministic-looking counters too,
+> because they are not deterministic.
+
+#### The claims this corrects
+
+`refused_method 57 -> 45` for `Math.abs(F)/(D)`: the 57 and the 45 came from
+different sittings and the gap is inside the 43-54 range a single configuration
+produces. The DIRECTION is not in doubt — the two families are recognised and
+lowered, `every_declared_family_is_recognised` proves the recognizer sees them,
+and `Math.abs` disappears from the per-family refusal breakdown — but the
+MAGNITUDE was never measured. The honest statement is "two families moved from
+refused to lowered", with no number attached.
+
+The same caution applies to every single-run census figure quoted above. The
+ones taken as an A/B pair in one sitting — the range-BCE arms, the
+over-intrinsic arms, the trap on/off arms — are unaffected, because both halves
+were taken back to back. That is the whole distinction.
+
+### `test_jit_cache_clear_all_evicts_entries`: 111 runs, 0 failures
+
+Recorded on the residual list as "1 failure in 11 parallel runs, 0
+single-threaded — measured, not proven pre-existing". It was unmeasurable for
+most of a day because the test target would not build: release ended in `rustc`
+exit 101 and debug in `os error 112, not enough disk space`, on a machine with
+**0 bytes free of 930 GB**. Once space came back it built immediately, which
+says the exit-101 was the disk too.
+
+Then a false start worth recording, because it produced a clean-looking zero:
+the first attempt ran the `cratonvm-vm` lib-test binary and got 0 failures in
+30 — from a binary that does not contain the test. `--list | grep -c` said
+`present: 0`. The test lives in `jit/src/lib.rs`, not the vm crate. A pass count
+from a binary that never ran the test is the vacuous green this file keeps
+re-learning, and the only thing that caught it was asking the binary whether it
+had the test rather than assuming the filter matched something.
+
+With the right binary, four shapes:
+
+| shape | runs | failures |
+|---|---:|---:|
+| the test alone, `--test-threads=1` | 30 | 0 |
+| the `jit_cache` module, 8 threads | 20 | 0 |
+| the FULL binary (2,283 tests), default parallelism | 25 | 0 |
+| **six CONCURRENT full binaries**, deliberate max contention | 36 | **0** |
+
+**111 runs, no failures.** At 0/111 the 95% upper bound on the rate is about
+2.7%, which excludes the 9% that "1 in 11" implies. The last shape matters most:
+the original sighting was inside a `cargo test` run, which starts many test
+binaries at once, so six concurrent copies of the heaviest one is a harder
+version of the same condition.
+
+Two readings survive and the second is better supported. Either the single
+observed failure was far rarer than one in eleven, or — consistent with the G1
+family in this same session, where failures under load turned out to be
+`rc=124 HARNESS FAULT — TIMED OUT` and the HotSpot ORACLE failed too — it was
+whole-machine contention during a `cargo test` that was also compiling. The
+recorded rate is not supported either way, and the residual should say so rather
+than carry a number nothing reproduces.

@@ -132,7 +132,15 @@ ALLOC0 = re.compile(
     # last of which only captures at all when `CRATONVM_DBG_DEFINE_STACK_FILTER`
     # is set. Kept as a note rather than deleted silently: if one of them ever
     # grows a `create_string` for a Java `StackTraceElement`, it belongs back.
-    r"|declared_fields|declared_methods|class_annotations|record_components"
+    # `declared_fields`, `declared_methods`, `class_annotations` and
+    # `record_components` are NOT here. All four are `&self` methods on
+    # `vm_exec` that take the class-manager read lock and build a Rust `Vec` of
+    # metadata — no Java object is allocated and no bytecode runs. Listing them
+    # made a reflective metadata read look like a collection point:
+    # `lk_member_access_flags` and `uri_has_synthetic_layout` rooted 16 rows of
+    # the transitive tranche between them. Same class of error as
+    # `capture_stack_trace` and `get_ascii_case_string_cached`, both removed
+    # earlier for the same reason — a getter named like a producer.
     r")\s*\("
     r"|\balloc_ref_array\b|\btry_alloc_synthetic\b"
 )
@@ -570,9 +578,35 @@ def statements(body):
     return out
 
 
+# A BARE NAME THAT EVERY TYPE IMPLEMENTS IS NOT A CALL GRAPH EDGE.
+#
+# `allocating()` keys the graph on the bare identifier before `(`, so all forty
+# `fn drop(&mut self)` bodies in these crates collapse into ONE node — and one
+# of them, the TLS guard in `t27_tls.rs`, calls `end_blocking_region`. That made
+# the node `drop` a depth-0 allocator, and every `drop(guard)` / `drop(map)` /
+# `drop(registry)` in the tree inherited it: 65 rows of the transitive tranche,
+# all of them dropping a mutex guard or a hash map.
+#
+# Excluding them is sound rather than merely convenient. A blocking region's
+# HAZARD is the window between `begin_blocking_region` and `end_blocking_region`,
+# and the audit matches both tokens directly wherever they appear; the `drop`
+# that closes the guard is the END of a window it has already reported.
+#
+# `get`, `new`, `build`, `finish` and `call` are deliberately NOT here. They
+# collide too, but in these crates they are also the names of real helpers that
+# really do allocate, and dropping them would trade a false positive for a false
+# negative — the direction this file's history says not to take.
+UNRESOLVABLE_BY_NAME = frozenset("""
+drop next clone fmt from into default eq ne hash cmp partial_cmp
+deref deref_mut as_ref as_mut borrow borrow_mut to_owned clone_from
+to_string try_from try_into len is_empty iter into_iter
+""".split())
+
+
 def allocating(fns, depth):
     alloc = {fn.name: 0 for fn in fns if ALLOC0.search("\n".join(fn.body))}
-    callees = [(fn.name, set(CALLEE.findall("\n".join(fn.body)))) for fn in fns]
+    callees = [(fn.name, set(CALLEE.findall("\n".join(fn.body))) - UNRESOLVABLE_BY_NAME)
+               for fn in fns]
     for d in range(1, depth + 1):
         known = set(alloc)
         add = {n: d for (n, cs) in callees if n not in alloc and not cs.isdisjoint(known)}
@@ -628,6 +662,8 @@ def _gc_tokens(text, allocfns):
     if ALLOC0.search(text):
         return True
     for c in CALLEE.findall(text):
+        if c in UNRESOLVABLE_BY_NAME:
+            continue
         if c in allocfns and c not in ("if", "while", "match", "for", "return", "Some", "Ok"):
             return True
     return False
@@ -969,6 +1005,142 @@ def assert_dominance_both_ways():
 assert_dominance_both_ways()
 
 
+# ---------------------------------------------------------------------------
+# LAUNDERING RULE (`--launder`)
+#
+# A refresh contract expressed as a PARAMETER MODE only binds the immediate
+# call. `ordered_snapshot_kv(obj: &mut ObjectRef)` says so on itself:
+#
+#     "Taking `obj` by `&mut` is the point: it forces every caller's own
+#      receiver to be refreshed across the walk instead of silently carrying a
+#      pre-GC address into the pins and virtual dispatches that follow."
+#
+# A wrapper that takes the SAME receiver BY VALUE satisfies that `&mut` with a
+# COPY -- `fn helper(this: ObjectRef) { let mut this = this; api(ctx, &mut
+# this); }` -- and throws the refreshed address away at the return, while its
+# caller walks on with the pre-GC one. No rule scoped to a single function can
+# see it: the refresh looks correct in the callee and the staleness is in the
+# caller.
+#
+# MEASURED: `collect_own_property_names` was exactly this, and the receiver its
+# caller then read `defaults` out of was the SIGSEGV of 2026-09-06.
+PARAM_BYVAL = re.compile(r"([a-z_][a-z_0-9]*)\s*:\s*ObjectRef\b")
+REFRESH_API = re.compile(r"read_native_pin|handle_get|scope\s*\.\s*get\b")
+
+
+def _params(sig):
+    """Parameter names in declaration order, top-level commas only."""
+    i = sig.find("(")
+    if i < 0:
+        return []
+    depth, buf, out = 0, [], []
+    for ch in sig[i + 1:]:
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            if depth == 0:
+                break
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    names = []
+    for p in out:
+        m = re.match(r"\s*(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", p)
+        names.append(m.group(1) if m else "")
+    return names
+
+
+def _args(text, callee):
+    """Top-level argument expressions of the FIRST `callee(..)` in `text`."""
+    m = re.search(r"(?<![a-z_0-9.])" + re.escape(callee) + r"\s*\(", text)
+    if not m:
+        return None
+    depth, buf, out = 0, [], []
+    for ch in text[m.end():]:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf).strip())
+    return out
+
+
+def launderers(fns):
+    """Functions that take an `ObjectRef` BY VALUE and refresh their own copy."""
+    out = {}
+    for fn in fns:
+        sig = signature(fn)
+        body = "\n".join(fn.body)
+        for p in set(PARAM_BYVAL.findall(sig)):
+            # `&mut ObjectRef` also matches the bare pattern; that one is fine,
+            # it is the contract being honoured.
+            if re.search(r"\b" + re.escape(p) + r"\s*:\s*&mut\s+ObjectRef\b", sig):
+                continue
+            why = None
+            if re.search(r"&mut\s+" + re.escape(p) + r"\b", body):
+                why = "passes `&mut` of its own copy to a refreshing API"
+            # NOT reported: `let this_pin = pin(this); .. this = read(this_pin,
+            # this)` -- a function refreshing its OWN copy for its OWN body is
+            # the correct, ubiquitous idiom, and nothing is being laundered.
+            # It fired 244 times in one crate, which is what said it was the
+            # wrong question. The laundering shape is narrower: a contract that
+            # says "this refreshes YOUR variable", satisfied with a copy.
+            if why:
+                out.setdefault(fn.name, []).append((p, why, fn))
+    return out
+
+
+def scan_launder(fns):
+    """(laundering fn, param) plus the call sites whose caller reuses its own
+    copy after the call -- which is where the stale read actually happens."""
+    lau = launderers(fns)
+    hits = []
+    for name, entries in sorted(lau.items()):
+        for p, why, fn in entries:
+            idx = _params(signature(fn)).index(p) if p in _params(signature(fn)) else -1
+            sites = []
+            for g in fns:
+                if g.name == name:
+                    continue
+                stmts = statements(g.body)
+                for k, st in enumerate(stmts):
+                    if not re.search(r"(?<![a-z_0-9.])" + re.escape(name) + r"\s*\(", st.text):
+                        continue
+                    args = _args(st.text, name)
+                    if not args or idx < 0 or idx >= len(args):
+                        continue
+                    a = args[idx].strip()
+                    if not re.fullmatch(r"[a-z_][a-z_0-9]*", a):
+                        continue
+                    for st2 in stmts[k + 1:]:
+                        # A REBINDING is a fresh value, not a stale use. A
+                        # registration function holds several closures, each
+                        # with its own `let this = obj_arg(args, 0)?`, and
+                        # without this every later closure read as a reuse of
+                        # the earlier one's receiver.
+                        m2 = LET.match(st2.text)
+                        if (m2 and m2.group(1) == a) or REBIND(a).search(st2.text):
+                            break
+                        if names(a, st2.text):
+                            sites.append((g.name, a, g.line + st.line, g.line + st2.line))
+                            break
+            hits.append((name, p, why, sites))
+    return hits
+
+
 def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
     stmts = statements(fn.body)
     # DROP THE SIGNATURE. It reassembles as one statement, and `gc_capable`
@@ -1129,6 +1301,8 @@ def main():
     ap.add_argument("--only", default=None)
     ap.add_argument("--any-binding", action="store_true", dest="any_binding",
                     help="rule 1: do not require the BINDING statement to be GC-capable")
+    ap.add_argument("--launder", action="store_true",
+                    help="helpers that take ObjectRef BY VALUE and refresh their own copy")
     ap.add_argument("--loops", action="store_true",
                     help="a GC anywhere in a loop body stales every reference carried in")
     ap.add_argument("--opt", action="store_true",
@@ -1144,12 +1318,26 @@ def main():
             continue
         if a.only and fn.name != a.only:
             continue
-        if a.loops:
+        if a.launder:
+            found = []
+        elif a.loops:
             found = scan_loops(fn, allocfns)
         else:
             found = scan(fn, allocfns, True, a.opt, a.any_binding)
         for (ln, nm, use, kind) in found:
             rows.append((os.path.basename(fn.file), ln, fn.name, nm, use, kind))
+    if a.launder:
+        hits = scan_launder(fns)
+        print("laundering helpers: %d" % len(hits))
+        live = 0
+        for name, p, why, sites in hits:
+            mark = "  <-- callers reuse their copy" if sites else ""
+            print("  %-46s %-14s %s%s" % (name, p, why, mark))
+            for g, var, cl, ul in sites:
+                live += 1
+                print("        caller %-40s passes `%s` at :%d, uses it again at :%d" % (g, var, cl, ul))
+        print("TOTAL laundering helpers: %d ; call sites that then reuse: %d" % (len(hits), live))
+        return
     per = collections.Counter(r[0] for r in rows)
     print("functions indexed: %d (test bodies skipped: %d) ; reachable-allocating: %d"
           % (len(fns), skipped, len(allocfns)))
