@@ -1294,3 +1294,42 @@ G1 and ZGC do and a Cheney copy structurally cannot.
 
 Windows only. Linux and the fallback return zeros with a comment saying so,
 rather than a silent no-op that would read as success.
+
+## 15. The 19 classes at FORCED engagement: zero NPEs, and how much that is worth
+
+The original question, finally asked under conditions that could answer it.
+
+§0 reported four of the family clean and said at the time that the reading was
+vacuous: relocation had collapsed to 0-1 moving cycles, so nothing was
+exercised. §13's kill-switch A/B is void for a related reason — the §10.4
+SIGSEGV no longer reproduces with the fix OFF either. Neither settles whether
+the family that opened this page still fails.
+
+`CRATONVM_GC_NO_PEER_PIN_DIVERT=1` makes relocation reachable, so this measures
+the symptom that OPENED the page — the `NullPointerException` in JUnit's
+`ValidatingInvocation` — on all 19 classes, 2 reps each, current dev.
+
+**Total: NPE=0, crashes=0.** And the engagement column, which is why that
+number needs qualifying:
+
+| class | moving cycles (2 reps) |
+|---|---:|
+| `UniqueIpFilterTest` | 104 |
+| `ReadOnlyDirectByteBufferBufTest` | 70 |
+| `LittleEndianCompositeByteBufTest` | 7 |
+| 14 further classes | 1–4 |
+| `NioEventLoopTest` | **0 — proves nothing** |
+
+**Two classes were meaningfully exercised and were clean.** The other
+seventeen relocated between zero and 3.5 times a run, against the 9–24 a run
+the family originally failed under, so for those this is a weak test rather
+than a clean bill. `DuplicatedByteBufTest` makes the point: 58 moving cycles a
+run under §11's pairing instrumentation, 1 a run here, same flag, same class.
+Engagement on this workload still varies by more than an order of magnitude for
+reasons §0.3's five refuted hypotheses did not find.
+
+**What can honestly be said:** the family shows no NPEs at the tip, and the two
+classes where relocation genuinely ran are clean. **What cannot:** that the
+remaining seventeen are fixed rather than under-exercised. Closing this page
+properly needs those classes driven to comparable engagement first — and
+nobody yet knows what drives it.
