@@ -239,6 +239,20 @@ pub fn report_at_exit() {
             "[c2-supersede] ir bounds elisions by range proof: {} (rest are dominating-redundancy)",
             cratonvm_jit::ir_check_elim::range_census(),
         );
+        // WHY the rest were not provable. "Extend the range pass" is four
+        // separate decisions with very different costs, and this says which
+        // one is actually holding the checks.
+        let refusals = cratonvm_jit::ir_check_elim::refusal_census();
+        if !refusals.is_empty() {
+            let body: Vec<String> = refusals
+                .iter()
+                .map(|(name, n)| format!("{name}={n}"))
+                .collect();
+            eprintln!(
+                "[c2-supersede] ir bounds range refusals: {}",
+                body.join(" ")
+            );
+        }
         eprintln!(
             "[c2-supersede] ir aastore sites lowered: {}",
             cratonvm_jit::ir_lower::ir_aastore_census(),

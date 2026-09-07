@@ -284,10 +284,29 @@ awk -F'\t' 'NR>1{
     printf "mean   per-class delta : %+.1f%%\n", sd/n/10
     printf "----------------------------------------------------------\n"
     if (med_d < 0) ad = -med_d; else ad = med_d
-    if (ad <= med_s) {
+    # The SIGN TEST is a separate question from the effect size, and hibernate
+    # is the case that proved it: 26 of 37 classes faster with the lever on
+    # (z=2.5) at a median delta of only +0.3%, against a 6.9% per-class floor.
+    # Comparing the median effect to the median noise alone calls that
+    # "unmeasurable" and throws away a consistent, real direction. A small
+    # effect that survives averaging over many classes is exactly what a
+    # per-class harness is FOR.
+    z = (n > 0) ? (2*wins - n) / sqrt(n) : 0
+    az = (z < 0) ? -z : z
+    printf "sign test on the paired count: z = %+.2f%s\n", z,
+           (az >= 2 ? "  (consistent, p < 0.05)" : "  (a coin)")
+    printf "----------------------------------------------------------\n"
+    if (ad <= med_s && az < 2) {
       printf "VERDICT: UNMEASURABLE. The effect (%.1f%%) is not larger than the\n", ad/10
       printf "         noise floor (%.1f%%) taken from two runs of the SAME\n", med_s/10
-      printf "         configuration. Report no throughput number from this run.\n"
+      printf "         configuration, and the paired count is a coin. Report no\n"
+      printf "         throughput number from this run.\n"
+    } else if (ad <= med_s) {
+      printf "VERDICT: SMALL BUT CONSISTENT. Each class is noise-dominated"\
+             "  (%.1f%% effect against a %.1f%% floor), but A wins %d of %d,\n",
+             ad/10, med_s/10, wins, n
+      printf "         which a fair coin does not do. Report the DIRECTION and the\n"
+      printf "         paired count; the per-class magnitude is not resolved.\n"
     } else {
       printf "VERDICT: effect %.1f%% exceeds the %.1f%% same-config noise floor.\n", ad/10, med_s/10
       printf "         Read the paired count above as the primary statistic.\n"

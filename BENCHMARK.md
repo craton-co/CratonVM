@@ -323,19 +323,50 @@ present in this tree.
 
 Notes:
 
-- **The offload gate only analyses the entry class, and says nothing when it
-  skips one.** `bench-gpu/GpuComputeWarm.java` has `main()` call
-  `GpuCompute.heavy` in another class; run it under `--gpu
-  --print-gpu-decisions` and `GpuCompute.heavy` never appears in the decision
-  log at all — not `Rejected(...)`, never considered — and the row reads
-  2,611-2,934 ms on the CPU. Move the identical kernel into the class that owns
-  `main()` (`bench-gpu/GpuComputeWarmSelf.java`) and the same run reports
-  `Eligible`, takes 7 ms, and produces a bit-identical checksum. The published
-  8 ms was always real; the harness the 2026-09-02 note recommended for it
-  cannot reproduce it on this build. Filed as a defect — a silently-skipped
-  kernel is worse than a rejected one, because `--print-gpu-decisions` is the
-  documented way to find out why something did not offload and it shows nothing
-  here.
+- **FIXED 2026-09-07: a compiled caller silently stopped offloading a kernel in
+  another class.** `bench-gpu/GpuComputeWarm.java` has `main()` call
+  `GpuCompute.heavy` in a second class. Under `--gpu --print-gpu-decisions`
+  that method never appeared in the decision log at all — not
+  `Rejected(...)`, never asked — and the row read **2,611-2,934 ms on the
+  CPU** against 7 ms on the device. The same kernel declared beside `main()`
+  (`GpuComputeWarmSelf.java`) offloaded normally, which is what made it
+  look like an analyzer problem. It was not.
+
+  Root cause: the JIT has two one-way doors for a static call site — bind it
+  directly to the callee's entry (`jit/src/lib.rs`) and inline it
+  (`jit/src/x64/bytecode_walk.rs`). Both were gated on
+  `offload_hook::is_kernel`, a lookup in a registry that `offload_jit_gate`
+  fills as a side effect of scanning callers — and that scan cannot judge a
+  target whose declaring class is not loaded yet. A caller is scanned when it
+  is admitted to the JIT, which happens **before** it runs, so a callee in
+  another class has typically never been touched at that moment. `main` here
+  fills two 2²⁴ arrays first, so it is compiled at exactly the wrong time.
+  The site was bound directly, the dispatch helper the offload hook lives
+  behind was gone, and `try_compiled_offload`'s late registration (the
+  2026-09-06 fix for the same underlying limitation) had no site left to run
+  on.
+
+  The fix is one predicate. A registry **miss** means either "not a kernel" or
+  "could not have known yet", and these doors treated the two identically while
+  making a decision that is irreversible. `offload_hook::keeps_dispatch_helper`
+  now falls back on a miss to a descriptor-only test — `)V`/`)I`/`)J` with an
+  array parameter, mirroring `target_can_ever_dispatch` — which needs no class
+  loading and no locks. Keeping a helper is reversible and cheap; binding
+  directly is neither.
+
+  Verified: `GpuComputeWarm` went 2,934 ms → **6 ms**, and the census now
+  prints `registered late, by the compiled site: GpuCompute.heavy([I[I[I)V`.
+  Across five runs each on a quiet host the two harnesses are indistinguishable
+  (cross-class 5-6 ms, same-class 5-6 ms), which is the property that was
+  broken. `test_classes/gpu/GpuForwardRef.java` passes on both arms with equal
+  checksums. `GpuHookOverheadBench`'s `base_ns_per_call` — a loop calling an
+  **ineligible** target, which is what a broader predicate would have taxed —
+  reads 7.07 ns with `--gpu` against 7.58 ns without, so the CPU side pays
+  nothing; for scale, the old caller-refusal approach cost 407.9 ns there.
+
+  `bench-gpu/rerun-table-rows.sh` now measures this row with the cross-class
+  harness on purpose, and keeps the same-class one as a control arm. If the two
+  ever diverge again, that is what regressed.
 
 - The div-chain rows are the "GPU wins big" cases: division has no
   competitive CPU-vectorized form, so raw parallelism wins at every size

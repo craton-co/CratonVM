@@ -7473,6 +7473,31 @@ impl<'a> Lowerer<'a> {
                 let sop = *sop;
                 let slot = self.alloc_slot(id);
                 let w = sop.operands_are_long();
+                if sop.is_fp() {
+                    // The FP families live in XMM and never touch RAX. Handled
+                    // before the general-purpose load below, which would
+                    // otherwise read an FP value through `gp_load_value` and
+                    // hand the arm a bit pattern in the wrong register file.
+                    //
+                    // `Math.abs` is one AND against a sign mask. The mask goes
+                    // via a GP register because this tier has no FP constant
+                    // pool; XMM1 is already the designated mask register (see
+                    // the file header's XMM role note).
+                    let dbl = matches!(sop, ScalarOp::AbsD);
+                    self.fp_load_value(XMM0, node.inputs[0], dbl);
+                    if dbl {
+                        self.emit_mov_reg_imm64(RAX, 0x7FFF_FFFF_FFFF_FFFF);
+                        self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC8]); // MOVQ XMM1, RAX
+                        self.buf.emit(&[0x66, 0x0F, 0x54, 0xC1]); // ANDPD XMM0, XMM1
+                    } else {
+                        self.buf.emit(&[0xB8]); // MOV EAX, imm32
+                        self.buf.emit(&0x7FFF_FFFFu32.to_le_bytes());
+                        self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC8]); // MOVD XMM1, EAX
+                        self.buf.emit(&[0x0F, 0x54, 0xC1]); // ANDPS XMM0, XMM1
+                    }
+                    self.fp_store_value(id, slot, XMM0, dbl);
+                    return;
+                }
                 self.gp_load_value(RAX, node.inputs[0]); // a
                 match sop {
                     ScalarOp::MinI | ScalarOp::MaxI | ScalarOp::MinL | ScalarOp::MaxL => {
@@ -7622,6 +7647,14 @@ impl<'a> Lowerer<'a> {
                         } else {
                             self.buf.emit(&[0xD3, modrm]); // ROL/ROR EAX, CL
                         }
+                    }
+                    ScalarOp::AbsF | ScalarOp::AbsD => {
+                        // Unreachable: the `is_fp()` guard above returns before
+                        // this match. Spelled out rather than folded into a
+                        // catch-all so that adding a THIRD FP family without
+                        // extending that guard is a compile error here, not a
+                        // value silently read out of RAX.
+                        unreachable!("FP scalar intrinsics return before this match")
                     }
                     ScalarOp::CompareI | ScalarOp::CompareL => {
                         // Byte for byte the `Op::LCmp` sequence below, which is
@@ -9698,6 +9731,9 @@ impl<'a> Lowerer<'a> {
         crate::ir_check_elim::note_check(1, elide_bounds);
         if elide_bounds && self.check_elision.bounds_range_proved(node) {
             crate::ir_check_elim::note_range_proved();
+        }
+        if !elide_bounds && node != NO_NODE {
+            crate::ir_check_elim::note_range_refusal(self.check_elision.bounds_refusal(node));
         }
         if !elide_null {
             // Null check: TEST RAX,RAX → ZF=1 iff array == null. Continue on JNZ.

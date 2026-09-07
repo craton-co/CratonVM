@@ -14,15 +14,20 @@
 # TornadoVM twin warms up before its timer. The two arms were not measuring the
 # same thing. `GpuComputeWarm` is that row's warm harness and is what this uses.
 #
-# MEASURED 2026-09-07, and the reason this file names GpuComputeWarmSelf rather
-# than GpuComputeWarm: the offload gate only analyses the ENTRY class. Run
-# `GpuComputeWarm`, whose main() calls `GpuCompute.heavy` in another class, and
-# `GpuCompute.heavy` never appears in --print-gpu-decisions at all -- not
-# rejected, never considered -- and the row reads 2611-2934 ms on the CPU. Move
-# the identical kernel into the class that owns main() and the same run reads
-# 8 ms with an Eligible verdict and a bit-identical checksum. That is a real
-# CratonVM defect, filed separately; GpuComputeWarmSelf exists so this table can
-# measure the kernel rather than the defect.
+# This uses GpuComputeWarm -- the CROSS-CLASS harness -- deliberately, and that
+# is now a regression test as well as a measurement.
+#
+# On 2026-09-07 it read 2,611-2,934 ms because a compiled caller bound its
+# static call site directly when the callee's class was not yet loaded, which
+# removed the dispatch helper the offload hook lives behind. `GpuCompute.heavy`
+# never appeared in --print-gpu-decisions at all -- not rejected, never asked.
+# The workaround was GpuComputeWarmSelf (same kernel, declared in the class that
+# owns main()), kept below as the control arm.
+#
+# Fixed the same day in jit/src/offload_hook.rs: the compile-time doors now ask
+# `keeps_dispatch_helper` rather than `is_kernel`, so a registry MISS that could
+# still turn out to be a kernel keeps its helper. If this row ever reads
+# hundreds of milliseconds again, that is what regressed.
 #
 # Every bench here has the same shape: best-of-REPS, printing `<key>_ms=` and a
 # `<KEY>_CHECKSUM=`. The checksum is the point -- a speed number whose checksum
@@ -62,7 +67,8 @@ echo "[env] N        : $N   reps: $REPS"
 echo "[build] bench-gpu classes ..."
 "$JAVAC" -d "$GO" \
   "$GO/GpuDivChain.java" "$GO/GpuFloatDivChain.java" \
-  "$GO/GpuComputeWarmSelf.java" "$GO/GpuDotBench.java" \
+  "$GO/GpuComputeWarm.java" "$GO/GpuCompute.java" "$GO/GpuComputeWarmSelf.java" \
+  "$GO/GpuDotBench.java" \
   || { echo "[build] FAILED" >&2; exit 1; }
 
 TORNADO_OK=1
@@ -115,7 +121,9 @@ echo
 echo "=== four array kernels, N=$N, best of $REPS ==="
 row "int div-chain"        GpuDivChain      TornadoDivChain      divchain_ms  DIV_CHECKSUM
 row "double div-chain"     GpuFloatDivChain TornadoFloatDivChain fdivchain_ms FDIV_CHECKSUM
-row "128 multiply-adds"    GpuComputeWarmSelf TornadoGpuCompute  heavy_ms     COMPUTE_CHECKSUM
+row "128 multiply-adds"    GpuComputeWarm   TornadoGpuCompute    heavy_ms     COMPUTE_CHECKSUM
+# Control arm for the cross-class fix: same kernel, declared beside main().
+row "128 mul-adds (same-class)" GpuComputeWarmSelf TornadoGpuCompute heavy_ms COMPUTE_CHECKSUM
 row "dot-product reduction" GpuDotBench     TornadoDotBench      dot_ms       DOT_CHECKSUM
 
 # ── report ────────────────────────────────────────────────────────────────────
@@ -129,7 +137,7 @@ mkdir -p "$(dirname "$OUT")"
   echo
   echo "| Kernel | HotSpot C2 | TornadoVM | CratonVM GPU | vs HotSpot | vs TornadoVM | checksum |"
   echo "|---|---|---|---|---|---|---|"
-  for label in "int div-chain" "double div-chain" "128 multiply-adds" "dot-product reduction"; do
+  for label in "int div-chain" "double div-chain" "128 multiply-adds" "128 mul-adds (same-class)" "dot-product reduction"; do
     hs="${MS[$label,hs]:-}"; cv="${MS[$label,cv]:-}"; tv="${MS[$label,tv]:-}"
     vh="n/a"; vt="n/a"
     [ -n "$hs" ] && [ -n "$cv" ] && [ "$cv" != "0" ] && vh="$(awk -v a="$hs" -v b="$cv" 'BEGIN{printf "%.1fx", a/b}')"
@@ -142,7 +150,7 @@ mkdir -p "$(dirname "$OUT")"
   echo
   echo "| Kernel | HotSpot | CratonVM | TornadoVM |"
   echo "|---|---|---|---|"
-  for label in "int div-chain" "double div-chain" "128 multiply-adds" "dot-product reduction"; do
+  for label in "int div-chain" "double div-chain" "128 multiply-adds" "128 mul-adds (same-class)" "dot-product reduction"; do
     printf '| %s | `%s` | `%s` | `%s` |\n' "$label" \
       "${SUM[$label,hs]:--}" "${SUM[$label,cv]:--}" "${SUM[$label,tv]:--}"
   done

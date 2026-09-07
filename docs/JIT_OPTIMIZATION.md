@@ -3777,3 +3777,255 @@ Run sequentially with no shard contention it takes **91.4 s with inlining and
 that crosses a 180 s cap when four shards compete, and the lever had nothing to
 do with it. The caution was right, and this is what it looks like to close that
 kind of loose end instead of leaving it as a hedge.
+
+## The seven follow-ups, 2026-09-07
+
+### 1. Pricing what shipped default-ON without a price
+
+Range BCE and the scalar-intrinsic families both went in on correctness and
+engagement — 91/91 on three collectors, six of ten checks removed on a probe,
+twenty-odd sites lowered — and neither was ever measured for throughput. That
+is the same omission this file criticised the acceptance gate for, so it was
+closed. H2, one binary, one lever, three arms with the default run TWICE as its
+own floor, host at 4% CPU:
+
+| lever | paired count (cpu / wall) | control (cpu / wall) | verdict |
+|---|---|---|---|
+| `CRATONVM_JIT_IR_BCE_RANGE=0` | 11/21, 11/21 | 13/21, 11/21 | **coin** |
+| `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` | 9/21, 10/21 | 12/21, 12/21 | **coin** |
+
+Both are throughput-neutral on H2. For the scalar-intrinsic arm the control's
+own means sat 3.6% apart, which is as large as the treatment gap, so only the
+paired counts are readable there — the means are not.
+
+Neither result is a disappointment and neither is a reason to remove anything:
+they are reach and correctness work, which is the same verdict the original
+seven-item pass earned. What changed is that it is now measured rather than
+assumed in the favourable direction.
+
+### 2. IR inlining on netty, with the per-class harness
+
+Two runs of `tools/suite-pair-ab/pair-ab.sh`, 46 usable classes between them:
+
+| run | classes | A faster | median delta | noise floor | verdict |
+|---|---:|---:|---|---|---|
+| quiet host | 6 | 2 | -0.6% | **2.0%** | UNMEASURABLE |
+| busier host | 40 | 17 | -0.7% | 8.8% | UNMEASURABLE |
+
+**19 of 46 overall** — a coin, leaning very slightly against inlining, with both
+runs agreeing on the sign and the magnitude (-0.6% / -0.7%). The 8% that
+motivated this whole line of work is not there. The quiet run resolves to 2%,
+so an 8% effect would have been unmissable.
+
+Five classes had a delta beating their own noise; A was faster in three of
+them. Even the individually-significant subset is a coin.
+
+### 3. Why the other bounds checks are not provable — and why NOT to extend the pass
+
+The range pass proves 9-11 checks of ~130 on H2. The obvious next move is to
+relax its two restrictions (unit stride, guard-dominates-back-edge). The
+refusal census says that would be wasted work:
+
+```
+[c2-supersede] ir bounds range refusals:
+    no-length-test=110  other-array=16  index-not-non-negative=4
+```
+
+`guard-not-dominating=0`. `iv-shape-rejected=0`. **Not one bounds check on H2
+fails because of the stride rule or the back-edge rule.** 110 of 130 fail
+because the index is never compared against ANY array length anywhere in the
+graph — they are isolated accesses, not loop-guarded ones, and no relaxation of
+a loop-shape rule reaches them.
+
+Removing those needs a different technique altogether (whole-method length-fact
+propagation, or speculative predication with a deopt), not an extension of
+this pass. Sixteen more are indexed by one array and length-tested against
+another, which needs an equal-length or aliasing fact this tier does not have.
+
+That is the entire value of the census: without it the next session extends the
+stride rule, measures no change, and has to work out why. `pair-ab` and this
+are the same lesson in two places — build the instrument that can say "no".
+
+### 4. `Math.abs(float)` / `Math.abs(double)` as scalar intrinsics
+
+The first FP members of `ScalarOp`, and the cheapest entry left on the
+work list. One AND against a sign mask — no branch, no memory, no CPU feature.
+
+The sign-mask form is not merely faster than `x < 0 ? -x : x`, it is *more
+correct*: the comparison form returns **-0.0** for `abs(-0.0)`, because
+`-0.0 < 0` is false. `probes/ScalarFpAbsProbe.java` pins that (via `1/x`, since
+`-0.0 == +0.0` compares true), plus NaN, both infinities, both `MIN_VALUE`
+subnormals and a full-mantissa value, and agrees with HotSpot on all of them.
+
+These do NOT go through `gp_load_value`/`store_rax` like every other member, so
+the lowering arm gained an `is_fp()` guard that returns before the
+general-purpose load. Two things made that safe to bolt onto the existing op
+rather than needing a new one: `fp_load_value`/`fp_store_value` already exist,
+and `value_home_droppable` refuses any type that is not `Int`/`Long`, so the
+`op_home_is_one_store_rax` claim over `Op::ScalarIntrinsic` is filtered by type
+before it can be consulted for an FP node.
+
+`every_declared_family_is_recognised` now drives off an EXHAUSTIVE match
+instead of a hand-kept tuple list. The old form could not catch the one failure
+it existed for — a family present in the enum and the lowering but missing from
+the recognizer, which reads from outside exactly like a workload with no such
+call site. Adding a variant is now a compile error until its signature is
+declared.
+
+H2 `refused_method` 57 -> 45.
+
+### 5. The unresolved-class trap does NOT self-heal — and the correction above was wrong
+
+This file said, earlier today, that the original assessment of this trap had
+named the wrong blocker:
+
+> `Op::Guard` does bake an action into its `DeoptimizationPoint`, but nothing
+> reads it. […] `UncommonTrap` takes the count-based policy: `Reinterpret` on
+> the first deopt, then `RecompileAndReinterpret`. So the self-healing the
+> switch was said to be waiting for is already there, one deopt later than
+> ideal.
+
+**That correction was itself wrong, and the text it corrected was right.**
+`probes/UnresolvedTrapProbe.java` fires the trap and the answer is not
+ambiguous.
+
+The probe's shape is the awkward part and worth keeping: for a trap to be
+planted the class must be unloaded when the method compiles, but a method only
+gets hot by running, and running the cast would load the class. So the cast
+sits behind a parameter that is false during warm-up — 200,000 calls with
+`doCast=false` compile the method with `Shape` still unloaded, then 200,000
+calls with `doCast=true` put the trap on a live path.
+
+```
+[c2-supersede] ir site traps planted: unresolved-typecheck=1
+200000  reason=UnreachedCode bci=5 action=MakeNotCompilable
+        eager re-queue (RecompileAndReinterpret): 0
+```
+
+**Every single call deopts.** 200,000 of 200,000, at the checkcast bci, with
+`MakeNotCompilable` and not one recompile. The answers stay correct — the
+interpreter finishes the bytecode — which is exactly why this could never have
+been settled by a correctness probe, and why the earlier reasoning went astray:
+the failure mode is throughput, permanently, and it is invisible unless you
+count deopts.
+
+Two things the run also settles:
+
+The reason is `UnreachedCode`, not the `UncommonTrap` that `Op::Guard`'s
+lowering bakes into its `DeoptimizationPoint`. So the guard's `reason` field is
+as dead as its `action` field — the runtime sees a fixed code — and
+`UnreachedCode` maps to `MakeNotCompilable` on the FIRST occurrence, with no
+count-based escalation at all. That is the mechanism, and it is worse than
+either the original text or its correction supposed.
+
+It is not the acceptance gate hiding the IR body either. With
+`CRATONVM_C2_ACCEPT=always` (`accepted=4 refused_no_evidence=0`) the result is
+byte-identical: 200,000 deopts, same reason, same action.
+
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` stays **OFF**, now for a measured
+reason. And a flag worth raising rather than burying: the `invokedynamic` trap
+is DEFAULT ON and is planted by the same `plant_uncommon_trap`, so it has the
+same property. No harm is observed — H2 plants 21 of them and fires none, and
+an indy bootstrap this tier will never lower has no "later" to wait for — but
+"none of them has ever gone live on a workload we run" is the only thing
+standing between that default and this behaviour.
+
+The lesson worth keeping is about the correction, not the trap: a unit test
+with no deopt runtime could not distinguish "traps once and heals" from "traps
+forever", and I used that inability as licence to prefer the reading I had
+derived from reading a policy function. Reading a policy function is not
+running one.
+
+### 6. hibernate-reactive
+
+60 classes, one binary, one lever.
+
+| arm | `IR_INLINE` | PASS | NOTESTS | `[ir] spliced` |
+|---|---|---:|---:|---:|
+| on | 1 | 59 | 1 | **12,677** |
+| off | 0 | 59 | 1 | **0** |
+
+Pass rates identical, and the engagement census is emphatic: hibernate gives IR
+inlining more than four times the work netty does (12,677 splices against
+2,802). If any workload here were going to show the effect, it is this one.
+
+`sum_class_ms` reads 1,061,583 on and 1,179,251 off — a 10% win, the largest
+apparent number in this whole investigation. **It is not reported as a result**,
+because it is a per-run sequential comparison, which the section above proved
+cannot produce a timing number on this host. It is exactly the shape that read
+"8% on netty" and turned out to be drift.
+
+So the harness was pointed at hibernate instead, and it found something.
+
+### The one real throughput result: inlining is a small, consistent win on hibernate
+
+37 usable classes, ABBA per class:
+
+```
+A faster than B in 26 of 37 classes
+median per-class delta : +0.3%
+median within-arm noise: 6.9%   (SAME config, two runs)
+  of the 3 classes whose own delta beats their own noise: A faster in 3
+sign test on the paired count: z = +2.47  (consistent, p < 0.05)
+VERDICT: SMALL BUT CONSISTENT.
+```
+
+26 of 37 is not something a fair coin does. Each individual class is
+noise-dominated — 0.3% against a 6.9% floor — but the DIRECTION survives
+averaging over 37 of them, and the three classes that individually clear their
+own noise all point the same way.
+
+**This is the first positive throughput result for IR inlining on real code in
+this document**, and it is nothing like 8%: it is a fraction of a percent,
+detectable only because the sign test aggregates many classes. Set against
+netty's 19 of 46 (z = -1.18, a coin), the picture is that IR inlining is
+somewhere between neutral and slightly positive on real applications, and the
+original 8% does not reproduce anywhere.
+
+#### The harness had to be corrected to see it
+
+The first version compared the median effect against the median noise floor and
+called hibernate UNMEASURABLE. That rule is right for a single class and wrong
+for a suite: a small effect that is CONSISTENT across many classes is exactly
+what a per-class design can detect and a per-run design cannot, and folding the
+paired count out of the verdict threw away the only thing this harness was
+built to find. `pair-ab.sh` now reports the sign test as a z-score and has a
+third verdict, SMALL BUT CONSISTENT, for effect-below-floor with a paired count
+a coin does not produce. netty still reads UNMEASURABLE under the new rule
+(z = +0.90); hibernate reads z = +2.47.
+
+### 7. The two flakes
+
+**G1's GC-stress family is a harness TIMEOUT, not a stochastic defect.** Four
+clean full-suite G1 runs on an uncontended host: **92/92, four times.** The
+earlier "91, 91, 90" that put this on the residual list was taken while other
+work shared the box.
+
+A fifth run, taken deliberately while twelve `cargo test` invocations ran
+alongside, reproduced the failure and labelled it:
+
+```
+RExceptions   FAIL rc=124: HARNESS FAULT — TIMED OUT; the harness killed the
+                   VM, it did not fail [try TIMEOUT=600]
+RMapGcStress  FAIL rc=124: HARNESS FAULT — TIMED OUT ...
+HARNESS ERROR [G4] RJdkFormatLocale: the HotSpot oracle run FAILED (rc=1)
+```
+
+The HotSpot ORACLE failed in that run too, which no CratonVM defect can cause.
+So the vector to record is not "RMapGcStress is flaky on G1" but "the suite's
+flat per-class timeout is too tight for a contended host", and the fix is
+`TIMEOUT=600` or an uncontended run, not a `known-flaky.txt` row. That also
+explains why the vector passed 4/4 when run alone and failed only inside a full
+suite: the suite is what supplies the load.
+
+**`test_jit_cache_clear_all_evicts_entries` is NOT MEASURED, and the reason is
+worth writing down.** The `cratonvm-vm` lib-test target does not build in this
+checkout: release ends in `rustc` exit 101, and debug fails with
+`os error 112 — not enough disk space`. The machine had **0 bytes free of
+930 GB**, and the debug tree from that one attempt was itself 9.3 GB. Nothing
+was measured because nothing could be run.
+
+What the G1 result does supply is a much better prior. The original observation
+was "1 failure in 11 PARALLEL runs, 0 single-threaded" — the same contention
+signature that turned out to explain the G1 family entirely. That is a
+hypothesis with new support, not a result, and it is recorded as one.

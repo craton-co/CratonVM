@@ -8568,6 +8568,22 @@ pub enum ScalarOp {
     RotateRightI,
     /// `Long.rotateRight(long, int)`.
     RotateRightL,
+
+    // -- Floating-point sign mask, 2026-09-07 ------------------------
+    //
+    // `Math.abs(float)` / `Math.abs(double)` clear the sign bit, which is one
+    // AND against a mask -- no branch, no memory, and no NaN special case:
+    // clearing the sign of a NaN yields a NaN, which is what the JLS requires.
+    // It also gets `abs(-0.0) == +0.0` right for free, where a comparison-based
+    // sequence (`x < 0 ? -x : x`) returns -0.0 and is WRONG.
+    //
+    // These are the first FP members of this enum. They do NOT go through
+    // `gp_load_value`/`store_rax` like every variant above; see
+    // `ScalarOp::is_fp` and the guard at the top of the lowering arm.
+    /// `Math.abs(float)`.
+    AbsF,
+    /// `Math.abs(double)`.
+    AbsD,
 }
 
 impl ScalarOp {
@@ -8586,9 +8602,23 @@ impl ScalarOp {
             | ScalarOp::LowestOneBitI
             | ScalarOp::LowestOneBitL
             | ScalarOp::HighestOneBitI
-            | ScalarOp::HighestOneBitL => 1,
+            | ScalarOp::HighestOneBitL
+            | ScalarOp::AbsF
+            | ScalarOp::AbsD => 1,
             _ => 2,
         }
+    }
+
+    /// Does this family operate in XMM registers rather than general-purpose
+    /// ones?
+    ///
+    /// The lowering arm loads `inputs[0]` into RAX before it dispatches, which
+    /// is wrong for an FP family; this is the predicate that guards it. Kept as
+    /// its own question rather than derived from `result_type`, because
+    /// `Long.numberOfLeadingZeros` already proves operand width and result
+    /// width are independent here.
+    pub fn is_fp(self) -> bool {
+        matches!(self, ScalarOp::AbsF | ScalarOp::AbsD)
     }
 
     /// The type of data input `idx`.
@@ -8608,6 +8638,8 @@ impl ScalarOp {
             {
                 IrType::Int
             }
+            ScalarOp::AbsF => IrType::Float,
+            ScalarOp::AbsD => IrType::Double,
             _ if self.operands_are_long() => IrType::Long,
             _ => IrType::Int,
         }
@@ -8624,6 +8656,8 @@ impl ScalarOp {
             | ScalarOp::HighestOneBitL
             | ScalarOp::RotateLeftL
             | ScalarOp::RotateRightL => IrType::Long,
+            ScalarOp::AbsF => IrType::Float,
+            ScalarOp::AbsD => IrType::Double,
             // `Integer.compare`, `Long.compare` and BOTH widths of
             // `numberOfLeading/TrailingZeros` return `int` --
             // `Long.numberOfLeadingZeros` takes a `long` and answers an `int`,
@@ -8678,6 +8712,8 @@ impl ScalarOp {
             ScalarOp::RotateLeftL => "Long.rotateLeft(JI)",
             ScalarOp::RotateRightI => "Integer.rotateRight(II)",
             ScalarOp::RotateRightL => "Long.rotateRight(JI)",
+            ScalarOp::AbsF => "Math.abs(F)",
+            ScalarOp::AbsD => "Math.abs(D)",
         }
     }
 }
@@ -8720,6 +8756,8 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
         ("java/lang/Long", "rotateLeft", "(JI)J") => Some(ScalarOp::RotateLeftL),
         ("java/lang/Integer", "rotateRight", "(II)I") => Some(ScalarOp::RotateRightI),
         ("java/lang/Long", "rotateRight", "(JI)J") => Some(ScalarOp::RotateRightL),
+        ("java/lang/Math", "abs", "(F)F") => Some(ScalarOp::AbsF),
+        ("java/lang/Math", "abs", "(D)D") => Some(ScalarOp::AbsD),
         _ => None,
     }
 }
@@ -8736,30 +8774,83 @@ mod scalar_intrinsic_recognizer_tests {
     /// call site.
     #[test]
     fn every_declared_family_is_recognised() {
-        let cases: &[(&str, &str, &str, ScalarOp)] = &[
-            ("java/lang/Math", "min", "(II)I", ScalarOp::MinI),
-            ("java/lang/Math", "max", "(II)I", ScalarOp::MaxI),
-            ("java/lang/Long", "compare", "(JJ)I", ScalarOp::CompareL),
-            ("java/lang/Integer", "numberOfLeadingZeros", "(I)I", ScalarOp::NlzI),
-            ("java/lang/Long", "numberOfLeadingZeros", "(J)I", ScalarOp::NlzL),
-            ("java/lang/Integer", "numberOfTrailingZeros", "(I)I", ScalarOp::NtzI),
-            ("java/lang/Long", "numberOfTrailingZeros", "(J)I", ScalarOp::NtzL),
-            ("java/lang/Integer", "reverseBytes", "(I)I", ScalarOp::ReverseBytesI),
-            ("java/lang/Long", "reverseBytes", "(J)J", ScalarOp::ReverseBytesL),
-            ("java/lang/Integer", "lowestOneBit", "(I)I", ScalarOp::LowestOneBitI),
-            ("java/lang/Long", "lowestOneBit", "(J)J", ScalarOp::LowestOneBitL),
-            ("java/lang/Integer", "highestOneBit", "(I)I", ScalarOp::HighestOneBitI),
-            ("java/lang/Long", "highestOneBit", "(J)J", ScalarOp::HighestOneBitL),
-            ("java/lang/Integer", "rotateLeft", "(II)I", ScalarOp::RotateLeftI),
-            ("java/lang/Long", "rotateLeft", "(JI)J", ScalarOp::RotateLeftL),
-            ("java/lang/Integer", "rotateRight", "(II)I", ScalarOp::RotateRightI),
-            ("java/lang/Long", "rotateRight", "(JI)J", ScalarOp::RotateRightL),
+        // Driven off an EXHAUSTIVE match rather than a hand-kept list. The
+        // previous version was a list of tuples, which could not catch the one
+        // failure this test exists for: a family added to the enum and to the
+        // lowering but missing from the recognizer reads, from outside,
+        // exactly like a workload with no such call site -- the census simply
+        // does not count it. With the match below, adding a variant without
+        // declaring its signature is a COMPILE error.
+        fn declared_signature(sop: ScalarOp) -> (&'static str, &'static str, &'static str) {
+            match sop {
+                ScalarOp::MinI => ("java/lang/Math", "min", "(II)I"),
+                ScalarOp::MaxI => ("java/lang/Math", "max", "(II)I"),
+                ScalarOp::MinL => ("java/lang/Math", "min", "(JJ)J"),
+                ScalarOp::MaxL => ("java/lang/Math", "max", "(JJ)J"),
+                ScalarOp::AbsI => ("java/lang/Math", "abs", "(I)I"),
+                ScalarOp::AbsL => ("java/lang/Math", "abs", "(J)J"),
+                ScalarOp::CompareI => ("java/lang/Integer", "compare", "(II)I"),
+                ScalarOp::CompareL => ("java/lang/Long", "compare", "(JJ)I"),
+                ScalarOp::NlzI => ("java/lang/Integer", "numberOfLeadingZeros", "(I)I"),
+                ScalarOp::NlzL => ("java/lang/Long", "numberOfLeadingZeros", "(J)I"),
+                ScalarOp::NtzI => ("java/lang/Integer", "numberOfTrailingZeros", "(I)I"),
+                ScalarOp::NtzL => ("java/lang/Long", "numberOfTrailingZeros", "(J)I"),
+                ScalarOp::ReverseBytesI => ("java/lang/Integer", "reverseBytes", "(I)I"),
+                ScalarOp::ReverseBytesL => ("java/lang/Long", "reverseBytes", "(J)J"),
+                ScalarOp::LowestOneBitI => ("java/lang/Integer", "lowestOneBit", "(I)I"),
+                ScalarOp::LowestOneBitL => ("java/lang/Long", "lowestOneBit", "(J)J"),
+                ScalarOp::HighestOneBitI => ("java/lang/Integer", "highestOneBit", "(I)I"),
+                ScalarOp::HighestOneBitL => ("java/lang/Long", "highestOneBit", "(J)J"),
+                ScalarOp::RotateLeftI => ("java/lang/Integer", "rotateLeft", "(II)I"),
+                ScalarOp::RotateLeftL => ("java/lang/Long", "rotateLeft", "(JI)J"),
+                ScalarOp::RotateRightI => ("java/lang/Integer", "rotateRight", "(II)I"),
+                ScalarOp::RotateRightL => ("java/lang/Long", "rotateRight", "(JI)J"),
+                ScalarOp::AbsF => ("java/lang/Math", "abs", "(F)F"),
+                ScalarOp::AbsD => ("java/lang/Math", "abs", "(D)D"),
+            }
+        }
+        const ALL: &[ScalarOp] = &[
+            ScalarOp::MinI,
+            ScalarOp::MaxI,
+            ScalarOp::MinL,
+            ScalarOp::MaxL,
+            ScalarOp::AbsI,
+            ScalarOp::AbsL,
+            ScalarOp::CompareI,
+            ScalarOp::CompareL,
+            ScalarOp::NlzI,
+            ScalarOp::NlzL,
+            ScalarOp::NtzI,
+            ScalarOp::NtzL,
+            ScalarOp::ReverseBytesI,
+            ScalarOp::ReverseBytesL,
+            ScalarOp::LowestOneBitI,
+            ScalarOp::LowestOneBitL,
+            ScalarOp::HighestOneBitI,
+            ScalarOp::HighestOneBitL,
+            ScalarOp::RotateLeftI,
+            ScalarOp::RotateLeftL,
+            ScalarOp::RotateRightI,
+            ScalarOp::RotateRightL,
+            ScalarOp::AbsF,
+            ScalarOp::AbsD,
         ];
-        for &(c, m, d, want) in cases {
+        for &sop in ALL {
+            let (c, m, d) = declared_signature(sop);
             assert_eq!(
                 try_ir_scalar_intrinsic(c, m, d),
-                Some(want),
+                Some(sop),
                 "{c}.{m}{d} is declared as a scalar-intrinsic family and was not recognised",
+            );
+            // And the shapes the lowering relies on must agree with the
+            // descriptor: a mistyped input is joined against a real stack entry
+            // at the next merge, which is a wrong-code bug rather than a missed
+            // optimization.
+            assert!(sop.arity() >= 1 && sop.arity() <= 2, "{c}.{m}{d} arity");
+            assert_eq!(
+                sop.is_fp(),
+                matches!(sop, ScalarOp::AbsF | ScalarOp::AbsD),
+                "{c}.{m}{d}: is_fp must name exactly the XMM families, because                  the lowering arm loads inputs[0] into RAX unless it says so",
             );
         }
     }
