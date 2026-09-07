@@ -23842,15 +23842,28 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // `ExecutionException`. MEASURED: HotSpot's `ch.read(..)` on a closed
     // channel is no-throw; this VM raised `IOException` from the call, which
     // is both the wrong moment and the wrong class.
-    if let Some(this) = args.first().and_then(|v| match v {
-        Value::Object(Some(o)) => Some(*o),
+    // GC: the dispatch above runs interpreted bytecode on EVERY path — a
+    // writable buffer answers 0 and falls through — so the receiver read out
+    // of `args` here is a pre-call address. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered, and a
+    // collection inside the callback does not rewrite it. The `read` and
+    // `write` entry points carry the identical shape. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    let this_pin = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(*o), *o)),
         _ => None,
-    }) {
+    });
+    if let Some((pin, obj)) = this_pin {
+        let this = ctx.read_native_pin(pin, obj);
         if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
+            let this = ctx.read_native_pin(pin, obj);
             return Ok(Some(afc_closed_channel_future(ctx, this)?));
         }
     }
-    let this = args.first().copied();
+    let this = match this_pin {
+        Some((pin, obj)) => Some(Value::Object(Some(ctx.read_native_pin(pin, obj)))),
+        None => args.first().copied(),
+    };
     let boxed = afc_read_boxed(ctx, args)?;
     Ok(Some(wrap_afc_future(ctx, this, boxed)?))
 }
@@ -24045,15 +24058,28 @@ fn afc_read_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, 
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // See `native_afc_read` for the closed-channel contract; `write` defers
     // the same check into the same task.
-    if let Some(this) = args.first().and_then(|v| match v {
-        Value::Object(Some(o)) => Some(*o),
+    // GC: the dispatch above runs interpreted bytecode on EVERY path — a
+    // writable buffer answers 0 and falls through — so the receiver read out
+    // of `args` here is a pre-call address. `args` is the snapshot
+    // `safe_native_call_impl` took before this native was entered, and a
+    // collection inside the callback does not rewrite it. The `read` and
+    // `write` entry points carry the identical shape. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    let this_pin = args.first().and_then(|v| match v {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(*o), *o)),
         _ => None,
-    }) {
+    });
+    if let Some((pin, obj)) = this_pin {
+        let this = ctx.read_native_pin(pin, obj);
         if !matches!(afc_get(ctx, this, AFC_FIELD_OPEN), Value::Int(1)) {
+            let this = ctx.read_native_pin(pin, obj);
             return Ok(Some(afc_closed_channel_future(ctx, this)?));
         }
     }
-    let this = args.first().copied();
+    let this = match this_pin {
+        Some((pin, obj)) => Some(Value::Object(Some(ctx.read_native_pin(pin, obj)))),
+        None => args.first().copied(),
+    };
     let boxed = afc_write_boxed(ctx, args)?;
     Ok(Some(wrap_afc_future(ctx, this, boxed)?))
 }

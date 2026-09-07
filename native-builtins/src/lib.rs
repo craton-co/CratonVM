@@ -45931,9 +45931,29 @@ fn native_formatter_init_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `create_string` allocates, so BOTH the receiver and the locale argument
+    // are pre-call addresses at the two stores below.
+    let this_pin = ctx.pin_native_root(this);
+    let locale_pin = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(*o), *o)),
+        _ => None,
+    };
     let empty = ctx.create_string("");
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(empty)));
-    ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let locale = match locale_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => args.get(1).copied().unwrap_or(Value::Object(None)),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, 1, locale);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 

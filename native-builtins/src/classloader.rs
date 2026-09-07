@@ -4327,6 +4327,24 @@ pub(crate) fn define_class_via_full(
     // `define_class_full` (verifier OOB, ASM-emitted bytecode that
     // defeats our class file parser, etc.) returns a clean
     // ClassFormatError instead of unwinding to SIGABRT.
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `define_class_full` defines a class and `get_class_mirror` below
+    // allocates the mirror, so BOTH incoming references — the `classData`
+    // object and the loader — are stale by the time they are stored and
+    // registered. The audit reported `loader`; reading found `class_data` too.
+    let class_data_pin = match class_data {
+        Some(Value::Object(Some(o))) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let loader_pin = match loader {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full(name, &bytes, loader_id, opts)
     }));
@@ -4346,6 +4364,10 @@ pub(crate) fn define_class_via_full(
             let mirror = ctx.get_class_mirror(cid);
             // Stash classData (defineClass0 path) on the side-table.
             if let Some(data) = class_data {
+                let data = match class_data_pin {
+                    Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+                    None => data,
+                };
                 set_class_data(mirror, data);
             }
             // Record the true defining loader (see the doc comment above)
@@ -4366,6 +4388,10 @@ pub(crate) fn define_class_via_full(
             // already has its own built-in-loader fallback).
             if loader_aware_resolution() {
                 if let Value::Object(Some(loader_obj)) = loader {
+                    let loader_obj = match loader_pin {
+                        Some((p, o)) => ctx.read_native_pin(p, o),
+                        None => loader_obj,
+                    };
                     if is_user_defined_loader(ctx, loader_obj) {
                         register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader_obj);
                     }

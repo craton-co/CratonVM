@@ -104,7 +104,14 @@ ALLOC0 = re.compile(
     r"|alloc_object|allocate_instance|try_alloc_object_gc_safe|fresh_object"
     r"|create_string|create_string_from_units|create_string_uninterned"
     r"|create_string_uninterned_gc_safe|init_string_from_units"
-    r"|create_ascii_case_string_cached|get_ascii_case_string_cached"
+    # `get_ascii_case_string_cached` is NOT here, and its sibling is: the
+    # getter (`vm_exec.rs`) walks `thread.string_case_cache` and returns a
+    # `ObjectRef` it finds — no allocation, no Java. Listing it made every
+    # statement that merely CONSULTS the cache read as a collection point, and
+    # `string_case_impl` was reported on exactly that: a cache hit RETURNS, and
+    # a miss allocates nothing. It stays in `REF_RHS`, where "binds a
+    # reference" is the right claim.
+    r"|create_ascii_case_string_cached"
     r"|get_class_mirror|primitive_class_mirror|cache_module_mirror"
     r"|invoke|invoke_virtual|invoke_special|invoke_by_class_id"
     r"|invoke_special_by_class_id|invoke_virtual_bytecode_only"
@@ -115,7 +122,16 @@ ALLOC0 = re.compile(
     r"|force_gc|reclaim_before_alloc_retry"
     r"|begin_blocking_region|begin_timed_blocking_region|end_blocking_region"
     r"|monitor_enter_gc_safe|monitor_wait|park|thread_join"
-    r"|capture_stack_trace|capture_throwable_stack_trace|get_stack_trace"
+    # `capture_stack_trace` / `capture_throwable_stack_trace` / `get_stack_trace`
+    # are NOT here. `vm_exec::capture_current_stack_trace` takes `&self`, reads
+    # the class store and this thread's frames, and returns a Rust
+    # `Vec<StackTraceEntry>`; no Java object is allocated and no bytecode runs.
+    # Listing them made three sites read as defects on the strength of a
+    # diagnostic capture — `native_fetch_stack_frames`,
+    # `delegate_to_real_bytecode` and `native_classloader_define_class1`, the
+    # last of which only captures at all when `CRATONVM_DBG_DEFINE_STACK_FILTER`
+    # is set. Kept as a note rather than deleted silently: if one of them ever
+    # grows a `create_string` for a Java `StackTraceElement`, it belongs back.
     r"|declared_fields|declared_methods|class_annotations|record_components"
     r")\s*\("
     r"|\balloc_ref_array\b|\btry_alloc_synthetic\b"
