@@ -132,7 +132,15 @@ ALLOC0 = re.compile(
     # last of which only captures at all when `CRATONVM_DBG_DEFINE_STACK_FILTER`
     # is set. Kept as a note rather than deleted silently: if one of them ever
     # grows a `create_string` for a Java `StackTraceElement`, it belongs back.
-    r"|declared_fields|declared_methods|class_annotations|record_components"
+    # `declared_fields`, `declared_methods`, `class_annotations` and
+    # `record_components` are NOT here. All four are `&self` methods on
+    # `vm_exec` that take the class-manager read lock and build a Rust `Vec` of
+    # metadata — no Java object is allocated and no bytecode runs. Listing them
+    # made a reflective metadata read look like a collection point:
+    # `lk_member_access_flags` and `uri_has_synthetic_layout` rooted 16 rows of
+    # the transitive tranche between them. Same class of error as
+    # `capture_stack_trace` and `get_ascii_case_string_cached`, both removed
+    # earlier for the same reason — a getter named like a producer.
     r")\s*\("
     r"|\balloc_ref_array\b|\btry_alloc_synthetic\b"
 )
@@ -570,9 +578,35 @@ def statements(body):
     return out
 
 
+# A BARE NAME THAT EVERY TYPE IMPLEMENTS IS NOT A CALL GRAPH EDGE.
+#
+# `allocating()` keys the graph on the bare identifier before `(`, so all forty
+# `fn drop(&mut self)` bodies in these crates collapse into ONE node — and one
+# of them, the TLS guard in `t27_tls.rs`, calls `end_blocking_region`. That made
+# the node `drop` a depth-0 allocator, and every `drop(guard)` / `drop(map)` /
+# `drop(registry)` in the tree inherited it: 65 rows of the transitive tranche,
+# all of them dropping a mutex guard or a hash map.
+#
+# Excluding them is sound rather than merely convenient. A blocking region's
+# HAZARD is the window between `begin_blocking_region` and `end_blocking_region`,
+# and the audit matches both tokens directly wherever they appear; the `drop`
+# that closes the guard is the END of a window it has already reported.
+#
+# `get`, `new`, `build`, `finish` and `call` are deliberately NOT here. They
+# collide too, but in these crates they are also the names of real helpers that
+# really do allocate, and dropping them would trade a false positive for a false
+# negative — the direction this file's history says not to take.
+UNRESOLVABLE_BY_NAME = frozenset("""
+drop next clone fmt from into default eq ne hash cmp partial_cmp
+deref deref_mut as_ref as_mut borrow borrow_mut to_owned clone_from
+to_string try_from try_into len is_empty iter into_iter
+""".split())
+
+
 def allocating(fns, depth):
     alloc = {fn.name: 0 for fn in fns if ALLOC0.search("\n".join(fn.body))}
-    callees = [(fn.name, set(CALLEE.findall("\n".join(fn.body)))) for fn in fns]
+    callees = [(fn.name, set(CALLEE.findall("\n".join(fn.body))) - UNRESOLVABLE_BY_NAME)
+               for fn in fns]
     for d in range(1, depth + 1):
         known = set(alloc)
         add = {n: d for (n, cs) in callees if n not in alloc and not cs.isdisjoint(known)}
@@ -628,6 +662,8 @@ def _gc_tokens(text, allocfns):
     if ALLOC0.search(text):
         return True
     for c in CALLEE.findall(text):
+        if c in UNRESOLVABLE_BY_NAME:
+            continue
         if c in allocfns and c not in ("if", "while", "match", "for", "return", "Some", "Ok"):
             return True
     return False

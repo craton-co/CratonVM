@@ -4546,6 +4546,40 @@ pub fn note_site_trap_taken() {
     SITE_TRAPS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Methods whose site-trap policy has been applied, by memo hash.
+///
+/// A DEDICATED set, not the IR refusal memo. The first version of this reused
+/// `ir_evidence::method_already_refused` as the "already decided" flag, which
+/// is wrong because that memo has a SECOND writer: the acceptance gate marks a
+/// method refused whenever it discards an optimizing body. A method that got a
+/// trapping IR body, was later recompiled, and had THAT recompile refused by
+/// the gate would then look "already decided" the first time its old artifact
+/// trapped -- so the policy would never be applied, the artifact never evicted,
+/// and the trap would fire forever with nothing recorded.
+///
+/// Two writers, two meanings, two sets.
+fn site_trap_decided_methods() -> &'static std::sync::RwLock<rustc_hash::FxHashSet<u64>> {
+    static M: std::sync::OnceLock<std::sync::RwLock<rustc_hash::FxHashSet<u64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Claim the site-trap policy decision for `hash`.
+///
+/// `true` exactly once per method: the caller that gets it must apply the
+/// policy, and every later trap on that method is a repeat. Insert-and-test
+/// under one write lock so two threads trapping the same method concurrently
+/// cannot both decide.
+pub fn claim_site_trap_decision(hash: u64) -> bool {
+    let mut set = site_trap_decided_methods().write().unwrap();
+    if set.len() >= MAX_TRAPPED_METHOD_MEMOS {
+        // Cap reached: decide every time rather than never. Re-deciding is a
+        // recompile request; NOT deciding leaves a trapping artifact installed.
+        return true;
+    }
+    set.insert(hash)
+}
+
 /// Site traps taken AFTER the policy for that method was already decided.
 ///
 /// These cost an interpreter resume each and buy nothing: the method is already
@@ -8904,6 +8938,47 @@ mod scalar_intrinsic_recognizer_tests {
             method_has_site_trap(other),
             other_before,
             "registering one method must not implicate another: the runtime              uses this answer to choose between recompiling and blacklisting",
+        );
+    }
+
+    /// The site-trap decision must be claimable exactly ONCE, and must not be
+    /// confused with the IR refusal memo.
+    ///
+    /// The first version read `ir_evidence::method_already_refused` as the
+    /// "already decided" flag. That memo has a second writer -- the acceptance
+    /// gate marks a method refused whenever it discards an optimizing body --
+    /// so a method that got a trapping IR body, was recompiled, and had THAT
+    /// recompile refused would look already-decided on its FIRST trap. The
+    /// policy would never be applied and the trapping artifact never evicted:
+    /// a trap firing forever with nothing recorded. Two writers, two meanings,
+    /// two sets.
+    #[test]
+    fn the_site_trap_decision_is_claimable_exactly_once_and_is_not_the_refusal_memo() {
+        let h = crate::ir_method_memo_hash(
+            "cratonvm/test/SiteTrapDecisionProbe",
+            "claimed",
+            "()V",
+        );
+        assert!(claim_site_trap_decision(h), "the first claim must succeed");
+        assert!(
+            !claim_site_trap_decision(h),
+            "a second claim must fail -- otherwise every trap re-applies the              policy and the per-method deopt count escalates to blacklisting",
+        );
+
+        // The refusal memo must NOT be able to pre-empt a decision.
+        let g = crate::ir_method_memo_hash(
+            "cratonvm/test/SiteTrapDecisionProbe",
+            "gate_refused_first",
+            "()V",
+        );
+        crate::ir_evidence::note_method_refused(g);
+        assert!(
+            crate::ir_evidence::method_already_refused(g),
+            "precondition: the gate has marked this method IR-refused",
+        );
+        assert!(
+            claim_site_trap_decision(g),
+            "a gate refusal must not consume the site-trap decision: the first              trap still has to evict the trapping artifact",
         );
     }
 

@@ -2742,7 +2742,11 @@ fn read_stream_to_end(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8>
     let mut out: Vec<u8> = Vec::with_capacity(4096);
     let chunk_size = 4096usize;
     let chunk = ctx.new_array(ArrayElementType::Byte, chunk_size);
+    let chunk_pin = ctx.pin_native_root(chunk);
+    let stream_pin = ctx.pin_native_root(stream);
     loop {
+        let chunk = ctx.read_native_pin(chunk_pin, chunk);
+        let stream = ctx.read_native_pin(stream_pin, stream);
         let res = ctx.invoke(
             "java/io/InputStream",
             "read",

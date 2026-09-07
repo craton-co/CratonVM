@@ -1115,7 +1115,9 @@ fn sha1prng_next_int_bound(
     if (bound & m) == 0 {
         return Some(((bound as i64).wrapping_mul(u as i64) >> 31) as i32);
     }
+    let this_pin = ctx.pin_native_root(this);
     loop {
+        let this = ctx.read_native_pin(this_pin, this);
         let r = u % bound;
         if u.wrapping_sub(r).wrapping_add(m) >= 0 {
             return Some(r);
@@ -1137,7 +1139,9 @@ fn sha1prng_next_gaussian(ctx: &mut dyn NativeContext, this: ObjectRef) -> Optio
     }
     // Bounded like `native_secure_random_next_gaussian`: P(reject) ≈ 0.215 per
     // pair, so 64 rounds is far below any practical failure probability.
+    let this_pin = ctx.pin_native_root(this);
     for _ in 0..64 {
+        let this = ctx.read_native_pin(this_pin, this);
         let v1 = 2.0 * sha1prng_next_double(ctx, this)? - 1.0;
         let v2 = 2.0 * sha1prng_next_double(ctx, this)? - 1.0;
         let s = v1 * v1 + v2 * v2;

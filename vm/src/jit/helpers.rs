@@ -4180,7 +4180,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
 /// per-method deopt count crosses `max_deopts_per_method`, which keeps a
 /// backstop if the assumption above is ever wrong.
 ///
-/// # Why the decision is taken ONCE
+/// # Why the decision is taken ONCE, and in its OWN set
 ///
 /// Everything after the first is a REPEAT of a decision already taken, and
 /// repeating it is not harmless: `SpeculationFailed` escalates on the
@@ -4203,6 +4203,9 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
 /// once, and let the remaining calls resume in the interpreter — correct, and
 /// self-correcting the moment that caller frame returns and re-enters its
 /// recompiled self.
+///
+/// "Once" is `ir::claim_site_trap_decision`, a set of its own, and not
+/// `ir_evidence`'s refusal memo — see 81c9c9fd7 and the comment at the call.
 pub(crate) fn despeculate_trapped_method(
     vm: &SharedVm,
     class_name: &str,
@@ -4216,9 +4219,12 @@ pub(crate) fn despeculate_trapped_method(
     let mut decided = true;
     if ir_site_trap {
         cratonvm_jit::ir::note_site_trap_taken();
-        // The memo doubles as the "already decided" flag: it is set exactly
-        // when this method has had its site-trap policy applied.
-        decided = !cratonvm_jit::ir_evidence::method_already_refused(h);
+        // A DEDICATED set, not `ir_evidence`'s refusal memo (81c9c9fd7): that
+        // memo has a second writer -- the acceptance gate marks a method
+        // refused whenever it discards an optimizing body -- so reading it here
+        // would let a gate-refused method look "already decided" on its FIRST
+        // trap, and the policy, including the eviction, would never be applied.
+        decided = cratonvm_jit::ir::claim_site_trap_decision(h);
         cratonvm_jit::ir_evidence::note_method_refused(h);
         if !decided {
             cratonvm_jit::ir::note_site_trap_repeat();

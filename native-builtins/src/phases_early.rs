@@ -5393,7 +5393,9 @@ fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) ->
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => return None,
     };
+    let set_pin = ctx.pin_native_root(set);
     for elem in elems {
+        let set = ctx.read_native_pin(set_pin, set);
         if let Value::Object(Some(_)) = *elem {
             if ctx
                 .invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[*elem])
@@ -5982,7 +5984,9 @@ fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         enum_set_elements(ctx, coll)
     };
     let mut modified = false;
+    let this_pin = ctx.pin_native_root(this);
     for elem in elems {
+        let this = ctx.read_native_pin(this_pin, this);
         if matches!(elem, Value::Object(Some(_))) {
             native_es_add(ctx, &[Value::Object(Some(this)), elem])?;
             modified = true;
@@ -25289,7 +25293,9 @@ fn spl_prim_for_each_remaining(
         _ => 0,
     };
     let len = ctx.array_length(data);
+    let consumer_pin = ctx.pin_native_root(consumer);
     for i in cursor..len {
+        let consumer = ctx.read_native_pin(consumer_pin, consumer);
         let raw = ctx.get_array_element(data, i);
         let val = spl_prim_element_value(raw, prim);
         ctx.invoke_virtual(consumer, "accept", accept_desc, &[val])?;

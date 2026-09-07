@@ -1000,7 +1000,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-171 tokens.
+169 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1012,8 +1012,6 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
-| `remap-frozen-peer-stacks` | `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS` |
-| `hold-helper-peers` | `CRATONVM_GC_HOLD_HELPER_PEERS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
