@@ -4428,3 +4428,43 @@ than a copy, so the two cannot drift, and it was verified to FAIL when the
 detector is disabled. Its own first draft had the bug this file keeps meeting:
 the "same pooled count" assertion compared two EMPTY strings and reported `ok`
 when the summary had not run at all.
+
+### And the trap does not buy anything measurable either
+
+With the correctness objection retracted, the only thing keeping
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` off was that its benefit had never been
+measured. Measured now — 57 hibernate-reactive classes, ABBA per class, on a
+binary with the deopt-sink fix:
+
+```text
+A faster than B in 34 of 57 classes            z = +1.46  (a coin)
+split-half   : first 28 z = +1.13 | last 29 z = +0.56
+median per-class delta : +1.4%
+median within-arm noise: 10.7%   (SAME config, two runs)
+VERDICT: UNMEASURABLE
+```
+
+No effect. The two halves at least AGREE in direction this time — both weakly
+positive, so this is not the reversal pattern the split-half check exists to
+catch — but the pooled count is a coin and the effect is a seventh of the noise
+floor.
+
+That floor is the caveat and it is a large one: **10.7%, against 2.7% on the
+quiet-host hibernate run earlier the same day**. Load was 3.5-6.5 on 8 cores
+throughout. This is a weak measurement, and it is reported as one. The
+sub-result that "of the 10 classes whose own delta beats their own noise, A is
+faster in 9" is NOT quoted as evidence: it is a selection conditioned on the
+noise estimate, over ten classes, and this document has already been burned once
+today by a significant-looking count over a small sample.
+
+So the switch stays OFF with both halves of its case now measured rather than
+assumed:
+
+- **not harmful** — 112 traps fired across 30 classes, `ok=241 failed=0`,
+  zero `refusing side-effecting replay` (the old "it craters hibernate" was a
+  broken deopt sink seen through this switch);
+- **not beneficial** — no measurable throughput effect, on a noisy run.
+
+What would settle it: the same 57-class A/B on a host at load < 2.5, which is
+what produced the 2.7% floor. Anything less and the answer is the noise floor,
+not the lever.
