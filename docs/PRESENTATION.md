@@ -66,11 +66,11 @@ ahead on the same hardware:
 
 | Compute kernel (N = 2²⁴)                          | HotSpot C2 | TornadoVM GPU   | **CratonVM GPU** | vs HotSpot | vs TornadoVM |
 |-----------------------------------------------------|------------|-----------------|-------------------|------------|--------------|
-| Integer division chain (48 divs/elem)               | 2,146 ms   | 26 ms           | **11 ms**         | **195x**   | **2.4x**     |
-| Double-precision division chain (64 divs/elem)      | 1,780 ms   | 128 ms          | **95 ms**         | **18.7x**  | **1.3x**     |
-| 128 multiply-adds/elem (data-dependent multiplier)  | 1,300 ms   | 27 ms           | **8 ms**          | **163x**   | **3.4x**     |
-| Dot-product reduction (int·int → long, ×300/elem)   | 1,172 ms   | *unimplemented* | **2 ms**          | **586x**   | n/a          |
-| Ray tracer kernel (33.2M pixels)                    | 837 ms     | 24.3 ms         | **12.3 ms**       | **68x**    | **2.0x**     |
+| Integer division chain (48 divs/elem)               | 2,179 ms   | 27 ms           | **7 ms**          | **311x**   | **3.9x**     |
+| Double-precision division chain (64 divs/elem)      | 1,784 ms   | 135 ms          | **82 ms**         | **21.8x**  | **1.6x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)  | 1,298 ms   | 26 ms           | **7 ms**          | **185x**   | **3.7x**     |
+| Dot-product reduction (int·int → long, ×300/elem)   | 1,168 ms   | *unimplemented* | **2 ms**          | **584x**   | n/a          |
+| Ray tracer kernel (33.2M pixels)†                   | 837 ms     | 24.3 ms         | **12.3 ms**       | **68x**    | **2.0x**     |
 
 Same box throughout — RTX 2060, TornadoVM 4.0.1 (PTX backend), warm, full
 host→device→host round-trip included. **Only the software varies.** That is
@@ -88,12 +88,13 @@ array cannot run there. We isolated it with three minimal repros on the same
 GPU rather than inferring it from a stack trace. CratonVM's automatic path
 completes the same reduction and the full read-back.
 
-*Provenance: GPU rows re-verified 2026-09-05; the CPU baselines are the
-original idle-host measurements and were not re-taken, which makes every
-ratio conservative rather than flattering. The ray-tracer row is a reduced
-proxy kernel measured earlier and not re-run. Per-row methodology and the
-caveats in full are in [BENCHMARK.md](../BENCHMARK.md) — read it before
-quoting any of this.*
+*Provenance: the first four rows were measured together on 2026-09-07 on a
+verified-quiet host — same session, same build, CPU baselines included, so the
+columns are comparable to each other. † The ray-tracer row is a reduced proxy
+kernel carried over from an earlier run; it needs a separate binary that is not
+in the tree and was not re-measured. Per-row methodology and the caveats in
+full are in [BENCHMARK.md](../BENCHMARK.md) — read it before quoting any of
+this.*
 
 ---
 

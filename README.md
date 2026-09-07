@@ -76,10 +76,10 @@ bit-identical to HotSpot):
 
 | Kernel                                                | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
 |---------------------------------------------------------|------------|---------------|--------------|------------|--------------|
-| Integer div-chain (48 divs/elem)                         | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
-| Double div-chain (64 divs/elem)                          | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
-| 128 multiply-adds/elem (data-dependent multiplier)       | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
-| Dot-product reduction (int·int → long, x300/elem)        | 1,172 ms   | unimplemented | **2 ms**     | **586x**   | n/a          |
+| Integer div-chain (48 divs/elem)                         | 2,179 ms   | 27 ms         | **7 ms**     | **311x**   | **3.9x**     |
+| Double div-chain (64 divs/elem)                          | 1,784 ms   | 135 ms        | **82 ms**    | **21.8x**  | **1.6x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)       | 1,298 ms   | 26 ms         | **7 ms**     | **185x**   | **3.7x**     |
+| Dot-product reduction (int·int → long, x300/elem)        | 1,168 ms   | unimplemented | **2 ms**     | **584x**   | n/a          |
 | Ray tracer kernel, 7680×4320 (33.2M px)                  | 837.1 ms   | 24.29 ms      | **12.29 ms** | **68x**    | **2.0x**     |
 
 Ray tracer rows are 6 interleaved rounds each (arm order alternated per round
