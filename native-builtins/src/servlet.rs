@@ -307,7 +307,23 @@ fn jython_new_module(
     name: &str,
     dict: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // GC: a reference held in a Rust local across an allocating or Java-re-entering
+    // call goes stale under a moving collector, and under the Generational
+    // non-moving young sweep an unrooted object is ZEROED in place. Pin and
+    // re-read. `safe_native_call_impl` truncates `native_pin_roots` when the native
+    // returns, so an unmatched pin costs nothing on an error path. See
+    // `internal/audits/wide-tranche-triage-20260907.md`.
+    // `create_string` allocates, so `dict` — held since entry — is a pre-call
+    // address by the time it is handed to the constructor.
+    let dict_pin = match dict {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
     let name_obj = ctx.create_string(name);
+    let dict = match dict_pin {
+        Some((p, o)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        None => dict,
+    };
     let module = match ctx.new_object_initialized(
         "org/python/core/PyModule",
         "(Ljava/lang/String;Lorg/python/core/PyObject;)V",

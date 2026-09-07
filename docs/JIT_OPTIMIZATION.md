@@ -4029,3 +4029,97 @@ What the G1 result does supply is a much better prior. The original observation
 was "1 failure in 11 PARALLEL runs, 0 single-threaded" — the same contention
 signature that turned out to explain the G1 family entirely. That is a
 hypothesis with new support, not a result, and it is recorded as one.
+
+### The invokedynamic trap fires on real code, and firing cost the method every tier
+
+The section above flagged this and did not measure it: the `invokedynamic`
+trap is DEFAULT ON, is planted by the same `plant_uncommon_trap` as the
+unresolved-class trap, and therefore has the same never-heals property —
+"no harm is observed" being the only thing standing between that default and
+the behaviour.
+
+Harm is observed. H2, default configuration:
+
+```
+ir site traps planted: invokedynamic=21 ... | TAKEN at runtime: 1
+org/h2/mvstore/MVStore.getMapId:(Ljava/lang/String;)I
+    reason=UnreachedCode bci=5 action=MakeNotCompilable
+```
+
+One of the twenty-one went live, and `MakeNotCompilable` is consulted by
+`compile_gate` itself (`is_jit_bail_listed`), so `getMapId` lost its body on
+**every** tier — including the single-pass backend, which lowers
+`invokedynamic` perfectly well and had been compiling that method before site
+traps existed. Planting a trap to gain the rest of the method's optimization
+cost the method all of its compilation, permanently, the first time the trapped
+path ran.
+
+#### Where it came from
+
+`try_resume_trapped_callee` hard-codes the reason it reports, ignoring the
+`DeoptimizationPoint` the artifact carries — which is why `Op::Guard`'s baked
+`UncommonTrap` never reaches the policy. Its comment says so, and anticipates
+this exact case:
+
+> Reason: `UnreachedCode` — the one-shot "give up immediately" policy […] so
+> the trapping method is made not-compilable on the FIRST resolution […]
+> (A guard-bail stash reaching this arm is over-blacklisted by this —
+> acceptable: it reverts to the interpreter, which is always correct.)
+
+Correct for the single-pass indy trap, where no tier can do better. Wrong for an
+IR site trap, where only the OPTIMIZING tier had the problem. "Reverts to the
+interpreter, which is always correct" is true about answers and silent about
+throughput, and this is the second time in this document that a
+correctness-only argument hid a permanent slowdown.
+
+#### The fix
+
+A site trap now says what it means: ban the optimizing tier for this method —
+the memo `try_compile_inner` already consults — and pick a reason that
+RECOMPILES rather than blacklists. The recompile then goes single-pass and does
+not trap. `SpeculationFailed` is that reason: `RecompileAndReinterpret` until
+the per-method deopt count crosses `max_deopts_per_method`, which keeps a
+backstop if the assumption is ever wrong.
+
+Telling the two apart needs the runtime to know the artifact carries a site
+trap, so `plant_uncommon_trap` now records the method (`build(mut self, ..)`
+consumes the builder, so the count comes back through a per-build thread-local,
+the same idiom `reset_string_access_sites` uses).
+
+H2, same workload, after:
+
+```
+ir site traps planted: invokedynamic=21 ... | TAKEN at runtime: 1
+org/h2/mvstore/MVStore.getMapId  reason=SpeculationFailed
+                                 action=RecompileAndReinterpret
+eager re-queue (RecompileAndReinterpret) org/h2/mvstore/MVStore.getMapId
+```
+
+One deopt, one recompile, IR banned for that method, single-pass body restored.
+`DOD RESULT OK`, regression suite 92/92.
+
+#### TAKEN, at last
+
+`plant_uncommon_trap`'s own doc has promised this since it was written —
+"[`ir_trap_census`] counts what was PLANTED by cause; the runtime side counts
+what is TAKEN. A cause whose taken count is not ~0 has had its coldness
+argument refuted" — and the runtime side did not exist. It does now, and it is
+the number that refuted the argument: `TAKEN at runtime: 1` on H2 by default,
+and 200,000 on `UnresolvedTrapProbe`.
+
+#### What is NOT fixed
+
+The fix restores the method's compilation; it does not stop a HOT trapped path
+from deopting. `UnresolvedTrapProbe`, whose trapped path runs 200,000 times,
+still reads 200,000 deopts — 20 of them `RecompileAndReinterpret` and the rest
+`MakeNotCompilable` once the per-method count crosses its threshold. The IR ban
+takes effect (`memo_skips=5`) and the re-queues happen (20), but the trapping
+artifact is not displaced from under the running caller, so calls keep entering
+it.
+
+So: a trap on a COLD-ish path (the real H2 case, one fire) is now cheap and
+self-correcting. A trap on a HOT path is still a permanent deopt loop, and the
+remaining blocker is artifact displacement, not the deopt policy. That is the
+next piece of work, and it is why
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` — whose sites are demonstrably hot —
+stays OFF.
