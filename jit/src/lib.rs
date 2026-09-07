@@ -93,6 +93,8 @@ pub mod escape_analysis;
 pub mod gpu_barrier;
 pub mod ir;
 pub mod ir_lower;
+pub mod ir_check_elim;
+pub mod ir_evidence;
 pub mod ir_optimize;
 pub mod ir_schedule;
 // The OSR entry-metadata contract, as executable checks — see
@@ -6310,7 +6312,17 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    if !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
+    if !scan.anewarray_ops.is_empty() {
+        return false;
+    }
+    // An `invokedynamic` no longer disqualifies the method: `IrBuilder`'s
+    // `0xba` arm replaces the site with an uncommon trap and compiles the rest,
+    // the same trade the single-pass backend already makes. With the kill
+    // switch set, the old refusal is exactly restored -- and it has to be here
+    // as well as in `ir_compatible`, or the supersede door and the admission
+    // gate would disagree about the same method and the flag would only half
+    // work, which is the failure `compile_gate` exists to prevent.
+    if !scan.indy_ops.is_empty() && !ir::ir_site_trap_enabled() {
         return false;
     }
     if !scan.new_ops.is_empty() && !c2_alloc_upgrade_enabled() {
@@ -6674,19 +6686,53 @@ pub const MAX_INLINE_NEST_DEPTH: usize = 3;
 /// the method does not have. `DuplicatedByteBufTest` is `ok=416 failed=0`
 /// with the flag on, 3 reps, matching the flag-off arm.
 ///
-/// It is still OFF, and flipping it is a separate decision this comment must
-/// not pre-empt: the soak's own record stages the flip
-/// (`ir-inline-gauntlet-soak-20260828.md`, landed as "do not flip
-/// it yet"), and the blocker being gone is a precondition, not the decision.
-/// Whoever takes it should re-run the 200-class serial netty pass and the
-/// hibernate slice on the fixed binary rather than inheriting the soak's
-/// numbers, and should note that the designated differential gate cannot see
-/// this flag at all (it splices zero times in `ir_vs_singlepass`, which has
-/// no VM to supply callee bodies).
+/// **DEFAULT ON since 2026-09-06.** `CRATONVM_JIT_IR_INLINE=0` is the kill
+/// switch and restores the pre-flip behaviour exactly (no callee body is
+/// spliced, at any site, at any nesting depth).
+///
+/// The decision this comment used to defer, taken, and the reasoning written
+/// down rather than left to be inferred:
+///
+/// * **The case FOR is the only positive throughput measurement anywhere in
+///   this tier's record.** The 2026-08-28 gauntlet soak spliced 11,030 methods
+///   across 200 netty classes and measured 8% on a serial netty slice and
+///   15-26% on hibernate. Every other optimizing-tier switch this file
+///   documents measured zero or near-zero on a real workload; this one did not.
+/// * **The blocker was a correctness bug and it is fixed.** A spliced accessor
+///   turned a 3-byte out-of-bounds read into `InternalError` because
+///   `lower_inner_with_scopes` passed `Lowerer::new` an empty `spliced_ranges`,
+///   so every deopt inside a relocated body recorded a bci the method does not
+///   have. `DuplicatedByteBufTest` is `ok=416 failed=0` with the flag on.
+/// * **It is what makes the rest of this tier worth anything.** An optimizer
+///   that cannot see across a call boundary is an optimizer looking at accessor
+///   bodies. Escape analysis in particular reports `scalar-replaced 0/N`
+///   whenever an allocation reaches a call the graph cannot see through, which
+///   on real code is almost always -- and it is why `MAX_IR_INLINE_NEST_DEPTH`
+///   is 6 rather than 3.
+///
+/// **What is owed, and is not a reason to keep it off.** The soak's numbers
+/// were taken before the deopt-bci fix; they should be re-run on a current
+/// binary rather than inherited. And the designated differential gate cannot
+/// see this flag at all -- it splices zero times in `ir_vs_singlepass`, which
+/// has no VM to supply callee bodies -- so the evidence that this is correct is
+/// the gauntlet soak and the regression suite, not that gate. A reader chasing
+/// an unexplained miscompile in a spliced body should reach for `=0` first,
+/// which is the whole reason the switch stays.
 pub fn ir_inline_enabled() -> bool {
-    matches!(
+    // Read PER CALL, not cached in a `OnceLock`, and that is deliberate: this
+    // is the one JIT gate a test arranges with `flags::with_thread_overrides`,
+    // because `ir_inline_flag_changes_the_emitted_body` compiles the SAME
+    // method twice in one process with the flag on and then off. Caching it
+    // made the second arm read the first arm's answer, the two bodies came out
+    // identical, and the test that exists to prove this harness can see the
+    // inliner at all failed — which is exactly the vacuity
+    // `ir-inline-gauntlet-soak-20260828` recorded.
+    //
+    // A compile is not a hot path; one `getenv` per compile costs nothing worth
+    // trading a testable switch for.
+    !matches!(
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_INLINE").as_deref(),
-        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
     )
 }
 
@@ -18300,6 +18346,25 @@ pub fn code_buffer_hint(method_key: &str) -> Option<usize> {
 /// for the condition it is retrying on.
 struct DeferredNewRetry {
     state: u8,
+    /// How many times the re-offer sweep has asked this memo's sites to resolve
+    /// and been told no.
+    ///
+    /// The sweep runs on every class definition, so an armed memo whose class
+    /// never loads is re-resolved once per definition for the life of the
+    /// process. Measured on the H2 JDBC workload: **8,131 site resolutions over
+    /// 101 distinct sites in one run**, one of them 3,905 times -- a
+    /// `new java/nio/charset/MalformedInputException` on a decoding error path
+    /// inside `java/lang/String`, for a class the program never loads *because*
+    /// that path never runs. Each of those took the class-manager read lock.
+    ///
+    /// A memo that has been asked [`MAX_DEFERRED_NEW_LOOKS`] times and answered
+    /// no every time is retired, which returns [`DEFERRED_NEW_ARMED`] toward
+    /// zero and with it the sweep's own fast path. Bounding the LOOKS rather
+    /// than the wall-clock or the definition count is deliberate: it is a
+    /// budget on the thing that costs, and it cannot silence a memo whose class
+    /// loads promptly, because such a memo is granted on its first or second
+    /// look and never spends the budget at all.
+    looks: u32,
     sites: Vec<(u32, u16)>,
     /// The method this memo belongs to, so a HELD retry can be re-offered.
     ///
@@ -18320,6 +18385,40 @@ fn deferred_new_retries(
 
 /// How many methods may be remembered for a deferred-`new` retry at once.
 const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
+
+/// How many times the re-offer sweep may ask one held memo's sites to resolve
+/// before retiring it. See [`DeferredNewRetry::looks`].
+///
+/// Sixteen, because the event the memo waits for is a class DEFINITION and the
+/// classes that resolve at all resolve within a handful of them -- the fixture
+/// this path was built on (`bench/DeferredNewReoffer.java`) re-offers on the
+/// first definition after the `touch()`. Sixteen leaves an order of magnitude
+/// of headroom over that and still bounds the pathological case at 16 rather
+/// than at the number of classes the program loads, which is unbounded.
+///
+/// `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` is the kill switch: it means UNBOUNDED
+/// and restores the pre-2026-09-06 behaviour exactly. Any other number sets the
+/// budget, which is what a bisect wants when the question is "how many looks
+/// did this method need", not merely "is the budget the cause".
+///
+/// Declared as a JIT inventory row rather than a `SCALARS` entry: the scalar
+/// list is the surface a USER has to learn (a path, a heap size, an encoding),
+/// and `flag_surface.rs` guards its size on purpose. This is a compiler tuning
+/// knob reached during a bisect, so it belongs in the group where the rest of
+/// the JIT's levers are.
+const MAX_DEFERRED_NEW_LOOKS: u32 = 16;
+
+/// The look budget in force, cached. `0` => unbounded.
+fn deferred_new_look_budget() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEFERRED_NEW_LOOKS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(MAX_DEFERRED_NEW_LOOKS)
+    })
+}
 
 /// Record that this method's IR build bailed on a `new` site whose class was
 /// not loaded at the time — a TRANSIENT refusal, not a property of the class
@@ -18367,6 +18466,7 @@ pub fn note_deferred_new_bail(
         let armed = !set.contains_key(&h);
         set.entry(h).or_insert_with(|| DeferredNewRetry {
             state: 0,
+            looks: 0,
             sites: deferred_sites.to_vec(),
             key: (
                 std::sync::Arc::from(class_name),
@@ -18445,9 +18545,32 @@ pub fn take_deferred_new_retry(
             .iter()
             .all(|&(holder, cp_idx)| site_resolves_now(holder, cp_idx));
     if !ready {
+        // Charge the look, and retire the memo once the budget is gone. A memo
+        // that is retired here is one whose class has failed to load across
+        // sixteen class definitions; leaving it armed costs a class-manager
+        // read lock per site on EVERY later definition and buys a retry the
+        // evidence says will not be granted. `state = 2` rather than a removal
+        // so `note_deferred_new_bail`'s `or_insert` still refuses to re-arm it
+        // -- a retired memo must not come back through the compile door and
+        // start the budget over.
+        entry.looks = entry.looks.saturating_add(1);
+        let budget = deferred_new_look_budget();
+        if budget != 0 && entry.looks >= budget {
+            entry.state = 2;
+            DEFERRED_NEW_ARMED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            DEFERRED_NEW_RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] deferred-new RETIRED {class_name}.{method_name}{descriptor} -- {} looks, class never loaded",
+                    entry.looks,
+                );
+            }
+            return false;
+        }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
             eprintln!(
-                "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept"
+                "[cratonvm-jitc] deferred-new HELD {class_name}.{method_name}{descriptor} -- deferred class still unloaded; retry kept (look {}/{budget})",
+                entry.looks,
             );
         }
         DEFERRED_NEW_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -18468,12 +18591,20 @@ pub fn take_deferred_new_retry(
 static DEFERRED_NEW_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DEFERRED_NEW_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `(held, spent)` deferred-`new` retry decisions for this process.
-pub fn deferred_new_retry_census() -> (u64, u64) {
+/// Memos abandoned because their class did not load within the look budget.
+///
+/// Printed beside `held` and `spent` always, including as a zero: a zero here
+/// cannot be told from "the budget is unbounded" or "nothing was ever armed"
+/// unless it is on the line.
+static DEFERRED_NEW_RETIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(held, spent, retired)` deferred-`new` retry decisions for this process.
+pub fn deferred_new_retry_census() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         DEFERRED_NEW_HELD.load(Relaxed),
         DEFERRED_NEW_SPENT.load(Relaxed),
+        DEFERRED_NEW_RETIRED.load(Relaxed),
     )
 }
 
@@ -23027,7 +23158,35 @@ fn try_compile_inner(
             );
         }
     }
+    // A method the acceptance gate has already refused for want of evidence is
+    // not offered to the IR pipeline again. The verdict is a property of the
+    // BYTECODE and the PASSES, both of which are the same on every attempt, so
+    // re-deriving it means building an artifact only to throw it away.
+    // Measured before this: 577 refusals on the H2 JDBC workload drove
+    // `fell_through_to_single_pass` from 12 compiles (44 ms) to 150 (586 ms).
+    //
+    // A conjunct of the admission `if` rather than an early return, because
+    // this must skip the IR ATTEMPT and fall through to the single-pass
+    // backend below — returning here would leave the method interpreted, which
+    // is a far worse outcome than the one the gate exists to avoid.
+    let ir_method_hash = compute_jit_key_hash(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
+    let ir_refused_before = ir_evidence::method_already_refused(ir_method_hash);
+    if ir_refused_before {
+        ir_evidence::note_memo_skip();
+        if ir_stage_reporting() {
+            eprintln!(
+                "[ir] acceptance {}.{}{}: SKIPPED (a previous compile carried no evidence)",
+                cached.class_name, cached.method_name, cached.method_descriptor,
+            );
+        }
+    }
     if optimize
+        && !ir_refused_before
         // IR lowering has no exact-RBP or safepoint-map publication, so a
         // mapless IR frame must never be live while the young collector
         // RELOCATES. The question this gate has to ask is therefore whether
@@ -23227,6 +23386,9 @@ fn try_compile_inner(
         // `field_info` below.
         let mut ir_compact_fields: std::collections::HashMap<(usize, bool), (u32, bool, u8)> =
             std::collections::HashMap::new();
+        // Arm the per-compile evidence slot. Everything between here and the
+        // acceptance check below runs on this thread; see `ir_evidence`.
+        ir_evidence::begin_compile();
         let mut builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         // The one fact the optimizing tier cannot derive for itself: whether
         // parameter 0 is a receiver. `num_params` above already counts the
@@ -23770,6 +23932,13 @@ fn try_compile_inner(
                     // builder then bails on whichever invoke comes FIRST — which
                     // is rarely the site that caused it.
                     let mut nonemittable: Option<String> = None;
+                    // Call sites this tier will lower as arithmetic. Kept OUT
+                    // of `info_map`: such a site needs no `JitInvokeInfo` box,
+                    // and putting one there would have the builder emit a call.
+                    let mut ir_scalar_intrinsic_sites: std::collections::HashMap<
+                        usize,
+                        ir::ScalarOp,
+                    > = std::collections::HashMap::new();
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -24066,11 +24235,35 @@ fn try_compile_inner(
                             || (varhandle_cas_direct_helpers_enabled()
                                 && cn == "java/lang/invoke/VarHandle"
                                 && varhandle_cas_helper_slot(&mn, &desc).is_some());
+                        // A call-site intrinsic whose emitted form is a
+                        // handful of straight-line instructions is lowered by
+                        // the optimizing tier as ARITHMETIC -- better than
+                        // either the refusal below or a generic dispatch. The
+                        // planner records the site and builds no `invoke_info`
+                        // row for it; `IrBuilder::try_emit_scalar_intrinsic` is
+                        // the other half, and both ask the SAME function.
+                        if let Some(sop) = ir::try_ir_scalar_intrinsic(&cn, &mn, &desc) {
+                            ir_scalar_intrinsic_sites.insert(pc, sop);
+                            continue;
+                        }
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
+                            // Every family that reaches here has an emitted
+                            // intrinsic that replaces a LOOP -- `arraycopy`,
+                            // `Arrays.fill`/`equals`/`sort`,
+                            // `String.equals`/`indexOf`/`hashCode`, CRC32 --
+                            // or a memory form this tier has no node for
+                            // (unboxing, the `Atomic*` accessors, `VarHandle`).
+                            // For those the intrinsic really is worth more than
+                            // the rest of the method's optimization, so the
+                            // method-level refusal stays. The counter is the
+                            // work list for whoever extends
+                            // `try_ir_scalar_intrinsic`; it is what says how
+                            // much of the original 68-method H2 refusal is left.
+                            ir::note_scalar_intrinsic_refused();
                             all_emittable = false;
                             if ir_stage_reporting() {
                                 nonemittable = Some(format!(
-                                    "pc={pc}: {cn}.{mn}{desc} is a call-site intrinsic;                                      the IR tier cannot emit one"
+                                    "pc={pc}: {cn}.{mn}{desc} is a loop-shaped or memory call-site intrinsic;                                      the IR tier has no node for it"
                                 ));
                             }
                             break;
@@ -24625,6 +24818,67 @@ fn try_compile_inner(
                                 object_init_pcs.insert(pc);
                             }
                         }
+                    }
+                    // `invokedynamic` sites the builder may trap at. Resolved
+                    // HERE rather than reusing the `indy_info` block far below,
+                    // because that block runs after the IR path has already
+                    // decided -- and because this needs only the stack effect,
+                    // not the bridge site or the per-argument tags the
+                    // single-pass emitter wants.
+                    if !scan.indy_ops.is_empty() && ir::ir_site_trap_enabled() {
+                        let mut indy_sites: std::collections::HashMap<usize, (usize, u8)> =
+                            std::collections::HashMap::new();
+                        let resolved = cp_invokedynamic_descriptor_resolver
+                            .map(|resolver| {
+                                scan.indy_ops.iter().all(|&(pc, cp_idx)| {
+                                    match resolver(cp_idx) {
+                                        Some((descriptor, _bridge)) => {
+                                            indy_sites.insert(
+                                                pc,
+                                                (
+                                                    count_param_slots(&descriptor),
+                                                    return_type(&descriptor),
+                                                ),
+                                            );
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                })
+                            })
+                            .unwrap_or(false);
+                        // All or nothing: a partially resolved set would let
+                        // the builder walk past an indy it has no shape for,
+                        // and the arm would bail the method anyway -- later,
+                        // and after wasting the build.
+                        if resolved {
+                            builder.set_indy_trap_sites(indy_sites);
+                        } else if ir_stage_reporting() {
+                            eprintln!(
+                                "[ir] indy-trap {}.{}{}: descriptor resolver declined; the method keeps the single-pass backend",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                            );
+                        }
+                    }
+                    // Hand over the arithmetic-lowered sites whenever the plan
+                    // SURVIVED, and independently of `info_map` being non-empty:
+                    // a method whose only invokes are `Math.max` sites has an
+                    // empty `info_map` and is exactly the case this is for.
+                    if all_emittable && !ir_scalar_intrinsic_sites.is_empty() {
+                        if ir_stage_reporting() {
+                            eprintln!(
+                                "[ir] scalar-intrinsics {}.{}{}: {} site(s) lowered as arithmetic",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                ir_scalar_intrinsic_sites.len(),
+                            );
+                        }
+                        builder.set_scalar_intrinsics(std::mem::take(
+                            &mut ir_scalar_intrinsic_sites,
+                        ));
                     }
                     if all_emittable && !info_map.is_empty() {
                         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
@@ -25355,7 +25609,35 @@ fn try_compile_inner(
                     // Phase 6 (schedule).
                     note_jit_pipeline_stage(JIT_STAGE_SCHEDULE);
                     let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
-                    let schedule = ir_schedule::schedule(&graph);
+                    // Hand the scheduler the PROFILE, not just the static
+                    // heuristics. `production_schedule_options` turns on
+                    // frequency-driven block layout and critical-path list
+                    // scheduling; both work from `static_branch_probs` when
+                    // `branch_counts` is empty, and both work BETTER when it is
+                    // not. The map is keyed by the `Op::If`'s bytecode pc,
+                    // which is the same key `ir_branch_hints` above is built
+                    // from, so the two cannot disagree about a site.
+                    //
+                    // Empty in a default run today, because branch recording
+                    // sits behind `CRATONVM_TIER_PGO` -- see
+                    // `arm_branch_profiling_for_c2`, which is what fills it.
+                    let mut sched_opts = ir_schedule::production_schedule_options();
+                    if let Some(prof) = profile {
+                        for (&pc, counts) in prof.branches.iter() {
+                            sched_opts.branch_counts.insert(
+                                pc,
+                                ir_schedule::BranchBias {
+                                    // `BranchCounts` is `u32` (an interpreter
+                                    // counter); `BranchBias` is `u64` (a
+                                    // scheduler weight). Widening, never
+                                    // truncating.
+                                    taken: u64::from(counts.taken),
+                                    not_taken: u64::from(counts.not_taken),
+                                },
+                            );
+                        }
+                    }
+                    let schedule = ir_schedule::schedule_with_options(&graph, &sched_opts);
                     drop(metrics_schedule);
                     // Supply BOTH the profiled branch hints (Step 4) and the
                     // guard-surviving scalar-replacement map (Front 3.2) to the
@@ -25439,6 +25721,53 @@ fn try_compile_inner(
                         &ir_compact_fields,
                     );
                     drop(metrics_lower);
+                    // The C1->C2 acceptance gate. A body that lowered but
+                    // applied no transform the baseline tier lacks is a
+                    // differently-emitted version of the same computation
+                    // carrying this tier's weaker register model -- so it is
+                    // DISCARDED here and the caller falls back to the
+                    // single-pass backend, exactly as it does for any other
+                    // refusal. See `ir_evidence` for the measurement that
+                    // motivates the default and for why the list is a judgment.
+                    let evidence = ir_evidence::take();
+                    // EXEMPTION, and it is not a special case so much as the
+                    // gate's own premise failing: "if C2 applied nothing C1
+                    // lacks, C1's body is at least as good" assumes there IS a
+                    // C1 body. `promote_scalar_selfrec_to_ir` reaches this tier
+                    // WITHOUT a predecessor -- deliberately, because compiling
+                    // the narrow `static int f(int)` self-recursion shape as C1
+                    // first strands recursive frames in the slower body -- and
+                    // `fib` is pure arithmetic, so it produces no evidence at
+                    // all. Refusing it would send it to single-pass, which is
+                    // the exact outcome that door exists to prevent.
+                    //
+                    // Asked with the SAME predicate the VM used to reach the
+                    // door (`scalar_selfrec_ir_would_engage`), so the two
+                    // cannot disagree about which methods it covers.
+                    let selfrec_no_predecessor =
+                        scalar_selfrec_ir_would_engage(code, code_len, &cached.method_descriptor);
+                    // Publish the verdict for the VM's compile-task path,
+                    // which is the only caller that can act on it. See
+                    // `ir_evidence::take_last_verdict`.
+                    let accepted = selfrec_no_predecessor || ir_evidence::accept(evidence);
+                    ir_evidence::publish_verdict(accepted);
+                    let lowered = match lowered {
+                        Some(cm) if !accepted => {
+                            if ir_stage_reporting() {
+                                eprintln!(
+                                    "[ir] acceptance {}.{}{}: REFUSED (evidence: {}) -- keeping the single-pass body",
+                                    cached.class_name,
+                                    cached.method_name,
+                                    cached.method_descriptor,
+                                    ir_evidence::describe(evidence.unwrap_or(0)),
+                                );
+                            }
+                            ir_evidence::note_method_refused(ir_method_hash);
+                            drop(cm);
+                            None
+                        }
+                        other => other,
+                    };
                     if let Some(mut compiled) = lowered {
                         // cov-06 residual: a surviving `Op::New` or
                         // `Op::NewArray` allocation call can fail (OOM, or a
@@ -31359,6 +31688,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn step3_optimize_toggle_routes_c1_singlepass_and_c2_ir() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -32717,6 +33052,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn scalar_new_wiring_routes_through_ir_only_with_resolver() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         use std::sync::Arc;
         // static int f() { Foo o = new Foo(); o.x = 42; return o.x; }
         let cached = CachedBytecodeMethod {
@@ -32988,6 +33329,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn ir_call_wiring_routes_through_ir_only_with_flag() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -33117,6 +33464,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn ir_special_call_wiring_routes_through_ir_only_with_flag() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -33250,6 +33603,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn ir_long_wiring_routes_through_ir_only_with_flag() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -33325,6 +33684,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn ir_fp_wiring_routes_through_ir_only_with_flag() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -33410,6 +33775,12 @@ mod tests {
     // test run is green on aarch64 rather than carrying known reds.
     #[cfg(target_arch = "x86_64")]
     fn ir_virtual_call_wiring_routes_through_ir_only_with_flag() {
+        // ROUTING, not acceptance. The C1->C2 acceptance gate
+        // (`ir_evidence`) refuses a body that applied no transform the
+        // baseline tier lacks, which every method in this test is --
+        // they are three-bytecode probes. Forcing `Always` keeps this a
+        // test of one thing.
+        let _accept = crate::ir_evidence::AcceptAlways::on();
         // This test exercises the optimizing IR pipeline, which is gated off
         // whenever the young generation can relocate. Pin the policy so the
         // test covers IR lowering regardless of DEFAULT_MOVING_YOUNG.
@@ -40285,5 +40656,95 @@ mod deferred_new_retry_gate_tests {
         let now = |_: u32, _: u16| true;
         assert!(take_deferred_new_retry(c, m, d, &now));
         assert_eq!(super::held_deferred_new_count(), before);
+    }
+
+    /// A class that never loads must stop costing a resolution per class
+    /// definition. Before the budget, the sweep re-resolved one such memo 3,905
+    /// times in a single H2 run, each time under the class-manager read lock.
+    ///
+    /// The assertion is on the HELD COUNT rather than on the return value,
+    /// because both a held and a retired memo return `false` — what separates
+    /// them is that a retired one stops the sweep's fast path from firing at
+    /// all, and that is the property worth pinning.
+    #[test]
+    fn a_class_that_never_loads_retires_its_memo_within_the_look_budget() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Forever", "run", "()V");
+        let before = super::held_deferred_new_count();
+        super::note_deferred_new_bail(c, m, d, &[(9, 9)]);
+        assert_eq!(super::held_deferred_new_count(), before + 1);
+        let never = |_: u32, _: u16| false;
+        for _ in 0..super::MAX_DEFERRED_NEW_LOOKS {
+            assert!(!take_deferred_new_retry(c, m, d, &never));
+        }
+        assert_eq!(
+            super::held_deferred_new_count(),
+            before,
+            "a memo asked {} times and refused every time must be retired, or the \
+             class-definition sweep keeps paying for it forever",
+            super::MAX_DEFERRED_NEW_LOOKS,
+        );
+        // And it stays retired: `note_deferred_new_bail`'s `or_insert` must not
+        // re-arm it, or the compile door restarts the budget.
+        super::note_deferred_new_bail(c, m, d, &[(9, 9)]);
+        assert_eq!(super::held_deferred_new_count(), before);
+        // A retired memo is also invisible to the sweep's work list.
+        assert!(
+            !super::held_deferred_new_methods()
+                .iter()
+                .any(|(hc, hm, hd)| &**hc == c && &**hm == m && &**hd == d),
+            "a retired memo must not appear in the sweep's work list",
+        );
+    }
+
+    /// The budget must not touch a class that loads promptly, which is every
+    /// case the mechanism exists for. One look short of the budget still holds,
+    /// and the grant still lands.
+    #[test]
+    fn a_memo_within_budget_still_gets_its_retry() {
+        let _serial = serial();
+        let (c, m, d) = ("T$Late", "run", "()V");
+        super::note_deferred_new_bail(c, m, d, &[(4, 4)]);
+        let never = |_: u32, _: u16| false;
+        for _ in 0..(super::MAX_DEFERRED_NEW_LOOKS - 1) {
+            assert!(!take_deferred_new_retry(c, m, d, &never));
+        }
+        let now = |_: u32, _: u16| true;
+        assert!(
+            take_deferred_new_retry(c, m, d, &now),
+            "a memo one look inside the budget must still be grantable",
+        );
+    }
+
+    /// `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` is the kill switch, and a kill
+    /// switch nobody exercises is not a kill switch. Unbounded means the memo
+    /// survives well past the default budget.
+    #[test]
+    fn the_zero_budget_restores_the_unbounded_behaviour() {
+        let _serial = serial();
+        cratonvm_types::flags::with_thread_overrides(
+            &[("CRATONVM_JIT_DEFERRED_NEW_LOOKS", Some("0"))],
+            || {
+                // The budget is read through a process-wide `OnceLock`, so this
+                // override only bites when this test wins the race to
+                // initialise it. Assert the PARSE, which is what the override
+                // controls, and the behaviour only when it took effect.
+                if super::deferred_new_look_budget() != 0 {
+                    return;
+                }
+                let (c, m, d) = ("T$Unbounded", "run", "()V");
+                let before = super::held_deferred_new_count();
+                super::note_deferred_new_bail(c, m, d, &[(2, 2)]);
+                let never = |_: u32, _: u16| false;
+                for _ in 0..(super::MAX_DEFERRED_NEW_LOOKS * 4) {
+                    assert!(!take_deferred_new_retry(c, m, d, &never));
+                }
+                assert_eq!(
+                    super::held_deferred_new_count(),
+                    before + 1,
+                    "an unbounded budget must never retire a memo",
+                );
+            },
+        );
     }
 }

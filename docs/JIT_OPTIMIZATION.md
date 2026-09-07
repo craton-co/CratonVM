@@ -2917,3 +2917,572 @@ String access/search, Arrays, CRC32).
 | Lint status | `clippy -D warnings` is a release gate, not a baked-in metric |
 | Native methods | **~3,100+** |
 | vs JDK C2 | See [`../BENCHMARK.md`](../BENCHMARK.md) for the current interleaved series |
+
+---
+
+## 2026-09-06 — the seven-item pass: C2 was a SMALLER optimizer than C1
+
+### The audit that opened it
+
+An audit asked why the optimizing tier delivers no measurable gain, and found a
+different answer from the one this file's tier-inversion arc had been chasing.
+That arc was about the BODY — frame traffic, register residency, the latency of
+a store-then-load chain — and it took `OsrTierBench.kernel` from 1.70x behind to
+parity. This one is about the OPTIMIZER, and the finding is structural:
+
+**C2 is not a superset of C1.** Tracing which modules each analysis is reachable
+from, on `dev@91d3077a9`:
+
+| Optimization | C1 single-pass | C2 optimizing (before this pass) |
+|---|---|---|
+| Bounds-check elimination (`range_analysis` + `x64/bce.rs`) | default on | **absent** |
+| Null-check elimination (`null_check_elim`, the `this` seed) | default on | **absent** |
+| Runtime-trip loop unrolling (`x64/loop_unroll_admission.rs`) | 4x | const-trip only |
+| Method inlining (`x64/inlining.rs` + guarded virtual) | default on | **off by default** |
+| Call-site intrinsics (~40) | ~40 | **0, and refuses the method** |
+| Vectorization (`x64/simd_analysis.rs`, `x64/vec_emit.rs`) | present | **absent** |
+| Loop-carried values in registers | default on | write-through cache |
+| Escape analysis / scalar replacement | bytecode-walk | SSA graph |
+| SSA GVN, LICM, sink-late, ALU-imm folding | partial | full |
+| Exception-handler bodies | compiled | skipped |
+
+`range_analysis` is referenced by `x64/bce.rs` and nothing else;
+`null_check_elim` by `x64/*` and nothing else. So
+`ir_lower::emit_array_null_bounds_guards` emitted a null test, a length load and
+a bounds compare at EVERY `ArrayLoad` and `ArrayStore`, every iteration, with no
+elision and no proof — in the tier that is supposed to be the optimizing one.
+
+**And the tier consumed no profile.** `CRATONVM_TIER_PGO` has never shipped on,
+so `MethodProfile::branches` is empty and the `ir_branch_hints` map
+`lower_inner` receives is empty in every default run. Worse, the production
+pipeline called `ir_schedule::schedule(&graph)`, which is
+`schedule_with_options(graph, &ScheduleOptions::default())` — and `Default` is
+documented as "the historical scheduler exactly: no profile, no reordering,
+dependence-order-only intra-block scheduling". Two of the three stages that
+module implements were off in every compile the VM has ever run.
+
+### The measurement that made it a defect rather than an observation
+
+H2 JDBC (`probes/DodJdbcWorkload.java` against the local h2corpus), three arms
+interleaved run-by-run with the order reversed on alternate reps, the same
+configuration run twice as its own noise floor, process CPU time. Windows
+workstation, 32 logical cores, host load ~76% from other sessions — so only
+within-run ratios are readable, which is why the control pair is there.
+
+| arm | run A median | run A min | run B median | run B min |
+|---|---:|---:|---:|---:|
+| C2 on (default) | 3.938 | 3.594 | 4.734 | 4.109 |
+| C2 on (control) | 3.953 | 3.516 | 4.547 | 3.922 |
+| **`CRATONVM_C2_SUPERSEDE=0`** | **3.703** | **3.297** | **4.234** | **3.891** |
+
+Control-vs-control floor 0.4% and 4.1%. `c2-off` is the fastest arm in both
+runs, on median AND minimum. About a quarter of the difference is background
+compile CPU (161 extra compiles, `total_compile_time_ms` 201 against 143); the
+rest is the published bodies and the supersede epoch bump.
+
+The size census says the same thing from the other side. Over 161 supersedes:
+**81 C2 bodies larger** than the C1 body they replaced, 66 smaller, 14 the same,
+519,344 bytes against 488,834 — **6% larger in aggregate**. A tier that neither
+inlines nor unrolls cannot explain a larger body by having done more work.
+
+### The refusal census: one site refused the whole method, five times over
+
+Reach at the method-entry door was never the problem — 164 of 199 C1 compiles
+reach C2 on H2. What was lost, was lost to one design decision repeated at five
+sites: when the IR front end meets something it cannot lower, it discards the
+entire method rather than the site.
+
+| refusal | count | what it was |
+|---|---:|---|
+| `ir.rs:7150` — invoke with no `invoke_info` | 64 | downstream of the discard below |
+| invoke plan discarded whole | **68** | **100% "one call-site intrinsic somewhere in the method"** |
+| `invokedynamic` anywhere | 53 | C1 lowers indy to an uncommon trap and compiles the rest |
+| opcode `0x53` (`aastore`) | 35 | no IR lowering, though `jit_aastore` exists |
+| unresolved `checkcast` / `instanceof` | 34 | a class that has never been loaded |
+| `new` of a not-yet-loaded class | 13 | an exception construction on a path that never runs |
+
+The intrinsics were `Math.max` (7), `System.arraycopy` (7), `Long.longValue`
+(7), `AtomicLong.get` (7), `Long.numberOfLeadingZeros` (4), `Math.min` (2),
+`Integer.compare` (2), `Long.compare` (2) and a long tail.
+
+And the deferred-`new` retry sweep, which runs on every class definition,
+re-resolved **8,131 sites over 101 distinct ones** in a single run — the top one
+3,905 times, a `new java/nio/charset/MalformedInputException` on a decoding
+error path inside `java/lang/String`, for a class the program never loads
+*because* that path never runs.
+
+### What landed
+
+Seven changes, each with a kill switch and an engagement census.
+
+| # | change | default | kill switch |
+|---|---|---|---|
+| 1 | IR-tier inlining | **ON** | `CRATONVM_JIT_IR_INLINE=0` |
+| 2a | IR null-check + bounds-check elimination | **ON** | `CRATONVM_JIT_IR_CHECK_ELIM=0` |
+| 2b | unroll over unreachable frame states | **ON** | `CRATONVM_JIT_IR_UNROLL_UNREACHABLE_FRAMES=0` |
+| 3a | scalar intrinsics lowered as arithmetic | **ON** | `CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` |
+| 3b | uncommon trap at an `invokedynamic` site | **ON** | `CRATONVM_JIT_IR_SITE_TRAP=0` |
+| 3b' | ...at an unresolved `checkcast`/`instanceof`/`new` | **OFF** — the coldness argument was refuted; see below | `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` |
+| 3c | `aastore` through `jit_aastore` | **ON** | `CRATONVM_JIT_IR_AASTORE=0` |
+| 4a | frequency block layout + list scheduling | **ON** | `CRATONVM_JIT_IR_HOT_LAYOUT=0`, `CRATONVM_JIT_IR_LIST_SCHED=0` |
+| 4b | branch profile window around a C2 nomination | **ON** | `CRATONVM_TIER_PGO_C2_WINDOW=0` |
+| 5 | `ScalarIntrinsic` + `ArrayLoad` may drop their home | **ON** | (rides `CRATONVM_JIT_IR_DROP_HOME`) |
+| 6 | C1→C2 acceptance gate | `evidence` | `CRATONVM_C2_ACCEPT=always` |
+| 6b | a refused supersede abandons the publish | **ON** | rides the gate; `CRATONVM_C2_ACCEPT_MEMO=0` for the memo half |
+| 7 | deferred-`new` look budget | **16** | `CRATONVM_JIT_DEFERRED_NEW_LOOKS=0` |
+
+Four of them are worth reading for their reasoning rather than their effect.
+
+**The trap is not a new mechanism, it is `Op::Guard` with a constant-zero
+condition** — the shape `add_div_zero_guard` already builds. Its lowering
+already emits `DeoptReason::UncommonTrap` with `DeoptAction::Reinterpret`, so
+the interpreter re-runs the bytecode at that bci, which is exactly what a site
+this tier declined to compile needs. Each caller owes a coldness argument and
+two of the three have a real one: an unresolved `new`/`checkcast`/`instanceof`
+names a class that **has never been loaded**, and a class that has never been
+loaded cannot have been touched by any path that has executed. That is a proof.
+`invokedynamic` has no such proof, and is on the list because the single-pass
+backend has made exactly this trade by default since it stopped bailing on indy.
+
+**The intrinsics split by what the intrinsic replaces, not by convenience.**
+Letting an unlowerable intrinsic site take an ordinary `Op::Call` is a
+DOWNGRADE — a dispatch is a ~300 ns floor where the single-pass backend emits
+two instructions — so the families whose emitted form is a handful of
+straight-line instructions (`Math.min`/`max`/`abs`, `Integer.compare`,
+`Long.compare`) are lowered as ARITHMETIC through one new op,
+`Op::ScalarIntrinsic`, and the families whose intrinsic replaces a LOOP
+(`arraycopy`, `Arrays.fill`/`equals`/`sort`, `String.equals`/`indexOf`, CRC32)
+keep the method-level refusal. `scalar_intrinsic_census` counts both halves, and
+the refused count is the work list for whoever extends the first.
+
+One op with a sub-enum rather than eight ops, because every new `Op` has to be
+added to `ir_verify`'s arity table, `regalloc::ir_op_defines_value` and
+`ir_lower::op_defines_result_slot` — and the last two are the pair
+`the_two_value_defining_enumerations_agree` exists to keep in lockstep after a
+drift that silently disabled register residency on every array-touching method.
+
+**The unroller's blocker was never sizing.** It refuses any loop whose body is
+named by a safepoint snapshot, because a `SafepointSnapshot` is keyed by one
+`bci` and `trip` copies of a body bci cannot be represented by one snapshot.
+That reasoning is correct and it is unchanged. What it did not ask is whether
+any of those snapshots is REACHABLE — and on a trap-free graph none is, which is
+the same fact `lower_inner`'s `graph_trap_free` already computes and acts on
+when it skips building unreachable deopt points. The relaxation is a
+PREDICTION, and it carries its own net: `UNROLL_USED_UNREACHABLE_FRAMES` is read
+in `lower_inner`, and if any deopt point was in fact built the compile is
+refused and the method takes the single-pass backend — which is what it did
+before the relaxation existed.
+
+**The acceptance gate is a policy and says so.** `ir_evidence` records which
+transforms a compile applied, and `CRATONVM_C2_ACCEPT=evidence` (the default)
+publishes only a body that applied one the baseline tier has no equivalent for:
+scalar replacement, splicing, guard elision, late sinking, a scalar intrinsic.
+`Unrolled` and `Licm` are deliberately absent — the single-pass backend has
+both, so doing the same is not a reason to replace its body. The membership of
+that list is a judgment, stated as one so it can be argued with. A compile with
+no recorded evidence (a plumbing mistake) is ACCEPTED and counted as `unjudged`,
+because a mistake there must cost an unfiltered publish and never a silently
+disabled tier.
+
+### Verified
+
+`cargo test -p cratonvm-jit --lib`: **2,267 passed, 0 failed**. `cargo test -p
+cratonvm-types`: green, including the flag-surface guards and the regenerated
+`docs/config/flag-inventory.md` / `docs/flag-tokens.md`.
+
+The new emitted sequences are EXECUTED against the answers the JLS specifies,
+edges included: `the_scalar_intrinsic_sequences_execute_to_the_specified_answers`
+runs each compiled body and checks `Math.abs(Integer.MIN_VALUE) ==
+Integer.MIN_VALUE` (JLS 15.15.4 — the negation wraps, and the branchless
+`(x ^ (x>>31)) - (x>>31)` reproduces that exactly), signed `min`/`max` across
+zero, and `Long.compare` on operands whose low halves are equal — the case that
+catches sizing the `CMP` from the RESULT type, which is why
+`ScalarOp::operands_are_long` exists separately from `ScalarOp::result_type`.
+
+Three source-scanning audits keep the couplings visible rather than remembered:
+`every_eligible_op_is_claimed_or_explicitly_rejected` (an op whose arm is shaped
+for a dropped home must be claimed or listed in `DELIBERATELY_NOT_DROPPABLE`
+with a reason), `the_block_node_order_is_the_emission_order` (the check-elision
+pass reads `Block::nodes` in order and treats that as program order, which is
+sound only while `ir_lower` emits a block the same way), and the existing
+`every_droppable_op_writes_its_home_once_through_store_rax`.
+
+### What is owed, stated rather than left to be inferred
+
+**No throughput claim is made for any of the seven.** Every number above is a
+COUNT — a census, a refusal tally, a body size — or the C2-off A/B that
+motivated the work. The arms that would price these changes have not been run,
+and the host they would have to be run on was at ~76% load throughout.
+
+Three measurements are owed, in this order:
+
+1. **The H2 A/B again, on the new binary.** The claim being tested is that the
+   `c2-off` arm is no longer the fastest one. If it still is, the acceptance
+   gate is doing its job and the tier is still not worth its epoch bumps.
+2. **The IR-inlining flip on a second real workload.** Its 8% netty / 15-26%
+   hibernate came from the 2026-08-28 gauntlet soak, taken BEFORE the deopt-bci
+   fix; those numbers should be re-taken rather than inherited.
+3. **A per-collector regression sweep.** Frequency-driven block layout moves
+   every oop-map and safepoint position in every compiled method, which is
+   exactly the change the RPO-layout work validated per collector for the same
+   reason.
+
+And one thing is NOT claimed: that C2's code generation was wrong. It was not.
+The existing arc took `OsrTierBench.kernel` from 1.70x behind to parity, and
+every checksum on every arm of this pass matched HotSpot. The problem was the
+size of the optimizer, not the quality of its emitter.
+
+### The measurement, and the three things it corrected
+
+The section above listed what was owed. It was taken. Three of its claims did
+not survive, and the corrections are more useful than the original text.
+
+#### 1. The unresolved-class trap's coldness argument was wrong
+
+The argument was: "the named class has never been loaded, and a class that has
+never been loaded cannot have been touched by any path that has executed." The
+first clause is true and the conclusion does not follow, because the observation
+is made at COMPILE time. A class not loaded when the method compiles can load a
+moment later, the path then runs, the trap fires on a LIVE path, and the body
+returns the deopt sentinel — on every call, for the life of the process.
+
+`ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir` executes exactly that
+path and caught it on the first run. The fixture predates the trap by years.
+
+Worse, trapping BYPASSES the machinery built for this transience:
+`note_deferred_new_bail` / `take_deferred_new_retry` refuse the method and
+re-offer it once the class loads. With the builder no longer bailing, nothing
+armed that memo and nothing re-offered the method — trading a delayed optimizing
+body for a permanently deopting one. The H2 census shows the repair:
+`deferred-new retries: held=152 spent=2 retired=10 re_offered=1`, where the
+trapping build read `spent=0 re_offered=0`.
+
+So `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` is its own switch and ships **OFF**.
+`invokedynamic` keeps its trap and stays on: there is no "later" for a bootstrap
+this tier will never lower, and the single-pass backend has made that exact
+trade by default since it stopped bailing on indy. The reach claim drops from
+~200 methods to ~150 accordingly.
+
+What would make the other three safe is `DeoptAction::RecompileAndReinterpret`
+instead of `Reinterpret`, so the first trap triggers the recompile that resolves
+the class. `Op::Guard`'s lowering hard-codes the action; parameterising it is
+the work that switch is waiting on.
+
+#### 2. The acceptance gate refused, and then published anyway
+
+The gate discards the optimizing body, `try_compile_inner` falls through to the
+single-pass backend, and `try_jit_compile_callee_slow` puts THAT in the cache —
+replacing a C1 body with an equal one and bumping the process-wide supersede
+epoch, which stales every cached invoke target in every thread. The entire cost
+the gate exists to avoid, paid in full by a gate that refused.
+
+A refused verdict on a method that ALREADY HAS a published body now abandons the
+supersede. Both halves of that condition are load-bearing: a refusal alone is
+not enough, because at the eager first-call door there is no predecessor and
+skipping the publish there would leave the method INTERPRETED.
+
+| H2 census | before | after |
+|---|---:|---:|
+| supersede publishes (`changed`) | 179 | **69** |
+| IC evictions from the epoch bump | 1,558 | **696** |
+| fell through to single-pass | 128 (275 ms) | **19 (42 ms)** |
+| supersedes abandoned | — | **113** |
+
+#### 3. "C2 supersede costs 6% of CPU" is true and was reported as more than it is
+
+**Process CPU counts background compile threads.** The tier's cost is largely
+the compile itself — `lowered=50 (33 ms) fell_through=19 (42 ms)` against a
+~1.9 s run — and that work overlaps with the mutator. Measuring only CPU
+attributes a parallel cost as though it were serial.
+
+Three interleaved runs of `probes/DodJdbcWorkload.java`, order reversed on
+alternate rounds, the default configuration run TWICE as its own floor, paired
+counts (a fair coin under no effect):
+
+| run | host load | CPU: default beats c2-off | WALL: default beats c2-off | control (CPU / wall) |
+|---|---|---|---|---|
+| A | 10 | **5 / 21** | not measured | 9/21 / — |
+| B | mid | **7 / 21** | 11 / 21 | 9/21 / 10/21 |
+| C | 38 | 10 / 25 | 11 / 25 | 12/25 / 11/25 |
+
+The control pair is a coin in every run, in both instruments, which is what
+makes the rest readable.
+
+**On wall clock there is no difference.** 11/21 and 11/25 against controls of
+10/21 and 11/25. **On process CPU, `CRATONVM_C2_SUPERSEDE=0` is a few per cent
+cheaper on a quiet host** (5/21 and 7/21) and washes out on a busy one — the
+signature of background work, not of a slower body.
+
+So the recommendation is NOT to flip the supersede default: the only instrument
+where turning the tier off wins is the one that charges parallel compile work to
+the serial total. And the honest verdict on the seven items is that they are
+**correctness and reach work whose throughput effect on this workload is below
+the measurement floor in both directions** — not a win, and not the regression
+the CPU-only reading suggested.
+
+The pre-change finding that motivated the work stands unaltered: before these
+changes C2 bodies were 6% larger in aggregate than the C1 bodies they replaced
+(81 bigger, 66 smaller, 14 equal over 161 supersedes), and `c2-off` was the
+fastest arm. It is no longer the fastest arm on wall clock.
+
+#### What is still owed
+
+A second real application. Every number here is H2, and H2 is a workload whose
+own profile is dominated by allocation and young-GC throughput rather than JIT
+codegen — which is the least favourable place to look for a codegen win. netty
+and hibernate are where the IR-inlining soak measured 8% and 15–26%, and those
+are the arms that would price item 1 on its own terms.
+
+The per-collector sweep is no longer owed -- it was taken, and the section
+below records both what it found and the G1 flake it turned out NOT to be.
+
+### The per-collector sweep, and the G1 failure that was not this branch's
+
+Owed because frequency-driven block layout moves every oop-map and safepoint
+position in every compiled method. Three collectors exist
+(`parse_gc_algorithm`): ZGC (default), G1, Generational.
+
+| collector | new defaults | every kill switch set |
+|---|---|---|
+| ZGC | 91/91, twice | 91/91 |
+| Generational | 91/91 | — |
+| G1 | 91, 91, **90** (`RMapGcStress`) | 91, 91, **90** (`RTreeRangeGc`) |
+
+**Both arms fail at 1 in 3 full-suite runs, with DIFFERENT vectors, both
+GC-stress.** That is a collector-level intermittency on G1, not something these
+changes introduced — and `RTreeRangeGc` is the vector `known-flaky.txt`'s own
+header records as quarantined at 3/12 (25%) on 2026-08-22, which is the same
+rate.
+
+Two things follow, and the second matters more than the first.
+
+`RMapGcStress` alone on G1 passes **4/4** with the new defaults; it fails only
+inside a full-suite run. So whatever perturbs it needs the suite's own memory
+and GC pressure, which is why running the vector alone — what `known-flaky.txt`
+asks for — cannot measure it.
+
+And **a single G1 suite run is not a gate.** At ~1/3, one green run says little
+and one red run says less. Any claim of the form "91/91 on G1" from one run is
+over-read, this file's earlier ones included.
+
+The hypothesis that was wrong is worth recording because it was well-motivated:
+`RMapGcStress` stresses HashMap and ConcurrentHashMap chains, which is exactly
+where JDK-internal `aastore` on an `Object[] table` lives, and this branch both
+added a new `jit_aastore` call site and moved every oop-map position. The
+all-off arm failing at the same rate refutes it.
+
+### The acceptance gate's evidence list was too narrow, and the measurement said so
+
+The gate shipped refusing 580 bodies on H2. The list omitted constant folding,
+algebraic simplification, GVN and dead-node elimination — real optimizer work —
+on this argument, written when the diagnostic landed:
+
+> the single-pass backend folds constants too, so a graph getting smaller says
+> the optimizer ran, not that its output beats C1's.
+
+It is a reasonable argument and it is wrong. `Transform::Simplified` was added
+to split the refusals by whether `ir_optimize`'s fixpoint loop actually removed
+nodes, and the split came back **296 simplified against 284 inert** — half the
+refusals had the optimizer genuinely work on them.
+
+So the gate was A/B'd against accepting everything. Twenty-one interleaved
+rounds, host load 7, order reversed on alternate rounds:
+
+| arm | wall mean | CPU mean |
+|---|---:|---:|
+| the gate (`evidence`) | 2.315 | 2.458 |
+| the gate again (control) | 2.306 | 2.463 |
+| **`CRATONVM_C2_ACCEPT=always`** | **2.237** | **2.378** |
+
+`always` won **15 of 21** rounds on wall AND on CPU, ~3.4%, against a control
+pair agreeing to 0.4% on the means. **The bodies the gate refused were better,
+and the gate was the thing costing throughput.**
+
+`Simplified` is evidence now. That keeps the half that is provably inert
+refused — 282 methods where the optimizer removed NOTHING — so the abandon path
+still saves their epoch bumps, and stops the gate discarding the half that did
+work:
+
+| census | narrow list | corrected |
+|---|---:|---:|
+| accepted | 238 | **568** |
+| refused (all `inert` now: `simplified=0`) | 580 | **282** |
+| supersedes abandoned | 113 | 42 |
+
+**And the regression that opened this whole section is gone.** Paired counts,
+same harness, same workload:
+
+| comparison | narrow list | corrected list |
+|---|---|---|
+| C2 supersede vs `CRATONVM_C2_SUPERSEDE=0` | c2-off won **16 of 21** on CPU | **coin** — 9/21 CPU, 10/21 wall |
+| the gate vs `CRATONVM_C2_ACCEPT=always` | the gate lost, 6 of 21 | **coin** — 9/21 and 9/21 |
+
+So the gate is now free: indistinguishable from accepting everything, while
+still refusing 282 methods whose optimizing body provably did nothing and
+saving their publishes and epoch bumps. Regression suite 91/91 on ZGC and 91/91
+on G1 with the corrected list, which publishes 568 optimizing bodies instead of
+238.
+
+### A harness defect worth copying, because it produced a fake control
+
+The arm order is reversed on alternate rounds so no arm is systematically first.
+With THREE arms that balances arms 1 and 3 and leaves arm 2 in the middle every
+single round — so the CONTROL pair, which is arms 1 and 2, carries a position
+bias its paired count cannot shed. It read 7 of 21 while its own means agreed to
+0.4%.
+
+Read the paired count off the 1-vs-3 comparison, which is balanced, and read the
+control for its MEANS. A control whose paired count is skewed by position looks
+exactly like a control that has found an effect.
+
+One run was discarded outright rather than reported: host load reached 76 and
+the control pair disagreed with ITSELF by 3.7%, larger than the effect being
+measured. This file has recorded that rule several times and it applied again.
+
+### The unresolved-class trap: the blocker was named wrong, and the reach is smaller than claimed
+
+The previous section left this: *"What would make the other three safe is
+`DeoptAction::RecompileAndReinterpret` instead of `Reinterpret`, so the first
+trap triggers the recompile that resolves the class. `Op::Guard`'s lowering
+hard-codes the action; parameterising it is the work that switch is waiting
+on."*
+
+**That names the wrong field.** `Op::Guard` does bake an action into its
+`DeoptimizationPoint`, but nothing reads it. The runtime recomputes the action
+from the REASON on every deopt — `record_deoptimization` calls
+`DeoptimizationLog::recommend_action_at_bci(method, reason, bci)` and returns
+that. The baked `action` is dead metadata on this path.
+
+And the reason it does bake, `DeoptReason::UncommonTrap`, already escalates.
+`UncommonTrap` takes the count-based policy: `Reinterpret` on the first deopt,
+then `RecompileAndReinterpret`. So the self-healing the switch was said to be
+waiting for is already there, one deopt later than ideal. Planting
+`DeoptReason::ClassLoading` instead would reach it on the FIRST deopt and would
+additionally clear the method's assumptions — but that is a one-deopt saving on
+a path measured below, not the unblocking the note described.
+
+#### The measurement, which is what should have been taken first
+
+| H2, `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` | off | on |
+|---|---:|---:|
+| traps planted (typecheck / new) | 0 / 0 | **39 / 9** |
+| bodies accepted | 579 | 586 |
+| bodies lowered | 118 | 124 |
+| fell through to single-pass | 19 | 15 |
+| deferred-new retries `spent` / `re_offered` | 2 / 1 | **0 / 0** |
+| eager re-queues (`RecompileAndReinterpret`) | 0 | **0** |
+| `DOD RESULT` | OK | OK |
+
+**All 48 traps plant and not one fires.** On this workload the coldness argument
+holds exactly as written: no path that executes reaches a site whose class was
+unloaded at compile time.
+
+Which cuts both ways, and the second reading is the one worth keeping. Zero
+fires means there is no evidence the trap is harmful — and equally none that
+the escalation path works, because it never ran. "I read the policy function
+and it returns `RecompileAndReinterpret` at count 1" is a claim about source,
+not a measurement. The switch stays OFF until something fires it.
+
+`ir_vs_singlepass_checkcast_not_yet_loaded_refuses_ir` cannot supply that.
+It was read earlier as proving the body "returns the deopt sentinel instead of
+the object — forever, on every call". It proves the first half only:
+`call_with_dummy_context` invokes the compiled body directly, with no VM, no
+deopt entry, no `record_deoptimization` and no recompiler. A unit test with no
+runtime cannot tell "traps once and heals" from "traps forever", and this one
+was cited for the second.
+
+So the honest state of this item: reach is +7 accepted bodies and +6 lowered on
+H2, the danger is unobserved rather than absent, and what it actually needs is
+a VM-level test that FIRES a trap and shows the recompile come back without it.
+That test is the work; the action parameter never was.
+
+### Range-based bounds-check elimination
+
+`bounds_elided=8` against `bounds_emitted=174` was the largest number left on
+the board, and it has a structural cause: the dominance pass removes the SECOND
+check on an SSA `(base, index)` pair and can never remove the FIRST. Almost all
+Java array traffic has no second access to remove.
+
+The new pass proves the check dead outright. A check at `(base, idx)` goes when
+both halves hold:
+
+* `idx < base.length` — a dominating `If` on `Cmp(Lt)[idx, ArrayLength(base)]`,
+  taken on its true edge, matched on the array's SSA node so two arrays of
+  equal length stay two arrays.
+* `idx >= 0` — a non-negative constant, another array length, or a unit-stride
+  induction variable.
+
+Both, always. The emitted check is an UNSIGNED compare, which is exactly the
+conjunction `0 <= idx < len`; the source-level test it is being proven from is
+SIGNED, and a negative index passes that. Eliding on the upper bound alone
+indexes behind the object.
+
+Two restrictions are proofs rather than conservatism, and the tests say so in
+their names:
+
+**Unit stride only.** For `i = [region, init, i + s]` guarded by `i < len`, the
+guard gives `i <= len - 1`, so after the increment `i <= len - 1 + s`. An array
+length reaches `i32::MAX`, so any `s > 1` overflows at the top of the range; the
+wrapped `i` is negative, passes the signed test, and indexes out of bounds with
+the check gone. At `s == 1` the bound is `i <= len <= i32::MAX` and the proof
+closes without knowing `len`. A "small constant" stride bound would not — it is
+still unsound against a near-maximal array.
+
+**The guard must dominate the BACK EDGE, not just the access.**
+`for (int i = 0; ; i++) if (c) if (i < a.length) a[i] = 1;` has a bounds test
+dominating every access and still lets `i` reach `i32::MAX` and wrap, after
+which that same test passes on a negative index. Requiring every back edge into
+the loop header to pass through the guard is what rules it out.
+
+The census splits the two mechanisms — `ir bounds elisions by range proof` —
+because a single total moves for either reason and they have opposite reach.
+
+#### Two ways it nearly shipped inert, and how each was caught
+
+Both were found by asking what shape the BUILDER actually emits, not by any
+test -- every unit test in the module passed through both.
+
+**Loop headers are `Op::Merge`, never `Op::Region`.** `IrBuilder::ensure_merge`
+creates every merge point as an `Op::Merge`; `activate_loop_header` then fills
+in its inputs and phis and never rewrites the op. `Op::Region` appears only in
+hand-built graphs -- including this module's own tests. A first version
+required `Op::Region` and would have eliminated exactly zero bounds checks in a
+compiled method while showing twelve green tests.
+
+**javac puts the loop body on the FALSE edge.** The builder preserves bytecode
+branch polarity: `if_icmpge exit` becomes `Cmp(Ge)` with `Proj(0)` going to the
+BRANCH TARGET, so for a top-tested loop the useful fact is `not (i >= len)` on
+`Proj(1)`. Matching only `Lt`-on-true finds the bottom-tested shape and misses
+the other one silently. Both edges are read now, with the four
+`(edge, comparison)` pairs tabulated at `upper_bounds`.
+
+Each has a test named for the failure rather than the feature --
+`the_header_op_the_builder_actually_emits_is_recognised`,
+`the_bound_is_read_off_the_false_edge_of_a_negated_test` -- because the thing
+that needs catching is a silent zero, and a zero is what a workload with no
+such loops also produces.
+
+#### Measured
+
+`probes/BceProbe.java` is the behavioural half: the unit tests assert what the
+ANALYSIS decides, the probe asserts what the EMITTED CODE does. It sums, fills
+and walks a jagged array on the proven shape, and demands
+`ArrayIndexOutOfBoundsException` from four shapes the pass must refuse -- an
+inclusive bound, a negative start, a second shorter array, and an empty array
+-- all after 20,000 warm-up calls, so it is the compiled body under test and
+not the interpreter.
+
+| | range pass on | off |
+|---|---:|---:|
+| `BceProbe` bounds elided / emitted | **6 / 4** | 0 / 10 |
+| `BceProbe` verdict | OK | OK |
+| H2 bounds elided (of which by range) | **18 (10)** | 8 (0) |
+| H2 `DOD RESULT` | OK | OK |
+
+Six of the probe's ten checks go, and every refusal still traps. On H2 the
+range pass adds ten elisions on top of the eight redundancy already found --
+purely additive, since the two prove disjoint things. Ten of ~166 is a modest
+share, and expected: H2's hot code is collections and MVStore rather than raw
+array loops, which is the same reason the seven-item pass measured flat there.
+
+Regression suite 91/91 on ZGC.
