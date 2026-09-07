@@ -13346,9 +13346,12 @@ pub(crate) const FILE_STORE_SLOTS: usize = 1;
 
 /// Where a minted `FileStore`'s private slot starts on `this`.
 ///
-/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
-/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
-/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
 /// and therefore `<clinit>`, so an ordinary private field read was a Java
 /// re-entry that could move — or under the generational young sweep zero — every
 /// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
@@ -13374,9 +13377,12 @@ pub(crate) const DIR_STREAM_SLOTS: usize = 3;
 
 /// Where a minted `DirectoryStream`'s private map starts on `this`.
 ///
-/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
-/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
-/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it
+/// makes reaching for `<clinit>` or any Java re-entry while resolving a
+/// private-slot base a COMPILE ERROR. (Scope, stated exactly in
+/// `appended_slots::base_for_class_id`: `&dyn` blocks every `&mut self` method,
+/// which is where `<clinit>` and re-entry live, but NOT a `&self` method using
+/// interior mutability.) Until 2026-09-07 this path reached `ensure_class_initialized`
 /// and therefore `<clinit>`, so an ordinary private field read was a Java
 /// re-entry that could move — or under the generational young sweep zero — every
 /// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
