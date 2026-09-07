@@ -9,6 +9,64 @@
 | **Probe** | `CRATONVM_DBG_SWEEP_ZERO=1` names the victim by class and sweep cycle |
 | **Supersedes** | the mechanism half of the retired `moving-young-jit-frame-fallback-costs-3-10x-20260906` page, which attributed this test's failure to `[moving-young]` fallbacks. It is not that — see "What this is not". |
 
+## Two producers on this page's own path, FIXED 2026-09-06
+
+The mechanism below was checked against this page's subsystem and found in
+`FileSystemProvider.newFileChannel` — the native `FileChannel.open` dispatches
+to, and the one Kafka's `FileRecords` opens its log and index files through.
+BOTH halves of the family were live in that one closure:
+
+* **a fresh allocation held only in a Rust local.** It allocated a
+  `java.io.FileDescriptor`, then allocated a path `String`, then ran
+  `FileChannelImpl`'s class initializer, and only then passed the descriptor
+  into `FileChannelImpl.open`. Nothing in Java referred to that descriptor
+  until the store, so the non-moving young sweep could ZERO it — and a zeroed
+  `FileDescriptor` reads its `fd`/`handle` back as 0, which is this page's
+  `FileChannel.map: invalid fd` exactly.
+* **a stale argument snapshot.** `args.get(2)` — the `Set<OpenOption>` — was
+  read AFTER `p57_read_path` allocated, then dereferenced twice. `args` is a
+  pre-call snapshot that no collection rewrites.
+
+Neither was reported by either shipped audit, and the reason is structural:
+the site is a CLOSURE registered inside `register_phase57_nio_file`, and both
+`scripts/unpinned-native-local-audit.py` and `scripts/stale-receiver-audit.py`
+index by top-level `fn`. Everything inside a 13,000-line `register_*` function
+is attributed to that one name. `native_fcimpl_open` and
+`new_native_thread_set` in `native-io` were converted that morning; this site
+is the same construction one provider layer up, and it was invisible.
+
+### A local reproducer, no Kafka and no Azure
+
+`test_classes/gc/NioChannelChurn.java` and its two controls open a
+`FileChannel` in a loop while background threads allocate — the concurrency is
+load-bearing, because a single-threaded loop only collects where it itself
+allocates, and the window here is inside the native. ~30 seconds:
+
+```bash
+cratonvm --java-home <jdk25> -cp test_classes/gc -Xmx32m     -XX:+UseGenerationalGC NioChannelChurn 300 200 4
+```
+
+| arm | before | after |
+|---|---|---|
+| Generational | 4/5 crash | **0/5** |
+| Generational `--nojit` | 5/5 crash | **0/5** |
+| `OpenCloseOnly` (no `size()`/`read()`), Gen `--nojit` | 5/5 crash | **0/5** |
+| `ChurnOnly` (same allocation shape, NO file I/O) | 0/5 | 0/5 |
+| ZGC, G1 | 0/5 | 0/5 |
+| HotSpot | pass | pass |
+
+`ChurnOnly` is the control that matters: identical allocation, identical
+threads, no file I/O, and it never fails. That is what attributes the crash to
+the file path rather than to the churn.
+
+**Note the `--nojit` row.** This page records Generational `--nojit` as PASSING,
+and these two producers fail there 5/5 — so this local defect is NOT gated on
+the JIT, and it is therefore not proven to be THIS page's failure. What it is:
+the same family, on this page's exact path, with this page's exact symptom, and
+now fixed. Whether the Kafka test still fails needs a run on the box.
+
+---
+
 ## A mechanism to test first, added 2026-09-06
 
 A defect with THIS PAGE'S EXACT SCOPE — Generational with the JIT on; HotSpot,
