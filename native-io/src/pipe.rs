@@ -1023,7 +1023,12 @@ fn pipe_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let read_id = register_pipe_end(read_end);
     let write_id = register_pipe_end(write_end);
     let source = alloc_channel(ctx, "sun/nio/ch/SourceChannelImpl", false, read_id);
+    // GC: `source` has to survive the SECOND channel's allocation, and both
+    // have to survive the `ensure_class_initialized` + `alloc_object` pair that
+    // mints the wrapper they are stored into.
+    let source_pin = ctx.pin_native_root(source);
     let sink = alloc_channel(ctx, "sun/nio/ch/SinkChannelImpl", true, write_id);
+    let sink_pin = ctx.pin_native_root(sink);
 
     // The wrapper is minted AS `sun/nio/ch/PipeImpl`, the class HotSpot
     // 25.0.3+9 constructs here, and NOT as the abstract `java/nio/channels/
@@ -1069,6 +1074,9 @@ fn pipe_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
             .unwrap_or_else(|_| ClassId::new(0)),
     };
     let wrapper = ctx.alloc_object(pipe_cid, 2);
+    let source = ctx.read_native_pin(source_pin, source);
+    let sink = ctx.read_native_pin(sink_pin, sink);
+    ctx.unpin_native_roots(source_pin);
     ctx.set_field(
         wrapper,
         PIPE_WRAPPER_FIELD_SOURCE,

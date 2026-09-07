@@ -1368,8 +1368,16 @@ fn read_process_environment(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
     };
+    // GC: every `invoke_virtual` in this loop runs the map's Java, so the
+    // iterator does not survive its own `hasNext`/`next` pair and an entry does
+    // not survive `getKey()` before `getValue()` reads it again. The pin is
+    // released on every exit — `read_process_environment` runs once per
+    // `ProcessBuilder.start()`, but the loop below is bounded at 100_000.
+    let iter_pin = ctx.pin_native_root(iter);
+    let mut iter = iter;
     let mut out = Vec::new();
     for _ in 0..100_000 {
+        iter = ctx.read_native_pin(iter_pin, iter);
         let has_next = matches!(
             ctx.invoke_virtual(iter, "hasNext", "()Z", &[]),
             Ok(Some(Value::Int(v))) if v != 0
@@ -1377,18 +1385,23 @@ fn read_process_environment(
         if !has_next {
             break;
         }
+        iter = ctx.read_native_pin(iter_pin, iter);
         let entry = match ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => break,
         };
+        let entry_pin = ctx.pin_native_root(entry);
         let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => object_to_string(ctx, o),
             _ => None,
         };
+        let entry = ctx.read_native_pin(entry_pin, entry);
+        ctx.unpin_native_roots(entry_pin);
         let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => object_to_string(ctx, o),
             _ => None,
         };
+        iter = ctx.read_native_pin(iter_pin, iter);
         if let (Some(k), Some(v)) = (key, value) {
             out.push((k, v));
         }
@@ -4151,9 +4164,15 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         })
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    // GC: nothing in Java refers to `list` yet, and `<init>`, one
+    // `build_process_handle` per descendant and one `add` per descendant all
+    // run Java between here and the `stream()` call that consumes it.
+    let list_pin = ctx.pin_native_root(list);
+    let mut list = list;
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
     for cpid in descendant_pids {
         let handle = build_process_handle(ctx, cpid)?;
+        list = ctx.read_native_pin(list_pin, list);
         ctx.invoke(
             al_class,
             "add",
@@ -4161,6 +4180,8 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             &[Value::Object(Some(list)), Value::Object(Some(handle))],
         )?;
     }
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     ctx.invoke(
         al_class,
         "stream",
@@ -4441,6 +4462,10 @@ fn wrap_fd_in_stream(
     };
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+    // GC: the stream's own constructor runs Java, and BOTH the descriptor and
+    // the stream are read again below — the descriptor is deliberately
+    // re-seeded after construction, which is exactly the window.
+    let fd_pin = ctx.pin_native_root(fd_obj);
     let stream = match ctx.new_object_initialized(
         stream_class,
         "(Ljava/io/FileDescriptor;)V",
@@ -4457,6 +4482,8 @@ fn wrap_fd_in_stream(
     // Some real-JDK stream constructors touch the descriptor during
     // initialization. Re-seed the descriptor after construction so the
     // fd-table id remains recoverable when the stream is later written/read.
+    let fd_obj = ctx.read_native_pin(fd_pin, fd_obj);
+    ctx.unpin_native_roots(fd_pin);
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
 

@@ -1402,10 +1402,17 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // — `java.io.File.list()` is declared to return `String[]`; see
     // `new_string_array` for the whole rule and for what an `Object[]` costs.
     let arr = new_string_array(ctx, entries.len());
+    // GC: one `create_string` per directory entry, with the array itself in a
+    // bare local and returned at the end.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr = arr;
     for (i, name) in entries.iter().enumerate() {
         let s = ctx.create_string(name);
+        arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
+    arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -15745,8 +15752,16 @@ fn throw_invalid_path_exception(
 ) -> MethodCallFailed {
     match ctx.new_object("java/nio/file/InvalidPathException") {
         Ok(Some(Value::Object(Some(exc)))) => {
+            // GC: two `create_string`s and a Java `<init>` stand between the
+            // exception's allocation and the reference this THROWS. A stale
+            // `ExceptionThrown` payload is a garbage throwable on the unwind
+            // path, which is the worst place to discover one.
+            let exc_pin = ctx.pin_native_root(exc);
             let input_str = ctx.create_string(input);
+            let input_pin = ctx.pin_native_root(input_str);
             let reason_str = ctx.create_string(reason);
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            let input_str = ctx.read_native_pin(input_pin, input_str);
             let _ = ctx.invoke(
                 "java/nio/file/InvalidPathException",
                 "<init>",
@@ -15757,6 +15772,8 @@ fn throw_invalid_path_exception(
                     Value::Object(Some(reason_str)),
                 ],
             );
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            ctx.unpin_native_roots(exc_pin);
             MethodCallFailed::ExceptionThrown(exc)
         }
         _ => RuntimeError::IllegalArgumentException {
@@ -16547,11 +16564,19 @@ fn native_files_read_all_lines(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Ok(cid) => ctx.alloc_object(cid, 2),
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
+    // GC: `al_init` and `al_add` pin what they are given, but the address
+    // this local carries is stale from the PREVIOUS iteration's
+    // `create_string` — the callee can only pin the address it is handed.
+    let list_pin = ctx.pin_native_root(list);
+    let mut list = list;
     al_init(ctx, list);
     for line in &lines {
         let line_str = ctx.create_string(line);
+        list = ctx.read_native_pin(list_pin, list);
         al_add(ctx, list, Value::Object(Some(line_str)));
     }
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -21616,7 +21641,12 @@ fn make_path_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
         Ok(cid) => ctx.alloc_object(cid, 1),
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
+    // GC: the array allocation below moves `stream`, which is then stored
+    // through and returned.
+    let stream_pin = ctx.pin_native_root(stream);
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    ctx.unpin_native_roots(stream_pin);
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
@@ -23202,6 +23232,9 @@ fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC: the `FileLockImpl` constructor runs Java, and `lock` is the
+    // reference this native RETURNS.
+    let lock_pin = ctx.pin_native_root(lock);
     ctx.invoke(
         "sun/nio/ch/FileLockImpl",
         "<init>",
@@ -23214,6 +23247,8 @@ fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             Value::Int(if shared { 1 } else { 0 }),
         ],
     )?;
+    let lock = ctx.read_native_pin(lock_pin, lock);
+    ctx.unpin_native_roots(lock_pin);
     Ok(Some(Value::Object(Some(lock))))
 }
 
@@ -23543,8 +23578,12 @@ fn alloc_afc_channel(
         AFC_NUM_FIELDS,
     )
     .obj;
+    // GC: `create_string` below allocates and `afc` is stored through after.
+    let afc_pin = ctx.pin_native_root(afc);
     afc_set(ctx, afc, AFC_FIELD_FD, Value::Int(handle_id as i32));
     let path_s = ctx.create_string(path_str);
+    let afc = ctx.read_native_pin(afc_pin, afc);
+    ctx.unpin_native_roots(afc_pin);
     afc_set(ctx, afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
     afc_set(ctx, afc, AFC_FIELD_OPEN, Value::Int(1));
     Ok(Some(Value::Object(Some(afc))))
@@ -24787,7 +24826,14 @@ fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
         WS_NUM_FIELDS,
     )
     .obj;
+    // GC: the registration array's allocation moves `ws`, which is then
+    // stored through, identity-hashed as the watch-service table key, and
+    // returned. A stale identity hash keys the table to an object nobody can
+    // find again.
+    let ws_pin = ctx.pin_native_root(ws);
     let regs = ctx.new_array(ArrayElementType::Reference, 64);
+    let ws = ctx.read_native_pin(ws_pin, ws);
+    ctx.unpin_native_roots(ws_pin);
     ws_set(ctx, ws, WS_FIELD_REGS, Value::Object(Some(regs)));
     ws_set(ctx, ws, WS_FIELD_COUNT, Value::Int(0));
     ws_set(ctx, ws, WS_FIELD_OPEN, Value::Int(1));
@@ -25367,10 +25413,15 @@ fn native_wk_poll_events(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Fallback for a VM configuration without a usable real ArrayList: the
     // historical 2-field synthetic list.
     let list = try_alloc_synthetic(ctx, "java/util/ArrayList", 2)?;
+    // GC: the `None` arm below ALLOCATES, so `list` is a pre-allocation
+    // address by the time it is stored through. The function pins `this` and
+    // the pending array and not this one.
+    let list_pin = ctx.pin_native_root(list);
     let arr = match pending_pin {
         Some((pin, fallback)) => ctx.read_native_pin(pin, fallback),
         None => ctx.new_array(ArrayElementType::Reference, 0),
     };
+    let list = ctx.read_native_pin(list_pin, list);
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(len as i32));
     ctx.unpin_native_roots(this_pin);
@@ -26122,24 +26173,38 @@ fn dc_interface_ipv4(ctx: &mut dyn NativeContext, ni: ObjectRef) -> Option<std::
             Ok(Some(Value::Object(Some(e)))) => e,
             _ => return None,
         };
+    // GC: every call in this loop runs the enumeration's Java, so the
+    // enumeration itself does not survive its own `hasMoreElements`.
+    let addr_pin = ctx.pin_native_root(addresses);
+    let mut addresses = addresses;
     // Bounded: an interface with a pathological address list must not spin.
     for _ in 0..64 {
+        addresses = ctx.read_native_pin(addr_pin, addresses);
         match ctx.invoke_virtual(addresses, "hasMoreElements", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
-            _ => return None,
+            _ => {
+                ctx.unpin_native_roots(addr_pin);
+                return None;
+            }
         }
+        addresses = ctx.read_native_pin(addr_pin, addresses);
         let addr = match ctx.invoke_virtual(addresses, "nextElement", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(a)))) => a,
-            _ => return None,
+            _ => {
+                ctx.unpin_native_roots(addr_pin);
+                return None;
+            }
         };
         let text = match ctx.invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[]) {
             Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
             _ => continue,
         };
         if let Ok(v4) = text.parse::<std::net::Ipv4Addr>() {
+            ctx.unpin_native_roots(addr_pin);
             return Some(v4);
         }
     }
+    ctx.unpin_native_roots(addr_pin);
     None
 }
 
@@ -26176,6 +26241,10 @@ fn dc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 .into())
             }
         };
+        // GC: `getIndex()` and `dc_interface_ipv4` both run Java, and `this`
+        // is stored through and RETURNED after them. (The audit flagged
+        // `index` here, which is an `i32`; the reference at risk is `this`.)
+        let this_pin = ctx.pin_native_root(this);
         let index = match ctx.invoke_virtual(ni, "getIndex", "()I", &[]) {
             Ok(Some(Value::Int(i))) => i,
             _ => 0,
@@ -26183,6 +26252,8 @@ fn dc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         if let (Some(fd), Some(v4)) = (fd, dc_interface_ipv4(ctx, ni)) {
             let _ = ctx.fd_table().udp_set_multicast_if_v4(fd, &v4);
         }
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         dc_option_set(ctx, this, &name, index);
         return Ok(Some(Value::Object(Some(this))));
     }
@@ -27049,12 +27120,19 @@ fn dc_inet_socket_address(
         .map(|ip| i32::from_be_bytes(ip.octets()))
         .unwrap_or(0);
 
+    // GC: six allocations, four references, and every store is to an object
+    // minted before the allocation that follows it. `inet` in particular is
+    // stored into `socket_holder` FIVE allocations after it was created.
     let inet = try_alloc_synthetic(ctx, "java/net/Inet4Address", 2)?;
+    let inet_pin = ctx.pin_native_root(inet);
     let inet_holder = try_alloc_synthetic(ctx, "java/net/InetAddress$InetAddressHolder", 3)?;
+    let holder_pin = ctx.pin_native_root(inet_holder);
     let host_string = ctx.create_string(host);
+    let inet_holder = ctx.read_native_pin(holder_pin, inet_holder);
     ctx.set_field_by_name(inet_holder, "hostName", Value::Object(Some(host_string)));
     ctx.set_field_by_name(inet_holder, "address", Value::Int(packed));
     ctx.set_field_by_name(inet_holder, "family", Value::Int(1));
+    let inet = ctx.read_native_pin(inet_pin, inet);
     ctx.set_field_by_name(inet, "holder", Value::Object(Some(inet_holder)));
 
     // Width 1, not 2: every field below is written BY NAME, so the request only
@@ -27068,13 +27146,19 @@ fn dc_inet_socket_address(
     // with three fields and `alloc_object` clamps any request up to them.
     // W7-66-live-over-allocations.md.
     let socket = try_alloc_synthetic(ctx, "java/net/InetSocketAddress", 1)?;
+    let socket_pin = ctx.pin_native_root(socket);
     let socket_holder =
         try_alloc_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
+    let sh_pin = ctx.pin_native_root(socket_holder);
     let socket_host = ctx.create_string(host);
+    let socket_holder = ctx.read_native_pin(sh_pin, socket_holder);
+    let inet = ctx.read_native_pin(inet_pin, inet);
     ctx.set_field_by_name(socket_holder, "hostname", Value::Object(Some(socket_host)));
     ctx.set_field_by_name(socket_holder, "addr", Value::Object(Some(inet)));
     ctx.set_field_by_name(socket_holder, "port", Value::Int(port));
+    let socket = ctx.read_native_pin(socket_pin, socket);
     ctx.set_field_by_name(socket, "holder", Value::Object(Some(socket_holder)));
+    ctx.unpin_native_roots(inet_pin);
     Ok(socket)
 }
 
