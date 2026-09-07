@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-534 tokens.
+536 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -165,6 +165,7 @@ export inherited from a parent shell.
 | `diag-jca` | `CRATONVM_DIAG_JCA` |
 | `diag-method-invoke-null` | `CRATONVM_DIAG_METHOD_INVOKE_NULL` |
 | `diag-properties` | `CRATONVM_DIAG_PROPERTIES` |
+| `deadrecv` | `CRATONVM_DBG_DEADRECV` |
 | `diag-serviceloader` | `CRATONVM_DIAG_SERVICELOADER` |
 | `dispatch-tally` | `CRATONVM_DBG_DISPATCH_TALLY` |
 | `dopriv` | `CRATONVM_DBG_DOPRIV` |
@@ -247,6 +248,7 @@ export inherited from a parent shell.
 | `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
 | `fmt-wrongtype` | `CRATONVM_DBG_FMT_WRONGTYPE` |
 | `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
+| `young-mark-watch` | `CRATONVM_DBG_YOUNG_MARK_WATCH` |
 | `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
 | `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
 | `hm-trace` | `CRATONVM_HM_TRACE` |
@@ -600,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-389 tokens.
+390 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -713,6 +715,7 @@ export inherited from a parent shell.
 | `ir-const-imm` | `CRATONVM_JIT_IR_CONST_IMM` |
 | `ir-phi-residency` | `CRATONVM_JIT_IR_PHI_RESIDENCY` |
 | `ir-phi-copy-regs` | `CRATONVM_JIT_IR_PHI_COPY_REGS` |
+| `ir-phi-home-publish-guard` | `CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD` |
 | `ir-phi-edge-interfere` | `CRATONVM_JIT_IR_PHI_EDGE_INTERFERE` |
 | `ir-skip-republish` | `CRATONVM_JIT_IR_SKIP_REPUBLISH` |
 | `ir-deopt-regs` | `CRATONVM_JIT_IR_DEOPT_REGS` |
@@ -996,7 +999,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-166 tokens.
+169 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1008,6 +1011,8 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
+| `remap-frozen-peer-stacks` | `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS` |
+| `hold-helper-peers` | `CRATONVM_GC_HOLD_HELPER_PEERS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
@@ -1017,6 +1022,7 @@ export inherited from a parent shell.
 | `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `zgc-jit-blanket-refusal` | `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` |
 | `blocked-wake-jit-remap` | `CRATONVM_BLOCKED_WAKE_JIT_REMAP` |
+| `blocked-peer-stack-remap` | `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP` |
 | `zgc-unrewritable-peer-refuses` | `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |

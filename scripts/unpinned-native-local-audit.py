@@ -25,11 +25,28 @@ one scope with no `read_native_pin` between", which is how it found 40 of the
 out of `args`, not declared in a signature. This one keys on the DECLARED type,
 so the two populations overlap without either containing the other.
 
-WHAT THIS RULE STILL CANNOT SEE. `args: &[Value]` — the shape of every native
-entry point, and the one `safe_native_call_impl` rebuilds only for collections
-it runs ITSELF, before the callback. A native that re-enters Java keeps naming
-the pre-call address. `Option<ObjectRef>`, `&[ObjectRef]` and `Vec<ObjectRef>`
-parameters are not matched either; `--opt` counts them separately.
+WHAT `--opt` SEES, CORRECTED 2026-09-07. `args: &[Value]` — the shape of every
+native entry point, and the one `safe_native_call_impl` rebuilds only for
+collections it runs ITSELF, before the callback. A native that re-enters Java
+keeps naming the pre-call address. `Option<ObjectRef>`, `&[ObjectRef]` and
+`Vec<ObjectRef>` are in the same tranche.
+
+This paragraph used to say the rule "cannot see" those, and that was true for
+the wrong reason: `PARAM_OPT` listed all five shapes and FOUR OF THEM MATCHED
+NOTHING, because a trailing `` after `]`/`>` demands a word character and a
+parameter list supplies `,` or `)`. `--opt` scanned only the bare `Value` arm
+while advertising the rest. See the note on `PARAM_OPT` itself; the three print
+natives that crashed under Generational are the positive control, and this
+script reported the same count over that file before and after their fix, with
+`--opt` or without.
+
+A SLICE IS NOT A REFERENCE, which is why `slice_ref_use` gates this tranche.
+"The statement mentions `args`" is the function's own argument list, not a
+defect: only a `Value::Object` destructured out of the slice, or the slice
+handed whole to a callee that will do it, can be stale. Unfiltered the tranche
+is 598 candidates across the native crates; gated it is 500, and it is
+depth-INSENSITIVE (53 vs 55 in `native-io` at `--depth 1` and `6`), so it is not
+an artifact of transitive reachability.
 
 WHAT A PARAMETER HIT MEANS, which is not what a local hit means.
 `safe_native_call_impl` pins every argument of a native call into
@@ -126,14 +143,65 @@ PARAM_REF = re.compile(r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&mut\s+)?ObjectRef\b")
 # same way, but each needs a different fix (destructure and pin the inner
 # reference, or pin every element), so counting them together would make the
 # default number mean two things at once.
+# THE TRAILING `\b` KILLED FOUR OF THE FIVE ALTERNATIVES, 2026-09-07.
+#
+# `Option<ObjectRef>`, `&[ObjectRef]`, `Vec<ObjectRef>` and `&[Value]` all end
+# in `>` or `]`. `\b` after a NON-word character asserts that the next character
+# IS a word character — and in a parameter list the next character is `,` or
+# `)`. So every bracketed form failed to match, always, and `--opt` scanned only
+# the bare `Value` arm while its `--help` advertised all of them.
+#
+# That is what let `native-builtins/src/lib.rs`'s `stream_write` /
+# `stream_writeln` / `stream_writeln_inner` through: they hold `args: &[Value]`
+# across `printstream_encode` (the JDK charset encoder) and
+# `route_write_through_out` (`Writer.write`), the receiver relocated under
+# `-XX:+UseGenerationalGC`, and `stream_fd` dereferenced the pre-call address —
+# `EXCEPTION_ACCESS_VIOLATION` in `gen_heap::get_field`. Running this script
+# over that file before and after the fix gave the same count both times, with
+# `--opt` or without. See
+# `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+#
+# `(?![A-Za-z_0-9])` is the assertion that was wanted: "the type ends here",
+# which is true after `]` and `>` and also stops `Value` from matching
+# `ValueRef`. [`assert_param_opt_alternatives_live`] runs on every invocation so
+# a dead alternative can never be silent again.
 PARAM_OPT = re.compile(
     r"\b([a-z_][a-z_0-9]*)\s*:\s*"
     r"(?:Option\s*<\s*(?:[A-Za-z_0-9]+::)*ObjectRef\s*>"
     r"|&\s*\[\s*(?:[A-Za-z_0-9]+::)*ObjectRef\s*\]"
     r"|Vec\s*<\s*(?:[A-Za-z_0-9]+::)*ObjectRef\s*>"
     r"|&\s*\[\s*Value\s*\]"
-    r"|Value)\b"
+    r"|Value)(?![A-Za-z_0-9])"
 )
+
+# One representative signature per alternative, asserted on every run.
+#
+# A regex alternative that matches nothing is invisible: the scan still runs,
+# still prints a total, and still looks like coverage. This is the cheapest
+# possible guard against that — five `findall`s at startup — and it exists
+# because the four dead arms above shipped, were used, and were reported as
+# coverage for eight days.
+PARAM_OPT_LIVE = [
+    ("Option<ObjectRef>", "fn f(a: Option<ObjectRef>, b: i32)", "a"),
+    ("&[ObjectRef]", "fn f(roots: &[ObjectRef])", "roots"),
+    ("Vec<ObjectRef>", "fn f(v: Vec<ObjectRef>, x: u8)", "v"),
+    ("&[Value]", "fn f(ctx: &mut dyn NativeContext, args: &[Value], t: &str) {", "args"),
+    ("Value", "fn f(x: Value)", "x"),
+]
+
+
+def assert_param_opt_alternatives_live():
+    dead = [(label, sig) for (label, sig, want) in PARAM_OPT_LIVE
+            if want not in PARAM_OPT.findall(sig)]
+    if dead:
+        raise SystemExit(
+            "PARAM_OPT has %d alternative(s) that match NOTHING — `--opt` would "
+            "report coverage it does not have:\n%s"
+            % (len(dead), "\n".join("  %-18s no match in: %s" % d for d in dead))
+        )
+
+
+assert_param_opt_alternatives_live()
 
 # A binding can only go stale if it HOLDS A REFERENCE. `epoch` binds
 # `let month = invoke_i32(ctx, obj, "getMonthValue")` — GC-capable RHS, used
@@ -184,9 +252,11 @@ REF_RHS = re.compile(
 # "read", "([BII)I", &[Value::Object(Some(buf)), ..]) { Ok(Some(Value::Int(n)))
 # => n, .. }` binds an `i32` and mentions `Value::Object` in the same breath.
 SCALAR_BIND = re.compile(
-    r"(?:Ok\s*\(\s*)?Some\s*\(\s*"
-    r"Value::(?:Int|Long|Float|Double|Char|Short|Byte|Boolean)\s*\([a-z_][a-z_0-9]*\)"
-    r"\s*\)\s*\)?\s*(?:if[^=]*)?=>"
+    # `Value::Int(v) => ..`, `Some(Value::Int(v)) => ..`,
+    # `Ok(Some(Value::Int(v))) if v >= 0 => ..` — the arm may carry a GUARD, and
+    # a guard contains `=` (`v >= 0`), so the span to `=>` cannot be `[^=]*`.
+    r"Value::(?:Int|Long|Float|Double|Char|Short|Byte|Boolean)"
+    r"\s*\(\s*[a-z_][a-z_0-9]*\s*\)[^;{}]{0,80}?=>"
     r"|\.map\s*\(\s*\|_\|\s*\(\s*\)\s*\)"
 )
 REF_BIND = re.compile(r"(?:Ok\s*\(\s*)?Some\s*\(\s*Value::Object")
@@ -194,6 +264,50 @@ REF_BIND = re.compile(r"(?:Ok\s*\(\s*)?Some\s*\(\s*Value::Object")
 
 def scalar_binding(text):
     return SCALAR_BIND.search(text) is not None and REF_BIND.search(text) is None
+
+
+# A SLICE USE THAT CANNOT GO STALE. `args: &[Value]` is the shape of every
+# native entry point, so "the statement mentions `args`" is not a defect — it is
+# the function's argument list. Reading a SCALAR out of the slice
+# (`args.get(3).and_then(|v| v.as_int())`, `matches!(args.get(1),
+# Some(Value::Int(1)))`) copies an `i32` out of a `Value` that is already in
+# hand; the pre-call address of a scalar is the same as its post-call one, and
+# there is nothing to dereference.
+#
+# Only a REFERENCE pulled out of the slice can be stale, and only two shapes
+# reach one:
+#
+#   * the statement destructures `Value::Object` out of the slice, or
+#   * it passes the SLICE ITSELF to a callee, which will do that for it — the
+#     shape that crashed (`stream_fd(ctx, args)` after two Java re-entries).
+#
+# Without this, `--opt` reported 598 `wide` candidates across the native
+# crates, most of them integer reads, and a population nobody reads is the
+# failure mode the 2026-08-25 write-up names.
+SLICE_SCALAR = re.compile(
+    r"Value::(?:Int|Long|Float|Double|Char|Short|Byte|Boolean)"
+    r"|\.as_(?:int|long|i32|i64|u8|u16|u32|f32|f64|bool|char|short|byte)\s*\("
+)
+
+
+def slice_ref_use(name, text):
+    """Does this statement reach a REFERENCE through the slice `name`?
+
+    True when it destructures `Value::Object` from it, or hands the whole slice
+    to a callee. False when the only contact is a scalar read."""
+    n = re.escape(name)
+    if re.search(r"Value::Object", text) and names(name, text):
+        return True
+    # The slice passed on as an argument: `f(ctx, args)`, `f(ctx, &args[1..])`,
+    # `f(ctx, args, text)`. An INDEXED read (`args.get(2)`, `args[0]`) is not
+    # this — it hands over one element, and the callee gets a `Value` by copy.
+    if re.search(r"[(,]\s*&?\s*" + n + r"\s*(?:\[[^\]]*\])?\s*[,)]", text):
+        if not re.search(r"\b" + n + r"\s*(?:\.\s*(?:get|first|last|iter)\s*\(|\[\s*[0-9])", text):
+            return True
+    # Everything else: a scalar read, or a length/emptiness test.
+    if SLICE_SCALAR.search(text):
+        return False
+    return False
 
 
 def ref_use(name, text):
@@ -465,7 +579,30 @@ def branchy(text):
     than improved, with the reason: a rule that dismisses confidently is worse
     than one that is noisy. Deciding exclusivity needs the read, not the grep."""
     t = text.strip()
-    return t.startswith("return") or (not t.startswith("let ") and "=>" in t)
+    if t.startswith("return"):
+        return True
+    # `let Some(id) = reg_id else { return Err(closed_channel_exception(ctx)); };`
+    # — the ONLY allocation is inside a block that leaves. Ten rows in
+    # `socket_channel.rs` latched onto one of these and reported a window that
+    # cannot exist, hiding whichever later call is the real one.
+    if t.startswith("let ") and " else " in t and re.search(r"(?:return|break|continue)", t):
+        return True
+    return not t.startswith("let ") and "=>" in t
+
+
+def leaves(text):
+    """Every GC-capable call in this statement is on a path that LEAVES.
+
+    Only the two forms that can be decided from the statement alone: a bare
+    `return ...`, and a `let PAT = x else { ...return/break/continue... };`.
+    A `match` arm is NOT included — the sibling arms fall through, and guessing
+    exclusivity is the heuristic the 2026-08-25 write-up deleted rather than
+    improved."""
+    t = text.strip()
+    if t.startswith("return"):
+        return True
+    return (t.startswith("let ") and " else " in t
+            and re.search(r"(?:return|break|continue)", t) is not None)
 
 
 def gc_capable(text, allocfns):
@@ -517,10 +654,16 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
                 if REBIND(p).search(t):
                     break
                 if gc_at is None:
-                    if gc_capable(t, allocfns):
+                    if gc_capable(t, allocfns) and not leaves(t):
                         gc_at, gc_cond = k, branchy(t)
                     continue
                 if names(p, t):
+                    # For the `wide` tranche the mention has to REACH a
+                    # reference; see `slice_ref_use`. `param` (a declared
+                    # `ObjectRef`) is a reference by its type, so it keeps the
+                    # bare-mention test.
+                    if shape == "wide" and not slice_ref_use(p, t):
+                        continue
                     kind = shape
                     if gc_cond:
                         kind += "~"
@@ -581,7 +724,11 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
             if REBIND(name).search(t):
                 break
             if gc_at is None:
-                if gc_capable(t, allocfns):
+                # A GC on a path that LEAVES does not precede what follows it,
+                # so keep looking rather than latching. This is not a
+                # branch-exclusivity guess: the statements below are reached
+                # only when that branch did not run.
+                if gc_capable(t, allocfns) and not leaves(t):
                     gc_at, gc_cond = k, branchy(t)
                 continue
             if names(name, t):
@@ -605,7 +752,8 @@ def main():
     ap.add_argument("--any-binding", action="store_true", dest="any_binding",
                     help="rule 1: do not require the BINDING statement to be GC-capable")
     ap.add_argument("--opt", action="store_true",
-                    help="also scan Option<ObjectRef> / &[Value] / Value parameters")
+                    help="also scan Option<ObjectRef> / &[ObjectRef] / Vec<ObjectRef> / &[Value] / Value parameters (`wide`). `args: &[Value]` is the shape of every registered native, so this is the tranche that covers native ENTRY "
+                    "points rather than their helpers.")
     a = ap.parse_args()
     fns = index(sorted(glob.glob(a.glob)))
     allocfns = allocating(fns, a.depth)

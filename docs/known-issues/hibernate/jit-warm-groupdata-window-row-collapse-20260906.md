@@ -1,26 +1,108 @@
-# A JIT-warm-up-dependent race collapses H2 `GROUP BY`/window row counts — not the 2026-07-27 `groupData` bug recurring
+# The IR lowerer published a phi from a home word it never wrote — H2 `GROUP BY`/window row counts collapse
+
+*(Titled "A JIT-warm-up-dependent race …" for its first two passes. It is not a
+race: it is deterministic per compiled body, and the warm-up requirement is just
+what it takes to reach the optimizing tier. The old title is kept here so a
+search for it still lands.)*
 
 ## Status
 
-**OPEN, but the mechanism is now pinned to one instruction.** Second pass,
-2026-09-06. The row loss is not a race and not a `groupData` problem: **compiled
-`org.h2.command.query.Select.processGroupResult` reloads its `long offset`
-parameter from a frame slot that nothing ever writes**, reads uninitialised
-stack, and its `quickOffset && offset > 0` arm then drops result rows as if the
-query carried an `OFFSET` clause. What is still missing is the compiler path that
-emits the unmatched reload — see the end of this section.
+**FIXED 2026-09-07** (`CRATONVM_JIT_IR_PHI_HOME_PUBLISH_GUARD`, default ON).
 
-The first pass's conclusions all stand: real, CratonVM-specific (HotSpot clean),
-JIT-and-warm-up dependent, and **not** a regression of the
-`ExpressionColumn.getValue` `groupData` delegation fix from 20260727.
+The optimizing IR lowerer published a phi from a home frame word it had
+deliberately decided never to write. `Select.processGroupResult`'s `long offset`
+phi came back as uninitialised stack, and the loop's `quickOffset && offset > 0`
+arm then dropped result rows as if the query carried an `OFFSET` clause.
 
-## Second pass — the mechanism
+Same binary, one switch, `CriteriaWindowFunctionTest`:
 
-What this pass added: a **100% reliable, 35-second, LOCAL (Windows)** repro (the
-first pass had only Azure); the miscompiled method, by bisection; proof that the
-rows are dropped **inside the loop body** rather than by a short iteration; the
-machine-code cause; and an **offline** detector for it
-(`tools/jit/frame-slot-scan.py`) that perturbs nothing.
+| arm | verdict | the compiled body |
+|---|---|---|
+| guard ON (default), 3 runs | **11/11** | **clean** |
+| `..._GUARD=0`, 3 runs | 9/11, `expected: <5> but was: <3>` | `reads-but-never-writes: rbp-0B0h` |
+
+and independently on finding 1's class, `OracleInlineMutationStrategyIdTest`:
+**6/6** with the guard against 5/6 (`expected: 1100`) without.
+
+Engagement across the whole `CriteriaWindowFunctionTest` run: 327 methods
+reported phi copies, **one** engaged the guard, skipping **3** publishes — which
+is exactly the three `[rbp-0B0h]` reads in the disassembly — and **zero**
+compiles were refused, so nothing lost the optimizing tier.
+
+**Finding 3 (`ASTParserLoadingTest`) is NOT verified.** That class discovers 106
+tests and starts none on this host (10 s, `found=106 started=0`, VM exits
+normally), so there is no local arm to read. Its symptom is the same loop in the
+same method with `withHaving` true, so the same fix should cover it, but that
+sentence is an inference and not a measurement.
+
+## The defect
+
+The IR lowerer may DROP a phi's home word: `phi_home_droppable` clears a
+register-resident phi whose register is exclusively its own, and `emit_copy_op`
+then skips the home store because "its register is the only location anyone
+reads".
+
+`emit_phi_copies`'s trailing residency loop is the reader that did not get that
+memo:
+
+```rust
+for c in &gathered {
+    if published.contains(&c.phi) { continue; }
+    if self.assigned_gpr(c.phi).is_some() {
+        self.publish_gp_from_slot(c.phi, c.dst);   // loads [rbp - c.dst]
+    }
+}
+```
+
+`published` holds the phis `emit_copy_op` published register-to-register. A phi
+is absent from it in two ways, and only one of them is safe:
+
+* it was **deferred** (`defer_publish`) — `emit_copy_op` keeps the home store
+  for exactly this reason, so the load is correct and must stay;
+* its copy was **dropped by `resolve_parallel_copy` as a self-copy** — the
+  value is already where it belongs, so `emit_copy_op` never ran at all for it,
+  neither storing the word nor publishing the register. The loop then loads a
+  word nothing has ever written.
+
+The second is what `Select.processGroupResult` hit. `offset` is decremented only
+inside a branch that these queries never take, so on the back edge the phi's
+copy is a self-copy, its home was dropped, and the publish read uninitialised
+stack — three times in one body, zero writes.
+
+The guard: a non-deferred phi whose home was dropped publishes nothing when its
+register is already live (the premise of dropping the home), and REFUSES the
+compile when it is not — the same refusal `emit_copy_op` already makes for the
+mirror case one screen away, rather than emitting a read of a word nothing
+wrote.
+
+### How the door was found
+
+The disassembly header now names the BACKEND as well as the door
+(`full/ir` rather than `full`), because `CompiledMethod::used_ir_backend` had
+recorded it all along and nothing printed it. That one word is what said the
+body came from the optimizing IR pipeline and not from `x64::compile` — which is
+why the never-stored reporter added in the second pass, hanging off
+`x64::driver`'s finish, produced no line for the method at all.
+
+`CRATONVM_JIT_IR_DROP_PHI_HOME=0` was then the first switch to remove BOTH the
+symptom and the machine-code signature, which named the home-drop as the owner.
+For the record, `CRATONVM_JIT_IR_DROP_HOME=0` also passed 11/11 while the
+never-written read REMAINED in the body — a passing arm that still carries the
+defect, and a reminder that on this page an outcome alone is not evidence.
+
+### The regression guard
+
+`every_phi_home_publish_site_is_guarded_against_a_dropped_home` pins the READER
+SET: exactly three phi publish sites, each in an allowlist, plus the guard's own
+text. A source scan rather than a lowering fixture, deliberately — the defect
+needed an 11 KB body with heavy inlining to appear at all and every small Java
+probe written for it read clean, so what can be pinned is that a fourth reader
+cannot be added without someone looking at the guard. It earned its keep
+immediately: the first version scanned every `publish_*_from_slot` call and
+found a site I had not looked at (the value-definition publishes, which
+`store_rax` the word first and are safe).
+
+## Second pass — how the instruction was found
 
 ### The local repro
 
@@ -133,7 +215,7 @@ Select.queryWindow(ILorg/h2/result/LocalResult;JZ)V          clean
   `(int, Object, long, boolean, boolean)` callee invoked from a hot caller with a
   literal `false`: 10 000 000 iterations, zero drops.
 
-### What is still not done, and the two traps
+### What the second pass could not do, and the two traps
 
 **Which compile door emits the unmatched reload.** Two detectors landed behind
 `CRATONVM_DBG_JIT_SLOT_OVERLAP=1`:
@@ -147,10 +229,10 @@ Select.queryWindow(ILorg/h2/result/LocalResult;JZ)V          clean
   scanner.
 
 The second **produces no line for `processGroupResult` at all** — not "the slot
-was stored", no line. It is called from `x64::driver`'s finish, so **the failing
-body comes from a different compile door**. That is the next thread: find which
-driver emits it (the disassembly is in hand), and the missing store belongs at
-whatever back-edge merge that door performs.
+was stored", no line. It is called from `x64::driver`'s finish, so the failing
+body came from a different compile door. **Answered in the third pass above:**
+the door is the eager full-compile door and the backend is the optimizing IR
+pipeline, which is why an `x64::driver` reporter could never see it.
 
 Two traps, both paid for here:
 
@@ -163,7 +245,8 @@ Two traps, both paid for here:
   that alone changed which methods tiered up and the run passed 11/11 with zero
   reports. It records a buffer position now.
 
-No fix is proposed: without the emitter, one would be guessing.
+No fix was proposed at the end of the second pass, on the grounds that without
+the emitter one would be guessing. The third pass found the emitter.
 
 ## First pass — triage, and why this is not the 2026-07-27 bug
 

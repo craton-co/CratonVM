@@ -6227,6 +6227,17 @@ fn run() -> Result<()> {
                  resignals={resig} classified_after_retry={saved} enabled={}",
                 cratonvm_vm::jit::xt_root_scan::enabled(),
             );
+            // Engagement census for the blocked-peer NATIVE-STACK remap
+            // (2026-09-07). `captured` is the denominator: a blocked peer's
+            // stack words that a cross-thread scan resolved to heap objects.
+            // `written` is the repair firing on wake; `skipped` is the guard
+            // declining a word the native call reused since the capture.
+            // written=0 means the repair never engaged on this run.
+            let (bs_c, bs_a, bs_w, bs_s, bs_on) = cratonvm_vm::blocked_peer_stack_remap_census();
+            eprintln!(
+                "[GC] blocked_peer_stack_remap: captured={bs_c} adopted={bs_a} written={bs_w} skipped={bs_s} \
+enabled={bs_on}"
+            );
             // Engagement census for the blocked-peer SHADOW-STACK scan. A
             // clean run with `sh_windows=0` means the scan never ran, and any
             // conclusion drawn from it is vacuous.
