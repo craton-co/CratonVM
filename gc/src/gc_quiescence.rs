@@ -1848,6 +1848,61 @@ pub fn set_watched_referents(addrs: &[usize]) {
 /// continuously in compiled code that is the one door to the moving arm that
 /// no ledger guards, so it has to be countable separately from an accepted
 /// handshake.
+/// Register words captured from a FROZEN peer, for the stale-register pairing.
+///
+/// `(os_tid, register index, value)`. The whole GPR block is recorded, not just
+/// the words a root filter accepted: the question is whether a peer resumes
+/// holding an address the collector MOVED, and pre-filtering with the same
+/// predicate the collector already trusts would beg it.
+///
+/// Empty and untouched unless `CRATONVM_DBG_PEER_REG_PAIRING` is set.
+pub static PEER_REG_CAPTURE: parking_lot::Mutex<Vec<(u32, u8, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Peer register words that turned out to name a RELOCATED object.
+///
+/// The counter behind the pairing §10.11 asked for: a frozen peer's registers
+/// are not heap, not frame-band memory, and are never rewritten by a Cheney
+/// copy, so a non-zero reading is a thread that will resume with a pointer to
+/// an address the collection vacated.
+pub static PEER_REG_STALE: AtomicU64 = AtomicU64::new(0);
+
+/// Record one frozen peer's register word. No-op unless the pairing is armed.
+pub fn record_peer_reg(os_tid: u32, reg: u8, value: usize) {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    let mut g = PEER_REG_CAPTURE.lock();
+    // Bounded: a runaway capture would change the timing it is measuring.
+    if g.len() < 65536 {
+        g.push((os_tid, reg, value));
+    }
+}
+
+/// Drop the previous cycle's capture. Called where the collection begins, so a
+/// hit is always attributable to the cycle that relocated.
+pub fn clear_peer_reg_capture() {
+    if !peer_reg_pairing_enabled() {
+        return;
+    }
+    PEER_REG_CAPTURE.lock().clear();
+}
+
+/// Take the capture for comparison against this cycle's pointer map.
+pub fn take_peer_reg_capture() -> Vec<(u32, u8, usize)> {
+    let mut g = PEER_REG_CAPTURE.lock();
+    std::mem::take(&mut *g)
+}
+
+/// `CRATONVM_DBG_PEER_REG_PAIRING` — arm the frozen-peer register capture and
+/// the post-evacuation comparison against the pointer map.
+pub fn peer_reg_pairing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PEER_REG_PAIRING").is_some()
+    })
+}
+
 pub static PEER_DEPTH_ZERO_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// The subset of [`PEER_DEPTH_ZERO_TOTAL`] where the process-wide JIT depth
