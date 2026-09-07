@@ -300,15 +300,97 @@ condition — not in dropping the term.
   what the non-moving path was built for.
 * **Compact TLAB allocation.** `CRATONVM_GC=-compact-tlab-alloc` still leaks.
 
-### What is still unknown
+## Mechanism, 2026-09-07: the sweep UNWINDS its own reclamation
 
-Why the non-moving walk finds nothing dead on this path. `gen_heap.rs` carries a
-purpose-built `MARKWHY` census for exactly this symptom — its comment says
-`dead_regions` empty has "exactly two ways that happens — the walk classified
-everything LIVE, or it collected spans and UNWOUND them", and its counters
-separate the two. It is gated on `young_mark_watch()` being a non-zero WATCH
-ADDRESS, so it needs a victim address from a prior run to arm. That is the next
-move, and it should answer the question in one run.
+The `MARKWHY` census answers its own question, and it is the second of the two:
+not "everything classified live", but **spans collected and then thrown away**.
+Armed with `CRATONVM_DBG_YOUNG_MARK_WATCH` (see below), one cycle reads:
+
+```
+walk ended:  cursor=0x259c30 used=0x359c30 objects_live=10286 dead_regions=0
+disposition: side_marked=10286 forwarded=0 header_marked=0
+             dead_pushed=294 unwinds=2 sites=[0, 2, 0, 0]
+             unwound_entries=295 dead_regions_final=0 side_sorted=10289
+sweep done:  objects_swept=0 bytes_swept=0 dead_regions=0 reclaimed_regions=0
+```
+
+Three things there:
+
+* `objects_live=10286`, not 125,000. **The mark is correct** — it is the JDK's
+  own live set, and the churn is not in it.
+* `dead_pushed=294`, `unwound_entries=295`, `dead_regions_final=0`. The walk
+  FINDS the dead spans and then discards every one.
+* `cursor` stops at `0x259c30` against `used=0x359c30` — a **1 MiB tail never
+  walked at all**.
+
+`sites=[0, 2, 0, 0]` is index 1, the *oversized-object clamp*, whose unwind is:
+
+```rust
+// A zero span is anomaly evidence like any other: the walk can only claim
+// `cursor` is on-grid if every stride since the last anchor was correctly
+// sized ... Unwind the reclaim decisions collected since the anchor
+// (over-retention is always safe), then re-anchor at the next free block,
+// or stop if no anchor remains.
+mw_unwinds += 1;
+mw_site[1] += 1;
+mw_unwound_entries += dead_regions.len() - dead_watermark;
+dead_regions.truncate(dead_watermark);
+```
+
+and its warning names the spans:
+
+```
+non-moving sweep: unlisted all-zero span at offset 948480  (run 58752 bytes,   next anchor at 3513392)
+non-moving sweep: unlisted all-zero span at offset 1416240 (run 1941248 bytes, next anchor at 3513392)
+non-moving sweep: unlisted all-zero span at offset 2464816 (run 892672 bytes,  next anchor at 3513392)
+```
+
+Runs of 0.9–2.0 MB — far too large for a TLAB tail, and ~2 MB is exactly
+125,000 x 16 bytes, the churn itself.
+
+### It is the FIELD-LESS object
+
+`ChurnKind` allocates the same count three ways, four rounds each:
+
+| churn | round 0 -> 3 | verdict |
+|---|---|---|
+| `new Object()` (no fields, never read) | 3431 -> 11879, +2.8 MB a round | **leaks** |
+| `new int[2]`, `o[0] = i` written | 4455 -> 7527 -> 7527 | plateaus |
+| `new StringBuilder()`, appended | 19625, flat from round 0 | plateaus |
+
+**Only the object with nothing written into it leaks.** A run of them is a run
+of bytes the walk cannot parse as objects, so it reads as "unlisted all-zero
+span", and one such span discards the whole cycle's reclamation.
+
+That also explains the H2 test exactly: `TestValueMemory` Type 0 is
+`ValueNull.INSTANCE`, and its 125,000 entries are references, so the arena fills
+with small short-lived objects the sweep then refuses to parse.
+
+### The two candidate fixes, and which is which
+
+1. **At the allocator.** If a bare `new Object()` can reach the heap with no
+   parseable header, the collector cannot walk its own arena — a GC must be able
+   to parse every allocated object. Whether the header store is being elided for
+   an object that is never read (the probe's `if (o == null)` never reads it) is
+   the thing to establish first; `--nojit` still leaks, so this is not purely a
+   JIT dead-store question.
+2. **At the sweep.** Teach the zero-run arm that a span between two proved
+   anchors, exactly divisible by the minimum object size, is a run of empty
+   objects rather than a broken grid. Riskier: the unwind exists so a mis-sized
+   stride cannot free a live object, and weakening it trades a retention bug for
+   a corruption one.
+
+(1) is the real defect if the header is genuinely absent. (2) should not be
+attempted before (1) is answered.
+
+### Arming the census
+
+`CRATONVM_DBG_YOUNG_MARK_WATCH=0xffffffffffff`. The gate is
+`w != 0 && w >= from_base`, so the value must be ABOVE every from-space base —
+`=1` looks like it should work and does not (it only reaches the `sweep enter`
+line, which has its own gate). Any huge value arms the two per-cycle census
+blocks under ASLR without naming a victim; the per-object paths compare
+`w == addr` and never match it.
 
 A caution that census's own code carries, and that applies to the table above:
 one of its counters is written only in a later loop, so reading it early "prints
