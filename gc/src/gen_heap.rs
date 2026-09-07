@@ -11126,12 +11126,18 @@ impl GenerationalHeap {
                             // measured run at `--Xmx 320m` — and under a
                             // permanent non-moving sweep promotion is the young
                             // generation's ONLY exit for live data.
+                            // `None`: this is the PARALLEL chunk path. The
+                            // proved-base resume is enabled only on the
+                            // sequential walk, the one measured for it; a chunk
+                            // that meets a live mark inside a zero run keeps
+                            // bailing, which is what it did before.
                             if let Some(resume) = zero_run_empty_object_resume(
                                 from_base,
                                 cursor,
                                 run_end,
                                 used,
                                 &side_sorted,
+                                None,
                             ) {
                                 SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                                 EMPTY_RUN_BYTES_CYCLE
@@ -11490,12 +11496,14 @@ impl GenerationalHeap {
                                 // holds nothing for this pass to rewrite. The
                                 // anomaly arm instead hands the whole stretch
                                 // to `rewrite_stretch`'s conservative rewrite.
+                                // `None` — parallel chunk path, see above.
                                 if let Some(resume) = zero_run_empty_object_resume(
                                     from_base,
                                     cursor,
                                     run_end,
                                     used,
                                     &side_sorted,
+                                    None,
                                 ) {
                                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                                     EMPTY_RUN_BYTES_CYCLE
@@ -12355,7 +12363,14 @@ impl GenerationalHeap {
                 // exists for. Still never parsed and never freed: over-retention
                 // is always safe here.
                 let empty_resume = if run_end - cursor >= HEADER_SIZE && !vouched_live {
-                    zero_run_empty_object_resume(from_base, cursor, run_end, used, &side_sorted)
+                    zero_run_empty_object_resume(
+                        from_base,
+                        cursor,
+                        run_end,
+                        used,
+                        &side_sorted,
+                        Some(&unresolved_snapshot),
+                    )
                 } else {
                     None
                 };
@@ -15417,7 +15432,7 @@ impl GenerationalHeap {
                     // fired on 4 of 4 entries — i.e. every major cycle seeded
                     // young->old from a conservative scan rather than a parse.
                     if let Some(resume) =
-                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[], None)
                     {
                         SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                         EMPTY_RUN_BYTES_CYCLE
@@ -15727,7 +15742,7 @@ impl GenerationalHeap {
                     // primitive included — and gives up the precise parse of
                     // every real object in the stretch.
                     if let Some(resume) =
-                        zero_run_empty_object_resume(base, cursor, run_end, used, &[])
+                        zero_run_empty_object_resume(base, cursor, run_end, used, &[], None)
                     {
                         SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                         EMPTY_RUN_BYTES_CYCLE
@@ -17217,7 +17232,7 @@ impl GenerationalHeap {
                         // consumer relies on. Today's arm omits them too, along
                         // with everything after them.
                         if let Some(resume) =
-                            zero_run_empty_object_resume(base, offset, run_end, used, &[])
+                            zero_run_empty_object_resume(base, offset, run_end, used, &[], None)
                         {
                             SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                             EMPTY_RUN_BYTES_CYCLE
@@ -18849,12 +18864,16 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             let run_end = zero_run_end(from_base, cursor, limit);
             let vouched_live = ctx.side_sorted.binary_search(&(from_base + cursor)).is_ok();
             if run_end - cursor >= HEADER_SIZE && !vouched_live {
+                // `None`: this walk's `ctx` carries no unresolved-mark set,
+                // so it cannot tell a proved base from a conservative interior
+                // mark and must keep refusing.
                 if let Some(resume) = zero_run_empty_object_resume(
                     from_base,
                     cursor,
                     run_end,
                     ctx.used,
                     ctx.side_sorted,
+                    None,
                 ) {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                     EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
@@ -20016,12 +20035,24 @@ pub static YOUNG_WALK_ENTRIES: [AtomicU64; 5] = [
 pub static ZERO_RUN_REFUSALS: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Zero runs stepped over by resuming at a PROVED live base inside them,
+/// instead of refusing and unwinding the cycle's reclaim decisions. See the
+/// long note in `zero_run_verdict`.
+///
+/// This is an ACCEPTANCE and deliberately not an entry in
+/// [`ZERO_RUN_REFUSALS`]: that array prints under a `refusals=` label, and
+/// filing an acceptance there would make the fix read as the defect it removes.
+/// `live_inside` stays the count of runs that were genuinely refused — an
+/// interior mark, or a caller with no `unresolved` set to judge against.
+pub static ZERO_RUN_LIVE_RESUMES: AtomicU64 = AtomicU64::new(0);
+
 fn zero_run_verdict(
     base: usize,
     cursor: usize,
     run_end: usize,
     used: usize,
     side_sorted: &[usize],
+    unresolved: Option<&[usize]>,
 ) -> ZeroRunVerdict {
     // Truncate to the last whole slot, and judge THAT boundary.
     //
@@ -20058,11 +20089,56 @@ fn zero_run_verdict(
         ZERO_RUN_REFUSALS[0].fetch_add(1, Ordering::Relaxed);
         return ZeroRunVerdict::Misaligned;
     }
-    // No marked base strictly inside `(cursor, run_end)`. `side_sorted` is
+    // A marked address strictly inside `(cursor, run_end)`. `side_sorted` is
     // ascending, so the only candidate is the last entry below `run_end`.
     let hi = base + run_end;
     let i = side_sorted.partition_point(|&a| a < hi);
     if i > 0 && side_sorted[i - 1] > base + cursor {
+        // RESUME AT A PROVED BASE, REFUSE OTHERWISE.
+        //
+        // The refusal below is right about its subject and must stay: a zero
+        // run casts doubt on every STRIDE since the last anchor, and the
+        // caller's unwind is what makes a mis-sized stride cost retention
+        // instead of a freed live object.
+        //
+        // But it is too strong for one shape. A field-less object is WHOLLY
+        // zero (`MARK_NEUTRAL`, `ObjectKind::Object` and
+        // `ArrayElementType::Reference` all encode as 0 — see the note above),
+        // so a run of them containing a LIVE empty object is the ordinary case,
+        // not a desync. On `ChurnLoop` (125k `new Object()` a round under
+        // `System.gc()`) every refusal was this one — `live_inside=17` against
+        // `zero_empty_runs=144` — and each discarded the cycle's whole
+        // reclamation: `dead_pushed=294 unwound_entries=295 bytes_swept=0`.
+        //
+        // What separates the two readings is whether the marked address is an
+        // object BASE. It need not be: `SWEEP_PHANTOM_INTERIOR_MARKS` records
+        // that conservative candidates can mark an object-INTERIOR word (a
+        // field address, a derived pointer, a spilled register mid-object) and
+        // the late-resolution pass cannot unmark the raw address, "so
+        // `side_sorted` can carry both". Resuming at an interior mark would
+        // land the cursor MID-OBJECT — the very desync this guard exists for,
+        // and the reason an earlier attempt at this (which argued `side_sorted`
+        // entries are "bases by construction") was reverted.
+        //
+        // `unresolved` is the set that may not be bases; everything else came
+        // from a precise ref-slot value or from `resolve_candidate_bases`, and
+        // is a base by construction. `None` means the caller cannot answer, and
+        // then this stays a refusal — which is what keeps every walk that has
+        // no live set, and `a_live_base_inside_the_run_is_still_a_desync`,
+        // behaving exactly as before.
+        //
+        // The FIRST base above `cursor` is the resume point, not the last below
+        // `run_end`: resuming at the last would step over the live objects
+        // between them, which are precisely the ones the walk must visit.
+        if let Some(unresolved) = unresolved {
+            let j = side_sorted.partition_point(|&a| a <= base + cursor);
+            if j < i && unresolved.binary_search(&side_sorted[j]).is_err() {
+                ZERO_RUN_LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
+                return ZeroRunVerdict::EmptyObjects {
+                    resume: side_sorted[j] - base,
+                };
+            }
+        }
         ZERO_RUN_REFUSALS[1].fetch_add(1, Ordering::Relaxed);
         return ZeroRunVerdict::LiveInside;
     }
@@ -20110,11 +20186,12 @@ fn zero_run_empty_object_resume(
     run_end: usize,
     used: usize,
     side_sorted: &[usize],
+    unresolved: Option<&[usize]>,
 ) -> Option<usize> {
     if empty_object_run_recovery_disabled() {
         return None;
     }
-    match zero_run_verdict(base, cursor, run_end, used, side_sorted) {
+    match zero_run_verdict(base, cursor, run_end, used, side_sorted, unresolved) {
         ZeroRunVerdict::EmptyObjects { resume } => Some(resume),
         _ => None,
     }
@@ -20245,7 +20322,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena, side_sorted: &[usize]) {
             let vouched_live = side_sorted.binary_search(&(base + cursor)).is_ok();
             if run_end - cursor >= HEADER_SIZE && !vouched_live {
                 if let Some(resume) =
-                    zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted)
+                    zero_run_empty_object_resume(base, cursor, run_end, used, side_sorted, None)
                 {
                     SWEEP_ZERO_SPAN_EMPTY_RUNS.fetch_add(1, Ordering::Relaxed);
                     EMPTY_RUN_BYTES_CYCLE.fetch_add((resume - cursor) as u64, Ordering::Relaxed);
@@ -20468,7 +20545,7 @@ mod tests {
         let mut buf = vec![0u64; 8]; // 64 bytes
         let base = put_header(&mut buf, HEADER_SIZE, plain_object(2));
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[], None),
             Some(HEADER_SIZE)
         );
     }
@@ -20522,7 +20599,7 @@ mod tests {
         // first word.
         assert_eq!(zero_run_end(base, 0, 64), HEADER_SIZE + 8);
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[]),
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE + 8, 64, &[], None),
             Some(HEADER_SIZE),
             "must resume at the empty object's end, not at the ragged run's end"
         );
@@ -20533,7 +20610,7 @@ mod tests {
     fn a_zero_run_shorter_than_one_slot_is_still_a_desync() {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 8, plain_object(1));
-        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[]), None);
+        assert_eq!(zero_run_empty_object_resume(base, 0, 8, 64, &[], None), None);
     }
 
     /// Several empty objects in a row are still empty objects.
@@ -20542,7 +20619,7 @@ mod tests {
         let mut buf = vec![0u64; 16]; // 128 bytes
         let base = put_header(&mut buf, 3 * HEADER_SIZE, plain_object(1));
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, 3 * HEADER_SIZE, 128, &[]),
+            zero_run_empty_object_resume(base, 0, 3 * HEADER_SIZE, 128, &[], None),
             Some(3 * HEADER_SIZE)
         );
     }
@@ -20555,7 +20632,43 @@ mod tests {
         let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
         let live = base + HEADER_SIZE;
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live]),
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], None),
+            None
+        );
+    }
+
+    /// A live mark inside the run is refused when it cannot be PROVED a base,
+    /// and resumed at when it can.
+    ///
+    /// The two arms are the whole of the 2026-09-07 change. `side_sorted`
+    /// carries conservative interior marks as well as bases
+    /// (`SWEEP_PHANTOM_INTERIOR_MARKS`), and resuming at an interior mark lands
+    /// the cursor mid-object — the desync
+    /// `a_live_base_inside_the_run_is_still_a_desync` exists to prevent. Only a
+    /// mark absent from `unresolved` is a base by construction.
+    #[test]
+    fn a_proved_live_base_inside_the_run_is_resumed_at_not_refused() {
+        let mut buf = vec![0u64; 8];
+        let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+        let live = base + HEADER_SIZE;
+        // UNPROVED: `live` is in the unresolved set, so it may be an interior
+        // word. Refuse, exactly as with no set at all.
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], Some(&[live])),
+            None,
+            "an unresolved mark may not be a base and must not be resumed at"
+        );
+        // PROVED: not in the unresolved set, so it came from a precise ref slot
+        // or `resolve_candidate_bases`. Resume AT it.
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], Some(&[])),
+            Some(HEADER_SIZE),
+            "a proved base is on-grid and is where the walk should continue"
+        );
+        // And with no information at all the answer is still refusal — this is
+        // what keeps every walk that cannot answer behaving as before.
+        assert_eq!(
+            zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live], None),
             None
         );
     }
@@ -20567,7 +20680,7 @@ mod tests {
         let mut buf = vec![0u64; 8];
         let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
         assert_eq!(
-            zero_run_empty_object_resume(base, HEADER_SIZE, 2 * HEADER_SIZE, 64, &[base]),
+            zero_run_empty_object_resume(base, HEADER_SIZE, 2 * HEADER_SIZE, 64, &[base], None),
             Some(2 * HEADER_SIZE)
         );
     }
@@ -20578,7 +20691,7 @@ mod tests {
     fn a_zero_run_to_the_end_of_used_is_not_a_desync() {
         let mut buf = vec![0u64; 4];
         let base = buf.as_mut_ptr() as usize;
-        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[]), Some(32));
+        assert_eq!(zero_run_empty_object_resume(base, 0, 32, 32, &[], None), Some(32));
     }
 
     /// If the header the run lands on does not size plausibly, `run_end` is not
@@ -20589,7 +20702,7 @@ mod tests {
         // 4096 slots = 32 KiB, far past the 64-byte `used` bound.
         let base = put_header(&mut buf, HEADER_SIZE, plain_object(4096));
         assert_eq!(
-            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[]),
+            zero_run_empty_object_resume(base, 0, HEADER_SIZE, 64, &[], None),
             None
         );
     }

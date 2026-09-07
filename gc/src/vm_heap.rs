@@ -3742,10 +3742,17 @@ impl VmHeap {
             let z = &crate::gen_heap::ZERO_RUN_REFUSALS;
             eprintln!(
                 "[GC] young_sweep_zero_refusals: misaligned={} live_inside={} \
-                 implausible_next={}",
+                 implausible_next={} live_resumes={}",
                 z[0].load(O::Relaxed),
                 z[1].load(O::Relaxed),
                 z[2].load(O::Relaxed),
+                // NOT a refusal: runs stepped over by resuming at a PROVED live
+                // base inside them (`zero_run_verdict`). `live_inside` beside it
+                // stays the genuine refusals — an UNRESOLVED mark, which may be
+                // an object interior rather than a base, or a caller with no
+                // unresolved set to judge against. Both nonzero is the expected
+                // reading: the gate is meant to accept only what it can prove.
+                crate::gen_heap::ZERO_RUN_LIVE_RESUMES.load(O::Relaxed),
             );
             // Did the five walks that still carry the old rule even RUN? A
             // zero anomaly count above means nothing without this. Legend on
