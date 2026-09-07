@@ -60,8 +60,10 @@
 // `class_num_total_fields`; `NativeContext` is the empty aggregate over the
 // access traits, so it alone does not bring those methods into scope.
 use crate::registry::{NativeClassAccess, NativeContext, NativeHeapAccess};
+use cratonvm_types::ClassId;
 
-/// The private-slot base for `class_name`, loading and initialising it first.
+/// The private-slot base for `class_name`, loading it first if it is not
+/// already loaded.
 ///
 /// Zero when the class is a fabricated stub — its fields are `_f0.._fN` and the
 /// private map IS the layout — and otherwise the real class's transitive
@@ -70,23 +72,93 @@ use crate::registry::{NativeClassAccess, NativeContext, NativeHeapAccess};
 /// `base + width`, which is what makes those slots both in bounds and
 /// non-aliasing.
 ///
-/// # There is deliberately only ONE of these
+/// # The already-loaded arm does not run `<clinit>`, and cannot disagree
 ///
-/// A `&dyn`-taking sibling that answered from `class_id_by_name` instead of
-/// `ensure_class_initialized` was written first and removed: an accessor and
-/// its allocator that can disagree about the base — which those two can, on any
-/// class whose by-name lookup is ambiguous across loaders — is *exactly* the
+/// A `&dyn`-taking sibling that answered *only* from `class_id_by_name` was
+/// written first and removed, for a reason that still stands: on a miss it
+/// answered 0 where this function answers the real count, and an accessor and
+/// its allocator that disagree about the base are *exactly* the
 /// two-layouts-on-one-class condition this module exists to prevent, arrived at
-/// from the other direction. Every accessor pays one already-warm
-/// `ensure_class_initialized` instead, and no call site can pick the wrong one.
+/// from the other direction.
+///
+/// The `class_id_by_name` arm below is not that sibling. It **falls through**
+/// to `ensure_class_initialized` on a miss, so the two can only ever differ
+/// when the lookup answers `Some` — and `Some` is exactly the case where they
+/// cannot. The VM implements it as `find_unique_class_by_name`, which fails
+/// **closed** on a name several loaders define: `None`, never one of the
+/// candidates. That is what
+/// [`classify_class_name`](NativeClassAccess::classify_class_name) exists to
+/// disambiguate, and its doc states the rule this arm relies on — a plain
+/// `None` means *absent OR ambiguous*. So `Some(cid)` says the name resolves to
+/// exactly one class, which is the one `ensure_class_initialized` would have
+/// returned, and a genuinely ambiguous name takes the old path unchanged.
+///
+/// # What it buys
+///
+/// `ensure_class_initialized` runs `<clinit>` — arbitrary Java, a GC point, and
+/// a re-entry that can move or (under the generational young sweep) zero every
+/// unpinned `ObjectRef` the calling native is holding. Every private-slot
+/// accessor in `native-io` reaches this function, so *a plain-looking private
+/// field read was a collection point*: 45 rows of
+/// `docs/internal/audits/wide-tranche-triage-20260907.md` are rooted here and
+/// nowhere else.
+///
+/// The count never needed `<clinit>` to be correct. `num_total_fields` is
+/// computed by `compute_field_layout` when the class is **defined**, and
+/// `class_manager` asserts that even `redefine_class` leaves it unchanged, so
+/// initialisation cannot move the number this function returns. Skipping it
+/// changes when `<clinit>` runs, not what the base is.
+///
+/// This is not the whole remedy: a class that is genuinely not loaded yet still
+/// falls through, and must — answering 0 for a real class would lay the private
+/// map over its declared fields. [`base_for_class_id`] is the arm for callers
+/// that already hold a resolved id and therefore need none of this.
 #[must_use]
 pub fn base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
     if ctx.is_class_synthetic_stub(class_name) {
         return 0;
     }
+    if let Some(cid) = ctx.class_id_by_name(class_name) {
+        return ctx.class_num_total_fields(cid);
+    }
     match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => ctx.class_num_total_fields(cid),
         Err(_) => 0,
+    }
+}
+
+/// [`base_for_class`] for a caller that already holds the resolved class id.
+///
+/// Takes `&dyn`, not `&mut dyn`, and that is the point rather than an
+/// incidental tightening: every method it calls is `&self`, so the signature is
+/// a compile-time statement that **no GC can run inside it**. An edit that
+/// later reached for `ensure_class_initialized`, `alloc_object` or any Java
+/// re-entry would fail to borrow — the only kind of guarantee that survives
+/// this file being read by someone who has not read this comment.
+///
+/// # Why an id-taking form is safe where the removed name-taking one was not
+///
+/// The sibling [`base_for_class`] describes was unsound because it could answer
+/// a *different number* than the allocator did for the *same name*. This one is
+/// handed the identity, so there is nothing left to resolve and nothing to
+/// disagree about: `class_num_total_fields` is a plain read of the class
+/// record's define-time count. Where the caller took that id from an object
+/// (`class_id_of_object`), it is strictly MORE faithful than the name
+/// round-trip it replaces — on an ambiguous name that round-trip could return a
+/// same-named sibling's field count and index the private map off a class the
+/// receiver is not an instance of.
+///
+/// The stub arm is kept and is still load-bearing: on a fabricated stub the
+/// fields ARE `_f0.._fN` and the private map IS the layout, so the base must
+/// collapse to 0 or it ratchets. See this module's header.
+#[must_use]
+pub fn base_for_class_id(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
+    match ctx.class_name_of_id(class_id) {
+        // An id naming no loaded class carries no known real fields, so the
+        // base collapses to 0 — the same answer the stub arm gives, and the
+        // same answer `base_for_class` gives a name that will not resolve.
+        Some(name) if !ctx.is_class_synthetic_stub(&name) => ctx.class_num_total_fields(class_id),
+        _ => 0,
     }
 }
 
@@ -111,21 +183,23 @@ pub fn base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
 /// Written out three times (`pipe.rs::channel_private_base`,
 /// `native-io/src/concrete_receiver.rs`, and this) before it moved here; the
 /// two callers now forward.
+///
+/// # It asks the receiver's OWN class, and takes `&dyn`
+///
+/// It used to read the class *name* back out of the id and hand that name to
+/// [`base_for_class`], which resolved it a second time. That round-trip cost an
+/// `ensure_class_initialized` — on the accessor side, so an ordinary private
+/// field read became a `<clinit>` door — and on an ambiguous name it could land
+/// on a different class than the receiver's. The id is already in hand and is
+/// the receiver's own, so [`base_for_class_id`] removes the GC point and the
+/// ambiguity in one step. The `&dyn` signature is what keeps it removed.
 #[must_use]
 pub fn base_for_object(
-    ctx: &mut dyn NativeContext,
+    ctx: &dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     width: usize,
 ) -> usize {
-    // Bound to a local before the match: the arm needs `ctx` mutably, and a
-    // `match ctx.class_name_of_id(..)` would keep the scrutinee's shared
-    // reborrow alive for the whole match.
-    let class_id = ctx.class_id_of_object(this);
-    let class_name = ctx.class_name_of_id(class_id);
-    let base = match class_name {
-        Some(name) => base_for_class(ctx, &name),
-        None => 0,
-    };
+    let base = base_for_class_id(ctx, ctx.class_id_of_object(this));
     if ctx.object_num_fields(this) >= base + width {
         base
     } else {
@@ -146,5 +220,68 @@ mod tests {
     fn an_unresolvable_class_has_a_zero_base() {
         let mut ctx = crate::test_mock::MockNativeContext::new();
         assert_eq!(base_for_class(&mut ctx, "does/not/Exist"), 0);
+    }
+
+    /// A class that IS loaded is answered from the loaded class, without
+    /// `ensure_class_initialized`.
+    ///
+    /// This is a positive control for the arm, not merely for the number. The
+    /// mock's `ensure_class_initialized` answers `ClassId::new(0)` for every
+    /// name — an id it never declares — so the fallback path can only ever
+    /// return 0 here. Deleting the `class_id_by_name` arm turns this assertion
+    /// from 3 into 0. That is the whole point: a fast path that is never taken
+    /// looks exactly like a correct one when both arms agree, and this file's
+    /// sibling `scripts/unpinned-native-local-audit.py` carries the same lesson
+    /// written three times.
+    #[test]
+    fn a_loaded_class_is_answered_without_initialising_it() {
+        let mut ctx = crate::test_mock::MockNativeContext::new();
+        ctx.declare_class(
+            "p/Loaded",
+            &[("a", "I"), ("b", "J"), ("c", "Ljava/lang/Object;")],
+        );
+        assert_eq!(
+            base_for_class(&mut ctx, "p/Loaded"),
+            3,
+            "the loaded arm must answer from the loaded class id"
+        );
+    }
+
+    /// [`base_for_class_id`] gives the same base as [`base_for_class`] for the
+    /// same class, and 0 for an id that names nothing.
+    ///
+    /// The two must not be allowed to drift: an accessor on the id form and an
+    /// allocator on the name form disagreeing about the base is the
+    /// two-layouts-on-one-class condition this module exists to prevent.
+    #[test]
+    fn the_id_form_and_the_name_form_agree() {
+        let mut ctx = crate::test_mock::MockNativeContext::new();
+        let cid = ctx.declare_class("p/Both", &[("x", "I"), ("y", "I")]);
+        assert_eq!(base_for_class_id(&ctx, cid), 2);
+        assert_eq!(base_for_class_id(&ctx, cid), base_for_class(&mut ctx, "p/Both"));
+        assert_eq!(
+            base_for_class_id(&ctx, cratonvm_types::ClassId::new(9999)),
+            0,
+            "an id naming no loaded class must collapse to 0, not index past the object"
+        );
+    }
+
+    /// The width guard still collapses the base on a receiver too narrow to
+    /// carry the private map — the direction that keeps a foreign receiver
+    /// reading exactly the slots it read before this module existed.
+    ///
+    /// Asserted through [`base_for_object`] rather than by inspection because
+    /// that function no longer round-trips the class NAME, and the guard is the
+    /// only thing left standing between a wide base and an out-of-range read.
+    #[test]
+    fn a_receiver_too_narrow_for_the_private_map_collapses_to_zero() {
+        let mut ctx = crate::test_mock::MockNativeContext::new();
+        let cid = ctx.declare_class("p/Narrow", &[("a", "I"), ("b", "I")]);
+        // Allocated at the bare declared width: no room for `base + width`.
+        let narrow = ctx.alloc_object(cid, 2);
+        assert_eq!(base_for_object(&ctx, narrow, 3), 0);
+        // Allocated the way this module's allocators do — `base + width`.
+        let wide = ctx.alloc_object(cid, 2 + 3);
+        assert_eq!(base_for_object(&ctx, wide, 3), 2);
     }
 }
