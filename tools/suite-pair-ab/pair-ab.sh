@@ -265,7 +265,7 @@ echo "pair-ab summary   lever=$LEVER  A=$ON_VAL  B=$OFF_VAL"
 echo "classes kept=$kept dropped=$dropped"
 [ "$kept" -gt 0 ] || { echo "no usable pairs"; exit 0; }
 awk -F'\t' 'NR>1{
-    d[n]=$8; s[n]=$9; n++
+    d[n]=$8; s[n]=$9; w[n] = ($6 < $7) ? 1 : 0; n++
     if ($6 < $7) wins++
     ad8 = ($8 < 0) ? -$8 : $8
     if (ad8 > $9) { cn++; if ($6 < $7) cw++ }
@@ -284,17 +284,43 @@ awk -F'\t' 'NR>1{
     printf "mean   per-class delta : %+.1f%%\n", sd/n/10
     printf "----------------------------------------------------------\n"
     if (med_d < 0) ad = -med_d; else ad = med_d
-    # The SIGN TEST is a separate question from the effect size, and hibernate
-    # is the case that proved it: 26 of 37 classes faster with the lever on
-    # (z=2.5) at a median delta of only +0.3%, against a 6.9% per-class floor.
-    # Comparing the median effect to the median noise alone calls that
-    # "unmeasurable" and throws away a consistent, real direction. A small
-    # effect that survives averaging over many classes is exactly what a
-    # per-class harness is FOR.
+    # The SIGN TEST is a separate question from the effect size: a small effect
+    # that survives averaging over many classes is what a per-class harness is
+    # FOR, and comparing the median effect to the median noise alone throws
+    # that away.
+    #
+    # But a significant z over ONE set of classes is NOT a result. Measured
+    # 2026-09-07 on hibernate, same binary and lever: classes 0-39 gave
+    # z=+2.47 and classes 40-119 gave z=-2.49. Pooled, 54 of 115 -- a coin.
+    # Classes carry their own systematic differences (how much of the run is
+    # JIT-visible at all), so slicing a NULL effect can hand you significance
+    # in either direction. Hence the SPLIT-HALF check below: this run scores
+    # its own two halves and says so when they disagree.
     z = (n > 0) ? (2*wins - n) / sqrt(n) : 0
     az = (z < 0) ? -z : z
     printf "sign test on the paired count: z = %+.2f%s\n", z,
            (az >= 2 ? "  (consistent, p < 0.05)" : "  (a coin)")
+    # SPLIT-HALF: score the two halves of this run separately. A direction
+    # that is real shows up in BOTH; one that is an artifact of which
+    # classes were sampled flips. This is the check that would have caught
+    # the 2026-09-07 hibernate reversal inside one run, not a day later.
+    h = int(n/2)
+    if (h >= 8) {
+      w1 = 0; for (i = 0; i < h; i++) w1 += w[i]
+      w2 = 0; for (i = h; i < n; i++) w2 += w[i]
+      n1 = h; n2 = n - h
+      z1 = (2*w1 - n1) / sqrt(n1)
+      z2 = (2*w2 - n2) / sqrt(n2)
+      printf "split-half   : first %d classes z = %+.2f | last %d classes z = %+.2f\n", n1, z1, n2, z2
+      if (!((z1 >= 0 && z2 >= 0) || (z1 < 0 && z2 < 0))) {
+        split_warn = 1
+        printf "  ** THE HALVES DISAGREE IN SIGN. What this run measured is not\n"
+        printf "     stable across WHICH classes were sampled. Do not report a\n"
+        printf "     direction from it; take a larger or different sample.\n"
+      }
+    } else {
+      printf "split-half   : n=%d is too small to split (need 16+)\n", n
+    }
     printf "----------------------------------------------------------\n"
     if (ad <= med_s && az < 2) {
       printf "VERDICT: UNMEASURABLE. The effect (%.1f%%) is not larger than the\n", ad/10
@@ -302,6 +328,12 @@ awk -F'\t' 'NR>1{
       printf "         configuration, and the paired count is a coin. Report no\n"
       printf "         throughput number from this run.\n"
     } else if (ad <= med_s) {
+      if (split_warn) {
+        printf "VERDICT: UNMEASURABLE (SPLIT-HALF DISAGREEMENT). A wins %d of %d\n", wins, n
+        printf "         overall, but the two halves of this run point OPPOSITE ways.\n"
+        printf "         The count is a property of WHICH classes were sampled, not of\n"
+        printf "         the lever. Report no direction. See the split-half line above.\n"
+      } else {
       printf "VERDICT: SMALL BUT CONSISTENT. Each class is noise-dominated"\
              "  (%.1f%% effect against a %.1f%% floor), but A wins %d of %d,\n",
              ad/10, med_s/10, wins, n
@@ -313,6 +345,7 @@ awk -F'\t' 'NR>1{
       printf "         classes 40-119 gave z=-2.49, SAME binary and lever. Pooled,\n"
       printf "         54 of 115 -- a coin. A significant count over ONE sample of\n"
       printf "         classes is a reason to take a SECOND sample, not a result.\n"
+      }
     } else {
       printf "VERDICT: effect %.1f%% exceeds the %.1f%% same-config noise floor.\n", ad/10, med_s/10
       printf "         Read the paired count above as the primary statistic.\n"
