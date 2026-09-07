@@ -22066,7 +22066,16 @@ pub const AFC_ABSTRACT_IMPL: &str = "sun/nio/ch/AsynchronousFileChannelImpl";
 /// `async_socket.rs::aio_base`. The width guard inside `concrete_base`
 /// collapses the base to 0 for any receiver this crate did not allocate, so a
 /// real `Impl` built by JDK bytecode reads the slots it read before.
-fn afc_base(ctx: &mut dyn NativeContext, o: ObjectRef) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
+/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
+/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+fn afc_base(ctx: &dyn NativeContext, o: ObjectRef) -> usize {
     crate::concrete_receiver::concrete_base(ctx, o, AFC_NUM_FIELDS)
 }
 
@@ -22775,7 +22784,16 @@ const WE_IMPLS: &[&str] = &["sun/nio/fs/AbstractWatchKey$Event"];
 /// JDK itself builds, which declare fields, so the map moves above them.
 /// `probes/W4Abstract.java` is the assertion that found this; JVMS §6.5 is why
 /// it is a defect with no oracle run required.
-fn watch_base(ctx: &mut dyn NativeContext, o: ObjectRef, slots: usize) -> usize {
+///
+/// `&dyn`, not `&mut dyn`, and that is load-bearing rather than tidiness: it is
+/// what makes "no GC runs while resolving a private-slot base" a COMPILE ERROR
+/// to violate. Until 2026-09-07 this path reached `ensure_class_initialized`
+/// and therefore `<clinit>`, so an ordinary private field read was a Java
+/// re-entry that could move — or under the generational young sweep zero — every
+/// unpinned `ObjectRef` its caller was holding. Widening this back to `&mut`
+/// would silently make that possible again; the borrow checker is the only
+/// guard that survives a reader who has not read this comment.
+fn watch_base(ctx: &dyn NativeContext, o: ObjectRef, slots: usize) -> usize {
     crate::concrete_receiver::concrete_base(ctx, o, slots)
 }
 
