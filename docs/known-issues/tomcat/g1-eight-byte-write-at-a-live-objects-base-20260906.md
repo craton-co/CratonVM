@@ -560,6 +560,57 @@ family used to appear within a couple of minutes and a few hundred pauses.
   fixes there are no reports left to classify. It stays open against the
   Tomcat-side reports, which this page's own census collected.
 
+## What the corrupt CELLS physically contain (2026-09-07)
+
+58 distinct corrupt cells, from the config that reproduces N/N, with the raw
+words the cell screen prints:
+
+| | |
+|---|---:|
+| `raw0` low-3-bit tag == 3 (`MARK_FORWARDED`) | 28 / 58 |
+| `raw0` with the tag stripped is an address in the slot's own arena window | 38 / 58 |
+| `raw1` == 0 | 40 / 58 |
+
+A legacy `Value` cell is sixteen bytes -- discriminant word, then payload. In
+these cells **the discriminant word holds a tagged heap pointer and the payload
+is zero**, and five distinct slots share one target (`0x1b1d8710000|3`). Sample:
+
+```
+slot=0x1b1ece7bc48 raw0=0x1b1d8710003 tag=3 addr=0x1b1d8710000 raw1=0x0
+slot=0x22e19cfa0c0 raw0=0x22e19cf002b tag=3 addr=0x22e19cf0028 raw1=0x0
+```
+
+That is not random damage. It is an **EIGHT-byte quantity sitting where a
+SIXTEEN-byte cell's first word belongs**, with the second word untouched.
+
+### the holder is genuinely legacy -- the reader picked the right arm
+
+Every one of the 67 corrupt-cell holder reports is `is_compact=false`, with
+`gc_flags` of `0x0` or `0x1` (`OLD_GEN`) and never `0x4` (`COMPACT`) -- while
+132 OTHER holder reports in the same logs ARE `is_compact=true`. So compact
+objects exist, are recognised, and are not these. The 16-byte stride the walk
+used is the holder's own layout, and the report's first horn ("the holder IS
+compact and this walk chose the wrong arm") is refuted for this population.
+
+### candidate writers, in the order the evidence supports
+
+1. **An 8-byte reference write into a legacy cell.** Both
+   `write_flat_object_reference(.., compact = true)` and the array arm's
+   `std::ptr::write(slot_ptr as *mut u64, ..)` write exactly eight bytes. An
+   array walk bounded by the REGION rather than by its own holder -- which is
+   what `SharedEvac::process_object` still is -- strides 8 bytes over its
+   neighbours and would stamp word0 of each legacy cell while leaving word1
+   alone. That is the observed shape exactly.
+2. **A read misaligned by 8 into a forwarded object's mark word.** At `base+8`
+   a forwarded object reads as `target|3` followed by its first body word; a
+   zero body word would give `raw1 = 0`. This also fits, and is distinguished
+   from (1) by whether the neighbouring object's header is intact.
+
+Both are eight-byte-granularity faults, which is the one thing the data settles
+outright. Distinguishing them needs the WRITE side instrumented, not the read
+side: record `(slot, value, holder, holder_extent)` at every eight-byte
+reference write and report any whose slot lies outside its own holder's body.
+
 ## RE-TAKEN 2026-09-07: `word0` is an arena pointer on 0 of 25, not 19 of 19
 
 This page's physical claim -- "the `class_id`/`shape` dword pair IS the object's
