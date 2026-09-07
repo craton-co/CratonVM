@@ -8838,6 +8838,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
     }
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
+        // DBG (`CRATONVM_DBG_DEADRECV`): the widest of the three sites — every
+        // "what class is this" read lands here, so a victim that reaches
+        // neither of the other two is still named. `ClassId::new(0)` on a hit
+        // is what a reclaimed header already reads as.
+        if deadrecv_check(&self.shared, obj, "class_id_of_object") {
+            return ClassId::new(0);
+        }
         self.shared.mem.heap.class_id_of(obj)
     }
 
@@ -12474,20 +12481,8 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // victims instead of dying at the first. That makes the flag
         // behaviour-changing -- a 0 identity hash is otherwise impossible, see
         // the C28 note below -- which is why it is opt-in and named DBG.
-        if dbg_deadrecv() {
-            let addr = obj.as_ptr() as usize;
-            if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
-                || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
-            {
-                crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
-                    &self.shared,
-                    addr,
-                    "identity_hash_code",
-                    "java/lang/Object",
-                    0,
-                );
-                return 0;
-            }
+        if deadrecv_check(&self.shared, obj, "identity_hash_code") {
+            return 0;
         }
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
@@ -13136,6 +13131,13 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     /// element type**, and `Int(0)` only where the element type is unknowable
     /// (non-array receiver). The type lookup is on the cold `Err` arm only.
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
+        // DBG (`CRATONVM_DBG_DEADRECV`) — the second measured face of the
+        // Generational `--nojit` reclaim: 1 crash in 3 faults in
+        // `get_array_element_unboxing` rather than in `identity_hash_code`.
+        // Asked before `load_and_forward`, which dereferences.
+        if deadrecv_check(&self.shared, obj, "get_array_element") {
+            return Value::Object(None);
+        }
         let obj = self.shared.mem.heap.load_and_forward(obj);
         match self.shared.mem.heap.get_array_element_unboxing(obj, index) {
             Ok(value) => value,
@@ -19181,6 +19183,36 @@ pub(super) fn convert_element_value(
 fn dbg_deadrecv() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEADRECV").is_some())
+}
+
+/// `CRATONVM_DBG_DEADRECV`'s shared body: is `obj` an address this process has
+/// already reclaimed, asked BEFORE anything dereferences it?
+///
+/// Both lookups are keyed on the ADDRESS and read only the always-on
+/// reclamation rings, so they answer whether or not the page is still mapped —
+/// which is the whole point, because this defect's face is a fault on the read
+/// that every other consumer performs first.
+///
+/// `true` means reported; the caller returns a benign value rather than
+/// walking into the fault, so one run names MANY victims.
+pub(crate) fn deadrecv_check(shared: &SharedVm, obj: ObjectRef, site: &'static str) -> bool {
+    if !dbg_deadrecv() {
+        return false;
+    }
+    let addr = obj.as_ptr() as usize;
+    if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
+        || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
+    {
+        crate::memory::reclaim_guard::report_reclaimed_receiver_forced(
+            shared,
+            addr,
+            site,
+            "java/lang/Object",
+            0,
+        );
+        return true;
+    }
+    false
 }
 
 pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
