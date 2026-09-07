@@ -33998,7 +33998,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
 
 // LinkedBlockingQueue: add element at tail, grow array if needed
 #[cfg(feature = "synthetic-jdk")]
-fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
+fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, mut this: ObjectRef, elem: Value) {
     let size = match ctx.get_field(this, 1) {
         Value::Int(n) => n as usize,
         _ => 0,
@@ -34010,12 +34010,39 @@ fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Valu
     let cap = ctx.array_length(arr);
     if size >= cap {
         let new_cap = (cap * 2).max(16);
-        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+    // GC: the grow path ALLOCATES, and everything it then touches is a Rust
+    // local holding a pre-allocation address — the old array it copies from,
+    // the element it stores, and the receiver it publishes into. Under a
+    // moving collector those go stale; under the Generational non-moving young
+    // sweep an object nothing else roots is ZEROED in place. Root them for the
+    // duration of the grow and re-read each one at its use. See
+    // `internal/fixed-bugs/native-arg-snapshot-stale-across-java-reentry-FIXED-20260906.md`.
+        let mut scope = cratonvm_native_api::NativeHandleScope::new(ctx);
+        let this_h = scope.root(this);
+        let arr_h = scope.root(arr);
+        let elem_h = match elem {
+            Value::Object(Some(o)) => Some(scope.root(o)),
+            _ => None,
+        };
+        let new_arr = scope.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let new_h = scope.root(new_arr);
         for i in 0..size {
-            ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+            let src = scope.get(&arr_h);
+            let v = scope.get_array_element(src, i);
+            let dst = scope.get(&new_h);
+            scope.set_array_element(dst, i, v);
         }
-        ctx.set_array_element(new_arr, size, elem);
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+        let elem_now = match &elem_h {
+            Some(h) => Value::Object(Some(scope.get(h))),
+            None => elem,
+        };
+        let dst = scope.get(&new_h);
+        scope.set_array_element(dst, size, elem_now);
+        let (recv, dst) = (scope.get(&this_h), scope.get(&new_h));
+        scope.set_field(recv, 0, Value::Object(Some(dst)));
+        // Carry the refreshed receiver out: the store below runs after the
+        // scope closes, and `this` named a pre-allocation address until now.
+        this = scope.get(&this_h);
     } else {
         ctx.set_array_element(arr, size, elem);
     }

@@ -566,6 +566,57 @@ def allocating(fns, depth):
     return alloc
 
 
+# AN ALLOCATION ON A RETURNING ARM DOES NOT DOMINATE WHAT FOLLOWS.
+#
+#     let this = match args.first() {
+#         Some(Value::Object(Some(r))) => *r,
+#         _ => { let opt = try_alloc_synthetic(ctx, …)?;   <- allocates
+#                return Ok(Some(Value::Object(Some(opt)))); }   <- and LEAVES
+#     };
+#     let operator = match args.get(1) { … };                   <- "use after GC"
+#
+# The arm that allocates is the arm that returns, so on every path that reaches
+# the next statement nothing was allocated. `branchy` cannot see this: it fires
+# on `return` or a bare `=>` at the START of a statement, and this statement
+# starts with `let`.
+#
+# Four `native_stream_*` entry points, `native_inflater_input_stream_init` and
+# `native_class_get_nest_members` were all reported for exactly this shape in
+# the 2026-09-07 triage — a fifth of the direct, untagged tranche.
+#
+# CONSERVATIVE by construction: it only clears a statement when EVERY
+# GC-capable token in it sits inside a brace group that returns. A statement
+# with one allocation on a returning arm and another on a falling-through arm
+# still counts, which is the safe direction.
+RETURNING_ARM = re.compile(r"=>\s*\{[^{}]*\breturn\b[^{}]*\}|=>\s*return\b")
+
+
+def alloc_only_on_returning_arm(text, allocfns):
+    """Is every GC-capable token in `text` inside an arm that returns?
+
+    Splits the statement on match arms and asks whether the ones carrying a
+    GC-capable call all end in `return`. Text-level and deliberately crude:
+    a wrong YES is a false negative, so it answers yes only when the statement
+    has arms at all AND none of the non-returning ones is GC-capable."""
+    if "=>" not in text:
+        return False
+    # The arms that return, blanked out; if what remains is not GC-capable, the
+    # allocation lived only on paths that leave.
+    stripped = RETURNING_ARM.sub("=> {}", text)
+    if stripped == text:
+        return False
+    return not _gc_tokens(stripped, allocfns)
+
+
+def _gc_tokens(text, allocfns):
+    if ALLOC0.search(text):
+        return True
+    for c in CALLEE.findall(text):
+        if c in allocfns and c not in ("if", "while", "match", "for", "return", "Some", "Ok"):
+            return True
+    return False
+
+
 def branchy(text):
     """Does this statement sit on a path that may not reach what follows?
 
@@ -605,13 +656,32 @@ def leaves(text):
             and re.search(r"(?:return|break|continue)", t) is not None)
 
 
+# A CLOSURE DEFINITION IS NOT AN EXECUTION.
+#
+#     let empty = |ctx: &mut dyn NativeContext| {
+#         let arr = ctx.new_ref_array(ClassId::new(0), 0);   <- allocates WHEN CALLED
+#         ...
+#     };
+#
+# Binding that closure allocates nothing. `class_annotations_by_type_impl` and
+# `native_method_get_annotations_by_type` both open with one, and both were
+# reported because the very next statement reads their receiver out of `args` —
+# a use "after" a collection that had not happened.
+#
+# Only the `let NAME = |…|` form is treated this way. An immediately-invoked
+# closure is written `(|| { … })()`, which does not start with `let`, and a
+# closure PASSED to something that calls it (`catch_unwind(AssertUnwindSafe(||
+# …))`, `map(|x| …)`) is not a `let` binding either — both still count, which is
+# right, because both run before the next statement.
+CLOSURE_BIND = re.compile(r"^\s*let\s+(?:mut\s+)?[a-z_][a-z_0-9]*\s*(?::[^=]*)?=\s*(?:move\s+)?\|")
+
+
 def gc_capable(text, allocfns):
-    if ALLOC0.search(text):
-        return True
-    for c in CALLEE.findall(text):
-        if c in allocfns and c not in ("if", "while", "match", "for", "return", "Some", "Ok"):
-            return True
-    return False
+    if CLOSURE_BIND.match(text):
+        return False
+    if alloc_only_on_returning_arm(text, allocfns):
+        return False
+    return _gc_tokens(text, allocfns)
 
 
 def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
