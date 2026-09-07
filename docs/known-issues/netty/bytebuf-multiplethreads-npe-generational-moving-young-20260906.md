@@ -1180,3 +1180,103 @@ So this is justified by the direct measurement — words that named relocated
 objects now name the right ones — and not by crash elimination. The honest
 summary is that it closes a demonstrated stale-reference channel whose last
 observed *symptom* had already been closed by other means.
+## 14. An ALTERNATIVE repair, SUPERSEDED by §13 — kept for what it measured
+
+> **§13 is the fix; this is not.** It landed while this was being written and is
+> the better design: it writes the scanned words back **when the blocked peer
+> wakes**, through the `GcBlockState::fixup` chain the blocked-region protocol
+> already maintains, so it holds nobody and ships ON. What follows held peers
+> suspended across the copy instead — a bigger hammer with a deadlock surface
+> §13 does not have. Both switches here stay OPT-IN and OFF, and nothing should
+> be defaulted to them.
+>
+> It is kept because three things it measured stand on their own: WHICH peers
+> own the stale words (§14.1), that holding blocked peers across a copy did not
+> deadlock in 28 runs (§14.3), and what a conservative rewrite actually costs
+> (§14.5).
+
+§11 named the home. This is the attempt to fix it, and the result is genuinely
+three-part: the mechanism works, the feared hazard did not appear, and the
+question everyone actually cares about could not be answered in this window.
+
+### 14.1 Which peers own the stale words — settled
+
+§11 could not say which freeze path owned the stale slots, because both capture
+sites shared one marker. Split (`0xfe` take-over, `0xff` helper window):
+
+| rep | take-over stale words | helper-window stale words |
+|---:|---:|---:|
+| 1 | **0** | 684 |
+| 2 | **0** | 588 |
+| 3 | **0** | 612 |
+
+**All of them are helper-window peers.** That is why the first repair reported
+nothing: `remap_frozen_peer_stacks` walks `TakenOver`, and on these cycles no
+take-over peer is held at all. It walked an empty list — which is not the same
+as finding a clean one, and the distinction is only visible because the summary
+prints the population size.
+
+### 14.2 Why it needed a protocol change
+
+`snapshot_peer` suspends a helper-window peer, copies its context and stack
+band, and **resumes it inside the pass** — long before anything relocates. By
+the time `pointer_map` exists those threads are running, so their slots are not
+merely unrepaired but unreachable.
+
+`CRATONVM_GC_HOLD_HELPER_PEERS=1` keeps them suspended until after the copy.
+Release is wired into `retire_skip_spans_and_resume` — the paired retire — so
+all nine collection exits free the handles by construction rather than by nine
+independent memories. That pairing exists because a ninth exit forgetting the
+matching half is precisely the defect this page opened with.
+
+### 14.3 It engages, and it does not deadlock
+
+| arm | held-peer resumes | stale words rewritten |
+|---|---:|---:|
+| none | 0 | 0 |
+| `HOLD_HELPER_PEERS` | 77 | 0 |
+| `HOLD` + `REMAP_FROZEN_PEER_STACKS` | 77 | **1055** |
+
+Three arms, 14 reps each, with the diagnostics actually enabled:
+
+| arm | crashes | hangs | moving cycles | words rewritten |
+|---|---:|---:|---:|---:|
+| baseline | 0/14 | 0/14 | 733 | 0 |
+| hold-only | 0/14 | 0/14 | 717 | 0 |
+| hold+remap | 0/14 | **0/14** | 697 | **17 977** |
+
+**28 runs holding blocked-in-native peers across a full copy, and not one
+hang.** That was the primary risk: `take_over_pass` holds a peer only when its
+`Rip` is in JIT code, on the stated grounds that such a thread holds no VM
+lock, and a helper-window peer is the opposite case by construction. The hazard
+is real in principle and did not materialise in 28 runs — which is evidence, not
+a proof, and a rare lock-holder would not necessarily show up in that many.
+
+### 14.4 What is NOT shown: that it fixes anything
+
+**Baseline crashed 0/14.** With no crashes in the control there is no signal for
+the repair to remove, so this A/B says nothing whatever about efficacy. The
+repro has been erratic all evening — 1/6 and 2/4 earlier, then 0/10, 0/36, 0/42
+— and a green fix arm against a green baseline is the vacuous arm this page has
+now recorded six times.
+
+**The next step is not another arm of this A/B.** It is re-establishing a
+baseline crash rate first, and only then judging the repair against it. Every
+attempt to skip that step today produced a claim that had to be withdrawn.
+
+### 14.5 And it is still not the sound repair
+
+Unchanged from §11: a frozen peer has no precise oop map for its pc — that is
+*why* its roots are conservative. Reading such a word asserts "might be a
+pointer, keep the target alive" and over-retains at worst. Writing it asserts
+"is a pointer", and a `usize` that merely equals a relocated address — a length,
+a hash, an index — is silently corrupted instead. **17 977 rewritten words a run
+is 17 977 assertions of that kind.** Both switches are opt-in for that reason,
+and neither should be defaulted on this evidence.
+
+The sound repairs remain the two the architecture already names: refuse the
+cycle (`unrewritable_conservative_jit_roots`, today's default), or pin — which
+G1 and ZGC do and a Cheney copy structurally cannot.
+
+Windows only. Linux and the fallback return zeros with a comment saying so,
+rather than a silent no-op that would read as success.
