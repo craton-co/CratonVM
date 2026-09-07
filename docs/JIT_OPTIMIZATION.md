@@ -4262,3 +4262,54 @@ family in this same session, where failures under load turned out to be
 whole-machine contention during a `cargo test` that was also compiling. The
 recorded rate is not supported either way, and the residual should say so rather
 than carry a number nothing reproduces.
+
+### The hibernate inlining result REVERSES on a disjoint sample — there is no positive throughput result
+
+This file said, earlier today:
+
+> **This is the first positive throughput result for IR inlining on real code
+> in this document** […] 26 of 37 is not something a fair coin does.
+
+It was tested on the rest of the suite and it does not hold. Same binary (one
+`mtime`, both runs on it), same harness, same lever, disjoint classes:
+
+| sample | classes | A (inline ON) faster | median delta | median noise | z |
+|---|---:|---:|---:|---:|---:|
+| hibernate, classes 0-39 | 37 | 26 (70%) | +0.3% | 6.9% | **+2.47** |
+| hibernate, classes 40-119 | 78 | 28 (36%) | **-0.4%** | **2.7%** | **-2.49** |
+| **hibernate pooled** | **115** | **54 (47%)** | — | — | **-0.65** |
+| netty | 46 | 19 (41%) | — | — | -1.18 |
+| **every inline pair taken** | **161** | **73 (45%)** | — | — | **-1.18** |
+
+Two disjoint halves of ONE suite, each "consistent, p < 0.05", pointing in
+OPPOSITE directions, with z-scores that are near mirror images. Pooled, the
+whole thing is a coin — and so is every inlining pair ever taken here, 73 of
+161.
+
+The second sample is the better one on every axis that matters: twice the
+classes, and a median within-arm noise of 2.7% against the first's 6.9%. If
+either were to be believed it would be the one saying inlining is SLOWER. The
+honest reading is that neither is: **IR inlining has no measurable throughput
+effect on hibernate**, and the earlier claim is withdrawn.
+
+#### What went wrong, and what the harness now has to say
+
+The design was right about the thing it was built for — a per-class ABBA pairing
+does remove the drift that made a per-run comparison useless, and the noise
+floor it reports is real. The error was in the inference laid on top: a sign
+test over classes assumes the per-class deltas differ only by the lever plus
+symmetric noise. They do not. Classes carry their own systematic
+differences — how much of the run is JIT-visible at all, how much is MySQL
+round-trips — and slicing a null effect into two class subsets can hand you a
+significant count in either direction. Which is exactly what it did.
+
+So a paired count is evidence about THE CLASSES IT WAS TAKEN OVER, and a
+significant z is a reason to take a SECOND, disjoint sample — not a result.
+This is the same lesson as the census drift recorded above, one level up: there
+the trap was comparing runs across time, here it is generalising from a sample
+to the suite.
+
+`pair-ab.sh` prints the count, the z and the noise floor and it printed them
+correctly both times. The verdict line is what over-reached, and it now says so:
+SMALL BUT CONSISTENT requires a confirming disjoint sample before it means
+anything.

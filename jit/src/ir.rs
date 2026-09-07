@@ -4520,8 +4520,29 @@ fn trapped_methods() -> &'static std::sync::RwLock<rustc_hash::FxHashSet<u64>> {
 /// must not turn a diagnostic into unbounded retained memory.
 const MAX_TRAPPED_METHOD_MEMOS: usize = 8192;
 
+/// Set once any method is registered, so the common case -- a VM that has
+/// planted no site trap at all -- costs one relaxed load instead of a hash and
+/// a lock acquisition.
+///
+/// `try_resume_trapped_callee` runs on EVERY deopt resume, not only trapped
+/// ones, so the lookup it performs is on a path that has nothing to do with
+/// site traps for most workloads.
+static ANY_SITE_TRAP_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has any method in this process been registered as carrying a site trap?
+///
+/// A `false` here is authoritative: the flag is set BEFORE the set insert, and
+/// only ever goes false -> true, so a reader that sees `false` cannot be racing
+/// a registration whose method it is about to be asked about -- the registering
+/// compile has not published its artifact yet.
+pub fn any_site_trap_registered() -> bool {
+    ANY_SITE_TRAP_REGISTERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record that `hash`'s IR body carries a planted site trap.
 pub fn register_site_trap_method(hash: u64) {
+    ANY_SITE_TRAP_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut set = trapped_methods().write().unwrap();
     if set.len() < MAX_TRAPPED_METHOD_MEMOS {
         set.insert(hash);

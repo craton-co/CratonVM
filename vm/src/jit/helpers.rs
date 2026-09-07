@@ -4354,8 +4354,14 @@ unsafe fn try_resume_trapped_callee(
     // once, and let the remaining calls resume in the interpreter -- correct,
     // and self-correcting the moment that caller frame returns and re-enters
     // its recompiled self.
-    let h = cratonvm_jit::ir_method_memo_hash(key_class, key_method, key_desc);
-    let ir_site_trap = cratonvm_jit::ir::method_has_site_trap(h);
+    // Cheap negative first: this function runs on EVERY deopt resume, and a VM
+    // that never planted a site trap must not pay a hash and a lock for it.
+    let (ir_site_trap, h) = if cratonvm_jit::ir::any_site_trap_registered() {
+        let h = cratonvm_jit::ir_method_memo_hash(key_class, key_method, key_desc);
+        (cratonvm_jit::ir::method_has_site_trap(h), h)
+    } else {
+        (false, 0)
+    };
     let mut decided = true;
     if ir_site_trap {
         cratonvm_jit::ir::note_site_trap_taken();

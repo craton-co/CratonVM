@@ -307,6 +307,12 @@ awk -F'\t' 'NR>1{
              ad/10, med_s/10, wins, n
       printf "         which a fair coin does not do. Report the DIRECTION and the\n"
       printf "         paired count; the per-class magnitude is not resolved.\n"
+      printf "         NOT A RESULT YET -- confirm on a DISJOINT set of classes\n"
+      printf "         (--start past this run) before believing the direction.\n"
+      printf "         Measured 2026-09-07: hibernate classes 0-39 gave z=+2.47,\n"
+      printf "         classes 40-119 gave z=-2.49, SAME binary and lever. Pooled,\n"
+      printf "         54 of 115 -- a coin. A significant count over ONE sample of\n"
+      printf "         classes is a reason to take a SECOND sample, not a result.\n"
     } else {
       printf "VERDICT: effect %.1f%% exceeds the %.1f%% same-config noise floor.\n", ad/10, med_s/10
       printf "         Read the paired count above as the primary statistic.\n"
