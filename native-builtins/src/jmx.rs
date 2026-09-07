@@ -6361,13 +6361,21 @@ pub(crate) fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, 
         "java/lang/management/OperatingSystemMXBean",
         5,
     )?;
-    init_os_mxbean_fields(ctx, obj);
+    let mut obj = obj;
+    init_os_mxbean_fields(ctx, &mut obj);
     Ok(obj)
 }
 
 /// Populate the 5 synthetic `OperatingSystemMXBean` slots — shared by the
 /// factory path and the `<init>` native.
-fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) {
+    // GC: three `create_string` calls, each followed by a store THROUGH `obj`.
+    // The receiver is `&mut` so the caller's copy is corrected too, and every
+    // unconverted caller is a compile error — the remedy this file's gate
+    // prescribes (`WORKER-5-NOTE-10` §7.3). The audit only started reporting
+    // this once `ctx.create_string` was added to its level-0 set; it had been
+    // missing while three tokens that match nothing in the tree were present.
+    let pin = ctx.pin_native_root(*obj);
     // REAL: OS name / arch / version come from the live process, and all three
     // come from the SAME place the corresponding system property does — the
     // `os.name` / `os.arch` / `os.version` properties the VM seeds at startup
@@ -6386,26 +6394,30 @@ fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from(std::env::consts::OS));
     let name = ctx.create_string(&os_name);
-    ctx.set_field(obj, 0, Value::Object(Some(name)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 0, Value::Object(Some(name)));
     let os_arch = ctx
         .get_system_property("os.arch")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from(std::env::consts::ARCH));
     let arch = ctx.create_string(&os_arch);
-    ctx.set_field(obj, 1, Value::Object(Some(arch)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 1, Value::Object(Some(arch)));
     let os_version = ctx
         .get_system_property("os.version")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from("unknown"));
     let version = ctx.create_string(&os_version);
-    ctx.set_field(obj, 2, Value::Object(Some(version)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 2, Value::Object(Some(version)));
     // Container-aware processor count (cgroup CPU quota under container support).
     let cpus = ctx.available_processor_count();
-    ctx.set_field(obj, 3, Value::Int(cpus));
+    ctx.set_field(*obj, 3, Value::Int(cpus));
     // Slot 4 = system load average. `getSystemLoadAverage()` answers live
     // rather than from this slot, but seed it with the same real value so a
     // direct slot read is not the only place still reporting -1.0.
-    ctx.set_field(obj, 4, Value::Double(system_load_average()));
+    ctx.set_field(*obj, 4, Value::Double(system_load_average()));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
@@ -6423,7 +6435,8 @@ fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
         // below would otherwise read null / untyped default slots.
         r.register(cls, "<init>", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            init_os_mxbean_fields(ctx, this);
+            let mut this = this;
+            init_os_mxbean_fields(ctx, &mut this);
             Ok(None)
         });
 
@@ -6494,13 +6507,14 @@ fn register_operating_system_mxbean_extensions(r: &mut NativeMethodRegistry) {
 
 fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3)?;
-    init_compilation_mxbean_fields(ctx, obj);
+    let mut obj = obj;
+    init_compilation_mxbean_fields(ctx, &mut obj);
     Ok(obj)
 }
 
 /// Populate the 3 synthetic `CompilationMXBean` slots — shared by the factory
 /// path and the `<init>` native.
-fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) {
     // name = CratonVM's real JIT identity (not a fabricated foreign name).
     // REAL: slots 1 and 2 are seeded from the ONE accessor
     // `NativeContext::jit_total_compile_time_ms`, so a bean can never be built
@@ -6509,15 +6523,19 @@ fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // trusting these slots — a compile-time snapshot taken at bean construction
     // would be frozen at ~0 for the whole run — but seeding them keeps a caller
     // that reads the fields directly consistent with the getters.
+    // GC: `create_string`, then three stores through `obj`.
+    let pin = ctx.pin_native_root(*obj);
     let name = ctx.create_string("CratonVM JIT");
-    ctx.set_field(obj, 0, Value::Object(Some(name)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.unpin_native_roots(pin);
+    ctx.set_field(*obj, 0, Value::Object(Some(name)));
     let compile_ms = ctx.jit_total_compile_time_ms();
     ctx.set_field(
-        obj,
+        *obj,
         1,
         Value::Long(compile_ms.map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX))),
     );
-    ctx.set_field(obj, 2, Value::Int(i32::from(compile_ms.is_some())));
+    ctx.set_field(*obj, 2, Value::Int(i32::from(compile_ms.is_some())));
 }
 
 fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
@@ -6528,7 +6546,8 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
     // is null on an unconstructed bean.
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        init_compilation_mxbean_fields(ctx, this);
+        let mut this = this;
+        init_compilation_mxbean_fields(ctx, &mut this);
         Ok(None)
     });
 
@@ -6666,27 +6685,41 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
 fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let obj =
         try_alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4)?;
-    init_gc_mxbean_fields(ctx, obj);
+    let mut obj = obj;
+    init_gc_mxbean_fields(ctx, &mut obj);
     Ok(obj)
 }
 
 /// Populate the 4 synthetic `GarbageCollectorMXBean` slots — shared by the
 /// factory path and the `<init>` native.
-fn init_gc_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+fn init_gc_mxbean_fields(ctx: &mut dyn NativeContext, obj: &mut ObjectRef) {
+    // GC: FIVE references cross an allocation here — `obj`, the pool-name
+    // array, and the first two of the three strings that go into it, each of
+    // which is minted before the next `create_string`.
+    let pin = ctx.pin_native_root(*obj);
     let name = ctx.create_string("CratonVM GC");
-    ctx.set_field(obj, 0, Value::Object(Some(name)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 0, Value::Object(Some(name)));
     let gc_count = ctx.gc_collection_count() as i64;
-    ctx.set_field(obj, 1, Value::Long(gc_count)); // collectionCount (real)
-    ctx.set_field(obj, 2, Value::Long(0)); // collectionTime
-                                           // field 3 = memoryPoolNames (String[])
+    ctx.set_field(*obj, 1, Value::Long(gc_count)); // collectionCount (real)
+    ctx.set_field(*obj, 2, Value::Long(0)); // collectionTime
+                                            // field 3 = memoryPoolNames (String[])
     let pool_names = ctx.new_ref_array(ClassId::new(0), 3);
+    let pool_pin = ctx.pin_native_root(pool_names);
     let eden = ctx.create_string("Eden");
+    let eden_pin = ctx.pin_native_root(eden);
     let survivor = ctx.create_string("Survivor");
+    let survivor_pin = ctx.pin_native_root(survivor);
     let old_gen = ctx.create_string("Old Gen");
+    let pool_names = ctx.read_native_pin(pool_pin, pool_names);
+    let eden = ctx.read_native_pin(eden_pin, eden);
+    let survivor = ctx.read_native_pin(survivor_pin, survivor);
     ctx.set_array_element(pool_names, 0, Value::Object(Some(eden)));
     ctx.set_array_element(pool_names, 1, Value::Object(Some(survivor)));
     ctx.set_array_element(pool_names, 2, Value::Object(Some(old_gen)));
-    ctx.set_field(obj, 3, Value::Object(Some(pool_names)));
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.set_field(*obj, 3, Value::Object(Some(pool_names)));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
@@ -6698,7 +6731,8 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
     // `String[]` return from `getMemoryPoolNames()` NPEs its callers).
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        init_gc_mxbean_fields(ctx, this);
+        let mut this = this;
+        init_gc_mxbean_fields(ctx, &mut this);
         Ok(None)
     });
 

@@ -429,7 +429,57 @@ can corrupt a heap rather than grow one, and it does not even close the leak
 (2.88 -> 2.05 MB a round). It was reverted for both reasons; the diagnosis below
 is what survives.
 
-### What a SAFE version would have to establish
+### The grid-alignment discriminator is REFUTED (2026-09-07)
+
+The idea below — accept the resume when the live base sits on the grid `cursor`
+implies — does not work, and the guard test refutes it without a build:
+
+```rust
+let base = put_header(&mut buf, 2 * HEADER_SIZE, plain_object(0));
+let live = base + HEADER_SIZE;                    // exactly ONE slot in
+assert_eq!(zero_run_empty_object_resume(base, 0, 2 * HEADER_SIZE, 64, &[live]), None);
+```
+
+`(live - (base + cursor)) % HEADER_SIZE` is `HEADER_SIZE % HEADER_SIZE` = **0**.
+The guard's live base is PERFECTLY ON-GRID and the test still demands refusal,
+so the alignment test would accept precisely the case it exists to reject. The
+hypothesis is dead; do not implement it.
+
+### Why, and the discriminator that is actually available
+
+The reason is in `SWEEP_PHANTOM_INTERIOR_MARKS`'s doc, and it also refutes the
+premise the reverted change was written on:
+
+> conservative candidates can mark an object-INTERIOR word (a field address, a
+> derived pointer, a spilled register mid-object), and the late-resolution pass
+> that marks the real base cannot unmark the raw address — **so `side_sorted`
+> can carry both**.
+
+The reverted commit argued the resume target "comes from `side_sorted`, so it is
+a marked object BASE by construction". **That is false.** `side_sorted` carries
+interior marks as well as bases, so resuming at one can land the cursor
+mid-object — exactly the desync the guard prevents. The change was unsafe for a
+reason stronger than the one it was reverted for.
+
+The same doc names the set that separates them:
+
+> `unresolved_snapshot` is exactly the set of marks that may not be bases;
+> everything else came from a precise ref-slot value (a base by construction) or
+> from `resolve_candidate_bases`.
+
+So the defensible version is: resume at the live address **only when it is not
+in `unresolved_snapshot`** — a proved base, not a raw conservative candidate.
+`unresolved_snapshot` is built in the same function and is already in scope near
+the zero-run branch. It would satisfy the guard test unchanged, since that test
+supplies no proved set and its mark would stay unproved and refused.
+
+**But price it before building it.** That change buys the ~880 KB a cycle
+measured above — the unwind it prevents — and NOT the leak: an accepted
+empty-object run is still stepped over and retained, which is the other 2.05 MB
+of the 2.88. It is a correctness improvement to the unwind decision, not the fix
+this page is open for. It also needs a new parameter through ~8 call sites.
+
+### The superseded hypothesis (kept for the record)
 
 The open question is whether a live base inside the run is evidence of a desync
 or an ordinary live EMPTY object — because a field-less live object is itself
