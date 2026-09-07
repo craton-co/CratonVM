@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-390 tokens.
+391 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -653,6 +653,7 @@ export inherited from a parent shell.
 | `real-new-site-flags` | `CRATONVM_JIT_REAL_NEW_SITE_FLAGS` |
 | `deny` | `CRATONVM_JIT_DENY` |
 | `deopt-real` | `CRATONVM_DEOPT_REAL` |
+| `deopt-sink-resume` | `CRATONVM_JIT_DEOPT_SINK_RESUME` |
 | `direct-callee-calls` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` |
 | `dispatch-cache-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` |
 | `dispatch-cache-virtual-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` |
