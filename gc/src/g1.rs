@@ -10816,6 +10816,18 @@ impl G1Collector {
         let drained: Vec<(usize, u32, u32, u64)> =
             std::mem::take(&mut *PENDING_CORRUPT_HOLDERS.lock());
         for (addr, cid, slots, mark) in drained {
+            // RE-TAKE OF THIS FAMILY'S `word0_plausible_ptr` STATISTIC.
+            // The page cites that field TRUE on 19 of 19 holders as its evidence
+            // that the header's first word is a pointer. It reports TRUE for
+            // `(18<<32)|64` -- an ordinary class_id/num_slots pair -- so the
+            // statistic cannot be read as taken. This computes the SAME question
+            // the refusal screens ask, from the same arena bounds, and prints it
+            // beside the holder so the two can be compared per address instead of
+            // per run.
+            let paired = ((slots as u64) << 32) | cid as u64;
+            let arena_says = self.arena_end > self.arena_base
+                && (paired as usize) >= self.arena_base
+                && (paired as usize) < self.arena_end;
             // THE SPLIT. See `CopyWatch::lookup`: in-ledger means the source was
             // already corrupt (the checkpoints prove the copy did not change it),
             // not-in-ledger means nothing copied this object this pause.
@@ -10849,8 +10861,10 @@ impl G1Collector {
                 .unwrap_or_else(|| "r?".to_string());
             tracing::warn!(
                 "[g1] CORRUPT-CELL HOLDER GRID VERDICT: holder={addr:#x} class_id={cid} \
-                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} source={where_from} {provenance}",
+                 num_slots={slots} mark={mark:#018x} gc_flags={:#x} paired={paired:#018x} \n                 word0_arena_test={arena_says} arena=[{:#x},{:#x}) \n                 source={where_from} {provenance}",
                 (mark >> 56) & 0xF,
+                self.arena_base,
+                self.arena_end,
             );
         }
     }
