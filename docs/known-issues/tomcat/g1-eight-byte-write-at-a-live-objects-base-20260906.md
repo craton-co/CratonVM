@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **OPEN.** The producer is not identified, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
+| **Status** | **The corrupt-header family no longer reproduces on H2** as of dev's 2026-09-06 evacuation fixes: ablating the four of them together brings it back (7 arena-pointer holders and a SIGSEGV in ~400 checkpoints, against 0 in ~36 000 with them on) -- see the 2026-09-07 section. Which of the four, and whether the Tomcat-side reports were corruption or a desynced walk, are both still open. The producer was never identified directly, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
 | **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
 | **Left behind by** | `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens` (2026-09-05), whose own "What is NOT closed" section names this class. |
 
@@ -441,6 +441,56 @@ checkpoints -- before the pause, after the parallel closure, after the serial
 drain -- in runs that reported 13 and 17 corrupt holders. So the victims are
 not sound to-space copies overwritten after the copy, which is the inference
 the top of this page rests on.
+
+## CLOSED 2026-09-07: dev's four evacuation fixes close the corrupt-header family
+
+One binary, all four of dev's 2026-09-06 evacuation fixes default-ON and
+individually ablatable, interleaved ABBA on H2 `TestMVStoreTool` (-Xmx256m, G1,
+mark driver on, copy watch on):
+
+* **A** -- `PARALLEL_EVAC_RESUME_DEST=0 RETIRE_FORWARDS_LATE=0 REEVAC_GUARD=0
+  PARALLEL_EVAC_SHARED_DEST=0`
+* **B** -- default
+
+| arm | reps | copy-watch checkpoints | holders with `word0` an ARENA POINTER | crashes |
+|---|---:|---|---:|---:|
+| A (fixes off) | 3 | 151, 133, 121 | **7** | 1 SIGSEGV at 37 s |
+| B (default) | 3 | 12301, 12064, 11905 | **0** | 0 |
+
+The refused holders in A are the genuine shape, not the array false-positive
+class -- `holder=0x252662c9cf0 paired=0x000002525cd7d290`,
+`holder=0x2114fe1ac60 paired=0x000002114040ba70`, both `paired` values landing
+in that run's arena. A-2 refused the SAME `paired=0x2525cd7d290` under two
+holders at `gc_age=1` and `gc_age=2`: one corrupted object, copied by two
+successive evacuations, which is the pattern this page recorded from the start.
+
+### why the depth difference does not void this
+
+The A arm is ~100x shallower, because with the fixes off the collector dies
+fast -- normally the "control that dies early" shape that invalidates an
+arm. It does not here, because **the asymmetry runs the right way**: the arm
+with far FEWER opportunities produced ALL of the defects. Fixes off, 7 corrupted
+headers and a SIGSEGV in ~400 checkpoints; fixes on, zero in ~36 000. A control
+that dies early can only manufacture a false NEGATIVE, and the negative is in
+the arm that ran 100x longer.
+
+Corroborating, on the default arm before the ablation: four reps at 7959, 7094,
+1394 and 4749 pauses, **0 corrupt cells and 0 refusals** in every one. The
+family used to appear within a couple of minutes and a few hundred pauses.
+
+### what this does NOT say
+
+* **Not which of the four.** They were ablated together; a per-flag ablation is
+  what attributes it.
+* **Not that the workload passes.** Every default-arm rep is a TIMEOUT, not a
+  pass. Under G1 with the mark driver this class does ~7959 pauses in 30 minutes
+  and never finishes its CREATE phase; HotSpot completes the whole class in
+  about 4 minutes, and the same binary without the driver OOMs at 84 s. That is
+  a throughput defect and it is not this page's.
+* **Not that the reports were corruption rather than misparse.** That question
+  (`grid_closes_on_cursor`, added for it) never got an answer, because after the
+  fixes there are no reports left to classify. It stays open against the
+  Tomcat-side reports, which this page's own census collected.
 
 ## The next step
 
