@@ -3732,3 +3732,48 @@ and 3% floors, so a quiet box should resolve effects in the low single digits.
 
 The verdict line is the contract: if it says UNMEASURABLE, the run has produced
 a noise measurement and no throughput claim, and the honest report is the floor.
+
+#### The floor is the machine, and the 8% is not there
+
+The claim above — that the 11.6% floor is a property of the host rather than of
+the harness — is testable, so it was tested: the SAME classes, the same lever,
+run again when the box had quietened from load 11-13 to load ~4.
+
+| class | floor at load 11-13 | floor at load ~4 |
+|---|---:|---:|
+| `BootstrapTest` | 2.5% | **0.9%** |
+| `ServerBootstrapTest` | 26.9% | **1.9%** |
+| `AbstractReferenceCountedByteBufTest` | 93.0% | **2.7%** |
+| `AdaptiveBigEndianDirectByteBufTest` | 3.7% | **2.1%** |
+| `AdaptiveBigEndianHeapByteBufTest` | 11.6% | **0.9%** |
+
+The floor is the machine. On the quiet run the harness resolves to about 2%,
+and it does that on the very classes that read 27% and 93% an hour earlier.
+
+```
+A faster than B in 2 of 6 classes
+median per-class delta : -0.6%
+median within-arm noise: 2.0%   (SAME config, two runs)
+  no class had a delta larger than its own within-arm noise
+VERDICT: UNMEASURABLE
+```
+
+**And that is the substantive finding, not a shrug.** At a 2.0% floor the
+effect of IR inlining on these six netty classes is smaller than 2%, and the
+median points very slightly the OTHER way (-0.6%, inlining marginally slower).
+The original 8% is not merely unconfirmed here — it is excluded at this
+resolution on this slice. Six classes is a small slice and the honest scope is
+"these six", but the instrument was good enough to have seen 8% and did not.
+
+#### The one class that differed in the suite A/B was a timeout, confirmed
+
+The per-run three-arm comparison found exactly one class differing between
+inline-on and inline-off: `AdaptiveByteBufAllocatorGrowthTest` passed with
+inlining and HUNG without it, at the flat 180 s cap. That was read cautiously at
+the time as "a slow class near the cap, not a rescue".
+
+Run sequentially with no shard contention it takes **91.4 s with inlining and
+90.7 s without** — a 0.7% difference against a 3.0% floor. It is a ~91 s class
+that crosses a 180 s cap when four shards compete, and the lever had nothing to
+do with it. The caution was right, and this is what it looks like to close that
+kind of loose end instead of leaving it as a hedge.
