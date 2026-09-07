@@ -252,6 +252,26 @@ pub struct ValueStack {
     /// fact and no per-slot runtime tag is needed at all. Until the interpreter
     /// consumes those maps, this array stays.
     ///
+    /// # And do not reach for the packed-mask shortcut instead
+    ///
+    /// Collapsing `kinds` / `Frame::local_kinds` from `Vec<u8>` to a packed
+    /// 2-bit mask is the obvious cheaper move — three values, and the second
+    /// `Vec` costs a bounds check, a cache line and a pooled buffer per frame.
+    /// It is not a point fix, and it carries one specific hazard:
+    ///
+    /// * 43 call sites read the two arrays, plus the GC root scan, freeze/thaw,
+    ///   deopt, `snapshot_raw` / `from_snapshot`, and the transmute listed
+    ///   above. `Frame::local_kinds` deliberately **is** the pool tuple's
+    ///   `Vec<u8>` half, so removing it reshapes the frame pool.
+    /// * `max_stack` and `max_locals` are `u16`. An inline `u64`/`u128` mask
+    ///   therefore needs a spill path for the tail — and **a fixed-width
+    ///   structure that silently stops describing slots past its width is
+    ///   precisely the defect this tree has already shipped once**, when
+    ///   precise oop maps stopped at 64 locals and said nothing about it.
+    ///
+    /// Whoever takes this should build the type-map consumer first; it deletes
+    /// the array rather than shrinking it, and it has no width to overrun.
+    ///
     /// The per-frame *allocation* cost this array used to imply is separately
     /// addressed: every `Frame` constructor now sources both halves from a
     /// buffer pool (`Frame::new_pooled*` from the thread pool, `Frame::new` /

@@ -5518,6 +5518,20 @@ fn execute_frame_from_index(
     // state observed at frame entry — the next `execute_frame` invocation
     // re-reads the global gate, so newly-enabled profiling picks up on the
     // next call rather than mid-loop.
+    // CORRECTION (2026-09-07): "the next call" understates the window, for
+    // every gate hoisted here. `execute_frame_from_index` runs an ENTIRE
+    // NESTED CALL TREE in one invocation — an interpreted call pushes a frame
+    // and `continue`s this same loop — so these locals are not observed per
+    // METHOD, they are observed per OUTERMOST interpreter entry. A gate armed
+    // while a deep call tree is running is not seen until that whole tree
+    // unwinds.
+    //
+    // That is defensible for a profiler and for a diagnostic trace, which is
+    // what every gate hoisted here is. It would NOT be defensible for a
+    // debugger's field watchpoints or for `any_class_redefined`, which is
+    // exactly why `field_fast`'s per-access checks are NOT hoisted alongside
+    // these — see the retired `heap-touching-bytecodes-are-the-outlier`
+    // write-up, which asked whether they could be and answered no.
     let pgo_enabled = crate::jit::profile::is_profiling_enabled();
     // T17.Δ.3 — hoist the JVMTI single-step listener gate out of the per-bytecode
     // loop (same contract as `pgo_enabled` above). `any_single_step_listener_active()`
@@ -5957,6 +5971,24 @@ fn execute_frame_from_index(
         // or backward-branch poll before another thread requests STW. Keep the
         // hot path to one atomic load; call the full safepoint machinery only
         // while a pause is actually active.
+        //
+        // # Why this stays `Acquire`, and where that stops being free
+        //
+        // The obvious optimisation — hoist this into a `poll_pending` local
+        // set at frame entry, the way `pgo_enabled` above is hoisted — was
+        // weighed and REFUSED on x86-64: an `Acquire` load there is a plain
+        // `mov`, so there is no fence to delete. The only thing hoisting buys
+        // is that the compiler may keep the flag in a register, and the only
+        // other lever is poll FREQUENCY, which is time-to-safepoint. The
+        // failure mode of getting that wrong is a GC that waits forever for a
+        // thread that never polls — the wrong trade for roughly one L1 hit,
+        // especially now that the flag has its own cache line
+        // (`threading::gc_barrier::CacheLineFlag`) and that hit is clean.
+        //
+        // **This must be revisited on aarch64.** There `Acquire` lowers to
+        // `ldar`, a real ordering instruction, and one per bytecode is not
+        // free. Whoever brings up that port owns this line; the x86-64
+        // reasoning above does not carry over.
         if shared
             .mem
             .gc_barrier
@@ -6024,6 +6056,38 @@ fn execute_frame_from_index(
         // — see the note at its binding for what it selects and why the
         // per-class `skip_verification` case still relies on the per-site
         // checks below as a second line of defence.
+        //
+        // # The two structural proposals for this match, both REFUTED (2026-09-05)
+        //
+        // Neither is a lever, and both are cheap to re-refute if the idea comes
+        // back. Straight-line arithmetic on this path costs ~7.5 ns per
+        // bytecode against HotSpot's ~0.95 — the whole remaining floor.
+        //
+        // * **"Dispatch on the pre-decoded `QuickenedCode` stream instead."**
+        //   `--noverify` flips `use_fast_path`, and the decoded path it selects
+        //   ALREADY runs on that stream — so the two engines price directly, in
+        //   one binary, on one program. `probes/FieldBurn.java`, N = 30 M,
+        //   min-of-5, wall ms: arithmetic loop **2312 fast against 5078
+        //   decoded**. The stream is 2.2x SLOWER. The cost is
+        //   `execute_instruction`'s out-of-line call, its ~200-variant match on
+        //   a 16-byte `Instruction`, the `thread.frames[frame_idx]` re-index
+        //   per operand and the `Result` round trip; an index-threaded loop
+        //   over the same handlers inherits all of it.
+        // * **"Give the eight opcodes with no fast arm one."** The ratio above
+        //   is per BYTECODE, and a switch executes once per iteration while
+        //   doing the work of a whole comparison chain.
+        //   `probes/SwitchBurn.java`, N = 20 M: `tableswitch` measures **4.7x**
+        //   HotSpot against straight-line arithmetic's 7.9x — BETTER than the
+        //   band, on the decoded path — and beats its own `ifchain` equivalent
+        //   outright (1752 ms against 2989).
+        //
+        // The one thing never tested is the INDIRECT BRANCH itself: a single
+        // dispatch site gives the predictor one history slot for every opcode
+        // transition in every program. That needs a branch-misprediction
+        // counter, i.e. a hardware profiler. **Do not build replicated dispatch
+        // sites before that number exists** — this note is two refutations long
+        // precisely because structural proposals here have not survived contact
+        // with a probe.
         // SAFETY (every `hot_fp` deref below): see the hoist note above —
         // reads only, no push, no `&mut` reborrow of the stack in between.
         // Explicit `&` on the place expression: calling `.len()` directly on
