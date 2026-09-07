@@ -32,13 +32,25 @@
 //!   `GC_FLAG_COMPACT` in the header. `GarbageCollector::alloc_object` builds
 //!   these when the class has a layout.
 //! * a **legacy** body — one 16-byte tagged `Value` cell per field, no flag.
-//!   `ZgcRealHeap::try_alloc_object`, the TLAB path
-//!   `interpreter::alloc_object_shared` takes, builds *only* these: it sizes
-//!   the allocation `num_fields * SLOT_SIZE` and never calls
-//!   `set_compact_shape`. So on this collector essentially every object the
-//!   interpreter allocates is legacy, and a fast path that handled compact
-//!   bodies alone measured `fast-field: get hit=0 miss=1801267` on
-//!   `probes/FieldShape.java` — it never fired once.
+//!
+//! **Which one predominates changed on 2026-09-03, and the reasoning printed
+//! here did not.** The paragraph this replaces said that
+//! `ZgcRealHeap::try_alloc_object` — the TLAB path
+//! `interpreter::alloc_object_shared` takes — "builds *only*" legacy bodies,
+//! so "essentially every object the interpreter allocates is legacy", and
+//! cited `fast-field: get hit=0 miss=1801267` on `probes/FieldShape.java` as
+//! the measurement. That was true when it was written and is false now:
+//! `gc_and_alloc::compact_tlab_alloc_enabled` has been **default-ON since
+//! 2026-09-03**, so the TLAB path plans a compact body for every class that
+//! has a registered layout, and it is the COMPACT arm that serves the common
+//! case.
+//!
+//! Both arms are still needed — a class with no registered layout, and every
+//! object allocated before its layout was registered, is still legacy — so
+//! this is a correction to the *reasoning*, not to the code. It matters
+//! because that reasoning is what a reader uses to decide which arm to touch:
+//! optimising the legacy arm on the strength of "essentially every object" is
+//! now optimising the cold one.
 //!
 //! Both are handled here, chosen per site by what the receiver's header says
 //! and re-checked on every access. The compact arm reads and writes the field
