@@ -848,21 +848,15 @@ fn channel_base_for_class(ctx: &mut dyn NativeContext, class_name: &str) -> usiz
 ///     four fields, so a later `base_for_class` on the receiver would answer
 ///     4 and disagree with the 0 the allocator used. The width check
 ///     (`4 < 4 + 4`) sends it back to 0, which is the base that was used.
-fn channel_private_base(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
-    let class_id = ctx.class_id_of_object(this);
-    // Bound to a local before the match: the arm needs `ctx` mutably, and a
-    // `match ctx.class_name_of_id(..)` keeps the scrutinee's shared reborrow
-    // alive for the whole match.
-    let class_name = ctx.class_name_of_id(class_id);
-    let base = match class_name {
-        Some(name) => channel_base_for_class(ctx, &name),
-        None => 0,
-    };
-    if ctx.object_num_fields(this) >= base + PIPE_CHANNEL_PRIVATE_SLOTS {
-        base
-    } else {
-        0
-    }
+///
+/// The body was a hand-written third copy of that guard; it now forwards to
+/// `appended_slots::base_for_object`, which carries the same two arms and — the
+/// reason for the move — resolves the base from the receiver's OWN class id
+/// instead of round-tripping its name back through `ensure_class_initialized`.
+/// Every pipe-channel accessor was a `<clinit>` door because of that round
+/// trip. `&dyn` is the compile-time statement that it no longer is.
+fn channel_private_base(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    cratonvm_native_api::appended_slots::base_for_object(ctx, this, PIPE_CHANNEL_PRIVATE_SLOTS)
 }
 
 fn alloc_channel(
