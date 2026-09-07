@@ -317,8 +317,12 @@ wrapper), so **a plain-looking private field read in these crates is a GC
 point**. That is 45 rows here and an architectural fact worth knowing
 independently of this audit: it also means a cheaper `base_for_class` — one
 that resolves an already-loaded class without initializing it — would remove a
-real hazard from a large family at once. Not attempted here; it is a
-behavioural change to a load-bearing path and needs its own measurement.
+real hazard from a large family at once.
+
+> **Closed 2026-09-07: 45 rows → 4.** See
+> [The `base_for_class` root, closed](#the-base_for_class-root-closed) below.
+> The cheaper-`base_for_class` idea was only half of it — the accessor side was
+> throwing away a class id it already held.
 
 `try_alloc_concurrent_synthetic` (42), the `foreign_*_delegate` family (59
 across four spellings) and the `make_*` stream constructors (31) are all
@@ -343,6 +347,119 @@ GC-capable only through `declared_fields`. Correct drop.
 into — builds its receiver in a `_` arm that ALLOCATES and does not return, then
 reads the name argument out of the pre-call `args`. `this` was already pinned
 for a different window; the name was not. Fixed the same way.
+
+## The `base_for_class` root, closed
+
+45 rows → **4**, transitive total 381 → 342.
+
+### The objection that had to be cleared first
+
+`base_for_class`'s own doc comment recorded that a `class_id_by_name` sibling
+**had already been written and removed**, because an accessor and its allocator
+that disagree about the base is exactly the two-layouts-on-one-class condition
+`appended_slots` exists to prevent. So "just look it up by name first" was not
+an untried idea; it was a rejected one.
+
+What was wrong with the sibling is that it answered **only** from
+`class_id_by_name`, so on a miss it returned 0 where the allocator returned the
+real count. The arm added here **falls through** to `ensure_class_initialized`
+on a miss. The two can therefore differ only when the lookup answers `Some` —
+and `Some` is precisely the case where they cannot: the VM implements it as
+`find_unique_class_by_name`, which fails **closed** on a name several loaders
+define (`None`, never one of the candidates — the whole reason
+`classify_class_name` exists is that a plain `None` means *absent OR
+ambiguous*). `Some(cid)` says the name resolves to exactly one class, which is
+the one `ensure_class_initialized` would have returned. An ambiguous name takes
+the old path unchanged.
+
+The count never needed `<clinit>` to be right: `num_total_fields` is computed by
+`compute_field_layout` at DEFINE time, and `class_manager` asserts that even
+`redefine_class` leaves it alone. Skipping initialisation changes *when
+`<clinit>` runs*, not what the base is.
+
+### The bigger half was on the accessor side
+
+`base_for_object` held the receiver's class id, threw it away, read the class
+NAME back out of it, and handed that name to `base_for_class` to resolve a
+second time. That round-trip is what actually cost the `<clinit>` on ordinary
+private field reads — and on an ambiguous name it could resolve to a *different*
+class than the receiver's and index the private map off that class's field
+count.
+
+It now asks a new `base_for_class_id(&dyn NativeContext, ClassId)` with the id
+it already has. `&dyn`, not `&mut dyn`: every method it calls is `&self`, so the
+signature is a compile-time statement that no GC can run inside it, and a later
+edit reaching for `ensure_class_initialized` fails to borrow rather than
+silently reopening the door. Two hand-written copies of the same accessor —
+`pipe.rs::channel_private_base` and `synthetic_file_channel::private_base` — now
+forward to it as well.
+
+### The four survivors are correct, and were checked
+
+`native_mbb_is_loaded`, `native_mbb_load`, `native_mbb_force` and
+`native_fc_unmap0` call `base_for_class` with a CONSTANT name while holding a
+receiver, so they still name a statically GC-capable function. Converting them
+to `base_for_object` was considered and **rejected**:
+`alloc_mapped_byte_buffer`'s class-resolution-FAILED arm allocates
+`base + MBB_PRIVATE_WIDTH` against the untyped sentinel, so the substitute
+`cratonvm/synthetic/AnonymousObject$N` is a stub and a receiver-derived base
+would answer 0 where the allocator used a non-zero `base`. The per-class design
+documented at `native-io/src/lib.rs` is right for these four. The new
+already-loaded arm covers them at run time regardless — the audit simply cannot
+see through the fallback.
+
+### Not done, and why
+
+The four private `synthetic_base_offset` copies in `native-builtins/src/jca/`
+(21 rows, `ensure_class_initialized`) are the same defect and are named in
+`appended_slots`' own header as the copies that **ratchet** in synthetic-JDK
+mode — they ask `class_num_total_fields` unconditionally, with no stub arm.
+Converting them to `appended_slots::base_for_class` is the right move and would
+take the rows with it, but it changes JCA slot layout in synthetic mode and
+needs its own reproducers. Left as the next unit rather than folded in here.
+
+### Measurement
+
+The one thing this change can get wrong is answering a **different number** than
+the round-trip it replaces, so that is what was measured, not the aggregate
+output. A temporary probe computed both answers on every real call and reported
+each divergence plus a census every 512 looks — a zero with no looks is a claim
+about the probe, not about the change.
+
+`test_classes/gc/PrivateSlotFamilies.java` (new) drives all six families whose
+base moved — FileChannel, Pipe, FileStore, DirectoryStream,
+AsynchronousFileChannel, WatchService — with a background-allocation churn
+between each allocation and each read, and asserts on values READ BACK OUT of
+private slots, so a base off by one is a wrong answer rather than a crash. It
+passes on HotSpot 25.0.3 first, as a check that the assertions are true of a
+reference JVM and not merely of this one.
+
+| arm | looks | mismatches | failures |
+|---|---|---|---|
+| ZGC (default) | 4608 | 0 | 0 |
+| Generational | 4608 | 0 | 0 |
+| G1 | 4608 | 0 | 0 |
+| Generational, `CRATONVM_DISABLE_JIT=1` | 4608 | 0 | 0 |
+| Generational, 200 rounds | 9728 | 0 | 0 |
+
+**`NioChannelChurn` produced ZERO looks** — it opens through the real
+`sun/nio/ch/FileChannelImpl`, which never reaches these accessors. Had it been
+the only fixture, its clean run would have been a vacuous zero. That is why
+`PrivateSlotFamilies` exists.
+
+Controls, both 3/3 and both already green on dev: `GpuResidencyGc 0 1024 800`
+and `NioChannelChurn 300 200 4` (`ok=300 bad=0`), Generational. Unit tests:
+352 `native-api`, 4204 `native-builtins`, 528 `native-io`, including the
+source-scanning `layout_alias_coverage` gate.
+
+The new `base_for_class` test is a POSITIVE CONTROL, not just an assertion on a
+number: `MockNativeContext::ensure_class_initialized` answers `ClassId::new(0)`
+for every name — an id it never declares — so the fallback path can only return
+0 there. Deleting the `class_id_by_name` arm turns the assertion from 3 into 0,
+and that ablation was run. `class_num_total_fields` had to be added to the mock
+for this: the trait default is a flat `0`, which collapsed every layout the mock
+can model onto one answer, so no test could previously tell a base that was
+computed from a base that was never reached.
 
 ## Still noisy
 
