@@ -16,7 +16,30 @@ TWO RULES, because they see different things:
   rule 2 (parameter) a parameter `X: ObjectRef` used after a GC-capable call.
                      Rule 1 structurally cannot see this: a parameter is never
                      `let`-bound. That blind spot is why the 2026-08-25 audit
-                     needed two rules, and rule 2 found 40 of its 48.
+                     needed two rules.
+
+NOT the same rule as that audit's rule 2, and an earlier version of this file
+said it was. THAT rule was "two or more `ctx.invoke_*` on the same receiver in
+one scope with no `read_native_pin` between", which is how it found 40 of the
+48 — it keys on repeated invokes, and most of what it caught was `let`-bound
+out of `args`, not declared in a signature. This one keys on the DECLARED type,
+so the two populations overlap without either containing the other.
+
+WHAT THIS RULE STILL CANNOT SEE. `args: &[Value]` — the shape of every native
+entry point, and the one `safe_native_call_impl` rebuilds only for collections
+it runs ITSELF, before the callback. A native that re-enters Java keeps naming
+the pre-call address. `Option<ObjectRef>`, `&[ObjectRef]` and `Vec<ObjectRef>`
+parameters are not matched either; `--opt` counts them separately.
+
+WHAT A PARAMETER HIT MEANS, which is not what a local hit means.
+`safe_native_call_impl` pins every argument of a native call into
+`thread.native_pin_roots`, so an object that arrived through a native entry is
+NOT reclaimable underneath its holder — the "zeroed in place" half of the family
+does not apply to it. What does apply is RELOCATION: the pin keeps the object
+alive and the snapshot keeps the old address, and Generational young relocates
+by Cheney copy on the moving path and by selective promotion even on the
+non-moving one. A parameter whose object was allocated by the CALLER rather than
+passed in from Java has neither protection.
 
 STATEMENTS, NOT LINES. The first version of this scanned lines and reported
 correctly-converted code, because
@@ -98,6 +121,19 @@ FNDEF = re.compile(r"^\s*(?:pub(?:\([a-z ]+\))? )?(?:async )?(?:unsafe )?fn ([a-
 LET = re.compile(r"^\s*let\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*[:=]")
 CALLEE = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\s*\(")
 PARAM_REF = re.compile(r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&mut\s+)?ObjectRef\b")
+# The shapes a bare `ObjectRef` declaration misses. `--opt` scans these too.
+# They are NOT folded into the default population: they carry a reference the
+# same way, but each needs a different fix (destructure and pin the inner
+# reference, or pin every element), so counting them together would make the
+# default number mean two things at once.
+PARAM_OPT = re.compile(
+    r"\b([a-z_][a-z_0-9]*)\s*:\s*"
+    r"(?:Option\s*<\s*(?:[A-Za-z_0-9]+::)*ObjectRef\s*>"
+    r"|&\s*\[\s*(?:[A-Za-z_0-9]+::)*ObjectRef\s*\]"
+    r"|Vec\s*<\s*(?:[A-Za-z_0-9]+::)*ObjectRef\s*>"
+    r"|&\s*\[\s*Value\s*\]"
+    r"|Value)\b"
+)
 
 # A binding can only go stale if it HOLDS A REFERENCE. `epoch` binds
 # `let month = invoke_i32(ctx, obj, "getMonthValue")` — GC-capable RHS, used
@@ -160,6 +196,51 @@ Fn = collections.namedtuple("Fn", "name file line body is_test")
 Stmt = collections.namedtuple("Stmt", "line text")
 
 
+CHARLIT = re.compile(r"'(?:\\.|[^\\'])'")
+
+
+def code_only(line):
+    """Blank the CONTENTS of string and char literals; drop a trailing `//`.
+
+    A JVM type descriptor is a bracket bomb. `"([BII)V"` carries one `(`, one
+    `[` and one `)` — the `[` never closes — so a statement containing it left
+    the paren/bracket depth permanently positive and NOTHING after it in that
+    function ever closed a statement again. `bos_side_write_bulk` stopped after
+    8 statements of 54 and its second `ObjectRef` parameter simply vanished:
+    a false NEGATIVE, produced by a line that looks like nothing.
+
+    `[B`, `()[B` and `[Ljava/lang/String;` are everywhere in a native crate, so
+    this is not a corner. Blanking also stops a `//` inside a URL from eating
+    the rest of a line, and keeps `;` inside a descriptor
+    (`"()Ljava/lang/String;"`) from ending a statement early."""
+    out, i, n = [], 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == '"':
+            out.append('""')
+            i += 1
+            while i < n:
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if c == "'":
+            m = CHARLIT.match(line, i)
+            if m:
+                out.append("''")
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def strip_comments(lines):
     """CODE ONLY — the existing gate learned this the hard way: three of its
     first 21 candidates were `ctx.alloc_object` in a DOC COMMENT."""
@@ -178,7 +259,7 @@ def strip_comments(lines):
         if s.startswith("//"):
             out.append("")
             continue
-        out.append(l)
+        out.append(code_only(l))
     return out
 
 
@@ -208,6 +289,28 @@ def test_spans(lines):
     return spans
 
 
+def fn_end(lines, i):
+    """Last line of the fn starting at `i`, by brace matching.
+
+    Splitting a body at "wherever the next `fn` keyword appears" is wrong two
+    ways at once when a function DEFINES one: the outer body is truncated at the
+    nested `fn`, so everything after it is invisible to both rules (a false
+    NEGATIVE), and that tail is then attributed to the nested fn (whose
+    parameter names differ, so it usually just disappears). `net_channels` was
+    the 2026-08-25 pass's false positive #4 for the mirror-image reason. Brace
+    matching costs nothing and removes the whole class."""
+    depth, seen, n = 0, False, len(lines)
+    j = i
+    while j < n:
+        depth += lines[j].count("{") - lines[j].count("}")
+        if "{" in lines[j]:
+            seen = True
+        if seen and depth <= 0:
+            return j
+        j += 1
+    return n - 1
+
+
 def index(paths):
     fns = []
     for f in paths:
@@ -215,11 +318,36 @@ def index(paths):
         lines = strip_comments(raw)
         tspans = test_spans(lines)
         idx = [i for i, l in enumerate(lines) if FNDEF.match(l)]
-        for n, i in enumerate(idx):
-            j = idx[n + 1] if n + 1 < len(idx) else len(lines)
+        ends = {i: fn_end(lines, i) for i in idx}
+        for i in idx:
+            body = list(lines[i:ends[i] + 1])
+            # Blank out the bodies of any fns DEFINED inside this one: they are
+            # indexed in their own right, and their statements are not this
+            # function's control flow.
+            for k in idx:
+                if i < k <= ends[i]:
+                    for m in range(k - i, min(ends[k] + 1, ends[i] + 1) - i):
+                        body[m] = ""
             is_test = any(a <= i <= b for (a, b) in tspans)
-            fns.append(Fn(FNDEF.match(lines[i]).group(1), f, i + 1, lines[i:j], is_test))
+            fns.append(Fn(FNDEF.match(lines[i]).group(1), f, i + 1, body, is_test))
     return fns
+
+
+def signature(fn):
+    """The parameter list, by PAREN matching from the `fn` line.
+
+    `"\n".join(body[:12]).split("{")[0]` truncated any signature longer than
+    twelve lines — and a `where` clause or a defaulted generic put a `{` in the
+    text before the parameters ended."""
+    depth, seen, out = 0, False, []
+    for l in fn.body:
+        out.append(l)
+        depth += l.count("(") - l.count(")")
+        if "(" in l:
+            seen = True
+        if seen and depth <= 0:
+            break
+    return "\n".join(out)
 
 
 def statements(body):
@@ -245,7 +373,12 @@ def statements(body):
         # intervening GC-capable call, and the store on the next line reads as a
         # stale use. That shape alone produced several false positives.
         txt = l.rstrip()
-        starts_let = buf and buf[0].startswith("let ")
+        # `buf[0]` is "" whenever a blanked comment line opened the buffer,
+        # which made `starts_let` false and tore the very `let … match {}`
+        # statements this guard exists to keep whole. Ask the first NON-EMPTY
+        # line instead.
+        first = next((b for b in buf if b), "")
+        starts_let = first.startswith("let ")
         if depth <= 0 and (txt.endswith(";")
                            or (not starts_let and (txt.endswith("{") or txt.endswith("}")))):
             out.append(Stmt(start, " ".join(buf)))
@@ -267,6 +400,22 @@ def allocating(fns, depth):
     return alloc
 
 
+def branchy(text):
+    """Does this statement sit on a path that may not reach what follows?
+
+    The 2026-08-25 pass's false positive #3 was two `return ctx.invoke_virtual`
+    calls on MUTUALLY EXCLUSIVE paths, read as one preceding the other. A
+    `return` ends its path and a bare match arm is one alternative of several,
+    so neither dominates a later statement.
+
+    This TAGS (`param~`), it does not filter. That page also records a false
+    negative produced by a branch-exclusivity heuristic it then deleted rather
+    than improved, with the reason: a rule that dismisses confidently is worse
+    than one that is noisy. Deciding exclusivity needs the read, not the grep."""
+    t = text.strip()
+    return t.startswith("return") or (not t.startswith("let ") and "=>" in t)
+
+
 def gc_capable(text, allocfns):
     if ALLOC0.search(text):
         return True
@@ -276,26 +425,57 @@ def gc_capable(text, allocfns):
     return False
 
 
-def scan(fn, allocfns, want_params):
+def scan(fn, allocfns, want_params, want_opt=False):
     stmts = statements(fn.body)
+    # DROP THE SIGNATURE. It reassembles as one statement, and `gc_capable`
+    # reads the function's OWN NAME in it as a call — so every recursive-looking
+    # signature of an allocating function made statement 0 a GC-capable call
+    # and rule 2 then reported every `ObjectRef` parameter used anywhere in the
+    # body. The negative control caught it: `ts_publish_real_backing_map` still
+    # reported `this` AFTER the commit that pinned it.
+    if stmts and FNDEF.match(stmts[0].text):
+        stmts = stmts[1:]
     hits = []
 
     if want_params:
-        sig = "\n".join(fn.body[:12]).split("{")[0]
-        for p in PARAM_REF.findall(sig):
-            gc_at = None
+        sig = signature(fn)
+        names = [(p, "param") for p in PARAM_REF.findall(sig)]
+        if want_opt:
+            names += [(p, "wide") for p in PARAM_OPT.findall(sig)
+                      if p not in {n for (n, _) in names}]
+        for p, shape in names:
+            gc_at, gc_cond, rooted_elsewhere = None, False, False
             for k, st in enumerate(stmts):
-                if ROOT.search(st.text):
+                t = st.text
+                if ROOT.search(t):
+                    # Break ONLY when the rooting names THIS parameter. Rule 1
+                    # was corrected for exactly this and rule 2 never inherited
+                    # it: any pin anywhere cleared the whole body, so a function
+                    # that pins one reference and not another read clean. The
+                    # 2026-08-25 write-up calls a confident dismissal the
+                    # dangerous kind of wrong, and this is that kind.
+                    if re.search(r"\b" + re.escape(p) + r"\b", t):
+                        break
+                    rooted_elsewhere = True
+                # A rebinding is a FRESH value. `let p = ...`, `if let Some(p)`,
+                # `for p in ...` and a closure parameter all shadow.
+                m2 = LET.match(t)
+                if m2 and m2.group(1) == p:
+                    break
+                if REBIND(p).search(t):
                     break
                 if gc_at is None:
-                    if gc_capable(st.text, allocfns):
-                        gc_at = k
+                    if gc_capable(t, allocfns):
+                        gc_at, gc_cond = k, branchy(t)
                     continue
-                if re.search(r"\b" + re.escape(p) + r"\b", st.text):
-                    if st.text.strip().startswith("return") or "=>" in st.text:
-                        continue
+                if re.search(r"\b" + re.escape(p) + r"\b", t):
+                    kind = shape
+                    if gc_cond:
+                        kind += "~"
+                    if rooted_elsewhere:
+                        kind += "*"
                     hits.append((fn.line + stmts[gc_at].line, p,
-                                 fn.line + st.line, "param"))
+                                 fn.line + st.line, kind))
                     break
 
     for i, st in enumerate(stmts):
@@ -356,6 +536,8 @@ def main():
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--tests", action="store_true", help="include test bodies")
     ap.add_argument("--only", default=None)
+    ap.add_argument("--opt", action="store_true",
+                    help="also scan Option<ObjectRef> / &[Value] / Value parameters")
     a = ap.parse_args()
     fns = index(sorted(glob.glob(a.glob)))
     allocfns = allocating(fns, a.depth)
@@ -366,7 +548,7 @@ def main():
             continue
         if a.only and fn.name != a.only:
             continue
-        for (ln, nm, use, kind) in scan(fn, allocfns, True):
+        for (ln, nm, use, kind) in scan(fn, allocfns, True, a.opt):
             rows.append((os.path.basename(fn.file), ln, fn.name, nm, use, kind))
     per = collections.Counter(r[0] for r in rows)
     print("functions indexed: %d (test bodies skipped: %d) ; reachable-allocating: %d"
