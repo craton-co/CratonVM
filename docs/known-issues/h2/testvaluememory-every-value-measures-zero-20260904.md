@@ -366,6 +366,65 @@ That also explains the H2 test exactly: `TestValueMemory` Type 0 is
 `ValueNull.INSTANCE`, and its 125,000 entries are references, so the arena fills
 with small short-lived objects the sweep then refuses to parse.
 
+### 2026-09-07: one half fixed and MEASURED, the leak still open
+
+**Candidate (1) below is refuted.** `new Object()` DOES write a header; it is
+simply all zero. The predicate's own note says so — `MARK_NEUTRAL`,
+`ObjectKind::Object` and `ArrayElementType::Reference` all encode as `0`, "so a
+freshly built empty object is wholly zero". There is nothing missing at the
+allocator. Do not go looking for an elided header store.
+
+What was wrong is one condition inside the empty-object-run recovery that
+already exists for this shape (added 2026-08-12). It accepted 144 runs and
+refused 13, and every refusal was the same one:
+
+```
+young_sweep_zero_refusals: misaligned=0 live_inside=17 implausible_next=0
+```
+
+A refusal unwinds every reclaim decision since the last anchor, so one live
+object interleaved in the churn cost the whole cycle. `zero_run_verdict` now
+resumes AT that live base instead — it comes from `side_sorted`, so it is a
+marked object base by construction, more firmly on-grid than the `resume:
+run_end` the function already returned.
+
+Measured, same binary and probe:
+
+| | before | after |
+|---|---|---|
+| `zero_spans` (unwind-forcing) | 13 | **0** |
+| `live_inside` refusals | 17 | **0** (`live_resumes=10`) |
+| `bytes_freed` per cycle | **0** | 197 784 -> 883 624 -> 883 696 |
+| `young_free_list` | 0 | 197 784 -> 1 081 296 -> 1 178 448 |
+| growth per round | +2.88 MB | +2.05 MB |
+
+**Reclamation went from nothing to ~880 KB a cycle, and the leak is still
+open.** That is the honest reading: the unwind was real and is gone, but it was
+not the whole cause.
+
+### What is left, and the hazard in it
+
+The accepted empty-object run is **stepped over and RETAINED**, by design —
+`cursor = resume; continue;` frees nothing. The churn is ~2.88 MB a round of
+exactly that shape, so retaining it is the remaining 2.05 MB.
+
+Reclaiming those runs is the rest of the fix, and it is not a one-liner:
+
+* the span is bounded below by `cursor`, which is on-grid, and above by a marked
+  live base — no live base lies strictly between, which the predicate checks;
+* but a live object may START exactly at `cursor` and extend into the run. The
+  check is `side_sorted[j] > base + cursor`, strictly greater, so a live base AT
+  `cursor` is not "inside" — and freeing from `cursor` would free that live
+  object. A field-less live object is itself wholly zero, so this is not a
+  hypothetical shape;
+* `!vouched_live` at the call site rules out the run being inside a vouched live
+  object, which is a different guarantee from the one above.
+
+So the reclaim must start after any live base at `cursor`, and wants its own
+guard (`live_in_dead` already exists and is the right tripwire). "Over-retention
+is always safe" is why the current code retains; trading that for a free is the
+one change here that can corrupt a heap rather than grow one.
+
 ### The two candidate fixes, and which is which
 
 1. **At the allocator.** If a bare `new Object()` can reach the heap with no
