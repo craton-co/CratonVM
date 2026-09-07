@@ -101,6 +101,13 @@ That policy now lives in one function, `despeculate_trapped_method`, which both
 sinks call. Two sinks that disagreed about the same frame had also disagreed
 about what to do with the method that produced it.
 
+"Once" is `ir::claim_site_trap_decision` — a set of its own, and deliberately
+not `ir_evidence`'s refusal memo, which has a second writer (the acceptance
+gate marks a method refused whenever it discards an optimizing body). Reading
+that memo as the flag would let a gate-refused method look already-decided on
+its FIRST trap, so the eviction would never happen at all; see `81c9c9fd7`,
+which found that hole in the helper the day this extraction was made.
+
 ## The fix
 
 `vm/src/runtime/interpreter.rs` — the tier-up sink attempts the resume whenever
@@ -124,6 +131,17 @@ names:
   reason `ir_unresumable_protected_trap`'s side-effect scan is: pc order is not
   execution order;
 * a **resume bci past the method's code**.
+
+Those three are also what covers the one thing `can_deopt_resume` was really
+protecting. On the SINGLE-PASS side the flag is set honestly —
+`!deopt_points.is_empty() && !has_elided_monitor` — and the second conjunct is
+real: escape analysis may elide a `monitorenter` over a non-escaping object,
+and an elided monitor leaves no trace in the reconstructed frame. But eliding
+is a codegen decision, not a bytecode rewrite, so such a body still CONTAINS
+the monitor ops, `bytecode_holds_monitor` is true for it, and the resume is
+refused on evidence the sink can actually see. `ACC_SYNCHRONIZED` covers the
+method-level monitor the same way. What is left — `deopt_points.is_empty()` —
+describes an artifact no trap can arrive at.
 
 The refusal message now names which of those declined, instead of blaming
 `can_deopt_resume` — a flag that, on an optimizing artifact, is false whatever

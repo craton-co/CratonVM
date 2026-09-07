@@ -22366,6 +22366,24 @@ pub fn bytecode_holds_monitor(code: &[u8], code_len: usize) -> bool {
 /// ([`bytecode_holds_monitor`] — the IR frame states record none), and a resume
 /// bci past the method's code.
 ///
+/// # The one thing `can_deopt_resume` was protecting, and what now protects it
+///
+/// On the SINGLE-PASS side that flag is set honestly:
+/// `!deopt_points.is_empty() && !has_elided_monitor` (`x64/driver.rs`). The
+/// second conjunct is real: escape analysis may elide a `monitorenter` over a
+/// non-escaping object, and an elided monitor leaves NO trace in the
+/// reconstructed frame, so a resumed body would run the matching `monitorexit`
+/// against a lock nothing entered.
+///
+/// The monitor refusal above covers exactly that case, and covers it on
+/// evidence the sink can actually see. A body whose monitor was elided still
+/// CONTAINS the `monitorenter`/`monitorexit` that was elided — eliding is a
+/// codegen decision, not a bytecode rewrite — so `bytecode_holds_monitor` is
+/// true for it and the resume is refused. `ACC_SYNCHRONIZED` covers the
+/// method-level monitor the same way. What is left, `deopt_points.is_empty()`,
+/// describes an artifact no trap can arrive at; a frame stashed against one
+/// anyway is still identity- and bci-checked by `build_deopt_frame_inner`.
+///
 /// # The OFF arm
 ///
 /// Off, the sink asks `can_deopt_resume` again and aborts as before. It is a
