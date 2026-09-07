@@ -4270,7 +4270,9 @@ fn extract_revocation_config(
         Ok(Some(Value::Object(Some(it)))) => it,
         _ => return None,
     };
+    let iter_obj_pin = ctx.pin_native_root(iter_obj);
     loop {
+        let iter_obj = ctx.read_native_pin(iter_obj_pin, iter_obj);
         match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => return None,
@@ -4390,7 +4392,9 @@ fn extract_pkix_trust_anchor_ders(ctx: &mut dyn NativeContext, mfp: ObjectRef) -
         Ok(Some(Value::Object(Some(it)))) => it,
         _ => return out,
     };
+    let iter_obj_pin = ctx.pin_native_root(iter_obj);
     loop {
+        let iter_obj = ctx.read_native_pin(iter_obj_pin, iter_obj);
         match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(1))) => {}
             _ => break,
@@ -5445,7 +5449,9 @@ fn extended_tm_sni_host_name(ctx: &mut dyn NativeContext, session: ObjectRef) ->
         Ok(Some(Value::Int(n))) => n,
         _ => return None,
     };
+    let names_pin = ctx.pin_native_root(names);
     for i in 0..size {
+        let names = ctx.read_native_pin(names_pin, names);
         let Ok(Some(Value::Object(Some(sn)))) =
             ctx.invoke_virtual(names, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])
         else {
