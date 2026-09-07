@@ -1422,9 +1422,13 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut found = 0usize;
-        for reg in &slot.regs {
+        let pair_tid = slot.tid.load(Ordering::Acquire);
+        for (ri, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if let Some(o) = is_obj(v) {
+                // LINUX arm of `CRATONVM_DBG_PEER_REG_PAIRING` (§11 built the
+                // Windows one). Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, ri as u8, v);
                 roots.push(o);
                 found += 1;
             }
@@ -1441,6 +1445,7 @@ mod imp {
         while p + 8 <= end {
             let w = unsafe { (p as *const usize).read_unaligned() };
             if let Some(o) = is_obj(w) {
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
                 roots.push(o);
                 found += 1;
             }
@@ -1479,12 +1484,15 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut has_jit = false;
-        for reg in &slot.regs {
+        let pair_tid_hw = slot.tid.load(Ordering::Acquire);
+        for (ri_hw, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                 has_jit = true;
             }
             if let Some(o) = is_obj(v) {
+                // Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, ri_hw as u8, v);
                 candidates.push(o);
             }
         }
@@ -1503,6 +1511,7 @@ mod imp {
                 has_jit = true;
             }
             if let Some(o) = is_obj(w) {
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
                 candidates.push(o);
             }
             p += 8;

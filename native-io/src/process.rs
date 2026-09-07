@@ -1256,6 +1256,9 @@ fn enum_ordinal(ctx: &mut dyn NativeContext, enum_obj: ObjectRef) -> Option<i32>
 }
 
 fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -> StdioRedirect {
+    // GC: `type()` runs Java, and every branch below reads `redirect_obj`
+    // again — `file()`, and for WRITE/APPEND `append()` as well.
+    let pin = ctx.pin_native_root(redirect_obj);
     let type_obj = match ctx.invoke_virtual(
         redirect_obj,
         "type",
@@ -1263,10 +1266,14 @@ fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -
         &[],
     ) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return StdioRedirect::Pipe,
+        _ => {
+            ctx.unpin_native_roots(pin);
+            return StdioRedirect::Pipe;
+        }
     };
     let ordinal = enum_ordinal(ctx, type_obj).unwrap_or(0);
-    match ordinal {
+    let redirect_obj = ctx.read_native_pin(pin, redirect_obj);
+    let out = match ordinal {
         // Redirect.Type.PIPE
         0 => StdioRedirect::Pipe,
         // Redirect.Type.INHERIT
@@ -1282,11 +1289,14 @@ fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -
         // JDK's null file, so this path also handles Redirect.DISCARD.
         3 | 4 => match ctx.invoke_virtual(redirect_obj, "file", "()Ljava/io/File;", &[]) {
             Ok(Some(Value::Object(Some(file)))) => {
+                // `file` must survive `append()`, which runs Java too.
+                let file_pin = ctx.pin_native_root(file);
                 let append = ordinal == 4
                     || matches!(
                         ctx.invoke_virtual(redirect_obj, "append", "()Z", &[]),
                         Ok(Some(Value::Int(v))) if v != 0
                     );
+                let file = ctx.read_native_pin(file_pin, file);
                 file_path_of(ctx, file)
                     .map(|path| StdioRedirect::WriteFile { path, append })
                     .unwrap_or(StdioRedirect::Null)
@@ -1294,7 +1304,9 @@ fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -
             _ => StdioRedirect::Null,
         },
         _ => StdioRedirect::Pipe,
-    }
+    };
+    ctx.unpin_native_roots(pin);
+    out
 }
 
 fn read_process_redirects(ctx: &mut dyn NativeContext, builder: ObjectRef) -> ProcessRedirects {
