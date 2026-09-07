@@ -252,9 +252,11 @@ REF_RHS = re.compile(
 # "read", "([BII)I", &[Value::Object(Some(buf)), ..]) { Ok(Some(Value::Int(n)))
 # => n, .. }` binds an `i32` and mentions `Value::Object` in the same breath.
 SCALAR_BIND = re.compile(
-    r"(?:Ok\s*\(\s*)?Some\s*\(\s*"
-    r"Value::(?:Int|Long|Float|Double|Char|Short|Byte|Boolean)\s*\([a-z_][a-z_0-9]*\)"
-    r"\s*\)\s*\)?\s*(?:if[^=]*)?=>"
+    # `Value::Int(v) => ..`, `Some(Value::Int(v)) => ..`,
+    # `Ok(Some(Value::Int(v))) if v >= 0 => ..` — the arm may carry a GUARD, and
+    # a guard contains `=` (`v >= 0`), so the span to `=>` cannot be `[^=]*`.
+    r"Value::(?:Int|Long|Float|Double|Char|Short|Byte|Boolean)"
+    r"\s*\(\s*[a-z_][a-z_0-9]*\s*\)[^;{}]{0,80}?=>"
     r"|\.map\s*\(\s*\|_\|\s*\(\s*\)\s*\)"
 )
 REF_BIND = re.compile(r"(?:Ok\s*\(\s*)?Some\s*\(\s*Value::Object")
@@ -577,7 +579,30 @@ def branchy(text):
     than improved, with the reason: a rule that dismisses confidently is worse
     than one that is noisy. Deciding exclusivity needs the read, not the grep."""
     t = text.strip()
-    return t.startswith("return") or (not t.startswith("let ") and "=>" in t)
+    if t.startswith("return"):
+        return True
+    # `let Some(id) = reg_id else { return Err(closed_channel_exception(ctx)); };`
+    # — the ONLY allocation is inside a block that leaves. Ten rows in
+    # `socket_channel.rs` latched onto one of these and reported a window that
+    # cannot exist, hiding whichever later call is the real one.
+    if t.startswith("let ") and " else " in t and re.search(r"(?:return|break|continue)", t):
+        return True
+    return not t.startswith("let ") and "=>" in t
+
+
+def leaves(text):
+    """Every GC-capable call in this statement is on a path that LEAVES.
+
+    Only the two forms that can be decided from the statement alone: a bare
+    `return ...`, and a `let PAT = x else { ...return/break/continue... };`.
+    A `match` arm is NOT included — the sibling arms fall through, and guessing
+    exclusivity is the heuristic the 2026-08-25 write-up deleted rather than
+    improved."""
+    t = text.strip()
+    if t.startswith("return"):
+        return True
+    return (t.startswith("let ") and " else " in t
+            and re.search(r"(?:return|break|continue)", t) is not None)
 
 
 def gc_capable(text, allocfns):
@@ -629,7 +654,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
                 if REBIND(p).search(t):
                     break
                 if gc_at is None:
-                    if gc_capable(t, allocfns):
+                    if gc_capable(t, allocfns) and not leaves(t):
                         gc_at, gc_cond = k, branchy(t)
                     continue
                 if names(p, t):
@@ -699,7 +724,11 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
             if REBIND(name).search(t):
                 break
             if gc_at is None:
-                if gc_capable(t, allocfns):
+                # A GC on a path that LEAVES does not precede what follows it,
+                # so keep looking rather than latching. This is not a
+                # branch-exclusivity guess: the statements below are reached
+                # only when that branch did not run.
+                if gc_capable(t, allocfns) and not leaves(t):
                     gc_at, gc_cond = k, branchy(t)
                 continue
             if names(name, t):
