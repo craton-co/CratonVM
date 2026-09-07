@@ -5,7 +5,7 @@
 | **Population** | 530 `wide` candidates across `native-builtins`, `native-collections`, `native-io`, `native-api` |
 | **Read** | the 46 that are DIRECT + UNTAGGED — a real allocator or Java re-entry, not a transitive guess, not on a branch the audit already doubts |
 | **Fixed here** | 10 functions — 2 in the first pass, 8 in the re-read |
-| **Tool** | two false-positive CLASSES removed, and four non-allocating tokens taken out of `ALLOC0` |
+| **Tool** | three false-positive CLASSES removed (closure definitions, returning match arms, returning `if` blocks) and four non-allocating tokens taken out of `ALLOC0` |
 | **Not done** | the 484 transitive/branch-tagged rows, and 14 core rows left unread |
 
 ## Why 46 and not 530
@@ -176,9 +176,77 @@ audit's own header predicts: a `wide` row is an argument, and
 the family cannot apply to it. Only RELOCATION can, which is a narrower hazard
 and needs a moving young collection at one instant.
 
-## Still noisy, and worth a rule
+## The `if`-level returning branch, closed 2026-09-07
 
-Four `native_stream_*` rows are the returning-arm class and survive it, because
-the arm's own text contains braces the blanking regex will not cross. A
-brace-matching arm splitter would clear them; a regex will not. That is the
-next precision improvement, and it is worth roughly a tenth of this core.
+The two precision rules above handle a returning MATCH ARM by blanking it
+inside one statement. The `if` form cannot be reached that way, because
+`statements()` has already torn the block apart: the allocation and the
+`return` are separate statements, with the `if` header a third.
+
+    if let Value::Object(Some(out)) = ctx.get_field_by_name(this, "out") {
+        let flushed = ctx.invoke_virtual(out, "flush", "()V", &[]);   <- allocates
+        return Ok(None);                                              <- and LEAVES
+    }
+    if let Some(fd) = stream_fd(ctx, args) { … }                      <- "use after GC"
+
+`dominates` recovers the nesting from brace depth and asks whether a block
+CONTAINING the allocation closes before the use and ends in an unconditional
+exit. Three things had to be right, and each was wrong first:
+
+* **Depth at a statement's END, not its start.** A bare `}` still starts at the
+  inner depth, so a walk looking for "the depth came back down" never saw a
+  block close and concluded the use was inside it.
+* **Only the blocks that CONTAIN the allocation.** The first version scanned
+  everything between the two statements and swept in SIBLING blocks —
+  `native_printstream_flush` allocates in a block that returns, but two later
+  siblings do not, and their last statement is what the scan read.
+* **Depth alone cannot compare siblings.** `native_class_for_name`'s allocation
+  and its use are BOTH at depth 2, in two different blocks, one of which
+  returns. A `dk <= dj` shortcut answered "reaches" for a path that does not
+  exist.
+
+A fourth thing was wrong in the plumbing rather than the rule: switching from
+"latch the first GC-capable statement" to "pick the first candidate that
+dominates" initially skipped any statement that both ALLOCATES and USES, which
+dropped `stream_writeln` from the positive control. A use is now checked before
+the statement is recorded as a candidate, so it is matched only against
+candidates strictly before it — which is also what this file's "STATEMENTS, NOT
+LINES" rule requires.
+
+### It proves itself, both ways, every run
+
+`dominates` DISMISSES, and this file's history says twice that a confident
+dismissal is the dangerous kind. `assert_dominance_both_ways()` runs on every
+invocation over four synthetic bodies — a block that returns, the same block
+without the return, two sibling blocks, and a straight line — and aborts naming
+the case. Forcing the function to always dismiss trips `if-falls-through`;
+forcing it never to dismiss trips `if-returns`. A self-test that only
+demonstrated the dismissal would pass while dismissing everything.
+
+### Effect
+
+| tranche | before | after |
+|---|---|---|
+| `native-builtins/src` | base 560, opt 754 | base 548, opt 719 |
+| `native-builtins/src/phases_late` | base 74, opt 88 | base 73, opt 84 |
+| `native-io/src` | base 4, opt 53 | base 4, opt 50 |
+| `native-collections/src` | base 93, opt 243 | base 83, opt 228 |
+| `native-api/src` | base 7, opt 10 | base 7, opt 10 |
+
+The base tranche moves too — 24 rows — and those belong to another lane's
+population, so they were spot-checked rather than assumed.
+`native_arrays_to_string` and `native_stpe_schedule` both bind out of `args` in
+a `match` whose other arms `create_string` and return; the allocation cannot
+precede the use on any path that reaches it. Both drops are correct.
+
+Both calibration controls still hold, and the eight functions fixed on
+2026-09-07 remain unreported.
+
+## Still noisy
+
+The four `native_stream_*` rows this page listed as surviving the returning-arm
+rule are cleared by the `if`-level rule above, which reaches them through brace
+depth rather than through the arm's text. What remains noisy is the TRANSITIVE
+tranche — a callee reachable to an allocator within `--depth`, where deciding
+the row means reading the callee. That is 443 of the original 547 and no rule
+will thin it; it is a reading job.
