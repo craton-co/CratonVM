@@ -378,6 +378,80 @@ else
   DEGRADED_FIXTURES="$DEGRADED_FIXTURES agent-class"
 fi
 
+# The MSVC fallback for the JNI fixture, and why it is not optional.
+#
+# `cc -shared -fPIC` is a GCC/Clang spelling. A Windows host (and a
+# `windows-latest` runner with no MinGW on PATH) has no `cc` at all, so the
+# branch below took the `jni-lib-no-cc` degradation and the whole `jni` section
+# reported `lib=absent` in ALL THREE arms -- the self-disabling shape this
+# script's own header rejects in so many words. It is worse here than that
+# header says, because this script is the ONLY scheduled consumer of the probe
+# corpus: with no compiler the JNI boundary on Windows was covered by nothing
+# anywhere, in either mode, and the run still said PASS.
+#
+# MSVC is present on every Windows host that can build this repo at all --
+# rustc's `x86_64-pc-windows-msvc` target links with it -- so this adds no
+# prerequisite, it spells one that was already required. `cl` is deliberately
+# not on PATH; `vcvars64.bat` is what puts it there, and `vswhere.exe` (a fixed,
+# versionless path shipped by every VS installer since 2017) is what finds
+# `vcvars64.bat` without hard-coding an edition or a version number.
+#
+# Writes $JNI_LIB and returns 0 on success. On any failure it explains itself
+# into the same jni-build.log and returns 1, so the caller falls through to the
+# SAME declared-degradation path as before -- this can turn a refusal into a
+# pass, never a pass into a refusal.
+build_jni_with_msvc() {
+  bjm_vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  if [ ! -x "$bjm_vswhere" ]; then
+    echo "no MSVC: $bjm_vswhere is not present, so cl cannot be located" \
+        > "$OUT/logs/jni-build.log" 2>&1
+    return 1
+  fi
+  bjm_root="$("$bjm_vswhere" -latest -products '*' \
+      -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+      -property installationPath 2>/dev/null | tr -d '\r' | head -n 1)"
+  if [ -z "$bjm_root" ]; then
+    echo "no MSVC: vswhere found no installation carrying the x64 C++ tools" \
+        > "$OUT/logs/jni-build.log" 2>&1
+    return 1
+  fi
+  bjm_vcvars="$bjm_root/VC/Auxiliary/Build/vcvars64.bat"
+  if [ ! -f "$bjm_vcvars" ]; then
+    echo "no MSVC: $bjm_vcvars is missing from the installation vswhere named" \
+        > "$OUT/logs/jni-build.log" 2>&1
+    return 1
+  fi
+  bjm_bat="$OUT/build-jni-msvc.bat"
+  # `cl` needs INCLUDE / LIB / PATH from vcvars64, and those survive only within
+  # one cmd.exe invocation -- hence a generated batch file rather than a direct
+  # call.
+  #
+  # The batch `cd`s into $OUT and names the DLL relatively instead of passing
+  # `/Fo:"<dir>\"`. That spelling looks right and is not: a backslash
+  # immediately before a closing quote escapes the quote, so cl received one
+  # merged argument and answered `D8003: missing source filename` -- a compiler
+  # error that reads like a broken source file rather than a quoting bug.
+  # Compiling in the output directory also puts the .obj there, which is what
+  # the explicit /Fo was for.
+  {
+    printf '@echo off\r\n'
+    printf 'call "%s" >nul\r\n' "$(cygpath -w "$bjm_vcvars")"
+    printf 'if errorlevel 1 exit /b 1\r\n'
+    printf 'cd /d "%s"\r\n' "$(cygpath -w "$OUT")"
+    printf 'if errorlevel 1 exit /b 1\r\n'
+    printf 'cl /nologo /LD /O1 /I "%s\\include" /I "%s\\include\\win32" /Fe:"%s" "%s"\r\n' \
+        "$(cygpath -w "$JAVA_HOME")" "$(cygpath -w "$JAVA_HOME")" \
+        "$(basename "$JNI_LIB")" "$(cygpath -w "$JNI_SRC")"
+  } > "$bjm_bat"
+  rm -f "$JNI_LIB"
+  if cmd //c "$(cygpath -w "$bjm_bat")" > "$OUT/logs/jni-build.log" 2>&1 \
+      && [ -f "$JNI_LIB" ]; then
+    return 0
+  fi
+  echo "WARNING: the MSVC JNI fixture build failed (see $OUT/logs/jni-build.log)."
+  return 1
+}
+
 # --------------------------------------------------------- fixture: the JNI lib
 
 # Built here rather than committed, because a shared object is a per-platform,
@@ -403,6 +477,9 @@ if [ -f "$JNI_SRC" ]; then
       echo "         The jni section will report lib=absent in EVERY arm."
       DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib"
     fi
+  elif [ "$JNI_OS" = win32 ] && build_jni_with_msvc; then
+    JNI_ARG="-Dcraton.probe.jnilib=$JNI_LIB"
+    echo "jni lib: $JNI_LIB (MSVC)"
   else
     echo "WARNING: no C compiler ($CC); the jni section reports lib=absent in every arm."
     DEGRADED_FIXTURES="$DEGRADED_FIXTURES jni-lib-no-cc"

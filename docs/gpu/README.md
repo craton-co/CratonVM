@@ -679,8 +679,8 @@ vm-cli/
 cratonvm-embed/
   Cargo.toml                         Mirrors vm-cli's gpu / gpu-driver features for embedders
 
-craton-gpu/                          Build-time only: packages @GpuKernel/@Parallel annotation
-                                      sources from an external craton-gpu-java checkout.
+craton-gpu4j/                        Build-time only: packages @GpuKernel/@Parallel annotation
+                                      sources from an external gpu4j checkout.
 
 test_classes/gpu/
   README.md                          The "no synthetic stubs" rule

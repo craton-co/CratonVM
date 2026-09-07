@@ -908,3 +908,190 @@ the count is just some running thread. The per-state breakdown is what separates
 "a peer is uninterruptibly in compiled code" from "somebody is running", and
 `relocation_blockers()` on its own should not be used as the obligation oracle
 its doc describes.
+
+## 11. The pairing §10.11 asked for: it is the SPILL SLOTS, not the registers
+
+§10.11 left this explicitly open — *"no per-cycle pairing between a
+`CompiledUninterruptible` peer and the fault has been taken … the next
+measurement is that pairing: record the peer's register file at the park, and
+after the collection check whether any of its words is a `pointer_map` key."*
+Taken, on Windows, with §10.4's repro.
+
+**`CRATONVM_DBG_PEER_REG_PAIRING=1`** (added here) captures a frozen peer's
+words while it is suspended — both freeze paths, `scan_context` for the
+take-over and the helper-window band — and `gen_heap` intersects them with
+`pointer_map` after the Cheney copy. `pointer_map` is exactly the set of
+from-space addresses the cycle relocated, so an intersection is a thread that
+resumes holding a vacated address.
+
+### 11.1 §10.4 reproduces on Windows
+
+Six reps, `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`, plain
+`-XX:+UseGenerationalGC --Xmx 1g`: **1 hard crash, 202 relocating cycles over 5
+reported reps (~40 a run).** The face is the same as their Linux SIGSEGV:
+
+```
+EXCEPTION_ACCESS_VIOLATION (0xC0000005) at pc=0x0000027D36440F01
+Faulting access: read at address 0x0000027CEC5286AF     <- unaligned
+thread: "pool-1-thread-1"                               <- a PEER
+gc young-gen actual: 27 moving cycle(s), 21 diverted
+jit: guarded compiled frames live process-wide: YES
+```
+
+The pc is outside the exe module: compiled code on a worker thread reading a
+malformed address. **This also finally settles §0.3** — engagement is
+controllable, by a flag, exactly as §10.1 found by reading the collector.
+
+### 11.2 The registers are CLEAN
+
+First cut captured the GPR block only — every word, before any root filter,
+since pre-filtering with the predicate the collector already trusts would beg
+the question:
+
+| reps | relocating cycles | captured register words | **stale** |
+|---:|---:|---:|---:|
+| 3 (one crashed) | ~176 | 32–80 per cycle | **0** |
+
+**Zero, on runs including one that crashed with the instrument armed.** That
+refutes the half of the `CompiledUninterruptible` contract everyone would have
+bet on — it is the half §10.11's 84 % association pointed at, and the half the
+register scan was originally written for ("the truncated-r10 SIGSEGV
+signature").
+
+### 11.3 The SPILL SLOTS are where the stale references are
+
+The state's comment names two things: *"registers **and JIT spill slots** are
+not rewritable"*. Spill slots are on the peer's stack, which the same freeze
+path already copies for its conservative scan. Capturing those too:
+
+| rep | relocating cycles | captured | **stale words** | crashed |
+|---:|---:|---:|---:|---|
+| 1 | 58 | 2194 | **684** | no |
+| 2 | — | 3243 | **276** | **YES** |
+| 3 | — | 2314 | **84** | **YES** |
+| 4 | 52 | 4243 | **600** | no |
+
+**Every hit is on the stack side; none on the register side.** A representative
+line, from a rep that crashed:
+
+```
+[peer-reg-stale] os_tid=6648 reg=r255 holds 0x20169a19940 -> RELOCATED to
+                 0x20151ae0000 (java/util/concurrent/FutureTask)
+                 -- this thread resumes with a vacated address
+```
+
+(`r255` is the marker for the stack side; registers are r0–r15.)
+
+So the chain is closed end to end, and every link is measured rather than
+inferred:
+
+1. the cycle relocates a live `FutureTask` from `0x20169a19940` to
+   `0x20151ae0000` and records the move in `pointer_map`;
+2. a peer thread is frozen in `CompiledUninterruptible`, and its **JIT spill
+   slot still holds the old address**;
+3. **nothing rewrites it** — a spill slot is not heap (§6's verifier reads ~0
+   missed heap rewrites on exactly these cycles), not frame-band memory
+   (§10.8 rewrote the whole unverifiable tail to no effect), and no pass in
+   this collector walks a frozen peer's stack to update it;
+4. the peer resumes and eventually dereferences it →
+   `EXCEPTION_ACCESS_VIOLATION` at a JIT pc, reading an unaligned address.
+
+### 11.4 What is NOT claimed
+
+**Hundreds of stale words per run, and only some runs crash.** A stale spill
+slot is necessary but not sufficient: the peer must go on to actually
+dereference that particular slot. So this demonstrates the mechanism, and does
+NOT claim that any specific one of the 684 caused any specific fault — the
+per-word link to the faulting address is a further measurement.
+
+The stack capture is gated on the collector's own `is_obj` while the register
+capture was not. That is defensible for this question — a `pointer_map` key is
+by construction an object the collector considered live, so `is_obj` accepts it
+— but it means the stack figures are "words the collector would treat as
+objects", not every word.
+
+### 11.5 What this says about the fix
+
+§10.1's `unrewritable_conservative_jit_roots` divert is the current default and
+refuses exactly this population, which is why the tip is green. The measurement
+above says that refusal is not conservatism — **the cycles it declines really do
+leave vacated addresses in resumed peers' spill slots.** Any work to restore
+moving-young engagement has to rewrite those slots (or pin, as G1 and ZGC do and
+Cheney structurally cannot), not merely re-prove the frames.
+## 12. Independent LINUX replication of §11, with the control §11 does not have
+
+§11 took the pairing on **Windows** and concluded it is the spill slots, not the
+registers. This is the same question asked independently on **Azure Linux**,
+with a different capture path and a different reporting site, before §11 was
+visible on `dev`. It agrees on every point, and it adds the negative control.
+
+The instrument is now ONE flag with two arms:
+`CRATONVM_DBG_PEER_REG_PAIRING` feeds `gc_quiescence::record_peer_reg` from the
+Windows `imp` (§11) **and**, as of this section, from the Linux `imp`'s
+`scan_slot_with_regions` and `classify_slot_helper_window` — register words with
+their index, stack words as `0xff`, exactly §11's convention. The duplicate
+buffer, flag registration and report this session had built alongside it were
+dropped in favour of §11's, which pairs inside `gen_heap` and names the
+relocated object's class.
+
+### 12.1 The result, `UniqueIpFilterTest`, 8 reps, `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`
+
+| rep | relocating cycles | cycles with stale peer words | stale words |
+|---:|---:|---:|---:|
+| 1 | 53 | **53** | 1003 |
+| 2 | 58 | **58** | 1173 |
+| 3 | 58 | **58** | 1106 |
+| 4 | 51 | **51** | 2604 |
+| 5 | 56 | **56** | 1133 |
+| 6 | 58 | **58** | 1102 |
+| 7 | 59 | **60** | 1124 |
+| 8 | 58 | **58** | 1102 |
+
+**Essentially every relocating cycle leaves stale words in a peer's stack**,
+19–91 per cycle, e.g.
+`tid:4085684 0x782e10739208 -> 0x782df8809948`.
+
+### 12.2 The control §11 does not report
+
+| arm | relocating cycles | peer stack words scanned | stale |
+|---|---:|---:|---:|
+| divert at its shipped default | 0 | 45347 / 42829 / 45336 / 36793 | **0 / 2 / 0 / 0** |
+| `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` | 51–59 | ~50000 | **1003–2604** |
+
+The **same ~40–50k peer stack words are scanned either way**. The stale count is
+zero when nothing relocates and ~1100 when it does. That rules out the reading
+in which the instrument is merely counting words that resemble moved addresses:
+the population is identical and only relocation changes.
+
+### 12.3 Where Linux differs from §11, and it matters for the fix
+
+§11 attributes the capture to a **frozen** peer (`CompiledUninterruptible`,
+taken over at the OS level). On Linux that is not what happens on this workload:
+
+```
+[GC] xt_peer_scan: taken_over=0 xt_roots=0 helper_windows=46 hw_pinned=45 hw_refused=1
+```
+
+**`taken_over=0`** — no thread is ever forcibly frozen here, so
+`stw_take_over_and_wait`'s "frozen peers keep the sweep non-moving" never
+engages. The 46 windows a run are **blocked** peers, and `hw_pinned=45` of them
+are *pinned* — on the collector whose `honours_conservative_pins()` is `false`
+(§10.1). Same defect, reached through the helper-window path rather than the
+takeover path, and the same reason it is unprotected: **the pin is a no-op on a
+Cheney copy.**
+
+The register arm agrees with §11.2 from the other direction: peer registers held
+**0** heap words across ~3200 reads (~190 slots x 17 GPRs) — because a blocked
+peer sits in a native call with C values in its registers and its Java
+references on its stack. §11.2's "zero, on runs including one that crashed" and
+this zero have different causes and the same consequence.
+
+### 12.4 A vacuous first cut, recorded so it is not repeated
+
+The first Linux pairing reported `captured=0` and was **not** read as a negative
+result: with no denominator it cannot distinguish "no peer was scanned" from "a
+peer was scanned through the register loop I did not patch" — there are two, and
+I had patched one. Adding `slots_scanned` and `stack_words` made the zero
+attributable, and the answer then changed sign. A zero from an instrument that
+cannot say what it inspected is not evidence, which is the same lesson §10.9
+records one level up.

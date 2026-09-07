@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-532 tokens.
+533 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -217,6 +217,7 @@ export inherited from a parent shell.
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
 | `oop-oracle-force-refute` | `CRATONVM_DBG_OOP_ORACLE_FORCE_REFUTE` |
 | `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `peer-reg-pairing` | `CRATONVM_DBG_PEER_REG_PAIRING` |
 | `static-slot-verify` | `CRATONVM_DBG_STATIC_SLOT_VERIFY` |
 | `gc-trigger-verify` | `CRATONVM_DBG_GC_TRIGGER_VERIFY` |
 | `markclear` | `CRATONVM_DBG_MARKCLEAR` |
@@ -1167,10 +1168,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-29 tokens.
+30 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `props-unrooted-receivers` | `CRATONVM_PROPS_UNROOTED_RECEIVERS` |
 | `bytebuffer-intrinsic` | `CRATONVM_BYTEBUFFER_INTRINSIC` |
 | `itr-bytecode` | `CRATONVM_ITR_BYTECODE` |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |

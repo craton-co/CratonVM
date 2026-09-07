@@ -562,7 +562,12 @@ mod imp {
 
     /// Conservatively scan a frozen peer's integer registers and used stack,
     /// pushing every value that resolves to a live object onto `roots`.
-    unsafe fn scan_context<F>(ctx: &[u8; CTX_SIZE], is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    unsafe fn scan_context<F>(
+        ctx: &[u8; CTX_SIZE],
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        os_tid: u32,
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -572,6 +577,15 @@ mod imp {
         let mut off = OFF_GPR_LO;
         while off <= OFF_GPR_HI {
             let v = *(ctx.as_ptr().add(off) as *const u64) as usize;
+            // Pairing capture: EVERY word, before any root filter. These
+            // registers are not heap and not frame-band memory, and a Cheney
+            // copy never rewrites them, so if one names an object this cycle
+            // relocates, the peer resumes holding a vacated address.
+            cratonvm_gc::gc_quiescence::record_peer_reg(
+                os_tid,
+                ((off - OFF_GPR_LO) / 8) as u8,
+                v,
+            );
             if let Some(o) = is_obj(v) {
                 roots.push(o);
                 found += 1;
@@ -590,6 +604,14 @@ mod imp {
             // and the peer is frozen, so the words are stable for this read.
             let w = *(p as *const usize);
             if let Some(o) = is_obj(w) {
+                // Pairing capture, STACK side -- the JIT spill slots the
+                // `CompiledUninterruptible` comment names alongside registers.
+                // Gated on `is_obj` rather than taking every word: a
+                // `pointer_map` key is by construction an object this cycle
+                // relocated, so the collector's own object test accepts it,
+                // and the alternative is millions of words per peer. Register
+                // 0xff marks the stack side.
+                cratonvm_gc::gc_quiescence::record_peer_reg(os_tid, 0xff, w);
                 roots.push(o);
                 found += 1;
             }
@@ -715,7 +737,7 @@ mod imp {
         let in_jit = ranges.iter().any(|&(e, end)| rip >= e && rip < end);
         if in_jit {
             // Pure JIT instruction stream → holds no VM lock → safe to freeze.
-            let found = scan_context(&ctx.0, is_obj, roots);
+            let found = scan_context(&ctx.0, is_obj, roots, tid);
             Some((h, found)) // keep suspended; caller records the handle
         } else {
             // Interpreter / native / already parked → let it arrive cooperatively.
@@ -828,6 +850,12 @@ mod imp {
                         // byte-aligned.
                         let v = unsafe { (ctx.as_ptr().add(off) as *const u64).read_unaligned() }
                             as usize;
+                        // Pairing capture -- see the take-over path.
+                        cratonvm_gc::gc_quiescence::record_peer_reg(
+                            tid,
+                            ((off - OFF_GPR_LO) / 8) as u8,
+                            v,
+                        );
                         if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                             has_jit = true;
                         }
@@ -841,6 +869,18 @@ mod imp {
                     let words = (0..band_len / 8).map(|i| unsafe {
                         (band.as_ptr().add(i * 8) as *const usize).read_unaligned()
                     });
+                    // Pairing capture, helper-window stack side. Same gate and
+                    // same 0xff marker as the take-over path.
+                    if cratonvm_gc::gc_quiescence::peer_reg_pairing_enabled() {
+                        for i in 0..band_len / 8 {
+                            let w = unsafe {
+                                (band.as_ptr().add(i * 8) as *const usize).read_unaligned()
+                            };
+                            if is_obj(w).is_some() {
+                                cratonvm_gc::gc_quiescence::record_peer_reg(tid, 0xff, w);
+                            }
+                        }
+                    }
                     has_jit |=
                         classify_helper_window_words(words, &ranges, is_obj, &mut candidates);
                     if has_jit {
@@ -1382,9 +1422,13 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut found = 0usize;
-        for reg in &slot.regs {
+        let pair_tid = slot.tid.load(Ordering::Acquire);
+        for (ri, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if let Some(o) = is_obj(v) {
+                // LINUX arm of `CRATONVM_DBG_PEER_REG_PAIRING` (§11 built the
+                // Windows one). Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, ri as u8, v);
                 roots.push(o);
                 found += 1;
             }
@@ -1401,6 +1445,7 @@ mod imp {
         while p + 8 <= end {
             let w = unsafe { (p as *const usize).read_unaligned() };
             if let Some(o) = is_obj(w) {
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
                 roots.push(o);
                 found += 1;
             }
@@ -1439,12 +1484,15 @@ mod imp {
         F: Fn(usize) -> Option<ObjectRef>,
     {
         let mut has_jit = false;
-        for reg in &slot.regs {
+        let pair_tid_hw = slot.tid.load(Ordering::Acquire);
+        for (ri_hw, reg) in slot.regs.iter().enumerate() {
             let v = reg.load(Ordering::Acquire);
             if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                 has_jit = true;
             }
             if let Some(o) = is_obj(v) {
+                // Cast: REG_COUNT is 17.
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, ri_hw as u8, v);
                 candidates.push(o);
             }
         }
@@ -1463,6 +1511,7 @@ mod imp {
                 has_jit = true;
             }
             if let Some(o) = is_obj(w) {
+                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
                 candidates.push(o);
             }
             p += 8;

@@ -3,6 +3,19 @@
 **Status: FIXED** (`native-builtins/src/apps_h2.rs`, branch
 `fix/hib-bulkid-insertselect-lastrow-20260727`).
 
+> **2026-09-06 note — this fix is still correct and still intact.** A full
+> 3-GC-arm hib-suite run on 2026-09-06 re-flagged
+> `bulkid.OracleInlineMutationStrategyIdTest#testInsertSelect` (this doc's own
+> class/method) as failing, which looked like a regression of this fix.
+> It is not: the failure's actual assertion is `expected: 1100 but was: 20` (a
+> row-count mismatch), not the `ConstraintViolationException`/duplicated-last-row
+> this doc describes, and it only reproduces as part of a JIT-warmed multi-test
+> run — never in a fresh single-method process, never under `--nojit`. The
+> `groupData.is_some()` delegation check below was independently re-verified
+> correct at this exact 1100-row scale via a Hibernate-free JDBC probe. This is a
+> newly discovered, unrelated JIT-warm-up-dependent defect — see
+> `docs/known-issues/hibernate/jit-warm-groupdata-window-row-collapse-20260906.md`.
+
 One CratonVM defect. It was filed as **seven separate OPEN docs** in
 `docs/known-issues/hibernate/`, several of which correctly suspected a single shared
 substrate cause but none of which had root-caused it. This doc supersedes and closes

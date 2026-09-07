@@ -570,12 +570,20 @@ fn write_bytes(
     }
     let to_encode = &combined[..encode_len];
 
+    // GC: `encode_for_stream` reads the stream's `encoder` and asks it for its
+    // malformed/unmappable actions through `invoke_virtual`, so it runs Java
+    // and can collect on a path that returns normally. `this` is then handed
+    // to `buffer_and_maybe_flush`.
     let name = name_of(ctx, this);
     let encode_name = effective_encode_name(ctx, this, &name);
+    let pin = ctx.pin_native_root(this);
     let bytes = encode_for_stream(ctx, this, &encode_name, to_encode)?;
     if bytes.is_empty() {
+        ctx.unpin_native_roots(pin);
         return Ok(());
     }
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
     buffer_and_maybe_flush(ctx, this, &name, &bytes)?;
     Ok(())
 }
@@ -606,7 +614,12 @@ fn buffer_and_maybe_flush(
     // growing the buffer unboundedly — mirrors real StreamEncoder's overflow
     // handling, which never grows `bb` past `maxBufferCapacity`.
     if bytes.len() > MAX_BYTE_BUFFER_CAPACITY {
+        // GC: `flush_pending_buffer` reaches `write_through`, which allocates a
+        // byte array and calls `write` on the wrapped stream.
+        let pin = ctx.pin_native_root(this);
         flush_pending_buffer(ctx, this)?;
+        let this = ctx.read_native_pin(pin, this);
+        ctx.unpin_native_roots(pin);
         return write_through(ctx, this, bytes);
     }
 

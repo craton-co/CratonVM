@@ -164,6 +164,30 @@ Every result here used a corrected classpath substituting the raw
 five missing jars. Not applied back to the shared `common.args` to avoid touching
 another session's checkout.
 
+## Addendum 2026-09-06 — today's 3-GC-arm run shows a Gen/G1 vs ZGC split, not a uniform spread
+
+A full 3-GC-arm hib-suite run reported, for the textually-identical bytecode:
+Generational ~382,755 KB, G1 ~383,181 KB, ZGC ~627,717 KB — Gen and G1 agree with
+each other tightly (0.1% apart) but sit at roughly **0.61x** of ZGC, not the "0.5%
+spread across three collectors" this doc's verification section claims for
+626-629 MB.
+
+The notable part: **ZGC's figure (627,717 KB) is inside this doc's own verified
+626-629 MB range.** It is Generational and G1 that are the outliers here, both
+reporting a figure close to the doc's earlier, since-fixed, wrong bug-1 reading for
+Generational at a 2 GB heap (`49 MB` — not this number, but the same class of
+"counter falls at a GC" symptom shape, since Gen/G1 collect far more eagerly than
+ZGC's default `CRATONVM_ZGC_CONC_START=60` heuristic on a small parse-only
+workload). This is consistent with, though not proof of, the process-wide
+allocation accumulator (the doc's bug-1 fix) having a live gap specific to
+Generational/G1 that this test's original two-collector table (which predates
+G1's inclusion) never exercised — not a new problem in ZGC.
+
+Not chased further here per this triage's scope (this is a data-quality note on an
+already-open item, not a new investigation): worth a follow-up rerun of
+`probes/AllocCounterFidelity.java` split out by collector before trusting any
+Gen/G1 allocation figure from this test again.
+
 ## Repro
 
 ```bash
