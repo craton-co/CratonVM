@@ -191,6 +191,8 @@ fn body() {
     // Anti-vacuity: the warm-up itself must not have tripped anything, or the
     // delta below would be measuring a counter that is already moving.
     let _ = vm.invoke(CLASS, "reset", "()V", &[]);
+    // Same for the residual census: warm-up traps are not this call's business.
+    cratonvm_vm::runtime::interpreter::reset_deopt_frame_bail_counts();
 
     let delta = match vm.invoke(CLASS, "trip", "()I", &[]) {
         Ok(Some(Value::Int(n))) => n,
@@ -199,6 +201,42 @@ fn body() {
              itself, so an escaping error means the trap took a path this file does not model"
         ),
     };
+
+    // The residual, asserted to be absent rather than assumed.
+    //
+    // `delta == 1` says THIS call resumed. It does not say the frame was
+    // rebuilt rather than the trap simply not happening, and it says nothing
+    // about any other trap the same call took. `deopt_frame_bail_total` is
+    // every way `build_deopt_frame_inner` can decline — and a decline is
+    // exactly what still falls back to re-running the method from entry, side
+    // effects and all. Zero here is what makes the residual of
+    // `jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`
+    // measured rather than merely described.
+    let bails = cratonvm_vm::runtime::interpreter::deopt_frame_bail_counts();
+    let bail_total: u64 = bails.iter().map(|(_, n)| *n).sum();
+    assert_eq!(
+        bail_total,
+        0,
+        "a trapped frame could not be rebuilt, so its method re-ran FROM ENTRY          with its side effects: {}",
+        bails
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(why, n)| format!("{why}={n}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+
+    // `lambda_site_deopt_outcomes()`'s own doc calls `unresumable` "the metric a
+    // regression test asserts is zero", and until now no test asserted it —
+    // the accessor had no caller anywhere in the tree. This is that caller.
+    // It covers the THIRD sink (`resume_deopted_body`, the one-shot lambda
+    // doors), which this fixture does not otherwise reach, so a non-zero value
+    // here would mean the fix left that door behind.
+    let (_resumed, unresumable) = cratonvm_vm::runtime::interpreter::lambda_site_deopt_outcomes();
+    assert_eq!(
+        unresumable, 0,
+        "a lambda-site deopt could not be resumed, so the generic path re-ran          the impl from entry, side effects and all"
+    );
 
     assert_eq!(
         delta, 1,
