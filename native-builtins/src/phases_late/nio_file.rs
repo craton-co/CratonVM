@@ -17327,30 +17327,35 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let ok = fs_set_permission(&path, FS_ACCESS_WRITE, writable, owner_only);
         Ok(Some(Value::Int(i32::from(ok))))
     });
+    // THE ONE-ARGUMENT FORM WAS THE ONE THIS BLOCK'S OWN COMMENT MISSED.
+    //
+    // `setReadable(Z)`, `setReadable(ZZ)`, `setWritable(Z)`, `setWritable(ZZ)`
+    // and `setExecutable(ZZ)` all delegate to `fs_set_permission`. This one
+    // hand-rolled its own body, and it was wrong on BOTH platforms:
+    //
+    //   * on Windows it answered `std::fs::metadata(path).is_ok()` -- "does
+    //     this file exist?" -- so `setExecutable(false)` reported TRUE. That is
+    //     exactly the fabricated success the comment above says was removed
+    //     from the other three; it survived here because the earlier sweep
+    //     never asked the DISABLE direction on Windows. The JDK's
+    //     `WinNTFileSystem` cannot revoke execute and reports the request back:
+    //     `enable`. Measured against HotSpot 25 by `apps/probes/L4FileSweep.java`,
+    //     the row `setExecutable false` -- HotSpot `false`, CratonVM `true`, in
+    //     BOTH `--real-jdk` and `--jdk-only`;
+    //
+    //   * on Unix it toggled `0o111`, all three execute bits, where the
+    //     one-argument form is DEFINED as the two-argument form with
+    //     `ownerOnly = true` -- so it should touch `0o100` only.
+    //     `fs_set_permission` already makes that distinction, which is the
+    //     second reason to call it rather than to re-derive it.
+    //
+    // Delegating fixes both and leaves one implementation of the rule.
     r.register(file, "setExecutable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let _path = file_read_path(ctx, this);
-        let _exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
-        // On unix, toggle 0o100 bit; on Windows, no-op (treat as success)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let ok = std::fs::metadata(&_path)
-                .and_then(|meta| {
-                    let mut perms = meta.permissions();
-                    let mode = perms.mode();
-                    let new_mode = if _exec { mode | 0o111 } else { mode & !0o111 };
-                    perms.set_mode(new_mode);
-                    std::fs::set_permissions(&_path, perms)
-                })
-                .is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        }
-        #[cfg(not(unix))]
-        {
-            let ok = std::fs::metadata(&_path).is_ok();
-            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
-        }
+        let path = file_read_path(ctx, this);
+        let exec = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let ok = fs_set_permission(&path, FS_ACCESS_EXECUTE, exec, true);
+        Ok(Some(Value::Int(i32::from(ok))))
     });
     r.register(file, "setExecutable", "(ZZ)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
