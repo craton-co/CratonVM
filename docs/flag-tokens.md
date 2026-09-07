@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-534 tokens.
+535 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -247,6 +247,7 @@ export inherited from a parent shell.
 | `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
 | `fmt-wrongtype` | `CRATONVM_DBG_FMT_WRONGTYPE` |
 | `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
+| `young-mark-watch` | `CRATONVM_DBG_YOUNG_MARK_WATCH` |
 | `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
 | `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
 | `hm-trace` | `CRATONVM_HM_TRACE` |
@@ -997,7 +998,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-167 tokens.
+169 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1009,6 +1010,8 @@ export inherited from a parent shell.
 | `peer-pin-divert` | `CRATONVM_GC_NO_PEER_PIN_DIVERT` |
 | `conditional-tlab-skip-publish` | `CRATONVM_GC_CONDITIONAL_TLAB_SKIP_PUBLISH` |
 | `frame-trace-span-retire` | `CRATONVM_GC_NO_FRAME_TRACE_SPAN_RETIRE` |
+| `remap-frozen-peer-stacks` | `CRATONVM_GC_REMAP_FROZEN_PEER_STACKS` |
+| `hold-helper-peers` | `CRATONVM_GC_HOLD_HELPER_PEERS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |
