@@ -3533,7 +3533,25 @@ as a coin, which is exactly why the rule is to discard on the control and not
 on whether the answer is convenient.
 
 Over the two valid runs `over` wins **11 of 42 on CPU and 10 of 42 on wall** —
-about 3% slower on the means, consistent in both instruments and both runs.
+about 3% slower on the means, and agreeing in DIRECTION in both instruments and
+both runs.
+
+*(Re-scored 2026-09-07 against the stricter standard the hibernate reversal
+forced on this file. Per run: run 1 is 8 of 21 on both instruments, z = -1.09 —
+**a coin on its own**; run 3 is 3 of 21 and 2 of 21, z = -3.27 and -3.71. Pooled,
+z = -3.09 and -3.39. So "consistent in both runs" overstated run 1: what is
+consistent is the DIRECTION, four times out of four, and the pooled count is
+what carries the significance. That is still a much stronger position than the
+withdrawn hibernate result, whose two samples pointed OPPOSITE ways (+2.47 and
+-2.49) — direction agreement across independent runs is exactly the check that
+one failed and this one passes.*
+
+*What remains untested is the same thing that broke hibernate: both runs used
+the SAME 21 classes, so this establishes REPEATABILITY, not that the effect
+generalises to other H2 classes. The claim is load-bearing — it is why
+`OVER_INTRINSIC` stays off and why the accessor work is scoped as "lower these
+families" rather than "stop refusing them" — so the disjoint-class check is
+worth running before anyone leans on it harder than that.)*
 
 **So the intrinsic at those sites really is worth more than optimizing the
 method around it.** Trading an inline unboxing load or an `Atomic*` accessor for
