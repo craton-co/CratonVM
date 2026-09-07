@@ -812,6 +812,9 @@ pub struct GcFlags {
     /// REGION, not by the holder, so a bad header rewrites the objects that
     /// follow it. Set to 0 to ablate.
     pub g1_serial_evac_holder_screen: bool,
+    /// `CRATONVM_G1_VERIFY_FORWARDS_RETIRED` -- count objects still FORWARDED
+    /// after `retire_forwards`. Diagnostic, opt-in, counts only.
+    pub g1_verify_forwards_retired: bool,
     /// `CRATONVM_G1_EVAC_COPY_WATCH` — record every to-space copy's first
     /// header word as it is made, and re-read them at two checkpoints inside
     /// the pause. **OPT-IN** ([`parse::non_empty_non_zero`]): a push per copy
@@ -1863,6 +1866,7 @@ impl GcFlags {
                 src,
                 "CRATONVM_G1_SERIAL_EVAC_HOLDER_SCREEN",
             ),
+            g1_verify_forwards_retired: present(src, "CRATONVM_G1_VERIFY_FORWARDS_RETIRED"),
             g1_evac_copy_watch: non_empty_non_zero(src, "CRATONVM_G1_EVAC_COPY_WATCH"),
             g1_parallel_evac_shared_dest: on_unless_zero(
                 src,

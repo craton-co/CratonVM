@@ -455,6 +455,11 @@ pub static SERIAL_SCAN_HOLDER_BODY_TOO_BIG: AtomicUsize = AtomicUsize::new(0);
 /// window from the one the evacuation screens close.
 pub static PHASE4_HOLDER_REFUSED: AtomicUsize = AtomicUsize::new(0);
 
+/// Forwards still set after `retire_forwards`, across the run.
+///
+/// Expected ZERO. `CRATONVM_G1_VERIFY_FORWARDS_RETIRED=1` only.
+pub static UNRETIRED_FORWARDS: AtomicUsize = AtomicUsize::new(0);
+
 /// How many compact reference-field offsets were skipped because the resolved
 /// layout places them past the body that same layout declares.
 ///
@@ -6926,6 +6931,7 @@ impl G1Collector {
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
         self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         phases.free_us = phase_mark.elapsed().as_micros() as u64;
         phase_mark = std::time::Instant::now();
@@ -7436,6 +7442,7 @@ impl G1Collector {
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
         self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -8013,6 +8020,7 @@ impl G1Collector {
         // `retire_forwards`.
         self.retire_forwards(&pointer_map);
         self.report_pending_corrupt_holders(&regions);
+        let _ = self.count_unretired_forwards(&regions, &cset_set);
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
 
         // Humongous spans are never evacuated, so this is the only point in a
@@ -9420,6 +9428,67 @@ impl G1Collector {
     /// claiming to be a zero-slot plain object.
     ///
     /// Must run AFTER Phase 4 (which resolves forwards) and BEFORE Phase 5.
+    /// Count objects still carrying a FORWARDED mark after [`Self::retire_forwards`].
+    ///
+    /// `CRATONVM_G1_VERIFY_FORWARDS_RETIRED=1` only, and a COUNTER rather than a
+    /// repair on purpose. `retire_forwards` clears every key of the pointer map,
+    /// so a forward can only survive it by never reaching that map — which is a
+    /// shape this file has fixed three times (the parallel driver's own retire
+    /// ordering, Phase 3.5's forwards, and the CAS-loser arm that did not record
+    /// its adopted forward). A survivor in a KEPT region outlives the pause and
+    /// is read as a header by the next one.
+    ///
+    /// Measure before repairing: a default-ON sweep that neutralises marks is a
+    /// write to every CSet region, and this branch has already shipped one
+    /// default-ON screen whose refusals were all healthy objects. If this
+    /// counter is non-zero the repair is justified and the count says how much
+    /// it is worth; if it is zero the failure path leaks nothing and the repair
+    /// would be unmeasured risk for no benefit.
+    fn count_unretired_forwards(&self, regions: &[G1Region], cset: &RegionSet) -> usize {
+        if !gc_flags().g1_verify_forwards_retired {
+            return 0;
+        }
+        let mut found = 0usize;
+        for i in cset.iter() {
+            let Some(r) = regions.get(i) else { continue };
+            let base = r.data.as_ptr() as usize;
+            let cursor = r.cursor();
+            let mut off = 0usize;
+            while off < cursor {
+                // SAFETY: below the region's own cursor, under the regions lock,
+                // and Phase 5 has not run.
+                let h = unsafe { &*((base + off) as *const ObjectHeader) };
+                let m = h.mark_word.load(Ordering::Relaxed);
+                // The quartet survives retirement, so the size is readable
+                // whether or not the mark is still forwarded.
+                let size = object_total_size(h);
+                if ObjectHeader::is_forwarded_mark(m) {
+                    found += 1;
+                    if found <= 4 {
+                        tracing::warn!(
+                            "[g1] UNRETIRED FORWARD (#{found}): obj=0x{:x} region={i} \
+                             off=0x{off:x} mark={m:#018x} target=0x{:x} class_id={} \
+                             -- still FORWARDED after `retire_forwards`, so it never \
+                             reached the pointer map. If this region is kept, the next \
+                             pause reads this word as a header.",
+                            base + off,
+                            ObjectHeader::forwarding_target(m) as usize,
+                            h.class_id.as_u32(),
+                        );
+                    }
+                }
+                if size == 0 || size > cursor - off {
+                    break;
+                }
+                off += size;
+            }
+        }
+        if found > 0 {
+            UNRETIRED_FORWARDS.fetch_add(found, Ordering::Relaxed);
+        }
+        found
+    }
+
     fn retire_forwards(&self, pointer_map: &cratonvm_types::PointerMap) {
         for &k in pointer_map.keys() {
             // SAFETY: `k` is a from-space object address forwarded this pause;
