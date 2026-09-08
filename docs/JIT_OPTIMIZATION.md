@@ -4453,7 +4453,27 @@ match before asserting the verdicts differ.
 
 `tools/suite-pair-ab/selftest.sh` runs the real awk out of `pair-ab.sh` rather
 than a copy, so the two cannot drift, and it was verified to FAIL when the
-detector is disabled. Its own first draft had the bug this file keeps meeting:
+detector is disabled.
+
+**The first version of that check was confounded, and it was my own.** Rows are
+written in RUN order, so first-half-vs-last-half is also EARLY-vs-LATE across a
+run that can span an hour: a disagreement could equally be the classes or the
+host drifting underneath. It now computes an ODD/EVEN split as well, which
+interleaves the same classes in time and is therefore blind to drift:
+
+| first/last | odd/even | reading |
+|---|---|---|
+| agree | agree | stable direction |
+| **disagree** | agree | **drift during the run**, not a class effect |
+| — | **disagree** | **genuinely class-dependent** — does not generalise |
+
+A near-zero z has no sign to disagree with, so a disagreement counts only when
+both sides clear \|z\| >= 1; without that gate the drift fixture reads +0.00
+against -0.45 and gets reported as class-dependence, which is how the bug was
+found. And the "identical pooled count" pair now separates three ways rather
+than two: `agree` reports a direction, `hidden` (one half carries it, the other
+is flat) keeps the direction but is annotated as resting on half the sample, and
+only a real sign reversal is refused. Its own first draft had the bug this file keeps meeting:
 the "same pooled count" assertion compared two EMPTY strings and reported `ok`
 when the summary had not run at all.
 
