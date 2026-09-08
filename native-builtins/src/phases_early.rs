@@ -8043,7 +8043,14 @@ fn exchanger_do_exchange(
         ctx.monitor_exit(this);
 
         // Wait until a partner completes the exchange (state == 2).
+        //
+        // The re-read at the top of the OUTER loop does not reach here: this
+        // inner loop is where the thread actually parks, and it can spin for
+        // the whole timeout without the outer body running again. Re-read
+        // `this` on every inner turn too -- `monitor_wait` at the foot of the
+        // body is the widest collection window in this function.
         loop {
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_enter(this);
             let cur_state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
             if cur_state == 2 {
