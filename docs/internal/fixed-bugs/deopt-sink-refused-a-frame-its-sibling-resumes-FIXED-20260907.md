@@ -202,17 +202,19 @@ third row of that file's `SHAPES` table.
 
 ## What this does NOT change, and the residual
 
-The two sinks in `jit_bridge.rs` (`jit-callsite-a`, `jit-callsite-b`) take a
-**third** answer to the same event: they fall back to a whole-method re-run
-from entry, unconditionally, with no side-effect check and no refusal. For a
-side-effecting body that is a silent double execution — worse than the abort,
-not better — and it is untouched here.
+The sinks in `jit_bridge.rs` took a **third** answer to the same event: they
+fell back to a whole-method re-run from entry, unconditionally, with no
+side-effect check and no refusal. For a side-effecting body that is a silent
+double execution — worse than the abort, not better — and it was untouched
+here, because changing behaviour on paths that work today, on a source reading,
+is exactly what this repository's own rules forbid.
 
-It is not reachable through the shape this page fixes (those sinks run
-`resume_from_ir_deopt` first, and reach the re-run only when it declines or is
-gated off), and changing them would alter behaviour on paths that work today,
-unmeasured. **Left open deliberately**, recorded in
-`docs/known-issues/jit/jit-bridge-sinks-re-run-a-side-effecting-body-20260907.md`.
+**Since fixed, once it was measured**, and there turned out to be three of them
+rather than two (`resume_deopted_body` as well): see
+`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`. The witness
+counts the side effect for one trapping call — 2 before, 1 after — and all four
+sinks now ask this page's guards through one shared predicate,
+`sink_precise_resume_allowed`.
 
 ## Relationship to the 2026-08-18 fix
 

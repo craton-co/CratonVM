@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | **OPEN, and now known to be TWO defects.** The reports are REAL corruption, not a desynced walk: `grid_closes_on_cursor=true` on 11 of 11, the walk stepping 8623 whole objects onto the exact region cursor (2026-09-07 section). One run produced BOTH a body-cell population (6 sound `class_id=64` objects, corrupt slots) and a header population (8 arena-pointer holders), at disjoint addresses. `word0_plausible_ptr` has a false-positive class, so this page's 19-of-19 statistic needs re-taking. The corrupt-header family no longer reproduces on H2 as of dev's 2026-09-06 evacuation fixes: ablating the four of them together brings it back (7 arena-pointer holders and a SIGSEGV in ~400 checkpoints, against 0 in ~36 000 with them on) -- see the 2026-09-07 section. Which of the four, and whether the Tomcat-side reports were corruption or a desynced walk, are both still open. The producer was never identified directly, and as of 2026-09-06 it is known NOT to be any of the six flat walks: screening two of them moves the reports to the others at an unchanged rate, and `CopyWatch` clears the copy path. The origin is upstream of everything this page instruments. The title's "eight bytes" is contradicted by the H2 population measured 2026-09-06 -- see that section; treat the size as unsettled. What this page adds is that the several Java-visible faces are ONE thing, that the thing lands at a live object's base during a pause, and that three of the screens reached for it are blind, note-only, or absent. Four guards and four diagnostic fields landed; the crash survives all of them. |
-| **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. |
+| **Scope** | The corrupt-cell REPORTS are G1 only (the walks are G1's). The WORKLOAD failing is not: at -Xmx256m `TestMVStoreTool` fails on CratonVM under G1 (OOM / SIGSEGV / `BufferOverflowException`) and under ZGC (`OutOfMemoryError ... native reference array of length 14053`, after 589 s in the create phase), where HotSpot passes rc=0 on the same classpath. Do not let this page's scope absorb that. G1 detail: Measured on `org.apache.catalina.startup.TestHostConfigAutomaticDeploymentXmlExternalWarXml`, Windows, jar-first classpath, `-Xmx2g -XX:+UseG1GC`. The same corrupt-cell family is on record from `org.h2.test.store.TestMVStoreTool`. **Amended 2026-09-07, and the two halves went opposite ways.** The `TestMVStoreTool` THROUGHPUT face is now measured and is not this defect at all -- it is mutator-side address validation plus the VM's general helper-bound execution, 24x HotSpot on a run in which the collector never executes once (`docs/internal/performance/h2-mvstoretool-create-phase-is-mutator-side-address-validation-20260907.md`), and the ZGC OOM is a refused compactor with 88% of the heap free (`docs/known-issues/h2/zgc-oom-on-mvstore-is-the-unregistered-entry-frame-blocking-compaction-20260907.md`). The `BufferOverflowException` face went the other way: H2's arithmetic on that path cannot overflow and both halves of the `ByteBuffer` contract under it are now proven sound by probes, so the only producer left is a reference naming memory that is not the object the check measured -- i.e. THIS page's family (`docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstoretool-bufferoverflow-is-not-a-nio-defect-RESOLVED-20260907.md`). Absorb that one; leave the other two alone. |
 | **Left behind by** | `g1-parallel-evacuator-had-none-of-the-serial-arms-header-screens` (2026-09-05), whose own "What is NOT closed" section names this class. |
 
 ## The faces are one defect
@@ -559,6 +559,62 @@ family used to appear within a couple of minutes and a few hundred pauses.
   (`grid_closes_on_cursor`, added for it) never got an answer, because after the
   fixes there are no reports left to classify. It stays open against the
   Tomcat-side reports, which this page's own census collected.
+
+## RE-TAKEN 2026-09-07: `word0` is an arena pointer on 0 of 25, not 19 of 19
+
+This page's physical claim -- "the `class_id`/`shape` dword pair IS the object's
+first eight bytes, and recombining them gives a pointer into the collector's own
+arena", evidenced by `word0_plausible_ptr` TRUE on 19 of 19 -- does not survive
+re-measurement.
+
+**A config that reproduces N/N first.** The marginal 1-in-6 rate made every
+lever look decisive, so the parameters were swept before anything was concluded
+from them:
+
+| config (all `RESUME_DEST=0`) | outcome | corrupt | arena refusals |
+|---|---|---:|---:|
+| `-Xmx2g`, default workers | PASS, PASS | 0, 0 | 0, 0 |
+| `-Xmx1g`, default workers | PASS, PASS | 0, 10 | 0, 0 |
+| `-Xmx768m`, default workers | PASS, PASS | 0, 0 | 0, 0 |
+| **`-Xmx1g`, `CRATONVM_G1_WORKERS=16`** | **SIGSEGV, SIGSEGV** | 0, 15 | 8, 14 |
+
+Worker count is the lever, not heap size -- which is what the mechanism
+predicts, since each worker claims its own region per pause and that is what
+drains the free pool into the failure path.
+
+**The re-take.** Six runs at that config with BOTH refusal screens stood down,
+so holders are REPORTED rather than refused (with the screens on, the surviving
+population is selected by the very predicate under test). 25 holders carried
+both readings:
+
+| `word0_plausible_ptr` | `word0_arena_test` | holders |
+|---|---|---:|
+| False | False | 23 |
+| **True** | **False** | **2** |
+| any | **True** | **0** |
+
+**Zero of 25.** And the two disagreements are the same value,
+`word0=0x0000001200000040`, which is `(18<<32)|64` -- an ordinary
+`class_id=64 / num_slots=18` header. Against the arena bounds the VM now prints
+on the same line, `[0x22d5ec70000, 0x22d9ec70000)`, a 1.00 GiB span containing
+the holder itself, that word sits **2157 GiB below `arena_base`**.
+
+So `word0_plausible_ptr` has a false-positive class, confirmed against printed
+bounds rather than inferred from address magnitude, and it is the field this
+page's 19-of-19 rests on.
+
+### what this does and does not overturn
+
+* It does NOT say the header corruption is imaginary. The same runs refused 8
+  and 14 holders whose first word genuinely IS an arena pointer, by the test
+  that fires a refusal. That population is real.
+* It DOES say the two populations were conflated. The corrupt-cell HOLDERS
+  measured here are sound-headed objects with corrupt BODY cells -- `word0`
+  arena-pointer on 0 of 25 -- and they are not the same objects as the
+  arena-pointer holders the screens refuse.
+* The 19-of-19 was therefore a statistic about one population taken with a
+  field that misreports on the other. It should not be quoted again without
+  the arena test beside it.
 
 ## ANSWERED 2026-09-07: the reports are REAL CORRUPTION, and the grid proves it
 

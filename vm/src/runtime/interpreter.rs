@@ -4126,6 +4126,11 @@ pub fn execute(
                                     //    is that information, read off the
                                     //    bytecode instead;
                                     //  * a resume bci past this method's code.
+                                    // The predicate's own terms, kept apart
+                                    // here only so the refusal message can name
+                                    // WHICH of them declined. The decision
+                                    // itself is `sink_precise_resume_allowed`,
+                                    // which all four deopt sinks ask.
                                     let body_holds_monitor = cratonvm_jit::bytecode_holds_monitor(
                                         &code_attr.code,
                                         code_attr.code.len(),
@@ -4160,10 +4165,12 @@ pub fn execute(
                                     // running without the backend's word for it.
                                     let resume_allowed = key_matches
                                         && (resume_gate_ok
-                                            || (cratonvm_jit::deopt_sink_resume_enabled()
-                                                && !is_synchronized
-                                                && !body_holds_monitor
-                                                && bci_in_code));
+                                            || sink_precise_resume_allowed(
+                                                &code_attr.code,
+                                                code_attr.code.len(),
+                                                is_synchronized,
+                                                rframe_for_despec.bci,
+                                            ));
                                     let mut materialize_failed = false;
                                     if resume_allowed {
                                         let cached =

@@ -213,6 +213,17 @@ HotSpot), which fits the cap on a quiet host and not on a loaded one.
 This is the "a deterministic failure hides the next one" shape: the fix did not
 cause either slowness, it exposed them.
 
+## One measurement note, because it cost a wrong conclusion
+
+An `export CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` left in the session's
+persistent SSH shell leaked into every later run launched from it, including
+the ones labelled "guard ON". Both arms of a four-run A/B therefore read as the
+OFF arm — the guard looked inert, and a known-issue page saying so was written
+before the environment was checked. `env -i PATH=… HOME=…` in the runner script
+is what makes an arm's environment a fact rather than an assumption; the same
+script then reports `planted=` and `refused=` per arm, so an arm that did not
+actually differ says so in its own output.
+
 ## Relationship to the already-fixed sibling bug
 
 `aot-cglib-dynamicclassfileobject-illegalargumentexception-20260811-FIXED.md`

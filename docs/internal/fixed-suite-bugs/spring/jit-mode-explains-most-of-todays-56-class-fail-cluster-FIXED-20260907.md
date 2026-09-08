@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **FIXED 2026-09-07.** All 56 classes pass under JIT-on, bar one that fails identically on HotSpot and one that is correct but slow. The `--nojit` lever is no longer needed. |
+| **Status** | ✅ **FIXED 2026-09-07.** All 56 classes pass under JIT-on, bar one that fails identically on HotSpot and two that are correct but over the runner's per-class cap. Both mechanisms this page described are closed. The `--nojit` lever is no longer needed. |
 | **Root cause** | ONE defect, not the two mechanisms this page originally described: the optimizing (IR) tier planted an unresumable uncommon trap at an `invokedynamic`, in methods that had already committed a side effect. |
 | **Fix** | Two changes landed the same day from two lanes — the deopt sink now resumes the frame instead of aborting, and the trap is no longer planted at all. Full derivation in `testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster-FIXED-20260907.md`. |
 | **Scope** | The 56 classes common to all three GC arms of the 2026-09-07 full 2848-class run (`gc3-{gen,g1,zgc}-jit-real-all-20260907-*`). |
@@ -18,10 +18,14 @@ carrying both changes, the 56-class list, one variable:
 
 | arm | OK | FAIL | TIMEOUT | test-methods failed |
 |---|---:|---:|---:|---:|
-| default (this change) | **53** | 1 | 2 | **6** of 1666 |
+| default (this change) | **54** | 1 | 1 | **6** of 1670 |
 | `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | 34 | **21** | 1 | **302** of 1670 |
 
-Twenty classes separate the arms. The families are exactly the ones this page
+Each arm launched through `env -i`, so nothing exported in the session shell
+could decide one — see the measurement note on the sibling page for why that
+sentence is here.
+
+Twenty classes and 296 test methods separate the arms. The families are exactly the ones this page
 grouped under Spring's `"Post-processing of merged bean definition failed"`
 wrapper plus the reactive/WebSocket set: `cache.config.EnableCachingTests`
 (27 of 74 without the guard), `cache.jcache.*`, `cache.aspectj.*`, the
@@ -47,10 +51,10 @@ is deterministic, not host load.
   **HotSpot fails it identically** (`FAIL 9/3/6`, re-measured today). Already
   recorded in `not-cratonvm-bugs-consolidated.md`; unchanged by this fix and
   not a CratonVM bug.
-* `beans.factory.aot.BeanRegistrationsAotContributionTests` and
-  `test.context.aot.AotIntegrationTests` — `TIMEOUT` at the suite's default
-  180 s per-class cap, not failures. Both were re-run alone with
-  `--one-to 2400`:
+* `beans.factory.aot.BeanRegistrationsAotContributionTests` — `TIMEOUT` at the
+  suite's default 180 s per-class cap, not a failure.
+  `test.context.aot.AotIntegrationTests` joins it on a loaded host and fits
+  inside the cap on a quiet one. Both were re-run alone with `--one-to 2400`:
 
   | class | status | found | succ | fail | skip | wall |
   |---|---|---:|---:|---:|---:|---:|
@@ -85,12 +89,35 @@ resulting `InternalError`, prints its own crash banner to stderr, and returns
 failure".
 
 **Mechanism 2** (`CommonAnnotationBeanPostProcessor` NPE) — the reasoning on
-this page was sound and its conclusion was right for the wrong target: the
-`||` short-circuit in `InjectionMetadata.needsRefresh` cannot evaluate wrongly,
-and it did not. The bean post-processor never got a chance to be wrong; a
-method on that path trapped unresumably and the `InternalError` surfaced as
-Spring's `"Post-processing of merged bean definition failed"` wrapper. Every
-class this page named under that signature now passes:
+this page was sound and its conclusion was right: the `||` short-circuit in
+`InjectionMetadata.needsRefresh` cannot evaluate wrongly, and it did not. A
+method on that path was compiled with an unresumable trap, and what came back
+was a `null` where the Java cannot produce one.
+
+`probes/CacheCtxProbe.java` is the direct witness this page asked for and could
+not build. It creates the same `AnnotationConfigApplicationContext` forty times
+in one process and prints the full cause chain that the suite runner's
+`FAILCAUSE` line truncates. On one binary, `env -i` so nothing leaks in:
+
+| arm | result | site traps planted | refused |
+|---|---|---:|---:|
+| default | **all 40 contexts built** | 233 | **58** |
+| `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | fails at iteration 27 | 269 | 0 |
+
+and the failure is exactly the chain this page inferred from reading:
+
+```
+  CAUSE org.springframework.beans.factory.BeanCreationException: ...
+        Post-processing of merged bean definition failed
+  CAUSE java.lang.NullPointerException: null
+      at CommonAnnotationBeanPostProcessor.postProcessMergedBeanDefinition(...:291)
+      at AbstractAutowireCapableBeanFactory.applyMergedBeanDefinitionPostProcessors(...:1112)
+```
+
+Two arms each, repeated, byte-identical between repeats. The iteration-27 onset
+is the tier-up: it is not a logic error and never was.
+
+Every class this page named under that signature now passes:
 
 | class | found | succ | fail |
 |---|---:|---:|---:|

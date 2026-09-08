@@ -16,8 +16,17 @@
 //! store, a call or a monitor action before the trap, that duplicates it, and
 //! nothing says so: it is a silent wrong answer, not an abort.
 //!
-//! Measured before the fix, on the probe below: `sink=200241` for `200000`
+//! Measured on the probe below, before either fix: `sink=200241` for `200000`
 //! calls, with `CRATONVM_DBG_DEOPT=1` naming `jit-callsite-a` 241 times.
+//!
+//! Both ends are now fixed, independently and on the same day:
+//! `CRATONVM_JIT_DEOPT_SINK_RESUME` makes those sinks resume the frame instead
+//! of re-running the body, and the guard this file tests stops the trap being
+//! planted at all. So the guard-off arm no longer produces a wrong ANSWER, and
+//! this test asserts the MECHANISM rather than the symptom: with the guard on
+//! the trap is refused, with it off the same site is still offered. Asserting
+//! the wrong answer would make this test depend on the sink fix staying
+//! broken, which is the opposite of what it is for.
 //!
 //! # Why the fix is in the compiler and this test is at the Java level
 //!
@@ -208,9 +217,7 @@ fn run_probe(bin: &Path, jdk: &Path, classes: &Path, guard_off: bool) -> (String
     if guard_off {
         cmd.env("CRATONVM_JIT_IR_TRAP_REPLAY_GUARD", "0");
     }
-    cmd.arg("-cp")
-        .arg(classes)
-        .arg("IndySiteTrapSinkProbe2");
+    cmd.arg("-cp").arg(classes).arg("IndySiteTrapSinkProbe2");
     let child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -273,18 +280,34 @@ fn a_site_trap_never_duplicates_the_side_effect_before_it() {
         tail(&stderr)
     );
 
-    // ---- anti-vacuity: the OFF arm must actually reproduce ----------------
-    //
-    // A green ON arm means nothing unless this workload can still fire the
-    // hazard. `hot` is a compiler-shape-sensitive probe (four walls, all of
-    // them properties of the tiering and the IR front end), so the day one of
-    // those shifts it will stop planting a trap and the ON arm will pass
-    // vacuously. This is the check that says so instead.
-    let (off_out, off_err) = run_probe(&bin, &jdk, &classes, true);
-    let planted = off_err
+    // The ON arm must be green because the trap was REFUSED, not because the
+    // workload stopped offering one. Assert the mechanism, not just the answer.
+    let refused_on = stderr
+        .lines()
+        .any(|l| l.contains("site TRAP REFUSED") && l.contains("IndySiteTrapSinkProbe2.hot"));
+    let planted_on = stderr
         .lines()
         .any(|l| l.contains("site TRAP planted") && l.contains("IndySiteTrapSinkProbe2.hot"));
-    if !planted {
+    assert!(
+        !planted_on,
+        "[site_trap_sink] a site trap was planted in `hot` with the guard ON — `hot` commits an \
+         invokestatic and an array store before its invokedynamic, so `trap_replay_is_safe` \
+         must refuse it.\nstderr (tail):\n{}",
+        tail(&stderr)
+    );
+
+    // ---- anti-vacuity: the OFF arm must still offer the trap ---------------
+    //
+    // A green ON arm means nothing unless this workload can still produce the
+    // thing the guard refuses. `hot` is a compiler-shape-sensitive probe (four
+    // walls, all of them properties of the tiering and the IR front end), so
+    // the day one of those shifts it will stop planting a trap and the ON arm
+    // will pass vacuously. This is the check that says so instead.
+    let (_off_out, off_err) = run_probe(&bin, &jdk, &classes, true);
+    let planted_off = off_err
+        .lines()
+        .any(|l| l.contains("site TRAP planted") && l.contains("IndySiteTrapSinkProbe2.hot"));
+    if !planted_off {
         eprintln!(
             "[site_trap_sink] WARNING: with the guard off, no site trap was planted in `hot`, \
              so the ON arm above is vacuous for this build. The probe's four walls have \
@@ -294,14 +317,12 @@ fn a_site_trap_never_duplicates_the_side_effect_before_it() {
         );
         return;
     }
-    let off_sink = field(&off_out, "sink=").unwrap_or_default();
-    let reached_bridge_sink = off_err.contains("sink=jit-callsite-a")
-        || off_err.contains("sink=jit-callsite-b");
     assert!(
-        off_sink != expected || !reached_bridge_sink,
-        "[site_trap_sink] the guard-off arm produced the RIGHT answer while still reaching a \
-         jit_bridge sink — the hazard this test guards may have been fixed at the sink instead, \
-         in which case this test is now asserting the wrong thing.\nstdout:\n{off_out}"
+        refused_on,
+        "[site_trap_sink] the guard-off arm plants a trap in `hot` and the guard-on arm did not \
+         report refusing one — the two arms are not looking at the same site.\n\
+         stderr (tail):\n{}",
+        tail(&stderr)
     );
 }
 

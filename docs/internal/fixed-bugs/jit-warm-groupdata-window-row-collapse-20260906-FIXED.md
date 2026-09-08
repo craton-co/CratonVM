@@ -102,7 +102,8 @@ page originally noted.
 
 Not a residual of this page, but found beside it and recorded rather than
 dropped:
-`docs/known-issues/jit/jit-bridge-sinks-re-run-a-side-effecting-body-20260907.md`.
+`docs/internal/fixed-bugs/jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`
+(filed here as open; fixed the same day, once it had a witness).
 
 ## The defect
 

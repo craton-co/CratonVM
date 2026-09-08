@@ -3076,12 +3076,20 @@ back to a tier that runs it. Measured ABBA-interleaved over 24 Spring classes
 316.4 s / 336.9 s — no overlap, and the fastest slot is the last one, so host
 drift cannot explain the ordering.
 
-Before this, every in-process javac compile under Spring's `TestCompiler` died
-with `InternalError: precise deoptimization unavailable ... refusing
-side-effecting replay` (javac catches it, prints its own banner to stderr and
-returns `false` with an empty `DiagnosticListener`, which reads as a compile
-that failed with no diagnostics), and every H2 CRASH class in the 2026-09-07
-3-arm run died the same way. See the retired
+What it is worth, measured on the same day's dev tip and AFTER both deopt-sink
+resume fixes had landed: on the 56-class Spring Framework cluster, switching it
+off costs **20 classes and 296 test methods** (53 OK / 1 FAIL / 2 TIMEOUT
+becomes 34 OK / 21 FAIL / 1 TIMEOUT). Confirmed ABBA-interleaved over six of
+them, byte-identical between repeats of each arm. The sink fixes make an
+unresumable trap *recoverable*; not planting it is what stops these classes
+failing.
+
+Before any of the three fixes, every in-process javac compile under Spring's
+`TestCompiler` died with `InternalError: precise deoptimization unavailable
+... refusing side-effecting replay` (javac catches it, prints its own banner to
+stderr and returns `false` with an empty `DiagnosticListener`, which reads as a
+compile that failed with no diagnostics), and every H2 CRASH class in the
+2026-09-07 3-arm run died the same way. See the retired
 `testcompiler-injit-mode-silent-compile-failure-19-class-aot-cluster` and
 `precise-deoptimization-unavailable-cross-suite-crash` write-ups.
 
@@ -3574,7 +3582,25 @@ as a coin, which is exactly why the rule is to discard on the control and not
 on whether the answer is convenient.
 
 Over the two valid runs `over` wins **11 of 42 on CPU and 10 of 42 on wall** —
-about 3% slower on the means, consistent in both instruments and both runs.
+about 3% slower on the means, and agreeing in DIRECTION in both instruments and
+both runs.
+
+*(Re-scored 2026-09-07 against the stricter standard the hibernate reversal
+forced on this file. Per run: run 1 is 8 of 21 on both instruments, z = -1.09 —
+**a coin on its own**; run 3 is 3 of 21 and 2 of 21, z = -3.27 and -3.71. Pooled,
+z = -3.09 and -3.39. So "consistent in both runs" overstated run 1: what is
+consistent is the DIRECTION, four times out of four, and the pooled count is
+what carries the significance. That is still a much stronger position than the
+withdrawn hibernate result, whose two samples pointed OPPOSITE ways (+2.47 and
+-2.49) — direction agreement across independent runs is exactly the check that
+one failed and this one passes.*
+
+*What remains untested is the same thing that broke hibernate: both runs used
+the SAME 21 classes, so this establishes REPEATABILITY, not that the effect
+generalises to other H2 classes. The claim is load-bearing — it is why
+`OVER_INTRINSIC` stays off and why the accessor work is scoped as "lower these
+families" rather than "stop refusing them" — so the disjoint-class check is
+worth running before anyone leans on it harder than that.)*
 
 **So the intrinsic at those sites really is worth more than optimizing the
 method around it.** Trading an inline unboxing load or an `Atomic*` accessor for
@@ -4303,3 +4329,209 @@ family in this same session, where failures under load turned out to be
 whole-machine contention during a `cargo test` that was also compiling. The
 recorded rate is not supported either way, and the residual should say so rather
 than carry a number nothing reproduces.
+
+### The hibernate inlining result REVERSES on a disjoint sample — there is no positive throughput result
+
+This file said, earlier today:
+
+> **This is the first positive throughput result for IR inlining on real code
+> in this document** […] 26 of 37 is not something a fair coin does.
+
+It was tested on the rest of the suite and it does not hold. Same binary (one
+`mtime`, both runs on it), same harness, same lever, disjoint classes:
+
+| sample | classes | A (inline ON) faster | median delta | median noise | z |
+|---|---:|---:|---:|---:|---:|
+| hibernate, classes 0-39 | 37 | 26 (70%) | +0.3% | 6.9% | **+2.47** |
+| hibernate, classes 40-119 | 78 | 28 (36%) | **-0.4%** | **2.7%** | **-2.49** |
+| **hibernate pooled** | **115** | **54 (47%)** | — | — | **-0.65** |
+| netty | 46 | 19 (41%) | — | — | -1.18 |
+| **every inline pair taken** | **161** | **73 (45%)** | — | — | **-1.18** |
+
+Two disjoint halves of ONE suite, each "consistent, p < 0.05", pointing in
+OPPOSITE directions, with z-scores that are near mirror images. Pooled, the
+whole thing is a coin — and so is every inlining pair ever taken here, 73 of
+161.
+
+The second sample is the better one on every axis that matters: twice the
+classes, and a median within-arm noise of 2.7% against the first's 6.9%. If
+either were to be believed it would be the one saying inlining is SLOWER. The
+honest reading is that neither is: **IR inlining has no measurable throughput
+effect on hibernate**, and the earlier claim is withdrawn.
+
+#### What went wrong, and what the harness now has to say
+
+The design was right about the thing it was built for — a per-class ABBA pairing
+does remove the drift that made a per-run comparison useless, and the noise
+floor it reports is real. The error was in the inference laid on top: a sign
+test over classes assumes the per-class deltas differ only by the lever plus
+symmetric noise. They do not. Classes carry their own systematic
+differences — how much of the run is JIT-visible at all, how much is MySQL
+round-trips — and slicing a null effect into two class subsets can hand you a
+significant count in either direction. Which is exactly what it did.
+
+So a paired count is evidence about THE CLASSES IT WAS TAKEN OVER, and a
+significant z is a reason to take a SECOND, disjoint sample — not a result.
+This is the same lesson as the census drift recorded above, one level up: there
+the trap was comparing runs across time, here it is generalising from a sample
+to the suite.
+
+`pair-ab.sh` prints the count, the z and the noise floor and it printed them
+correctly both times. The verdict line is what over-reached, and it now says so:
+SMALL BUT CONSISTENT requires a confirming disjoint sample before it means
+anything.
+
+### A one-lever A/B found the TRIGGER and I called it the defect
+
+The question was whether `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` could default ON
+now that firing no longer blacklists a method. H2 said yes emphatically — 48
+traps planted, **none taken**, `accepted` 579 -> 592, `lowered` 116 -> 127, no
+blacklists. Thirty hibernate-reactive classes said the opposite, and the control
+arm is where the interesting number was:
+
+| arm (binary WITHOUT the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| unresolved-class trap ON | 64 | 33 | 120 | 102 |
+| the shipped default (indy trap ON) | 182 | 7 | 4 | **36** |
+| all site traps OFF | **241** | **0** | 0 | **0** |
+
+The third arm only got run because the second — the *control* — had 36 hard
+errors sitting in it. One lever, 241/0/0 against 182/7/36, and the conclusion
+looked inescapable: the default-ON `invokedynamic` trap was costing 59 passing
+tests and 36 `InternalError`s in the stock configuration. The callees named in
+those errors were exactly the ones tabulated on the `TransferToInterpreter`
+known-issue page filed that morning. So site traps were switched to default OFF.
+
+**That was wrong, and the check that caught it was re-reading dev before
+pushing.** Another session had spent the same afternoon on the same family from
+the other end and found the actual defect: one deopt SINK aborted on a trapped
+frame that its sibling sink resumed (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default
+ON). Re-measured on a binary carrying their fix:
+
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| site traps ON | 239 | 0 | 7 | **0** |
+| site traps OFF | 241 | 0 | 0 | **0** |
+
+Zero errors either way. The trap was never the defect — it was the thing that
+*produced the deopts* the broken sink then mishandled. Traps fire (`TAKEN=7`)
+and nothing breaks. The default-OFF flip is reverted.
+
+And the arm that started all this reverses too. The unresolved-class trap, the
+one that read `ok=64 failed=33` and looked destructive, on the fixed binary:
+
+| arm (binary WITH the deopt-sink fix) | ok | failed | TAKEN | `refusing side-effecting replay` |
+|---|---:|---:|---:|---:|
+| `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP=1` | **241** | **0** | **112** | **0** |
+| the shipped default | 241 | 0 | 9 | 0 |
+
+One hundred and twelve traps fired, no failures, no errors, the same pass count
+as the default. Every number this file has ever recorded against that switch —
+"200,000 deopts", "traps forever", "craters hibernate" — was measuring a broken
+deopt sink through it.
+
+So the CORRECTNESS objection to `CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` is gone.
+It stays OFF anyway, because the case for turning it ON was always throughput
+(+13 accepted bodies and +11 lowered on H2) and that has never been measured —
+and the inlining reversal recorded above is a fresh demonstration of how hard
+that measurement is to get right here. What has changed is the reason: it is no
+longer "this is harmful", it is "this is unmeasured".
+
+#### The methodological point, which is the part worth keeping
+
+A single-lever A/B is airtight about one thing and silent about another. Turning
+site traps off removed the errors, and that PROVED the trap is on the causal path
+to the failure. It said nothing about whether the trap or something downstream of
+it was the defect — and a kill switch answers identically in both cases. Every
+feature that produces deopts would have "fixed" this bug by being switched off.
+
+The tell was available and I read past it: the failing arm's errors named
+`can_deopt_resume=false`, a property of the METHOD and the SINK, not of the trap.
+A lever that removes a symptom by removing its input is a bisection step, not a
+diagnosis.
+
+Two further notes. `TAKEN` undercounts on the pre-fix binary by construction:
+the counter sits in the resume path past the point where the resume succeeded,
+so a trap whose resume was REFUSED never reached it — `TAKEN=4` beside 36 errors
+was 4 traps that resumed and 36 that could not, and that discrepancy was itself
+a signal the trap was not the whole story. And H2 remains unable to see any of
+this: it plants traps and fires none, so its census reads as pure gain either
+way. A lever whose entire risk is what happens when a trap FIRES has to be
+measured where traps fire.
+
+#### What this does retire
+
+The case for artifact displacement — entry patching, a real `MakeNotEntrant`.
+Its premise was that a trap on a HOT path needs the trapping artifact displaced
+to be survivable. With the sink fixed, traps fire on hibernate and nothing
+breaks, and the residual re-fire counter reads 0 on both real workloads. Nothing
+here is asking for live-code patching, which in this tree means atomic surgery
+under W^X with no safepoint hook and no existing patch site to copy. It is not
+being built, and this is the measurement that says why.
+
+#### The split-half check, so the next run catches this itself
+
+The reversal above took a day and a second deliberate sample to find. It should
+not have: the evidence was inside the FIRST run, in the classes it had already
+measured. `pair-ab.sh` now scores its own two halves and prints them:
+
+```text
+sign test on the paired count: z = +2.85  (consistent, p < 0.05)
+split-half   : first 20 classes z = +4.02 | last 20 classes z = -0.45
+  ** THE HALVES DISAGREE IN SIGN. ...
+VERDICT: UNMEASURABLE (SPLIT-HALF DISAGREEMENT). A wins 29 of 40
+         overall, but the two halves of this run point OPPOSITE ways.
+```
+
+The discriminating case is the pair the self-test is built on: two runs with the
+IDENTICAL pooled count — 29 of 40, z = +2.85 — where one has halves at
++1.79/+1.79 and the other +4.02/-0.45. The first is reported as SMALL BUT
+CONSISTENT; the second is refused. A check that could not separate those two
+would be doing nothing, which is why the self-test asserts the pooled counts
+match before asserting the verdicts differ.
+
+`tools/suite-pair-ab/selftest.sh` runs the real awk out of `pair-ab.sh` rather
+than a copy, so the two cannot drift, and it was verified to FAIL when the
+detector is disabled. Its own first draft had the bug this file keeps meeting:
+the "same pooled count" assertion compared two EMPTY strings and reported `ok`
+when the summary had not run at all.
+
+### And the trap does not buy anything measurable either
+
+With the correctness objection retracted, the only thing keeping
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` off was that its benefit had never been
+measured. Measured now — 57 hibernate-reactive classes, ABBA per class, on a
+binary with the deopt-sink fix:
+
+```text
+A faster than B in 34 of 57 classes            z = +1.46  (a coin)
+split-half   : first 28 z = +1.13 | last 29 z = +0.56
+median per-class delta : +1.4%
+median within-arm noise: 10.7%   (SAME config, two runs)
+VERDICT: UNMEASURABLE
+```
+
+No effect. The two halves at least AGREE in direction this time — both weakly
+positive, so this is not the reversal pattern the split-half check exists to
+catch — but the pooled count is a coin and the effect is a seventh of the noise
+floor.
+
+That floor is the caveat and it is a large one: **10.7%, against 2.7% on the
+quiet-host hibernate run earlier the same day**. Load was 3.5-6.5 on 8 cores
+throughout. This is a weak measurement, and it is reported as one. The
+sub-result that "of the 10 classes whose own delta beats their own noise, A is
+faster in 9" is NOT quoted as evidence: it is a selection conditioned on the
+noise estimate, over ten classes, and this document has already been burned once
+today by a significant-looking count over a small sample.
+
+So the switch stays OFF with both halves of its case now measured rather than
+assumed:
+
+- **not harmful** — 112 traps fired across 30 classes, `ok=241 failed=0`,
+  zero `refusing side-effecting replay` (the old "it craters hibernate" was a
+  broken deopt sink seen through this switch);
+- **not beneficial** — no measurable throughput effect, on a noisy run.
+
+What would settle it: the same 57-class A/B on a host at load < 2.5, which is
+what produced the 2.7% floor. Anything less and the answer is the noise floor,
+not the lever.

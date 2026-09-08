@@ -454,6 +454,42 @@ accepted={accepted} total={ms}ms",
         }
     }
 
+    // The per-SITE half of the same question, and the reason it once took a
+    // sampled-backtrace build to answer: `MEMBERSHIP_WALK_BY_SITE` has counted
+    // every JIT-helper membership walk since it was added, and
+    // `membership_walks_by_site()` -- its only reader -- had NO CALLER at all.
+    // A write-only counter is a diagnosis nobody can read; the census's own doc
+    // says `perf` cannot attribute this population on an optimized build (DWARF
+    // returns self-recursive frames, LBR is unavailable on the virtualised PMU),
+    // which is exactly why the counters exist. They are ungated and already
+    // paid for, so the only thing missing was this line.
+    //
+    // It rides the same gate as the total above -- a non-zero census -- rather
+    // than printing unconditionally: whoever asks for the TOTAL is the one who
+    // wants the split, and re-reading the env var here would be a second
+    // spelling of the same switch that could drift from it. The JIT-helper
+    // sites are a MINORITY of that total -- the
+    // sampled population on `org.h2.test.store.TestMVStoreTool`'s create phase
+    // was 57% `VmHeap::load_and_forward` (the software read barrier, one walk
+    // per reference field/array access) and 17% `G1Collector::autobox_payload`
+    // -- so a small number here is the useful answer, not a broken instrument.
+    {
+        let sites = cratonvm_vm::jit::helpers::membership_walks_by_site();
+        if !sites.is_empty() && cratonvm_vm::g1_object_address_census().0 != 0 {
+            let total: u64 = sites.iter().map(|(_, v)| *v).sum();
+            let body = sites
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "[cratonvm] jit-helper membership walks: total={total} {body} -- the \
+JIT-helper SUBSET of the is_object_address line above; the remainder is the read \
+barrier and the array/field accessors, which carry no site counter."
+            );
+        }
+    }
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The `getfield` fast-path ENGAGEMENT number, on the same switch. The
