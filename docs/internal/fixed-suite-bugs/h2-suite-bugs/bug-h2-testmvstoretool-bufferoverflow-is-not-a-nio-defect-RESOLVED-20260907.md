@@ -125,10 +125,11 @@ the one that page is about.
 | `MvsCreate` 500 000, `-Xmx256m`: G1 ×3, Generational ×3, G1 + `CRATONVM_G1_JIT_MARK_DRIVER=1` ×2 (all `rc=0`), ZGC ×3 (OOM, §below) | 11 | none |
 | `MvsWriteBuffer` / `MvsGrowBarrier` | 8 | none |
 
-The ZGC arms of the third row are not trials for this: they die in 9-10 s to a
-separate, now-characterised defect
-(`docs/known-issues/h2/zgc-oom-on-mvstore-is-the-unregistered-entry-frame-blocking-compaction-20260907.md`),
-long before the chunk-write path has been exercised enough to mean anything.
+The ZGC arms of the third row are not trials for this: they died in 9-10 s to a
+separate defect, **fixed 2026-09-08**
+(`docs/internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md`),
+long before the chunk-write path had been exercised enough to mean anything.
+Those arms are now runnable and have not been re-taken.
 The G1 and Generational arms are the ones that ran the write path to completion,
 eight times, at half a million entries each.
 

@@ -371,3 +371,93 @@ policy is not implicated.
 Probe: `org.h2.test.unit.TestBnfTiming`, ~8 s per run, deterministic on the
 MISS. It must call `linkStatements()` — see this page's own 2026-07-22 warning
 about the repro that skipped it.
+
+## Follow-up (2026-09-08): the cold query is 53% ONE `java.text.Collator` bootstrap, and the gap is 1.6-2x
+
+Arrived here from the other end: `docs/known-issues/h2/bnf-completion-omits-the-user-defined-function-token-20260908.md`
+opened the same failure as a `DbContextRule` rule bug. It is not one — that page
+is refuted and retired to
+`docs/internal/retired/bnf-completion-token-was-the-100ms-sentence-budget-RETIRED-20260908.md`,
+which carries the full narrowing. **This page owns the finding, as it has since
+2026-07-22.** Three things it adds.
+
+### 1. The distance is now a single bisected number: 150-200 ms against 100
+
+Recompiling **only** `org.h2.bnf.Sentence` with a wider `MAX_PROCESSING_TIME` and
+putting it first on the classpath — no VM change, no test change — moves
+`org.h2.test.unit.TestBnf` from FAIL to PASS between 150 and 200:
+
+| `MAX_PROCESSING_TIME` | `TestBnf` |
+|---:|---|
+| 100 (H2's value), 110, 125, 150 | FAIL at `TestBnf.java:138` |
+| **200, 300, 100000** | **PASS** |
+
+That is the acceptance criterion this page has never had in one line: the cold
+`SELECT CUSTOM_PR` head has to lose a factor of 1.6-2. The 2026-08-10 follow-up's
+"~1.3-2x, not broad throughput work" reading is confirmed, and narrowed.
+
+### 2. Where that time goes — over half of it is one JDK bootstrap
+
+`Bnf.getNextTokenList` calls `sentence.start()` **per head**, so the budget is
+per statement and only head 1 (`SELECT`) matters: it is 80% of HotSpot's entire
+131-head walk and 100% of CratonVM's failure. `probes/BnfSplit.java` splits it by
+doing one `Collator.getInstance()` *outside* the timed region. Interleaved, N=7,
+medians, JIT on:
+
+| | cold head 1 | = `java.text.Collator` bootstrap | + rule walk |
+|---|---:|---:|---:|
+| HotSpot 25.0.4 | 22 ms | 18 | 6 |
+| CratonVM | **126 ms** | **67** | **51** |
+| ratio | 5.7x | 3.7x | 8.5x |
+
+H2 reaches the collator from `org.h2.util.StringUtils.startsWithIgnoringCase`,
+which calls `Collator.getInstance()` on **every** invocation;
+`DbContextRule.autoComplete` calls that once per candidate, so the first one
+inside the timed walk pays for `RuleBasedCollator`'s whole table build
+(`RBTableBuilder.addComposedChars`, `sun.text.UCompactIntArray.initPlane`,
+`PatternEntry$Parser`, the `jdk.internal.icu` normaliser — the top of a
+`--stack-sample-ms 2` profile of the real `TestBnf` walk).
+
+Ruled out, so nobody re-checks: the default locale differs (`en` vs `en_US`) but
+the collation rules are byte-identical (length 850, same `hashCode`), and
+`Collator.getInstance`'s per-locale cache works (`200 x getInstance(Locale.US)`
+= 3 ms on CratonVM against 7 ms on HotSpot). Only the first build is slow, and it
+is slow at the ambient interpreter ratio — there is no pathology inside it.
+
+### 3. The one disproportion found: uncontended `synchronized` at 2.1x where HotSpot is 1.05x
+
+The rule walk half IS disproportionate. `collator.equals` — i.e.
+`RuleBasedCollator.compare` — is 446 ms per 2000 calls on CratonVM `--nojit`
+against 37 ms on HotSpot `-Xint` (**12x**, where the ambient plain-call ratio on
+this host is ~7x). Profiling that loop puts `java.lang.StringBuffer.charAt` and
+`.length` at the top: `synchronized` methods, called per character by the ICU
+normaliser.
+
+`probes/SyncCost.java` prices it. Ratios *within one process*, so host load
+cancels:
+
+| | plain call | `synchronized` method | `StringBuffer.charAt` vs `StringBuilder.charAt` |
+|---|---:|---:|---:|
+| HotSpot `-Xint`, 1M | 23 ms | 30 (**1.30x**) | 126 vs 120 (**1.05x**) |
+| CratonVM `--nojit`, 1M | 155 | 494 (**3.19x**) | 1283 vs 598 (**2.15x**) |
+
+Every uncontended `monitorenter` runs `ThreadRegistry::complete_jmx_monitor_enter`
+(an `RwLock` read, an `FxHashMap` lookup, three `parking_lot` mutexes and a linear
+membership scan); every `monitorexit` runs `remove_jmx_locked_monitor` (the same
+lookup plus a linear `retain`); the `monitorenter`/`monitorexit` opcode handlers
+clone three `Arc`s each to pre-build a JEP 358 message only a null operand can
+need; and the `ACC_SYNCHRONIZED` invoke path copies the argument vector before it
+knows whether the acquire will block. A throwaway build with only the first two
+stubbed out took `StringBuffer.charAt` from 1501 to 1124 ms per million.
+
+**It is not enough to close this page** — low-double-digit percent of a walk that
+is 47% of a head that has to halve — but it is a real, contained defect with a
+load-independent oracle, and it wants its own lane.
+
+### Levers re-checked and still inert
+
+`CRATONVM_JIT_THRESHOLD` at 1 / 4 / 10 / 50 and `CRATONVM_JIT_C2_FIRST_CALL=1`
+all land inside the run-to-run spread, confirming 2026-08-10. New: `-Xverify:none`
+makes the collator bootstrap **twice as slow** (252-291 ms against 113-141 ms) —
+not a lever, but a separate anomaly worth its own look, since it says the
+interpreter depends on `verified_code` for speed.
