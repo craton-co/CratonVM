@@ -1265,6 +1265,19 @@ pub struct IrInlineSite {
     pub arg_local_slots: Vec<u32>,
     /// Whether the callee returns a value to push on the caller's stack.
     pub returns_value: bool,
+    /// Is argument 0 a RECEIVER — i.e. is the callee an instance method?
+    ///
+    /// JVMS §6.5 makes a null `objectref` an NPE AT THE INVOKE, before the
+    /// callee's first instruction. Splicing deletes that invoke, so unless the
+    /// builder puts a check back a null receiver simply flows into callee local
+    /// 0 and the body runs with `this == null` — measured on
+    /// `NullReceiverCachedProbe`: `warm-invokespecial=NO-THROW(3)`, the private
+    /// method's body returning its value for a receiver that was null. See
+    /// [`IrBuilder::begin_splice`], which is where the guard goes.
+    ///
+    /// Not derivable from `num_args` or `arg_local_slots`: a static callee's
+    /// argument 0 also lands in local 0.
+    pub receiver_is_arg0: bool,
 }
 
 /// The pc-keyed rows a set of [`IrInlineSite`]s adds to the builder's existing
@@ -5328,6 +5341,7 @@ impl IrBuilder {
         let num_args = site.num_args;
         let max_locals = site.max_locals;
         let returns_value = site.returns_value;
+        let receiver_is_arg0 = site.receiver_is_arg0;
         let arg_local_slots = site.arg_local_slots.clone();
 
         if self.splice.len() >= MAX_IR_SPLICE_DEPTH {
@@ -5348,6 +5362,88 @@ impl IrBuilder {
                 return None;
             }
             callee_locals[slot] = *arg;
+        }
+
+        // JVMS §6.5, put back where the deleted invoke used to enforce it.
+        //
+        // The splice replaces `invokespecial`/`invokevirtual` with the callee's
+        // own bytecode, and nothing in that bytecode is obliged to touch `this`
+        // — `private int small() { return 3; }` does not. So a null receiver ran
+        // the body and returned its value, with no exception anywhere:
+        // `warm-invokespecial=NO-THROW(3)` on `NullReceiverCachedProbe`, against
+        // HotSpot's NPE, and `NO-THROW(440)` for a callee too large for the
+        // single-pass inliner but not for this one. The single-pass backend's
+        // own direct-call arm has carried this check since `cd451facc`; this
+        // tier had it nowhere, so the fix that landed there was invisible on
+        // every method the optimizing tier claimed. See
+        // `docs/internal/retired/warm-invokespecial-on-a-null-receiver-runs-the-callee-again-FIXED-20260908.md`.
+        //
+        // An `Op::Guard` rather than a thrown NPE, which is HotSpot's answer
+        // too: the deopt reconstructs the frame for THIS bci and the
+        // interpreter re-executes the invoke, where the null-receiver guard in
+        // `execute_invokevirtual_cached` sends it to the slow path and the
+        // canonical NPE (message, JEP 358 action and all) is raised by the code
+        // that owns it. Re-executing is sound because the guard fires before a
+        // single byte of the callee has run.
+        //
+        // The snapshot the deopt resolves is the one the main walk pushed at
+        // the top of this bci, with the receiver and the arguments still on the
+        // operand stack — recorded before this function popped them. Absent it,
+        // `resolve_frame_state_for_bci` answers with an EMPTY frame rather than
+        // an error, which would park the interpreter at `pc` with no operands;
+        // so refuse the compile instead, exactly as `plant_uncommon_trap` does
+        // for the same reason.
+        // ...UNLESS THE RECEIVER CANNOT BE NULL, and this is not only a saved
+        // `TEST`/`JNZ`.
+        //
+        // `Op::Guard`'s reference inputs are `GlobalEscape` to escape analysis
+        // (`ir_op_to_ea_op` funnels `Op::Cmp` into `EaOp::Other`, whose arm
+        // republishes every reference operand), so a guard on the receiver of
+        // `new Vec3(…).add(…)` would take scalar replacement away from exactly
+        // the shape the IR inliner exists to enable -- the `per-voxel-allocation`
+        // case, where splicing the accessor chain is what lets the object die
+        // where it is used.
+        //
+        // `definitely_non_null` is `ir_check_elim`'s own predicate rather than a
+        // second copy of the list: a successful `Op::New`/`Op::NewArray` returns
+        // a non-null reference and a failed one returns the deopt sentinel and
+        // never reaches a use. Nothing is given up by skipping the guard for
+        // one -- the check could not fire.
+        let receiver_needs_null_check = receiver_is_arg0
+            && args.first().is_some_and(|&r| {
+                self.graph
+                    .nodes
+                    .get(r as usize)
+                    .is_none_or(|n| !crate::ir_check_elim::definitely_non_null(&n.op))
+            });
+        if receiver_needs_null_check {
+            let receiver = *args.first()?;
+            let ctrl = self.ctrl_opt()?;
+            if self.splice.is_empty() && !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+                return None;
+            }
+            // A guard inside an OPEN splice resolves its frame state through
+            // `resume_bci` to the OUTERMOST invoke, so taking it re-executes
+            // that whole call — including any spliced prefix that already ran.
+            // `spliced_bodies_pure` is the property that makes that harmless
+            // and it is the same clause `trap_replay_is_safe` asks; when it does
+            // not hold, raise the fence that refuses the graph, exactly as
+            // `add_div_zero_guard` and `plant_uncommon_trap` do.
+            if !self.splice.is_empty() && !self.spliced_bodies_pure {
+                self.splice_guard_seen = true;
+            }
+            // `aconst_null`, not `iconst(0)`: `ir_lower`'s `Op::Cmp` selects a
+            // 64-bit CMP only when an operand is `Ref`-typed, and a 32-bit one
+            // would read a pointer whose low word is zero as null. The
+            // `ifnull` arm makes the same choice for the same reason.
+            let null = self.aconst_null();
+            let cond = self.add_data(Op::Cmp(CmpOp::Ne), IrType::Int, vec![receiver, null], pc);
+            self.graph.add(
+                Op::Guard { bci: pc },
+                IrType::Void,
+                vec![ctrl, cond],
+                Some(pc),
+            );
         }
 
         let saved_locals = std::mem::replace(&mut self.locals, callee_locals);

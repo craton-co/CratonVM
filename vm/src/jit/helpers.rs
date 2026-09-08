@@ -3548,7 +3548,7 @@ unsafe fn route_implicit_exc_through_callee(
     // keeps the common exception path free of the thread-guard acquire.
     if cratonvm_jit::deopt::has_last_deopt() {
         if let Some((thread, _guard)) = jit_thread_mut() {
-            if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+            if let Some(v) = try_resume_trapped_callee(vm, thread, info, receiver_class_id) {
                 return v;
             }
         }
@@ -4034,7 +4034,7 @@ unsafe fn handle_compiled_callee_deopt_sentinel(
     // Precise resume of a frame-stashing deopt in the dispatched callee (see
     // `try_resume_trapped_callee`). Must run before consuming the exception
     // signals below: a pure deopt sets no exception flags.
-    if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+    if let Some(v) = try_resume_trapped_callee(vm, thread, info, receiver_class_id) {
         return Some(v);
     }
 
@@ -4253,6 +4253,58 @@ pub(crate) fn despeculate_trapped_method(
     }
 }
 
+/// Does the receiver at this call site resolve `info`'s SAM to the method the
+/// stashed frame names?
+///
+/// This is the identity `try_resume_trapped_callee` could not supply from
+/// `info` alone, and the one `try_lambda_site_direct_call` already spends on
+/// the other door (`site.cached_impl()`). It is read from the metafactory's own
+/// record — `LambdaCallSite::impl_handle`, the handle the `invokedynamic`
+/// bootstrap bound — rather than from `lambda_jit_site`, whose eligibility
+/// gates (static impl, identity coercion, no exception table, the
+/// `CRATONVM_JIT_LAMBDA_SITE` switch) decide whether a FAST PATH may serve the
+/// call and have nothing to say about which method a trapped frame belongs to.
+/// Measured on `DeoptLambdaRerunCount`: that door's `calls` counter is 0 for
+/// the shape this arm has to answer for, so keying on it would have been a fix
+/// that never fires.
+///
+/// Every clause is an equality, and all four must hold. `false` for a receiver
+/// that is not a lambda proxy, which is the overwhelmingly common case and
+/// costs one `FxHashMap` probe under a read lock.
+fn lambda_site_resolves_to(
+    vm: &SharedVm,
+    receiver_class_id: ClassId,
+    info: &JitInvokeInfo,
+    key_class: &str,
+    key_method: &str,
+    key_desc: &str,
+) -> bool {
+    // `ClassId::new(0)` is the "no receiver" value the dispatch helpers pass for
+    // a statically bound site. A lambda SAM call always has one.
+    if receiver_class_id.as_u32() == 0 {
+        return false;
+    }
+    let Some(call_site) = vm
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&receiver_class_id)
+        .cloned()
+    else {
+        return false;
+    };
+    // The proxy must answer THIS call — name and descriptor both, the same pair
+    // `LambdaJitSite::serves` asks. A default method on the functional
+    // interface reaches the same receiver and is not the SAM.
+    if &*call_site.sam_method_name != info.method_name
+        || !descriptors_match_modulo_return(&call_site.sam_descriptor, info.descriptor)
+    {
+        return false;
+    }
+    let h = &call_site.impl_handle;
+    &*h.class_name == key_class && &*h.member_name == key_method && &*h.descriptor == key_desc
+}
+
 /// SAFETY: same contract as the surrounding dispatch helpers — `vm` live,
 /// `info` a live `JitInvokeInfo`, `thread` the current thread's exclusive
 /// borrow (passed in, NOT re-acquired via `jit_thread_mut`, because some call
@@ -4262,6 +4314,7 @@ unsafe fn try_resume_trapped_callee(
     vm: &SharedVm,
     thread: &mut JvmThread,
     info: &JitInvokeInfo,
+    receiver_class_id: ClassId,
 ) -> Option<i64> {
     let trc = |why: &str, detail: &dyn std::fmt::Display| {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
@@ -4292,7 +4345,27 @@ unsafe fn try_resume_trapped_callee(
         trc("the stashed callee was redefined", &key);
         return None;
     }
-    if key_method != info.method_name || !descriptors_match_modulo_return(key_desc, info.descriptor)
+    // The identity check, asked of the method the site RESOLVED to rather than
+    // only of the name it was written with.
+    //
+    // For an ordinary call those are the same method, and `info` answers. For a
+    // SAM call on a lambda they are NEVER the same: `info.method_name` is the
+    // interface method (`apply`, `accept`, `test`) while the frame the compiled
+    // body stashed names the synthetic impl (`lambda$static$0`). Comparing the
+    // two therefore refused EVERY lambda callee's deopt, unconditionally and by
+    // construction — the frame was dropped as an orphan and the impl was
+    // re-entered from bci 0, re-running whatever it had already committed. See
+    // `docs/internal/retired/lambda-callee-deopt-is-orphaned-by-the-sam-name-check-FIXED-20260908.md`.
+    //
+    // The widening is exactly one alternative and it is not a relaxation: the
+    // receiver must be a lambda proxy, its SAM must be the method this call
+    // site names, and the impl the metafactory bound must be the stashed method
+    // NAME FOR NAME. A foreign frame — the Groovy "duplicate `main`" shape that
+    // forced the `5ceb880f` revert, and the reason this refusal is load-bearing
+    // — satisfies none of those.
+    if !(key_method == info.method_name
+        && descriptors_match_modulo_return(key_desc, info.descriptor))
+        && !lambda_site_resolves_to(vm, receiver_class_id, info, key_class, key_method, key_desc)
     {
         trc(
             "stash is not this call site's callee",
@@ -4300,6 +4373,12 @@ unsafe fn try_resume_trapped_callee(
         );
         return None;
     }
+    // A resume claimed through the lambda arm above is a lambda body's deopt
+    // that did NOT re-run from entry, which is what the SAM door's own outcome
+    // split counts. Record it there — the counter's question is "was a lambda
+    // body's trapped frame spent or dropped", and the answer is the same
+    // whichever door spent it. See `lambda_site_deopt_outcomes`.
+    let via_lambda_identity = key_method != info.method_name;
 
     // Resolve the trapping method from ITS OWN declaring class (baked in the
     // key) — mirrors the `callee_compiler` resolution recipe.
@@ -4419,6 +4498,9 @@ unsafe fn try_resume_trapped_callee(
 
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
         eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
+    }
+    if via_lambda_identity {
+        crate::runtime::interpreter::lambda_site_bump_resumed();
     }
 
     // De-speculate the trapping method FIRST (record + evict + escalate), so
@@ -21157,13 +21239,17 @@ unsafe fn try_lambda_site_direct_call(
         // apart. Draining them is safe here BECAUSE this arm called exactly one
         // method: whatever they say happened, happened inside this site's impl.
         //
-        // The shared sentinel handler cannot be used for this: it identifies
-        // the trapped callee by the CALL SITE's name (`try_resume_trapped_callee`
-        // compares `info.method_name`), which for a SAM call is `apply` — never
-        // the `lambda$...` body that actually trapped. It would refuse the
-        // resume, re-stash the deopt flag, and the compiled CALLER would then
-        // read the callee's deopt as its own, de-speculating an innocent method
-        // and leaving a reconstructed frame nobody can claim.
+        // The shared sentinel handler is not used for this, and the reason is
+        // no longer that it CANNOT be: `try_resume_trapped_callee` used to
+        // identify the trapped callee by the CALL SITE's name alone, which for
+        // a SAM call is `apply` and never the `lambda$...` body that actually
+        // trapped, so it refused the resume and minted an orphan
+        // (`lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908`).
+        // It now asks the metafactory's `impl_handle` as a second identity and
+        // would answer correctly. This arm still owns the case, because it owns
+        // something that helper does not: `site.disable_direct()`, the latch
+        // that keeps every LATER call to this site off the direct arm. Draining
+        // the signals here is what makes that decision possible.
         let sig = take_all_jit_signals(thread);
         let stashed = cratonvm_jit::deopt::take_last_deopt();
         if sig.exception.is_some() || (stashed.is_none() && !sig.deopt) {

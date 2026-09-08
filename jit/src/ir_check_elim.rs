@@ -228,7 +228,7 @@ fn bounds_pair(node_op: &Op, inputs: &[NodeId]) -> Option<(NodeId, NodeId)> {
 }
 
 /// Does this node's result carry a value that cannot be null?
-fn definitely_non_null(op: &Op) -> bool {
+pub(crate) fn definitely_non_null(op: &Op) -> bool {
     matches!(
         op,
         // A successful allocation returns a non-null reference; a failed one
