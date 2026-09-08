@@ -44,8 +44,10 @@
 // One caveat, with its own page: the `growth` section SIGSEGVs under all THREE
 // of those flags together, identically on both binaries and at the same minor
 // cycle every run. See
-// `docs/known-issues/gcprobes-stale-value-reaches-set_field-under-the-three-flag-harness-20260908.md`;
-// it is not this family, and removing any one of the three flags makes it pass.
+// `docs/internal/audits/stale-value-at-set_field-methodhandles-lookup-RETIRED-20260908.md`.
+// It was `MethodHandles.lookup()` storing a pre-GC class mirror, reached from
+// `ConcurrentSkipListMap.<clinit>`, and it is fixed -- the caveat is kept here
+// because the section is what found it.
 
 import java.io.StringReader;
 import java.io.StringWriter;

@@ -9955,7 +9955,15 @@ pub fn register_essential_natives_with_shims(
                     }
                 }
                 let mut read = 0usize;
+                // GC-safety: `buffered_input_stream_read_one` dispatches the
+                // delegate's `read()` -- real bytecode -- once per byte, and
+                // both the stream and the destination array are carried in
+                // from outside the loop.
+                let this_pin = ctx.pin_native_root(this);
+                let arr_pin = ctx.pin_native_root(arr);
                 for i in 0..limit {
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     let b = buffered_input_stream_read_one(ctx, this)?;
                     if b < 0 {
                         break;
@@ -15069,7 +15077,14 @@ pub fn register_essential_natives_with_shims(
             };
             let len = ctx.array_length(input_arr);
             let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+            // GC-safety: `build_stack_trace_element_array` allocates once per
+            // thread, and both the input array being read and the output array
+            // being written are carried across every turn.
+            let input_pin = ctx.pin_native_root(input_arr);
+            let outer_pin = ctx.pin_native_root(outer);
             for i in 0..len {
+                let input_arr = ctx.read_native_pin(input_pin, input_arr);
+                let outer = ctx.read_native_pin(outer_pin, outer);
                 let inner = match ctx.get_array_element(input_arr, i) {
                     Value::Object(Some(t)) => {
                         let trace = ctx.thread_stack_trace(t);
