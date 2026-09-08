@@ -32,8 +32,30 @@ use super::*;
 /// real-frame-deopt: `true` (default OFF) when an IR-path deopt should resume
 /// the interpreter at the trapping bci from the reconstructed frame, instead of
 /// re-running the method from entry. Gated by `CRATONVM_IR_DEOPT_RESUME` while
-/// it soaks — the precise resume is unvalidated against the full VM suite, and
-/// no production IR method emits a deopt guard yet, so default OFF is inert.
+/// it soaks — the precise resume is unvalidated against the full VM suite.
+///
+/// # "default OFF is inert" was true once, and stopped being true
+///
+/// This doc used to finish "…and no production IR method emits a deopt guard
+/// yet, so default OFF is inert." That clause is FALSE and was load-bearing for
+/// a real defect: it is why three `jit_bridge` sinks could gate their precise
+/// resume behind this flag and read as harmless, while in fact they fell
+/// through to re-running the method from entry and repeating any side effect
+/// the compiled body had already committed
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`).
+///
+/// Production IR methods emit deopt guards routinely — array access, field
+/// access and division all lower to one, and every `invokedynamic` the tier
+/// cannot lower gets an unconditional planted trap. Measured 2026-09-07 on a
+/// single `ASTParserLoadingTest` run: **27 547 traps taken at runtime.**
+///
+/// What makes default OFF tolerable now is NOT inertness. It is that the sinks
+/// no longer depend on this flag to resume: they ask
+/// [`sink_precise_resume_allowed`], which is default ON. This flag now governs
+/// only the `resume_from_ir_deopt` path, whose distinguishing capability is
+/// inlined-caller chains (`materialise_inlined_chain`) — a case
+/// `build_deopt_frame_inner` declines and counts as
+/// `DeoptFrameBail::InlinedChain`, and which has not been observed to occur.
 pub(super) fn ir_deopt_resume_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
