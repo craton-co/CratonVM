@@ -3533,7 +3533,35 @@ as a coin, which is exactly why the rule is to discard on the control and not
 on whether the answer is convenient.
 
 Over the two valid runs `over` wins **11 of 42 on CPU and 10 of 42 on wall** —
-about 3% slower on the means, consistent in both instruments and both runs.
+about 3% slower on the means, and agreeing in DIRECTION in both instruments and
+both runs.
+
+*(Re-scored 2026-09-07 against the stricter standard the hibernate reversal
+forced on this file. Per run: run 1 is 8 of 21 on both instruments, z = -1.09 —
+**a coin on its own**; run 3 is 3 of 21 and 2 of 21, z = -3.27 and -3.71. Pooled,
+z = -3.09 and -3.39. So "consistent in both runs" overstated run 1: what is
+consistent is the DIRECTION, four times out of four, and the pooled count is
+what carries the significance. That is still a much stronger position than the
+withdrawn hibernate result, whose two samples pointed OPPOSITE ways (+2.47 and
+-2.49) — direction agreement across independent runs is exactly the check that
+one failed and this one passes.*
+
+*What remains untested is the same thing that broke hibernate: both runs used
+the SAME 21 classes, so this establishes REPEATABILITY, not that the effect
+generalises to other H2 classes. The claim is load-bearing — it is why
+`OVER_INTRINSIC` stays off and why the accessor work is scoped as "lower these
+families" rather than "stop refusing them" — so the disjoint-class check is
+worth running before anyone leans on it harder than that.)*
+
+*And that check cannot currently be run, which is the more useful finding: **the
+instrument that produced these numbers is not in the repo.** `tools/suite-pair-ab`
+is fork-per-class JUnit only ("netty, hibernate-reactive" by its own header) and
+knows nothing about H2; the three-interleaved-run harness described above was
+ad-hoc and did not survive its session. So the measurement backing a default-OFF
+flag and a filed work item is, today, unreproducible by anyone including its
+author. Committing an H2 equivalent of `pair-ab` — same ABBA-per-unit shape, same
+same-config noise floor, same split-half check — is the prerequisite for
+re-testing any H2 throughput claim in this file, not just this one.*
 
 **So the intrinsic at those sites really is worth more than optimizing the
 method around it.** Trading an inline unboxing load or an `Atomic*` accessor for
@@ -4428,3 +4456,43 @@ than a copy, so the two cannot drift, and it was verified to FAIL when the
 detector is disabled. Its own first draft had the bug this file keeps meeting:
 the "same pooled count" assertion compared two EMPTY strings and reported `ok`
 when the summary had not run at all.
+
+### And the trap does not buy anything measurable either
+
+With the correctness objection retracted, the only thing keeping
+`CRATONVM_JIT_IR_UNRESOLVED_CLASS_TRAP` off was that its benefit had never been
+measured. Measured now — 57 hibernate-reactive classes, ABBA per class, on a
+binary with the deopt-sink fix:
+
+```text
+A faster than B in 34 of 57 classes            z = +1.46  (a coin)
+split-half   : first 28 z = +1.13 | last 29 z = +0.56
+median per-class delta : +1.4%
+median within-arm noise: 10.7%   (SAME config, two runs)
+VERDICT: UNMEASURABLE
+```
+
+No effect. The two halves at least AGREE in direction this time — both weakly
+positive, so this is not the reversal pattern the split-half check exists to
+catch — but the pooled count is a coin and the effect is a seventh of the noise
+floor.
+
+That floor is the caveat and it is a large one: **10.7%, against 2.7% on the
+quiet-host hibernate run earlier the same day**. Load was 3.5-6.5 on 8 cores
+throughout. This is a weak measurement, and it is reported as one. The
+sub-result that "of the 10 classes whose own delta beats their own noise, A is
+faster in 9" is NOT quoted as evidence: it is a selection conditioned on the
+noise estimate, over ten classes, and this document has already been burned once
+today by a significant-looking count over a small sample.
+
+So the switch stays OFF with both halves of its case now measured rather than
+assumed:
+
+- **not harmful** — 112 traps fired across 30 classes, `ok=241 failed=0`,
+  zero `refusing side-effecting replay` (the old "it craters hibernate" was a
+  broken deopt sink seen through this switch);
+- **not beneficial** — no measurable throughput effect, on a noisy run.
+
+What would settle it: the same 57-class A/B on a host at load < 2.5, which is
+what produced the 2.7% floor. Anything less and the answer is the noise floor,
+not the lever.

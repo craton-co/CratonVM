@@ -784,6 +784,137 @@ pub(super) fn verify_reconstructed_oops(
 /// Rust-side only), so no GC can stale the built frame. `stress` forces a GC
 /// immediately before refill — the ONLY sanctioned injection point — to
 /// exercise the forward-in-place path (tests / `CRATONVM_GC_STRESS`).
+/// Why [`build_deopt_frame_inner`] declined to rebuild a trapped frame.
+///
+/// # Why this is counted at all
+///
+/// Before 2026-09-07 the deopt sinks answered a trap they could not resume by
+/// re-running the method from entry, which for a body that had already
+/// committed a store runs it twice
+/// (`jit-bridge-sinks-re-ran-a-side-effecting-body-FIXED-20260907.md`). The fix
+/// resumes instead — but only when the frame can be rebuilt, and "when it
+/// cannot" was a single phrase covering NINE distinct causes, none of them
+/// counted. So the residual could be described and not sized, and nobody could
+/// say whether a given workload hits it at all, or which cause to attack first.
+///
+/// `try_resume_trapped_callee` learned the same lesson in its own comments: *"a
+/// refusal that cannot be named cannot be counted, which is why the orphan in
+/// `jit-direct-call-mints-an-orphaned-deopt-frame` was attributed to inlining
+/// on no evidence."* These are that naming, for the rebuild side.
+///
+/// Ungated: one relaxed increment on a path that is already doing frame
+/// reconstruction, and a census that is off by default is a census nobody reads
+/// when the number finally matters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeoptFrameBail {
+    /// The stash names an inlined caller chain. `materialise_inlined_chain`
+    /// handles those for `resume_from_ir_deopt`; this builder does not.
+    InlinedChain,
+    /// The frame belongs to a DIFFERENT method than the one being rebuilt — a
+    /// nested callee's trap whose sentinel travelled outward.
+    IdentityMismatch,
+    /// `bci == u32::MAX`, the superseded-guard sentinel, which exists precisely
+    /// so this check fails.
+    SupersededSentinel,
+    /// `CRATONVM_DEOPT_VERIFY` found a structural invariant violated.
+    VerifyFailed,
+    /// An `ACC_SYNCHRONIZED` method carrying scalar-replaced objects: the
+    /// method monitor may have been elided under that replacement.
+    SynchronizedWithVirtuals,
+    /// Re-materialising the scalar-replaced object graph failed.
+    VirtualMaterialise,
+    /// A local slot the mapper has no representation for.
+    UnmappableLocal,
+    /// An operand-stack slot the mapper has no representation for.
+    UnmappableStack,
+    /// A held monitor that is not a resolved object reference.
+    BadMonitor,
+    /// The reconstructed operand stack did not fit the frame's padded stack.
+    StackPush,
+}
+
+impl DeoptFrameBail {
+    const ALL: [DeoptFrameBail; 10] = [
+        DeoptFrameBail::InlinedChain,
+        DeoptFrameBail::IdentityMismatch,
+        DeoptFrameBail::SupersededSentinel,
+        DeoptFrameBail::VerifyFailed,
+        DeoptFrameBail::SynchronizedWithVirtuals,
+        DeoptFrameBail::VirtualMaterialise,
+        DeoptFrameBail::UnmappableLocal,
+        DeoptFrameBail::UnmappableStack,
+        DeoptFrameBail::BadMonitor,
+        DeoptFrameBail::StackPush,
+    ];
+
+    /// The census name. Hyphenated and stable: these are grepped out of suite
+    /// logs, so renaming one silently breaks whoever is tracking it.
+    pub fn name(self) -> &'static str {
+        match self {
+            DeoptFrameBail::InlinedChain => "inlined-caller-chain",
+            DeoptFrameBail::IdentityMismatch => "identity-mismatch",
+            DeoptFrameBail::SupersededSentinel => "superseded-guard-sentinel",
+            DeoptFrameBail::VerifyFailed => "deopt-verify-failed",
+            DeoptFrameBail::SynchronizedWithVirtuals => "synchronized-with-virtual-objects",
+            DeoptFrameBail::VirtualMaterialise => "virtual-object-materialise-failed",
+            DeoptFrameBail::UnmappableLocal => "unmappable-local-slot",
+            DeoptFrameBail::UnmappableStack => "unmappable-stack-slot",
+            DeoptFrameBail::BadMonitor => "held-monitor-not-an-object",
+            DeoptFrameBail::StackPush => "operand-stack-did-not-fit",
+        }
+    }
+}
+
+static DEOPT_FRAME_BAILS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Count one decline, and trace it under `CRATONVM_DBG_DEOPT`.
+fn note_deopt_frame_bail(why: DeoptFrameBail, rframe: &cratonvm_jit::deopt::ReconstructedFrame) {
+    DEOPT_FRAME_BAILS[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+        eprintln!(
+            "[cratonvm-deopt] frame rebuild refused ({}): stash={} bci={}",
+            why.name(),
+            rframe.method_key,
+            rframe.bci,
+        );
+    }
+}
+
+/// `(reason, count)` for every way a trapped frame could not be rebuilt.
+///
+/// A non-zero total is the size of the residual the sink fix left behind: those
+/// traps still fall back to re-running the method from entry, side effects and
+/// all. Zero means every trap this run took was resumed precisely.
+pub fn deopt_frame_bail_counts() -> Vec<(&'static str, u64)> {
+    DeoptFrameBail::ALL
+        .iter()
+        .map(|w| {
+            (
+                w.name(),
+                DEOPT_FRAME_BAILS[*w as usize].load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Total declines, across every reason — the one number a regression test
+/// asserts is zero.
+pub fn deopt_frame_bail_total() -> u64 {
+    DEOPT_FRAME_BAILS
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .sum()
+}
+
+/// Reset the census. **Tests only** — a test that warms a VM and then measures
+/// one trapping call needs the warm-up's declines out of the way.
+pub fn reset_deopt_frame_bail_counts() {
+    for c in DEOPT_FRAME_BAILS.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn build_deopt_frame_inner(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -798,6 +929,7 @@ pub(crate) fn build_deopt_frame_inner(
     // (a non-scalar elision sets `has_elided_monitor` → `can_deopt_resume=false`),
     // so every monitor here is materializable + relockable.
     if !rframe.caller_frames.is_empty() {
+        note_deopt_frame_bail(DeoptFrameBail::InlinedChain, rframe);
         return None;
     }
 
@@ -814,9 +946,11 @@ pub(crate) fn build_deopt_frame_inner(
         &cached.method_name,
         &cached.method_descriptor,
     ) {
+        note_deopt_frame_bail(DeoptFrameBail::IdentityMismatch, rframe);
         return None;
     }
     if rframe.bci == u32::MAX {
+        note_deopt_frame_bail(DeoptFrameBail::SupersededSentinel, rframe);
         return None;
     }
 
@@ -834,6 +968,7 @@ pub(crate) fn build_deopt_frame_inner(
                  — forcing safe re-run",
                 rframe.method_key, rframe.bci
             );
+            note_deopt_frame_bail(DeoptFrameBail::VerifyFailed, rframe);
             return None;
         }
     }
@@ -889,13 +1024,18 @@ pub(crate) fn build_deopt_frame_inner(
         // this sink to bail on. This whole path is `CRATONVM_DEOPT_REAL`-gated
         // (default-off).
         if cached.is_synchronized {
+            note_deopt_frame_bail(DeoptFrameBail::SynchronizedWithVirtuals, rframe);
             return None;
         }
         let mut copy = rframe.clone();
-        crate::runtime::deopt_materialize::materialize_virtual_objects(
+        if crate::runtime::deopt_materialize::materialize_virtual_objects(
             shared, thread, &mut copy, /* stress_gc */ false, /* keep_pins */ true,
         )
-        .ok()?;
+        .is_err()
+        {
+            note_deopt_frame_bail(DeoptFrameBail::VirtualMaterialise, rframe);
+            return None;
+        }
         materialized_frame = copy;
         &materialized_frame
     } else {
@@ -918,8 +1058,20 @@ pub(crate) fn build_deopt_frame_inner(
             rframe.method_key, rframe.bci, rframe.locals, rframe.stack
         );
     }
-    let locals = ir_deopt_locals(&rframe.locals)?;
-    let stack_vals = ir_deopt_frame_values(&rframe.stack)?;
+    let locals = match ir_deopt_locals(&rframe.locals) {
+        Some(l) => l,
+        None => {
+            note_deopt_frame_bail(DeoptFrameBail::UnmappableLocal, rframe);
+            return None;
+        }
+    };
+    let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
+        Some(v) => v,
+        None => {
+            note_deopt_frame_bail(DeoptFrameBail::UnmappableStack, rframe);
+            return None;
+        }
+    };
 
     // ROOT the reconstructed oops BEFORE the GC-capable refill (locals then
     // stack — the order the re-read below relies on).
@@ -947,7 +1099,10 @@ pub(crate) fn build_deopt_frame_inner(
             // Null monitor or an unresolved form — refuse rather than relock a
             // bogus object (would corrupt the monitor table). Release nothing
             // extra; the caller truncates `native_pin_roots` to its watermark.
-            _ => return None,
+            _ => {
+                note_deopt_frame_bail(DeoptFrameBail::BadMonitor, rframe);
+                return None;
+            }
         }
     }
 
@@ -1024,6 +1179,7 @@ pub(crate) fn build_deopt_frame_inner(
         // them. The caller then releases the pins and re-runs.
         if frame.stack.push(*v).is_err() {
             frame.recycle(&mut thread.locals_pool, &mut thread.stacks_pool);
+            note_deopt_frame_bail(DeoptFrameBail::StackPush, rframe);
             return None;
         }
     }
