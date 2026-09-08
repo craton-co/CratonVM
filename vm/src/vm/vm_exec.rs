@@ -19200,6 +19200,47 @@ pub(crate) fn deadrecv_check(shared: &SharedVm, obj: ObjectRef, site: &'static s
         return false;
     }
     let addr = obj.as_ptr() as usize;
+    // RE-ALLOCATION SCREEN, and without it this probe reports mostly noise.
+    //
+    // Neither reclamation ring is pruned when the allocator hands a freed span
+    // back out: `record_young_span_freed` appends one entry per coalesced span
+    // and nothing ever removes it, so EVERY object later allocated inside that
+    // span answers `young_freed_lookup` for the rest of the process. The rings
+    // remember what was freed, not what is dead now.
+    //
+    // `is_object_address` is the opposite question and the one this guard
+    // actually wants: the arena's object-start bitmap records "a base this
+    // arena handed out and has NOT freed", so `Some` means the address was
+    // RE-SERVED and is live whatever the ring remembers. It is address-keyed
+    // and lock-free, and it screens through the commit bitmap before touching
+    // anything, so it is safe on exactly the decommitted addresses this guard
+    // exists to survive.
+    //
+    // What this trades away, stated rather than hidden: an ABA — a stale
+    // reference to an address the allocator has since re-served for a
+    // DIFFERENT object — now reads as live and is not reported. That case is
+    // indistinguishable here without a per-address allocation epoch, and the
+    // alternative was a guard whose every hit had to be re-litigated by hand.
+    // `CRATONVM_DBG_VACATED_FRAMES` (`gc_quiescence::was_vacated`) is the
+    // instrument that does track re-issue exactly; use it for the ABA face.
+    //
+    // Measured on `test_classes/gpu/GpuResidencyGc 0 1024 800` under
+    // `--XX:UseGc Generational`, which is where the unscreened form was read as
+    // evidence (`gpuresidencygc-generational-jit-reclaims-a-live-object-FIXED-20260908.md`):
+    // 8 hits every run with the JIT on and 0 with `--nojit` — a split that is
+    // fully explained by WHICH COLLECTOR RAN, since only the non-moving sweep
+    // populates the young ring at all, and not by any reference being stale.
+    // With the screen: 0 hits, 3 runs, and the probe passes.
+    //
+    // It also puts the guard's COST back where it belongs. Both lookups are
+    // linear scans of their rings — the old-gen one is 2^20 entries — on every
+    // `identity_hash_code` and `class_id_of_object`. Armed, that probe took
+    // 163-251 s against 4 s unarmed; with this screen in front of them it is 4 s
+    // armed, because a live address never reaches the scan. An instrument that
+    // dilates its workload 40-60x is not measuring the same run.
+    if shared.mem.heap.is_object_address(addr).is_some() {
+        return false;
+    }
     if cratonvm_gc::gen_heap::old_freed_lookup_covering(addr).is_some()
         || cratonvm_gc::gen_heap::young_freed_lookup(addr).is_some()
     {
