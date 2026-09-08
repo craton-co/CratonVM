@@ -9286,6 +9286,145 @@ fn report_stale_words_in(
     }
 }
 
+/// Walk this thread's live compiled frame bands and report any word naming an
+/// address the LAST collection vacated.
+///
+/// # Why this exists next to `reclaim_guard::audit_thread_frames`
+///
+/// That auditor tests `thread.frames` -- the INTERPRETER frames -- against the
+/// same ledger, and its report ("a LIVE frame slot still names an address the
+/// LAST collection moved an object away from") is the exact verdict wanted
+/// here. It simply cannot see a compiled frame: a JIT frame's oops live in the
+/// machine stack band, not in a `Frame`. So on a workload whose stale holder is
+/// compiled, the interpreter auditor is silent and the first symptom is the
+/// SIGSEGV.
+///
+/// The ledger is what makes this sharper than
+/// [`report_stale_after_remap`]. That one flags any word equal to a pointer-map
+/// KEY, which on a real stack is mostly dead slop that happens to look like a
+/// moved address (thousands per run). `gc_quiescence::was_vacated` subtracts the
+/// destination set, so a hit is a word naming an address the collector moved an
+/// object AWAY from and did not move anything back INTO -- which is precisely
+/// the read that faults.
+///
+/// No-op unless `CRATONVM_DBG_VACATED_FRAMES` is armed.
+pub fn audit_jit_frames_for_vacated(
+    shared: Option<&crate::vm::SharedVm>,
+    tid: u64,
+    site: &'static str,
+) {
+    if !cratonvm_gc::gc_quiescence::vacated_frames_enabled() {
+        return;
+    }
+    let scanner_sp = current_stack_pointer();
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut v = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(v.as_mut_slice());
+        }
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            let Some(info) = entry.precise else { continue };
+            let entry_sp = entry.entry_sp;
+            let mut rbp = info.exact_rbp;
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+                continue;
+            }
+            let Some(innermost_cm) = innermost_frame_method(
+                rbp,
+                info.exact_cm_id,
+                entry_sp,
+                scanner_sp,
+                info.compiled_method,
+            ) else {
+                continue;
+            };
+            // SAFETY: same contract as `report_stale_after_remap` -- the chain
+            // entry's CompiledMethod is Arc-owned by the JIT cache while any of
+            // its frames is live.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*innermost_cm };
+            let mut frames = 0usize;
+            while frames < 4096 {
+                frames += 1;
+                let frame_size = cm.osr_frame_size;
+                if frame_size <= 0 {
+                    break;
+                }
+                let frame_size = frame_size as usize;
+                const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+                if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+                    break;
+                }
+                report_vacated_words_in(rbp - frame_size, rbp, cm, rbp, shared, tid, site);
+                // SAFETY: `rbp` is a validated frame base in this thread's live
+                // JIT stack interval.
+                let parent_rbp = unsafe { (rbp as *const usize).read() };
+                let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+                let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    break;
+                };
+                if parent_rbp <= rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp >= entry_sp
+                    || parent_rbp < scanner_sp
+                {
+                    break;
+                }
+                // SAFETY: code ranges retain their CompiledMethod metadata for
+                // the lifetime of an active frame.
+                cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                rbp = parent_rbp;
+            }
+        }
+    });
+}
+
+/// Hits reported by [`audit_jit_frames_for_vacated`] this process.
+pub static JIT_VACATED_FRAME_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn report_vacated_words_in(
+    lo: usize,
+    hi: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    rbp: usize,
+    shared: Option<&crate::vm::SharedVm>,
+    tid: u64,
+    site: &'static str,
+) {
+    if hi <= lo {
+        return;
+    }
+    let mut addr = (lo + 7) & !7usize;
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi {
+        // SAFETY: aligned read inside this thread's own live stack interval,
+        // bounded by the caller's frame bounds.
+        let w = unsafe { (addr as *const usize).read() };
+        if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(w) {
+            let n = JIT_VACATED_FRAME_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 200 {
+                // Cast: a compiled frame is far smaller than i32::MAX.
+                let off = (rbp - addr) as i32;
+                eprintln!(
+                    "[jit-vacated-frame] site={site} tid={tid} method={} off={off} region={}                      verifiable={} resumed_from={} value=0x{w:x} moved_to=0x{moved_to:x}                      class_at_target={}",
+                    cm.method_label,
+                    cm.frame_layout.region_name(off),
+                    band_slot_is_verifiable(
+                        off,
+                        &cm.frame_layout,
+                        moving_young_frame_live_hi(rbp, cm),
+                    ),
+                    is_callee_saved_gpr_image(off, &cm.frame_layout),
+                    class_name_at(shared, moved_to),
+                );
+            }
+        }
+        addr += 8;
+    }
+}
+
 /// Walk every live compiled frame band after a moving collection has remapped
 /// the oop-map slots and report words that still name a moved-from address.
 ///
