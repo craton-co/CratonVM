@@ -5724,7 +5724,7 @@ mod pin_capability_tests {
     ///
     /// That arm read `true` until 2026-09-06, and the cost was a wrong ANSWER,
     /// not a slow one:
-    /// `docs/known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+    /// `docs/internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
     /// (19 netty classes, Generational only, an NPE on a live JUnit object) and
     /// the ten-second H2 SIGSEGV in `70c486744`'s call-site comment. The rule
     /// itself is tested next to `pinned_credit_admissible`; this is the other

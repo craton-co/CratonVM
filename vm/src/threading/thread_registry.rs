@@ -2709,12 +2709,19 @@ impl ThreadRegistry {
         // stacks, as `(os_tid, addr, value)`. Drained once here and bucketed by
         // owner below: these words live in a peer's machine stack, are named by
         // no oop map, and are the population §12 of
-        // `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+        // `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
         // measured stale on essentially every relocating cycle. Draining
         // unconditionally matters as much as using it -- a capture left behind
         // by a cycle that did not fold would be applied against the WRONG
         // pointer map later.
         let scanned_stack_slots = cratonvm_gc::gc_quiescence::take_peer_stack_slots();
+        // Adopted by SOME blocked thread below. The complement is the reading
+        // that matters: a capture nobody claimed is a word in a peer that is
+        // NOT in a blocked region -- a take-over freeze, whose thread has no
+        // wake hook to apply a fixup at -- naming an object this cycle just
+        // relocated, with nothing left to rewrite it. Counted rather than
+        // assumed absent; see `PEER_STACK_SLOTS_UNROUTED`.
+        let mut adopted_here = 0usize;
         let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -2799,6 +2806,7 @@ impl ThreadRegistry {
                             });
                             cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_ADOPTED
                                 .fetch_add(1, Ordering::Relaxed);
+                            adopted_here += 1;
                         }
                     }
                 }
@@ -2879,6 +2887,14 @@ impl ThreadRegistry {
                     snapshot.len()
                 );
             }
+        }
+        // The complement of the adoption, taken after the walk so every blocked
+        // thread has had its chance to claim a capture.
+        if scanned_stack_slots.len() > adopted_here {
+            cratonvm_gc::gc_quiescence::PEER_STACK_SLOTS_UNROUTED.fetch_add(
+                (scanned_stack_slots.len() - adopted_here) as u64,
+                Ordering::Relaxed,
+            );
         }
     }
 

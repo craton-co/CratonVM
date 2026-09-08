@@ -202,7 +202,7 @@ confounded with the result: the arm that failed relocated ~2.5x more than the
 arm that did not. **A relocation-gated defect not firing in the arm that
 relocates less is not evidence of a repair.**
 
-`docs/known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+`docs/internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
 reaches the same conclusion independently for its own 19 classes, and states the
 consequence plainly: the refusal now suppressing relocation is the SAME
 `[moving-young] fallback` this page's Part 2 documents as a *throughput*

@@ -654,7 +654,6 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_BD_DEBUG` | DBG | `CRATONVM_DBG=bd-debug` | opt-in | off | diag | snapshot | types, vm |
 | `CRATONVM_BG_COMPILE` | JIT | `CRATONVM_JIT=bg-compile` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_BIN` | — | `CRATONVM_BIN` | scalar | unset | behaviour | snapshot | difftest |
-| `CRATONVM_BLOCKED_WAKE_JIT_REMAP` | GC | `CRATONVM_GC=blocked-wake-jit-remap` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_BLOCK_PRIVATE_NETS` | SECURITY | `CRATONVM_SECURITY=block-private-nets` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_BOOT_MODULE_REGISTRY` | LOADER | `CRATONVM_LOADER=boot-module-registry` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_BYTEBUFFER_INTRINSIC` | REAL | `CRATONVM_REAL=bytebuffer-intrinsic` | opt-in | off | behaviour | snapshot | native-builtins |
@@ -1674,6 +1673,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_NEEDS_EXACT_TRACE` | DBG | `CRATONVM_DBG=needs-exact-trace` | opt-in | off | diag | snapshot | vm |
 | `CRATONVM_NETTY_QUEUE_BRIDGE` | IO | `CRATONVM_IO=netty-queue-bridge` | default-on | on | behaviour | snapshot | types |
 | `CRATONVM_NONEXISTENT_VAR_12345` | — | n/a (undeclared) | live | unset | harness/ABI | live getenv | absent-name probe |
+| `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP` | GC | `CRATONVM_GC=blocked-wake-jit-remap` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_NO_CONSERVATIVE_LOCALS` | JIT | `CRATONVM_JIT=conservative-locals` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_NO_CTOR_DIRECT_CALL` | JIT | `CRATONVM_JIT=ctor-direct-call` | opt-out | on | behaviour | snapshot | vm |
 | `CRATONVM_NO_DEFRAG_PROMOTE` | GC | `CRATONVM_GC=defrag-promote` | opt-out | on | behaviour | snapshot | types |
