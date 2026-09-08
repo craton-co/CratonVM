@@ -2008,25 +2008,37 @@ fn apply_jul_config_entries(
     // handler built this way is publish-silent. Detect the unset field
     // and patch in the documented default pattern directly, sidestepping
     // the broken `invokedynamic` path without reimplementing it.
+    // GC-safety: `new_object_initialized` and `create_string` both allocate,
+    // and `handler` is an element of a Rust `Vec` that no collection rewrites
+    // -- so on every turn but the first, `setFormatter` was dispatched on the
+    // handler's pre-GC address. The formatter itself is live only in a Rust
+    // local between its construction and its store, and `create_string` sits
+    // between them. Pin both, per turn, and release them at the foot of the
+    // body so the pin stack does not grow with the handler count.
     for (idx, (_, handler)) in created.iter().enumerate() {
         if formatter_configured[idx] {
             continue;
         }
+        let handler_pin = ctx.pin_native_root(*handler);
         if let Ok(Some(Value::Object(Some(fmt)))) =
             ctx.new_object_initialized("java/util/logging/SimpleFormatter", "()V", &[])
         {
+            let fmt_pin = ctx.pin_native_root(fmt);
             // Always overwrite: the broken constructor doesn't reliably
             // leave `format` exactly null (observed non-null-but-wrong
             // values too), so a null-only guard under-detects.
             let pattern = ctx.create_string("%1$tc%n%4$s: %5$s%n%6$s%n");
+            let fmt = ctx.read_native_pin(fmt_pin, fmt);
             ctx.set_field_by_name(fmt, "format", Value::Object(Some(pattern)));
+            let handler_now = ctx.read_native_pin(handler_pin, *handler);
             let _ = ctx.invoke_virtual(
-                *handler,
+                handler_now,
                 "setFormatter",
                 "(Ljava/util/logging/Formatter;)V",
                 &[Value::Object(Some(fmt))],
             );
         }
+        ctx.unpin_native_roots(handler_pin);
     }
     Ok(None)
 }

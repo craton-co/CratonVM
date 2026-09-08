@@ -507,9 +507,9 @@ fn https_not_yet_open(ctx: &mut dyn NativeContext) -> MethodCallFailed {
 /// once happened, which is not the question — the question is whether this
 /// CONNECTION is open now, and after [`https_recycle_carrier`] it is not. See
 /// that function for HotSpot's measured post-`disconnect()` transcript.
-fn https_has_session(ctx: &mut dyn NativeContext, mut this: ObjectRef) -> bool {
-    https_ensure_exchanged(ctx, &mut this);
-    let key = ctx.identity_hash_code(this) as u32 as u64;
+fn https_has_session(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> bool {
+    https_ensure_exchanged(ctx, this);
+    let key = ctx.identity_hash_code(*this) as u32 as u64;
     https_peer_info()
         .lock()
         .unwrap()
@@ -522,10 +522,10 @@ fn https_has_session(ctx: &mut dyn NativeContext, mut this: ObjectRef) -> bool {
 /// `SSLPeerUnverifiedException` when one was and it carried no chain.
 fn https_peer_chain_or_throw(
     ctx: &mut dyn NativeContext,
-    mut this: ObjectRef,
+    this: &mut ObjectRef,
 ) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
-    https_ensure_exchanged(ctx, &mut this);
-    let key = ctx.identity_hash_code(this) as u32 as u64;
+    https_ensure_exchanged(ctx, this);
+    let key = ctx.identity_hash_code(*this) as u32 as u64;
     // A recycled entry is filtered out here rather than matched below, so it
     // lands on the `None` arm — `IllegalStateException: connection not yet
     // open`, which is HotSpot's measured post-`disconnect()` answer, and NOT
@@ -627,8 +627,8 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
         "getServerCertificates",
         "()[Ljava/security/cert/Certificate;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let chain = https_peer_chain_or_throw(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            let chain = https_peer_chain_or_throw(ctx, &mut this)?;
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
             for (i, der) in chain.iter().enumerate() {
                 let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der)?;
@@ -655,8 +655,8 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
         "getLocalCertificates",
         "()[Ljava/security/cert/Certificate;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !https_has_session(ctx, this) {
+            let mut this = obj_arg(args, 0)?;
+            if !https_has_session(ctx, &mut this) {
                 return Err(https_not_yet_open(ctx));
             }
             Ok(Some(Value::Object(None)))
@@ -697,8 +697,8 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
         "getPeerPrincipal",
         "()Ljava/security/Principal;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let chain = https_peer_chain_or_throw(ctx, this)?;
+            let mut this = obj_arg(args, 0)?;
+            let chain = https_peer_chain_or_throw(ctx, &mut this)?;
             // JSSE's own fallback: the peer principal is the leaf certificate's
             // subject when the session carries no separate principal.
             let leaf = crate::keystore::make_x509_mirror(ctx, "peer", &chain[0])?;
@@ -726,8 +726,8 @@ fn register_https_session_accessors(r: &mut NativeMethodRegistry, cls: &str) {
         "getLocalPrincipal",
         "()Ljava/security/Principal;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !https_has_session(ctx, this) {
+            let mut this = obj_arg(args, 0)?;
+            if !https_has_session(ctx, &mut this) {
                 return Err(https_not_yet_open(ctx));
             }
             Ok(Some(Value::Object(None)))

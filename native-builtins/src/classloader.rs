@@ -8551,11 +8551,19 @@ pub(crate) fn ucl_try_define_local_class(
     };
     let (define_lock_mutex, define_lock_cvar) = &*define_lock;
     let mut in_progress = define_lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    // GC-safety: this loop WAITS on a condvar, which is the widest window there
+    // is -- a peer thread's collection is exactly what runs while this one is
+    // parked -- and then re-probes with `loader`, a bare Rust local carried in
+    // from outside. `find_loaded_class_for_loader` can itself allocate, so even
+    // without the wait the second turn would be reading a pre-GC address. Pin
+    // it and re-read at the top of each turn.
+    let loader_pin = ctx.pin_native_root(loader);
     while *in_progress {
         let (guard, timeout) = define_lock_cvar
             .wait_timeout(in_progress, std::time::Duration::from_secs(30))
             .unwrap_or_else(|e| e.into_inner());
         in_progress = guard;
+        let loader = ctx.read_native_pin(loader_pin, loader);
         // The other thread may have finished defining it (success -- return
         // its result) or failed (we should try ourselves rather than loop
         // forever on a definition that will never arrive).
@@ -8583,6 +8591,7 @@ pub(crate) fn ucl_try_define_local_class(
     // auto-configuration conditions on a second thread and races the main one
     // for exactly these classes. HotSpot has no such window: `loadClass`
     // re-checks `findLoadedClass` after taking `getClassLoadingLock(name)`.
+    let loader = ctx.read_native_pin(loader_pin, loader);
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }

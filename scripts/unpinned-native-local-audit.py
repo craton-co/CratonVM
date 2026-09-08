@@ -33,7 +33,7 @@ keeps naming the pre-call address. `Option<ObjectRef>`, `&[ObjectRef]` and
 
 This paragraph used to say the rule "cannot see" those, and that was true for
 the wrong reason: `PARAM_OPT` listed all five shapes and FOUR OF THEM MATCHED
-NOTHING, because a trailing `` after `]`/`>` demands a word character and a
+NOTHING, because a trailing `\b` after `]`/`>` demands a word character and a
 parameter list supplies `,` or `)`. `--opt` scanned only the bare `Value` arm
 while advertising the rest. See the note on `PARAM_OPT` itself; the three print
 natives that crashed under Generational are the positive control, and this
@@ -154,13 +154,63 @@ ROOT = re.compile(
     r"|\bscope\s*\.\s*(?:root|get)\b"
 )
 
+# NOT A REFERENCE, whatever `REF_RHS` saw in the same statement. Each of these
+# was a row: `server_id` (`get_field(..).as_int()`) in `re10_serve_loop_run`,
+# `copied` (`.is_ok()`) in `native_sl_iterator`, `retain_class_ref`
+# (`.as_int() != 0`, `.unwrap_or(false)`) in both `p59_sw_*`, `name`
+# (`ctx.read_string(s)`) in `bdru_register_bean_definition`, and `path`
+# (a string LITERAL, `"java/nio/file/Path"`) in `register_phase57_nio_file`.
+# The reassembled statement mentions an allocating call because the binding
+# sits in a `match` or is glued to the `r.register(` that follows it; the
+# BOUND VALUE is an `i32`, a `bool`, a `String` or a `&str`.
+NON_REF_RHS = re.compile(
+    r"\.as_(?:int|long|float|double|bool|str|string)\s*\(\s*\)"
+    r"|\.is_(?:ok|err|some|none|empty)\s*\(\s*\)"
+    r"|\bread_string\s*\("
+    r"|^\s*let\s+(?:mut\s+)?[a-z_][a-z_0-9]*\s*=\s*\""
+)
+
 # Leading whitespace ALLOWED. Anchoring at column 0 left every function
 # inside `mod tests` or an `impl` block unindexed, and glued its body onto
 # the previous top-level fn — which is how 23 `#[test]` bodies in
 # lang_string.rs were reported under `register_phase52_string_buffer`.
 FNDEF = re.compile(r"^\s*(?:pub(?:\([a-z ]+\))? )?(?:async )?(?:unsafe )?fn ([a-z_][a-z_0-9]*)")
 LET = re.compile(r"^\s*let\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*[:=]")
-CALLEE = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\s*\(")
+# A DESTRUCTURING `let` IS A REBINDING TOO, and `LET` cannot see one.
+# `rooted_across1` hands its refreshed receiver back as `(this, out)`, and
+# all 21 of its callers spell that `let (this, buf) = rooted_across1(..)`.
+# With only the scalar `LET`, none of those reads as a rebinding and every
+# one of them was reported as a caller reusing a stale copy -- 21 of the
+# `--launder` rule's 34 native-collections sites, all false.
+LET_PAT = re.compile(r"^\s*let\s+(.*?)\s*=[^=]")
+IDENT = re.compile(r"[a-z_][a-z_0-9]*")
+PAT_KEYWORDS = frozenset(("mut", "ref", "if", "let"))
+
+
+def let_binds(name, text):
+    """True if this statement `let`-binds `name` -- scalar OR destructured.
+
+    The pattern side of a `let` is matched loosely on purpose: a name that
+    appears there is bound by it in every shape this tree uses (`(a, b)`,
+    `[a, b]`, `Some(a)`, `Foo { a, .. }`), and a name that appears on the
+    pattern side but is NOT a binder (an enum path segment, say) is a
+    conservative early stop rather than a false report."""
+    m = LET.match(text)
+    if m and m.group(1) == name:
+        return True
+    m = LET_PAT.match(text)
+    if not m:
+        return False
+    pat = m.group(1)
+    if not pat.startswith(("(", "[", "{")) and "(" not in pat and "{" not in pat:
+        return False
+    return any(t == name for t in IDENT.findall(pat) if t not in PAT_KEYWORDS)
+# `$` JOINS THE LOOKBEHIND. `register_s2_bytebuffer` is a `macro_rules!` whose
+# bodies call `$read(ctx, this, off)` / `$write(..)`; without `$` here the
+# metavariable read as a call to some `fn read(` elsewhere in the tree, that
+# node was transitively allocating, and all three of the macro's loops became
+# rows. A metavariable is not an edge in any call graph.
+CALLEE = re.compile(r"(?<![a-z_0-9.$])([a-z_][a-z_0-9]*)\s*\(")
 PARAM_REF = re.compile(r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&mut\s+)?ObjectRef\b")
 # The shapes a bare `ObjectRef` declaration misses. `--opt` scans these too.
 # They are NOT folded into the default population: they carry a reference the
@@ -688,7 +738,7 @@ def branchy(text):
     # — the ONLY allocation is inside a block that leaves. Ten rows in
     # `socket_channel.rs` latched onto one of these and reported a window that
     # cannot exist, hiding whichever later call is the real one.
-    if t.startswith("let ") and " else " in t and re.search(r"(?:return|break|continue)", t):
+    if t.startswith("let ") and " else " in t and re.search(r"\b(?:return|break|continue)\b", t):
         return True
     return not t.startswith("let ") and "=>" in t
 
@@ -705,7 +755,7 @@ def leaves(text):
     if t.startswith("return"):
         return True
     return (t.startswith("let ") and " else " in t
-            and re.search(r"(?:return|break|continue)", t) is not None)
+            and re.search(r"\b(?:return|break|continue)\b", t) is not None)
 
 
 # A CLOSURE DEFINITION IS NOT AN EXECUTION.
@@ -846,7 +896,36 @@ def gc_capable(text, allocfns):
 # The default and `--any-binding` rules report 18 rows on that file before the
 # fix and NONE of them is one of the four.
 LOOPHEAD = re.compile(r"^\s*(?:\}\s*)?(?:for\b|while\b|loop\s*\{)")
-REREAD = re.compile(r"read_native_pin|handle_get|scope\s*\.\s*get|end_blocking_region_refs")
+REREAD = re.compile(r"read_native_pin|handle_get|\bscope\s*\.\s*get\b|end_blocking_region_refs")
+
+ROOTED_ACROSS = re.compile(r"\brooted_across\s*\(")
+ROOT_LIST = re.compile(r"&mut\s*\[(.*?)\]", re.S)
+
+
+def rooted_across_roots(text):
+    """The names in a `rooted_across(ctx, &mut [..], ..)` root list.
+
+    `rooted_across` IS the correct fix for a loop-carried reference -- it
+    pins each root, runs the body, and writes the forwarded address back
+    through the `&mut`. A rule that cannot see a correct fix will apply a
+    second one on top of it, which is the exact damage the `native-io` page
+    names, so the loop rule has to read this list.
+
+    Both spellings appear: `&mut this` for an owned local, and a bare `this`
+    where the enclosing function already holds it as `&mut ObjectRef`."""
+    if not ROOTED_ACROSS.search(text):
+        return frozenset()
+    m = ROOT_LIST.search(text, ROOTED_ACROSS.search(text).end())
+    if not m:
+        return frozenset()
+    out = set()
+    for part in m.group(1).split(","):
+        part = part.strip()
+        if part.startswith("&mut "):
+            part = part[5:].strip()
+        if re.fullmatch(r"[a-z_][a-z_0-9]*", part):
+            out.add(part)
+    return frozenset(out)
 
 
 def loop_spans(body):
@@ -863,6 +942,11 @@ def loop_spans(body):
                 spans.append((i, j))
                 break
     return spans
+
+
+PIN_BIND = re.compile(
+    r"^\s*let\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*=\s*"
+    r"(?:ctx|scope)\s*\.\s*pin_native_root\s*\(\s*([a-z_][a-z_0-9]*)\s*\)")
 
 
 def scan_loops(fn, allocfns):
@@ -895,23 +979,68 @@ def scan_loops(fn, allocfns):
             if m and m.group(1) != "_":
                 pre_map[m.group(1)] = st
         pre = list(pre_map.items())
+        # THE PIN IS HANDED TO THE CALLEE, BESIDE THE NAME.
+        # `put_str(ctx, map_pin, map, k, v)` re-reads `map` through `map_pin`
+        # as its FOURTH line, so the loops in `populate_locale_names_en_body`
+        # and `overlay_cldr_bundle` are already correct -- and a rule that
+        # cannot see a correct fix applies a second one on top of it.
+        pin_of = {}
+        for st in stmts:
+            if st.line >= a:
+                break
+            m = PIN_BIND.match(st.text)
+            if m:
+                pin_of[m.group(2)] = m.group(1)
         cands = [(p, None) for p in params] + pre
         for name, bind in cands:
             # A handle is not an ObjectRef; that is the point of a handle scope.
             if bind is not None and re.search(
-                    r"(?:scope\s*\.\s*root|handle_root|pin_native_root)\s*\(", bind.text):
+                    r"\b(?:scope\s*\.\s*root|handle_root|pin_native_root)\s*\(", bind.text):
+                continue
+            if bind is not None and NON_REF_RHS.search(bind.text):
                 continue
             if bind is not None and not REF_RHS.search(bind.text) and not ref_use(
                     name, chr(10).join(fn.body)):
                 continue
             # Refreshed or rebound INSIDE the body: this is the correct form.
+            # AN ASSIGNMENT IS A REBINDING. `point = next` in
+            # `bc_ec_point_return_times_pow2`, `state = ctx.invoke_virtual(..)`
+            # in `pd_gather_fold`/`pd_gather_scan`, `this = cur` at the foot of
+            # `ecs_take`'s body -- in every one the assigned value is the
+            # post-call return, so the NEXT iteration starts current. `LET` and
+            # `REBIND` see neither.
+            #
+            # It only counts when no GC-capable statement NAMES the reference
+            # after it: an assignment early in the body with a collection after
+            # it leaves the next turn just as stale. The assigning statement
+            # itself counts as after -- its call returns before the assignment
+            # lands.
+            assign = re.compile(r"(?<![.\w!<>=+\-*/%&|^])" + re.escape(name)
+                                + r"\s*=(?!=)")
+            last_assign = max((k for k, st in enumerate(inner)
+                               if assign.search(st.text)), default=-1)
+            last_gc = max((k for k, st in enumerate(inner)
+                           if gc_capable(st.text, allocfns) and not leaves(st.text)
+                           and names(name, st.text)), default=-1)
+            if last_assign >= 0 and last_assign >= last_gc:
+                continue
             refreshed = False
             for st in inner:
+                # The pin handle beside the name (see `pin_of`).
+                pin = pin_of.get(name)
+                if pin and names(pin, st.text) and names(name, st.text):
+                    refreshed = True
+                    break
                 if REREAD.search(st.text) and names(name, st.text):
                     refreshed = True
                     break
-                m2 = LET.match(st.text)
-                if m2 and m2.group(1) == name:
+                # `rooted_across` writes the forwarded address back through the
+                # `&mut` in its root list. Carrying a reference in that list is
+                # already the fix.
+                if name in rooted_across_roots(st.text):
+                    refreshed = True
+                    break
+                if let_binds(name, st.text):
                     refreshed = True
                     break
                 if REBIND(name).search(st.text):
@@ -1078,9 +1207,62 @@ def _args(text, callee):
     return out
 
 
+def return_type(fn):
+    """The declared return type, or "" for a unit function.
+
+    Needed because "hands the refresh back" is only meaningful for a function
+    that returns something. `ad_grow`, `lbq_ensure_capacity`,
+    `lli_resnapshot` and `pq_ensure_capacity` all end on a trailing
+    `if .. { .. }` block that MENTIONS `this`, and a tail test without this
+    gate read all four as returning it. They return `()`."""
+    sig = signature(fn)
+    head = "\n".join(fn.body[: len(sig.split("\n")) + 4])
+    depth, idx = 0, None
+    for i, ch in enumerate(head):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                idx = i
+                break
+    if idx is None:
+        return ""
+    rest = head[idx + 1:]
+    brace = rest.find("{")
+    if brace >= 0:
+        rest = rest[:brace]
+    m = re.search(r"->\s*(.+)", rest, re.S)
+    return " ".join(m.group(1).split()) if m else ""
+
+
+def returns_param(fn, p):
+    """True if `fn`'s TAIL EXPRESSION hands `p` back to its caller.
+
+    Only the tail, deliberately. `cslm_ensure_capacity` has an early
+    `return (keys, values);` on the no-growth path and returns
+    `(new_keys, new_values)` on the growth path -- the one that refreshes
+    `keys`/`values` and then does NOT return them. Accepting any `return` that
+    names the parameter excused exactly that laundering."""
+    if not return_type(fn):
+        return False
+    stmts = statements(fn.body)
+    if stmts and FNDEF.match(stmts[0].text):
+        stmts = stmts[1:]
+    for st in reversed(stmts):
+        t = st.text.strip()
+        if not t or t in ("}", "};"):
+            continue
+        # A statement is not a tail expression, and neither is a `let`.
+        if t.endswith(";") or LET.match(t) or LET_PAT.match(t):
+            return False
+        return names(p, t)
+    return False
+
+
 def launderers(fns):
     """Functions that take an `ObjectRef` BY VALUE and refresh their own copy."""
-    out = {}
+    out, out_returns = {}, {}
     for fn in fns:
         sig = signature(fn)
         body = "\n".join(fn.body)
@@ -1098,15 +1280,25 @@ def launderers(fns):
             # It fired 244 times in one crate, which is what said it was the
             # wrong question. The laundering shape is narrower: a contract that
             # says "this refreshes YOUR variable", satisfied with a copy.
+            # NOT laundering: the copy is RETURNED. `rooted_across1` exists to
+            # root one receiver across a body and hand it back as
+            # `(this, out)`, and every caller spells the call
+            # `let (this, buf) = rooted_across1(..)` -- a refresh, not a leak.
+            # Reported on its own line rather than dropped, because "returns
+            # it" only helps a caller that BINDS it: `let (_, buf) = ..` is
+            # back in the laundering shape and this rule cannot tell.
+            if why and returns_param(fn, p):
+                out_returns.setdefault(fn.name, []).append(p)
+                why = None
             if why:
                 out.setdefault(fn.name, []).append((p, why, fn))
-    return out
+    return out, out_returns
 
 
 def scan_launder(fns):
     """(laundering fn, param) plus the call sites whose caller reuses its own
     copy after the call -- which is where the stale read actually happens."""
-    lau = launderers(fns)
+    lau, handed_back = launderers(fns)
     hits = []
     for name, entries in sorted(lau.items()):
         for p, why, fn in entries:
@@ -1125,20 +1317,25 @@ def scan_launder(fns):
                     a = args[idx].strip()
                     if not re.fullmatch(r"[a-z_][a-z_0-9]*", a):
                         continue
+                    # `let (this, buf) = helper(ctx, this, ..)` REBINDS the
+                    # very name it passes, so every statement below reads the
+                    # RETURNED value. The rebinding scan starts at k+1 and
+                    # structurally cannot see the call statement itself.
+                    if let_binds(a, st.text):
+                        continue
                     for st2 in stmts[k + 1:]:
                         # A REBINDING is a fresh value, not a stale use. A
                         # registration function holds several closures, each
                         # with its own `let this = obj_arg(args, 0)?`, and
                         # without this every later closure read as a reuse of
                         # the earlier one's receiver.
-                        m2 = LET.match(st2.text)
-                        if (m2 and m2.group(1) == a) or REBIND(a).search(st2.text):
+                        if let_binds(a, st2.text) or REBIND(a).search(st2.text):
                             break
                         if names(a, st2.text):
                             sites.append((g.name, a, g.line + st.line, g.line + st2.line))
                             break
             hits.append((name, p, why, sites))
-    return hits
+    return hits, handed_back
 
 
 def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
@@ -1180,8 +1377,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
                     rooted_elsewhere = True
                 # A rebinding is a FRESH value. `let p = ...`, `if let Some(p)`,
                 # `for p in ...` and a closure parameter all shadow.
-                m2 = LET.match(t)
-                if m2 and m2.group(1) == p:
+                if let_binds(p, t):
                     break
                 if REBIND(p).search(t):
                     break
@@ -1263,8 +1459,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
             # not the only way to make one. `if let Some(obj) = ...` in a later
             # branch shadowed the outer `obj` in `bb_derive_view` and was
             # reported as a use of it.
-            m2 = LET.match(t)
-            if m2 and m2.group(1) == name:
+            if let_binds(name, t):
                 break
             if REBIND(name).search(t):
                 break
@@ -1292,9 +1487,27 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
     return hits
 
 
+def assert_no_control_bytes():
+    """A `\\b` written into a `sed` REPLACEMENT becomes a literal backspace, and
+    0x08 is an ordinary character to `re` -- the alternative then demands a
+    backspace in the Rust source and matches nothing, silently. Three of this
+    file's guards were dead that way for an unknown number of runs. Fail at
+    import instead."""
+    import inspect
+    src = inspect.getsource(inspect.getmodule(assert_no_control_bytes))
+    bad = [i + 1 for i, l in enumerate(src.split("\n"))
+           if any(c in l for c in "\x07\x08\x0b\x0c")]
+    if bad:
+        raise SystemExit("control bytes in this script at lines %s -- a `\\b` "
+                         "was written by a sed replacement; see "
+                         "assert_no_control_bytes" % bad)
+
+
+assert_no_control_bytes()
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("glob")
+    ap.add_argument("glob", nargs="+")
     ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--tests", action="store_true", help="include test bodies")
@@ -1309,7 +1522,11 @@ def main():
                     help="also scan Option<ObjectRef> / &[ObjectRef] / Vec<ObjectRef> / &[Value] / Value parameters (`wide`). `args: &[Value]` is the shape of every registered native, so this is the tranche that covers native ENTRY "
                     "points rather than their helpers.")
     a = ap.parse_args()
-    fns = index(sorted(glob.glob(a.glob)))
+    # `**` is written in every invocation in the docs; without recursive=True
+    # glob treats it as a single `*` and SILENTLY drops every file below the
+    # first subdirectory level -- 41 of native-builtins' 178 sources.
+    files = sorted({f for g in a.glob for f in glob.glob(g, recursive=True)})
+    fns = index(files)
     allocfns = allocating(fns, a.depth)
     rows, skipped = [], 0
     for fn in fns:
@@ -1327,7 +1544,7 @@ def main():
         for (ln, nm, use, kind) in found:
             rows.append((os.path.basename(fn.file), ln, fn.name, nm, use, kind))
     if a.launder:
-        hits = scan_launder(fns)
+        hits, handed_back = scan_launder(fns)
         print("laundering helpers: %d" % len(hits))
         live = 0
         for name, p, why, sites in hits:
@@ -1337,6 +1554,12 @@ def main():
                 live += 1
                 print("        caller %-40s passes `%s` at :%d, uses it again at :%d" % (g, var, cl, ul))
         print("TOTAL laundering helpers: %d ; call sites that then reuse: %d" % (len(hits), live))
+        if handed_back:
+            print("not laundering -- the refreshed copy is RETURNED "
+                  "(sound only where the caller binds it): %d"
+                  % sum(len(v) for v in handed_back.values()))
+            for nm, ps in sorted(handed_back.items()):
+                print("  %-46s %s" % (nm, ", ".join(sorted(ps))))
         return
     per = collections.Counter(r[0] for r in rows)
     print("functions indexed: %d (test bodies skipped: %d) ; reachable-allocating: %d"

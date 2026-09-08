@@ -23334,7 +23334,12 @@ pub(crate) fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: O
     let _ = ctx.ensure_class_initialized(pfp);
     let cid = ctx.class_id_by_name(pfp);
     let mut mode = 0u32;
+    // GC-safety: `Set.contains` is a virtual dispatch into real bytecode
+    // (`hashCode`/`equals` on the caller's own set), run once per permission
+    // constant. `set` is a bare Rust parameter, stale from the second turn on.
+    let set_pin = ctx.pin_native_root(set);
     for i in 0..BITS.len().min(POSIX_FILE_PERMISSION_CONSTANTS.len()) {
+        let set = ctx.read_native_pin(set_pin, set);
         let Some(c) = cid else { break };
         let Some(slot) = ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i])
         else {

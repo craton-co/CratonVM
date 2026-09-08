@@ -2935,23 +2935,23 @@ pub(crate) fn lucene_buffered_checksum_flush_body(ctx: &mut dyn NativeContext, t
 
 pub(crate) fn lucene_buffered_checksum_write(
     ctx: &mut dyn NativeContext,
-    mut this: ObjectRef,
+    this: &mut ObjectRef,
     bytes: &[u8],
 ) {
-    let buffer = match ctx.get_field_by_name(this, "buffer") {
+    let buffer = match ctx.get_field_by_name(*this, "buffer") {
         Value::Object(Some(buffer)) => buffer,
         _ => return,
     };
     let cap = ctx.array_length(buffer);
     let mut upto = ctx
-        .get_field_by_name(this, "upto")
+        .get_field_by_name(*this, "upto")
         .as_int()
         .unwrap_or(0)
         .max(0) as usize;
     if upto.saturating_add(bytes.len()) > cap {
-        lucene_buffered_checksum_flush(ctx, &mut this);
+        lucene_buffered_checksum_flush(ctx, this);
         upto = ctx
-            .get_field_by_name(this, "upto")
+            .get_field_by_name(*this, "upto")
             .as_int()
             .unwrap_or(0)
             .max(0) as usize;
@@ -2962,16 +2962,16 @@ pub(crate) fn lucene_buffered_checksum_write(
     for (i, b) in bytes.iter().enumerate() {
         ctx.set_array_element(buffer, upto + i, Value::Int(*b as i8 as i32));
     }
-    ctx.set_field_by_name(this, "upto", Value::Int((upto + bytes.len()) as i32));
+    ctx.set_field_by_name(*this, "upto", Value::Int((upto + bytes.len()) as i32));
 }
 
 pub(crate) fn lucene_buffered_checksum_update_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+    lucene_buffered_checksum_write(ctx, &mut this, &value.to_le_bytes());
     Ok(None)
 }
 
@@ -2979,13 +2979,13 @@ pub(crate) fn lucene_buffered_checksum_update_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let value = match args.get(1) {
         Some(Value::Long(v)) => *v,
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
-    lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+    lucene_buffered_checksum_write(ctx, &mut this, &value.to_le_bytes());
     Ok(None)
 }
 
@@ -2993,7 +2993,7 @@ pub(crate) fn lucene_buffered_checksum_update_longs(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
+    let mut this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
     let mut off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
     let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
@@ -3003,7 +3003,7 @@ pub(crate) fn lucene_buffered_checksum_update_longs(
             Value::Int(v) => v as i64,
             _ => 0,
         };
-        lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+        lucene_buffered_checksum_write(ctx, &mut this, &value.to_le_bytes());
         off += 1;
     }
     Ok(None)
