@@ -1,4 +1,79 @@
-# A lambda callee's deopt is orphaned by an identity check that compares the SAM's name, and its side effect runs twice
+# A lambda callee's deopt is orphaned by an identity check that compares the SAM's name, and its side effect runs twice — FIXED
+
+**Status:** FIXED and retired 2026-09-08, the day it was opened. The witness
+that was `#[ignore]`d because it failed is now un-ignored and green:
+
+```
+lambda site: resumed=1 unresumable=0 | delta=1 delta_static=1
+```
+
+**12 runs, 12 times `delta=1`** — against the 12-of-12 `delta=2` recorded below,
+with the same non-lambda control still reporting 1 in both. Measured on the
+Linux build host, release binary, `vm/tests/jit_lambda_door_deopt_resumes.rs`.
+
+## The fix, which is the one this page specified
+
+`try_resume_trapped_callee` (`vm/src/jit/helpers.rs`) asked for the identity of
+the method the call site RESOLVED to and had only the name it was WRITTEN with.
+It now asks a second question when the first says no:
+
+```rust
+if !(key_method == info.method_name
+    && descriptors_match_modulo_return(key_desc, info.descriptor))
+    && !lambda_site_resolves_to(vm, receiver_class_id, info, key_class, key_method, key_desc)
+```
+
+`lambda_site_resolves_to` reads the metafactory's own record — the
+`LambdaCallSite::impl_handle` bound by the `invokedynamic` bootstrap, keyed on
+the receiver's proxy class — and requires four equalities: the receiver is a
+lambda proxy, its SAM name is this site's method name, its SAM descriptor
+matches this site's descriptor modulo return, and the impl handle names the
+stashed class, method and descriptor exactly. A foreign frame — the Groovy
+"duplicate `main`" shape that forced the `5ceb880f` revert, and the reason the
+refusal is load-bearing — satisfies none of them, so nothing this check used to
+refuse is now admitted.
+
+Both callers (`route_implicit_exc_through_callee` and
+`handle_compiled_callee_deopt_sentinel`) already computed a `receiver_class_id`
+for their own callee-exception-table probes; it is threaded through rather than
+re-derived.
+
+### Not `lambda_jit_site`, and that is the part worth keeping
+
+The obvious source for the resolved impl is `LambdaJitSite::cached_impl()`,
+which `try_lambda_site_direct_call` already spends on the other door. It is the
+wrong source here. That door's `calls` counter is **0** for this shape — the
+number this page recorded — because `lambda_jit_site` is gated on whether a FAST
+PATH may serve the call (static impl, identity coercion, no exception table, the
+`CRATONVM_JIT_LAMBDA_SITE` switch), a question with nothing to say about which
+method a trapped frame belongs to. Keying the fix on it would have been a fix
+that never fires. `lambda_proxies` is the registry that always has the answer.
+
+### The counter the test asserts on
+
+`lambda_site_deopt_outcomes().resumed` now counts two doors, not one: the direct
+arm as before, and this dispatch-helper arm when it claims a lambda body's frame
+through the impl handle. Both answer the same question — was a trapped lambda
+body's frame SPENT rather than dropped — and a split reporting only one of them
+reads as zero engagement on a run where the other door did all the work, which
+is exactly the vacuity the witness's `resumed > 0` assertion exists to remove.
+
+## The gate
+
+* `vm/tests/jit_lambda_door_deopt_resumes.rs` — un-ignored, 12/12.
+* `vm/tests/jit_bridge_sink_resumes_instead_of_rerunning.rs` — the sibling whose
+  `unresumable == 0` was structurally vacuous; still green, and now non-vacuous
+  through the file above.
+* `vm/tests/null_receiver_cached_invoke.rs`, `vm/tests/jit_null_receiver_npe.rs`,
+  `vm/tests/lambda_safe_unmodifiable_map_classcast.rs` — the rest of the
+  2026-09-08 set, green.
+
+Everything below is the original record, kept for its reasoning and its
+measurements.
+
+---
+
+## The original record
 
 | | |
 |---|---|

@@ -2034,11 +2034,21 @@ pub(crate) fn lambda_site_bump_unresumable() {
     lambda_site_prof::SITE_UNRESUMABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `(resumed, unresumable)` — the direct arm's deopt outcome split.
+/// `(resumed, unresumable)` — the deopt outcome split for a lambda body.
 ///
 /// `unresumable` is the number of SAM calls whose compiled body trapped and was
 /// then re-executed from entry by the generic path, side effects and all. It is
 /// the metric a regression test asserts is zero.
+///
+/// **`resumed` counts two doors, not one.** The direct arm
+/// (`try_lambda_site_direct_call`) is the original, and since 2026-09-08 the
+/// compiled caller's dispatch helper (`try_resume_trapped_callee`) bumps it too
+/// when it claims a lambda body's frame through the metafactory's
+/// `impl_handle`. Both answer the same question — was a trapped lambda body's
+/// frame SPENT rather than dropped — and a split that reported only one of them
+/// would read as zero engagement on a run where the other door did all the
+/// work, which is precisely the shape
+/// `lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908` had.
 pub fn lambda_site_deopt_outcomes() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (
