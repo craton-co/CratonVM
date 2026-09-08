@@ -79,6 +79,31 @@ cargo test -p cratonvm-vm --test null_receiver_cached_invoke
 Expect `warm-invokespecial=NPE`. `NO-THROW(3)` is the defect. Run it more than
 once — it is ~80% and the cold arm always passes.
 
+## A second one from the same gate run, unrelated mechanism
+
+`cargo test --workspace` on `dev` is red for two independent reasons today. The
+other is `lambda_safe_unmodifiable_map_classcast`, and unlike the one above it
+is **deterministic — 3 of 3 alone**:
+
+```
+java/lang/ClassCastException: class java.util.ImmutableCollections$MapN
+    cannot be cast to class java.lang.String
+  at LambdaSafeUnmodifiableMapClassCastProbe.check(…:24)
+  at LambdaSafeUnmodifiableMapClassCastProbe.safelyApply(…:12)
+```
+
+A `Map` reaching a `String` cast through a lambda's `safelyApply`. Different
+mechanism from the null-receiver defect above — that one skips a check, this one
+delivers the wrong object — but recorded here rather than on its own page
+because the useful fact is the pair: **the workspace gate is not green on `dev`,
+for two reasons, neither of them anybody's landing.** Whoever picks either up
+should run `cargo test --workspace` first and see what else has joined them.
+
+Both are lambda- or dispatch-adjacent, as is
+`lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908.md` found the
+same day. Three defects in one week in the dispatch paths is either a coincidence
+or a shape; nothing here settles which.
+
 ## Related
 
 - `sealed-derencodable-getinterfaces-npe-mockito-x509-FIXED.md` — the field
