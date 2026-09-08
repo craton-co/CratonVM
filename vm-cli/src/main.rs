@@ -139,6 +139,17 @@ fn maybe_dump_shutdown_reports() {
     // function is where W7-90 put its answer.
     if gc_stats_requested() {
         eprintln!("{}", cratonvm_vm::collector_decision_report());
+        // Step 14a5's engagement (`roots::a5_frame_pass`): how many cycles took
+        // the non-moving sweep on the A5 unregistered-JIT-frame term alone —
+        // where step 1's conservative frame probe, keyed on `is_active()`, was
+        // off — and how many roots the repair added there. `cycles=0` says the
+        // repair decided nothing in this run, which a passing test cannot
+        // otherwise be distinguished from "the repair works". Printed HERE for
+        // the same reason as the decision report above: `maybe_dump_shutdown_
+        // reports` is on the normal-return arm, and the workloads this number
+        // is wanted for end in `System.exit`.
+        let (a5_cycles, a5_roots) = cratonvm_vm::memory::roots::a5_frame_pass::census();
+        eprintln!("[GC] a5_frame_pass: cycles={a5_cycles} roots={a5_roots}");
         // The collector-state half of the same census -- see
         // `VM_FOR_SHUTDOWN`. Only reachable while the VM is alive, which is
         // the `System.exit` arm; on the normal-return arm `run()` has already

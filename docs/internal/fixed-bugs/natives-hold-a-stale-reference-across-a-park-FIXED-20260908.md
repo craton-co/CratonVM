@@ -288,10 +288,13 @@ Two co-occurrences were a coincidence of a deterministic workload. The reclaim
 and the Mockito failure are two separate pre-existing things in one class.
 
 Filed with the evidence, the ruled-out mechanisms, and the most specific lead
-(three predicates in this tree disagree about whether the non-moving sweep is
-running, and the one that guards the conservative frame-slot probe is the
-narrowest):
-`bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+(the predicate guarding the conservative frame-slot probe is narrower than the
+collector's own, so an A5 unregistered-JIT-frame cycle ran the non-moving sweep
+with the root-widening pass off). That lead was the defect, and it is now
+fixed:
+`docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-FIXED-20260908.md`.
+The page listed THREE disagreeing predicates; one of the three was a disjunct
+that could only ever read `false` and has been deleted.
 
 ## What this does NOT claim
 

@@ -2356,6 +2356,7 @@ impl Frame {
                         if let Some(ptr) = cv.as_object_ptr() {
                             cratonvm_gc::gc_quiescence::note_liveness_filtered(
                                 ptr as usize,
+                                heap.collection_count(),
                                 || {
                                     format!(
                                         "{}.{} pc={} local[{}]",

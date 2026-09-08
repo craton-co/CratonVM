@@ -1803,9 +1803,6 @@ fn dbg_no_prune() -> bool {
     *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_PRUNE").is_some())
 }
 
-/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
-/// per-native-call hot-path rationale as [`dbg_no_prune`].
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 /// H2-CID0 (2026-08-05) — times the unregistered-JIT-frame memo said "clean"
 /// while a real scan of the same range found a frame.
 ///
@@ -2025,6 +2022,15 @@ fn unreg_memo_hiwater_enabled() -> bool {
     })
 }
 
+/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate, same per-native-call hot-path
+/// rationale as [`dbg_no_prune`].
+///
+/// Its doc comment and a `#[cfg(any(windows, linux))]` used to sit ~200 lines
+/// above, orphaned where the function had been before it moved — so the
+/// attribute landed on [`UNREG_MEMO_SUPPRESSED`] instead, cfg-gating a counter
+/// that `vm-cli` reads unconditionally. Both are reunited with the function
+/// here; the gate itself needs no cfg (the flag is read on every target, only
+/// its CONSUMER in `scan_active_jit_frames` is windows/linux).
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
