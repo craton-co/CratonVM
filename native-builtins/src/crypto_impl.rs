@@ -2254,13 +2254,17 @@ pub struct RsaPrivateKey {
 
 impl Drop for RsaPrivateKey {
     fn drop(&mut self) {
-        // Zeroize private key material
-        for limb in &mut self.d.limbs {
-            *limb = 0;
-        }
-        for limb in &mut self.n.limbs {
-            *limb = 0;
-        }
+        // Zeroize private key material.
+        //
+        // `fill(0)` rather than the equivalent `for limb in .. { *limb = 0 }`
+        // only because `cargo clippy -- -D warnings` began refusing the loop
+        // form (`manual_slice_fill`, stable 1.98) and was red on `dev` for
+        // every push. Semantics are identical, and so is what the optimiser is
+        // allowed to do with either: neither form is a GUARANTEED zeroization —
+        // that needs a volatile write or the `zeroize` crate — so this is a
+        // lint fix, not a strengthening of the property above.
+        self.d.limbs.fill(0);
+        self.n.limbs.fill(0);
         for crt in [
             &mut self.p,
             &mut self.q,
@@ -2269,9 +2273,7 @@ impl Drop for RsaPrivateKey {
             &mut self.qinv,
         ] {
             if let Some(v) = crt {
-                for limb in &mut v.limbs {
-                    *limb = 0;
-                }
+                v.limbs.fill(0);
             }
         }
     }

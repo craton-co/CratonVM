@@ -414,7 +414,13 @@ impl MonitorManager {
     pub fn notify_all(&mut self, obj_addr: usize) -> MonitorResult {
         let monitor = self.get_or_create(obj_addr);
         let count = monitor.wait_set.len() as u64;
-        let drained: Vec<u64> = monitor.wait_set.drain(..).collect();
+        // `mem::take` rather than `drain(..).collect()`: same result, one fewer
+        // allocation, and `clippy::drain_collect` (stable 1.98) refuses the
+        // latter under `-D warnings`, which was red on `dev` for every push.
+        // The wait set is left empty either way; it gives up its spare capacity
+        // here, which for a monitor wait set costs one re-grow on the next
+        // `wait()` and is what the lint is asking for.
+        let drained: Vec<u64> = std::mem::take(&mut monitor.wait_set);
         monitor.entry_set.extend(drained);
         MonitorResult::Notified(count)
     }

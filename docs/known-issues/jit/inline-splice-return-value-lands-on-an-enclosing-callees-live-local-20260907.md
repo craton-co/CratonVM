@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN. The hazard is real and now quantified; **not observed to produce a wrong answer** on the workload that exposes it. |
+| **Status** | OPEN, and the leading hypothesis is now REFUTED — see *The recommended experiment was run, and it says no*. The title names a mechanism that accounts for 3 of 304 reports, not the 151. |
 | **Origin** | The residual `jit-warm-groupdata-window-row-collapse-20260906` left as "that hazard is real and deserves its own page". This is that page — with the count classified rather than repeated. |
 
 ## What the earlier count actually was
@@ -112,33 +112,95 @@ The same run is 11/11. Two reasons it can be quiet, and neither is a defence:
 
 Neither is enforced anywhere, so both are luck.
 
-## What would settle it
+## The recommended experiment was run, and it says no
 
-Not another census. What is missing is a case where the enclosing callee READS
-the clobbered local after the inner call, with a value that differs. Two ways
-in:
+This page recommended option 2 — *"extending the clamp to include every open
+scope's locals region (not just the operand stack) is a two-line change, and
+running the affected workload with it on and off says whether any of these 151
+was load-bearing."* Done, 2026-09-07. **Nothing moved.**
 
-1. **Make the detector prove liveness.** `InlineOopScope` already carries the
-   per-pc local oop masks (`masks`, `reached`) computed by
-   `compute_local_oop_masks`. A report could say whether the overlapped local
-   is still read at or after the enclosing scope's `cur_pc` — turning 151
-   "maybe" into a number of "definitely".
-2. **A/B the clamp.** `inline_live_slot_clamp_disabled()` already exists.
-   Extending the clamp to include every open scope's locals region (not just
-   the operand stack) is a two-line change, and running the affected workload
-   with it on and off says whether any of these 151 was load-bearing. If
-   nothing moves, the cost is a slightly higher frame; if something moves, the
-   miscompile has a witness.
+The guard was written exactly as described: `caller_post_pop_spill` clamped up
+to the top of every ENCLOSING open scope's locals (excluding the splice's own,
+whose locals are dead at its `xreturn`), behind
+`CRATONVM_JIT_NO_INLINE_ENCLOSING_LOCAL_CLAMP` with its own engagement counter.
+`CriteriaWindowFunctionTest`, same binary, one switch:
 
-Option 2 is the cheaper experiment and is the recommended next step. It was not
-taken here because it is a behaviour change to the inliner, on a workload that
-is currently green, in a session whose subject was a different defect — and
-this repository's own rule for that situation is a page, not a patch.
+| arm | engagements | overlap reports | ENCLOSING | INNERMOST | result |
+|---|---:|---:|---:|---:|---|
+| clamp ON | **3** | 304 | **151** | 152 | 11/11 |
+| clamp OFF | 0 | 304 | **151** | 152 | 11/11 |
+
+The guard engages (3, and the switch gates it cleanly to 0) and changes the
+census by **zero**. So the mechanism this page's title names — the `xreturn`
+cursor rewind landing a return value on an enclosing callee's live locals — is
+real but accounts for 3 reservations, not for the 151 reports.
+
+**The change was reverted.** It is a behaviour change to working code with no
+witness of harm, and its one validation came back null; shipping after that is
+worse than shipping without it. The two-line diff is recoverable from this
+page's description if a witness ever appears.
+
+## What the 151 actually are, and what that rules out
+
+With the labels the detector now carries, the two populations are structurally
+different — they are not the same event seen twice:
+
+* **INNERMOST, 152 reports** — all `scope #0/1`: a single open scope, the
+  splice that is returning, its locals dead. Harmless, as this page said.
+* **ENCLOSING, 151 reports** — all `scope #1/3`: **three** scopes open, and the
+  reservation lands exactly on the MIDDLE one's locals
+  (`reservation 160..168` against `locals 160..168 (num_locals=1)`, and five
+  other offsets of the same shape).
+
+They are not paired reports of one reservation, which was the other candidate
+explanation and is now excluded.
+
+That `#1/3` shape is what rules the return-value push out. The clamp is computed
+at splice start from `inline_oop_scopes`, and for the innermost splice of a
+three-deep nest it raises the cursor above scope #1's locals — so if these
+reservations came from `caller_post_pop_spill` they would have moved. They did
+not. Something else writes `next_spill_offset` low enough to hand out scope #1's
+locals while scope #2 is still open.
+
+### Where to look next
+
+`next_spill_offset` has ~20 writers in `x64/inlining.rs`. All but three are the
+bail path (`= callee_local_base`, unwinding a refused splice). The three that
+are not:
+
+| site | what it does |
+|---|---|
+| `= spill_checkpoint` (~1548) | full rollback of an abandoned splice |
+| `= save_spill` (~1927) | merge-point restore inside the walk |
+| `= caller_post_pop_spill` (the `xreturn` arms) | **excluded by the experiment above** |
+
+The merge-point restore is the interesting one: `save_spill` is captured after
+the merge region is reserved, so it should sit above this splice's own locals —
+but it is captured ONCE per splice and restored at every merge point, and a
+nested splice that has since moved the cursor is exactly the shape the `#1/3`
+reports have. That is a reading, not a measurement, and this page has just
+demonstrated the cost of acting on one of those.
+
+The cheap instrument is the one this page already suggested as option 1 and
+which is now the ONLY option left standing: have `dbg_note_spill_overlap` also
+report which reservation site it came from (`SpillReason` is already passed in
+and is `Push` for all 304 — the caller of `push_stack` is what is missing), and
+whether the overlapped local is still read at or after the enclosing scope's
+`cur_pc`. That turns 151 "maybe" into a named writer and a liveness answer.
 
 ## Related
+
 
 * `docs/internal/fixed-bugs/jit-warm-groupdata-window-row-collapse-20260906-FIXED.md`
   — where the count came from, and the defect it was NOT.
 * The `LEATest` miscompile recorded in `try_emit_inline_body`'s own comments —
   the same class of defect on the operand stack, fixed by the clamp this page
-  says is incomplete for locals.
+  originally proposed extending to locals. That extension is now tried and
+  refuted as an explanation for the 151; see above.
+
+## A note on the title
+
+It names the mechanism this page was opened on, and that mechanism is now known
+to account for 3 reservations rather than 151. The title is kept so a search for
+it still lands, in the same spirit as the phi-home page's own retitling note —
+but read *The recommended experiment was run* before acting on it.

@@ -596,6 +596,19 @@ pub enum Op {
     /// Inputs are `[a]` for unary and `[a, b]` for binary; [`ScalarOp::arity`]
     /// is the single source of truth and `ir_verify` reads it.
     ScalarIntrinsic(ScalarOp),
+    /// An unboxing accessor lowered inline: null check, exact receiver class
+    /// guard, per-object compact/legacy layout branch, then the payload load.
+    /// Inputs `[ctrl, mem, obj]`; result `Long` or `Int`.
+    ///
+    /// Carries only the guard class id -- the byte offsets are re-derived at
+    /// lowering from `unbox_offsets`, the same resolver the single-pass backend
+    /// asks, so the two cannot disagree about where the field lives.
+    ///
+    /// A null receiver or a class mismatch DEOPTS rather than throwing here:
+    /// the interpreter re-runs the call and raises the NPE, or dispatches to
+    /// the override that made the guard fail. `AtomicLong` and friends are not
+    /// final, which is why the guard is not optional.
+    Unbox { op: UnboxOp, class_id: u32 },
 
     // ── Dead / removed ───────────────────────────────────────────────
     /// Placeholder for a removed node (inputs cleared, not referenced).
@@ -4351,6 +4364,7 @@ pub struct IrBuilder {
     /// planner handled on purpose would be indistinguishable from one it could
     /// not handle at all.
     scalar_intrinsics: HashMap<usize, ScalarOp>,
+    unbox_intrinsics: HashMap<usize, (UnboxOp, u32)>,
     /// `invokedynamic` sites this tier replaces with an uncommon trap, keyed by
     /// caller pc: `(operand-stack entries the call consumes, return type tag)`.
     ///
@@ -4683,6 +4697,7 @@ impl IrBuilder {
             object_init_pcs: HashSet::new(),
             invoke_info: HashMap::new(),
             scalar_intrinsics: HashMap::new(),
+            unbox_intrinsics: HashMap::new(),
             indy_trap_sites: HashMap::new(),
             inline_sites: HashMap::new(),
             splice: Vec::new(),
@@ -5183,6 +5198,10 @@ impl IrBuilder {
     /// Record the call sites the planner will lower as arithmetic. Keyed by
     /// caller pc, exactly like [`Self::set_invoke_info`], and deliberately a
     /// SEPARATE map: a site here has no `JitInvokeInfo` box and never will.
+    pub fn set_unbox_intrinsics(&mut self, sites: HashMap<usize, (UnboxOp, u32)>) {
+        self.unbox_intrinsics = sites;
+    }
+
     pub fn set_scalar_intrinsics(&mut self, sites: HashMap<usize, ScalarOp>) {
         self.scalar_intrinsics = sites;
     }
@@ -5199,6 +5218,33 @@ impl IrBuilder {
     /// abstract stack in reverse order, which is the same convention every
     /// binary arm in this builder uses; the receiver is never popped because
     /// every family in [`ScalarOp`] is declared `static`.
+    /// Emit an unboxing accessor inline. One input (the receiver), and the
+    /// node needs `ctrl` and `mem` because it can DEOPT and it reads the heap.
+    fn try_emit_unbox_intrinsic(&mut self, pc: usize) -> bool {
+        let Some(&(uop, class_id)) = self.unbox_intrinsics.get(&pc) else {
+            return false;
+        };
+        if self.ctrl_opt().is_none() {
+            return false;
+        }
+        // A guard needs a snapshot to resume from, exactly as `plant_uncommon_trap`
+        // does: without a safepoint at this bci the deopt would rebuild a frame
+        // from nothing. Refusing here leaves the site to the fallback path.
+        if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
+            return false;
+        }
+        let obj = self.pop();
+        let node = self.graph.add(
+            Op::Unbox { op: uop, class_id },
+            uop.result_type(),
+            vec![self.ctrl, self.mem, obj],
+            Some(pc),
+        );
+        self.push(node);
+        note_unbox_lowered();
+        true
+    }
+
     fn try_emit_scalar_intrinsic(&mut self, pc: usize) -> bool {
         let Some(&sop) = self.scalar_intrinsics.get(&pc) else {
             return false;
@@ -7673,6 +7719,14 @@ impl IrBuilder {
                         pc += 3;
                         continue;
                     }
+                    // An unboxing accessor: emit the guarded field load inline
+                    // and skip the call. Same contract as the scalar families
+                    // above -- the planner builds no `invoke_info` row for a
+                    // site it registered here.
+                    if self.try_emit_unbox_intrinsic(pc) {
+                        pc += 3;
+                        continue;
+                    }
                     let (info_ptr, num_args, ret_type) = match self.invoke_info.get(&pc) {
                         Some(&t) => t,
                         None => return self.bail_invoke(line!(), pc),
@@ -8988,6 +9042,93 @@ impl ScalarOp {
 /// `StrictMath` is accepted alongside `Math` for `min`/`max`/`abs` only: those
 /// three are specified identically in both classes (JLS 15.20, `StrictMath`'s
 /// own javadoc delegates), unlike the transcendentals, which are not.
+/// The unboxing accessors, as a GUARDED FIELD LOAD rather than a refusal.
+///
+/// `ScalarOp` covers call-site intrinsics that are pure register arithmetic.
+/// These are not: they read a field, and the byte offset of that field depends
+/// on how the INSTANCE was allocated -- a compact instance stores the payload
+/// at a registered body offset, a legacy one inside its 16-byte `Value` cell,
+/// and both shapes exist at once because different allocators build different
+/// cells. That per-object branch is why this family sat on the refusal list
+/// while the arithmetic ones were lowered.
+///
+/// The node carries only the guard class id. The offsets are re-derived at
+/// LOWERING time from that id, through the very same `AtomicLongFieldLayout` /
+/// `AtomicIntFieldLayout` the single-pass emitter uses, so the two backends
+/// cannot drift into disagreeing about where the field is -- which, for a raw
+/// load, is the difference between a value and a wild read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnboxOp {
+    /// `java/lang/Long.longValue()J` -- 8-byte payload.
+    LongValue,
+    /// `java/lang/Integer.intValue()I` -- 4-byte payload, sign-extended.
+    IntValue,
+}
+
+impl UnboxOp {
+    pub fn result_type(self) -> IrType {
+        match self {
+            UnboxOp::LongValue => IrType::Long,
+            UnboxOp::IntValue => IrType::Int,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnboxOp::LongValue => "java/lang/Long.longValue",
+            UnboxOp::IntValue => "java/lang/Integer.intValue",
+        }
+    }
+}
+
+/// Recognise an unboxing call site the optimizing tier can lower.
+///
+/// `class_id` is the receiver guard, resolved from the constant pool by the
+/// caller. Id 0 means "unresolved", and the layout resolvers refuse it -- a
+/// site with no class id must decline, because the emitter has nothing to
+/// derive an offset from.
+pub fn try_ir_unbox_intrinsic(
+    class: &str,
+    method: &str,
+    descriptor: &str,
+    class_id: u32,
+) -> Option<UnboxOp> {
+    if !ir_scalar_intrinsics_enabled() || class_id == 0 {
+        return None;
+    }
+    let op = match (class, method, descriptor) {
+        ("java/lang/Long", "longValue", "()J") => UnboxOp::LongValue,
+        ("java/lang/Integer", "intValue", "()I") => UnboxOp::IntValue,
+        _ => return None,
+    };
+    // Ask the layout NOW as well as at lowering: a class whose `value` field is
+    // not an 8/4-byte scalar at a resolvable offset must be refused at the
+    // planner, not discovered by the emitter after the method was admitted.
+    unbox_offsets(op, class_id)?;
+    Some(op)
+}
+
+/// `(compact, legacy)` byte offsets of the payload, from the SAME resolver the
+/// single-pass backend uses. The single source of truth for both backends.
+pub fn unbox_offsets(op: UnboxOp, class_id: u32) -> Option<(i32, i32)> {
+    match op {
+        UnboxOp::LongValue => crate::AtomicLongFieldLayout::new(0, class_id)
+            .map(|l| (l.value_compact_offset, l.value_legacy_offset)),
+        UnboxOp::IntValue => crate::AtomicIntFieldLayout::new(0, class_id)
+            .map(|l| (l.value_compact_offset, l.value_legacy_offset)),
+    }
+}
+
+/// Unbox sites the optimizing tier LOWERED, for the engagement census.
+static UNBOX_LOWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_unbox_lowered() {
+    UNBOX_LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn unbox_lowered() -> u64 {
+    UNBOX_LOWERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> Option<ScalarOp> {
     if !ir_scalar_intrinsics_enabled() {
         return None;
@@ -9025,13 +9166,6 @@ pub fn try_ir_scalar_intrinsic(class: &str, method: &str, descriptor: &str) -> O
 mod scalar_intrinsic_recognizer_tests {
     use super::*;
 
-    /// Every family the recognizer claims must actually be recognised.
-    ///
-    /// A table rather than a spot check, because the failure this catches is a
-    /// family added to `ScalarOp` and its lowering but forgotten in the match —
-    /// which reads, from the outside, exactly like a workload that has no such
-    /// call site.
-    #[test]
     /// The site-trap registry is what lets the runtime tell an IR SITE TRAP
     /// apart from genuinely unreachable code, and the two want OPPOSITE
     /// actions: unreachable code should blacklist the method, a site trap must
@@ -9255,6 +9389,66 @@ mod scalar_intrinsic_recognizer_tests {
         );
     }
 
+    /// The unbox recognizer must decline an UNRESOLVED receiver class.
+    ///
+    /// `class_id == 0` means the constant pool did not resolve the receiver.
+    /// The lowering derives its byte offsets from that id, so a site admitted
+    /// without one would have the emitter loading from an offset nobody
+    /// vouched for -- which for a raw field load is a wild read, not a wrong
+    /// answer. This is the same refusal `box_unbox_intrinsic_shape` makes for
+    /// the single-pass backend, and the two must agree.
+    #[test]
+    fn the_unbox_recognizer_declines_an_unresolved_receiver_class() {
+        assert!(
+            try_ir_unbox_intrinsic("java/lang/Long", "longValue", "()J", 0).is_none(),
+            "class_id 0 is 'unresolved' and must never be admitted",
+        );
+        assert!(
+            try_ir_unbox_intrinsic("java/lang/Integer", "intValue", "()I", 0).is_none(),
+        );
+    }
+
+    /// Only the two triples, and only with their exact descriptors. A
+    /// near-miss must fall through to the ordinary path rather than be lowered
+    /// as a field load of something else.
+    #[test]
+    fn the_unbox_recognizer_matches_only_its_two_triples() {
+        for (c, n, d) in [
+            ("java/lang/Long", "intValue", "()I"),
+            ("java/lang/Integer", "longValue", "()J"),
+            ("java/lang/Long", "longValue", "()I"),
+            ("java/lang/Double", "doubleValue", "()D"),
+            ("java/lang/Short", "shortValue", "()S"),
+            ("java/util/concurrent/atomic/AtomicLong", "get", "()J"),
+        ] {
+            assert!(
+                try_ir_unbox_intrinsic(c, n, d, 7).is_none(),
+                "{c}.{n}{d} must not be recognised as an unbox site",
+            );
+        }
+    }
+
+    /// `unbox_offsets` is the SINGLE source of truth for both backends. If this
+    /// ever stopped agreeing with `AtomicLongFieldLayout`/`AtomicIntFieldLayout`
+    /// the optimizing tier and the single-pass tier would read different halves
+    /// of the same object.
+    #[test]
+    fn unbox_offsets_come_from_the_same_resolver_the_single_pass_backend_uses() {
+        const CID: u32 = 42;
+        if let Some(l) = crate::AtomicLongFieldLayout::new(0, CID) {
+            assert_eq!(
+                unbox_offsets(UnboxOp::LongValue, CID),
+                Some((l.value_compact_offset, l.value_legacy_offset)),
+            );
+        }
+        if let Some(l) = crate::AtomicIntFieldLayout::new(0, CID) {
+            assert_eq!(
+                unbox_offsets(UnboxOp::IntValue, CID),
+                Some((l.value_compact_offset, l.value_legacy_offset)),
+            );
+        }
+    }
+
     /// The per-build counter is what carries "this build planted a trap" back
     /// to `lib.rs`, because `build(mut self, ..)` consumes the builder. It must
     /// start at zero for every build or one trapping method would register
@@ -9273,6 +9467,20 @@ mod scalar_intrinsic_recognizer_tests {
         );
     }
 
+    // RESTORED 2026-09-07. The site-trap tests above were inserted between
+    // this test's doc comment and its `fn`, which orphaned the comment onto
+    // the first of them and left this function with NO `#[test]` attribute —
+    // so the one check that a `ScalarOp` family cannot be added without its
+    // recognizer signature had silently stopped running, and
+    // `cargo clippy --workspace --all-targets -- -D warnings` was red on
+    // `duplicated attribute` for everyone.
+    /// Every family the recognizer claims must actually be recognised.
+    ///
+    /// A table rather than a spot check, because the failure this catches is a
+    /// family added to `ScalarOp` and its lowering but forgotten in the match —
+    /// which reads, from the outside, exactly like a workload that has no such
+    /// call site.
+    #[test]
     fn every_declared_family_is_recognised() {
         // Driven off an EXHAUSTIVE match rather than a hand-kept list. The
         // previous version was a list of tuples, which could not catch the one
