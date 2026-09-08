@@ -126,3 +126,46 @@ writer_flush_real
 #                              it is a timeout being hit, not an assertion
 #                              disagreeing. Diagnose the 60s wait before
 #                              ratcheting it.
+
+# ---------------------------------------------------------------------------
+# NOT ratcheted: RED. These RUN against a real binary and FAIL -- a defect,
+# not a prerequisite question -- so ratcheting one turns this step red for
+# every lane until it is fixed.
+#
+# NAMED HERE FOR THE REASON THE VACUOUS BLOCK GIVES: "the alternative is that
+# they stay invisible -- which is how they got here." Until 2026-09-08 the
+# header counted the REDs ("3 RED out of 95") and the file named none of them,
+# so a target that RUNS AND FAILS was less visible than one that merely skips.
+# Both categories now get a name and a reason.
+#
+# Re-surveyed 2026-09-08 against a release binary and Temurin 25.0.3+9 on
+# Windows: 79 RUNS, 14 VACUOUS, 2 RED out of 95 (was 73/19/3 on 2026-08-30).
+#
+# NINE of today's RUNS are not in the list above, and they are promotion
+# candidates rather than a promotion -- each was observed exactly ONCE, and one
+# of the nine is `vthread_probe_regression`, which the FLAKY block above says
+# failed 3 of 4 runs eight days ago. That it passed today is precisely why a
+# single observation does not earn a ratchet row. Re-run before promoting:
+#
+#   inet_address_hostname_contract         jit_ir_phi_copy_register_alias
+#   jit_final_devirt_native_shadow         jit_site_trap_never_duplicates_a_side_effect
+#   jit_guarded_inline_native_shadow       osr_unbox_intrinsic_handler_frame
+#   sealed_bootstrap_permitted_subclasses  stack_trace_compiled_callee
+#   vthread_probe_regression  (FLAKY, see above -- do not promote on this run)
+#
+#   null_receiver_cached_invoke   `invokespecial` on a NULL receiver does not
+#                              throw NPE once the caller is JIT-warm, and the
+#                              callee runs with `this == null` (JVMS 6.5).
+#                              MODE-INDEPENDENT. The 2026-08-30 fix is intact
+#                              in bytecode_walk.rs's direct-call arm; the
+#                              inliner now claims the site first and the
+#                              spliced path carries no receiver null check.
+#                              Diagnosis, reproduction and DBG_JITC evidence:
+#                              invokespecial-on-a-null-receiver-lost-its-npe-again-and-the-gate-that-sees-it-is-unratcheted-20260908.md
+#
+#   stack_trace_across_tiers   `after_main_osr` loses the `mid`/`outer`
+#                              frames: "the callees the JIT inlined into their
+#                              caller's artifact contributing no frame at
+#                              all". Same family as the row above -- inlining
+#                              dropping a JVMS-visible property the
+#                              un-inlined path preserves.
