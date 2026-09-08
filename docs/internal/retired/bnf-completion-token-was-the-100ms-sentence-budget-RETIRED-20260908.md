@@ -12,7 +12,7 @@ measurements too.
 |---|---|
 | **Verdict** | Not a BNF/JDBC-metadata defect. `org.h2.bnf.Sentence` gives each statement head a **100 ms wall-clock budget**; `Bnf.getNextTokenList` catches the resulting `IllegalStateException` and returns the partial map it has. CratonVM's cold `SELECT` head costs 150-200 ms, so the `PROCEDURE` rule never runs. |
 | **Still open** | Yes — as a throughput gap on the canonical page. Nothing here closes `TestBnf`. |
-| **What is new** | The cold head is now **decomposed**, and 53% of it is one thing the earlier pages never named: the one-shot `java.text.Collator` bootstrap (§3). |
+| **What is new** | The cold head is now **decomposed**, and 53% of it is one thing the earlier pages never named: the one-shot `java.text.Collator` bootstrap (§3). One residual the narrowing exposed — uncontended `synchronized` costing 2.1x its unsynchronised twin where HotSpot pays 1.05x — was **fixed on this branch** for the block half (§4); it does not move this page's number. |
 | **Where** | Azure host 2 (`20.80.105.49`), branch `claude/h2-known-issues-retire-20260908` off `origin/dev` `2b0913374`, H2 2.4.249, JDK 25.0.4. Host load ranged 5-18 throughout; every number below is an interleaved median, never a sequential pair. |
 
 ---
@@ -156,11 +156,45 @@ the acquire will block. A throwaway build with only
 `StringBuffer.charAt` from 1501 ms to 1124 ms per million — a quarter of the
 overhead in two functions.
 
-**This is a real, contained defect and it is NOT enough to close `TestBnf`**:
-it is worth low-double-digit percent of a walk that is 47% of a head that needs
-to halve. It wants its own lane, with `probes/SyncCost.java` as the oracle —
-the ratio columns above are the acceptance criterion and they do not depend on
-what else the host is running.
+**PARTLY FIXED, 2026-09-08, and it did not move this page's number.** The
+bookkeeping named above is now off the uncontended path: the two opcode
+prologues take a peek-first fast path (`monitor_operand_slow` is `#[cold]` and
+runs only for a null / `Uninitialized` / smuggled-`long` operand), and the JMX
+slots moved into a `JmxMonitorBook` behind an `Arc` that the owning thread
+caches, so neither acquire nor release consults the registry map and the
+uncontended arm skips the two contended slots entirely. `CRATONVM_MONITOR_FASTPATH=0`
+restores the old path in the same binary, which is how the arms below were taken
+(N=9, interleaved, medians of per-run ratios):
+
+| arm | `syncMethod/plain` | `syncBlock/plain` | `SBuffer/SBuilder` |
+|---|---:|---:|---:|
+| HotSpot `-Xint` | 1.36 | 1.04 | 1.02 |
+| CratonVM, fast path **off** | 3.18 | 2.13 | 1.92 |
+| CratonVM, fast path **on** | 2.96 | **1.45** | 1.91 |
+
+A `synchronized` block's excess over its unsynchronised twin falls from 113% to
+45%; a `synchronized` *method*'s from 218% to 196%. The block half is done; the
+method half is not, and the profile says why — what is left is not monitor work
+at all. In the `synchronized`-method loop the JMX pair fell from 8.9% to 3.2% of
+samples, and the top of what remains is the INVOKE path taking a slower route for
+an `ACC_SYNCHRONIZED` callee than for a plain one: `ProfileStore::get_or_insert_borrowed`
++ `record_receiver_borrowed` (6.7%) and `core::hash::sip::Hasher` (4.6%), where
+the same loop with a plain callee uses the memoized `record_receiver_memoized`
+and shows no SipHash at all. That is a receiver-profile memoization miss on the
+synchronized invoke path, and it is the next thing to pull — in its own lane.
+
+**And it does not move the cold head.** Re-measured on the fixed binary:
+174 ms against HotSpot's 35 on a host busy enough to have moved HotSpot itself
+from 22 (ratio 5.0 against 5.7). The head is bootstrap-dominated, and
+`StringBuffer.charAt` — the synchronized method the collator path actually calls
+— is in the *method* half, which barely moved. This is exactly why the two were
+measured on separate oracles.
+
+**The unfixed remainder, for the next lane:** the synchronized-invoke receiver-profile
+miss above, and `probes/SyncCost.java` as the oracle. The ratio columns are the
+acceptance criterion and they do not depend on what else the host is running;
+`probes/JmxMonitorOwnership.java` is the correctness oracle that has to stay
+green on both settings of the switch.
 
 ## 5. Levers checked and found inert, so nobody re-runs them
 
@@ -171,9 +205,10 @@ what else the host is running.
   252-291 ms against 113-141 ms). Turning verification off is not a lever here;
   it is a separate anomaly worth its own look, since it says the interpreter
   depends on `verified_code` for speed and falls off a cliff without it.
-* **The monitor bookkeeping alone.** The stubbed build above moved
-  `probes/BnfHeads.java` not at all — the head is bootstrap-dominated, and §4's
-  fix has to be judged on its own oracle, not on this one.
+* **The monitor bookkeeping alone.** Both the throwaway stubbed build and the
+  real fix that followed it moved `probes/BnfHeads.java` not at all — the head is
+  bootstrap-dominated, and §4's fix has to be judged on its own oracle, not on
+  this one.
 
 ## 6. Reproducing
 

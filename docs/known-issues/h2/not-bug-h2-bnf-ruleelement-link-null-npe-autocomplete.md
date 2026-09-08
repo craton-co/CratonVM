@@ -450,9 +450,29 @@ need; and the `ACC_SYNCHRONIZED` invoke path copies the argument vector before i
 knows whether the acquire will block. A throwaway build with only the first two
 stubbed out took `StringBuffer.charAt` from 1501 to 1124 ms per million.
 
-**It is not enough to close this page** — low-double-digit percent of a walk that
-is 47% of a head that has to halve — but it is a real, contained defect with a
-load-independent oracle, and it wants its own lane.
+**Fixed for the block half on the same branch, and it did not move this page's
+number.** The opcode prologues took a peek-first fast path and the JMX slots
+moved behind a per-thread cached `Arc`; `CRATONVM_MONITOR_FASTPATH=0` restores
+the old path in the same binary. N=9 interleaved, medians of per-run ratios:
+
+| arm | `syncMethod/plain` | `syncBlock/plain` |
+|---|---:|---:|
+| HotSpot `-Xint` | 1.36 | 1.04 |
+| CratonVM, fast path off | 3.18 | 2.13 |
+| CratonVM, fast path on | 2.96 | **1.45** |
+
+The cold head re-measured at 174 ms against HotSpot's 35 on a busier host —
+ratio 5.0 against 5.7, i.e. unchanged within the spread. The head is
+bootstrap-dominated, and `StringBuffer.charAt` is in the *method* half, which
+barely moved. What is left there is not monitor work: in the
+`synchronized`-method loop the JMX pair fell from 8.9% to 3.2% of samples and
+the top of the remainder is the invoke path taking a slower route for an
+`ACC_SYNCHRONIZED` callee — `ProfileStore::get_or_insert_borrowed` +
+`record_receiver_borrowed` (6.7%) and `core::hash::sip::Hasher` (4.6%), where a
+plain callee uses the memoized `record_receiver_memoized` and shows no SipHash
+at all. A receiver-profile memoization miss on the synchronized invoke path is
+the next thing to pull, and it is a general interpreter win rather than
+something this page owns.
 
 ### Levers re-checked and still inert
 
