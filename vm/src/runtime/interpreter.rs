@@ -4955,6 +4955,37 @@ pub fn pop_and_recycle_frame_with_reason(
             );
         }
     }
+    // AN `ACC_SYNCHRONIZED` FRAME A FAST DOOR PUSHED RELEASES ITS MONITOR HERE.
+    //
+    // The general path scopes that release to an RAII guard around the nested
+    // Rust invoke (`SynchronizedMethodGuard`). A door pushes the callee into
+    // THIS loop and returns, so there is no Rust scope to hang it on -- the
+    // frame owns it instead, in the `monitor_on_exit` slot the stackless
+    // design added and never filled.
+    //
+    // This is the only place it can go, and that is checkable rather than
+    // hopeful: every removal of an interpreter frame reaches this function --
+    // the return opcodes, the exception unwind (`was_popped_by_exception`),
+    // and the orphan sweeps `execute` and `resume_continuation` run after
+    // `execute_frame_from_index` returns early through `return Err`.
+    //
+    // Before the JVMTI hooks below, because a `FramePop` callback can run
+    // arbitrary Java -- including code that wants this very monitor.
+    //
+    // The address is read from the frame rather than remembered by the door: a
+    // moving collection between the acquire and the return relocates the
+    // object, and `memory/gc.rs` already remaps `monitor_on_exit` for exactly
+    // this reason.
+    if thread.frames.last().is_some_and(|f| f.monitor_on_exit.is_some()) {
+        let tid = thread.thread_id;
+        let monitor = thread
+            .frames
+            .last_mut()
+            .and_then(|f| f.monitor_on_exit.take());
+        if let Some(monitor) = monitor {
+            let _ = crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, monitor, tid);
+        }
+    }
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
     fire_jvmti_frame_pop_if_requested(shared.vm_identity, thread, was_popped_by_exception);
     // The dying frame is read THROUGH THE STACK, not moved out of it.

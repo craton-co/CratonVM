@@ -1537,3 +1537,145 @@ Two things this cost, worth naming rather than filing away:
 * A door that goes off and back on inside 24 hours is not an unusual event in
   this tree. A section that says "X is the path now" dates itself; one that says
   "X served N of M calls in this census, on this commit" does not.
+
+## The fifth pass (2026-09-08): the doors had no census, and the biggest thing they refused was `synchronized`
+
+Arrived from `docs/known-issues/h2/not-bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`,
+whose cold `SELECT` head is ~90% method-call machinery and therefore this page's
+problem. Two things came out of it: a diagnostic this page needed and did not
+have, and the largest single refusal it exposed.
+
+### The census the doors were missing
+
+`door: static hit/miss special hit/miss` said how often a door declined and
+never which reason, and the twelve `[invoke-door]` lines it printed were the
+first twelve of millions. Worse, **the virtual door had no counters at all** —
+and it is the door tried FIRST for `invokevirtual`, so every decline it made was
+attributed to the non-virtual door that runs after it.
+
+`CRATONVM_DBG_FIELD_SITE=1` now ends with a full tally, and the shape of the
+answer is why it was worth building. First cut, `probes/CollatorSplit.java`
+(4000 `RuleBasedCollator.compare` calls, `--nojit`):
+
+```text
+[invoke-door] declines by reason (total 2204094):
+[invoke-door]  1705988  77.4%  special: cached target is not plain bytecode
+```
+
+One reason, 77%, naming nothing. Splitting the catch-all by cached variant, and
+then instrumenting the virtual door:
+
+```text
+[invoke-door] declines by reason (total 3092393):
+[invoke-door]   888279  28.7%  special: cached target is VirtualBytecode on a non-special call
+[invoke-door]   888105  28.7%  virtual: callee is SYNCHRONIZED
+[invoke-door]   526663  17.0%  special: cached target is a virtual registered native
+[invoke-door]   368941  11.9%  special: inline cache miss
+[invoke-door]   247945   8.0%  special: cached target is not plain bytecode
+[invoke-door]   120339   3.9%  static: cached target is a registered native
+```
+
+The top two rows are ONE population — 888 279 against 888 105 — the virtual
+door declining and the non-virtual door declining the same call again. **A
+census that cannot see the first door reports the second door's echo.**
+
+### What it found
+
+`execute_invokevirtual_fast_door` opened with `if cached.is_synchronized ||
+cached.is_static { return None }`, and `callee_is_plain_bytecode` (the static
+and non-virtual doors) began the same way. On this workload that refusal alone
+took **888 105 of 2.47 M interpreted calls — 36%** — off the ~150 ns door and
+onto the ~430 ns general path.
+
+It is not an exotic shape. `java.lang.StringBuffer` is `final` and every one of
+its accessors is `synchronized`, so ICU's normaliser — which H2's BNF
+autocompletion reaches through `StringUtils.startsWithIgnoringCase` →
+`RuleBasedCollator.compare` — drives one declined call per character. `Vector`,
+`Hashtable`, `Random` and `StringBuffer` are the same shape everywhere.
+
+### The fix
+
+The doors now serve a synchronized callee whose monitor is **free**:
+
+* `door_monitor_acquire` takes it with the same `enter_or_contend` CAS the
+  general path's uncontended arm uses, and makes the same
+  `complete_jmx_monitor_enter` ownership publish.
+* A **contended** acquire declines to the general path. That is the design, not
+  a fallback: the blocking acquire has to pin and remap the callee's arguments
+  across a moving collection (`monitor_enter_synchronized_method`), and a door
+  that tried would be a second, unaudited copy of it.
+* **Static** synchronized also declines — its monitor is the class mirror, and
+  fetching one can allocate, which a door must not do between
+  `read_args_verbatim` and the push.
+* The release rides on `Frame::monitor_on_exit`, a field the stackless-dispatch
+  design added — with the GC's remap and root-scan support already wired — and
+  never filled from production code. It is released in
+  `pop_and_recycle_frame_with_reason`, before the JVMTI hooks, reading the
+  address back out of the frame so a collection that moved the object in the
+  meantime is followed.
+
+That release site is the whole safety argument, and it is checkable rather than
+hopeful: **every** removal of an interpreter frame reaches that function — the
+return opcodes, the exception unwind (`was_popped_by_exception`), and the orphan
+sweeps `execute` and `resume_continuation` run after `execute_frame_from_index`
+returns early through `return Err`.
+
+Kill switch: `CRATONVM_JIT_NO_DOOR_SYNC=1` (`CRATONVM_JIT=-door-sync`).
+
+### What it is worth, and the honest gap between the two numbers
+
+Priced first, with a deliberately unsound instrument that let the doors take
+synchronized callees **without** acquiring anything — the only way to separate
+"the door is faster" from "the monitor is cheap". `CollatorSplit 4000`,
+`--nojit`, 5 interleaved pairs, ms: 1886/1450, 2596/1664, 1924/1602, 1558/1415,
+1630/1417 — **5/5, about −23%**.
+
+The real change, which pays for the monitor, N=9 interleaved medians:
+
+| arm | median | raw |
+|---|---:|---|
+| `CRATONVM_JIT_NO_DOOR_SYNC=1` | 1765 | 1587 1650 1897 1942 1819 1716 1976 1765 1746 |
+| default | **1607** | 1741 1592 1781 1484 1607 1550 1964 1608 1484 |
+
+**−9%, 7 of 9 pairwise.** The 23% → 9% difference is exactly the uncontended
+monitor pair, and it is the reason to state both: a reader who sees only the 9%
+would price the *door* at 9% and be wrong about where the rest went.
+
+### What it does NOT do
+
+**It does not close the page it came from.** H2's `TestBnf` still fails at the
+same assertion with the change on, and the cold `SELECT` head did not resolvably
+move — that head is 53% one `java.text.Collator` bootstrap, and the synchronized
+traffic is in the other half. This is the same shape as this page's own §"The
+aggregate does NOT resolvably move an end-to-end workload": a real per-call win
+that an end-to-end workload absorbs.
+
+### The next levers, ranked, from the same census
+
+With the synchronized rows gone the tally on that workload is:
+
+```text
+[invoke-door] declines by reason (total 1308204):
+[invoke-door]   526663  40.3%  special: cached target is a virtual registered native
+[invoke-door]   368941  28.2%  special: inline cache miss
+[invoke-door]   247945  19.0%  special: cached target is not plain bytecode
+[invoke-door]   120339   9.2%  static: cached target is a registered native
+```
+
+**69% of what is left is a registered native.** A door for a leaf native — the
+compiled side already has one (`try_jit_site_cached_native_dispatch`) — is the
+next structural item, and it is a different project from the bytecode doors:
+the callee has no frame to push, so the whole cost is the argument decode and
+the `NativeMethodRegistry` probe, both of which show in a `perf` profile of the
+same workload (`find` 1.55%, `slot_for_exact` 1.02%, `should_force_registered_native_over_bytecode`
+1.47%, `__memcmp` 3.32% — the registry is keyed by name).
+
+### The probes
+
+`probes/CollatorSplit.java` (the workload), `probes/DoorSyncUnwind.java` (the
+correctness oracle: normal return, throwing return, a 30-frame unwind, 40-deep
+re-entrant recursion, four-thread contention, and a synchronized method that
+blocks on a second monitor — every arm ends by proving from a second thread and
+from JMX that the lock came back free), `probes/JmxMonitorOwnership.java`.
+Both oracles pass on HotSpot and on both settings of the switch, under the JIT
+and under `--nojit`.

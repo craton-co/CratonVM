@@ -1746,6 +1746,13 @@ pub const INVENTORY: &[E] = &[
     // `frame-slot-reuse` — off routes every frame's buffers back through
     // the thread pools on return instead of retiring the frame in place.
     E { group: Group::JIT, token: "frame-slot-reuse", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_SLOT_REUSE"), off_word: None, since: "2026-09-02" },
+    // 2026-09-08. Opt-in restore of the pre-door refusal of `synchronized`
+    // callees. That refusal was the single largest reason any fast door
+    // declined anything -- 888,105 of 2.47 M interpreted calls on a
+    // `java.text` collator workload, 36% of them -- because ICU's normaliser
+    // drives `StringBuffer` one character at a time. See
+    // `invoke_fast::door_sync_enabled`.
+    E { group: Group::JIT, token: "door-sync", on_key: None, off_key: Some("CRATONVM_JIT_NO_DOOR_SYNC"), off_word: None, since: "2026-09-08" },
     // `frame-emplace` — off builds the frame on the Rust stack and moves it
     // into the slot instead of constructing it there.
     E { group: Group::JIT, token: "frame-emplace", on_key: None, off_key: Some("CRATONVM_JIT_NO_FRAME_EMPLACE"), off_word: None, since: "2026-09-03" },

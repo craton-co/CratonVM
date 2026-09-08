@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-394 tokens.
+395 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -885,6 +885,7 @@ export inherited from a parent shell.
 | `door-recv-memo` | `CRATONVM_JIT_NO_DOOR_RECV_MEMO` |
 | `nonvirtual-fast-door` | `CRATONVM_JIT_NO_NONVIRTUAL_FAST_DOOR` |
 | `frame-slot-reuse` | `CRATONVM_JIT_NO_FRAME_SLOT_REUSE` |
+| `door-sync` | `CRATONVM_JIT_NO_DOOR_SYNC` |
 | `frame-emplace` | `CRATONVM_JIT_NO_FRAME_EMPLACE` |
 | `iface-select-memo` | `CRATONVM_JIT_NO_IFACE_SELECT_MEMO` |
 | `ldc-const-cache` | `CRATONVM_JIT_NO_LDC_CONST_CACHE` |
