@@ -92,4 +92,6 @@ returns every key still present in the map, matching real
 
 ## Related
 
-* `docs/known-issues/netty/` tombstone at the original filing path.
+* the `docs/known-issues/netty/` tombstone at the original filing path was
+  itself retired on 2026-09-08, when the last open netty Generational page
+  it sat beside closed; this file is now the only copy.

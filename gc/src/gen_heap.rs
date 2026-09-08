@@ -8914,6 +8914,43 @@ impl GenerationalHeap {
             let captured = crate::gc_quiescence::take_peer_reg_capture();
             let mut hits = 0usize;
             let mut reported = 0usize;
+            // THE INTERIOR CENSUS, and it is the one class of stale peer word
+            // no conservative write-back can repair.
+            //
+            // `record_peer_stack_slot`'s capture and the blocked-wake
+            // write-back both key on an OBJECT BASE, because `is_object_address`
+            // is the only predicate a conservative scan is allowed to trust. A
+            // word naming the INTERIOR of a live object -- a byte-array data
+            // pointer, a `DirectByteBuffer` address, any derived pointer -- is
+            // therefore neither marked, nor captured, nor rewritten, while the
+            // object it points into is kept alive by some other root and
+            // RELOCATED. The peer resumes and dereferences a vacated interior
+            // address, which is why the observed faults read at UNALIGNED
+            // addresses inside a decommitted span.
+            //
+            // That population is exactly what `unrewritable_conservative_jit_roots`
+            // exists to refuse -- its own comment says the registry "drops
+            // interior/derived pointers that name no base at all" -- so this
+            // counter is the measurement behind that refusal rather than an
+            // argument for it. It is only reachable with
+            // `CRATONVM_GC_NO_PEER_PIN_DIVERT=1`.
+            let from_lo = young_from.base_ptr() as usize;
+            let from_hi = from_lo + young_from.used();
+            let mut interior = 0usize;
+            let mut dead_base = 0usize;
+            for (_tid, _reg, val) in captured.iter().copied() {
+                if val < from_lo || val >= from_hi || pointer_map.contains_key(&val) {
+                    continue;
+                }
+                if young_object_starts.contains(val) {
+                    // A base that nothing relocated: the object died this
+                    // cycle. Harmless — the peer's word names garbage, and
+                    // garbage is what it named before the collection too.
+                    dead_base += 1;
+                } else {
+                    interior += 1;
+                }
+            }
             for (tid, reg, val) in captured.iter().copied() {
                 let Some(&new_addr) = pointer_map.get(&val) else {
                     continue;
@@ -8939,9 +8976,11 @@ impl GenerationalHeap {
                 crate::gc_quiescence::PEER_REG_STALE.fetch_add(hits as u64, Ordering::Relaxed);
             }
             eprintln!(
-                "[peer-reg-stale] cycle summary: captured_words={} stale={} pointer_map={}",
+                "[peer-reg-stale] cycle summary: captured_words={} stale={} interior={}                  dead_base={} pointer_map={}",
                 captured.len(),
                 hits,
+                interior,
+                dead_base,
                 pointer_map.len(),
             );
         }
@@ -9019,6 +9058,16 @@ impl GenerationalHeap {
                 n
             };
 
+            // Speculative copies the parallel evacuator abandoned after
+            // losing a forwarding CAS. They are complete objects that nothing
+            // references and nothing scanned, so every slot still names
+            // from-space -- a WHOLE-OBJECT miss, which is the shape that
+            // produced (and then sank) this instrument's only two historical
+            // non-zero readings. Excluded here so a non-zero count means what
+            // the instrument's contract says it means.
+            let abandoned = take_abandoned_evac_copies();
+            let mut skipped_abandoned = 0usize;
+
             let mut cursor = 0usize;
             let young_used = young_to.used();
             while cursor < young_used {
@@ -9029,19 +9078,28 @@ impl GenerationalHeap {
                 if size < HEADER_SIZE || cursor + size > young_used {
                     break;
                 }
-                missed_young += scan_obj("YOUNG", obj, header);
+                if abandoned.contains(&(obj as usize)) {
+                    skipped_abandoned += 1;
+                } else {
+                    missed_young += scan_obj("YOUNG", obj, header);
+                }
                 cursor += size;
             }
             for (obj, _size) in old_gen.walk_objects() {
                 // SAFETY: walk_objects yields live old-gen object starts.
                 let header = unsafe { &*(obj as *const ObjectHeader) };
-                missed_old += scan_obj("OLD", obj, header);
+                if abandoned.contains(&(obj as usize)) {
+                    skipped_abandoned += 1;
+                } else {
+                    missed_old += scan_obj("OLD", obj, header);
+                }
             }
             eprintln!(
-                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}",
+                "[moving-young-verify] forwarded_heap_refs_remaining young={} old={} pointer_map={}                  abandoned_cas_loser_copies_skipped={}",
                 missed_young,
                 missed_old,
                 pointer_map.len(),
+                skipped_abandoned,
             );
             eprintln!(
                 "[moving-young-verify] scan frontier: scan_cursor=0x{:x} to_used=0x{:x} \
@@ -17621,6 +17679,46 @@ fn seedhunt_enabled() -> bool {
 #[inline]
 fn moving_young_dangling_verify_enabled() -> bool {
     gc_flags().moving_young_verify
+}
+
+/// Speculative to-space (or old-gen) copies the parallel evacuator ABANDONED
+/// after losing the forwarding CAS, for the cycle currently being verified.
+///
+/// # Why the verifier above is unreadable without this
+///
+/// `ParEvac::evacuate` copies first and claims second, so a worker that loses
+/// the race has already written a complete object at `new_addr` and simply
+/// walks away from it: "to-space garbage reclaimed next cycle". Nothing
+/// references it, so nothing scans it, so **every one of its reference slots
+/// keeps the pre-move address** — and the verifier, which walks all of to-space
+/// and old-gen, reports each of them as a missed heap rewrite.
+///
+/// That is exactly the shape
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+/// §6 published a root cause off and then withdrew: *"an object whose every
+/// slot was missed"*, twice, never reproducible, and refuted by a scan-cursor
+/// instrument that could not explain it either. An abandoned loser explains
+/// both halves — whole-object, because the object was never scanned; and
+/// harmless, because it is unreachable garbage and no mutator can dereference
+/// it.
+///
+/// Populated only while the verifier is armed, so the ordinary evacuation path
+/// pays nothing.
+static ABANDONED_EVAC_COPIES: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+
+/// Record one abandoned CAS-loser copy. No-op unless the verifier is armed.
+pub(crate) fn record_abandoned_evac_copy(addr: usize) {
+    if !moving_young_dangling_verify_enabled() {
+        return;
+    }
+    ABANDONED_EVAC_COPIES.lock().push(addr);
+}
+
+/// Take (and clear) this cycle's abandoned copies, as a set the verifier can
+/// test membership against.
+fn take_abandoned_evac_copies() -> rustc_hash::FxHashSet<usize> {
+    let mut g = ABANDONED_EVAC_COPIES.lock();
+    std::mem::take(&mut *g).into_iter().collect()
 }
 
 /// Scan a single object's reference slots for the `0x4` seed signature

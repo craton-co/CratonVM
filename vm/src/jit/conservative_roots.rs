@@ -9534,7 +9534,7 @@ fn is_callee_saved_gpr_image(off: i32, layout: &cratonvm_jit::FrameLayout) -> bo
 /// by construction, and its zero is not an all-clear for them.
 ///
 /// The experiment this enables is a single A/B on the reproducer in
-/// `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
 /// §10.4 -- `CRATONVM_GC_NO_PEER_PIN_DIVERT=1` on
 /// `io.netty.handler.ipfilter.UniqueIpFilterTest`, which SIGSEGVs 3 runs in 13
 /// with compiled code reading a decommitted span. If widening the write removes
