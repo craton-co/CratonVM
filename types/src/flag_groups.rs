@@ -1087,6 +1087,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None, since: "2026-08-07" },
     E { group: Group::JIT, token: "a5-residue-filter", on_key: Some("CRATONVM_JIT_A5_RESIDUE_FILTER"), off_key: None, off_word: Some("0"), since: "2026-09-06" },
     E { group: Group::JIT, token: "a5-shape-filter", on_key: Some("CRATONVM_JIT_A5_SHAPE_FILTER"), off_key: None, off_word: None, since: "2026-09-06" },
+    // 2026-09-08. Default-ON kill switch over the RELOCATION LICENCE half of the
+    // unregistered-JIT-frame probe: `0` restores the pre-fix behaviour, where a
+    // hit the returned-frame residue mark explained still refused compaction for
+    // the cycle. Marking is unaffected either way, so this can only change how
+    // often the collector is allowed to compact. See
+    // docs/internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md
+    E { group: Group::JIT, token: "unreg-residue-licence", on_key: Some("CRATONVM_JIT_UNREG_RESIDUE_LICENCE"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
     // so `=0` still enables it and `off_word` must stay `None`.
@@ -1940,7 +1947,13 @@ pub const INVENTORY: &[E] = &[
     // Default-ON since 2026-09-05, so it takes an `off_word`: presence alone no
     // longer decides it and `=0` has to be able to turn it off.
     E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
-    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: Some("CRATONVM_BLOCKED_WAKE_JIT_REMAP"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON kill switch as of 2026-09-08, hence `off_key` only: the JIT
+    // half of a blocked-region wake (active compiled frames, register images,
+    // shadow stack). It shipped opt-in and wired only into the LEAKED-region
+    // fallback, so the wake that actually runs remapped interpreter frames and
+    // nothing compiled -- a peer that blocked with compiled frames below it
+    // resumed with every JIT oop at its pre-move address.
+    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: None, off_key: Some("CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP"), off_word: None, since: "2026-09-03" },
     // Default-ON kill switch, hence `off_key` only: a blocked peer's
     // conservatively-scanned native-stack words are written back on wake. The
     // objects were kept alive AND relocated while it slept, nothing else
@@ -2476,6 +2489,13 @@ pub const INVENTORY: &[E] = &[
     // switch. THREADS rather than a JMX group because the group vocabulary
     // has no JMX and this is a threading capability the bean exposes.
     E { group: Group::THREADS, token: "jmx-owned-synchronizers", on_key: Some("CRATONVM_JMX_OWNED_SYNCHRONIZERS"), off_key: None, off_word: Some("0"), since: "2026-08-27" },
+    // 2026-09-08. Default-ON kill switch over the uncontended monitorenter /
+    // monitorexit fast path (peek-first opcode operand, per-thread cached JMX
+    // monitor book). `0` restores the previous path in the SAME binary, which is
+    // what `probes/SyncCost.java` needs: a sequential pair of builds on a shared
+    // host is not a measurement. Behaviour is identical either way --
+    // `probes/JmxMonitorOwnership.java` is green on both.
+    E { group: Group::THREADS, token: "monitor-fastpath", on_key: Some("CRATONVM_MONITOR_FASTPATH"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
     E { group: Group::THREADS, token: "assert-single-os-thread", on_key: Some("CRATONVM_ASSERT_SINGLE_OS_THREAD"), off_key: None, off_word: None, since: "2026-06-21" },
     E { group: Group::THREADS, token: "async-handoff-sleep-floor-ms", on_key: Some("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS"), off_key: None, off_word: None, since: "2026-07-04" },
     E { group: Group::THREADS, token: "async-submit-grace-ms", on_key: Some("CRATONVM_ASYNC_SUBMIT_GRACE_MS"), off_key: None, off_word: None, since: "2026-07-04" },

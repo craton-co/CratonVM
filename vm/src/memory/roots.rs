@@ -1479,10 +1479,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // eye and a genuine PEER blocker (`compiled_uninterruptible`, or a
         // second running thread) is visible.
         eprintln!(
-            "[reloc-blockers] coverage_proven={coverage_proven} blockers={} \
+            "[reloc-blockers] coverage_proven={coverage_proven} blockers={} peer_blockers={} \
 (java={} vm={} native={} deopt={} compiled_uninterruptible={} parked={} blocked={}) \
 moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete={}",
             census.relocation_blockers(),
+            // The count the obligation is actually about: `Forbidden` AND
+            // `may_hold_unrewritable_object_refs`, with this thread subtracted
+            // so a zero is reachable. `blockers` beside it is kept only so the
+            // two can be compared — see `relocation_blockers`' own doc.
+            census.peer_relocation_blockers(TES::VmRunning),
             census.get(TES::JavaRunning),
             census.get(TES::VmRunning),
             census.get(TES::NativeRunning),

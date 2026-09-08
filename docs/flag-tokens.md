@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-393 tokens.
+394 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -625,6 +625,7 @@ export inherited from a parent shell.
 | `unreg-accept-residue` | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` |
 | `a5-residue-filter` | `CRATONVM_JIT_A5_RESIDUE_FILTER` |
 | `a5-shape-filter` | `CRATONVM_JIT_A5_SHAPE_FILTER` |
+| `unreg-residue-licence` | `CRATONVM_JIT_UNREG_RESIDUE_LICENCE` |
 | `activation-global-mutex` | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` |
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
 | `alloc-spill-sink` | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` |
@@ -1022,7 +1023,7 @@ export inherited from a parent shell.
 | `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
 | `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `zgc-jit-blanket-refusal` | `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` |
-| `blocked-wake-jit-remap` | `CRATONVM_BLOCKED_WAKE_JIT_REMAP` |
+| `blocked-wake-jit-remap` | `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP` |
 | `blocked-peer-stack-remap` | `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP` |
 | `zgc-unrewritable-peer-refuses` | `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
@@ -1255,11 +1256,12 @@ export inherited from a parent shell.
 
 ## `CRATONVM_THREADS`
 
-22 tokens.
+23 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `jmx-owned-synchronizers` | `CRATONVM_JMX_OWNED_SYNCHRONIZERS` |
+| `monitor-fastpath` | `CRATONVM_MONITOR_FASTPATH` |
 | `assert-single-os-thread` | `CRATONVM_ASSERT_SINGLE_OS_THREAD` |
 | `async-handoff-sleep-floor-ms` | `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` |
 | `async-submit-grace-ms` | `CRATONVM_ASYNC_SUBMIT_GRACE_MS` |

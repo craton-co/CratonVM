@@ -129,7 +129,7 @@ pub struct SlotOrigin {
 /// INTERPRETER frames, and these words live in the peer's machine stack, below
 /// or between its compiled frames, named by no oop map. They are the population
 /// §12 of
-/// `known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+/// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
 /// measured as stale on essentially every relocating cycle.
 #[derive(Clone, Copy)]
 pub struct NativeSlotFixup {

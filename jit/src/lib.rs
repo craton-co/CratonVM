@@ -2595,6 +2595,29 @@ pub struct FrameLayout {
     pub frame_size: i32,
 }
 
+/// Compiles whose frame layout was published, and how many of them gave each
+/// nominated storage class a non-empty extent. Read by
+/// [`region_extent_census`].
+static FRAMES_PUBLISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_WITH_SCALAR_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_WITH_REF_HOIST_SPAN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FRAMES_WITH_ARITH_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(frames_published, with_scalar_span, with_ref_hoist_span, with_arith_span)`.
+///
+/// The denominator a stale-word census by `FrameLayout::region_name` needs
+/// before any of its per-region zeros can be read as evidence.
+pub fn region_extent_census() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FRAMES_PUBLISHED.load(Relaxed),
+        FRAMES_WITH_SCALAR_SPAN.load(Relaxed),
+        FRAMES_WITH_REF_HOIST_SPAN.load(Relaxed),
+        FRAMES_WITH_ARITH_SPAN.load(Relaxed),
+    )
+}
+
 impl FrameLayout {
     /// Whether `off` names a slot that is only ever an IMAGE of a register.
     #[inline]
@@ -2608,6 +2631,46 @@ impl FrameLayout {
             || (self.reg_spill_hi > self.reg_spill_lo
                 && off >= self.reg_spill_lo
                 && off < self.reg_spill_hi)
+    }
+
+    /// Whether each of the three storage classes
+    /// `moving-young-corruption-rootcause.md` nominates actually HAS an extent
+    /// in this frame: `(scalar-replaced-field, licm-ref-hoist, licm-arith)`.
+    ///
+    /// The reason this is a method and not left to the reader of a census:
+    /// [`Self::region_name`]'s ladder gates every one of those names behind
+    /// `hi > lo`, and `frame_layout()` builds all three spans from collections
+    /// that are EMPTY when the optimisation produced no slots. So a stale-word
+    /// census reporting zero words in `scalar-replaced-field` says nothing
+    /// about scalar replacement unless some frame it walked had a non-empty
+    /// scalar span — the region has to exist before a count of words inside it
+    /// can mean anything. That is the trap §10.9 of
+    /// `internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
+    /// records, one level below the one §10.8 fell into.
+    #[inline]
+    pub fn candidate_region_extents(&self) -> (bool, bool, bool) {
+        (
+            self.scalar_hi > self.scalar_lo,
+            self.ref_hoist_hi > self.ref_hoist_lo,
+            self.arith_hi > self.arith_lo,
+        )
+    }
+
+    /// Fold this layout into the process-wide extent census. Called once per
+    /// published compile; see [`region_extent_census`].
+    pub fn record_region_extent_census(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (scalar, hoist, arith) = self.candidate_region_extents();
+        FRAMES_PUBLISHED.fetch_add(1, Relaxed);
+        if scalar {
+            FRAMES_WITH_SCALAR_SPAN.fetch_add(1, Relaxed);
+        }
+        if hoist {
+            FRAMES_WITH_REF_HOIST_SPAN.fetch_add(1, Relaxed);
+        }
+        if arith {
+            FRAMES_WITH_ARITH_SPAN.fetch_add(1, Relaxed);
+        }
     }
 
     /// Name the region `off` falls in. Diagnostics only.

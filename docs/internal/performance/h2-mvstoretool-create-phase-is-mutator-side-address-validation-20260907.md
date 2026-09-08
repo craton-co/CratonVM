@@ -44,12 +44,17 @@ Eight `MvsCreate 500000` runs at `-Xmx256m` completed (G1 ×3: 466 / 237 / 173 s
 Generational ×3: 220 / 203 / 168 s; G1 + `CRATONVM_G1_JIT_MARK_DRIVER=1` ×2:
 164 / 127 s).
 
-**ZGC does not complete any of them.** It OOMs in 9-10 s at 500 000 (3/3), and
-at 100 000 and 200 000 too, with 88% of the heap free. That is a distinct defect
-with its own cause matrix and its own page —
-`docs/known-issues/h2/zgc-oom-on-mvstore-is-the-unregistered-entry-frame-blocking-compaction-20260907.md`
-— and it is what the old page's ZGC row
-(`OutOfMemoryError ... native reference array of length 14053`) was.
+**ZGC did not complete any of them.** It OOMed in 9-10 s at 500 000 (3/3), and
+at 100 000 and 200 000 too, with 88% of the heap free. That was a distinct
+defect with its own cause matrix and its own page — and it is what the old page's
+ZGC row (`OutOfMemoryError ... native reference array of length 14053`) was.
+
+**FIXED 2026-09-08** (`docs/internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md`):
+the compactor was being refused by a returned compiled frame's leftover return
+address, misread as a live unregistered JIT frame. `MvsCreate 500000` at
+`-Xmx256m` on ZGC is now `rc=0` in 101 s where it was `rc=1` in 9-10 s. **The
+rows in this section are pre-fix and the ZGC column wants re-taking**; the §4
+address-validation finding is unaffected, since that arm never collects.
 
 The whole class, `-Xmx256m`, for the record: **HotSpot `rc=0` in 17 s**, with
 `Created in 5661 ms` — not "about four minutes", which is what the old page

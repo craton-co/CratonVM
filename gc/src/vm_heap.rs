@@ -3494,6 +3494,21 @@ impl VmHeap {
                     );
                 }
             }
+            // WHAT THE UNREGISTERED-FRAME PROBE ACTUALLY SAW, because the
+            // coverage reason above cannot say. `unregistered-jit-frame-on-stack`
+            // counts cycles refused; these two count the HITS behind them, split
+            // by the only question that decides whether a refusal was earned: was
+            // the stack word at or above this thread's returned-JIT-frame residue
+            // mark (a band no returned frame can have written -- a live guardless
+            // frame) or below it (the leftovers of a frame that has returned)?
+            // Printed only when the probe fired at all.
+            let (residue_explained, residue_live) =
+                crate::gc_quiescence::unregistered_jit_frame_residue_census();
+            if residue_explained > 0 || residue_live > 0 {
+                eprintln!(
+                    "[GC] zgc-unregistered-jit-frame: hits_above_residue_mark={residue_live}                      hits_explained_by_residue={residue_explained}                      (the second kind marks and pins the band but no longer refuses                      relocation; CRATONVM_JIT_UNREG_RESIDUE_LICENCE=0 restores the refusal)"
+                );
+            }
             // THE OTHER END OF THE ARENA, on its own line.
             //
             // Every number above describes the LOW end. A heap can compact that
@@ -5709,7 +5724,7 @@ mod pin_capability_tests {
     ///
     /// That arm read `true` until 2026-09-06, and the cost was a wrong ANSWER,
     /// not a slow one:
-    /// `docs/known-issues/netty/bytebuf-multiplethreads-npe-generational-moving-young-20260906.md`
+    /// `docs/internal/fixed-suite-bugs/netty/bytebuf-multiplethreads-npe-generational-blocked-wake-jit-remap-FIXED-20260908.md`
     /// (19 netty classes, Generational only, an NPE on a live JUnit object) and
     /// the ten-second H2 SIGSEGV in `70c486744`'s call-site comment. The rule
     /// itself is tested next to `pinned_credit_admissible`; this is the other

@@ -5287,7 +5287,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 .slot_origins
                 .lock()
                 .iter()
-                .any(|so| so.cur != so.orig);
+                .any(|so| so.cur != so.orig)
+            // The native-stack write-back is a third channel with the same
+            // leaked-exit exposure, and testing only the first two let a
+            // thread whose ONLY pending repair was a raw stack word run on
+            // with it. See `apply_native_slot_fixups`.
+            || thread
+                .gc_block_state
+                .native_slots
+                .lock()
+                .iter()
+                .any(|ns| ns.cur != ns.orig);
         if pending {
             let n = crate::vm::vm_exec::apply_pending_blocked_fixups(shared, thread);
             if n > 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
