@@ -420,7 +420,16 @@ def REBIND(name):
 
 
 Fn = collections.namedtuple("Fn", "name file line body is_test")
-Stmt = collections.namedtuple("Stmt", "line text")
+# `scope` is the tuple of closure-body ids this statement sits inside, outermost
+# first. `()` is the function body itself. Defaulted so every existing
+# `Stmt(line, text)` construction keeps working.
+Stmt = collections.namedtuple("Stmt", "line text scope")
+Stmt.__new__.__defaults__ = ((),)
+
+
+def in_scope(inner, outer):
+    """True if `inner` is `outer` or nested inside it."""
+    return inner[:len(outer)] == outer
 
 
 CHARLIT = re.compile(r"'(?:\\.|[^\\'])'")
@@ -590,16 +599,52 @@ def signature(fn):
     return "\n".join(out)
 
 
+# A CLOSURE BODY IS A STATEMENT SCOPE. Matches a closure header that OPENS A
+# BLOCK -- `|ctx, args| {` at end of line, with or without `move`. A
+# single-expression closure (`|ctx| alloc_ref_array(ctx, cap)`) has no brace and
+# is deliberately left alone: it is an argument, evaluated before the call runs,
+# which is this file's whole "STATEMENTS, NOT LINES" rule.
+CLOSURE_OPEN = re.compile(r"(?:\bmove\s*)?\|[^|]*\|\s*\{\s*$")
+
+
 def statements(body):
     """Reassemble the body into statements: split on `;` at paren/brace depth 0.
 
     This is what makes "used after the call RETURNS" askable — a use inside the
-    same statement is an argument, evaluated before the call runs."""
+    same statement is an argument, evaluated before the call runs.
+
+    A closure body opened as a call ARGUMENT gets its own depth scope; without
+    that, `r.register(.., |ctx, args| { .. })` -- the shape of most natives in
+    this tree -- reassembled into a single statement and neither rule could ever
+    range over it."""
     out, buf, start, depth = [], [], 0, 0
+    # (saved paren depth, brace balance) per open closure body, innermost last.
+    closures = []
+    scope, next_scope_id = (), 0
+    # Brace balance of the CURRENT buffer, so a `let` whose initializer is a
+    # block stays whole even when that block contains `;` of its own.
+    buf_brace = 0
     for i, l in enumerate(body):
         if not buf:
             start = i
+            buf_brace = 0
         buf.append(l.strip())
+        buf_brace += l.count("{") - l.count("}")
+        # Track braces INSIDE the innermost closure body so its end is counted
+        # rather than guessed. `} else {` is net zero and must not close it;
+        # the `},` that ends the body takes the balance negative.
+        if closures:
+            rem = l.count("{") - l.count("}")
+            while closures and rem:
+                closures[-1][1] += rem
+                if closures[-1][1] < 0:
+                    # One `}` closed this body; anything beyond it belongs to
+                    # the enclosing frame, so carry the remainder outward.
+                    rem = closures[-1][1] + 1
+                    depth = closures.pop()[0]
+                    scope = scope[:-1]
+                else:
+                    rem = 0
         # Parens and brackets only. A `{` opens a BLOCK, not a continuation —
         # counting it made the `fn ...(...) {` signature line leave the depth
         # permanently positive, no statement ever closed, and the whole audit
@@ -613,18 +658,38 @@ def statements(body):
         # intervening GC-capable call, and the store on the next line reads as a
         # stale use. That shape alone produced several false positives.
         txt = l.rstrip()
+        # OPENING a closure body: the header is its own statement, and the body
+        # starts a fresh depth scope so its statements can close normally.
+        if CLOSURE_OPEN.search(txt):
+            # This line's trailing `{` opens the body about to be pushed, and
+            # its matching `}` is counted against THAT frame. Un-charge it from
+            # the parent, which the balance update above just credited.
+            if closures:
+                closures[-1][1] -= 1
+            # The header belongs to the ENCLOSING scope; the body does not.
+            out.append(Stmt(start, " ".join(buf), scope))
+            buf = []
+            closures.append([depth, 0])
+            depth = 0
+            next_scope_id += 1
+            scope = scope + (next_scope_id,)
+            continue
         # `buf[0]` is "" whenever a blanked comment line opened the buffer,
         # which made `starts_let` false and tore the very `let … match {}`
         # statements this guard exists to keep whole. Ask the first NON-EMPTY
         # line instead.
         first = next((b for b in buf if b), "")
         starts_let = first.startswith("let ")
+        # A `let` does not close while its initializer block is still open --
+        # see the module note on `let caller_class = if let .. { .. };`.
+        if starts_let and buf_brace > 0:
+            continue
         if depth <= 0 and (txt.endswith(";")
                            or (not starts_let and (txt.endswith("{") or txt.endswith("}")))):
-            out.append(Stmt(start, " ".join(buf)))
+            out.append(Stmt(start, " ".join(buf), scope))
             buf, depth = [], 0
     if buf:
-        out.append(Stmt(start, " ".join(buf)))
+        out.append(Stmt(start, " ".join(buf), scope))
     return out
 
 
@@ -971,10 +1036,16 @@ def scan_loops(fn, allocfns):
         # shadows `this` ten times) has exactly one live binding when the loop
         # is entered; reporting all of them turned one question into thirty
         # rows and buried the two real ones in the same file.
+        body_scope = inner[0].scope
         pre_map = {}
         for st in stmts:
             if st.line >= a:
                 break
+            # Only bindings the loop body can actually SEE. Without this a
+            # `let` in one `r.register(..)` closure paired with a loop in
+            # another, thousands of lines away.
+            if not in_scope(body_scope, st.scope):
+                continue
             m = LET.match(st.text)
             if m and m.group(1) != "_":
                 pre_map[m.group(1)] = st
@@ -1443,6 +1514,10 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
         gc_cands = []
         rooted_elsewhere = False
         for k in range(i + 1, len(stmts)):
+            # Left the binding's own closure body: it is out of scope, and the
+            # next closure's statements are a different native entirely.
+            if not in_scope(stmts[k].scope, st.scope):
+                break
             t = stmts[k].text
             if ROOT.search(t):
                 # Break ONLY when the rooting names THIS binding. Breaking
@@ -1493,8 +1568,17 @@ def assert_no_control_bytes():
     backspace in the Rust source and matches nothing, silently. Three of this
     file's guards were dead that way for an unknown number of runs. Fail at
     import instead."""
-    import inspect
-    src = inspect.getsource(inspect.getmodule(assert_no_control_bytes))
+    # READ THE FILE, not `inspect.getsource`. The latter needs a module with a
+    # real `__file__`, so it raised `TypeError` for anyone who `exec`s this
+    # script from a string -- which is how its own helpers get unit-tested and
+    # how a caller reuses `statements()` without shelling out.
+    path = globals().get("__file__")
+    if not path:
+        return
+    try:
+        src = io.open(path, encoding="utf-8").read()
+    except OSError:
+        return
     bad = [i + 1 for i, l in enumerate(src.split("\n"))
            if any(c in l for c in "\x07\x08\x0b\x0c")]
     if bad:
