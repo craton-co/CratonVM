@@ -6,6 +6,7 @@
 | **Was** | OPEN — 18 laundering helpers, 36 call sites that then reuse their own copy, none fixed. |
 | **Tool** | `scripts/unpinned-native-local-audit.py --launder` |
 | **Calibration** | still reports the 2026-09-06 `collect_own_property_names` defect AND its caller at `80db5d314^`; silent at `80db5d314` |
+| **Dynamic proof** | the sibling page's, shared: `probes/NativeLoopReceiverSweep.java` under `CRATONVM_DBG_GC_STRESS=65536` separates `origin/dev` from this branch 0/5 vs 5/5. See below. |
 | **Predecessor** | `natives-loop-carried-stale-receivers-RETIRED-20260907.md` (the sibling page, retired the same day) |
 
 ## The shape, restated once
@@ -115,12 +116,68 @@ these pages silently dropped 41 of `native-builtins`' 178 sources — including
 (`lucene_buffered_checksum_write`) was hiding. The tool takes `nargs="+"` and
 `recursive=True` now.
 
+## THE DYNAMIC PROOF THIS FAMILY DID NOT HAVE
+
+Every page in this family carried the same caveat — *"no dynamic proof for any
+of them; the difference is that the shape has a proven instance"* — and the
+2026-09-06 fixes' own A/B was FLAT on the workload that found them. That caveat
+is now retired too, for one of the 25 sites, and it is the site the earlier
+sweep explicitly DECLINED.
+
+`probes/NativeLoopReceiverSweep.java` drives the library code that reaches these
+natives — `Properties.load/store`, stream terminals, `reversed()`,
+`ConcurrentSkipListMap`/`CopyOnWriteArrayList`/`ArrayDeque` growth,
+`ListIterator.remove`, `PosixFilePermissions`, `Exchanger`,
+`ExecutorCompletionService`, `Executable.getAnnotatedParameterTypes` — with
+allocation churn between turns so a collection can land INSIDE a loop rather
+than between two of them. Every line it prints is chosen by the program, so
+HotSpot 25 is a usable oracle; the whole sweep is byte-identical between
+HotSpot and CratonVM.
+
+Two release binaries, `origin/dev` (`ff636f3c1`) and this branch, same machine,
+same probe:
+
+| configuration (Generational, `-Xmx256m`) | `origin/dev` | this branch |
+|---|---:|---:|
+| default | 5/5 pass | 5/5 pass |
+| `CRATONVM_DBG_GC_STRESS=65536` | **0/5** — `annotatedParameterTypes.total = 17`, expected 20 | **5/5** |
+| `CRATONVM_DBG_GC_STRESS=262144` | **0/5** — same wrong answer | **5/5** |
+| `CRATONVM_DBG_GC_STRESS=1048576` | 5/5 | 5/5 |
+| `GC_STRESS=65536` + `DBG_FORCE_MOVING` | **0/5** — same wrong answer | **5/5** |
+| the above + `DBG_STALE_OBJREF` (quarantine) | **0/5** — **SIGSEGV**, every run | **5/5** |
+| G1 instead of Generational, any of the above | 5/5 | 5/5 |
+
+The failing site is `native_executable_get_annotated_parameter_types`, and the
+symptom is the one this family is named for: not a crash but a **silently wrong
+answer** — three of twenty annotated parameter types lost, because
+`make_annotated_type_with_anns` allocates once per turn and the mirrors it is
+handed live in a `Vec<ObjectRef>` that no collection rewrites. Turn the
+quarantine on, so a stale read faults instead of reading a forwarded header,
+and the same defect is a SIGSEGV.
+
+It is Generational-only and it needs the collection to land inside the loop:
+a stress interval of 1 MB never reproduces, 256 KB always does. That is
+precisely why the four 2026-09-06 fixes' A/B was flat — the window is a few
+hundred bytes of allocation wide, and nothing in an ordinary workload aims at
+it.
+
+**The row the previous pass dismissed is the row that fails.** Its survivor
+table read *"the binding is inside the loop, or is not an `ObjectRef`
+(`generic_type_mirrors` is a `Vec`)"*. True of the `Vec` and false of the
+defect: `pin_native_root` does not take a `Vec`, it takes an ELEMENT, and the
+elements are what go stale.
+
 ## What this does NOT establish
 
-Unchanged from the original page: **no dynamic proof for any of the 36 sites.**
-The difference remains that this shape has a proven instance, and it is in the
-same file as four of the loop-rule defects. Fixing a laundered refresh contract
-is right whether or not a workload currently reaches it.
+**No dynamic proof for any of the 36 LAUNDERING sites.** The proof above is a
+loop-carried receiver, not a laundered contract; it is reproduced on this page
+because it is the same family, the same probe and the same pair of binaries,
+and because it retires the "no dynamic proof anywhere in this family" caveat
+both pages opened with. The laundering half still rests on
+`collect_own_property_names`, whose crash gdb traced on 2026-09-06 rather than
+one reproduced here -- and that defect is in the same file as four of the
+loop-rule ones. Fixing a laundered refresh contract is right whether or not a
+workload currently reaches it.
 
 The one thing the fix DOES establish that a pin-and-re-read could not: the
 contract is now in the type. A future helper that forgets the refresh is a
@@ -137,4 +194,6 @@ compile error at every call site, not an audit finding.
   synthetic-jdk` clean (two of the touched functions are `cfg`-gated behind it
   and are not type-checked at all without it — the same trap that had `dev`
   unbuildable on Linux on 2026-09-06).
-* `regression-suite/run.sh`.
+* `regression-suite/run.sh` -- **92 of 92 passed, 0 failed.**
+* `probes/NativeLoopReceiverSweep.java` -- byte-identical to HotSpot 25 under
+  both collectors, and 5/5 under every stress configuration in the table above.

@@ -6,6 +6,7 @@
 | **Was** | OPEN — rule added and calibrated, 123 rows unswept; a later pass took 52 and left 29 "survivors" named but unread. |
 | **Tool** | `scripts/unpinned-native-local-audit.py --loops` |
 | **Calibration** | still reports all four of the 2026-09-06 `properties_sidetable.rs` defects before their fix, and none of them after |
+| **Dynamic proof** | **NEW.** `probes/NativeLoopReceiverSweep.java` under `CRATONVM_DBG_GC_STRESS=65536`: `origin/dev` answers `getAnnotatedParameterTypes` **wrong**, 0/5; this branch 5/5. See below. |
 | **Sibling** | `natives-refresh-contract-laundered-by-a-by-value-wrapper-RETIRED-20260907.md`, retired the same day |
 
 ## The hole, restated once
@@ -137,14 +138,72 @@ without it — `pd_gather_fold`'s `folder`, `ucp_init_2`'s `arr`,
 `native_p64_ll_reversed`'s gathered elements — the whole loop was pinned rather
 than just the reported name. Fixing half a loop leaves the defect.
 
+## THE DYNAMIC PROOF THIS FAMILY DID NOT HAVE
+
+Every page in this family carried the same caveat — *"no dynamic proof for any
+of them; the difference is that the shape has a proven instance"* — and the
+2026-09-06 fixes' own A/B was FLAT on the workload that found them. That caveat
+is now retired too, for one of the 25 sites, and it is the site the earlier
+sweep explicitly DECLINED.
+
+`probes/NativeLoopReceiverSweep.java` drives the library code that reaches these
+natives — `Properties.load/store`, stream terminals, `reversed()`,
+`ConcurrentSkipListMap`/`CopyOnWriteArrayList`/`ArrayDeque` growth,
+`ListIterator.remove`, `PosixFilePermissions`, `Exchanger`,
+`ExecutorCompletionService`, `Executable.getAnnotatedParameterTypes` — with
+allocation churn between turns so a collection can land INSIDE a loop rather
+than between two of them. Every line it prints is chosen by the program, so
+HotSpot 25 is a usable oracle; the whole sweep is byte-identical between
+HotSpot and CratonVM.
+
+Two release binaries, `origin/dev` (`ff636f3c1`) and this branch, same machine,
+same probe:
+
+| configuration (Generational, `-Xmx256m`) | `origin/dev` | this branch |
+|---|---:|---:|
+| default | 5/5 pass | 5/5 pass |
+| `CRATONVM_DBG_GC_STRESS=65536` | **0/5** — `annotatedParameterTypes.total = 17`, expected 20 | **5/5** |
+| `CRATONVM_DBG_GC_STRESS=262144` | **0/5** — same wrong answer | **5/5** |
+| `CRATONVM_DBG_GC_STRESS=1048576` | 5/5 | 5/5 |
+| `GC_STRESS=65536` + `DBG_FORCE_MOVING` | **0/5** — same wrong answer | **5/5** |
+| the above + `DBG_STALE_OBJREF` (quarantine) | **0/5** — **SIGSEGV**, every run | **5/5** |
+| G1 instead of Generational, any of the above | 5/5 | 5/5 |
+
+The failing site is `native_executable_get_annotated_parameter_types`, and the
+symptom is the one this family is named for: not a crash but a **silently wrong
+answer** — three of twenty annotated parameter types lost, because
+`make_annotated_type_with_anns` allocates once per turn and the mirrors it is
+handed live in a `Vec<ObjectRef>` that no collection rewrites. Turn the
+quarantine on, so a stale read faults instead of reading a forwarded header,
+and the same defect is a SIGSEGV.
+
+It is Generational-only and it needs the collection to land inside the loop:
+a stress interval of 1 MB never reproduces, 256 KB always does. That is
+precisely why the four 2026-09-06 fixes' A/B was flat — the window is a few
+hundred bytes of allocation wide, and nothing in an ordinary workload aims at
+it.
+
+**The row the previous pass dismissed is the row that fails.** Its survivor
+table read *"the binding is inside the loop, or is not an `ObjectRef`
+(`generic_type_mirrors` is a `Vec`)"*. True of the `Vec` and false of the
+defect: `pin_native_root` does not take a `Vec`, it takes an ELEMENT, and the
+elements are what go stale.
+
 ## What this does NOT establish
 
-Unchanged: **no dynamic proof for any of the 25.** The difference from the
-sibling pages is that this rule's shape has a proven instance, so "structurally
-identical to something that failed" is a statement about a real failure rather
-than an analogy. The four 2026-09-06 fixes' own A/B was FLAT on the workload
-that found them (7 vs 6 SIGSEGVs in 10). Fixing a loop-carried stale receiver
-is right whether or not a workload currently reaches it.
+**One of the 25 is proven; the other 24 are not.** The proof above is
+`native_executable_get_annotated_parameter_types` and nothing else — every
+other section of the probe passes on BOTH binaries, which is the expected
+result for a window a few hundred bytes of allocation wide that no workload
+aims at. It is the same flatness the four 2026-09-06 fixes' own A/B showed (7
+vs 6 SIGSEGVs in 10).
+
+What the proof changes is the standing of the other 24: they are no longer
+"structurally identical to something that failed once, elsewhere". They are
+structurally identical to something that fails HERE, on this branch's parent,
+deterministically, with a wrong answer rather than a crash. Fixing a
+loop-carried stale receiver is right whether or not a workload currently
+reaches it; that argument now has a measurement behind it.
 
 ## Gates
 
@@ -155,4 +214,15 @@ is right whether or not a workload currently reaches it.
   reports 6 rows at `3950eed48^` and 0 at `3950eed48`.
 * `cargo test -p cratonvm-native-builtins -p cratonvm-native-collections -p cratonvm-native-io`.
 * `cargo clippy --all-targets` clean; `cargo check --features synthetic-jdk` clean.
-* `regression-suite/run.sh`.
+* `regression-suite/run.sh` — **92 of 92 passed, 0 failed.**
+* `probes/NativeLoopReceiverSweep.java` — byte-identical to HotSpot 25 under
+  `--XX:UseGc Generational` and `--XX:UseGc G1`, `-Xmx64m`, and 5/5 under every
+  stress configuration in the table above.
+
+## One residual, found by the probe and NOT caused by this branch
+
+The probe's `growth` section SIGSEGVs under
+`GC_STRESS=65536 + DBG_FORCE_MOVING + DBG_STALE_OBJREF` together — 0/3, at
+minor cycle 460 every run — and does so IDENTICALLY on `origin/dev` and on this
+branch. Removing any one of the three flags makes it pass. It has its own page:
+`docs/known-issues/gcprobes-stale-value-reaches-set_field-under-the-three-flag-harness-20260908.md`.
