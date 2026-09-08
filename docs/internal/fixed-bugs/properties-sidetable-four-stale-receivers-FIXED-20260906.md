@@ -65,7 +65,7 @@ Flat. A `gdb` census of five crashes on that workload says why: four are in
 `native_object_hash_code` and one in `execute_invoke_kind` — none in this file.
 The open defect that workload has is a receiver already dead on ENTRY to a
 native, tracked in
-`known-issues/springboot/generational-young-sweep-frees-an-interpreter-held-object-20260906.md`.
+`generational-young-sweep-frees-an-interpreter-held-object-FIXED-20260908.md`.
 
 These four are landed because they are provable by inspection against a
 contract the file states, not because a measurement moved. The lever exists so

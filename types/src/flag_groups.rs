@@ -1222,12 +1222,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "string-access-inline-rows", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "licm-read-hoist", on_key: None, off_key: Some("CRATONVM_JIT_NO_LICM_READ_HOIST"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-live-slot-clamp", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP"), off_word: None, since: "2026-08-24" },
-    // Declared 2026-09-08 -- `f64681484` added the read and not the row, so the
-    // guard was served by a live `getenv` rather than the latched snapshot and
-    // `cargo test -p cratonvm-types` (and the pre-push hook) has been red on
-    // `dev` since. Kept beside its sibling above because the two are
-    // deliberately separate switches: see `inline_locals_floor_disabled`.
-    E { group: Group::JIT, token: "inline-locals-floor", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR"), off_word: None, since: "2026-09-07" },
+    E { group: Group::JIT, token: "inline-locals-floor", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR"), off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "inline-new", on_key: None, off_key: Some("CRATONVM_JIT_DISABLE_INLINE_NEW"), off_word: None, since: "2026-05-28" },
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None, since: "2026-07-24" },
     E { group: Group::JIT, token: "inline-self-guard", on_key: Some("CRATONVM_JIT_INLINE_SELF_GUARD"), off_key: None, off_word: None, since: "2026-07-10" },

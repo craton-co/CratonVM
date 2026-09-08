@@ -1,3 +1,35 @@
+# ✅ FIXED — `JerseyEndpointRequestIntegrationTests` SIGSEGV under Generational GC
+
+> **RESOLVED 2026-09-08, by the family fix, not by a re-run of this class.**
+>
+> This page's most useful line is its register decode: `[rbx+r13*8]` with
+> `r13=1` — an object base plus 8, which is the second header word.
+> `MonitorTable::exit` opens with `header_of(obj_ref)`, and that is the exact
+> instruction. `probes/OldToYoungBarrierSweep.java` produces a crash whose
+> banner carries the same decode, the same faulting RVA and a symbolized stack
+> naming `MonitorTable::exit` under `native_sync_map_get`; the cause is a
+> native that used a reference across a park or an allocation without
+> refreshing it. Nine such sites are fixed, and a gate rule now catches the
+> shape — see
+> `natives-hold-a-stale-reference-across-a-park-FIXED-20260908.md`.
+>
+> **Stated plainly: this class was NOT re-run green.** It does not currently
+> load in this checkout — `JerseyAutoConfiguration` is absent from the
+> generated test classpath of `module/spring-boot-security`, and the class fails
+> the same way on HotSpot, so that is a fixture gap and not a VM one. The
+> retirement rests on the identical fault decode and the identical faulting
+> site, not on a green run of this test.
+>
+> This page's own "what this is NOT" section was right on all three counts, and
+> right for the right reasons. Its fourth possibility — that the crash sits on
+> the JIT/GC boundary — was the one that did not hold: the faulting frame is
+> neither the JIT nor the collector, it is a native holding a reference the
+> collector moved.
+>
+> The original page follows unchanged.
+
+---
+
 # `JerseyEndpointRequestIntegrationTests` SIGSEGV under Generational GC — indexed load through a stale/garbage base pointer
 
 ## Status
