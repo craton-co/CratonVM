@@ -6269,10 +6269,26 @@ fn run() -> Result<()> {
             // `written` is the repair firing on wake; `skipped` is the guard
             // declining a word the native call reused since the capture.
             // written=0 means the repair never engaged on this run.
-            let (bs_c, bs_a, bs_w, bs_s, bs_on) = cratonvm_vm::blocked_peer_stack_remap_census();
+            let (bs_c, bs_a, bs_w, bs_s, bs_d, bs_x, bs_u, bs_on) =
+                cratonvm_vm::blocked_peer_stack_remap_census();
+            // `discarded` is a correct discard (the cycle that captured never
+            // relocated); `dropped` is the capture buffer at its cap, which is
+            // a repair OUTAGE; `unrouted` is a capture on a RELOCATING cycle
+            // that no blocked thread claimed, i.e. a word nothing will rewrite.
             eprintln!(
                 "[GC] blocked_peer_stack_remap: captured={bs_c} adopted={bs_a} written={bs_w} skipped={bs_s} \
-enabled={bs_on}"
+discarded={bs_d} dropped={bs_x} unrouted={bs_u} enabled={bs_on}"
+            );
+            // Extent census for the two storage classes
+            // `moving-young-corruption-rootcause.md` nominates and that no
+            // stale-word census has ever been able to rank: a frame that gave
+            // scalar replacement or LICM hoisting no slots has no such region,
+            // so a zero word-count against one of those names is a statement
+            // about the optimisation rather than about the region.
+            let (fl_n, fl_sc, fl_rh, fl_ar) = cratonvm_jit::region_extent_census();
+            eprintln!(
+                "[GC] jit_frame_region_extents: frames={fl_n} with_scalar_span={fl_sc} \
+with_ref_hoist_span={fl_rh} with_arith_span={fl_ar}"
             );
             // Engagement census for the blocked-peer SHADOW-STACK scan. A
             // clean run with `sh_windows=0` means the scan never ran, and any

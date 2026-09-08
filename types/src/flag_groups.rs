@@ -1222,6 +1222,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "string-access-inline-rows", on_key: None, off_key: Some("CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "licm-read-hoist", on_key: None, off_key: Some("CRATONVM_JIT_NO_LICM_READ_HOIST"), off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "inline-live-slot-clamp", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP"), off_word: None, since: "2026-08-24" },
+    // Default-ON kill switch, same shape and same neighbourhood as the clamp
+    // above: the inliner reserves callee locals above the caller's live floor.
+    // Undeclared until 2026-09-08, which meant `CRATONVM_JIT=-inline-locals-floor`
+    // could not reach it and `flags::with_thread_overrides` could not arrange it
+    // in a test -- it was served by a live `getenv` off the ambient environment.
+    E { group: Group::JIT, token: "inline-locals-floor", on_key: None, off_key: Some("CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR"), off_word: None, since: "2026-09-08" },
     E { group: Group::JIT, token: "inline-new", on_key: None, off_key: Some("CRATONVM_JIT_DISABLE_INLINE_NEW"), off_word: None, since: "2026-05-28" },
     E { group: Group::JIT, token: "inline-putfield", on_key: None, off_key: Some("CRATONVM_NO_JIT_INLINE_PUTFIELD"), off_word: None, since: "2026-07-24" },
     E { group: Group::JIT, token: "inline-self-guard", on_key: Some("CRATONVM_JIT_INLINE_SELF_GUARD"), off_key: None, off_word: None, since: "2026-07-10" },
@@ -1939,7 +1945,13 @@ pub const INVENTORY: &[E] = &[
     // Default-ON since 2026-09-05, so it takes an `off_word`: presence alone no
     // longer decides it and `=0` has to be able to turn it off.
     E { group: Group::JIT, token: "local-mask-unreached-fail-closed", on_key: Some("CRATONVM_JIT_LOCAL_MASK_UNREACHED_FAIL_CLOSED"), off_key: None, off_word: Some("0"), since: "2026-09-03" },
-    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: Some("CRATONVM_BLOCKED_WAKE_JIT_REMAP"), off_key: None, off_word: None, since: "2026-09-03" },
+    // Default-ON kill switch as of 2026-09-08, hence `off_key` only: the JIT
+    // half of a blocked-region wake (active compiled frames, register images,
+    // shadow stack). It shipped opt-in and wired only into the LEAKED-region
+    // fallback, so the wake that actually runs remapped interpreter frames and
+    // nothing compiled -- a peer that blocked with compiled frames below it
+    // resumed with every JIT oop at its pre-move address.
+    E { group: Group::GC, token: "blocked-wake-jit-remap", on_key: None, off_key: Some("CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP"), off_word: None, since: "2026-09-03" },
     // Default-ON kill switch, hence `off_key` only: a blocked peer's
     // conservatively-scanned native-stack words are written back on wake. The
     // objects were kept alive AND relocated while it slept, nothing else

@@ -857,6 +857,21 @@ pub fn begin_moving_young_coverage_cycle() {
     // through it and a pause that reaches only one of the two is still cleared.
     clear_xt_cycle_pinned_jit_roots();
     clear_xt_cycle_pinned_jit_depth();
+    // Same scope, and this one is load-bearing rather than belt-and-braces.
+    // The blocked-peer native-stack captures are produced by exactly the
+    // conservative scans `CONSERVATIVE_JIT_SCANS` counts above, and their only
+    // drain (`fold_pointer_map_into_blocked_audited`) sits behind
+    // `update_all_roots`'s empty-pointer-map early return — i.e. it never runs
+    // on a NON-moving cycle. Without a clear here the buffer accumulates every
+    // non-moving cycle's captures until it reaches its cap and the repair goes
+    // silent on the one cycle whose captures matter. See
+    // `clear_peer_stack_slots` for the ABA half of the argument.
+    clear_peer_stack_slots();
+    // The pairing diagnostic's capture has the same shape and the same drain:
+    // `take_peer_reg_capture` runs on the moving path only, so "words captured
+    // this cycle" silently included every non-moving cycle since the last
+    // relocation.
+    clear_peer_reg_capture();
 }
 
 /// Whether this cycle's root scan touched state belonging to a peer thread that
@@ -1895,6 +1910,34 @@ pub static PEER_STACK_SLOTS_ADOPTED: AtomicU64 = AtomicU64::new(0);
 pub static PEER_STACK_SLOTS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 pub static PEER_STACK_SLOTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Captures the buffer refused because it was already at its cap.
+///
+/// Non-zero is a REPAIR OUTAGE, not a tuning note: the words this pass exists
+/// to rewrite were the ones it declined to record. It reads zero only while the
+/// buffer's lifetime is genuinely per-cycle — see
+/// [`clear_peer_stack_slots`]'s caller.
+pub static PEER_STACK_SLOTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Captures discarded at the next cycle's open because the cycle that took them
+/// never relocated.
+///
+/// These are correct discards — nothing moved, so nothing needs rewriting — and
+/// they are counted separately so they can never be mistaken for [`
+/// PEER_STACK_SLOTS_UNROUTED`], which is the population that DID need a channel
+/// and got none.
+pub static PEER_STACK_SLOTS_DISCARDED: AtomicU64 = AtomicU64::new(0);
+
+/// Captures a RELOCATING cycle's fold could not hand to any thread.
+///
+/// The fold adopts a capture onto its owning thread only while that thread is
+/// inside a blocked region; a peer frozen by the take-over path is in
+/// `CompiledUninterruptible` instead and has no wake hook to apply a fixup at.
+/// A non-zero reading is therefore a word in a live peer's stack that named an
+/// object this cycle moved and that nothing will ever rewrite — the defect
+/// `bytebuf-multiplethreads-npe-generational-moving-young` is about, counted
+/// instead of assumed absent.
+pub static PEER_STACK_SLOTS_UNROUTED: AtomicU64 = AtomicU64::new(0);
+
 /// Record one scanned native-stack word and the address it lives at.
 pub fn record_peer_stack_slot(os_tid: u32, addr: usize, value: usize) {
     if !blocked_peer_stack_remap_enabled() {
@@ -1906,6 +1949,8 @@ pub fn record_peer_stack_slot(os_tid: u32, addr: usize, value: usize) {
     if g.len() < 65536 {
         g.push((os_tid, addr, value));
         PEER_STACK_SLOTS_CAPTURED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PEER_STACK_SLOTS_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1917,8 +1962,35 @@ pub fn take_peer_stack_slots() -> Vec<(u32, usize, usize)> {
 
 /// Discard the cycle's captures without applying them -- for the paths that
 /// scan but then do not relocate, so nothing carries into the next cycle.
+///
+/// # Why this has to be called, and what happened while it was not
+///
+/// This function shipped with the 2026-09-07 repair and **had no caller**, and
+/// the drain on the other side is reached only through `update_all_roots`,
+/// which returns early on an empty pointer map — that is, on every NON-moving
+/// cycle. Since the non-moving cycles outnumber the moving ones by roughly
+/// forty to one on the workload the repair was written for, the buffer was in
+/// practice a process-lifetime accumulator of captures belonging to cycles that
+/// never relocated. Two consequences, and both are correctness ones:
+///
+/// * **the cap silences the repair.** `record_peer_stack_slot` drops a capture
+///   once the buffer holds 65536, so once the accumulation saturates, the
+///   moving cycle — the only cycle whose captures matter — records nothing.
+/// * **ABA.** A capture taken at cycle N carries `orig` = the word's value
+///   *then*. Folded at a later cycle M, it is advanced through M's pointer map.
+///   If the address was vacated at N, recycled, and moved again at M, the fold
+///   computes `cur` for the *new* occupant and the wake write-back stores it
+///   into a word that meant the old one — the repair manufacturing exactly the
+///   wrong-address read it exists to prevent.
+///
+/// Clearing at the point that OPENS a pause gives the buffer the per-cycle
+/// lifetime the fold already assumes, so a capture is only ever folded against
+/// the pointer map of the very cycle that took it.
 pub fn clear_peer_stack_slots() {
     let mut g = PEER_STACK_SLOTS.lock();
+    if !g.is_empty() {
+        PEER_STACK_SLOTS_DISCARDED.fetch_add(g.len() as u64, Ordering::Relaxed);
+    }
     g.clear();
 }
 

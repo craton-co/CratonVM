@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-392 tokens.
+393 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -685,6 +685,7 @@ export inherited from a parent shell.
 | `string-access-inline-rows` | `CRATONVM_JIT_NO_STRING_ACCESS_INLINE_ROWS` |
 | `licm-read-hoist` | `CRATONVM_JIT_NO_LICM_READ_HOIST` |
 | `inline-live-slot-clamp` | `CRATONVM_JIT_NO_INLINE_LIVE_SLOT_CLAMP` |
+| `inline-locals-floor` | `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR` |
 | `inline-new` | `CRATONVM_JIT_DISABLE_INLINE_NEW` |
 | `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
 | `inline-self-guard` | `CRATONVM_JIT_INLINE_SELF_GUARD` |
@@ -1021,7 +1022,7 @@ export inherited from a parent shell.
 | `moving-young-band-liveness-screen` | `CRATONVM_MOVING_YOUNG_NO_BAND_LIVENESS_SCREEN` |
 | `moving-young-band-thread-window` | `CRATONVM_MOVING_YOUNG_NO_BAND_THREAD_WINDOW` |
 | `zgc-jit-blanket-refusal` | `CRATONVM_ZGC_JIT_BLANKET_REFUSAL` |
-| `blocked-wake-jit-remap` | `CRATONVM_BLOCKED_WAKE_JIT_REMAP` |
+| `blocked-wake-jit-remap` | `CRATONVM_NO_BLOCKED_WAKE_JIT_REMAP` |
 | `blocked-peer-stack-remap` | `CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP` |
 | `zgc-unrewritable-peer-refuses` | `CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES` |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
