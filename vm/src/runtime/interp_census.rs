@@ -278,6 +278,21 @@ pub fn report_at_exit() {
         eprintln!(
             "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"
         );
+        // The guarded slot-0 accessors (`Op::Unbox`): the unboxing pair and the
+        // four `Atomic*` families. Counted on their own line rather than folded
+        // into `lowered_as_arithmetic`, because they are not arithmetic -- they
+        // are guarded memory ops, and three of them WRITE. They came off the
+        // `refused_method` work list, so the two numbers have to be readable
+        // against each other.
+        //
+        // `note_unbox_lowered` existed from the day the op landed and nothing
+        // printed it, which is the "instrument armed where nobody reads it"
+        // shape this census exists to avoid: a zero here now means the emitter
+        // found no sites, and that is a different statement from silence.
+        eprintln!(
+            "[c2-supersede] unbox accessors: lowered_inline={}",
+            cratonvm_jit::ir::unbox_lowered()
+        );
         // The branch-profile window. `still_open` at exit should be ~0: a
         // nomination that opens the window and never closes it pins branch
         // recording on for the rest of the process, which is the global cost

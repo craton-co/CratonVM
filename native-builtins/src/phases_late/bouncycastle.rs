@@ -9618,7 +9618,18 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
             let use_aes = kw.len() >= 2;
 
             let _ = iv_last;
+            // GC-safety: the non-AES arm below dispatches `processBlock` -- real
+            // BouncyCastle bytecode -- once per block, and `cipher` and both
+            // counter arrays are bare Rust locals bound before the loop. From
+            // the second block on the dispatch and the two array arguments are
+            // pre-GC addresses.
+            let cipher_pin = ctx.pin_native_root(cipher);
+            let counter_pin = ctx.pin_native_root(counter_arr);
+            let counter_out_pin = ctx.pin_native_root(counter_out_arr);
             for i in 0..len {
+                let cipher = ctx.read_native_pin(cipher_pin, cipher);
+                let counter_arr = ctx.read_native_pin(counter_pin, counter_arr);
+                let counter_out_arr = ctx.read_native_pin(counter_out_pin, counter_out_arr);
                 let next;
                 if byte_count == 0 {
                     // checkLastIncrement — BOTH branches. Anything already
@@ -9669,7 +9680,11 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
                 out_buf[i] = next;
             }
 
-            // Persist mutated state + output.
+            // Persist mutated state + output, through the pins: the loop
+            // above ran bytecode.
+            let counter_arr = ctx.read_native_pin(counter_pin, counter_arr);
+            let counter_out_arr = ctx.read_native_pin(counter_out_pin, counter_out_arr);
+            ctx.unpin_native_roots(cipher_pin);
             ctx.write_byte_array_from(counter_arr, 0, &counter);
             ctx.write_byte_array_from(counter_out_arr, 0, &keystream);
             ctx.set_field_by_name(this, "byteCount", Value::Int(byte_count));
