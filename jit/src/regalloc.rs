@@ -4286,6 +4286,7 @@ fn ir_op_defines_value(op: &Op) -> bool {
             | Op::Param(_)
             | Op::Phi
             | Op::ScalarIntrinsic(_)
+            | Op::Unbox { .. }
             | Op::Add
             | Op::Sub
             | Op::Mul

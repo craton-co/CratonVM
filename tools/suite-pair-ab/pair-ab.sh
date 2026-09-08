@@ -300,10 +300,19 @@ awk -F'\t' 'NR>1{
     az = (z < 0) ? -z : z
     printf "sign test on the paired count: z = %+.2f%s\n", z,
            (az >= 2 ? "  (consistent, p < 0.05)" : "  (a coin)")
-    # SPLIT-HALF: score the two halves of this run separately. A direction
-    # that is real shows up in BOTH; one that is an artifact of which
-    # classes were sampled flips. This is the check that would have caught
-    # the 2026-09-07 hibernate reversal inside one run, not a day later.
+    # SPLIT-HALF, two ways, because one way cannot tell two causes apart.
+    #
+    # Rows are in RUN order, so FIRST-vs-LAST is also EARLY-vs-LATE in a run
+    # that can span an hour: a disagreement there could be the classes OR the
+    # host drifting under it. ODD-vs-EVEN interleaves the same classes in time,
+    # so it is blind to drift and sensitive only to WHICH classes were sampled.
+    #
+    #   both agree             -> stable direction
+    #   first/last disagree,
+    #     odd/even agrees      -> DRIFT during the run, not the classes
+    #   odd/even disagrees     -> genuinely class-dependent; does not
+    #                             generalise. That is the 2026-09-07 hibernate
+    #                             reversal (z=+2.47 then z=-2.49).
     h = int(n/2)
     if (h >= 8) {
       w1 = 0; for (i = 0; i < h; i++) w1 += w[i]
@@ -311,12 +320,41 @@ awk -F'\t' 'NR>1{
       n1 = h; n2 = n - h
       z1 = (2*w1 - n1) / sqrt(n1)
       z2 = (2*w2 - n2) / sqrt(n2)
-      printf "split-half   : first %d classes z = %+.2f | last %d classes z = %+.2f\n", n1, z1, n2, z2
-      if (!((z1 >= 0 && z2 >= 0) || (z1 < 0 && z2 < 0))) {
+      wo = 0; no = 0; we = 0; ne = 0
+      for (i = 0; i < n; i++) {
+        if (i % 2) { wo += w[i]; no++ } else { we += w[i]; ne++ }
+      }
+      zo = (no > 0) ? (2*wo - no) / sqrt(no) : 0
+      ze = (ne > 0) ? (2*we - ne) / sqrt(ne) : 0
+      # A z near zero has NO sign to disagree with: two halves at +0.0 and
+      # -0.4 are both 'no signal', not a contradiction. Only count a
+      # disagreement when both sides actually say something (|z| >= 1).
+      SIG = 1.0
+      az1 = (z1 < 0) ? -z1 : z1; az2 = (z2 < 0) ? -z2 : z2
+      azo = (zo < 0) ? -zo : zo; aze = (ze < 0) ? -ze : ze
+      agree_time  = !(az1 >= SIG && az2 >= SIG && ((z1 < 0) != (z2 < 0)))
+      agree_class = !(azo >= SIG && aze >= SIG && ((zo < 0) != (ze < 0)))
+      printf "split first/last : %d cls z = %+.2f | %d cls z = %+.2f%s\n", n1, z1, n2, z2, (agree_time ? "" : "   <- DISAGREE")
+      printf "split odd/even   : %d cls z = %+.2f | %d cls z = %+.2f%s\n", no, zo, ne, ze, (agree_class ? "" : "   <- DISAGREE")
+      if (!agree_class) {
         split_warn = 1
-        printf "  ** THE HALVES DISAGREE IN SIGN. What this run measured is not\n"
-        printf "     stable across WHICH classes were sampled. Do not report a\n"
-        printf "     direction from it; take a larger or different sample.\n"
+        printf "  ** ODD/EVEN DISAGREE: the direction depends on WHICH CLASSES were\n"
+        printf "     sampled, and odd/even is balanced in time so drift cannot explain\n"
+        printf "     it. The effect does not generalise. Report no direction.\n"
+      } else if (!agree_time) {
+        printf "  ** FIRST/LAST disagree but ODD/EVEN agree: that is DRIFT DURING THE\n"
+        printf "     RUN, not a class effect. The direction may be real, the host was\n"
+        printf "     not steady. Re-run on a quiet host before reporting a magnitude.\n"
+      }
+      # Softer than a reversal, and worth saying: one half carries the result
+      # and the other says nothing. Not a contradiction, so no verdict change,
+      # but the pooled count is then resting on half the sample.
+      if (agree_class && agree_time) {
+        lop = (az1 >= 2 && az2 < 1) || (az2 >= 2 && az1 < 1) || (azo >= 2 && aze < 1) || (aze >= 2 && azo < 1)
+        if (lop)
+          printf "  (note: one half carries this and the other is flat -- the pooled count\n"
+        if (lop)
+          printf "   rests on half the sample; a disjoint confirming run is worth more here.)\n"
       }
     } else {
       printf "split-half   : n=%d is too small to split (need 16+)\n", n

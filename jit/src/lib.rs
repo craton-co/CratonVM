@@ -24090,6 +24090,13 @@ fn try_compile_inner(
                         usize,
                         ir::ScalarOp,
                     > = std::collections::HashMap::new();
+                    // Unboxing accessors this tier will lower as a guarded
+                    // field load. Kept out of `info_map` for the same reason,
+                    // and carrying the receiver class id the guard needs.
+                    let mut ir_unbox_intrinsic_sites: std::collections::HashMap<
+                        usize,
+                        (ir::UnboxOp, u32),
+                    > = std::collections::HashMap::new();
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -24395,6 +24402,24 @@ fn try_compile_inner(
                         // the other half, and both ask the SAME function.
                         if let Some(sop) = ir::try_ir_scalar_intrinsic(&cn, &mn, &desc) {
                             ir_scalar_intrinsic_sites.insert(pc, sop);
+                            continue;
+                        }
+                        // An unboxing accessor is a GUARDED FIELD LOAD, not
+                        // arithmetic, so it gets its own recognizer and its own
+                        // site map -- but the same contract: the site is
+                        // recorded, no `invoke_info` row is built, and the
+                        // builder emits the load in place of the call. The
+                        // receiver class id comes from the constant pool, and a
+                        // site whose id does not resolve declines (the emitter
+                        // would have nothing to derive an offset from).
+                        if let Some(uop) = cp_invoke_class_id_resolver
+                            .and_then(|r| r(cp_idx))
+                            .and_then(|cid| {
+                                ir::try_ir_unbox_intrinsic(&cn, &mn, &desc, cid)
+                                    .map(|op| (op, cid))
+                            })
+                        {
+                            ir_unbox_intrinsic_sites.insert(pc, uop);
                             continue;
                         }
                         if !ir_over_intrinsic_enabled() && is_intrinsic_site {
@@ -25032,6 +25057,20 @@ fn try_compile_inner(
                         }
                         builder.set_scalar_intrinsics(std::mem::take(
                             &mut ir_scalar_intrinsic_sites,
+                        ));
+                    }
+                    if all_emittable && !ir_unbox_intrinsic_sites.is_empty() {
+                        if ir_stage_reporting() {
+                            eprintln!(
+                                "[ir] unbox-intrinsics {}.{}{}: {} site(s) lowered as a guarded field load",
+                                cached.class_name,
+                                cached.method_name,
+                                cached.method_descriptor,
+                                ir_unbox_intrinsic_sites.len(),
+                            );
+                        }
+                        builder.set_unbox_intrinsics(std::mem::take(
+                            &mut ir_unbox_intrinsic_sites,
                         ));
                     }
                     if all_emittable && !info_map.is_empty() {

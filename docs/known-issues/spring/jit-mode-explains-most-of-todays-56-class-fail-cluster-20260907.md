@@ -87,6 +87,20 @@ side-effecting replay`, suggesting a deopt-path defect may be a contributing
 or related factor, not confirmed as the same root cause as either mechanism
 above.
 
+> **That deopt defect is FIXED (2026-09-07)** —
+> `internal/fixed-bugs/deopt-sink-refused-a-frame-its-sibling-resumes-FIXED-20260907.md`.
+> It was one gap hitting three suites the same day: the entire H2 CRASH
+> population, 7 hibernate-reactive classes, and this line. So this page should
+> no longer carry it as an open suspect.
+>
+> **What that does NOT settle**, and why this page stays open: the abort was a
+> hard, VISIBLE process failure, whereas the two mechanisms above are a silent
+> compile failure and an NPE. A class can stop aborting and still fail for the
+> reasons this page is actually about. Re-running
+> `CrossOriginAnnotationIntegrationTests` on a current binary is the cheap next
+> step, and until someone does, the only claim supported here is that one of
+> the three symptoms it showed has a known fix.
+
 ## Not the same as the already-fixed sibling
 
 `aot-cglib-dynamicclassfileobject-illegalargumentexception-20260811-FIXED.md`

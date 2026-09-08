@@ -4453,7 +4453,27 @@ match before asserting the verdicts differ.
 
 `tools/suite-pair-ab/selftest.sh` runs the real awk out of `pair-ab.sh` rather
 than a copy, so the two cannot drift, and it was verified to FAIL when the
-detector is disabled. Its own first draft had the bug this file keeps meeting:
+detector is disabled.
+
+**The first version of that check was confounded, and it was my own.** Rows are
+written in RUN order, so first-half-vs-last-half is also EARLY-vs-LATE across a
+run that can span an hour: a disagreement could equally be the classes or the
+host drifting underneath. It now computes an ODD/EVEN split as well, which
+interleaves the same classes in time and is therefore blind to drift:
+
+| first/last | odd/even | reading |
+|---|---|---|
+| agree | agree | stable direction |
+| **disagree** | agree | **drift during the run**, not a class effect |
+| — | **disagree** | **genuinely class-dependent** — does not generalise |
+
+A near-zero z has no sign to disagree with, so a disagreement counts only when
+both sides clear \|z\| >= 1; without that gate the drift fixture reads +0.00
+against -0.45 and gets reported as class-dependence, which is how the bug was
+found. And the "identical pooled count" pair now separates three ways rather
+than two: `agree` reports a direction, `hidden` (one half carries it, the other
+is flat) keeps the direction but is annotated as resting on half the sample, and
+only a real sign reversal is refused. Its own first draft had the bug this file keeps meeting:
 the "same pooled count" assertion compared two EMPTY strings and reported `ok`
 when the summary had not run at all.
 
@@ -4496,3 +4516,114 @@ assumed:
 What would settle it: the same 57-class A/B on a host at load < 2.5, which is
 what produced the 2.7% floor. Anything less and the answer is the noise floor,
 not the lever.
+
+#### `tools/h2-ab` — so an H2 claim can be re-checked at all
+
+The audit above found that no H2 throughput number in this file is
+reproducible: the harness that produced them was never committed, and the
+corpus's `test-classes/` directory is empty on this box, so even the 21-class
+shape cannot be rebuilt. `tools/h2-ab/h2-ab.sh` is the replacement, and its
+limits are stated in its own header rather than discovered later.
+
+It carries over the two rules that made the original trustworthy — ABBA per
+round (BAAB on odd rounds, so order bias cancels across rounds too), and a
+CONTROL arm measured twice every round whose spread is the noise floor, with an
+effect inside the floor refused. It adds a third: with no control pair at all it
+reports NO CONTROL rather than comparing against nothing.
+
+**What it cannot do, and the header says so.** One timed unit means no per-class
+sign test and no split-half check — the two things that caught a false result
+the same day. It answers only "is this bigger than the host's own same-config
+spread", the weakest of the three questions, and its positive verdict tells the
+reader to confirm on a second workload. `suite-pair-ab` remains the better
+instrument wherever the workload is fork-per-class.
+
+`--analyze <samples.tsv>` runs the statistics on recorded samples with no VM, so
+`selftest.sh` can check the maths directly. It was mutation-tested, and the
+mutation testing paid immediately: an assertion that checked only the VERDICT
+passed when `worst` was changed to "whichever round awk visited last", because
+awk walks an associative array in unspecified order and both readings happened
+to give UNMEASURABLE. The fixture now puts the worst round FIRST and asserts the
+reported floor VALUE (30.0%), which fails at 0.3% under that mutation.
+
+First real run, corroborating the Azure result on different hardware: the
+unresolved-class trap reads an effect of **-0.2% against a 7.5% floor** —
+UNMEASURABLE, agreeing with hibernate's z = +1.46.
+
+### The unboxing accessors, lowered — the first MEMORY family the IR tier has
+
+`Long.longValue()J` and `Integer.intValue()I` were the two largest single
+entries on the call-site-intrinsic refusal list (8 and 2-3 sites on H2). They
+are now lowered by the optimizing tier instead of refusing the method, and they
+are the first family it lowers that touches the HEAP rather than registers.
+
+```
+[ir] unbox-intrinsics UnboxIntrinsicProbe.sumLong([Ljava/lang/Long;)J:
+     1 site(s) lowered as a guarded field load
+```
+
+Both families are gone from the H2 refusal breakdown — `java/lang/Long.longValue`
+and `java/lang/Integer.intValue` no longer appear at all, against 8 and 2-3
+before — and 11 sites lower per run. `refused_method` reads 43-45, which is
+inside the 43-54 band one configuration produces, so **no delta is claimed
+there**: the disappearance of the two families from the per-family list is the
+engagement evidence, not the total.
+
+#### Why this one was left until last
+
+The arithmetic families are pure register work. These read a field, and the byte
+offset of that field is not a compile-time constant: a compact instance keeps
+the payload at a registered body offset, a legacy one inside its 16-byte `Value`
+cell, and BOTH shapes exist in one heap because different allocators build
+different cells. So the lowering is not a load — it is a null check, an exact
+receiver class guard, a per-object test of the header's compact bit, and then
+one of two loads.
+
+The node carries only the guard class id. Offsets are re-derived at lowering
+from `ir::unbox_offsets`, which is the same `AtomicLongFieldLayout` /
+`AtomicIntFieldLayout` the single-pass backend asks — because two backends
+disagreeing about where a field lives is not a wrong answer, it is a wild read.
+A test pins that agreement.
+
+#### What the codebase made me declare
+
+Adding one `ir::Op` variant failed to compile in FIVE places, every one of them
+a deliberate forcing function, and each wanted a different decision:
+
+| where | what it forced |
+|---|---|
+| `ir_verify::expected_arity` | the node's input shape (`[ctrl, mem, obj]`) |
+| `declared_lowering` | that it produces a value, not an effect |
+| `op_representatives` | a concrete instance for the coverage tests to drive |
+| `op_defines_result_slot` | that it allocates a result slot |
+| `regalloc::ir_op_defines_value` | the same, for the LIVENESS model — without it every method containing the node silently loses register residency |
+
+And a sixth asked for a judgement rather than a fact: the arm ends in exactly
+one `store_rax`, so `every_eligible_op_is_claimed_or_explicitly_rejected`
+demanded it be claimed for the home-drop optimization or explicitly rejected
+with a reason. It is **rejected**: unlike every claimed op its arm is not
+straight-line — two deopts and a layout branch precede that store — and
+reasoning about what each deopt edge sees is exactly what that list exists to
+stop being done casually. Claimable later with a measurement; not worth a wrong
+answer to save one store.
+
+#### Verification
+
+`probes/UnboxIntrinsicProbe.java` mixes boxes from BOTH allocation paths on
+purpose — values inside the `Integer`/`Long` cache come from a preallocated
+table, values outside it are freshly allocated — so a compact/legacy branch that
+was wrong for either shape returns garbage for one group. Every answer is
+checked against a value computed without the accessor, so it cannot pass by
+agreeing with itself, and a null receiver must still raise NPE rather than read
+offset 0 of nothing.
+
+It agrees with HotSpot exactly (`SUMS -4 -3`) under
+`CRATONVM_COMPACT_REF_FIELDS=1` **and** `=0`, which exercises both offset
+derivations. The kill switch was checked in the direction that matters: with
+`CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` the two families reappear in the refusal
+log (86 lines); on, zero. Suite 92/92, 2,285 jit tests green.
+
+**Not claimed: any throughput number.** `h2-ab` says an effect this size is
+inside this host's noise floor, and today's two withdrawn results are the reason
+that is left as a measurement someone takes on a quiet host rather than a figure
+asserted here.
