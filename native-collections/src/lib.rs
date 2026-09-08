@@ -29113,9 +29113,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
             let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29159,9 +29164,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
             let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29205,9 +29215,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
             let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -68746,7 +68761,7 @@ fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Loop predicate is re-checked after each wake (handles spurious wakeups
 /// and the case where another producer raced in to fill the gap).
 fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -68756,8 +68771,16 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     ctx.monitor_enter(this);
     let this_pin = ctx.pin_native_root(this);
+    // The ELEMENT crosses the wait too — it is handed to `native_lbq_offer`
+    // below, after the loop — so it needs the same pin as the receiver.
+    // `args` is the interpreter's pre-call snapshot and nothing refreshes it.
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let elem_pin = match elem {
+        Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+        _ => None,
+    };
     loop {
-        let this = ctx.read_native_pin(this_pin, this);
+        this = ctx.read_native_pin(this_pin, this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
@@ -68771,23 +68794,37 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `monitor_notify_all` is a no-op.
         let _ = ctx.monitor_wait(this, Some(50));
     }
-    let r = native_lbq_offer(ctx, args);
+    // `monitor_wait` above PARKS, so a collection can have moved (or, for an
+    // object the sweep proved dead, reclaimed) both the receiver and the
+    // element inside the loop. The shadowed `this` used to be scoped to the
+    // loop BODY, so everything below ran on the pre-wait address:
+    // `native_lbq_offer` appended into a stale queue, and `monitor_exit`
+    // released a monitor at an address `MonitorTable::exit` then dereferenced.
+    // Assign through the outer binding instead, and refresh the element the
+    // same way.
+    this = ctx.read_native_pin(this_pin, this);
+    let elem = match (elem, elem_pin) {
+        (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        _ => elem,
+    };
+    let r = native_lbq_offer(ctx, &[Value::Object(Some(this)), elem]);
     // Wake any thread parked in `take()` waiting for an element to arrive.
     let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
+    ctx.unpin_native_roots(this_pin);
     r
 }
 
 /// Blocking take: waits until an element is available using monitor wait/notify.
 fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     ctx.monitor_enter(this);
     let this_pin = ctx.pin_native_root(this);
     loop {
-        let this = ctx.read_native_pin(this_pin, this);
+        this = ctx.read_native_pin(this_pin, this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
@@ -68797,10 +68834,15 @@ fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         let _ = ctx.monitor_wait(this, Some(50));
     }
+    // See `native_lbq_put_blocking`: the refresh has to reach the OUTER
+    // binding, or the dequeue and the monitor exit below both run on the
+    // pre-wait address.
+    this = ctx.read_native_pin(this_pin, this);
     let r = lbq_poll_locked(ctx, this);
     // Wake any thread parked in `put()` waiting for a slot to free up.
     let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(r))
 }
 
@@ -71600,6 +71642,15 @@ fn register_priority_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "()V", native_pbq_init);
     r.register(c, "offer", "(Ljava/lang/Object;)Z", native_pbq_offer);
     r.register(c, "poll", "()Ljava/lang/Object;", native_pbq_poll);
+    // The TIMED poll too — see `native_pbq_poll_timed` for why leaving it to
+    // real bytecode is not an option: that body walks these same two fields as
+    // a binary HEAP while every native here keeps them a sorted array.
+    r.register(
+        c,
+        "poll",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        native_pbq_poll_timed,
+    );
     r.register(c, "peek", "()Ljava/lang/Object;", native_pbq_peek);
     r.register(c, "put", "(Ljava/lang/Object;)V", native_pbq_put);
     r.register(c, "take", "()Ljava/lang/Object;", native_pbq_take);
@@ -71935,6 +71986,131 @@ fn native_pbq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             break;
         }
         let _ = ctx.monitor_wait(this, Some(50));
+        this = ctx.read_native_pin(h_this, this);
+    }
+    let head = pbq_poll_locked(ctx, this);
+    let h_head = pin_value(ctx, head);
+    ctx.monitor_exit(this);
+    let head = read_pinned_elem(ctx, h_head, head);
+    ctx.unpin_native_roots(h_this);
+    Ok(Some(head))
+}
+
+/// A `java.util.concurrent.TimeUnit` constant's timeout in MILLISECONDS.
+///
+/// The real `TimeUnit` is a JDK enum: its ordinal lives in the `Enum` base
+/// field `ordinal`, while object slot 0 holds the enum `name` (a `String`).
+/// Reading slot 0 for the ordinal works against a synthetic one-field stand-in
+/// and is WRONG for the real enum — `await(N, SECONDS)` then waits `N` ms — so
+/// the named field is preferred and slot 0 is only the fallback.
+///
+/// This duplicates `native-builtins`' `time_unit_ordinal` /
+/// `convert_time_unit_to_millis` pair, and the duplication is a crate boundary
+/// rather than a choice: both are private to that crate and `native-collections`
+/// does not depend on it. If a third copy is ever wanted, move this one into
+/// `native-api` instead of adding it — the scaling-UP arms below have to
+/// SATURATE (HotSpot's `TimeUnit.SECONDS.toMillis(Long.MAX_VALUE)` is
+/// `Long.MAX_VALUE`, not a wrapped negative), and that is exactly the kind of
+/// rule that goes wrong when it is written out a third time.
+fn pbq_timeout_millis(ctx: &mut dyn NativeContext, value: i64, unit: Option<ObjectRef>) -> i64 {
+    let ordinal = match unit {
+        Some(u) => match ctx.get_field_by_name(u, "ordinal") {
+            Value::Int(v) => v,
+            _ => match ctx.get_field(u, 0) {
+                Value::Int(v) => v,
+                _ => 2,
+            },
+        },
+        None => 2,
+    };
+    match ordinal {
+        0 => value / 1_000_000,
+        1 => value / 1_000,
+        2 => value,
+        3 => value.saturating_mul(1_000),
+        4 => value.saturating_mul(60_000),
+        5 => value.saturating_mul(3_600_000),
+        6 => value.saturating_mul(86_400_000),
+        _ => value,
+    }
+}
+
+/// `poll(long, TimeUnit)` — the TIMED blocking read.
+///
+/// # Why this has to be a native, and what happened when it was not
+///
+/// The natives above own `offer`/`put`/`poll()`/`take()` and keep the queue in
+/// a SORTED ARRAY (`PBQ_FIELD_DATA` ascending, `PBQ_FIELD_SIZE` its length).
+/// The real `java.util.concurrent.PriorityBlockingQueue` keeps a BINARY HEAP in
+/// the same two fields and its own `dequeue()` sifts down through them. The two
+/// representations agree only for zero or one element.
+///
+/// Leaving `poll(long, TimeUnit)` to real bytecode therefore mixed them, and
+/// both possible outcomes are bad:
+///
+/// * **As shipped**, the real body waits on `notEmpty` under `lock`, and the
+///   natives signal the receiver's OBJECT MONITOR instead — no `Condition`
+///   waiter is on that — so a consumer that actually had to wait was woken only
+///   by whatever periodic re-check its `await` made. Measured against HotSpot
+///   with an empty queue and a producer that puts after 300 ms: HotSpot returns
+///   in under a second, this VM took more than one, and
+///   `probes/ConcurrencyUnderGcSweep.java` expired a 120 s phase deadline
+///   draining 480 elements.
+/// * **Signalling `notEmpty` from the native insert** — the obvious repair, and
+///   it was tried — wakes the real `dequeue()` promptly and it then sifts a
+///   sorted array as if it were a heap: `NullPointerException: Cannot invoke
+///   "java.lang.Comparable.compareTo(Object)" because "key" is null`, and 1 of
+///   480 elements consumed. Waking the mixed path is worse than starving it.
+///
+/// So the fix is to stop mixing: this is `native_pbq_take` with a deadline, on
+/// the native representation, coordinated through the same object monitor as
+/// every other native here. `null` on timeout, per the `BlockingQueue`
+/// contract.
+///
+/// The remaining real-bytecode readers (`drainTo`, `remove(Object)`,
+/// `iterator`) still see the sorted array through a heap-shaped body. That is
+/// pre-existing and unchanged here; the representation mismatch is the real
+/// defect and it wants its own page.
+fn native_pbq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let timeout = match args.get(1) {
+        // WP4.5 tag erasure: a `long` popped generically can come back tagged
+        // `Double` with the bits intact, exactly as `Object.wait(J)` handles.
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        _ => 0,
+    };
+    let unit = match args.get(2) {
+        Some(Value::Object(Some(u))) => Some(*u),
+        _ => None,
+    };
+    let timeout_ms = pbq_timeout_millis(ctx, timeout, unit).max(0) as u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    // Family-1: this method BLOCKS, so pin the receiver and re-read it after
+    // every blocking call — see `native_pbq_take`.
+    let h_this = ctx.pin_native_root(this);
+    let this = ctx.monitor_enter_gc_safe(this);
+    let mut this = ctx.read_native_pin(h_this, this);
+    loop {
+        let size = match ctx.get_field(this, PBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        if size > 0 {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            ctx.monitor_exit(this);
+            ctx.unpin_native_roots(h_this);
+            return Ok(Some(Value::Object(None)));
+        }
+        // Bounded, so the deadline is re-checked even if a notify is lost.
+        let wait_ms = (remaining.as_millis().min(50) as u64).max(1);
+        let _ = ctx.monitor_wait(this, Some(wait_ms));
         this = ctx.read_native_pin(h_this, this);
     }
     let head = pbq_poll_locked(ctx, this);
@@ -72964,30 +73140,62 @@ fn native_cowal_bulk_remove_predicate(
         return Ok(Some(Value::Int(0)));
     };
 
-    let mut survivors: Vec<Value> = Vec::with_capacity(n);
+    // Family-1 (stale ObjectRef across a Java re-entry). `predicate.test` runs
+    // USER code on every turn, so it allocates and can collect: the receiver,
+    // the snapshot array, the predicate and the monitor all move under this
+    // loop. Three of the four were kept as pre-loop addresses — `arr` was
+    // dereferenced again on the next turn, and `exit_mon` released a monitor at
+    // an address `MonitorTable::exit` dereferences, which is a fault when the
+    // slot was reclaimed and a permanently leaked lock when it merely moved.
+    //
+    // Survivors are recorded as INDICES rather than as `Value`s for the same
+    // reason: a `Vec<Value>` of raw references held across the remaining turns
+    // is N more stale addresses, and the elements are already kept alive by the
+    // snapshot array itself (which `this` roots).
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let lock_pin = lock_obj.map(|lo| ctx.pin_native_root(lo));
     let pred_pin = ctx.pin_native_root(pred);
+    let refresh_lock = |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
+        match (lock_obj, lock_pin) {
+            (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
+            _ => lock_obj,
+        }
+    };
+
+    let mut survivors: Vec<usize> = Vec::with_capacity(n);
     for i in 0..n {
         let pred = ctx.read_native_pin(pred_pin, pred);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         let elem = ctx.get_array_element(arr, i);
-        let remove = match ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[elem]) {
-            Ok(Some(Value::Int(1))) => true,
-            _ => false,
-        };
+        let remove = matches!(
+            ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[elem]),
+            Ok(Some(Value::Int(1)))
+        );
         if !remove {
-            survivors.push(elem);
+            survivors.push(i);
         }
     }
 
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_obj = refresh_lock(ctx, lock_obj);
     if survivors.len() == n {
         exit_mon(ctx, lock_obj, this);
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
 
     let new_arr = ctx.new_array(ArrayElementType::Reference, survivors.len());
-    for (i, v) in survivors.iter().enumerate() {
-        ctx.set_array_element(new_arr, i, *v);
+    let new_pin = ctx.pin_native_root(new_arr);
+    for (i, &src) in survivors.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let new_arr = ctx.read_native_pin(new_pin, new_arr);
+        let v = ctx.get_array_element(arr, src);
+        ctx.set_array_element(new_arr, i, v);
     }
 
+    let this = ctx.read_native_pin(this_pin, this);
+    let new_arr = ctx.read_native_pin(new_pin, new_arr);
     if let Some(aslot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
         ctx.set_field(this, aslot, Value::Object(Some(new_arr)));
         cowal_bump_mod_count(ctx, this);
@@ -72996,7 +73204,9 @@ fn native_cowal_bulk_remove_predicate(
         ctx.set_field(this, 1, Value::Int(survivors.len() as i32));
     }
 
+    let lock_obj = refresh_lock(ctx, lock_obj);
     exit_mon(ctx, lock_obj, this);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -73025,8 +73235,13 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let n = ctx.array_length(arr_obj);
         let mut any_added = 0i32;
         let this_pin = ctx.pin_native_root(this);
+        // `arr_obj` crosses the same `add` re-entry the receiver does, and the
+        // element is read OUT of it on every turn — pinning only `this` left
+        // the source array as a pre-call address from the second turn on.
+        let arr_pin = ctx.pin_native_root(arr_obj);
         for i in 0..n {
             let this = ctx.read_native_pin(this_pin, this);
+            let arr_obj = ctx.read_native_pin(arr_pin, arr_obj);
             let elem = ctx.get_array_element(arr_obj, i);
             if matches!(
                 ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem]),
@@ -73035,6 +73250,7 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 any_added = 1;
             }
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(any_added)));
     };
 
@@ -73063,16 +73279,35 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
 
-    let cs = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
+    // `collection.toArray()` is USER code (any `Collection` implementation),
+    // so it allocates and can collect. The receiver and the monitor both cross
+    // it, and the monitor is what `exit_mon` dereferences below — the whole
+    // reason this function could leak a lock or fault on the way out. Pin
+    // before the call, re-read after it. `ctx.new_array` below is another
+    // collection point, so `base` and `cs` are pinned across it too.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = lock_obj.map(|lo| ctx.pin_native_root(lo));
+    let refresh_lock = |ctx: &dyn NativeContext, lock_obj: Option<ObjectRef>| -> Option<ObjectRef> {
+        match (lock_obj, lock_pin) {
+            (Some(lo), Some(h)) => Some(ctx.read_native_pin(h, lo)),
+            _ => lock_obj,
+        }
+    };
+    let cs = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]);
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_obj = refresh_lock(ctx, lock_obj);
+    let cs = match cs {
         Ok(Some(Value::Object(Some(a)))) => a,
         _ => {
             exit_mon(ctx, lock_obj, this);
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Int(0)));
         }
     };
     let add_n = ctx.array_length(cs);
     if add_n == 0 {
         exit_mon(ctx, lock_obj, this);
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
 
@@ -73080,20 +73315,30 @@ fn native_cowal_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(a)) => a,
         _ => {
             exit_mon(ctx, lock_obj, this);
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Int(0)));
         }
     };
     let base_n = ctx.array_length(base);
+    let cs_pin = ctx.pin_native_root(cs);
+    let base_pin = ctx.pin_native_root(base);
     let out = ctx.new_array(ArrayElementType::Reference, base_n + add_n);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    let base = ctx.read_native_pin(base_pin, base);
+    let this = ctx.read_native_pin(this_pin, this);
     for i in 0..base_n {
-        ctx.set_array_element(out, i, ctx.get_array_element(base, i));
+        let v = ctx.get_array_element(base, i);
+        ctx.set_array_element(out, i, v);
     }
     for i in 0..add_n {
-        ctx.set_array_element(out, base_n + i, ctx.get_array_element(cs, i));
+        let v = ctx.get_array_element(cs, i);
+        ctx.set_array_element(out, base_n + i, v);
     }
     ctx.set_field(this, aslot, Value::Object(Some(out)));
     cowal_bump_mod_count(ctx, this);
+    let lock_obj = refresh_lock(ctx, lock_obj);
     exit_mon(ctx, lock_obj, this);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 

@@ -30,6 +30,36 @@ public class UnboxIntrinsicProbe {
     static long oneLong(Long x) { return x; }
     static int  oneInt(Integer x) { return x; }
 
+    // The VOLATILE readers. Unlike Long/Integer these read a mutable field, so
+    // the probe mutates it BETWEEN reads: a load that was wrongly hoisted or
+    // CSE'd out of the loop would keep returning the first value.
+    static final java.util.concurrent.atomic.AtomicLong AL =
+        new java.util.concurrent.atomic.AtomicLong();
+    static final java.util.concurrent.atomic.AtomicInteger AI =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    static long readAL() { return AL.get(); }
+    static int  readAI() { return AI.get(); }
+
+    static boolean atomicReadsSeeWrites() {
+        boolean ok = true;
+        for (int i = 0; i < WARM; i++) {
+            AL.set(i);
+            if (readAL() != i) { ok = false; break; }   // a hoisted load fails here
+            AI.set(-i);
+            if (readAI() != -i) { ok = false; break; }
+        }
+        AL.set(Long.MIN_VALUE);
+        if (readAL() != Long.MIN_VALUE) ok = false;
+        AL.set(Long.MAX_VALUE);
+        if (readAL() != Long.MAX_VALUE) ok = false;
+        AI.set(Integer.MIN_VALUE);
+        if (readAI() != Integer.MIN_VALUE) ok = false;
+        AI.set(Integer.MAX_VALUE);
+        if (readAI() != Integer.MAX_VALUE) ok = false;
+        return ok;
+    }
+
     public static void main(String[] args) {
         boolean ok = true;
 
@@ -78,6 +108,11 @@ public class UnboxIntrinsicProbe {
             for (int i = 0; i < 2000; i++) oneInt(n);
             ok = false; System.out.println("FAIL null Integer did not throw");
         } catch (NullPointerException expected) { }
+
+        if (!atomicReadsSeeWrites()) {
+            ok = false;
+            System.out.println("FAIL atomic reader did not observe a write");
+        }
 
         System.out.println("SUMS " + gotL + " " + gotI);
         System.out.println("UNBOX INTRINSIC PROBE " + (ok ? "OK" : "FAILED"));

@@ -9955,7 +9955,15 @@ pub fn register_essential_natives_with_shims(
                     }
                 }
                 let mut read = 0usize;
+                // GC-safety: `buffered_input_stream_read_one` dispatches the
+                // delegate's `read()` -- real bytecode -- once per byte, and
+                // both the stream and the destination array are carried in
+                // from outside the loop.
+                let this_pin = ctx.pin_native_root(this);
+                let arr_pin = ctx.pin_native_root(arr);
                 for i in 0..limit {
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     let b = buffered_input_stream_read_one(ctx, this)?;
                     if b < 0 {
                         break;
@@ -15069,7 +15077,14 @@ pub fn register_essential_natives_with_shims(
             };
             let len = ctx.array_length(input_arr);
             let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+            // GC-safety: `build_stack_trace_element_array` allocates once per
+            // thread, and both the input array being read and the output array
+            // being written are carried across every turn.
+            let input_pin = ctx.pin_native_root(input_arr);
+            let outer_pin = ctx.pin_native_root(outer);
             for i in 0..len {
+                let input_arr = ctx.read_native_pin(input_pin, input_arr);
+                let outer = ctx.read_native_pin(outer_pin, outer);
                 let inner = match ctx.get_array_element(input_arr, i) {
                     Value::Object(Some(t)) => {
                         let trace = ctx.thread_stack_trace(t);
@@ -33255,11 +33270,26 @@ fn rl_with<R>(key: RlKey, f: impl FnOnce(&mut RlState) -> R) -> R {
 /// `enumset-synthetic-surface-drop-realmode-FIXED.md`).
 fn monitor_wait_release(
     ctx: &mut dyn NativeContext,
-    obj: ObjectRef,
+    obj: &mut ObjectRef,
     timeout_ms: Option<u64>,
 ) -> MethodCallResult {
-    let result = ctx.monitor_wait(obj, timeout_ms);
-    ctx.monitor_exit(obj);
+    // `monitor_wait` PARKS this thread, so a collection runs inside this call
+    // whenever one is due — the moving collector, or the non-moving young
+    // sweep's selective promotion. The exit below and every later iteration of
+    // the caller's retry loop must therefore use the POST-WAIT address:
+    // `MonitorTable::exit` opens with `header_of(obj)`, so a pre-wait address
+    // is an `EXCEPTION_ACCESS_VIOLATION` when the young slot was reclaimed and
+    // a permanently LEAKED monitor when it was merely moved — every later
+    // waiter on that object then blocks forever.
+    //
+    // The refreshed reference is written back through `obj` rather than
+    // returned, so a caller that keeps looping cannot forget to re-read it:
+    // every call site here is a `loop { ... monitor_wait_release(..)? }` retry.
+    let pin = ctx.pin_native_root(*obj);
+    let result = ctx.monitor_wait(*obj, timeout_ms);
+    *obj = ctx.read_native_pin(pin, *obj);
+    ctx.monitor_exit(*obj);
+    ctx.unpin_native_roots(pin);
     result
 }
 
@@ -34760,8 +34790,15 @@ fn cb_await_inner(
     cb_set(ctx, state, CB_H_COUNT, new_count);
     let arrival_index = (parties - new_count) as i32;
     let this_pin = ctx.pin_native_root(this);
+    // `state` is the int[] holder every `cb_get`/`cb_set` below dereferences,
+    // and it crosses the same `monitor_wait` park as the receiver. Pinning
+    // only `this` kept it ALIVE (it hangs off `this`) but not CURRENT: after a
+    // relocating collection inside the wait, every state read in the next
+    // iteration went to the pre-wait array.
+    let state_pin = ctx.pin_native_root(state);
     loop {
         let this = ctx.read_native_pin(this_pin, this);
+        let state = ctx.read_native_pin(state_pin, state);
         if cb_get(ctx, state, CB_H_BROKEN_GEN) == my_gen {
             ctx.monitor_exit(this);
             return Err(cb_throw(ctx, CB_BROKEN_BARRIER));
@@ -34792,6 +34829,10 @@ fn cb_await_inner(
         // error (interrupt) the monitor is still held — release it before
         // propagating so the unwind doesn't leak ownership.
         if let Err(e) = ctx.monitor_wait(this, Some(wait_ms)) {
+            // The wait PARKED before it failed, so a collection may have moved
+            // the receiver: exit on the post-wait address, not the pre-wait one
+            // (`MonitorTable::exit` dereferences it).
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             return Err(e);
         }

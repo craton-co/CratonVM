@@ -14772,9 +14772,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
                 pairs.push((name, value));
                 i += 2;
             }
+            // GC-safety: `re5_builder_append_header` allocates the header
+            // string it appends, so `this` is a pre-GC address from the second
+            // header on.
+            let this_pin = ctx.pin_native_root(this);
             for (name, value) in pairs {
+                let this = ctx.read_native_pin(this_pin, this);
                 re5_builder_append_header(ctx, this, &format!("{name}: {value}"));
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -19563,7 +19570,11 @@ fn register_re9_nio_selector(r: &mut NativeMethodRegistry) {
         } else {
             let deadline = std::time::Instant::now() + Duration::from_millis(raw as u64);
             let mut total = 0i32;
+            // GC-safety: `selectNow` is real bytecode, dispatched on `this`
+            // every turn of a loop that spins until a deadline.
+            let this_pin = ctx.pin_native_root(this);
             while std::time::Instant::now() < deadline {
+                let this = ctx.read_native_pin(this_pin, this);
                 if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(this, "selectNow", "()I", &[]) {
                     if n > 0 {
                         total = n;
