@@ -231,12 +231,29 @@ pub fn report_at_exit() {
             .map(|(cause, n)| format!("{cause}={n}"))
             .collect::<Vec<_>>()
             .join(" ");
+        // REFUSED, beside PLANTED, for the same reason PLANTED is printed as
+        // all three rows including zeros: a planted count on its own cannot
+        // tell "this workload has no such site" from "every such site was
+        // declined", and those want opposite next steps.
+        //
+        // It is also the price tag of `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD`.
+        // Every refusal is one optimizing body handed back to the single-pass
+        // tier, and the guard's own doc claims that cost is "countable rather
+        // than argued about" — which was not true while nothing read the
+        // counter. `ir_trap_refusal_census` landed with no reader in
+        // 7ade4a87c; this is that reader.
+        let refused_line = cratonvm_jit::ir::ir_trap_refusal_census()
+            .iter()
+            .map(|(cause, n)| format!("{cause}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         // TAKEN, beside PLANTED. The planting doc promised this half and did
         // not have it: "a cause whose taken count is not ~0 has had its
         // coldness argument refuted". A non-zero number means a trap sat on a
         // LIVE path, which is the falsifiable form of that claim.
         eprintln!(
-            "[c2-supersede] ir site traps planted: {trap_line} | TAKEN at runtime: {}",
+            "[c2-supersede] ir site traps planted: {trap_line} | REFUSED as unresumable: \
+             {refused_line} | TAKEN at runtime: {}",
             cratonvm_jit::ir::site_traps_taken(),
         );
         let repeats = cratonvm_jit::ir::site_trap_repeats();
@@ -260,6 +277,21 @@ pub fn report_at_exit() {
         let (lowered, refused) = cratonvm_jit::ir::scalar_intrinsic_census();
         eprintln!(
             "[c2-supersede] call-site intrinsics: lowered_as_arithmetic={lowered} refused_method={refused}"
+        );
+        // The guarded slot-0 accessors (`Op::Unbox`): the unboxing pair and the
+        // four `Atomic*` families. Counted on their own line rather than folded
+        // into `lowered_as_arithmetic`, because they are not arithmetic -- they
+        // are guarded memory ops, and three of them WRITE. They came off the
+        // `refused_method` work list, so the two numbers have to be readable
+        // against each other.
+        //
+        // `note_unbox_lowered` existed from the day the op landed and nothing
+        // printed it, which is the "instrument armed where nobody reads it"
+        // shape this census exists to avoid: a zero here now means the emitter
+        // found no sites, and that is a different statement from silence.
+        eprintln!(
+            "[c2-supersede] unbox accessors: lowered_inline={}",
+            cratonvm_jit::ir::unbox_lowered()
         );
         // The branch-profile window. `still_open` at exit should be ~0: a
         // nomination that opens the window and never closes it pins branch

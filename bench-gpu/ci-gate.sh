@@ -5,8 +5,8 @@
 # is the only thing standing between a silent offload regression and a green
 # build. It exists because one already slipped through undetected: the
 # 2026-07-11 invoke-cache promotion bug made offload silently stop after the
-# first call at a call site (see docs/known-issues/gpu-offload-followups-
-# 20260711.md item 7) — any checksum+timing gate on real hardware would have
+# first call at a call site (see gpu-offload-followups-20260711.md item 7)
+# — any checksum+timing gate on real hardware would have
 # caught it the day it landed.
 #
 # This script does NOT build anything; the caller (gpu-selfhosted.yml) builds

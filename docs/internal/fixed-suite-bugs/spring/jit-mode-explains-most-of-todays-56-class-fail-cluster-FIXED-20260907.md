@@ -99,10 +99,20 @@ not build. It creates the same `AnnotationConfigApplicationContext` forty times
 in one process and prints the full cause chain that the suite runner's
 `FAILCAUSE` line truncates. On one binary, `env -i` so nothing leaks in:
 
-| arm | result | site traps planted | refused |
-|---|---|---:|---:|
-| default | **all 40 contexts built** | 233 | **58** |
-| `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | fails at iteration 27 | 269 | 0 |
+| arm | result | traps planted | refused | TAKEN at runtime |
+|---|---|---:|---:|---:|
+| default | **all 40 contexts built** | 233 | **32** | 1 |
+| `CRATONVM_JIT_IR_TRAP_REPLAY_GUARD=0` | fails at iteration 27 | 269 | 0 | 2 |
+
+(The `refused` column read 58 when this page was written. That was a counting
+bug in the census, not a different measurement: the replay guard sat above the
+default-OFF unresolved-class gate, so `checkcast`/`instanceof`/`new` sites that
+were never going to be planted anyway were charged to it. Corrected, along with
+the reader that exposed it, in the follow-up that wired
+`ir_trap_refusal_census` into the `[c2-supersede]` line — it had landed here
+with no reader at all, which is the only reason the wrong number survived a
+review. The `TAKEN` column is the sharper signal and was not available before:
+the guard removes exactly one taken trap, and that one is the defect.)
 
 and the failure is exactly the chain this page inferred from reading:
 

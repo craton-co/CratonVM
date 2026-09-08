@@ -5394,15 +5394,15 @@ fn alloc_snapshot_thread_info(
             -1
         }),
     );
-    ctx.set_field_by_name(
-        info,
-        "blockedCount",
-        Value::Long(if contention_enabled {
-            snapshot.blocked_count
-        } else {
-            0
-        }),
-    );
+    // THE COUNTS ARE NOT GATED, ONLY THE TIMES. `ThreadInfo.getBlockedTime()`
+    // and `getWaitedTime()` are specified to return -1 while thread contention
+    // monitoring is disabled; `getBlockedCount()` and `getWaitedCount()` carry
+    // no such clause and are always available. Gating all four made
+    // `getBlockedCount()` read 0 on a thread that was BLOCKED at that very
+    // instant -- the case the number exists for -- while HotSpot 25 reports 1
+    // on the same probe with contention monitoring left off
+    // (`probes/JmxMonitorOwnership.java`, which is the oracle for this).
+    ctx.set_field_by_name(info, "blockedCount", Value::Long(snapshot.blocked_count));
     ctx.set_field_by_name(
         info,
         "waitedTime",
@@ -5412,15 +5412,7 @@ fn alloc_snapshot_thread_info(
             -1
         }),
     );
-    ctx.set_field_by_name(
-        info,
-        "waitedCount",
-        Value::Long(if contention_enabled {
-            snapshot.waited_count
-        } else {
-            0
-        }),
-    );
+    ctx.set_field_by_name(info, "waitedCount", Value::Long(snapshot.waited_count));
     ctx.set_field_by_name(info, "lockOwnerId", Value::Long(snapshot.lock_owner_id));
     ctx.set_field_by_name(info, "priority", Value::Int(5));
     ctx.set_field_by_name(info, "stackTrace", Value::Object(Some(stack_trace)));
@@ -5907,14 +5899,21 @@ fn register_thread_mxbean_for(cls: &'static str, r: &mut NativeMethodRegistry) {
     // KEEP (the two below): false is the measurement, and CONFIRMED 2026-07-28
     // to be a different datum from the lock OWNERSHIP the two flags above turn
     // on — contention monitoring means TIMING every blocked and waiting interval
-    // per thread, and nothing in the VM records those durations. Re-checked
-    // after the write side landed: `ThreadJmxSnapshot` carries no blocked/waited
-    // time or count field at all, `alloc_snapshot_thread_info` therefore writes
-    // the -1/0 sentinels for `blockedTime`/`blockedCount`/`waitedTime`/
-    // `waitedCount`, and the only `blocked_count` in the tree
-    // (`threading/gc_barrier.rs`) counts GC-barrier arrivals, not Java monitor
-    // contention. So `ThreadInfo.getBlockedTime()`/`getWaitedTime()` have no
-    // source at all.
+    // per thread, and this flag governs only that timing.
+    //
+    // AMENDED 2026-09-08. The paragraph here used to add that
+    // "`ThreadJmxSnapshot` carries no blocked/waited time or count field at
+    // all", and that is no longer true: the registry counts a block on the way
+    // IN and `thread_jmx_snapshot` carries all four numbers. The counts were
+    // nevertheless being zeroed alongside the times, which is a spec error, not
+    // a missing source — `getBlockedTime()`/`getWaitedTime()` are specified to
+    // return -1 while contention monitoring is disabled, and
+    // `getBlockedCount()`/`getWaitedCount()` are specified with no such clause.
+    // HotSpot 25 reports `getBlockedCount() == 1` for a thread blocked on a
+    // monitor with contention monitoring left off; CratonVM reported 0 for the
+    // same thread at the same instant. See `alloc_snapshot_thread_info` and
+    // `probes/JmxMonitorOwnership.java`. This flag stays `false` — the TIMES
+    // still have no source.
     // The JMM's answer for an unsupported optional feature is exactly `false`,
     // and a `false` from `...Supported()` makes
     // `setThreadContentionMonitoringEnabled` throw

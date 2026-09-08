@@ -1198,6 +1198,49 @@ pub fn unregistered_jit_frame_on_stack() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Residue census for the unregistered-JIT-frame probe
+// ---------------------------------------------------------------------------
+//
+// The probe reads raw stack words and calls any word that lands inside a
+// registered JIT code range a frame. A compiled method that has ALREADY
+// RETURNED left exactly such a word at every depth below its own `entry_sp`,
+// so "there is a JIT return address up there" and "a compiled frame is live up
+// there" are not the same statement. `conservative_roots::jit_residue_hi` is
+// the discriminator the VM side already maintains for it.
+//
+// These two counters say which of the two a run actually saw, because
+// `relocation-coverage-reason: unregistered-jit-frame-on-stack=N` cannot: it
+// reads identically for a run held back by a live entry-point frame and for one
+// held back by the leftovers of a frame that returned minutes ago. On the H2
+// `MvsCreate` ZGC OOM every hit was the second kind.
+
+static UNREG_RESIDUE_EXPLAINED: AtomicUsize = AtomicUsize::new(0);
+static UNREG_RESIDUE_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// A probe hit that the returned-frame residue mark fully explains: the band it
+/// was found in is one a returned compiled frame may have written, and no hit
+/// remains above the mark. The frame's oops are still conservatively MARKED (and
+/// therefore page-pinned); only the relocation refusal is withheld.
+pub fn note_unregistered_jit_frame_residue() {
+    UNREG_RESIDUE_EXPLAINED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A probe hit at or above the residue mark — a band no returned frame on this
+/// thread can have written, so it is treated as a genuinely live guardless
+/// compiled frame and the relocation refusal stands.
+pub fn note_unregistered_jit_frame_live() {
+    UNREG_RESIDUE_LIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(explained_by_residue, above_the_mark)` for the run so far.
+pub fn unregistered_jit_frame_residue_census() -> (usize, usize) {
+    (
+        UNREG_RESIDUE_EXPLAINED.load(Ordering::Relaxed),
+        UNREG_RESIDUE_LIVE.load(Ordering::Relaxed),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Per-cycle fallback for incomplete rewritable JIT coverage
 // ---------------------------------------------------------------------------
 //

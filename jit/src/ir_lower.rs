@@ -7519,32 +7519,94 @@ impl<'a> Lowerer<'a> {
                 self.buf
                     .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
                 self.buf.emit(&[cratonvm_types::GC_FLAG_COMPACT]);
+                // RDX = delta, RCX = a copy of it, for the read-modify-write
+                // families only. `XADD` overwrites its SOURCE with the pre-add
+                // value, so the `*AndGet` forms need the delta preserved
+                // somewhere to add back. Loaded AFTER both guards, so neither
+                // deopt edge has a live RCX to preserve -- which also keeps the
+                // Windows `DEOPT_ARG0 == RCX` collision out of reach, since
+                // `emit_deopt_unless` writes that register only on the side of
+                // its `Jcc` that never returns.
+                let wide = uop.is_wide();
+                if !uop.is_load() {
+                    match uop.delta_imm() {
+                        Some(imm) => {
+                            if wide {
+                                // MOV RDX, imm32 (sign-extended). Exact for the
+                                // only immediates here, +1 and -1.
+                                self.buf.emit(&[0x48, 0xC7, 0xC2]);
+                                self.buf.emit(&imm.to_le_bytes());
+                            } else {
+                                self.buf.emit(&[0xBA]); // MOV EDX, imm32
+                                self.buf.emit(&imm.to_le_bytes());
+                            }
+                        }
+                        None => {
+                            // The runtime delta (`getAndAdd`), a full 64-bit
+                            // word: its node is `IrType::Long`.
+                            self.gp_load_value(RDX, node.inputs[3]);
+                        }
+                    }
+                    if wide {
+                        self.buf.emit(&[0x48, 0x89, 0xD1]); // MOV RCX, RDX
+                    } else {
+                        self.buf.emit(&[0x89, 0xD1]); // MOV ECX, EDX
+                    }
+                }
+
                 let to_legacy = self.emit_jcc_rel32(0x84); // JZ -> legacy
 
+                // The one access, emitted twice against the two offsets. A
+                // `MOV` for the loads; a `LOCK XADD` for the three
+                // read-modify-writes, which leaves the PRE-add value in RCX.
+                let mut emit_access = |lower: &mut Self, disp: i32| {
+                    match (uop.is_load(), wide) {
+                        // MOV RAX, [RAX + disp32]
+                        (true, true) => lower.buf.emit(&[0x48, 0x8B, 0x80]),
+                        // MOV EAX, [RAX + disp32]
+                        (true, false) => lower.buf.emit(&[0x8B, 0x80]),
+                        // LOCK XADD [RAX + disp32], RCX
+                        (false, true) => lower.buf.emit(&[0xF0, 0x48, 0x0F, 0xC1, 0x88]),
+                        // LOCK XADD [RAX + disp32], ECX
+                        (false, false) => lower.buf.emit(&[0xF0, 0x0F, 0xC1, 0x88]),
+                    }
+                    lower.buf.emit(&disp.to_le_bytes());
+                };
+
                 // compact: payload at the registered body offset
-                if matches!(uop, crate::ir::UnboxOp::LongValue) {
-                    self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX+disp32]
-                } else {
-                    self.buf.emit(&[0x8B, 0x80]); // MOV EAX, [RAX+disp32]
-                }
-                self.buf.emit(&compact_off.to_le_bytes());
+                emit_access(self, compact_off);
                 let done = self.emit_jmp_rel32();
 
                 // legacy: payload inside the 16-byte Value cell
                 self.patch_rel32_to_here(to_legacy);
-                if matches!(uop, crate::ir::UnboxOp::LongValue) {
-                    self.buf.emit(&[0x48, 0x8B, 0x80]);
-                } else {
-                    self.buf.emit(&[0x8B, 0x80]);
-                }
-                self.buf.emit(&legacy_off.to_le_bytes());
+                emit_access(self, legacy_off);
 
                 self.patch_rel32_to_here(done);
+
+                // The loads already have their answer in RAX. For an `XADD` it
+                // is in RCX and is the PRE-add value: `getAndAdd` wants exactly
+                // that and owes no fixup, while `incrementAndGet` /
+                // `decrementAndGet` want the POST-add value and add the
+                // preserved delta back.
+                if !uop.is_load() {
+                    if uop.returns_post_add() {
+                        if wide {
+                            self.buf.emit(&[0x48, 0x01, 0xD1]); // ADD RCX, RDX
+                        } else {
+                            self.buf.emit(&[0x01, 0xD1]); // ADD ECX, EDX
+                        }
+                    }
+                    if wide {
+                        self.buf.emit(&[0x48, 0x89, 0xC8]); // MOV RAX, RCX
+                    } else {
+                        self.buf.emit(&[0x89, 0xC8]); // MOV EAX, ECX
+                    }
+                }
                 // Width convention (see `Op::ScalarIntrinsic` above): an `Int`
                 // slot holds its result in the low 32 bits with the upper half
-                // ZEROED, which `MOV EAX, [..]` already produces. No
-                // sign-extension here -- the single-pass arm's `MOVSXD` is for
-                // its own 64-bit slot convention, not this one.
+                // ZEROED, which `MOV EAX, [..]` and `MOV EAX, ECX` both already
+                // produce. No sign-extension here -- the single-pass arm's
+                // `MOVSXD` is for its own 64-bit slot convention, not this one.
                 self.store_rax(slot);
             }
             Op::ScalarIntrinsic(sop) => {
@@ -19309,6 +19371,301 @@ mod tests {").next().unwrap_or(src);
     }
 
 
+
+    /// The class id every unbox-accessor test object carries, and the constant
+    /// the emitted guard compares against. Any value but `0` will do; `0` is
+    /// what the recognizer and the layout resolvers treat as "unresolved".
+    #[cfg(test)]
+    const UNBOX_TEST_CLASS_ID: u32 = 0x00C0_FFEE;
+
+    /// Build `f(recv[, delta]) = <op>(recv[, delta])` as a graph and lower it.
+    ///
+    /// Direct graph construction rather than bytecode, for the reason
+    /// `compile_scalar_intrinsic` gives: reaching `Op::Unbox` from bytecode
+    /// needs the invoke planner, a constant pool AND a resolved receiver class
+    /// id, and that machinery is tested where it lives. This is a test of the
+    /// emitted instructions.
+    ///
+    /// `unbox_offsets` derives the two offsets from the class id, so the test
+    /// object below must be laid out to match whatever it answers -- which is
+    /// why the caller reads them back rather than choosing them.
+    #[cfg(test)]
+    fn compile_unbox(op: crate::ir::UnboxOp) -> Option<(CompiledMethod, i32, i32)> {
+        let (compact_off, legacy_off) = crate::ir::unbox_offsets(op, UNBOX_TEST_CLASS_ID)?;
+        let n = 1 + op.arity();
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+            uses: Default::default(),
+            receiver_param: None,
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let recv = graph.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let mut inputs = vec![ctrl, mem, recv];
+        if op.arity() == 1 {
+            // The delta is a `long` for the one family that takes one.
+            inputs.push(graph.add(Op::Param(1), IrType::Long, vec![start], None));
+        }
+        let v = graph.add(
+            Op::Unbox {
+                op,
+                class_id: UNBOX_TEST_CLASS_ID,
+            },
+            op.result_type(),
+            inputs,
+            Some(0),
+        );
+        graph.exit = graph.add(Op::Return, IrType::Void, vec![ctrl, v], Some(1));
+        let schedule = ir_schedule::schedule(&graph);
+        let cm = lower(&graph, &schedule, n, n, &no_helpers()).expect("the accessor body lowers");
+        Some((cm, compact_off, legacy_off))
+    }
+
+    /// A 64-byte buffer shaped like an object header, with the class id at
+    /// offset 0 and the COMPACT flag set or clear as asked.
+    #[cfg(test)]
+    fn unbox_test_object(compact: bool) -> Box<[u64; 8]> {
+        let mut obj = Box::new([0u64; 8]);
+        // SAFETY: `obj` is 64 bytes and 8-byte aligned; the class id is a `u32`
+        // at offset 0 and the flags byte is inside the first word, so both
+        // writes land well inside it.
+        unsafe {
+            let p = obj.as_mut_ptr() as *mut u8; // Cast: array base -> byte cursor
+            std::ptr::write_unaligned(p as *mut u32, UNBOX_TEST_CLASS_ID); // Cast: header field
+            *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) =
+                if compact { cratonvm_types::GC_FLAG_COMPACT } else { 0 };
+        }
+        obj
+    }
+
+    /// The six emitted sequences, EXECUTED against a synthetic receiver, in
+    /// BOTH object layouts.
+    ///
+    /// # Why both layouts, every time
+    ///
+    /// The compact/legacy branch is per-OBJECT, not per-class, and a
+    /// compact-only arm is an arm that almost never fires: `init_object_header`
+    /// -- the TLAB fast path serving nearly every allocation -- writes a LEGACY
+    /// header unconditionally, whatever layout the class has registered. That
+    /// is not hypothetical; `the_gated_arm_emits_both_store_shapes` in this file
+    /// records it measured at `inline=0` over 16,384,000 executions when only
+    /// the compact shape was emitted.
+    ///
+    /// When the resolver hands back the SAME offset for both layouts (which it
+    /// does when no `CompactLayout` is registered for the forged class id, the
+    /// usual case in a unit-test process), the two arms address one word and the
+    /// per-layout half of this test is vacuous. It is written to be correct
+    /// either way and asserts the arithmetic regardless; the two-arm SELECTION
+    /// is pinned by `only_the_read_modify_write_families_carry_a_lock_prefix`,
+    /// which counts one access encoding per arm in the emitted image.
+    #[test]
+    fn the_unbox_sequences_execute_against_both_object_layouts() {
+        use crate::ir::UnboxOp as U;
+        // (family, starting field value, delta, expected result, expected field)
+        let cases: &[(U, i64, i64, i64, i64)] = &[
+            // The three loads leave the field alone.
+            (U::LongValue, 0x1234_5678_9ABC_DEF0u64 as i64, 0, 0x1234_5678_9ABC_DEF0u64 as i64, 0x1234_5678_9ABC_DEF0u64 as i64),
+            (U::LongValue, -1, 0, -1, -1),
+            (U::AtomicLongGet, i64::MIN, 0, i64::MIN, i64::MIN),
+            (U::AtomicLongGet, 42, 0, 42, 42),
+            // `Integer.intValue` is 32-bit. The IR tier's `Int` convention
+            // ZERO-extends the upper half, so a negative field reads back as
+            // its unsigned 32-bit image in the full slot -- checked below by
+            // comparing the low half, which is the half every consumer reads.
+            (U::IntValue, -7, 0, -7, -7),
+            (U::IntValue, 0x7FFF_FFFF, 0, 0x7FFF_FFFF, 0x7FFF_FFFF),
+            (U::IntValue, 7, 0, 7, 7),
+            // The three `LOCK XADD` forms. `*AndGet` returns the POST-add
+            // value, `getAndAdd` the PRE-add one -- the single place the two
+            // differ, and what a fixup emitted for the wrong family breaks.
+            (U::AtomicIntIncrementAndGet, 5, 0, 6, 6),
+            (U::AtomicIntIncrementAndGet, -1, 0, 0, 0),
+            (U::AtomicIntDecrementAndGet, 5, 0, 4, 4),
+            (U::AtomicIntDecrementAndGet, 0, 0, -1, -1),
+            (U::AtomicIntIncrementAndGet, i32::MAX as i64, 0, i32::MIN as i64, i32::MIN as i64),
+            (U::AtomicLongGetAndAdd, 100, 5, 100, 105),
+            (U::AtomicLongGetAndAdd, 100, -5, 100, 95),
+            (U::AtomicLongGetAndAdd, 0, 1i64 << 40, 0, 1i64 << 40),
+        ];
+
+        for &(op, start, delta, want, want_field) in cases {
+            for compact in [true, false] {
+                let Some((cm, compact_off, legacy_off)) = compile_unbox(op) else {
+                    // No layout for the forged class id: nothing to execute.
+                    continue;
+                };
+                let off = if compact { compact_off } else { legacy_off };
+                assert!(
+                    off >= 0 && (off as usize) + 8 <= 64,
+                    "the resolved offset {off} must leave 8 bytes inside the 64-byte \
+                     test object -- the payload plus, for a narrow family, the \
+                     poison word above it",
+                );
+                let mut obj = unbox_test_object(compact);
+                // Addressed by BYTE offset, not by word index: a LEGACY
+                // int-category payload sits at `cell + FIELD_CELL_PAYLOAD32_
+                // OFFSET`, which is not 8-byte aligned, and a first cut of this
+                // test that divided by 8 read the wrong half and got its own
+                // poison back.
+                //
+                // The 4 bytes ABOVE a narrow field are poisoned, so a 64-bit
+                // load emitted where a 32-bit one belongs returns the poison
+                // rather than a plausible answer.
+                const POISON: u32 = 0x0BAD_0BAD;
+                let base = obj.as_mut_ptr() as *mut u8; // Cast: array base -> byte cursor
+                // SAFETY: `off` was asserted to leave 8 bytes inside the
+                // 64-byte object, and the writes are unaligned-safe.
+                unsafe {
+                    let at = base.add(off as usize); // Cast: resolved field offset
+                    if op.is_wide() {
+                        std::ptr::write_unaligned(at as *mut i64, start);
+                    } else {
+                        std::ptr::write_unaligned(at as *mut u32, start as u32);
+                        std::ptr::write_unaligned(at.add(4) as *mut u32, POISON);
+                    }
+                }
+                let addr = obj.as_mut_ptr() as i64; // Cast: receiver address
+
+                let args: &[i64] = if op.arity() == 1 { &[addr, delta] } else { &[addr] };
+                // SAFETY: the body takes the receiver (and for one family a
+                // delta), builds and tears down its own frame, and calls
+                // nothing. `obj` is a live 64-byte buffer whose header the
+                // emitted guards accept, so no deopt edge is taken.
+                let got = unsafe { cm.try_call(args) }.expect("the body runs");
+
+                let layout = if compact { "compact" } else { "legacy" };
+                let got = if op.is_wide() { got } else { got as i32 as i64 };
+                assert_eq!(
+                    got, want,
+                    "{} on a {layout} receiver (field={start:#x}, delta={delta})",
+                    op.as_str(),
+                );
+                // SAFETY: same range, same reasoning as the writes above.
+                let field = unsafe {
+                    let at = base.add(off as usize); // Cast: resolved field offset
+                    if op.is_wide() {
+                        std::ptr::read_unaligned(at as *const i64)
+                    } else {
+                        assert_eq!(
+                            std::ptr::read_unaligned(at.add(4) as *const u32),
+                            POISON,
+                            "{} wrote past the 4 bytes a 32-bit field owns",
+                            op.as_str(),
+                        );
+                        i64::from(std::ptr::read_unaligned(at as *const u32) as i32)
+                    }
+                };
+                assert_eq!(
+                    field, want_field,
+                    "{} left the wrong value in the {layout} field",
+                    op.as_str(),
+                );
+            }
+        }
+    }
+
+    /// The `LOCK` prefix is on the three read-modify-write families and on
+    /// neither of the others, and each access is emitted in BOTH layout arms.
+    ///
+    /// Executing them proves the ARITHMETIC and cannot prove this: an unlocked
+    /// `XADD` computes the identical answer on one thread, and the difference
+    /// only appears as a lost update under contention -- the failure a
+    /// single-threaded test is structurally unable to see. So the byte is
+    /// checked in the emitted image.
+    ///
+    /// The converse half matters too: a `LOCK` on the loads would be a needless
+    /// full barrier on the hottest of the six (`AtomicLong.get`), and the reason
+    /// it is not owed -- x86-64 does not reorder loads with older loads, so an
+    /// aligned `MOV` already IS the volatile read -- is the kind of claim that
+    /// rots silently.
+    #[test]
+    fn only_the_read_modify_write_families_carry_a_lock_prefix() {
+        use crate::ir::UnboxOp as U;
+        for op in [
+            U::LongValue,
+            U::IntValue,
+            U::AtomicLongGet,
+            U::AtomicIntIncrementAndGet,
+            U::AtomicIntDecrementAndGet,
+            U::AtomicLongGetAndAdd,
+        ] {
+            let Some((cm, _, _)) = compile_unbox(op) else {
+                continue;
+            };
+            // SAFETY: the artifact owns an executable mapping of `code_len`
+            // bytes at `entry_ptr`; this only reads it.
+            let code =
+                unsafe { std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()) };
+            // The WHOLE `LOCK XADD` opcode -- with the `REX.W` in the middle at
+            // 64 bits -- rather than a bare `0xF0`, which also occurs inside
+            // displacements and immediates.
+            let want: &[u8] = if op.is_wide() {
+                &[0xF0, 0x48, 0x0F, 0xC1]
+            } else {
+                &[0xF0, 0x0F, 0xC1]
+            };
+            let locked = code.windows(want.len()).filter(|w| *w == want).count();
+            assert_eq!(
+                locked,
+                if op.is_load() { 0 } else { 2 },
+                "{} must emit {} LOCK XADD (one per layout arm)",
+                op.as_str(),
+                if op.is_load() { 0 } else { 2 },
+            );
+        }
+    }
+
+    /// Both guards and the per-object layout branch are emitted, for every
+    /// family.
+    ///
+    /// The class-id compare cannot be checked by executing a well-formed
+    /// receiver: with it missing every assertion above still passes, and what
+    /// breaks instead is a receiver of another class reading this one's slot 0.
+    #[test]
+    fn every_unbox_family_emits_its_guards_and_the_layout_branch() {
+        use crate::ir::UnboxOp as U;
+        for op in [
+            U::LongValue,
+            U::IntValue,
+            U::AtomicLongGet,
+            U::AtomicIntIncrementAndGet,
+            U::AtomicIntDecrementAndGet,
+            U::AtomicLongGetAndAdd,
+        ] {
+            let Some((cm, _, _)) = compile_unbox(op) else {
+                continue;
+            };
+            // SAFETY: as above.
+            let code =
+                unsafe { std::slice::from_raw_parts(cm.entry_ptr() as *const u8, cm.code_len()) };
+            assert!(
+                code.windows(3).any(|w| w == [0x48, 0x85, 0xC0]),
+                "{} must null-check its receiver (TEST RAX, RAX)",
+                op.as_str(),
+            );
+            let mut cid = vec![0x81, 0x78, 0x00];
+            cid.extend_from_slice(&UNBOX_TEST_CLASS_ID.to_le_bytes());
+            assert!(
+                code.windows(cid.len()).any(|w| w == cid.as_slice()),
+                "{} must compare the receiver's header class id against the \
+                 constant the planner resolved",
+                op.as_str(),
+            );
+            let mut flags = vec![0xF6, 0x80];
+            flags.extend_from_slice(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+            flags.push(cratonvm_types::GC_FLAG_COMPACT);
+            assert!(
+                code.windows(flags.len()).any(|w| w == flags.as_slice()),
+                "{} must branch on the receiver's own COMPACT flag",
+                op.as_str(),
+            );
+        }
+    }
 
     /// The emitted sequences, EXECUTED, against the answers the JLS specifies.
     ///

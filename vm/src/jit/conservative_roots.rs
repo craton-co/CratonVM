@@ -2546,6 +2546,25 @@ fn unreg_jit_accept_residue() -> bool {
     })
 }
 
+/// Kill switch for the residue test on the unregistered-JIT-frame probe's
+/// RELOCATION LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=0` restores the
+/// pre-2026-09-08 behaviour, where any accepted hit refused relocation for the
+/// cycle even when the returned-frame residue mark explained it.
+///
+/// Marking is unaffected either way: the full band is conservatively scanned on
+/// every accepted hit under both settings, so this switch can only change how
+/// often the collector is ALLOWED TO COMPACT, never what it retains.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn unreg_residue_licence_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_RESIDUE_LICENCE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 /// Cached `CRATONVM_JIT_RANGE_SCAN_LEGACY` gate — see `native_stack_has_jit_frame`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn jit_range_scan_legacy() -> bool {
@@ -6140,12 +6159,81 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // scan itself is narrowed above, never the marking scope
                         // once something is actually found.
                         scan_one_frame(search_lo, high, heap, out);
-                        cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
-                        // The frame's oops are now MARKED but still not
-                        // rewritable, so the cycle cannot be a moving one.
-                        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
-                            cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
-                        );
+                        // MARKING AND THE RELOCATION LICENCE ARE TWO QUESTIONS,
+                        // and until 2026-09-08 this site answered both with the
+                        // one `accept` above.
+                        //
+                        // `accept`'s residue test is short-circuited by
+                        // `chain_len > 0`, on the argument quoted above it:
+                        // "with entries on the chain, `search_lo` is already
+                        // `cover_hi`, so anything found above it is a frame the
+                        // chain does not cover and must be marked". That is
+                        // right about MARKING and wrong about LIVENESS.
+                        // `JIT_RESIDUE_HI` is MONOTONIC over the thread's whole
+                        // life (its own doc says why), so a shallower JIT call
+                        // that returned long ago leaves residue ABOVE the
+                        // current chain's `cover_hi` — and the band
+                        // `[cover_hi, residue_hi)` is then scanned and its
+                        // leftovers read as a live guardless frame. Every hit
+                        // on the H2 `MvsCreate` ZGC OOM was of exactly that
+                        // shape (`is_residue=true`, `chain_len=1..3`), and the
+                        // refusal it raised cost the collector its only
+                        // defragmentation for the life of the process.
+                        //
+                        // So: keep marking the full band unconditionally (a
+                        // conservative mark is over-retention, never a
+                        // correctness risk, and `roots.rs` republishes these
+                        // addresses as `publish_pinned_jit_roots`, which ZGC
+                        // withholds the PAGE of), and raise the refusal only for
+                        // a hit the residue mark cannot explain.
+                        //
+                        // The re-probe is NOT "believe the first hit was
+                        // residue and stop". `native_stack_has_jit_frame`
+                        // returns the LOWEST hit in the band, so a residue hit
+                        // can hide a genuine one above it; the band
+                        // `[residue_hi, scan_hi)` is one no returned frame on
+                        // this thread can have written, and the one live
+                        // guardless frame this probe exists for — the process
+                        // entry point — sits above every JIT entry the run ever
+                        // makes and therefore inside it.
+                        //
+                        // CLASSIFY FIRST, THEN DECIDE. The census describes what
+                        // the probe SAW and is therefore identical under either
+                        // setting of the kill switch below; only the refusal
+                        // consults the switch. A census that changed with the
+                        // switch could not be used to judge the switch.
+                        let live_hit = match probe {
+                            None => None,
+                            Some((hit_slot, w)) => {
+                                let residue_hi = jit_residue_hi();
+                                if residue_hi == 0 || hit_slot >= residue_hi {
+                                    Some((hit_slot, w))
+                                } else {
+                                    let live_lo = residue_hi.max(search_lo);
+                                    if scan_hi > live_lo {
+                                        native_stack_has_jit_frame(live_lo, scan_hi)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                        if live_hit.is_some() {
+                            cratonvm_gc::gc_quiescence::note_unregistered_jit_frame_live();
+                        } else {
+                            cratonvm_gc::gc_quiescence::note_unregistered_jit_frame_residue();
+                        }
+                        if live_hit.is_some()
+                            || !unreg_residue_licence_enabled()
+                            || unreg_jit_accept_residue()
+                        {
+                            cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                            // The frame's oops are now MARKED but still not
+                            // rewritable, so the cycle cannot be a moving one.
+                            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                                cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+                            );
+                        }
                     } else if probe.is_none() {
                         UNREG_JIT_MEMO.with(|c| {
                             let mut m = c.get();

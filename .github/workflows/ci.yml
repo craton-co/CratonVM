@@ -490,6 +490,17 @@ jobs:
       # pass. Fix the fixture; declaring it with `ALLOW_DEGRADED_FIXTURES` turns
       # the one gate that covers the JNI boundary under `--jdk-only` back off.
       #
+      # HOW MANY PROBES THIS RUNS IS NOT IN THIS FILE, AND THAT IS DELIBERATE.
+      # The script's built-in list is three. It then appends every line of
+      # `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.probes` for
+      # THIS leg's key, if that file exists -- so the Windows leg runs 67 and
+      # the Linux leg runs 3, from one unchanged command. The list has to be
+      # keyed that way because the ratchet is a set difference against a
+      # baseline with the same key: scheduling a probe on a leg whose baseline
+      # was frozen without it makes each of its divergent sections a NEW row
+      # and fails the leg. Promote a probe by measuring it on a key and adding
+      # it to that key's file; do not add legs to this step to compensate.
+      #
       # Prerequisites are already met by earlier steps: `Set up JDK 25` exports
       # JAVA_HOME, and `Build` leaves target/debug/cratonvm. `jar` comes from
       # that JDK.
