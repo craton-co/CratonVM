@@ -32,8 +32,29 @@ use super::*;
 /// real-frame-deopt: `true` (default OFF) when an IR-path deopt should resume
 /// the interpreter at the trapping bci from the reconstructed frame, instead of
 /// re-running the method from entry. Gated by `CRATONVM_IR_DEOPT_RESUME` while
-/// it soaks — the precise resume is unvalidated against the full VM suite, and
-/// no production IR method emits a deopt guard yet, so default OFF is inert.
+/// it soaks — the precise resume is unvalidated against the full VM suite.
+///
+/// # The second half of that justification is FALSE, and has been for a while
+///
+/// This comment used to add "and no production IR method emits a deopt guard
+/// yet, so default OFF is inert." **Production IR methods emit deopt guards.**
+/// `ir_lower.rs` lowers every array access, `arraylength`, field access and
+/// integer division under it to one (`emit_array_null_bounds_guards_for`,
+/// `emit_deopt_if_zero`), and the IR front end plants an UNCONDITIONAL site
+/// trap at every `invokedynamic` it cannot lower (`ir_site_trap_enabled`,
+/// default ON). Those guards are what the 2026-09-07 cross-suite crash
+/// population was made of — the entire H2 CRASH set, seven hibernate-reactive
+/// classes and a Spring Framework class — and what
+/// `probes/DeoptTrapProbe.java` and `probes/DeoptRerunProbe.java` fire on
+/// demand.
+///
+/// So "default OFF is inert" was load-bearing and wrong: this flag being off
+/// is exactly why all four deopt sinks fell through to their
+/// `can_deopt_resume` arm, and that arm is `false` on every production
+/// optimizing artifact. The four fixes of 2026-09-07 added a second admission
+/// beside this one rather than turning it on, because THIS path
+/// (`resume_from_ir_deopt`, the int-only mapper) is still the unsoaked one.
+/// What is no longer true is that leaving it off costs nothing.
 pub(super) fn ir_deopt_resume_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();

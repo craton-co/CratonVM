@@ -229,9 +229,22 @@ fn body() {
     // `lambda_site_deopt_outcomes()`'s own doc calls `unresumable` "the metric a
     // regression test asserts is zero", and until now no test asserted it —
     // the accessor had no caller anywhere in the tree. This is that caller.
-    // It covers the THIRD sink (`resume_deopted_body`, the one-shot lambda
-    // doors), which this fixture does not otherwise reach, so a non-zero value
-    // here would mean the fix left that door behind.
+    //
+    // BUT READ THE NEXT PARAGRAPH BEFORE TREATING IT AS COVERAGE (2026-09-08).
+    // This zero is STRUCTURAL. `DeoptRerunCount` contains no SAM anywhere — it
+    // is `invokestatic` throughout — so neither `SITE_RESUMED` nor
+    // `SITE_UNRESUMABLE` can be incremented by this fixture, and the assertion
+    // below would hold just as firmly on a VM whose lambda door was completely
+    // broken. Measured: `lambda_site_dispatch_counts()` reports `calls=0` for
+    // this file, so the door is not merely declining, it is never entered.
+    //
+    // It is kept as a belt — a non-zero here would still be a real failure —
+    // and the earned version lives in `jit_lambda_door_deopt_resumes.rs`, which
+    // drives a real SAM and asserts ENGAGEMENT (`resumed > 0`) beside the zero.
+    // That file is `#[ignore]`d because it reproduces an open defect: a lambda
+    // callee's deopt is orphaned by an identity check comparing the SAM's name,
+    // and its side effect runs twice
+    // (`lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908`).
     let (_resumed, unresumable) = cratonvm_vm::runtime::interpreter::lambda_site_deopt_outcomes();
     assert_eq!(
         unresumable, 0,
