@@ -5687,6 +5687,19 @@ impl IrBuilder {
         if !ir_site_trap_enabled() {
             return false;
         }
+        // Counted at the END, on the success path only -- see the increment
+        // just before `true` is returned. A refused plant must not make the
+        // runtime think this method carries a trap.
+        // The unresolved-class causes are opt-in and off by default; see
+        // `ir_unresolved_class_trap_enabled` for the argument that was refuted.
+        if matches!(
+            cause,
+            TrapCause::UnresolvedTypeCheck | TrapCause::UnresolvedNew
+        ) && !ir_unresolved_class_trap_enabled()
+        {
+            return false;
+        }
+
         // A trap this tier CANNOT BE RESUMED FROM is not a slow path, it is a
         // guaranteed `InternalError`. `x64::driver` sets
         // `can_deopt_resume = !deopt_points.is_empty() && !has_elided_monitor`
@@ -5716,6 +5729,16 @@ impl IrBuilder {
         // vm/src/runtime/interpreter/deopt_resume.rs) so the two ends cannot
         // drift: whole body pure, else the prefix before the trap pure and
         // every spliced body pure.
+        // AFTER the default-off unresolved-class gate, deliberately. Both
+        // arms return `false` and the compile bails identically either way,
+        // so the order is not a behaviour question -- it is a COUNTING one.
+        // Above the gate, every `checkcast`/`instanceof`/`new` site was
+        // charged to this refusal even though `ir_unresolved_class_trap_enabled`
+        // was going to decline it regardless: on one javac workload that was
+        // 77 of 126 rows, i.e. the census read the guard as three times more
+        // expensive than it is. A refusal counted here now means exactly
+        // "this site would have been a trap but for the resumability rule",
+        // which is the only reading that makes the census a price tag.
         if ir_trap_replay_guard_enabled() && !self.trap_replay_is_safe(code, code_len, pc) {
             if ir_bail_reporting() {
                 eprintln!(
@@ -5725,18 +5748,6 @@ impl IrBuilder {
                 );
             }
             note_trap_refused(cause);
-            return false;
-        }
-        // Counted at the END, on the success path only -- see the increment
-        // just before `true` is returned. A refused plant must not make the
-        // runtime think this method carries a trap.
-        // The unresolved-class causes are opt-in and off by default; see
-        // `ir_unresolved_class_trap_enabled` for the argument that was refuted.
-        if matches!(
-            cause,
-            TrapCause::UnresolvedTypeCheck | TrapCause::UnresolvedNew
-        ) && !ir_unresolved_class_trap_enabled()
-        {
             return false;
         }
         let Some(ctrl) = self.ctrl_opt() else {
