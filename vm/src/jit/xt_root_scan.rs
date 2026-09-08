@@ -1391,6 +1391,43 @@ mod imp {
         }
     }
 
+    /// Snapshot of every readable mapping, from `/proc/self/maps`.
+    ///
+    /// # This snapshot must be taken PER PARKED PEER, never hoisted
+    ///
+    /// It is used to bound a conservative stack walk, and the walk
+    /// DEREFERENCES what it bounds. A snapshot only describes the address
+    /// space at the instant it was read, and this process remaps constantly:
+    /// every platform thread that starts or exits maps or unmaps an 8 MiB
+    /// stack, and a virtual-thread workload churns them by the thousand.
+    ///
+    /// The danger is not that the parked peer's own stack disappears — a
+    /// parked peer cannot exit, so its mapping is stable for exactly as long
+    /// as the walk needs it. It is that a STALE entry can still CONTAIN the
+    /// peer's `rsp` while describing a mapping that no longer exists: an
+    /// exited thread's 8 MiB stack is unmapped, a new thread's smaller stack
+    /// is later placed inside that freed span, and the old entry answers the
+    /// lookup with an `hi` far above the new stack's real top.
+    /// `readable_region_end_from_regions` then returns an `end` past the end
+    /// of the peer's stack and the walk steps off it.
+    ///
+    /// Measured 2026-09-08 on Linux, `VthreadProbe` (10000 virtual threads),
+    /// with `helper_window_pass` hoisting one snapshot for the whole pass:
+    ///
+    /// ```text
+    /// [xt-hw] tid=582 rsp=0x7126e17f29b8 end=0x7126e1ff29b8   <- rsp + 8 MiB
+    /// SIGSEGV               addr=0x7126e17fb000               <- ~34 KiB up
+    /// ```
+    ///
+    /// `end` had fallen back to the `MAX_STACK_SCAN` cap, so the matched entry
+    /// claimed at least 8 MiB above `rsp`, while the peer's real stack ended
+    /// 34 KiB up — a page-aligned fault on the first unmapped page above it,
+    /// killing the VM mid-collection. Both `vthread_probe_10000_all_increment`
+    /// and `vthread_gc_stress_completes` died this way.
+    ///
+    /// Taking it after the peer parks removes the window: the entry containing
+    /// a parked peer's `rsp` is that peer's own live stack, and a parked peer
+    /// holds it mapped.
     fn readable_regions() -> Vec<(usize, usize)> {
         let mut regions = Vec::new();
         let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
@@ -1416,6 +1453,100 @@ mod imp {
         }
         regions
     }
+
+    /// Whether `process_vm_readv` can read THIS process's own memory here.
+    ///
+    /// Probed once, against a known-good address, because a kernel or a seccomp
+    /// profile that refuses the syscall must not silently turn every stack scan
+    /// into zero roots — that is a missing-root bug, which is far worse than
+    /// the crash this reader exists to prevent. When it is unavailable the
+    /// walk falls back to the direct load it has always used.
+    fn safe_self_read_available() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            // Kill switch, so the reader and the historical direct load are
+            // A/B-able inside ONE binary. Setting it restores the pre-fix
+            // behaviour exactly — including the SIGSEGV.
+            if std::env::var_os("CRATONVM_XT_NO_SAFE_PEER_READ").is_some() {
+                return false;
+            }
+            let probe: u64 = 0x5ab0_1234_5678_9abc;
+            let mut out: u64 = 0;
+            let n = unsafe {
+                let local = libc::iovec {
+                    iov_base: (&mut out as *mut u64).cast::<libc::c_void>(),
+                    iov_len: 8,
+                };
+                let remote = libc::iovec {
+                    iov_base: (&probe as *const u64 as *mut u64).cast::<libc::c_void>(),
+                    iov_len: 8,
+                };
+                libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0)
+            };
+            n == 8 && out == probe
+        })
+    }
+
+    /// Copy up to `out.len()` bytes from OUR OWN address space at `addr`,
+    /// returning how many bytes were actually copied.
+    ///
+    /// # Why a syscall and not a load
+    ///
+    /// The conservative stack walk dereferences addresses it derived from a
+    /// `/proc/self/maps` snapshot, and NO snapshot of this process is
+    /// trustworthy for the duration of a walk. glibc caches an exited thread's
+    /// stack with its pages still readable — so the kernel reports it merged
+    /// with the neighbouring mapping — and then, when a new thread reuses that
+    /// cached stack, `mprotect`s a PROT_NONE guard page into the middle of the
+    /// span. A region that was readable when it was read back can therefore
+    /// grow an unreadable hole INSIDE it a moment later, with no unmapping
+    /// involved and nothing the reader could have re-checked. Under a
+    /// virtual-thread workload that churns thousands of threads, this happens
+    /// constantly.
+    ///
+    /// `process_vm_readv` makes the kernel do the access check: an unreadable
+    /// page ends the copy with a SHORT READ instead of delivering SIGSEGV. It
+    /// is the same primitive a debugger uses, applied to our own pid, where it
+    /// needs no privilege. Verified against a deliberately `mprotect`ed
+    /// PROT_NONE page: it returns exactly the bytes before the hole.
+    ///
+    /// A short read is not an error and is not a coverage hole: it means the
+    /// peer's readable stack ends there. Everything above is some other
+    /// thread's memory, which this peer cannot reach and which the walk had no
+    /// business reading in the first place — the fault was only the visible
+    /// half of that mistake.
+    fn read_self_memory(addr: usize, out: &mut [u8]) -> usize {
+        if !safe_self_read_available() {
+            // Historical behaviour, kept for a kernel that refuses the syscall.
+            unsafe {
+                std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+            }
+            return out.len();
+        }
+        let n = unsafe {
+            let local = libc::iovec {
+                iov_base: out.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: out.len(),
+            };
+            let remote = libc::iovec {
+                iov_base: addr as *mut libc::c_void,
+                iov_len: out.len(),
+            };
+            libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0)
+        };
+        if n <= 0 {
+            0
+        } else {
+            (n as usize).min(out.len())
+        }
+    }
+
+    /// Number of 8-byte words copied per `read_self_memory` call.
+    ///
+    /// One syscall per 8 KiB. The scanned span is `stack_top - rsp`, i.e. the
+    /// peer's USED depth, which is tens of KiB in the common case — a handful
+    /// of syscalls per peer, against a walk that already touches every word.
+    const SCAN_CHUNK_WORDS: usize = 1024;
 
     fn readable_region_end_from_regions(addr: usize, regions: &[(usize, usize)]) -> Option<usize> {
         for &(lo, hi) in regions {
@@ -1463,19 +1594,39 @@ mod imp {
         let Some(end) = readable_region_end_from_regions(rsp, regions) else {
             return found;
         };
+        // Read through the kernel rather than dereferencing directly: the
+        // bound above comes from a `/proc/self/maps` snapshot, and a snapshot
+        // of this process is stale the instant it is taken. See
+        // `read_self_memory`.
         let mut p = rsp;
+        let mut chunk = [0u64; SCAN_CHUNK_WORDS];
         while p + 8 <= end {
-            let w = unsafe { (p as *const usize).read_unaligned() };
-            if let Some(o) = is_obj(w) {
-                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
-                // THE REPAIR: this word lives at `p` in the peer's own stack
-                // and nothing else will ever rewrite it. Hand the address to
-                // the blocked-wake fixup.
-                cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid, p, w);
-                roots.push(o);
-                found += 1;
+            let want = (end - p).min(SCAN_CHUNK_WORDS * 8) & !7;
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<u8>(), want) };
+            let got = read_self_memory(p, bytes) & !7;
+            if got == 0 {
+                // The peer's readable stack ends here.
+                break;
             }
-            p += 8;
+            for (i, &w) in chunk[..got / 8].iter().enumerate() {
+                let w = w as usize;
+                if let Some(o) = is_obj(w) {
+                    let at = p + i * 8;
+                    cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid, 0xff, w);
+                    // THE REPAIR: this word lives at `at` in the peer's own
+                    // stack and nothing else will ever rewrite it. Hand the
+                    // address to the blocked-wake fixup.
+                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid, at, w);
+                    roots.push(o);
+                    found += 1;
+                }
+            }
+            p += got;
+            if got < want {
+                // Short read: an unreadable page, i.e. the top of the stack.
+                break;
+            }
         }
         found
     }
@@ -1530,19 +1681,39 @@ mod imp {
         let Some(end) = readable_region_end_from_regions(rsp, regions) else {
             return (has_jit, false);
         };
+        // Same kernel-mediated read as `scan_slot_with_regions`, and for the
+        // same reason: this pass is the one that SIGSEGV'd the VM on
+        // `VthreadProbe`. See `read_self_memory`.
         let mut p = rsp;
+        let mut chunk = [0u64; SCAN_CHUNK_WORDS];
         while p + 8 <= end {
-            let w = unsafe { (p as *const usize).read_unaligned() };
-            if !has_jit && ranges.iter().any(|&(lo, hi)| w >= lo && w < hi) {
-                has_jit = true;
+            let want = (end - p).min(SCAN_CHUNK_WORDS * 8) & !7;
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<u8>(), want) };
+            let got = read_self_memory(p, bytes) & !7;
+            if got == 0 {
+                break;
             }
-            if let Some(o) = is_obj(w) {
-                cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
-                cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid_hw, p, w);
-                candidates.push(o);
+            for (i, &w) in chunk[..got / 8].iter().enumerate() {
+                let w = w as usize;
+                if !has_jit && ranges.iter().any(|&(lo, hi)| w >= lo && w < hi) {
+                    has_jit = true;
+                }
+                if let Some(o) = is_obj(w) {
+                    let at = p + i * 8;
+                    cratonvm_gc::gc_quiescence::record_peer_reg(pair_tid_hw, 0xff, w);
+                    cratonvm_gc::gc_quiescence::record_peer_stack_slot(pair_tid_hw, at, w);
+                    candidates.push(o);
+                }
             }
-            p += 8;
+            p += got;
+            if got < want {
+                break;
+            }
         }
+        // COMPLETE: every readable word from `rsp` up has been read. Stopping
+        // at an unreadable page is not a partial scan — that page is the end of
+        // this peer's stack, and what lies above belongs to another thread.
         (has_jit, true)
     }
 
@@ -1687,6 +1858,11 @@ mod imp {
         }
         install_handler();
         publish_ranges(&ranges);
+        // Hoisted deliberately: `/proc/self/maps` is enormous in a process
+        // holding thousands of thread stacks, and re-reading it per peer cost
+        // this pass 119-268 s against a 120 s cap (measured 2026-09-08). It is
+        // only ever an UPPER BOUND now — `read_self_memory` stops the walk at
+        // the first unreadable page whatever this says.
         let regions = readable_regions();
         let had_taken = taken.count() > 0;
         ACTIVE.store(true, Ordering::Release);
