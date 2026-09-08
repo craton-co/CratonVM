@@ -2782,7 +2782,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             // turn.
             let this_pin = ctx.pin_native_root(this);
             loop {
-                let this = ctx.read_native_pin(this_pin, this);
+                let mut this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -2888,7 +2888,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             // the next turn.
             let this_pin = ctx.pin_native_root(this);
             loop {
-                let this = ctx.read_native_pin(this_pin, this);
+                let mut this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -2946,7 +2946,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 // on the next turn.
                 let this_pin = ctx.pin_native_root(this);
                 loop {
-                    let this = ctx.read_native_pin(this_pin, this);
+                    let mut this = ctx.read_native_pin(this_pin, this);
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
                         Value::Int(n) => n,
@@ -3577,7 +3577,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             // element, and dereferences `this` on the next turn.
             let this_pin = ctx.pin_native_root(this);
             loop {
-                let this = ctx.read_native_pin(this_pin, this);
+                let mut this = ctx.read_native_pin(this_pin, this);
                 let size_now = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
                     _ => 0,
@@ -3666,7 +3666,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 // window there is -- and dereferences `this` on the next turn.
                 let this_pin = ctx.pin_native_root(this);
                 loop {
-                    let this = ctx.read_native_pin(this_pin, this);
+                    let mut this = ctx.read_native_pin(this_pin, this);
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
                         Value::Int(n) => n,
@@ -3698,7 +3698,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             // the next turn.
             let this_pin = ctx.pin_native_root(this);
             loop {
-                let this = ctx.read_native_pin(this_pin, this);
+                let mut this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
