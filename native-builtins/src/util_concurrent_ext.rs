@@ -1563,6 +1563,86 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             }
             false
         }
+        /// Allocate the copy-on-write destination array with everything that
+        /// must survive it PINNED, and hand back their post-allocation
+        /// addresses.
+        ///
+        /// `ctx.new_array` ALLOCATES, and an allocation is a collection point.
+        /// Every mutator below then reads the OLD array, writes the receiver's
+        /// `array` field and releases the receiver's monitor — so all three
+        /// have to be re-read afterwards. A stale `old` copies out of memory
+        /// the sweep may have reclaimed; a stale `this` writes the swap into
+        /// it; and a stale monitor makes `MonitorTable::exit` dereference a
+        /// dead header, which is an `EXCEPTION_ACCESS_VIOLATION` when the young
+        /// slot was reclaimed and a PERMANENTLY LEAKED lock when it merely
+        /// moved (every later writer on that list then blocks forever).
+        fn cowal_pinned_new_array(
+            ctx: &mut dyn NativeContext,
+            len: usize,
+            this: &mut ObjectRef,
+            old_arr: &mut Option<ObjectRef>,
+            elem: &mut Value,
+        ) -> ObjectRef {
+            let base = ctx.pin_native_root(*this);
+            let old_h = old_arr.map(|a| ctx.pin_native_root(a));
+            let elem_h = match *elem {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+            *this = ctx.read_native_pin(base, *this);
+            if let (Some(a), Some(h)) = (*old_arr, old_h) {
+                *old_arr = Some(ctx.read_native_pin(h, a));
+            }
+            if let (Value::Object(Some(o)), Some(h)) = (*elem, elem_h) {
+                *elem = Value::Object(Some(ctx.read_native_pin(h, o)));
+            }
+            ctx.unpin_native_roots(base);
+            new_arr
+        }
+
+        /// First index whose element matches `needle`, with the scan's three
+        /// references kept current across `cowal_element_matches`.
+        ///
+        /// That helper calls `Object.equals` — USER code, so it allocates and
+        /// can collect on every turn. The loops that used to inline this scan
+        /// held `this`, the array and the needle as pre-scan addresses and
+        /// dereferenced all three on the next turn.
+        fn cowal_find_pinned(
+            ctx: &mut dyn NativeContext,
+            this: &mut ObjectRef,
+            old_arr: &mut Option<ObjectRef>,
+            needle: &mut Value,
+            size: usize,
+        ) -> Option<usize> {
+            let base = ctx.pin_native_root(*this);
+            let old_h = old_arr.map(|a| ctx.pin_native_root(a));
+            let needle_h = match *needle {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let mut found = None;
+            for i in 0..size {
+                let Some(old) = *old_arr else { break };
+                let elem = ctx.get_array_element(old, i);
+                let n = *needle;
+                let matched = cowal_element_matches(ctx, elem, n);
+                *this = ctx.read_native_pin(base, *this);
+                if let (Some(a), Some(h)) = (*old_arr, old_h) {
+                    *old_arr = Some(ctx.read_native_pin(h, a));
+                }
+                if let (Value::Object(Some(o)), Some(h)) = (*needle, needle_h) {
+                    *needle = Value::Object(Some(ctx.read_native_pin(h, o)));
+                }
+                if matched {
+                    found = Some(i);
+                    break;
+                }
+            }
+            ctx.unpin_native_roots(base);
+            found
+        }
+
         // Reads — re-routed to use real-COWAL layout when available.  The
         // previous registrations delegated to `native_al_*` which assumed
         // ArrayList slot semantics; on a real COWAL receiver they read the
@@ -1616,46 +1696,34 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             ))
         });
         registry.register(cowal, "contains", "(Ljava/lang/Object;)Z", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let needle = args.get(1).copied().unwrap_or(Value::Object(None));
-            let (data, size) = cowal_read_state(ctx, this);
-            if let Some(arr) = data {
-                for i in 0..size {
-                    let elem = ctx.get_array_element(arr, i);
-                    if cowal_element_matches(ctx, elem, needle) {
-                        return Ok(Some(Value::Int(1)));
-                    }
-                }
-            }
-            Ok(Some(Value::Int(0)))
+            let mut needle = args.get(1).copied().unwrap_or(Value::Object(None));
+            let (mut data, size) = cowal_read_state(ctx, this);
+            let found = cowal_find_pinned(ctx, &mut this, &mut data, &mut needle, size);
+            Ok(Some(Value::Int(i32::from(found.is_some()))))
         });
         registry.register(cowal, "indexOf", "(Ljava/lang/Object;)I", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let needle = args.get(1).copied().unwrap_or(Value::Object(None));
-            let (data, size) = cowal_read_state(ctx, this);
-            if let Some(arr) = data {
-                for i in 0..size {
-                    let elem = ctx.get_array_element(arr, i);
-                    if cowal_element_matches(ctx, elem, needle) {
-                        return Ok(Some(Value::Int(i as i32)));
-                    }
-                }
-            }
-            Ok(Some(Value::Int(-1)))
+            let mut needle = args.get(1).copied().unwrap_or(Value::Object(None));
+            let (mut data, size) = cowal_read_state(ctx, this);
+            let found = cowal_find_pinned(ctx, &mut this, &mut data, &mut needle, size);
+            Ok(Some(Value::Int(found.map_or(-1, |i| i as i32))))
         });
         registry.register(cowal, "toArray", "()[Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (data, size) = cowal_read_state(ctx, this);
-            let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+            let (mut data, size) = cowal_read_state(ctx, this);
+            // `new_array` collects; `data` is dereferenced right after it.
+            let mut no_elem = Value::Object(None);
+            let out = cowal_pinned_new_array(ctx, size, &mut this, &mut data, &mut no_elem);
             if let Some(arr) = data {
                 for i in 0..size {
                     ctx.set_array_element(out, i, ctx.get_array_element(arr, i));
@@ -1690,14 +1758,16 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         // `internalConfigurationAnnotationProcessor` before Spring Boot
         // could finish bootstrapping its main config class.
         registry.register(cowal, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let (data_opt, size) = cowal_read_state(ctx, this);
+            let (mut data_opt, size) = cowal_read_state(ctx, this);
             // Copy into snapshot array (matches COWAL semantics: writes after
             // iterator creation do not affect what the iterator sees).
-            let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+            // `new_array` collects, and `data_opt` is read out right after it.
+            let mut no_elem = Value::Object(None);
+            let snap = cowal_pinned_new_array(ctx, size, &mut this, &mut data_opt, &mut no_elem);
             if let Some(data) = data_opt {
                 for i in 0..size {
                     let elem = ctx.get_array_element(data, i);
@@ -1740,7 +1810,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             "set",
             "(ILjava/lang/Object;)Ljava/lang/Object;",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
@@ -1748,9 +1818,9 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     Some(Value::Int(i)) => *i,
                     _ => return Ok(Some(Value::Object(None))),
                 };
-                let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+                let mut new_val = args.get(2).copied().unwrap_or(Value::Object(None));
                 ctx.monitor_enter(this);
-                let (old_arr, size) = cowal_read_state(ctx, this);
+                let (mut old_arr, size) = cowal_read_state(ctx, this);
                 // See the `get` registration above for why this throws rather
                 // than answering `null`.
                 if raw_idx < 0 || raw_idx as usize >= size {
@@ -1766,7 +1836,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                     );
                 }
                 let idx = raw_idx as usize;
-                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+                let new_arr =
+                    cowal_pinned_new_array(ctx, size, &mut this, &mut old_arr, &mut new_val);
                 let mut old_val = Value::Object(None);
                 if let Some(old) = old_arr {
                     for i in 0..size {
@@ -1785,14 +1856,15 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             },
         );
         registry.register(cowal, "add", "(Ljava/lang/Object;)Z", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
+            let new_arr =
+                cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
             if let Some(old) = old_arr {
                 for i in 0..size {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1808,23 +1880,19 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             "addIfAbsent",
             "(Ljava/lang/Object;)Z",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+                let mut elem = args.get(1).copied().unwrap_or(Value::Object(None));
                 ctx.monitor_enter(this);
-                let (old_arr, size) = cowal_read_state(ctx, this);
-                if let Some(old) = old_arr {
-                    for i in 0..size {
-                        let cur = ctx.get_array_element(old, i);
-                        if cowal_element_matches(ctx, cur, elem) {
-                            ctx.monitor_exit(this);
-                            return Ok(Some(Value::Int(0)));
-                        }
-                    }
+                let (mut old_arr, size) = cowal_read_state(ctx, this);
+                if cowal_find_pinned(ctx, &mut this, &mut old_arr, &mut elem, size).is_some() {
+                    ctx.monitor_exit(this);
+                    return Ok(Some(Value::Int(0)));
                 }
-                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
+                let new_arr =
+                    cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
                 if let Some(old) = old_arr {
                     for i in 0..size {
                         ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1837,7 +1905,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             },
         );
         registry.register(cowal, "add", "(ILjava/lang/Object;)V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -1845,9 +1913,9 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i,
                 _ => return Ok(None),
             };
-            let elem = args.get(2).copied().unwrap_or(Value::Object(None));
+            let mut elem = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
             // `add(int, E)` uses `rangeCheckForAdd`, so `index == size` is
             // legal and the exception is the PLAIN `IndexOutOfBoundsException`
             // (measured on HotSpot 25), unlike the absolute accessors above.
@@ -1862,7 +1930,8 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 .into());
             }
             let idx = raw_idx as usize;
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
+            let new_arr =
+                cowal_pinned_new_array(ctx, size + 1, &mut this, &mut old_arr, &mut elem);
             if let Some(old) = old_arr {
                 for i in 0..idx.min(size) {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1879,7 +1948,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             Ok(None)
         });
         registry.register(cowal, "remove", "(I)Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -1888,7 +1957,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
             // See the `get` registration above.
             if raw_idx < 0 || raw_idx as usize >= size {
                 ctx.monitor_exit(this);
@@ -1901,7 +1970,9 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 );
             }
             let idx = raw_idx as usize;
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
+            let mut no_elem = Value::Object(None);
+            let new_arr =
+                cowal_pinned_new_array(ctx, size - 1, &mut this, &mut old_arr, &mut no_elem);
             let mut removed = Value::Object(None);
             if let Some(old) = old_arr {
                 for i in 0..idx {
@@ -1918,25 +1989,17 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         });
         // remove(Object)Z — remove first occurrence by value.
         registry.register(cowal, "remove", "(Ljava/lang/Object;)Z", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+            let mut needle = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (old_arr, size) = cowal_read_state(ctx, this);
-            let mut found_idx: Option<usize> = None;
-            if let Some(old) = old_arr {
-                for i in 0..size {
-                    let elem = ctx.get_array_element(old, i);
-                    if cowal_element_matches(ctx, elem, needle) {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-            }
+            let (mut old_arr, size) = cowal_read_state(ctx, this);
+            let found_idx = cowal_find_pinned(ctx, &mut this, &mut old_arr, &mut needle, size);
             if let Some(idx) = found_idx {
-                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
+                let new_arr =
+                    cowal_pinned_new_array(ctx, size - 1, &mut this, &mut old_arr, &mut needle);
                 if let Some(old) = old_arr {
                     for i in 0..idx {
                         ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -1954,12 +2017,14 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             }
         });
         registry.register(cowal, "clear", "()V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
             ctx.monitor_enter(this);
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let mut none_arr: Option<ObjectRef> = None;
+            let mut no_elem = Value::Object(None);
+            let new_arr = cowal_pinned_new_array(ctx, 0, &mut this, &mut none_arr, &mut no_elem);
             cowal_write_array(ctx, this, new_arr);
             ctx.monitor_exit(this);
             Ok(None)
@@ -2680,7 +2745,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             Ok(None)
         });
         registry.register(abq, "put", "(Ljava/lang/Object;)V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -2711,7 +2776,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     ctx.monitor_exit(this);
                     return Ok(None);
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                monitor_wait_release(ctx, &mut this, Some(10))?;
             }
         });
         registry.register(abq, "offer", "(Ljava/lang/Object;)Z", |ctx, args| {
@@ -2783,7 +2848,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             Ok(Some(Value::Int(1)))
         });
         registry.register(abq, "take", "()Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -2799,7 +2864,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                monitor_wait_release(ctx, &mut this, Some(10))?;
             }
         });
         registry.register(abq, "poll", "()Ljava/lang/Object;", |ctx, args| {
@@ -2825,7 +2890,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             "poll",
             "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
@@ -2859,7 +2924,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                         return Ok(Some(Value::Object(None))); // timed out
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    monitor_wait_release(ctx, this, Some(wait_ms))?;
+                    monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
                 }
             },
         );
@@ -3446,7 +3511,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
         });
         // transfer(E) — blocking: adds element and waits until it is consumed
         registry.register(ltq, "transfer", "(Ljava/lang/Object;)V", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
@@ -3469,7 +3534,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     return Ok(None);
                 }
                 ctx.monitor_enter(this);
-                monitor_wait_release(ctx, this, Some(5))?;
+                monitor_wait_release(ctx, &mut this, Some(5))?;
             }
         });
         // tryTransfer(E) — non-blocking: add if there's a waiting consumer
@@ -3530,7 +3595,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
             "poll",
             "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
             |ctx, args| {
-                let this = match args.first() {
+                let mut this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
                 };
@@ -3563,13 +3628,13 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                         return Ok(Some(Value::Object(None)));
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    monitor_wait_release(ctx, this, Some(wait_ms))?;
+                    monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
                 }
             },
         );
         // take() — blocking
         registry.register(ltq, "take", "()Ljava/lang/Object;", |ctx, args| {
-            let this = match args.first() {
+            let mut this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -3585,7 +3650,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                monitor_wait_release(ctx, this, Some(10))?;
+                monitor_wait_release(ctx, &mut this, Some(10))?;
             }
         });
         // peek() — non-blocking
@@ -3765,7 +3830,7 @@ pub(crate) fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let key = rl_key(ctx, this);
     let this_pin = ctx.pin_native_root(this);
     loop {
-        let this = ctx.read_native_pin(this_pin, this);
+        let mut this = ctx.read_native_pin(this_pin, this);
         // Atomically claim (or reentrantly re-claim) the lock under the
         // side-table mutex. `claimed` is true iff this call now holds it.
         let claimed = rl_with(key, |st| {
@@ -3799,7 +3864,7 @@ pub(crate) fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             // absorb that here, restore the flag via `thread_interrupt` on
             // our own thread object, and keep retrying instead of
             // propagating the exception out of a method that must not throw.
-            if let Err(e) = monitor_wait_release(ctx, this, Some(5)) {
+            if let Err(e) = monitor_wait_release(ctx, &mut this, Some(5)) {
                 if is_interrupted_exception(&e) {
                     let self_thread = ctx.current_thread_object();
                     ctx.thread_interrupt(self_thread);
@@ -3897,7 +3962,7 @@ pub(crate) fn native_rl_try_lock_timeout(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     let this_pin = ctx.pin_native_root(this);
     loop {
-        let this = ctx.read_native_pin(this_pin, this);
+        let mut this = ctx.read_native_pin(this_pin, this);
         let claimed = rl_with(key, |st| {
             if st.owner == RL_UNOWNED || st.owner == tid {
                 st.owner = tid;
@@ -3916,7 +3981,7 @@ pub(crate) fn native_rl_try_lock_timeout(
         }
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        monitor_wait_release(ctx, this, Some(wait_ms))?;
+        monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -5483,7 +5548,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let this_pin = ctx.pin_native_root(this);
     loop {
-        let this = ctx.read_native_pin(this_pin, this);
+        let mut this = ctx.read_native_pin(this_pin, this);
         let done = match ctx.get_field(this, FUT_FIELD_DONE) {
             Value::Int(d) => d,
             _ => 0,
@@ -5500,7 +5565,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        monitor_wait_release(ctx, this, Some(wait_ms))?;
+        monitor_wait_release(ctx, &mut this, Some(wait_ms))?;
     }
 }
 
@@ -7804,8 +7869,29 @@ where
         });
     }
     let out = body(ctx, this, &fixed);
-    ctx.unpin_native_roots(base);
+    // `body` RE-ENTERS JAVA (`invoke_virtual` into `HashMap.get`,
+    // `ArrayList.set`, ...), so a collection can run inside it and move the
+    // mutex just as the contended entry above can. The refresh after
+    // `monitor_enter_gc_safe` covers only the wait; the exit needs its own,
+    // and it has to happen BEFORE `unpin_native_roots(base)` truncates the
+    // stack that owns `mutex_h`.
+    //
+    // Without it `monitor_exit` dereferenced the PRE-BODY address:
+    // `MonitorTable::exit` opens with `header_of(obj_ref)`, so a mutex whose
+    // young slot the collection had reclaimed faulted there —
+    // `EXCEPTION_ACCESS_VIOLATION` inside `native_sync_map_get` /
+    // `sync_collection_delegate`, reproduced in seconds by
+    // `probes/OldToYoungBarrierSweep.java` under
+    // `--XX:UseGc Generational` with and without the JIT, and absent under
+    // ZGC only because its wrapper objects had not been relocated yet.
+    // The quiet face is worse than the loud one: a mutex that merely MOVED
+    // exits a monitor at its old address, so the real one is never released
+    // and every later waiter on that wrapper blocks forever.
+    let mutex = ctx.read_native_pin(mutex_h, mutex);
     ctx.monitor_exit(mutex);
+    // Unpin LAST: `monitor_exit` is the final use of a pinned reference, and
+    // the previous order released the pins while one was still live.
+    ctx.unpin_native_roots(base);
     out
 }
 
@@ -10801,7 +10887,7 @@ fn native_rwl_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let Some((owner, is_write)) = rwl_view_target(ctx, view) else {
+    let Some((mut owner, is_write)) = rwl_view_target(ctx, view) else {
         return Ok(None);
     };
     let tid = ctx.thread_id() as i64;
@@ -10822,7 +10908,7 @@ fn native_rwl_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         };
         if still_blocked {
-            if let Err(e) = monitor_wait_release(ctx, owner, Some(5)) {
+            if let Err(e) = monitor_wait_release(ctx, &mut owner, Some(5)) {
                 if is_interrupted_exception(&e) {
                     let self_thread = ctx.current_thread_object();
                     ctx.thread_interrupt(self_thread);

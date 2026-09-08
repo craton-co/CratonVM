@@ -75,3 +75,36 @@ references finds one, deterministically, and nobody has yet named the producer.
   probe can print and attribute.
 * The `[storechk]` canary names the STORED VALUE. Its sibling in
   `set_array_element` is the one to watch if the bisection moves the fault.
+
+## Addendum 2026-09-08: it does NOT reproduce on Windows, on either binary
+
+Run on a Windows 11 box while
+`natives-hold-a-stale-reference-across-a-park-FIXED-20260908.md` was being
+verified, because the `growth` section is exactly the surface that page's fixes
+touch (`CopyOnWriteArrayList.addIfAbsent`/`contains`/`addAll` and
+`LinkedBlockingQueue.offer`, all of which held a reference across an allocation
+or a park before it).
+
+The command is this page's own, verbatim, `growth` alone:
+
+| binary | runs | rc=139 | `[storechk]` lines |
+|---|---:|---:|---:|
+| `origin/dev` tip of 2026-09-07 20:29, **pre-fix** | 3 | **0** | 0 |
+| the same tree **with the nine park/allocation fixes** | 3 | **0** | 0 |
+
+Both print the same 18 rows and every one is `OK`; `diff` of the two outputs is
+empty. So on this platform the harness does not produce the stale store at all,
+and the fixes neither caused nor cured it — **this page is not retired, and its
+reproducer is now known to be platform-dependent**, which its "3 of 3 runs, and
+the minor-GC cycle number is 460 every time" reads as it not being.
+
+The useful consequence for whoever picks this up: the bisection in "Next"
+should run on the platform the original measurement came from, and the first
+thing worth checking is whether `cycle=460` survives a different allocator
+page-size / arena geometry at all. A fixed point in the allocation sequence is
+a property of the sequence, and the sequence is not the same on both hosts.
+
+What the two runs above DO establish, and it is worth keeping: the `growth`
+section's answers are byte-identical before and after nine natives in that exact
+call path were rewritten to re-read their references. That is the regression
+check those rewrites needed.

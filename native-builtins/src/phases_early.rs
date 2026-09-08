@@ -8032,6 +8032,11 @@ fn exchanger_do_exchange(
             // A previous exchange is still completing (the first thread has
             // not yet collected its reply) — wait for the reset, then retry.
             let wait_result = ctx.monitor_wait(this, Some(5));
+            // The wait PARKS, so the exit that pairs with it has to use the
+            // post-wait address: `MonitorTable::exit` dereferences the header,
+            // and a pre-wait address is a fault (reclaimed) or a permanently
+            // leaked monitor (merely moved).
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             wait_result?;
             continue;
@@ -8077,6 +8082,8 @@ fn exchanger_do_exchange(
                 }
             }
             let wait_result = ctx.monitor_wait(this, Some(5));
+            // Post-wait address, as in the state==2 branch above.
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.monitor_exit(this);
             wait_result?;
         }
@@ -8312,15 +8319,26 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
             // Not all parties arrived yet — record arrival and wait for phase to advance
             ph_set(ctx, this, PH_H_ARRIVALS, new_arrivals);
             let target_phase = phase + 1;
+            // `monitor_wait` PARKS, which is exactly where a peer thread's
+            // collection runs — and `this` is the holder array every `ph_get`
+            // and the `monitor_exit` below dereference. Pin it and re-read
+            // through the pin after each wait; without that the loop kept
+            // reading (and released the monitor at) the pre-wait address.
+            let this_pin = ctx.pin_native_root(this);
+            let mut cur = this;
             // Bounded monitor-waits until the phase advances
             loop {
-                if let Err(e) = ctx.monitor_wait(this, Some(10)) {
-                    ctx.monitor_exit(this);
+                let wr = ctx.monitor_wait(cur, Some(10));
+                cur = ctx.read_native_pin(this_pin, cur);
+                if let Err(e) = wr {
+                    ctx.monitor_exit(cur);
+                    ctx.unpin_native_roots(this_pin);
                     return Err(e);
                 }
-                let current_phase = ph_get(ctx, this, PH_H_PHASE);
+                let current_phase = ph_get(ctx, cur, PH_H_PHASE);
                 if current_phase >= target_phase || current_phase < 0 {
-                    ctx.monitor_exit(this);
+                    ctx.monitor_exit(cur);
+                    ctx.unpin_native_roots(this_pin);
                     return Ok(Some(Value::Int(current_phase)));
                 }
             }
