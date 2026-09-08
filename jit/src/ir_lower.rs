@@ -7469,6 +7469,84 @@ impl<'a> Lowerer<'a> {
             // is exactly why `ScalarOp::operands_are_long` exists separately
             // from `ScalarOp::result_type`. Sizing the compare from the result
             // type would compare the low halves of two longs.
+            // An unboxing accessor, inline. The shape is the single-pass
+            // backend's arm for the same two triples, node for node, and it has
+            // to be: both derive their offsets from `ir::unbox_offsets`, so if
+            // the sequences drifted apart one of them would be reading the
+            // wrong half of an object.
+            //
+            // NULL and the class guard DEOPT rather than throw. `Long` and
+            // `Integer` are final, but the guard is not therefore pointless:
+            // the receiver here is whatever the constant pool said, and a site
+            // that sees a different class must run the real dispatch. On the
+            // null path the interpreter re-runs the call and raises the NPE
+            // that `longValue()` on `null` raises today.
+            //
+            // The LAYOUT BRANCH is the reason this family was not lowered
+            // earlier: a compact instance keeps the payload at a registered
+            // body offset, a legacy one inside its 16-byte `Value` cell, and
+            // both exist at once because different allocators build different
+            // cells. There is no compile-time answer -- the header bit is read
+            // per object, every time.
+            Op::Unbox { op, class_id } => {
+                let uop = *op;
+                let class_id = *class_id;
+                let bci = node.bytecode_pc.unwrap_or(0);
+                let Some((compact_off, legacy_off)) = crate::ir::unbox_offsets(uop, class_id) else {
+                    // The planner already asked and got an answer; a refusal
+                    // here means the layout moved under us between planning and
+                    // lowering. Refuse the artifact rather than emit a load
+                    // from an offset nobody vouched for.
+                    self.latch_bailout(Bailout::new(BailoutReason::Internal(
+                        "ir_lower: unbox intrinsic layout no longer resolves",
+                    )));
+                    return;
+                };
+                let slot = self.alloc_slot(id);
+                self.gp_load_value(RAX, node.inputs[2]); // receiver
+
+                // null -> deopt
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+                self.emit_deopt_if_zero(bci, DeoptReason::NullCheck);
+
+                // exact receiver class guard: CMP DWORD [RAX+0], class_id
+                self.buf.emit(&[0x81, 0x78, 0x00]);
+                self.buf.emit(&class_id.to_le_bytes());
+                self.emit_deopt_unless(0x84, bci, DeoptReason::ReceiverTypeChanged); // JE continue
+
+                // TEST BYTE [RAX + GC_FLAGS_BYTE_OFFSET], GC_FLAG_COMPACT
+                self.buf.emit(&[0xF6, 0x80]);
+                self.buf
+                    .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
+                self.buf.emit(&[cratonvm_types::GC_FLAG_COMPACT]);
+                let to_legacy = self.emit_jcc_rel32(0x84); // JZ -> legacy
+
+                // compact: payload at the registered body offset
+                if matches!(uop, crate::ir::UnboxOp::LongValue) {
+                    self.buf.emit(&[0x48, 0x8B, 0x80]); // MOV RAX, [RAX+disp32]
+                } else {
+                    self.buf.emit(&[0x8B, 0x80]); // MOV EAX, [RAX+disp32]
+                }
+                self.buf.emit(&compact_off.to_le_bytes());
+                let done = self.emit_jmp_rel32();
+
+                // legacy: payload inside the 16-byte Value cell
+                self.patch_rel32_to_here(to_legacy);
+                if matches!(uop, crate::ir::UnboxOp::LongValue) {
+                    self.buf.emit(&[0x48, 0x8B, 0x80]);
+                } else {
+                    self.buf.emit(&[0x8B, 0x80]);
+                }
+                self.buf.emit(&legacy_off.to_le_bytes());
+
+                self.patch_rel32_to_here(done);
+                // Width convention (see `Op::ScalarIntrinsic` above): an `Int`
+                // slot holds its result in the low 32 bits with the upper half
+                // ZEROED, which `MOV EAX, [..]` already produces. No
+                // sign-extension here -- the single-pass arm's `MOVSXD` is for
+                // its own 64-bit slot convention, not this one.
+                self.store_rax(slot);
+            }
             Op::ScalarIntrinsic(sop) => {
                 let sop = *sop;
                 let slot = self.alloc_slot(id);
@@ -11063,6 +11141,7 @@ fn op_defines_result_slot(op: &Op) -> bool {
             | Op::Param(_)
             | Op::Phi
             | Op::ScalarIntrinsic(_)
+            | Op::Unbox { .. }
             | Op::Add
             | Op::Sub
             | Op::Mul
@@ -12707,7 +12786,16 @@ fn op_home_is_one_store_rax(op: &Op) -> bool {
 /// reference results need the deopt register image to be able to name a `Ref`,
 /// which is a GC contract change and not a lowering one.
 #[cfg(test)]
-const DELIBERATELY_NOT_DROPPABLE: [&str; 10] = [
+const DELIBERATELY_NOT_DROPPABLE: [&str; 11] = [
+    // `Unbox` ends in exactly one `store_rax`, so it LOOKS claimable, and it is
+    // rejected on purpose. Unlike every claimed op its arm is not straight-line:
+    // it deopts twice (null, then the receiver class guard) and branches on the
+    // per-object layout before reaching that store. Dropping the home would
+    // leave the value live only in RAX across those edges, and reasoning about
+    // what each deopt sees is precisely what this list exists to stop being done
+    // casually. Claimable later WITH a measurement; not worth a wrong answer to
+    // save one store.
+    "Unbox",
     "Cmp",
     "LCmp",
     "FCmp",
@@ -22274,6 +22362,7 @@ mod tests {").next().unwrap_or(src);
             | Op::LoadStatic { .. }
             | Op::LambdaIntToDouble
             | Op::InstanceOf { .. }
+            | Op::Unbox { .. }
             | Op::CheckCast { .. } => LoweredValue,
             // Effects with an arm but no result slot.
             Op::Store(_) | Op::MonitorEnter | Op::MonitorExit | Op::Guard { .. } => LoweredEffect,
@@ -22301,6 +22390,13 @@ mod tests {").next().unwrap_or(src);
             ("Param", Op::Param(0)),
             ("Phi", Op::Phi),
             ("ScalarIntrinsic", Op::ScalarIntrinsic(ScalarOp::MaxI)),
+            (
+                "Unbox",
+                Op::Unbox {
+                    op: crate::ir::UnboxOp::LongValue,
+                    class_id: 1,
+                },
+            ),
             ("Add", Op::Add),
             ("Sub", Op::Sub),
             ("Mul", Op::Mul),

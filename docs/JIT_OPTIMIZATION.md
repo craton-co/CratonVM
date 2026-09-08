@@ -4549,3 +4549,81 @@ reported floor VALUE (30.0%), which fails at 0.3% under that mutation.
 First real run, corroborating the Azure result on different hardware: the
 unresolved-class trap reads an effect of **-0.2% against a 7.5% floor** —
 UNMEASURABLE, agreeing with hibernate's z = +1.46.
+
+### The unboxing accessors, lowered — the first MEMORY family the IR tier has
+
+`Long.longValue()J` and `Integer.intValue()I` were the two largest single
+entries on the call-site-intrinsic refusal list (8 and 2-3 sites on H2). They
+are now lowered by the optimizing tier instead of refusing the method, and they
+are the first family it lowers that touches the HEAP rather than registers.
+
+```
+[ir] unbox-intrinsics UnboxIntrinsicProbe.sumLong([Ljava/lang/Long;)J:
+     1 site(s) lowered as a guarded field load
+```
+
+Both families are gone from the H2 refusal breakdown — `java/lang/Long.longValue`
+and `java/lang/Integer.intValue` no longer appear at all, against 8 and 2-3
+before — and 11 sites lower per run. `refused_method` reads 43-45, which is
+inside the 43-54 band one configuration produces, so **no delta is claimed
+there**: the disappearance of the two families from the per-family list is the
+engagement evidence, not the total.
+
+#### Why this one was left until last
+
+The arithmetic families are pure register work. These read a field, and the byte
+offset of that field is not a compile-time constant: a compact instance keeps
+the payload at a registered body offset, a legacy one inside its 16-byte `Value`
+cell, and BOTH shapes exist in one heap because different allocators build
+different cells. So the lowering is not a load — it is a null check, an exact
+receiver class guard, a per-object test of the header's compact bit, and then
+one of two loads.
+
+The node carries only the guard class id. Offsets are re-derived at lowering
+from `ir::unbox_offsets`, which is the same `AtomicLongFieldLayout` /
+`AtomicIntFieldLayout` the single-pass backend asks — because two backends
+disagreeing about where a field lives is not a wrong answer, it is a wild read.
+A test pins that agreement.
+
+#### What the codebase made me declare
+
+Adding one `ir::Op` variant failed to compile in FIVE places, every one of them
+a deliberate forcing function, and each wanted a different decision:
+
+| where | what it forced |
+|---|---|
+| `ir_verify::expected_arity` | the node's input shape (`[ctrl, mem, obj]`) |
+| `declared_lowering` | that it produces a value, not an effect |
+| `op_representatives` | a concrete instance for the coverage tests to drive |
+| `op_defines_result_slot` | that it allocates a result slot |
+| `regalloc::ir_op_defines_value` | the same, for the LIVENESS model — without it every method containing the node silently loses register residency |
+
+And a sixth asked for a judgement rather than a fact: the arm ends in exactly
+one `store_rax`, so `every_eligible_op_is_claimed_or_explicitly_rejected`
+demanded it be claimed for the home-drop optimization or explicitly rejected
+with a reason. It is **rejected**: unlike every claimed op its arm is not
+straight-line — two deopts and a layout branch precede that store — and
+reasoning about what each deopt edge sees is exactly what that list exists to
+stop being done casually. Claimable later with a measurement; not worth a wrong
+answer to save one store.
+
+#### Verification
+
+`probes/UnboxIntrinsicProbe.java` mixes boxes from BOTH allocation paths on
+purpose — values inside the `Integer`/`Long` cache come from a preallocated
+table, values outside it are freshly allocated — so a compact/legacy branch that
+was wrong for either shape returns garbage for one group. Every answer is
+checked against a value computed without the accessor, so it cannot pass by
+agreeing with itself, and a null receiver must still raise NPE rather than read
+offset 0 of nothing.
+
+It agrees with HotSpot exactly (`SUMS -4 -3`) under
+`CRATONVM_COMPACT_REF_FIELDS=1` **and** `=0`, which exercises both offset
+derivations. The kill switch was checked in the direction that matters: with
+`CRATONVM_JIT_IR_SCALAR_INTRINSICS=0` the two families reappear in the refusal
+log (86 lines); on, zero. Suite 92/92, 2,285 jit tests green.
+
+**Not claimed: any throughput number.** `h2-ab` says an effect this size is
+inside this host's noise floor, and today's two withdrawn results are the reason
+that is left as a measurement someone takes on a quiet host rather than a figure
+asserted here.
