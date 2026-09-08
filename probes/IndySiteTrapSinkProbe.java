@@ -56,7 +56,13 @@
 //      counter -- is the one the front end cannot lower. Hence the array store
 //      below, which is `opcode_commits_side_effect` just the same.
 //
-//   4. **Still open.** With all of the above, the build reaches the
+//   4. **CLEARED 2026-09-07, and the reading below is wrong** -- see the
+//      note after this list. The completed witness lives in
+//      `vm/tests/jit_site_trap_never_duplicates_a_side_effect.rs`, which
+//      embeds its own copy of the repaired probe so CI runs it; this file
+//      stays for walls 1-3 and for the record of how wall 4 was misread.
+//
+//      What this file concluded at the time: With all of the above, the build reaches the
 //      `invokedynamic` arm and bails there:
 //      `[ir] IrBuilder::build refused at ir.rs:7586`, the
 //      `indy_trap_sites.get(&pc)` miss. The trap is planted only when the
@@ -67,6 +73,23 @@
 //      (H2 reported `invokedynamic=21` planted, 1 taken), so the next step is
 //      to find which door passes the resolver and enter through that one --
 //      not to change this Java.
+//
+// ## Wall 4 was not the door, it was the invoke plan (2026-09-07)
+//
+// "The door this path takes supplies none" is the wrong diagnosis, and the
+// right one is one line away. `indy_trap_sites` is populated inside
+// `if call_eligible { ... }` inside `if let Some(resolver) = cp_invoke_resolver`
+// -- the INVOKE-PLANNING block in `jit/src/lib.rs`. A method whose only call is
+// the `invokedynamic` itself is never invoke-planned, so the map stays empty
+// and the 0xba arm bails on the `indy_trap_sites.get(&pc)` miss whichever door
+// compiled it. The resolver was never asked; the "declined" message a few lines
+// further down never printed, which is the tell.
+//
+// So `hot` needs ONE ordinary invoke before the concat. Give it an
+// `invokestatic` -- which is also `opcode_commits_side_effect` in its own
+// right -- and `[ir] site TRAP planted at bytecode pc 17` appears. With the
+// trap planted the hazard reproduces immediately: 200241 side effects for
+// 200000 calls, `CRATONVM_DBG_DEOPT=1` naming `jit-callsite-a` 241 times.
 //
 // Correctness, not throughput: `SINK[0]` must equal ITERS exactly. A
 // whole-method replay would count some iterations twice, which is the
