@@ -312,6 +312,42 @@ false)` path — Hibernate's `getResultStream()`, Spring's iteration shims,
 
 ## 5. What was deliberately left, and why
 
+> **§5.1 MEASURED against HotSpot for the first time, 2026-09-08 — and the
+> residual turns out to have a working reference implementation in the same
+> binary.**
+>
+> §5.1's *Cost* line was a prediction. `apps/probes/StreamReuseProbe.java` run
+> through the three-arm harness (HotSpot control, `--real-jdk`, `--jdk-only`)
+> on Windows / JDK 25 makes it a measurement. **26 rows** diverge, in exactly
+> the predicted shape — a consumed stream answers a second terminal operation
+> instead of throwing:
+>
+> ```text
+>   61 IntStream.range count second   HotSpot: THREW IllegalStateException   CratonVM: 3
+>   65 mapToInt count second          HotSpot: THREW IllegalStateException   CratonVM: 3
+>   73 LongStream.range count second  HotSpot: THREW IllegalStateException   CratonVM: 3
+>   96 singleton set  98 emptySet  106 ArrayDeque  108 array stream
+>  110 parallelStream                                   ... 26 rows in total
+> ```
+>
+> **The new fact is the third arm: `--jdk-only` is BYTE-IDENTICAL to HotSpot on
+> all 26.** This record claims strict-mode immunity for residual §5.2 — the
+> deferred intermediate op, where `cratonvm/stream/LazyOp` is a stub strict
+> refuses — and says nothing either way about §5.1. Measured, strict is clean
+> here too.
+>
+> That changes what a taker has to hand. The oracle for this residual need not
+> be HotSpot on another host: **the same binary, the same probe, `--jdk-only`,
+> is a 0-diff reference for all 26 rows.** A `--real-jdk` vs `--jdk-only` diff
+> on `StreamReuseProbe` is therefore a one-command regression check for the
+> conversion §5.1.1(b) describes, and it needs no second VM.
+>
+> **Not taken here, for this record's own stated reason.** §5.6.1 says *"do not
+> take it from a lane that cannot run those arms"*, and the arms are the
+> constraint rather than the edit: `apps/spring-boot`, `apps/tomcat` and
+> `apps/h2database` are **absent on this host** (they live on azure-host-2).
+> The 25-site pin audit in §5.1.1(b) stands exactly as written.
+
 Each of these is a residual divergence taken knowingly, in preference to a
 guess that could fire spuriously.
 
