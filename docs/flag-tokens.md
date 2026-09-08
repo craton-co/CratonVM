@@ -602,7 +602,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-394 tokens.
+395 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -709,6 +709,7 @@ export inherited from a parent shell.
 | `precise-getstatic-checkcast` | `CRATONVM_JIT_NO_PRECISE_GETSTATIC_CHECKCAST` |
 | `precise-alloc-athrow` | `CRATONVM_JIT_NO_PRECISE_ALLOC_ATHROW` |
 | `precise-indy` | `CRATONVM_JIT_NO_PRECISE_INDY` |
+| `precise-array-access` | `CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS` |
 | `ir-linear-scan` | `CRATONVM_JIT_IR_LINEAR_SCAN` |
 | `ir-inline-tlab` | `CRATONVM_JIT_IR_INLINE_TLAB` |
 | `tls-thread-fetch` | `CRATONVM_JIT_TLS_THREAD_FETCH` |

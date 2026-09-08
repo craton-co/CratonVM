@@ -1295,6 +1295,11 @@ pub const INVENTORY: &[E] = &[
     // `MVMap.flushAppendBuffer` -- 15.2% of CPU on a contended H2 workload --
     // permanently interpreted.
     E { group: Group::JIT, token: "precise-indy", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_INDY"), off_word: None, since: "2026-09-06" },
+    // Array loads and PRIMITIVE array stores. A real lowering change, not
+    // bookkeeping: the AIOOBE pad and the array null-check stub both published
+    // nothing, and now route to deopt-stub reasons 11 and 10. `aastore` is
+    // excluded -- its ZGC-barrier fallback arm still does not publish.
+    E { group: Group::JIT, token: "precise-array-access", on_key: None, off_key: Some("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS"), off_word: None, since: "2026-09-06" },
     // Opt-in. The GP register file landed beside the FP one on 2026-09-02, but
     // the flip still wants a wall-clock measurement -- see
     // `ir_lower::linear_scan_enabled`. `since` stays 2026-08-01: the flag is the

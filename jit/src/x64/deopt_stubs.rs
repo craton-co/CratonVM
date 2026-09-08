@@ -2082,7 +2082,7 @@ impl Compiler {
                     // `emit_post_invoke_exception_check`) and lives in its own
                     // map, because it is consumed by the interpreter's exception
                     // route rather than by any resume sink.
-                    9 | 10 => self.exc_frame_box_ptr_by_bci.get(&site_pc).copied(),
+                    9 | 10 | 11 => self.exc_frame_box_ptr_by_bci.get(&site_pc).copied(),
                     _ => None,
                 }
             } else {
@@ -2146,6 +2146,47 @@ impl Compiler {
                     // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_movq_mem_rbp_from_xmm(base - 128 - (n as i32) * 8, n);
                 }
+                if reason == 11 {
+                    // PRECISE AIOOBE. The trapping instant had RAX = array and
+                    // RCX = index (see `emit_bounds_check`), and both were just
+                    // spilled, so read them BACK from the saved region rather
+                    // than trusting live registers: the arg setup below clobbers
+                    // exactly those two, and reason 10's `MOV ECX, imm32` is the
+                    // precedent for how easily that goes wrong.
+                    //
+                    // `gpr[r] -> [rbp - (base - r*8)]`, so RAX is gpr[0] and RCX
+                    // is gpr[1]; see the spill loop above.
+                    self.emit_load_local(RAX, base); // array
+                    self.emit_load_local(RCX, base - 8); // index
+                    // Length is not live here either -- `emit_bounds_check`
+                    // folded its load into the compare -- so re-load it from the
+                    // header. RAX was just restored and the fast path
+                    // dereferenced this same word, so it cannot fault.
+                    const LEN_DISP: u8 =
+                        crate::x64::disp::disp8_const(cratonvm_types::ARRAY_LENGTH_OFFSET as i64)
+                            as u8;
+                    self.buf.emit(&[0x44, 0x8B, 0x50, LEN_DISP]); // MOV R10D, [RAX+len]
+                    // jit_throw_aioobe(index, length, array_ptr, bytecode_pc) --
+                    // the same signature and order the shared pad uses.
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.buf.emit(&[0x49, 0x89, 0xC0]); // MOV R8, RAX
+                        self.buf.emit(&[0x4C, 0x89, 0xD2]); // MOV RDX, R10
+                        self.emit_mov_imm32_sx(R9, site_pc as i32);
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        self.rex_w();
+                        self.buf.emit_byte(0x8B);
+                        self.modrm_reg(RDX, RAX); // MOV RDX, RAX
+                        self.rex_w();
+                        self.buf.emit_byte(0x8B);
+                        self.modrm_reg(RDI, RCX); // MOV RDI, RCX
+                        self.buf.emit(&[0x4C, 0x89, 0xD6]); // MOV RSI, R10
+                        self.emit_mov_imm32_sx(RCX, site_pc as i32);
+                    }
+                    self.emit_call_absolute(self.helpers.throw_aioobe);
+                }
                 if reason == 10 {
                     // A locally-detected putfield null has no helper return
                     // value to carry its exception. Publish it after saving
@@ -2155,7 +2196,16 @@ impl Compiler {
                     self.buf.emit_byte(0xB9); // MOV ECX, imm32
                     #[cfg(not(target_os = "windows"))]
                     self.buf.emit_byte(0xBF); // MOV EDI, imm32
-                    self.buf.emit(&(npe_action::NONE as u32).to_le_bytes());
+                    // The action travels with the bci for an ARRAY access; a
+                    // `putfield` records none and keeps `NONE`, which is what
+                    // this constant used to be for every site. See
+                    // `precise_npe_action_by_bci`.
+                    let action = self
+                        .precise_npe_action_by_bci
+                        .get(&site_pc)
+                        .copied()
+                        .unwrap_or(npe_action::NONE);
+                    self.buf.emit(&(action as u32).to_le_bytes());
                     self.emit_call_absolute(self.helpers.jit_npe_with_action);
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
@@ -2272,7 +2322,7 @@ mod spill_region_contract {
     fn covered_by(reason: i64) -> Option<&'static str> {
         match reason {
             8 => Some("has_indy_sites"),
-            9 | 10 => Some("precise_exception_frames"),
+            9 | 10 | 11 => Some("precise_exception_frames"),
             _ => None,
         }
     }
