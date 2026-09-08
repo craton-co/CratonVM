@@ -21753,6 +21753,11 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
     if op == 0xba {
         return precise_indy_enabled();
     }
+    // Array LOADS and PRIMITIVE array stores. `aastore` (0x53) is deliberately
+    // NOT here -- see `precise_array_access_enabled`.
+    if matches!(op, 0x2e..=0x35 | 0x4f..=0x52 | 0x54..=0x56) {
+        return precise_array_access_enabled();
+    }
     matches!(op, 0xb7 | 0xb8 | 0xc2 | 0xc3)
 }
 
@@ -21787,6 +21792,50 @@ fn precise_frame_publishing_opcode(op: u8) -> bool {
 /// This is the case `first_unsupported_precise_frame_site`'s doc anticipated
 /// when it said the pc/opcode is what makes a refusal actionable: the reason
 /// alone named a policy, and the opcode named the lowering.
+/// Whether a protected array LOAD (0x2e..=0x35) or PRIMITIVE array STORE
+/// (0x4f..=0x52, 0x54..=0x56) may be treated as publishing a precise
+/// exceptional frame.
+///
+/// **This one IS a lowering change**, unlike `precise_indy_enabled`. Both of
+/// these opcodes' throwing edges published nothing before:
+///
+/// * the AIOOBE pad returned the sentinel through the epilogue, so the handler
+///   was entered from the INTERPRETER's frame. `emit_bounds_check` now routes a
+///   protected site to deopt-stub reason 11, which publishes the exception via
+///   `jit_throw_aioobe` and then materialises the frame -- the shape reason 10
+///   uses for a locally-detected NPE.
+/// * the array null check went to the shared stub. `emit_null_check_array_
+///   store_at` now routes a protected site to reason 10, carrying its JEP-358
+///   action per bci (`precise_npe_action_by_bci`) so an array NPE inside a try
+///   block keeps the message naming which access was null.
+///
+/// # Why `aastore` (0x53) is excluded even though it motivated the work
+///
+/// It has a THIRD edge the others do not: the JVMS covariance check. The inline
+/// arm publishes it correctly (`jit_aastore_type_check` +
+/// `emit_post_invoke_exception_check`), but the ZGC-barrier fallback arm calls
+/// the void `jit_aastore` helper and, in that call site's own words, takes
+/// "deliberately NO `emit_post_invoke_exception_check`" -- its exceptions travel
+/// the pending-signal channel for the interpreter to drain.
+///
+/// RBC.6 decides before codegen and cannot know which arm the emitter will pick,
+/// so admitting `aastore` would be admitting the unpublished arm too. That the
+/// arm is unreachable today (nothing arms the barrier;
+/// `AASTORE_ZGC_GATE_FALLBACKS` is expected to be zero for the life of every
+/// shipping process) is exactly the kind of "provably unreachable" argument that
+/// stops being true quietly. Admitting it needs that arm to publish first.
+///
+/// So this change does NOT free `MVMap.flushAppendBuffer`, which is refused at
+/// `0x53`. It frees every method refused for an array LOAD or a primitive store,
+/// which is the larger population and shares all of the work.
+fn precise_array_access_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_PRECISE_ARRAY_ACCESS").is_none()
+    })
+}
+
 fn precise_indy_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -38627,21 +38676,29 @@ mod tests {
 
         // One un-admitted throwing opcode anywhere in the same protected
         // range is still enough to withhold coverage for the whole method —
-        // this list is a conjunction, not a majority vote. `aaload` (0x32) is
-        // the witness: its inline bounds/null check bails to the shared
-        // sentinel stub, which records no frame.
-        let mut with_aaload = code.clone();
-        with_aaload.splice(1..1, [0x32]);
-        let aaload_table = vec![ExceptionTableEntry {
+        // this list is a conjunction, not a majority vote.
+        //
+        // The witness was `aaload` (0x32), "its inline bounds/null check bails
+        // to the shared sentinel stub, which records no frame". That stopped
+        // being true when the bounds check and the array null check grew
+        // publishing exits (deopt-stub reasons 11 and 10) and array loads were
+        // admitted, so the witness moved to `aastore` (0x53) — which is
+        // deliberately still un-admitted for a reason of its own: its
+        // ZGC-barrier fallback arm calls the void `jit_aastore` helper and takes
+        // "deliberately NO `emit_post_invoke_exception_check`". See
+        // `precise_array_access_enabled`.
+        let mut with_aastore = code.clone();
+        with_aastore.splice(1..1, [0x53]);
+        let aastore_table = vec![ExceptionTableEntry {
             start_pc: 0,
             end_pc: 14,
             handler_pc: 14,
             catch_type: 0,
         }];
         assert!(!precise_exception_frame_sites_supported(
-            &with_aaload,
-            with_aaload.len(),
-            &aaload_table,
+            &with_aastore,
+            with_aastore.len(),
+            &aastore_table,
         ));
     }
 
