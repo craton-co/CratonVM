@@ -3358,7 +3358,15 @@ fn native_process_wait_for_timeout(
         else {
             return Ok(Some(Value::Int(0)));
         };
+        // `end_blocking_region_refs` refreshes `this` across the SLEEP, and
+        // nothing refreshes it across `foreign_exit_value` -- which is the
+        // comment below's own reason for keeping that call outside the blocked
+        // region: it runs arbitrary application bytecode. That bytecode can
+        // collect, and the NEXT turn then hands the pre-GC address to
+        // `begin_blocking_region`. Pin for the poll and re-read at the top.
+        let this_pin = ctx.pin_native_root(this);
         loop {
+            this = ctx.read_native_pin(this_pin, this);
             let now = Instant::now();
             if now >= deadline {
                 return Ok(Some(Value::Int(0)));
