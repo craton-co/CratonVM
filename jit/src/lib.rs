@@ -6818,6 +6818,9 @@ fn append_ir_inline_site(
             max_locals: site.callee_max_locals,
             arg_local_slots: arg_local_slots.iter().map(|&s| s as u32).collect(),
             returns_value: ret != b'V',
+            // The receiver the deleted invoke used to null-check. See
+            // `ir::IrInlineSite::receiver_is_arg0`.
+            receiver_is_arg0: !site.callee_is_static,
         },
     );
     for &(cpc, field_index, type_tag) in &site.field_info {

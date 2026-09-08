@@ -319,7 +319,46 @@ echo "self-test: an undeclared degraded fixture refuses; a declared one does not
 # counters under a JIT-hot workload, and its transcript is a throughput
 # artefact, not a value to diff. scripts/jdk-only-measure-refusals-and-overlays.sh
 # is where it belongs.
-PROBE_LIST="${PROBE_LIST:-JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe}"
+# The default list is three probes. `apps/probes/` holds 107 files, and until
+# 2026-09-08 nothing scheduled the other 104 -- not because they are worthless
+# but because there was no way to add one to a SINGLE platform.
+#
+# The ratchet is a set difference against a baseline keyed <feature>-<os>.
+# Appending a probe HERE puts its divergent sections into `observed` on every
+# leg at once, including legs whose baseline was frozen without them, where
+# every such section reads as NEW and the gate fails. So promoting a probe
+# measured on one platform used to require measuring it on all of them first,
+# and the corpus stayed frozen at three.
+#
+# The promoted set is therefore keyed exactly like the baseline it is scored
+# against. Each non-comment line of
+#     scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.probes
+# names one probe to run on THAT key only; a key with no such file runs the
+# three below and nothing else, unchanged. Promote a probe by measuring it on
+# a key and adding it to that key's file -- never by editing this list.
+#
+# An explicit PROBE_LIST= in the environment still wins outright, so the
+# single-probe invocations used for triage are unaffected by either.
+PROBE_LIST_DEFAULT="JdkOnlyCensusLoadProbe JdkOnlyBreadthProbe JdkOnlyPlatformProbe"
+PROMOTED="$ROOT/scripts/baselines/jdk-only-strict-corpus-$FEATURE-$OSKEY.probes"
+if [ -n "${PROBE_LIST+set}" ]; then
+  echo "probe list:   PROBE_LIST= from the environment (promoted file not read)"
+else
+  PROBE_LIST="$PROBE_LIST_DEFAULT"
+  if [ -f "$PROMOTED" ]; then
+    # `sort -u` so a duplicated line, or one that repeats a default probe,
+    # cannot schedule the same probe twice: the harness writes its logs to
+    # $OUT/logs/<probe>.* and a second pass would overwrite the first, leaving
+    # a transcript whose name no longer says which run produced it.
+    extra="$(grep -vE '^[[:space:]]*(#|$)' "$PROMOTED" | tr -d '\r' | tr -s '[:space:]' '\n' \
+             | grep -vxF -e JdkOnlyCensusLoadProbe -e JdkOnlyBreadthProbe -e JdkOnlyPlatformProbe \
+             | grep -v '^$' | sort -u | tr '\n' ' ')"
+    PROBE_LIST="$PROBE_LIST $extra"
+    echo "promoted:     $(printf '%s' "$extra" | wc -w) probe(s) from $(basename "$PROMOTED")"
+  else
+    echo "promoted:     none -- no $(basename "$PROMOTED")"
+  fi
+fi
 
 SRCS=""
 for p in $PROBE_LIST; do

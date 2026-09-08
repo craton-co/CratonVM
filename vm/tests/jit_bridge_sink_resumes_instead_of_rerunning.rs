@@ -241,10 +241,12 @@ fn body() {
     // It is kept as a belt — a non-zero here would still be a real failure —
     // and the earned version lives in `jit_lambda_door_deopt_resumes.rs`, which
     // drives a real SAM and asserts ENGAGEMENT (`resumed > 0`) beside the zero.
-    // That file is `#[ignore]`d because it reproduces an open defect: a lambda
-    // callee's deopt is orphaned by an identity check comparing the SAM's name,
-    // and its side effect runs twice
-    // (`lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908`).
+    // That file was `#[ignore]`d while it reproduced an open defect — a lambda
+    // callee's deopt orphaned by an identity check comparing the SAM's name,
+    // its side effect running twice
+    // (`lambda-callee-deopt-is-orphaned-by-the-sam-name-check-FIXED-20260908`).
+    // Fixed and un-ignored 2026-09-08, so the earned version is now a running
+    // gate rather than a promise.
     let (_resumed, unresumable) = cratonvm_vm::runtime::interpreter::lambda_site_deopt_outcomes();
     assert_eq!(
         unresumable, 0,

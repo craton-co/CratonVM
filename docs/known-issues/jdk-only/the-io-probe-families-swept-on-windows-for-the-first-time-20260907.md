@@ -143,6 +143,25 @@ HotSpot in both modes**, and `L4FileSweep` joins them after §3. That is four
 probe families, several thousand rows, with no divergence at all on a platform
 where none of them had ever been run in three arms.
 
+> **SUPERSEDED 2026-09-08 — the limit below was real and is now gone.** The
+> paragraph is kept verbatim because the *reason* it gives is the design
+> constraint that got fixed: the probe list was shared by every matrix leg, so
+> a probe measured on one platform could only be promoted by measuring it on
+> all of them. `scripts/jdk-only-strict-probes.sh` now reads a
+> `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.probes` file keyed
+> exactly like the baseline it is scored against, so a promotion is per-key and
+> a leg with no such file runs the same three probes it always did. **Three of
+> the four families named above are in the `25-windows` file as of today**, with
+> 60 more from the separate 107-probe sweep and `L4FileSweep` -- 64 in all. (Two
+> further sweep probes passed the same bar and were dropped on cost alone: they
+> spent 1000s of a 1784s run checking eight rows between them.)
+> `L4FilesSweep`, which §3 unblocked by guarding `Paths.get("//")`, is NOT among
+> them: re-running it a second time found it diverging in BOTH modes over ten
+> sections, which is how it got its own record rather than a gate row.
+> **The Linux half of the sentence still stands**: nothing here promotes them
+> on `25-linux`, and the next lane with a Linux box still has to measure them
+> there before adding that key's file.
+
 **They are NOT added to the gate's `PROBE_LIST` here, and the reason is a
 limit rather than a preference.** The default list is shared by every matrix
 leg; the gate is a ratchet keyed `<feature>-<os>`; and a probe that diverges on

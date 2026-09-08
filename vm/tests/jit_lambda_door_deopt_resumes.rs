@@ -177,20 +177,20 @@ fn wait_until_optimizing_compiled(vm: &mut Vm) {
     );
 }
 
-/// **IGNORED BECAUSE IT FAILS, AND THAT IS THE POINT.**
+/// The regression test for
+/// `lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908`, which was
+/// `#[ignore]`d while that defect was open: 12 runs, 12 times `delta=2` for the
+/// lambda arm against `delta_static=1` for the identical non-lambda control in
+/// the same process. `try_resume_trapped_callee` now asks the metafactory's
+/// `impl_handle` for the identity the SAM's name could not supply, and both
+/// arms report 1.
 ///
-/// It reproduces `lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908`
-/// — 12 runs, 12 times `delta=2` for the lambda arm against `delta_static=1`
-/// for the identical non-lambda control in the same process. Un-ignore it with
-/// the fix; until then `--ignored` runs it and prints the split.
-///
-/// It is checked in rather than left as a paragraph on that page because the
-/// hour that went into it was not the diagnosis, it was getting the fixture to
-/// engage at all: the SAM call site has to be compiled, the arm has to run
-/// before the control warms it, and the impl has to be on the optimizing
-/// backend. All three are encoded here.
+/// It was checked in ahead of the fix rather than left as a paragraph on that
+/// page because the hour that went into it was not the diagnosis, it was
+/// getting the fixture to engage at all: the SAM call site has to be compiled,
+/// the arm has to run before the control warms it, and the impl has to be on
+/// the optimizing backend. All three are encoded here.
 #[test]
-#[ignore = "OPEN defect: a lambda callee's deopt is orphaned and its side effect runs twice (lambda-callee-deopt-is-orphaned-by-the-sam-name-check-20260908)"]
 fn a_lambda_door_trap_resumes_and_runs_its_side_effect_once() {
     assert_fixture_staged();
     cratonvm_types::flags::with_process_overrides(TIER_OVERRIDES, body);
