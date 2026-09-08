@@ -3,7 +3,8 @@
 | | |
 |---|---|
 | **Status** | **FIXED** 2026-09-07. `Compiler::open_inline_locals_floor`, enforced in `reserve_spill_slots`. |
-| **Origin** | `jit-warm-groupdata-window-row-collapse-20260906-FIXED.md` left a bare count of 325 spill overlaps as "that hazard is real and deserves its own page". The page that produced classified the count; this is that page with the fix. |
+| **Origin** | `jit-warm-groupdata-window-row-collapse-20260906-FIXED.md` left a bare count of 325 spill overlaps as "that hazard is real and deserves its own page". The page that produced classified the count, then ran its own recommended experiment and refuted it (`8dc07faa1`). This is that page with the fix. |
+| **On the title** | It names the mechanism the page was opened on, and that mechanism is **4 of 151**. Kept so a search for it still lands, in the same spirit as the phi-home page's retitling note — but the dominant writer is the VOID return arm; see *Which writer actually leaves the cursor low*. |
 | **Never observed to produce a wrong answer.** | The workload that exposes it is 11/11 before and after. What is fixed is the hazard, not a failing test. |
 | **The hazard is worse than this page originally said.** | 147 of the 151 overlaps land on a word the enclosing splice publishes to the collector as a **rewritable GC root**, on the DEFAULT configuration. See "How bad each of the 151 was". |
 
@@ -54,19 +55,24 @@ handing a slot out.
 
 ### Why at the RESERVATION and not at the descent
 
-**This page's own recommendation was wrong, and the measurement is how that was
-found.** It proposed extending `try_emit_inline_body`'s live-slot clamp to cover
-open scopes' locals — "a two-line change" — and predicted that would settle it.
+**This page's own recommendation was wrong, and measurement is how that was
+found — twice, independently.** It proposed extending `try_emit_inline_body`'s
+live-slot clamp to cover open scopes' locals ("a two-line change") and predicted
+that would settle it.
 
-Tried first. It engaged **3 times** on the workload while all 150 reports
-stayed. The cursor does not reach an enclosing scope's locals through the
-splice's return-value reclaim.
+Tried here: it engaged **3 times** while all 150 reports stayed. Tried
+separately on `claude/spill-overlap-enclosing-locals-20260907`, which reached the
+same number and reverted the change (`8dc07faa1`, merged as `49a8a6f41`) — the
+right call on a null result. Both arms agree: the cursor does not reach an
+enclosing scope's locals through the splice's VALUE-return reclaim, which
+accounts for 4 of the 151.
 
 Tried second: guard the two obvious descent paths, `pop_stack`'s reclaim arm and
 `reset_spills`. That took 150 → **125**. Better, and still not the mechanism —
 there are a dozen more assignments to `next_spill_offset` inside `inlining.rs`
-alone (a nested real call's `post_pop_spill`, the merge-point `save_spill`
-restore, each bail path), and any one of them can leave the cursor low.
+alone, and any one of them can leave the cursor low. Which ones actually do is
+now measured rather than guessed — see the next section, where the answer turns
+out not to be on the open page's shortlist.
 
 So the floor is enforced where a word is actually **handed out**, which is the
 one choke point every descent path funnels through — and is where
@@ -74,6 +80,54 @@ one choke point every descent path funnels through — and is where
 prove the population is empty rather than merely smaller. A cursor left below
 the floor is harmless until something reserves; the next reservation bumps past
 the open locals and `next_spill_offset` self-heals above them.
+
+### Which writer actually leaves the cursor low — measured, not read
+
+The open page's "where to look next" listed three candidate writers and picked
+one to look at first:
+
+| its shortlist | its reading |
+|---|---|
+| `= spill_checkpoint` | full rollback of an abandoned splice |
+| `= save_spill` | merge-point restore — **"the interesting one"** |
+| `= caller_post_pop_spill` (the `xreturn` arms) | excluded by its own experiment |
+
+**All three are wrong**, and the instrument it asked for says so. Tagging every
+one of the 76 single-line writes to `next_spill_offset` with the site that
+performed it — recording only writes that LOWER the cursor, because the last
+writer of ANY kind is the previous reservation raising it, which is true and
+uninformative — and running the pre-fix arm:
+
+| site that lowered the cursor | ENCLOSING reports |
+|---|---:|
+| `inlining.rs` — the **VOID** `return` arm (0xb1), `= caller_post_pop_spill` | **117** |
+| `operand_stack.rs` — `pop_stack`'s reclaim arm, `-= 8` | 30 |
+| `inlining.rs` — the **VALUE** `xreturn` arm, `= caller_post_pop_spill` | 4 |
+
+The dominant writer is the arm that reclaims a **void** callee's frame, and it
+was not on the shortlist. Its own comment already anticipates the shape without
+drawing the conclusion:
+
+> It IS load-bearing for a nested splice: the mini-walk in this function has no
+> per-instruction reset, so an inner void body would leave the enclosing
+> CALLEE's cursor parked in the inner callee's abandoned frame region.
+
+That is the right reason to rewind and the wrong distance to rewind it.
+
+The 4 against the value-returning arm are the mechanism this page's title names,
+and they independently reproduce the open page's own refutation of it (it
+measured 3 engagements for a clamp on that path). Two arms, one variable, and
+the split between them is 117 to 4.
+
+### Why no per-writer fix was attempted
+
+Three writers, in two files, one of which (`pop_stack`) is shared with every
+non-inlined method. Guarding them individually was tried for two of the three
+and took 151 to 125; the third would have taken it lower without ever proving
+the set was closed, because "every writer" is a claim about 76 assignments that
+no test can hold. The floor at `reserve_spill_slots` needs no such claim: it is
+the one place a word is handed out, so it catches a cursor left low by a writer
+nobody has enumerated, including one added tomorrow.
 
 ### Why the INNERMOST scope is excluded
 
