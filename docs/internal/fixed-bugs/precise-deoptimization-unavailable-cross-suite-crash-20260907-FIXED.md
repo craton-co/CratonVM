@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | **FIXED 2026-09-07** (`CRATONVM_JIT_DEOPT_SINK_RESUME`, default ON). Was: OPEN, high severity — hard process abort (`InternalError`), not a catchable exception. |
 | **The fix** | `deopt-sink-refused-a-frame-its-sibling-resumes-FIXED-20260907.md` carries the mechanism, the A/B and the in-repo witness. This page keeps the H2 + Spring population that found it. |
+| **Verified on H2** | Yes — all 8 CRASH classes re-run on a current binary, **0 occurrences of the abort**. See *Verified on the H2 CRASH population itself*. |
 | **Scope** | All 8 distinct CRASH classes across the 2026-09-07 full 218-class 3-GC-arm H2 run's three completed arms (Generational CRASH=8, G1 CRASH=8, ZGC CRASH=5 — 8 unique classes total, listed below), plus at least one Spring Framework class from the same day's run. **This is the entire H2 CRASH population for this run — no other crash mechanism was found.** |
 
 ## Symptom
@@ -148,6 +149,51 @@ JDK25=<jdk25> CRATONVM_BIN=<cratonvm> ./run-h2-suite.sh run \
   reason.
 - `jit-mode-explains-most-of-todays-56-class-fail-cluster-20260907.md` — the
   Spring Framework side of today's finding.
+
+## Verified on the H2 CRASH population itself (2026-09-07, later)
+
+This page was retired on the strength of an in-repo witness reproducing the
+signature exactly and of the mechanism being one gate. **It was not verified on
+H2**, because the suite's test classes were not compiled on this host — which
+left the page's central claim ("all 8 CRASH classes, this one mechanism")
+resting on inference. Closed now.
+
+All eight were compiled from the checkout's OWN sources
+(`javac -sourcepath "src/main;src/test;src/tools"`, 1 527 classes, zero errors)
+and run on a current `dev` binary:
+
+| class | exit | `precise deoptimization unavailable` |
+|---|---|---:|
+| `store.TestFreeSpace` | normal | **0** |
+| `poweroff.TestReorderWrites` | normal | **0** |
+| `db.TestAlterSchemaRename` | normal | **0** |
+| `db.TestTriggersConstraints` | normal | **0** |
+| `store.TestKillProcessWhileWriting` | normal | **0** |
+| `unit.TestSampleApps` | failed | **0** |
+| `db.TestFunctions` | failed | **0** |
+| `unit.TestBnf` | failed | **0** |
+
+**Zero occurrences of the abort across the whole population.** Five of the eight
+now run to a normal exit; the three that do not fail on something else
+entirely — a timezone comparison (`Expected: UTC (3) actual: America/…`), an
+`IOException`/NPE out of the sample-app driver, and a `testProcedures`
+assertion. None is this signature, and all three are consistent with the
+ad-hoc build used here rather than with a VM defect: they are exactly the
+`CREATE ALIAS`-driven classes, whose in-process javac wants a real classpath,
+and this run had no suite harness supplying one.
+
+**So: the crash mechanism is gone, and the pass/fail status of those three is
+not established here.** Settling that needs `mvnw test-compile` and the suite
+runner; the offline attempt failed on a missing `org.ow2.asm:asm-bom:9.5`.
+
+### Why the first attempt did not count
+
+Compiling the test sources against the published `h2-2.4.240.jar` looked
+easier and produced a nine-build-ID version skew — the checkout is
+`2.4.249-SNAPSHOT`. Two classes failed under it that pass without it
+(`TestTriggersConstraints`, `TestKillProcessWhileWriting`), so that arm's
+failures were the skew talking. Building main and test from the same tree is
+what makes the table above mean anything.
 
 ## Answered (2026-09-07)
 
