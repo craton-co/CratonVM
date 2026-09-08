@@ -29113,9 +29113,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
             let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29159,9 +29164,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
             let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,
@@ -29205,9 +29215,14 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(f))) => *f,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: `apply` is an arbitrary user lambda, dispatched
+            // on `mapper` once per element, and `mapper` came out of `args`
+            // before `stream_elements` re-entered Java.
+            let mapper_pin = ctx.pin_native_root(mapper);
             let elements = stream_elements(ctx, &mut this)?;
             let mut flat: Vec<Value> = Vec::new();
             for e in elements {
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
                 let sub = ctx
                     .invoke_virtual(
                         mapper,

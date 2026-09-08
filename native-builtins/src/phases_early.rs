@@ -3319,7 +3319,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             };
             // Each entry is a 3-field object (key=0, value=1, next=2)
             let arr_len = ctx.array_length(entries);
+            // GC-safety: `accept` is an arbitrary user lambda -- it allocates --
+            // and both the consumer and the bucket array are carried across
+            // every turn.
+            let action_pin = ctx.pin_native_root(action);
+            let entries_pin = ctx.pin_native_root(entries);
             for i in 0..arr_len {
+                let action = ctx.read_native_pin(action_pin, action);
+                let entries = ctx.read_native_pin(entries_pin, entries);
                 if let Value::Object(Some(entry)) = ctx.get_array_element(entries, i) {
                     let key = ctx.get_field(entry, 0);
                     let val = ctx.get_field(entry, 1);
@@ -8322,8 +8329,19 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
             // `monitor_wait` PARKS, which is exactly where a peer thread's
             // collection runs — and `this` is the holder array every `ph_get`
             // and the `monitor_exit` below dereference. Pin it and re-read
-            // through the pin after each wait; without that the loop kept
+            // through the pin AFTER each wait; without that the loop kept
             // reading (and released the monitor at) the pre-wait address.
+            //
+            // MERGE NOTE (2026-09-08): `origin/dev` fixed this site in the same
+            // hour with the re-read at the TOP of the loop instead. That closes
+            // the loop-carried half — turn N+1 no longer reads turn N's address
+            // — but not the within-turn half: the `monitor_exit` on the error
+            // path and the `ph_get` that follows the wait both still ran on the
+            // PRE-wait value, which is the address `MonitorTable::exit`
+            // dereferences. Resolved to this side because the park window ends
+            // at the wait, not at the top of the loop, and because
+            // `stale-receiver-audit.py`'s RULE 2 reports the other shape as a
+            // site.
             let this_pin = ctx.pin_native_root(this);
             let mut cur = this;
             // Bounded monitor-waits until the phase advances

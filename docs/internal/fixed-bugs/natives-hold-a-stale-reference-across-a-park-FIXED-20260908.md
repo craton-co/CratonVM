@@ -145,14 +145,21 @@ hung run. It is what found the `PriorityBlockingQueue` defect below.
 | Spring Boot subset, 90 classes, plain `Generational` | — | **90 / 90 PASS** |
 | the same subset, `GC_STRESS=4194304` + `GC_VERIFY_RSET=1` | 88 PASS, **2 HANG** | 88 PASS, 1 FAIL |
 | `probes/NativeLoopReceiverSweep growth`, three-flag harness | 18 rows OK | **identical 18 rows** |
+| `probes/ConcurrencyUnderGcSweep`, three collectors | — | **OK on all three** |
+| `cargo test -p cratonvm-native-builtins` | — | **4259 passed, 0 failed** |
 
-The one remaining FAIL is `BindableTests.withAnnotationsShouldSetAnnotations`,
-which is `MockitoException: cannot mock this class: interface
-java.lang.annotation.Annotation` after 828 s under a 4 MiB GC-stress interval, a
-full old-generation walk per collection, four concurrent JVMs and a release
-build on the same box. 26 of its 27 tests pass. It is an inline-mock /
-bytecode-generation limitation and has nothing to do with this change; the two
-classes that HUNG in the same configuration before it no longer do.
+`NativeLoopReceiverSweep growth` is the regression check the COWAL and LBQ
+rewrites needed, and it is the only reason that row is here: its own three-flag
+SIGSEGV was root-caused and retired the same day, independently, as
+`stale-value-at-set_field-methodhandles-lookup-RETIRED-20260908.md`
+(`MethodHandles.lookup()` storing a pre-GC class mirror). It never reproduced on
+this Windows box on either binary, which is why nothing here claims it.
+
+The one remaining FAIL is `BindableTests.withAnnotationsShouldSetAnnotations`
+(26 of its 27 tests pass), and it is NOT one of the sites fixed here — it is the
+residual below, which the same run's always-on guard caught and named. The two
+classes that HUNG in this configuration before no longer do; one of them is this
+class, whose failure mode moved from a 900 s timeout to a named reclaim.
 
 **The negative result is worth as much as the fix.** That stress run produced
 **15,369 `[rset-verify]` reports and `missing=0` in every one** — the card table
