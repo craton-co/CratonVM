@@ -2953,8 +2953,17 @@ pub fn register_self_jit_depth_slot(os_tid: u32) -> std::sync::Arc<std::sync::at
 /// scans registers plus `[rsp, stack_base)`, cannot see them. For the initiator
 /// and for a cooperatively parked peer that is fine (`collect_roots` scans its
 /// own; a parked peer publishes its own and remaps on resume). A BLOCKED peer
-/// does neither, and `apply_pending_blocked_fixups` never remaps a shadow
-/// stack, so its shadow-stack oops are unpinned and unremapped.
+/// does neither, so without this its shadow-stack oops are unpinned during the
+/// collection -- which is what this map exists to fix, by letting the initiator
+/// find and pin them.
+///
+/// The REMAP half is a separate repair and has since landed beside it:
+/// `apply_blocked_wake_jit_remap` (both wake paths, `check_post_block_gc_refs`
+/// and the leaked-region fallback `apply_pending_blocked_fixups`) now remaps the
+/// waking peer's shadow stack, active JIT frames and register image. The two are
+/// complementary and neither subsumes the other -- a pin keeps the objects still
+/// for the cycle, a remap fixes up a peer whose objects moved on a cycle that
+/// did not pin it.
 ///
 /// The initiator cannot recover the window from the peer's frames the way
 /// `shadow_window_from_frame` does: that helper only trusts a frame whose
