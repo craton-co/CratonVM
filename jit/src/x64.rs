@@ -220,6 +220,10 @@ mod inlining;
 /// Engagement count for the splice cursor clamp, for `jit-method-stats`.
 /// A number beside a result is what says whether the guard ran at all.
 pub(crate) use inlining::inline_live_slot_clamps;
+/// Engagement count for the open-inline-locals floor, for `jit-method-stats`.
+/// Separate from the clamp above for the reason the counter itself is: one
+/// number cannot say which of the two guards a result should be credited to.
+pub(crate) use inlining::inline_locals_floor_bumps;
 /// The PC -> inline-chain map, and the per-compile session that records it.
 ///
 /// NAMED rather than glob re-exported, unlike the ~15 `pub use foo::*;`

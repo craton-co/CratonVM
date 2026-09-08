@@ -705,29 +705,169 @@ fn is_unit_stride_induction(
 /// **Default ON** since 2026-09-06. `CRATONVM_JIT_IR_BCE_RANGE=0` keeps the
 /// dominating-redundancy pass and drops only the range proof, so a bisect can
 /// separate the two; `CRATONVM_JIT_IR_CHECK_ELIM=0` drops both.
+fn read_range_flag() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_BCE_RANGE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
 pub fn range_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_BCE_RANGE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        )
-    })
+    // Test-only force, then an UNCACHED read -- see `enabled` for why the
+    // process-wide memo may not exist in a test binary.
+    #[cfg(test)]
+    {
+        if let Some(forced) = range_forced() {
+            return forced;
+        }
+        return read_range_flag();
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(read_range_flag)
+    }
 }
 
 /// **Default ON** since 2026-09-06. `CRATONVM_JIT_IR_CHECK_ELIM=0` restores the
 /// unconditional guards at every array site, which is every build before this
 /// module existed.
+fn read_check_elim_flag() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CHECK_ELIM").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
 pub fn enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CHECK_ELIM").as_deref(),
-            Ok("0") | Ok("false") | Ok("off") | Ok("no")
-        )
-    })
+    // # There is no process-wide memo in a TEST binary, deliberately
+    //
+    // A `OnceLock` here is right in production -- the flag cannot change and
+    // this is on the compile path -- and wrong under `cfg(test)`, because
+    // `flags::runtime_var` honours `flags::with_thread_overrides`, which is
+    // THREAD-scoped. Memoizing a thread-scoped answer in a process-wide cell
+    // means whichever test thread calls this first decides the answer for every
+    // other test in the binary. When that thread was inside an override asking
+    // for `0`, the pass was switched off for the whole run and every test
+    // asserting that a check IS elided failed at once -- six of them, together,
+    // on 2026-09-07. See `CHECK_ELIM_FORCE` for the reproduction.
+    //
+    // So the cache is compiled out of test builds rather than merely avoided by
+    // convention. That closes the whole class: a future test reaching this gate
+    // through `with_thread_overrides` now gets the correct per-thread answer
+    // instead of poisoning its neighbours, and needs no note in this file to
+    // stay correct. `CheckElimForce` remains the preferred spelling because it
+    // says what it does at the call site.
+    #[cfg(test)]
+    {
+        if let Some(forced) = check_elim_forced() {
+            return forced;
+        }
+        return read_check_elim_flag();
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(read_check_elim_flag)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`enabled`], so a unit test never depends on the
+    /// process environment, on whether the flag has been declared yet, or on
+    /// which test won a race.
+    ///
+    /// # The defect this exists to make impossible
+    ///
+    /// `the_kill_switch_elides_nothing` used to reach the gate through
+    /// `flags::with_thread_overrides(&[("CRATONVM_JIT_IR_CHECK_ELIM", Some("0"))])`.
+    /// That override is THREAD-scoped; the `OnceLock` in [`enabled`] is
+    /// PROCESS-wide. So when that test happened to be the first caller of
+    /// `enabled()` in the binary, it memoized **false** for every other test in
+    /// the run, and every test asserting that a check IS elided failed at once.
+    ///
+    /// Observed 2026-09-07: six of them, together, in a lib-suite run that took
+    /// 7.37 s against the usual 0.13 s because a release build and a JVM
+    /// workload shared the box -- load changed the interleaving, and that
+    /// changed who won the race. Reproduced deterministically by giving the
+    /// override a name that sorts first and running `--test-threads=1`:
+    /// `enabled()` after the override read `false`, and the same six tests
+    /// failed. `a_different_index_keeps_its_bounds_check`,
+    /// `a_fresh_allocation_needs_no_null_check_and_still_needs_bounds`,
+    /// `the_bound_is_read_off_the_false_edge_of_a_negated_test`,
+    /// `the_classic_counted_loop_needs_no_bounds_check`,
+    /// `the_header_op_the_builder_actually_emits_is_recognised`,
+    /// `the_second_access_to_the_same_element_needs_no_checks`.
+    ///
+    /// Thread-local, so parallel tests cannot see each other's setting and no
+    /// race exists to win. This is the same shape `ir_lower::ls_forced` and
+    /// `lib.rs::box_unbox_forced` use, and for the same reason.
+    ///
+    /// The memo itself is also compiled out of test builds now (see
+    /// [`enabled`]), so this cell is the PREFERRED spelling rather than the
+    /// only safe one -- it says at the call site what is being forced, where a
+    /// `with_thread_overrides` call says only which environment variable.
+    static CHECK_ELIM_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+
+    /// The [`range_enabled`] twin. Separate cell, because the two flags are
+    /// separately switchable in production (`CRATONVM_JIT_IR_BCE_RANGE=0` keeps
+    /// the dominating-redundancy pass and drops only the range proof) and a
+    /// test that could not tell them apart could not test that split.
+    static RANGE_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn check_elim_forced() -> Option<bool> {
+    CHECK_ELIM_FORCE.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn range_forced() -> Option<bool> {
+    RANGE_FORCE.with(|c| c.get())
+}
+
+/// Test-only RAII override of [`enabled`] on this thread.
+#[cfg(test)]
+struct CheckElimForce;
+
+#[cfg(test)]
+impl CheckElimForce {
+    /// Force the pass OFF for the duration -- the kill-switch arm.
+    fn off() -> CheckElimForce {
+        CHECK_ELIM_FORCE.with(|c| c.set(Some(false)));
+        CheckElimForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for CheckElimForce {
+    fn drop(&mut self) {
+        CHECK_ELIM_FORCE.with(|c| c.set(None));
+    }
+}
+
+/// Test-only RAII override of [`range_enabled`] on this thread.
+#[cfg(test)]
+struct RangeForce;
+
+#[cfg(test)]
+impl RangeForce {
+    /// Force the range proof OFF for the duration, leaving the
+    /// dominating-redundancy pass on -- the production `=0` shape.
+    fn off() -> RangeForce {
+        RANGE_FORCE.with(|c| c.set(Some(false)));
+        RangeForce
+    }
+}
+
+#[cfg(test)]
+impl Drop for RangeForce {
+    fn drop(&mut self) {
+        RANGE_FORCE.with(|c| c.set(None));
+    }
 }
 
 /// Null checks and bounds checks elided in the optimizing tier, process-wide.
@@ -958,42 +1098,144 @@ mod tests {
 
     /// The kill switch must produce the pre-change answer at every site, or the
     /// A/B compares two things.
+    ///
+    /// # This test used to assert nothing, most of the time
+    ///
+    /// It reached the gate through `flags::with_thread_overrides`, which is
+    /// THREAD-scoped, while `enabled()`'s cache is a process-wide `OnceLock`.
+    /// Two consequences, and the second is the one that bit:
+    ///
+    ///  * whenever another test had already initialised the lock, `enabled()`
+    ///    still answered `true` inside the override, and the body returned
+    ///    early with no assertion at all -- which under a parallel run is the
+    ///    common case, so the kill switch was effectively untested;
+    ///  * whenever THIS test won the race instead, it memoized **false** for
+    ///    the whole binary and every test asserting a check IS elided failed.
+    ///    Six did, together, on 2026-09-07.
+    ///
+    /// `CheckElimForce` is thread-local, so there is no race to win or lose:
+    /// the assertion below now runs on every execution, and no other test can
+    /// see the setting.
     #[test]
     fn the_kill_switch_elides_nothing() {
+        let _off = CheckElimForce::off();
+        assert!(
+            !enabled(),
+            "the force must actually reach the gate, or everything below is \
+             asserting the DEFAULT-ON behaviour under a kill-switch name"
+        );
+        let mut g = empty_graph();
+        let start = g.add(Op::Start, IrType::Control, vec![], None);
+        g.entry = start;
+        let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let arr = g.add(Op::Param(0), IrType::Ref, vec![start], None);
+        let idx = g.add(Op::Param(1), IrType::Int, vec![start], None);
+        let l1 = g.add(
+            Op::ArrayLoad(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, mem, arr, idx],
+            Some(0),
+        );
+        let l2 = g.add(
+            Op::ArrayLoad(MemKind::Int),
+            IrType::Int,
+            vec![ctrl, mem, arr, idx],
+            Some(1),
+        );
+        let sum = g.add(Op::Add, IrType::Int, vec![l1, l2], Some(2));
+        g.exit = g.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(3));
+        let sched = ir_schedule::schedule(&g);
+        let e = analyze(&g, &sched);
+        assert!(!e.null_elided(l2) && !e.bounds_elided(l2));
+    }
+
+    /// The force is THREAD-local and leaves the process-wide cache alone.
+    ///
+    /// This is the regression test for the defect itself rather than for the
+    /// pass: it proves that switching the gate off for one test cannot switch
+    /// it off for the binary. Without it, a future edit that "simplifies"
+    /// `CheckElimForce` back into `with_thread_overrides` reintroduces the
+    /// original failure and nothing here notices -- the six tests it breaks
+    /// only fail when the interleaving happens to put the kill-switch test
+    /// first, which is why it took a loaded box to surface.
+    #[test]
+    fn the_kill_switch_force_does_not_escape_its_own_thread() {
+        {
+            let _off = CheckElimForce::off();
+            assert!(!enabled(), "the force must apply on this thread");
+        }
+        // Dropped: this thread sees the real gate again.
+        assert!(
+            enabled(),
+            "the force leaked past its guard on this thread"
+        );
+        // And it was never visible on another thread, whichever order the two
+        // ran in.
+        let elsewhere = std::thread::spawn(enabled).join().expect("probe thread");
+        assert!(
+            elsewhere,
+            "the force was visible on another thread: the gate's cache has been \
+             poisoned for the whole binary, which is the 2026-09-07 defect"
+        );
+    }
+
+    /// A `with_thread_overrides` caller cannot poison the gate for the binary.
+    ///
+    /// This is the test for the CLASS rather than for the one caller that was
+    /// fixed. `the_kill_switch_elides_nothing` no longer reaches the gate that
+    /// way, but nothing stops the next test from doing so, and the failure it
+    /// would reintroduce is invisible in a normal run -- it needs the
+    /// interleaving to put that test first, which took a loaded box to produce
+    /// on 2026-09-07.
+    ///
+    /// The guarantee is structural, not conventional: `enabled`'s `OnceLock` is
+    /// compiled out of test builds, so a thread-scoped override yields a
+    /// thread-scoped answer and the process keeps its own.
+    ///
+    /// It reads `false` inside the override on THIS thread and `true` on
+    /// another thread at the same time -- which a memoized gate cannot do,
+    /// whichever of the two won.
+    #[test]
+    fn a_thread_override_of_the_gate_stays_on_its_own_thread() {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_JIT_IR_CHECK_ELIM", Some("0"))],
             || {
-                if enabled() {
-                    // The gate is a process-wide `OnceLock`; another test won
-                    // the race to initialise it. Assert nothing rather than
-                    // assert something false.
-                    return;
-                }
-                let mut g = empty_graph();
-                let start = g.add(Op::Start, IrType::Control, vec![], None);
-                g.entry = start;
-                let ctrl = g.add(Op::Proj(0), IrType::Control, vec![start], None);
-                let mem = g.add(Op::Proj(1), IrType::Memory, vec![start], None);
-                let arr = g.add(Op::Param(0), IrType::Ref, vec![start], None);
-                let idx = g.add(Op::Param(1), IrType::Int, vec![start], None);
-                let l1 = g.add(
-                    Op::ArrayLoad(MemKind::Int),
-                    IrType::Int,
-                    vec![ctrl, mem, arr, idx],
-                    Some(0),
+                assert!(
+                    !enabled(),
+                    "the override must be visible on the thread that set it"
                 );
-                let l2 = g.add(
-                    Op::ArrayLoad(MemKind::Int),
-                    IrType::Int,
-                    vec![ctrl, mem, arr, idx],
-                    Some(1),
+                let elsewhere = std::thread::spawn(enabled).join().expect("probe thread");
+                assert!(
+                    elsewhere,
+                    "a THREAD-scoped override was visible on another thread: the \
+                     gate has memoized it process-wide, which is the 2026-09-07 \
+                     defect -- six tests asserting a check IS elided then fail \
+                     together, but only when the interleaving puts this one first"
                 );
-                let sum = g.add(Op::Add, IrType::Int, vec![l1, l2], Some(2));
-                g.exit = g.add(Op::Return, IrType::Void, vec![ctrl, sum], Some(3));
-                let sched = ir_schedule::schedule(&g);
-                let e = analyze(&g, &sched);
-                assert!(!e.null_elided(l2) && !e.bounds_elided(l2));
             },
+        );
+        assert!(
+            enabled(),
+            "and the gate is unchanged once the override is dropped"
+        );
+    }
+
+    /// The range proof has its own switch, and its own force.
+    ///
+    /// `CRATONVM_JIT_IR_BCE_RANGE=0` keeps the dominating-redundancy pass and
+    /// drops only the range proof, so the two are separately switchable in
+    /// production; a test that could not tell them apart could not test that
+    /// split. The counted loop below is elided by the RANGE proof alone -- with
+    /// it off, nothing dominates the access and the check must stay.
+    #[test]
+    fn the_range_switch_drops_only_the_range_proof() {
+        let _off = RangeForce::off();
+        assert!(!range_enabled(), "the force must reach the range gate");
+        assert!(
+            enabled(),
+            "and must leave the dominating-redundancy pass alone -- that is \
+             what makes this a separate switch"
         );
     }
 
