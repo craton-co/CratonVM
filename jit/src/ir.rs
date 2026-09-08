@@ -3153,6 +3153,19 @@ impl Op {
             Op::Throw => (3, MemAccess::Opaque), // [ctrl, mem, exc]
             Op::LambdaIntToDouble => (4, MemAccess::Opaque), // [ctrl, mem, lambda, index]
             Op::MonitorEnter => (3, MemAccess::MonitorEnter), // [ctrl, mem, obj]
+            // The guarded slot-0 accessors. `Opaque` -- the top of the lattice --
+            // rather than the `FieldRead`/`FieldWrite` pair the shape suggests:
+            // `access_location` reads a `(base, offset)` out of input slots 2
+            // and 3, and this node's slot 3 is a DELTA, not an offset (the
+            // offsets it uses are resolved from `class_id` at lowering and are
+            // carried by no edge at all). Three of the six are a `LOCK XADD` on
+            // a VOLATILE field, whose ordering is a full fence anyway, which is
+            // what `Opaque` already means here.
+            //
+            // Added 2026-09-08 with the `Atomic*` families. Before them the op
+            // had no entry at all, which was survivable for a pure load and is
+            // not for a read-modify-write.
+            Op::Unbox { .. } => (3, MemAccess::Opaque), // [ctrl, mem, receiver]
             Op::MonitorExit => (3, MemAccess::MonitorExit), // [ctrl, mem, obj]
             _ => return None,
         };
@@ -5233,13 +5246,41 @@ impl IrBuilder {
         if !self.graph.safepoints.iter().any(|sp| sp.bci == pc) {
             return false;
         }
+        // The receiver is one abstract-stack entry and so is the one argument
+        // any of these takes (`getAndAdd(J)J` -- a category-2 value is ONE entry
+        // in this builder, see `static_call_shape`). A stack shallower than that
+        // means the planned site and the abstract state disagree; refuse rather
+        // than pop a depth nothing agreed on. Every refusal above and here
+        // returns before the first `pop`, so the caller's dispatch path finds
+        // the stack exactly as it left it.
+        if self.stack.len() < uop.arity() + 1 {
+            return false;
+        }
+        // Operands come off deepest-last: the delta is shallower, the receiver
+        // is deepest, so the delta pops first.
+        let delta = if uop.arity() == 1 {
+            Some(self.pop())
+        } else {
+            None
+        };
         let obj = self.pop();
+        let mut inputs = vec![self.ctrl, self.mem, obj];
+        if let Some(d) = delta {
+            inputs.push(d);
+        }
         let node = self.graph.add(
             Op::Unbox { op: uop, class_id },
             uop.result_type(),
-            vec![self.ctrl, self.mem, obj],
+            inputs,
             Some(pc),
         );
+        // The node IS the new memory token as well as the result -- the
+        // convention `Op::Load` and the String expander use. Three of the six
+        // families WRITE the field with a `LOCK XADD`, so dropping this would
+        // let a later read of the same object float above the write. It is set
+        // for the pure loads too: the cost is ordering a load this tier could
+        // otherwise move, and the alternative is a rule with an exception in it.
+        self.mem = node;
         self.push(node);
         note_unbox_lowered();
         true
@@ -9061,21 +9102,110 @@ impl ScalarOp {
 pub enum UnboxOp {
     /// `java/lang/Long.longValue()J` -- 8-byte payload.
     LongValue,
-    /// `java/lang/Integer.intValue()I` -- 4-byte payload, sign-extended.
+    /// `java/lang/Integer.intValue()I` -- 4-byte payload.
     IntValue,
+
+    // -- The `Atomic*` accessors, 2026-09-08 ----------------------------
+    //
+    // Same node, same three guards, same per-object layout branch: these are
+    // the SAME shape as the two above -- a guarded field access at slot 0 of a
+    // receiver whose class id the planner resolved -- differing only in the
+    // instruction at the bottom and, for one of them, an argument.
+    //
+    // They joined `UnboxOp` rather than arriving as a second op with a second
+    // recognizer and a second planner clause, which is what a first cut of this
+    // work did (`claude/unboxing-atomic-ir-nodes-d7aff4`). Two recognizers both
+    // claiming `Long.longValue` is one recognizer plus dead code that still
+    // compiles and still has passing tests -- the failure this file has a
+    // standing rule about.
+    //
+    // The name is now a little narrow for its contents. It is kept because
+    // every reference to it is, and because "the guarded slot-0 accessor
+    // families" has no shorter spelling.
+    /// `AtomicLong.get()J` -- a VOLATILE 8-byte load. An aligned 8-byte `MOV`
+    /// is atomic on x86-64 and loads are not reordered with older loads under
+    /// TSO, so the acquire is owed nothing: the same plain `MOV`
+    /// [`Self::LongValue`] emits is the correct encoding.
+    AtomicLongGet,
+    /// `AtomicInteger.incrementAndGet()I` -- `LOCK XADD` of `+1`, returning the
+    /// POST-add value.
+    AtomicIntIncrementAndGet,
+    /// `AtomicInteger.decrementAndGet()I` -- `LOCK XADD` of `-1`, POST-add.
+    AtomicIntDecrementAndGet,
+    /// `AtomicLong.getAndAdd(J)J` -- `LOCK XADD` of a runtime delta, returning
+    /// the PRE-add value, which is what `XADD` leaves in its source register
+    /// with no fixup at all.
+    AtomicLongGetAndAdd,
 }
 
 impl UnboxOp {
     pub fn result_type(self) -> IrType {
-        match self {
-            UnboxOp::LongValue => IrType::Long,
-            UnboxOp::IntValue => IrType::Int,
+        if self.is_wide() {
+            IrType::Long
+        } else {
+            IrType::Int
         }
     }
+
+    /// True when the field access is 64-bit (`REX.W`) rather than 32-bit.
+    pub fn is_wide(self) -> bool {
+        matches!(
+            self,
+            UnboxOp::LongValue | UnboxOp::AtomicLongGet | UnboxOp::AtomicLongGetAndAdd
+        )
+    }
+
+    /// True for the families that only READ the field -- a `MOV`, with no
+    /// `LOCK` prefix and no delta register.
+    pub fn is_load(self) -> bool {
+        matches!(
+            self,
+            UnboxOp::LongValue | UnboxOp::IntValue | UnboxOp::AtomicLongGet
+        )
+    }
+
+    /// How many DATA inputs the node takes past `[ctrl, mem, receiver]`.
+    /// `ir_verify` reads this rather than carrying a second copy of the table.
+    pub fn arity(self) -> usize {
+        match self {
+            UnboxOp::AtomicLongGetAndAdd => 1,
+            _ => 0,
+        }
+    }
+
+    /// The `LOCK XADD` delta when it is a compile-time immediate, or `None`
+    /// when the family has no delta (the loads) or takes it as an argument.
+    ///
+    /// `+1`/`-1` are the only immediates here.
+    pub fn delta_imm(self) -> Option<i32> {
+        match self {
+            UnboxOp::AtomicIntIncrementAndGet => Some(1),
+            UnboxOp::AtomicIntDecrementAndGet => Some(-1),
+            _ => None,
+        }
+    }
+
+    /// True when the result is the POST-add value, so the delta must be added
+    /// back after the `XADD` (which leaves the PRE-add value in its source).
+    pub fn returns_post_add(self) -> bool {
+        matches!(
+            self,
+            UnboxOp::AtomicIntIncrementAndGet | UnboxOp::AtomicIntDecrementAndGet
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             UnboxOp::LongValue => "java/lang/Long.longValue",
             UnboxOp::IntValue => "java/lang/Integer.intValue",
+            UnboxOp::AtomicLongGet => "java/util/concurrent/atomic/AtomicLong.get",
+            UnboxOp::AtomicIntIncrementAndGet => {
+                "java/util/concurrent/atomic/AtomicInteger.incrementAndGet"
+            }
+            UnboxOp::AtomicIntDecrementAndGet => {
+                "java/util/concurrent/atomic/AtomicInteger.decrementAndGet"
+            }
+            UnboxOp::AtomicLongGetAndAdd => "java/util/concurrent/atomic/AtomicLong.getAndAdd",
         }
     }
 }
@@ -9098,6 +9228,16 @@ pub fn try_ir_unbox_intrinsic(
     let op = match (class, method, descriptor) {
         ("java/lang/Long", "longValue", "()J") => UnboxOp::LongValue,
         ("java/lang/Integer", "intValue", "()I") => UnboxOp::IntValue,
+        ("java/util/concurrent/atomic/AtomicLong", "get", "()J") => UnboxOp::AtomicLongGet,
+        ("java/util/concurrent/atomic/AtomicInteger", "incrementAndGet", "()I") => {
+            UnboxOp::AtomicIntIncrementAndGet
+        }
+        ("java/util/concurrent/atomic/AtomicInteger", "decrementAndGet", "()I") => {
+            UnboxOp::AtomicIntDecrementAndGet
+        }
+        ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J") => {
+            UnboxOp::AtomicLongGetAndAdd
+        }
         _ => return None,
     };
     // Ask the layout NOW as well as at lowering: a class whose `value` field is
@@ -9110,11 +9250,19 @@ pub fn try_ir_unbox_intrinsic(
 /// `(compact, legacy)` byte offsets of the payload, from the SAME resolver the
 /// single-pass backend uses. The single source of truth for both backends.
 pub fn unbox_offsets(op: UnboxOp, class_id: u32) -> Option<(i32, i32)> {
-    match op {
-        UnboxOp::LongValue => crate::AtomicLongFieldLayout::new(0, class_id)
-            .map(|l| (l.value_compact_offset, l.value_legacy_offset)),
-        UnboxOp::IntValue => crate::AtomicIntFieldLayout::new(0, class_id)
-            .map(|l| (l.value_compact_offset, l.value_legacy_offset)),
+    // The WIDTH decides which resolver applies, and it is read off the family
+    // rather than off the class name: `AtomicLong` and `AtomicInteger` differ by
+    // exactly this, and pointing the 64-bit form at a 4-byte payload is a wrong
+    // VALUE that no test of the 32-bit form would catch. Both constructors
+    // carry the width check too -- they refuse unless slot 0's compact storage
+    // is exactly 8 / 4 bytes -- so a layout the access could not address never
+    // reaches codegen.
+    if op.is_wide() {
+        crate::AtomicLongFieldLayout::new(0, class_id)
+            .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+    } else {
+        crate::AtomicIntFieldLayout::new(0, class_id)
+            .map(|l| (l.value_compact_offset, l.value_legacy_offset))
     }
 }
 
@@ -9412,18 +9560,141 @@ mod scalar_intrinsic_recognizer_tests {
     /// near-miss must fall through to the ordinary path rather than be lowered
     /// as a field load of something else.
     #[test]
-    fn the_unbox_recognizer_matches_only_its_two_triples() {
+    fn the_unbox_recognizer_matches_only_its_declared_triples() {
         for (c, n, d) in [
             ("java/lang/Long", "intValue", "()I"),
             ("java/lang/Integer", "longValue", "()J"),
             ("java/lang/Long", "longValue", "()I"),
             ("java/lang/Double", "doubleValue", "()D"),
             ("java/lang/Short", "shortValue", "()S"),
-            ("java/util/concurrent/atomic/AtomicLong", "get", "()J"),
+            // The BOXING half: `valueOf` allocates or reads a cache, and has no
+            // receiver whose slot 0 could be read.
+            ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;"),
+            ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;"),
+            // Right name, wrong owner: `Number.longValue` is abstract and its
+            // receiver may be any subclass, so slot 0 means nothing.
+            ("java/lang/Number", "longValue", "()J"),
+            // Real `Atomic*` methods this family deliberately does NOT claim.
+            // `compareAndSet` is a `LOCK CMPXCHG` whose operand placement
+            // differs in a way that compiles fine while comparing the object
+            // pointer against the field; the `getAnd*`/`addAndGet` spellings are
+            // absent because the H2 census does not name them, and a family
+            // added without a site to exercise it is one whose first real
+            // receiver is a user's.
+            ("java/util/concurrent/atomic/AtomicLong", "compareAndSet", "(JJ)Z"),
+            ("java/util/concurrent/atomic/AtomicLong", "getAndIncrement", "()J"),
+            ("java/util/concurrent/atomic/AtomicLong", "addAndGet", "(J)J"),
+            ("java/util/concurrent/atomic/AtomicInteger", "get", "()I"),
+            ("java/util/concurrent/atomic/AtomicInteger", "getAndAdd", "(I)I"),
+            // Right owner and name, wrong descriptor.
+            ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(I)I"),
         ] {
             assert!(
                 try_ir_unbox_intrinsic(c, n, d, 7).is_none(),
                 "{c}.{n}{d} must not be recognised as an unbox site",
+            );
+        }
+    }
+
+    /// The triple each declared family must be recognised from, as an
+    /// EXHAUSTIVE match: a new `UnboxOp` variant is a COMPILE ERROR here until
+    /// its signature is declared.
+    ///
+    /// A `match` rather than a hand-written table, because the failure this
+    /// catches is a family added to the enum and its lowering but forgotten in
+    /// the recognizer -- which reads, from the outside, exactly like a workload
+    /// that has no such call site, and which a table only catches if someone
+    /// remembers to add a row.
+    #[cfg(test)]
+    fn unbox_triple_for(op: UnboxOp) -> (&'static str, &'static str, &'static str) {
+        match op {
+            UnboxOp::LongValue => ("java/lang/Long", "longValue", "()J"),
+            UnboxOp::IntValue => ("java/lang/Integer", "intValue", "()I"),
+            UnboxOp::AtomicLongGet => {
+                ("java/util/concurrent/atomic/AtomicLong", "get", "()J")
+            }
+            UnboxOp::AtomicIntIncrementAndGet => (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "incrementAndGet",
+                "()I",
+            ),
+            UnboxOp::AtomicIntDecrementAndGet => (
+                "java/util/concurrent/atomic/AtomicInteger",
+                "decrementAndGet",
+                "()I",
+            ),
+            UnboxOp::AtomicLongGetAndAdd => {
+                ("java/util/concurrent/atomic/AtomicLong", "getAndAdd", "(J)J")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    const ALL_UNBOX_OPS: [UnboxOp; 6] = [
+        UnboxOp::LongValue,
+        UnboxOp::IntValue,
+        UnboxOp::AtomicLongGet,
+        UnboxOp::AtomicIntIncrementAndGet,
+        UnboxOp::AtomicIntDecrementAndGet,
+        UnboxOp::AtomicLongGetAndAdd,
+    ];
+
+    #[test]
+    fn every_declared_unbox_family_is_recognised() {
+        for op in ALL_UNBOX_OPS {
+            let (c, m, d) = unbox_triple_for(op);
+            assert_eq!(
+                try_ir_unbox_intrinsic(c, m, d, 7),
+                Some(op),
+                "{c}.{m}{d} is declared as an unbox family and was not recognised",
+            );
+        }
+    }
+
+    /// The width and delta plans, checked against each family's DESCRIPTOR
+    /// rather than against the tables under test.
+    ///
+    /// A wrong answer in either is a wrong VALUE, not a slow one: an `IntValue`
+    /// mistyped wide reads four bytes of the next field into the answer, and a
+    /// `getAndAdd` that claimed `returns_post_add` would add the delta twice.
+    #[test]
+    fn unbox_width_and_delta_plans_match_each_descriptor() {
+        for op in ALL_UNBOX_OPS {
+            let (_, m, d) = unbox_triple_for(op);
+            let wide = d.ends_with(")J");
+            assert_eq!(op.is_wide(), wide, "{}", op.as_str());
+            assert_eq!(
+                op.result_type(),
+                if wide { IrType::Long } else { IrType::Int },
+                "{}",
+                op.as_str(),
+            );
+            assert_eq!(
+                op.arity(),
+                usize::from(!d.starts_with("()")),
+                "{} disagrees with its descriptor about the argument count",
+                op.as_str(),
+            );
+            // Exactly one delta source: an immediate, an argument, or neither.
+            assert!(
+                !(op.arity() == 1 && op.delta_imm().is_some()),
+                "{} claims both an immediate and an argument delta",
+                op.as_str(),
+            );
+            assert_eq!(
+                op.is_load(),
+                op.arity() == 0 && op.delta_imm().is_none(),
+                "{} disagrees about whether it has a delta at all",
+                op.as_str(),
+            );
+            // `XADD` leaves the PRE-add value in its source, so only the
+            // `*AndGet` spellings owe the fixup -- and `getAndAdd`, whose name
+            // also ends in "AndGet" if read carelessly, must not.
+            assert_eq!(
+                op.returns_post_add(),
+                m.ends_with("AndGet") && !m.starts_with("getAnd"),
+                "{}",
+                op.as_str(),
             );
         }
     }
@@ -9435,17 +9706,18 @@ mod scalar_intrinsic_recognizer_tests {
     #[test]
     fn unbox_offsets_come_from_the_same_resolver_the_single_pass_backend_uses() {
         const CID: u32 = 42;
-        if let Some(l) = crate::AtomicLongFieldLayout::new(0, CID) {
-            assert_eq!(
-                unbox_offsets(UnboxOp::LongValue, CID),
-                Some((l.value_compact_offset, l.value_legacy_offset)),
-            );
-        }
-        if let Some(l) = crate::AtomicIntFieldLayout::new(0, CID) {
-            assert_eq!(
-                unbox_offsets(UnboxOp::IntValue, CID),
-                Some((l.value_compact_offset, l.value_legacy_offset)),
-            );
+        // Every family, driven off the same list the recognizer test uses, so a
+        // new one cannot be added with its width silently pointed at the wrong
+        // resolver.
+        for op in ALL_UNBOX_OPS {
+            let want = if op.is_wide() {
+                crate::AtomicLongFieldLayout::new(0, CID)
+                    .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+            } else {
+                crate::AtomicIntFieldLayout::new(0, CID)
+                    .map(|l| (l.value_compact_offset, l.value_legacy_offset))
+            };
+            assert_eq!(unbox_offsets(op, CID), want, "{}", op.as_str());
         }
     }
 
