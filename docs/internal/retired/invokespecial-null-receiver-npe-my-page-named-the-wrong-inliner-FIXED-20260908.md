@@ -1,4 +1,41 @@
-# `invokespecial` on a null receiver has lost its NPE again — the inliner claims the site before the emitter that carries the check, and the one gate that sees it is the one CI never runs
+# `invokespecial` on a null receiver lost its NPE again — FIXED 2026-09-08, and §2 of this page named the wrong inliner
+
+> **RETIRED 2026-09-08. The defect is fixed; §2's mechanism was WRONG.** Everything
+> below the banner is kept unedited so the error stays legible -- including its
+> now-false `Status: OPEN` line and its "No fix in this page" claim. Read the
+> banner as the status; read the body as what was believed on the day.
+>
+> Fixed by `936536100` (`jit,vm: three dispatch checks that existed on one
+> lowering path and not on its sibling`, defect 2). The write-up is
+> `warm-invokespecial-on-a-null-receiver-runs-the-callee-again-FIXED-20260908.md`
+> in this directory.
+>
+> **What §2 got wrong.** It named the single-pass backend's `try_emit_inline`
+> in `jit/src/x64/bytecode_walk.rs` as the optimisation that claimed the site.
+> The real culprit was the OPTIMIZING (C2/IR) tier: `IrBuilder::begin_splice`
+> bound arg 0 into callee local 0 and walked in, and since splicing deletes the
+> `invokespecial` that JVMS §6.5 hangs the NPE on, a body that never touches
+> `this` left no fault to fall back on. The fix adds `receiver_is_arg0` to
+> `IrInlineSite` and an `Op::Guard` on `Cmp(Ne, receiver, aconst_null)` ahead
+> of the splice, so taking it re-executes the invoke in the interpreter, where
+> the canonical NPE is raised by the code that owns it.
+>
+> **Why the evidence in §1 could not tell them apart, which is the reusable
+> part.** `NrpVariants`' callees are all small, and a small private callee is
+> claimed by BOTH inliners — the single-pass one and the IR one. Either fix
+> makes the site green, so a green small callee says nothing about which tier
+> was at fault, and `CRATONVM_DBG_JITC` naming an inline plan does not say
+> which inliner will finally own the site in a warmed method. The fix's test
+> settles it with a second callee, `privateCallBig`, sized past the single-pass
+> budget (`Refuse(CalleeTooLarge)`) and inside the IR tier's, which is four
+> times larger. Both arms reported NO-THROW; only the big one rules the
+> single-pass inliner out. **A discriminating probe needs a body each candidate
+> door sizes differently.**
+>
+> §3 (two gates, and CI ran the blind one) and §4 (the RED targets were a
+> number in a header) stand as written. `null_receiver_cached_invoke` was
+> ratcheted on 2026-09-08 after this fix, which was §5's step 3.
+
 
 **Status: OPEN — MEASURED 2026-09-08.** Windows 11, JDK 25 (Temurin
 `25.0.3+9`, the same image as the oracle), release binary built from
