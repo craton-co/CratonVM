@@ -1606,7 +1606,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` | JIT | `CRATONVM_JIT=unreg-accept-residue` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNREG_MEMO_GC_RESET` | JIT | `CRATONVM_JIT=unreg-memo-gc-reset` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNREG_MEMO_HIWATER` | JIT | `CRATONVM_JIT=unreg-memo-hiwater` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_JIT_UNREG_RESIDUE_LICENCE` | JIT | `CRATONVM_JIT=unreg-residue-licence` | default-on | on | behaviour | snapshot | vm |
+| `CRATONVM_JIT_UNREG_RESIDUE_LICENCE` | JIT | `CRATONVM_JIT=unreg-residue-licence` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_JIT_UNRESOLVED_FIELD_SUBSTITUTE` | JIT | `CRATONVM_JIT=unresolved-field-substitute` | opt-in | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_UNROLL` | JIT | `CRATONVM_JIT=unroll` | both | off | behaviour | snapshot | jit |
 | `CRATONVM_JIT_VARHANDLE_CAS_DIRECT_HELPERS` | JIT | `CRATONVM_JIT=varhandle-cas-direct-helpers` | default-on | on | behaviour | snapshot | jit |

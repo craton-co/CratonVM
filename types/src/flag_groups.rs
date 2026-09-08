@@ -1093,7 +1093,7 @@ pub const INVENTORY: &[E] = &[
     // the cycle. Marking is unaffected either way, so this can only change how
     // often the collector is allowed to compact. See
     // docs/internal/fixed-suite-bugs/gc/zgc-oom-on-mvstore-was-returned-frame-residue-FIXED-20260908.md
-    E { group: Group::JIT, token: "unreg-residue-licence", on_key: Some("CRATONVM_JIT_UNREG_RESIDUE_LICENCE"), off_key: None, off_word: Some("0"), since: "2026-09-08" },
+    E { group: Group::JIT, token: "unreg-residue-licence", on_key: Some("CRATONVM_JIT_UNREG_RESIDUE_LICENCE"), off_key: None, off_word: None, since: "2026-09-08" },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
     // so `=0` still enables it and `off_word` must stay `None`.

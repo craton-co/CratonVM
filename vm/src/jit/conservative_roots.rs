@@ -2546,21 +2546,50 @@ fn unreg_jit_accept_residue() -> bool {
     })
 }
 
-/// Kill switch for the residue test on the unregistered-JIT-frame probe's
-/// RELOCATION LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=0` restores the
-/// pre-2026-09-08 behaviour, where any accepted hit refused relocation for the
-/// cycle even when the returned-frame residue mark explained it.
+/// Opt-in for the residue test on the unregistered-JIT-frame probe's RELOCATION
+/// LICENCE -- `CRATONVM_JIT_UNREG_RESIDUE_LICENCE=1` lets a cycle relocate when
+/// every accepted hit is explained by the returned-frame residue mark.
 ///
-/// Marking is unaffected either way: the full band is conservatively scanned on
-/// every accepted hit under both settings, so this switch can only change how
-/// often the collector is ALLOWED TO COMPACT, never what it retains.
+/// **DEFAULT OFF since 2026-09-08, and the default is the measured one.** This
+/// shipped default-ON the same day and corrupts the heap. The reasoning that
+/// made it look safe is quoted here because it is nearly right:
+///
+/// > Marking is unaffected either way: the full band is conservatively scanned
+/// > on every accepted hit under both settings, so this switch can only change
+/// > how often the collector is ALLOWED TO COMPACT, never what it RETAINS.
+///
+/// Retention is indeed unaffected -- and retention is not the failure. Granting
+/// the licence lets ZGC RELOCATE a marked object while a raw word in that same
+/// band still holds its old address, and nothing rewrites a conservative root.
+/// The object survives; the pointer to it does not.
+///
+/// Measured on dev@d7768380b, ONE binary, concurrent paired arms,
+/// `MvsCreate 500000` at `-Xmx2g` on ZGC -- a heap where BOTH arms complete, so
+/// the control is a real control rather than an OOM:
+///
+/// | | `rc=0` |
+/// |---|---:|
+/// | licence granted | **8/10** |
+/// | licence withheld | **10/10** |
+///
+/// with faces `MVStoreException: Chunk 13 not found` and, unambiguously,
+/// `ClassCastException: class [B cannot be cast to class [J` -- one address
+/// carrying two different array headers. Pooled with the equivalent arms of an
+/// independent implementation of the same idea: 35 of 43 against 43 of 43,
+/// Fisher's exact p ~ 0.005.
+///
+/// The ZGC OOM this licence was built to fix is real and comes back when it is
+/// withheld. A loud OOM is a better default than silent corruption; the repair
+/// is to give the shallow band above `cover_hi` precise roots so the pin is not
+/// needed at all. See
+/// `docs/known-issues/gc/zgc-residue-licence-relocates-under-a-conservative-root-20260908.md`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn unreg_residue_licence_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNREG_RESIDUE_LICENCE").as_deref(),
-            Ok("0") | Ok("false") | Ok("off")
+            Ok("1") | Ok("true") | Ok("on")
         )
     })
 }
