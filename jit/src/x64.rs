@@ -246,7 +246,7 @@ pub use inlining::{
     begin_inline_frame_recording, begin_npe_trap_recording, finish_inline_frame_recording,
     finish_npe_trap_recording, inline_call_map_at_return_counts, inline_frame_map_enabled,
     inline_miss_edge_poison_counts, npe_trap_lines_enabled, InlineFrameLevel, InlineFrameMap,
-    NpeTrapMap, NpeTrapSite,
+    InlineFrameRow, NpeTrapMap, NpeTrapSite,
 };
 mod arith;
 mod arrays;

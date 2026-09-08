@@ -5262,16 +5262,31 @@ fn activation_bci(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> 
 ///
 /// Key 2 is the safepoint-id slot read back as a bci, and since 2026-09-02
 /// [`activation_bci`] can answer that for an `used_ir_backend` artifact too
-/// (through `CompiledMethod::safepoint_bci_table`). It still reaches no chain:
-/// an IR artifact's `inline_frame_map` is EMPTY, because
-/// `record_inline_frame_row` is called only from the single-pass splicer and
-/// one compile produces one artifact, so `compiled_frame_inline_chain` returns
-/// on the `is_empty()` guard before either key is consulted. Key 1 is a CODE
-/// LAYOUT fact -- the byte offset of a return address in this artifact's own
-/// buffer -- and carries no assumption about which backend emitted it, so it
-/// needs no refusal either. IR-tier inlining therefore still contributes no
-/// frames; it needs its own producer, keyed off `InlineScopeTable`, and that is
-/// a separate change from giving the tier a line.
+/// (through `CompiledMethod::safepoint_bci_table`). Key 1 is a CODE LAYOUT
+/// fact -- the byte offset of a return address in this artifact's own buffer
+/// -- and carries no assumption about which backend emitted it. Neither needs
+/// a backend refusal, and since 2026-09-08 neither gets one: an IR artifact
+/// that spliced a body now arrives here with a POPULATED `inline_frame_map`
+/// and its inlined callees are reported like any other.
+///
+/// Until then they were not. `record_inline_frame_row` is called only from the
+/// single-pass splicer, so an IR artifact's map was empty and this function
+/// returned on the `is_empty()` guard before either key was consulted -- and
+/// IR-tier inlining contributed no frames at all. That was invisible while the
+/// optimizing tier claimed few methods and became a live trace defect when it
+/// claimed more: measured 2026-09-08 on `probes/StackTraceAfterOsr.java`,
+/// `after_main_osr` printed `len=3 [leaf mid* outer* probe main]` against the
+/// interpreter's `len=5`, the two starred frames being bodies the IR splicer
+/// had inlined into `probe`.
+///
+/// The producer is `ir_lower`'s `note_inline_frame_return_site`, and it is
+/// keyed off `ir::IrInlineFrameSites` -- the COMBINED-BUFFER pc -- not off
+/// `InlineScopeTable` as this note used to predict. The reason is key 2's own
+/// ambiguity: a spliced region is covered by the caller's snapshot at the
+/// `invoke` pc, so every level of a NESTED splice reports one bci and
+/// `from_rows` (correctly) poisons rows that disagree under it. Combined-pc
+/// ranges are disjoint by construction, so they name one body and one nesting
+/// exactly -- which is what key 1, the exact return address, then carries.
 ///
 /// # The fail-closed rule
 ///
