@@ -1,3 +1,31 @@
+# ✅ FIXED — the Generational young sweep frees an object the INTERPRETER still holds
+
+> **RESOLVED 2026-09-08.** The object was not lost by the sweep. It was lost by
+> the NATIVE that was using it: `monitor_wait` parks, a peer's collection runs
+> to completion inside that park, and nine natives went on using the pre-park
+> address afterwards — including `MonitorTable::exit`, whose first act is
+> `header_of(obj_ref)`. That is the SIGSEGV this page reports, and the
+> `native_object_hash_code` / `get_array_element` sites below are the same
+> family one call deeper: `native_lbq_put_blocking` handed `native_lbq_offer`
+> its raw pre-park `args`, so the callee's receiver really was "dead on ENTRY,
+> straight out of `args`" — this page's own words.
+>
+> The fix, the evidence, the two probes and the new gate rule that catches the
+> shape are in
+> `natives-hold-a-stale-reference-across-a-park-FIXED-20260908.md`.
+> `probes/OldToYoungBarrierSweep.java` reproduces this page's crash in seconds
+> on Windows, with and without the JIT, and is clean 35/35 after the fix.
+>
+> **What this page got right and is worth keeping**: `--nojit` reproduces (the
+> defect is not the JIT); it is a FREE, not a move; the load gating; and the
+> retraction of its own first revision. **What it got wrong**: the sweep. The
+> root-in-dead-span invariant it never reached is unconditional and would have
+> retained the span — these references were in no root set at all.
+>
+> The original page follows unchanged.
+
+---
+
 # The Generational young sweep frees an object the INTERPRETER still holds
 
 | | |

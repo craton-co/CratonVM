@@ -219,10 +219,29 @@ reaches it; that argument now has a measurement behind it.
   `--XX:UseGc Generational` and `--XX:UseGc G1`, `-Xmx64m`, and 5/5 under every
   stress configuration in the table above.
 
+## 2026-09-08: the residual was a THIRD blind spot, and 25 more rows
+
+The residual below was root-caused the next day, and the answer changes this
+page's own numbers. A closure body -- `r.register(.., |ctx, args| { .. })`, the
+shape of most natives in this tree -- reassembled into ONE statement, so both
+rules were blind to every native registered that way.
+`register_p63_method_handles_lookup` is 410 lines and 26 statements; the audit
+reported 0 rows for it while `MethodHandles.lookup()` stored a pre-GC class
+mirror into a freshly allocated `Lookup`.
+
+With `statements()` closure-aware -- and closure-SCOPE-aware, so a binding in
+one registration cannot pair with a use in another -- `--loops` went from 0 to
+25 across `native-builtins` and `native-collections`. All 25 are fixed by the
+insertion this page describes, and both rules are back to 0. The full account,
+including the two bugs inside the fix itself, is on
+`stale-value-at-set_field-methodhandles-lookup-RETIRED-20260908.md`.
+
 ## One residual, found by the probe and NOT caused by this branch
 
 The probe's `growth` section SIGSEGVs under
 `GC_STRESS=65536 + DBG_FORCE_MOVING + DBG_STALE_OBJREF` together — 0/3, at
 minor cycle 460 every run — and does so IDENTICALLY on `origin/dev` and on this
 branch. Removing any one of the three flags makes it pass. It has its own page:
-`docs/known-issues/gcprobes-stale-value-reaches-set_field-under-the-three-flag-harness-20260908.md`.
+`docs/internal/audits/stale-value-at-set_field-methodhandles-lookup-RETIRED-20260908.md`
+-- **root-caused and fixed 2026-09-08**; it was `MethodHandles.lookup()`, not
+the collections that section names.
