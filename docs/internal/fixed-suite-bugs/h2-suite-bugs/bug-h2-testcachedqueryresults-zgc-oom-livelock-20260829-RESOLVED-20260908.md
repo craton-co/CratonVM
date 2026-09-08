@@ -1,6 +1,143 @@
 # `TestCachedQueryResults` — a ZGC `OutOfMemoryError` LIVELOCK, thousands per run, not a single failure
 
 
+## RETIRED 2026-09-08 -- re-verified 8/8 on dev, and the last soundness hole in the pin is closed
+
+Every code fix this page names is on dev and **default-on**: the pinned-peer
+credit, the peer shadow scan, the helper-window discharge,
+`Arena::commit_for_relocation` (the SIGSEGV's write half), the `JIT_READ_BOUNDS`
+withdrawal (its read half), the sp-id sentinel on all three backends, and the
+blocked-wake JIT remap. Re-verified here on `56f5a2fd3`, 304 commits past the
+last verification on this page: release binary, `-Xmx1g`, quiet host.
+
+### The acceptance test, met 5 of 5
+
+The test this page states is `relocation_on_proven_jit > 0` with 0 OOM **and**
+0 NPE **and** no crash, together. All five:
+
+| run | wall | `actual` | ref-array OOM | any OOM | arena | SIGSEGV | NPE | `skipped_jit` | `on_proven_jit` | relocated | windows pinned |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 717 s | 99938 | **0** | **0** | **0** | **0** | **0** | **0** | 49 | 655688 | 219/219 |
+| 2 | 729 s | 99910 | **0** | **0** | **0** | **0** | **0** | **0** | 64 | 703487 | 308/308 |
+| 3 | 770 s | 99930 | **0** | **0** | **0** | **0** | **0** | **0** | 53 | 655938 | 246/246 |
+| 4 | 625 s | 99935 | **0** | **0** | **0** | **0** | **0** | **0** | 42 | 632007 | 200/200 |
+| 5 | 665 s | 99933 | **0** | **0** | **0** | **0** | **0** | **0** | 55 | 654761 | 247/247 |
+
+**And the runs are not vacuous**, which is the number to check first:
+`relocation_on_proven_jit` is 42-64, at or above the 22-43 the 2026-09-05 (b)
+re-verification recorded, and `relocation_skipped_jit` is **0 in every run** --
+the relocation gate refuses nothing at all. Compaction is well above what this
+page closed on (632k-703k objects against 545893).
+
+The shortfall accounts exactly, by this page's own method, in all five:
+`100000 - actual` equals the `COUNTER` lock-timeout count to the unit (62, 90,
+70, 65, 67), and **none of it is an `OutOfMemoryError`**. That is the residual
+the 2026-09-05 (b) addendum characterised and accounted to the unit; it has not
+changed kind.
+
+### The one residual that was still a DEFECT: the pin claimed a completeness its predicate could not deliver
+
+`CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE` shipped 2026-09-04 as opt-in, and
+`fixed-suite-bugs/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904`
+records, while eliminating it as that page's cause, that *"it is
+`runtime_var_os(..).is_some()`, i.e. opt-in and default OFF, so it was never
+active in any run"*. True, and it was the last unclosed hole on this page.
+
+It mattered because `helper_window_discharge_enabled` is **default-on** and
+**discharges the refusal on the strength of the pin**. From 2026-09-04 the pin
+stopped being additive -- a hint that could only ever cost compaction -- and
+became the thing standing between relocation and a frozen peer's registers. A
+discharged cycle asks `helper_windows_all_pinned_this_cycle`, and that answered
+yes for windows pinned with `is_heap_addr`, which
+`ZgcRealHeap::resolve_interior_for_pin`'s own doc says drops exactly two shapes:
+
+* a **misaligned** interior pointer -- a compiled loop's cursor into a `char[]`
+  or `byte[]`;
+* a **one-past-the-end** cursor, because its extent test is `addr < end`.
+
+Either leaves the array unpinned while the cycle relocates. That is a
+use-after-free, not lost compaction, and it is the asymmetry
+`resolve_interior_for_pin` already argues for itself: a false positive costs one
+page of compaction, a false negative costs a use-after-free. The two flags had
+to agree, and the direction to agree in was never in doubt.
+`CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=0` is the kill switch.
+
+**Be clear about what the A/B does and does not show.** The control is CLEAN
+too:
+
+| arm | runs | ref-array OOM | any OOM | SIGSEGV | NPE | `skipped_jit` | `on_proven_jit` | relocated |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `PIN_RESOLVE` on (default) | 5 | 0 | 0 | 0 | 0 | 0 | 42-64 | 632k-703k |
+| `PIN_RESOLVE=0` (control) | 3 | 0 | 0 | 0 | 0 | 0 | 38-75 | 599k-751k |
+
+So this repair is **not validated by a failure it prevents**, and nobody should
+write it up as one. The hole is rare by construction -- it needs a misaligned or
+one-past-the-end cursor in a frozen peer's registers at the moment of a
+discharged relocating cycle -- and three runs were never going to reproduce it.
+This page's own 2026-09-05 addendum makes the same point about the read half:
+*"Five runs is not proof against a rarer fault."* The case rests on the
+soundness argument, not on the A/B.
+
+What the control DOES establish is the thing that could have blocked the change:
+**widening the pin costs no compaction.** The wider arm relocated more, not
+less, and every helper window pinned rather than refused (`hw_refused=0`,
+200-308 windows per run in both arms).
+
+### The last unmeasured item on this page's own path-to-a-PASS list, measured -- and it does not help
+
+The 2026-09-02 (idle host) entry specified three steps, of which step 2 was
+never run: *"keep the compaction pause under 500 ms -- `CRATONVM_ZGC_CONC_START`
+low enough that most cycles mark concurrently"*, on the reading that a 609 ms
+stop-the-world pause is above H2's `FOR UPDATE WAIT 0.5`, so every such pause
+landing inside a lock wait costs one entry.
+
+`CRATONVM_ZGC_CONC_START=auto` is the adaptive window that did not exist when
+that step was written. One run, same binary, and **engagement is confirmed
+first**: `concurrent_phase_ms=826` against `0` in every default-arm run, so
+concurrent marking genuinely ran and the arm is not vacuous.
+
+| arm | wall | `COUNTER` timeouts | `concurrent_phase_ms` | relocated |
+|---|---:|---:|---:|---:|
+| default (`CONC_START` unset) | 625-770 s | 62-90 | **0** | 632k-703k |
+| `CONC_START=auto` | 790 s | 90 | **826** | 865019 |
+
+**No improvement.** 90 timeouts sits inside the default arm's own 62-90 spread,
+and the wall clock is longer than any default run. That is what
+`Z_CONC_START_PERCENT_DEFAULT` predicts -- it records that marking concurrently
+wins 38-58% per cycle and roughly DOUBLES the cycle count, which is why the
+trigger is off by default -- and it agrees with this page's own 2026-09-05 (b)
+refutation of the throughput reading: the residual is SCHEDULING JITTER inside a
+500 ms budget, not mean pause duration. A uniformly shorter pause does not buy
+back a descheduled lock holder.
+
+So step 2 is answered in the negative and closes with the page. Nothing here
+argues for changing the `CONC_START` default, and the arm is recorded so the
+next reader does not spend the run.
+
+*(A second `auto` run was killed mid-flight by an unrelated session teardown,
+and a third was abandoned when another tenant started a 13-process build. Both
+are "no measurement" under this page's own rule, not results, and neither is
+counted above.)*
+
+### Regression suite
+
+92 passed, 0 failed on the same binary (`regression-suite/run.sh`), so the
+wider pin costs nothing elsewhere either.
+
+### What retires this page
+
+The two things this page said retiring it needs -- *"a quiet-host quorum on
+[ref-array `OutOfMemoryError` and SIGSEGV], not a better `actual`"* -- are 0 and
+0 across **8** runs on a quiet host, non-vacuous in every one. The residual is
+H2's own `WAIT 0.5` lock timeout, accounted to the unit, refuted as a throughput
+effect and now also refuted as a pause-duration effect. It is a property of the
+machine, not of the VM.
+
+Everything below this line is the investigation as it ran, kept verbatim --
+including a Status line that says OPEN, which was true when it was written.
+
+
+
 ## RESOLVED 2026-09-04 -- two complementary fixes, and the crash was never a GC root
 
 | configuration | SIGSEGV | ref-array OOM | completes | `actual` |
@@ -1002,6 +1139,11 @@ result.
 
 ## Status
 
+**RETIRED 2026-09-08.** Everything below this line is the investigation as it
+ran, kept verbatim -- including the Status text that said OPEN, which was true
+when it was written and is superseded by the 2026-09-08 addendum at the top of
+the page.
+
 **OPEN. The chain this Status line describes is REFUTED -- see the 2026-08-30 (b) addendum above, which measures the handshake at accepted=1731 refused=0 and gets the identical failure. Kept verbatim below because the four repairs it led to are real. Original text: the chain is traced to one frame — see §"2026-08-29 (second)".**
 The `xt_cov=(accepted=0 refused=1730)` lead this page shipped with turned out to
 be four measurements deep: the peers DO park, some of their own proofs return
@@ -1667,11 +1809,19 @@ style of depth accounting that produced a false positive earlier on this page.
 
 ### Bisect levers
 
-- `CRATONVM_XT_PINNED_PEER_DEPTH=1` — the credit (default OFF).
+**Every default in this list is as it was WHEN THE SECTION WAS WRITTEN, and two
+of them flipped on 2026-09-04.** The credit and the shadow scan are the fix, so
+they ship on; the `=1` forms below are what you needed on the tree these arms
+were measured on and are no-ops today. Read the 2026-09-08 addendum for the
+shipped defaults.
+
+- `CRATONVM_XT_PINNED_PEER_DEPTH` — the credit. **Default ON since 2026-09-04**;
+  `=0` is the kill switch.
 - `CRATONVM_XT_PINNED_PEER_PUBLISH_ONLY=1` — publish and deposit but credit
   nothing; separates the publisher from the decision, which one flag otherwise
-  conflates.
-- `CRATONVM_XT_PEER_SHADOW_SCAN=1` — the candidate fix (default OFF).
+  conflates. Still opt-in.
+- `CRATONVM_XT_PEER_SHADOW_SCAN` — the other half of the fix. **Default ON since
+  2026-09-04**; `=0` is the kill switch.
 - `CRATONVM_DBG_XT_COVERAGE=1` prints `peer_depth= proven= pinned= accounted=`.
   It is an ENGAGEMENT counter: `pinned=0` throughout means the credit never
   engaged and everything downstream is vacuous. Do NOT leave it on while
@@ -1681,9 +1831,18 @@ style of depth accounting that produced a false positive earlier on this page.
 
 ## Related
 
-- `bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
+- `fixed-suite-bugs/h2-suite-bugs/bug-h2-testkillprocess-zgc-oom-at-97-percent-free-20260821-FIXED-20260829.md`
   — the page this was split out of: the whole fragmentation diagnosis, the four
   repairs, and the counters to read.
-- `docs/known-issues/gc/zgc-arena-fragmentation-occurrences-to-reverify-20260829.md`
-  — the Spring Framework class with the same exponential-retry shape, and the
-  re-verification matrix both are waiting for.
+- `fixed-suite-bugs/gc/zgc-frag-occurrences-reverified-20260829.md` — the
+  re-verification matrix this page used to say both were waiting for. It has
+  been **run**: the Spring `SimpleClientHttpResponseTests` occurrence, which
+  this page cited for the same exponential-retry shape, is **re-attributed off
+  the fragmentation family** (it hangs with the frag gauge firing zero times,
+  and the `occurrence=` counter that made the shapes look alike belongs to the
+  descriptor-coercion guards, not to the frag gauge). Nothing on that matrix is
+  owed to this page.
+- `fixed-bugs/zgc-relocation-slides-wrote-into-decommitted-granules-FIXED-20260904.md`
+  — the SIGSEGV's write half.
+- `fixed-bugs/bug-box-unbox-intrinsic-segv-under-relocation-20260902-RESOLVED-20260905.md`
+  — the crash this page spent a week attributing to its own credit.
