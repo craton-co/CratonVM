@@ -2233,7 +2233,13 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 _ => return Ok(None),
             };
             let arr_len = ctx.array_length(entries);
+            // GC-safety: `accept` is an arbitrary user lambda; the consumer and
+            // the bucket array are both carried across every turn.
+            let action_pin = ctx.pin_native_root(action);
+            let entries_pin = ctx.pin_native_root(entries);
             for i in 0..arr_len {
+                let action = ctx.read_native_pin(action_pin, action);
+                let entries = ctx.read_native_pin(entries_pin, entries);
                 if let Value::Object(Some(entry)) = ctx.get_array_element(entries, i) {
                     let key = ctx.get_field(entry, 0);
                     let val = ctx.get_field(entry, 1);
@@ -2304,16 +2310,27 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 if let Some(Value::Object(Some(iter))) =
                     ctx.invoke_virtual(*coll, "iterator", "()Ljava/util/Iterator;", &[])?
                 {
+                    // GC-safety: `hasNext`/`next` are real bytecode and
+                    // `m18_lbq_add_internal` grows a backing array; the queue
+                    // being filled and the iterator driving it are both carried
+                    // in from outside.
+                    let this_pin = ctx.pin_native_root(this);
+                    let iter_pin = ctx.pin_native_root(iter);
                     loop {
+                        let this = ctx.read_native_pin(this_pin, this);
+                        let iter = ctx.read_native_pin(iter_pin, iter);
                         let has = ctx.invoke_virtual(iter, "hasNext", "()Z", &[])?;
                         if has != Some(Value::Int(1)) {
                             break;
                         }
+                        let iter = ctx.read_native_pin(iter_pin, iter);
                         let elem = ctx
                             .invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[])?
                             .unwrap_or(Value::Object(None));
+                        let this = ctx.read_native_pin(this_pin, this);
                         m18_lbq_add_internal(ctx, this, elem);
                     }
+                    ctx.unpin_native_roots(this_pin);
                 }
             }
             Ok(None)
@@ -2637,10 +2654,20 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                     return Ok(Some(Value::Int(0)));
                 }
             };
+            // GC-safety: `Collection.add` is real bytecode and can grow the
+            // target; the drained queue, its backing array and the destination
+            // are all carried across every turn.
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
+            let coll_pin = ctx.pin_native_root(coll);
             for i in 0..size as usize {
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                let coll = ctx.read_native_pin(coll_pin, coll);
                 let elem = ctx.get_array_element(arr, i);
                 ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             ctx.set_field(this, 1, Value::Int(0));
             ctx.monitor_notify_all(this)?;
             ctx.monitor_exit(this);
@@ -2685,7 +2712,12 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 _ => return Ok(None),
             };
             let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            // GC-safety: this loop parks on the monitor, which is the widest
+            // collection window there is, and dereferences `this` on the next
+            // turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -2787,7 +2819,11 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: parks on the monitor and dereferences `this` on
+            // the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
@@ -2841,7 +2877,11 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
+                // GC-safety: parks on the monitor and dereferences `this`
+                // on the next turn.
+                let this_pin = ctx.pin_native_root(this);
                 loop {
+                    let this = ctx.read_native_pin(this_pin, this);
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
                         Value::Int(n) => n,
@@ -3015,11 +3055,19 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
                 Value::Int(n) => n,
                 _ => 0,
             };
+            // GC-safety: as in the LBQ drain above.
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
+            let coll_pin = ctx.pin_native_root(coll);
             for i in 0..size {
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                let coll = ctx.read_native_pin(coll_pin, coll);
                 let idx = ((head + i) % cap) as usize;
                 let elem = ctx.get_array_element(arr, idx);
                 ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
             }
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             ctx.set_field(this, 1, Value::Int(0));
             ctx.set_field(this, 2, Value::Int(0));
             ctx.monitor_notify_all(this)?;
@@ -3460,7 +3508,11 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 _ => 0,
             };
             ctx.monitor_exit(this);
+            // GC-safety: parks on the monitor until a consumer takes the
+            // element, and dereferences `this` on the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let this = ctx.read_native_pin(this_pin, this);
                 let size_now = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,
                     _ => 0,
@@ -3545,7 +3597,11 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+                // GC-safety: parks on the monitor -- the widest collection
+                // window there is -- and dereferences `this` on the next turn.
+                let this_pin = ctx.pin_native_root(this);
                 loop {
+                    let this = ctx.read_native_pin(this_pin, this);
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
                         Value::Int(n) => n,
@@ -3573,7 +3629,11 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // GC-safety: parks on the monitor and dereferences `this` on
+            // the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
                     Value::Int(n) => n,

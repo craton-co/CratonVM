@@ -23727,7 +23727,12 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             let _ = ctx.ensure_class_initialized(pfp);
             let cid = ctx.class_id_by_name(pfp);
             let mut out = String::with_capacity(9);
+            // GC-safety: `Set.contains` below is a virtual dispatch into the
+            // caller's own set, run once per permission constant, and `set` is
+            // carried in from outside the loop.
+            let set_pin = ctx.pin_native_root(set);
             for i in 0..9 {
+                let set = ctx.read_native_pin(set_pin, set);
                 let present = if let Some(c) = cid {
                     match ctx.static_field_index_by_name(c, POSIX_FILE_PERMISSION_CONSTANTS[i]) {
                         Some(slot) => {

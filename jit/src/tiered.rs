@@ -1469,7 +1469,7 @@ pub fn dump_method_stats_to_stderr() {
          | still-interpreted={} c1={} full-profile={} c2={} \
          | compiles: c1={} c2={} osr={} deopts={} c2_bailouts={} total_compile_time_ms={} \
          | code_buffer_bails={} (discarded_compile_ms={}) \
-         | inline_live_slot_clamps={} \
+         | inline_live_slot_clamps={} inline_locals_floor_bumps={} \
          | c1_threshold={} hot_but_stuck_in_interpreter={} (of which ineligible-by-policy={}, compile-failures={})",
         snap.distinct_methods,
         snap.methods_ever_invoked,
@@ -1487,6 +1487,7 @@ pub fn dump_method_stats_to_stderr() {
         crate::code_buffer_bail_cost().0,
         crate::code_buffer_bail_cost().1,
         crate::x64::inline_live_slot_clamps(),
+        crate::x64::inline_locals_floor_bumps(),
         c1_threshold,
         hot_but_stuck.len(),
         ineligible_by_policy,

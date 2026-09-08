@@ -312,6 +312,175 @@ fn a_splice_does_not_rewind_the_cursor_under_a_buried_operand() {
     );
 }
 
+/// A reservation must not hand out a frame word that an OPEN inline scope's
+/// LOCALS still own.
+///
+/// # What this is about
+///
+/// A spliced callee's locals are reserved once, at its `callee_local_base`, and
+/// stay live until the wrapper pops the scope. They are NOT on the operand
+/// stack, so every "is this slot still owned?" scan in the compiler — the one
+/// in `pop_stack`'s reclaim arm, the one in `reset_spills`, the live-slot clamp
+/// in `try_emit_inline_body` — is blind to them. Any of the ~70 places that
+/// assign `next_spill_offset` can therefore leave the cursor pointing into an
+/// enclosing splice's locals, and the next reservation hands that word out to a
+/// second owner. The enclosing body then reads back whatever the new owner
+/// stored.
+///
+/// Measured on `CriteriaWindowFunctionTest` with `CRATONVM_DBG=jit-slot-overlap`
+/// before the floor: **151 of 304** overlap reports were against an ENCLOSING
+/// scope, i.e. one whose body continues after the inner call returns. Nearly
+/// all were `#1/3` — a middle scope in a three-deep splice — and in every
+/// sampled report the reservation range was EXACTLY the scope's locals range.
+/// With the floor: **0**, same binary, one switch, 11/11 both arms.
+///
+/// # Why the assertion is on the RESERVATION and not on a computed answer
+///
+/// The same reason its sibling above asserts on the cursor: the defect lives in
+/// the spill-slot simulation, and the descent that reaches an enclosing scope's
+/// locals needs a three-deep splice in an 11 KB bytebuddy body to occur
+/// naturally. What can be pinned here is the invariant itself — that a
+/// reservation never starts inside an open scope's locals, however the cursor
+/// got there — which is exactly what `reserve_spill_slots` now enforces.
+///
+/// The `A` arm is `CRATONVM_JIT_NO_INLINE_LOCALS_FLOOR=1`; it is not exercised
+/// here because the switch is a process-wide environment read and these tests
+/// run in parallel in one process.
+#[test]
+fn a_reservation_never_starts_inside_an_open_inline_scopes_locals() {
+    let alloc_result = crate::regalloc::RegAllocResult {
+        assignments: Vec::new(),
+        xmm_assignments: Vec::new(),
+        used_callee_saved: Vec::new(),
+        used_xmm_regs: Vec::new(),
+        block_live_in: Vec::new(),
+    };
+    let mut compiler = Compiler::new(
+        "inline-enclosing-locals-test".to_string(),
+        ExecutableBuffer::new(65536).expect("test executable buffer"),
+        0,
+        0,
+        64,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        alloc_result,
+        false,
+        test_helpers(),
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+
+    // THREE open scopes, the `#1/3` shape the census reports, because the
+    // floor is the maximum over the ENCLOSING ones only. Two scopes would leave
+    // a single enclosing scope and would pass just as well against a
+    // `last()`-style floor that ignores the outer one; three separates "max
+    // over the enclosing scopes" from "the scope just below the top".
+    let outer_base = compiler.next_spill_offset;
+    let outer = InlineOopScope {
+        local_base: outer_base,
+        num_locals: 3,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    };
+    let middle_base = outer_base + 3 * 8;
+    let middle = InlineOopScope {
+        local_base: middle_base,
+        num_locals: 2,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    };
+    // The top of the highest ENCLOSING scope: the floor.
+    let locals_top = middle_base + 2 * 8;
+    // The INNERMOST scope is the splice that is RETURNING. Its locals are dead
+    // at the `xreturn` that reclaims them, and the floor must NOT include them:
+    // a result pushed above them lands at the wrong operand depth, which is the
+    // ECJ `OperandStack.pop(OperandCategory)` miscompile that
+    // `a_spliced_callees_result_lands_at_the_callers_operand_depth` guards. The
+    // first cut of this floor included it and that test caught it.
+    let innermost = InlineOopScope {
+        local_base: locals_top,
+        num_locals: 4,
+        masks: Vec::new(),
+        reached: Vec::new(),
+        cur_pc: 0,
+    };
+    compiler.inline_oop_scopes.push(outer);
+    compiler.inline_oop_scopes.push(middle);
+    compiler.inline_oop_scopes.push(innermost);
+
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        locals_top,
+        "the floor is the top of the highest ENCLOSING scope's locals - not the \
+         innermost's, whose locals are dead at the return that reclaims them"
+    );
+
+    // Any of the cursor-lowering paths, simulated directly: what matters is not
+    // which assignment did it (the first attempt at this fix guarded two of
+    // them and took 151 reports only to 125) but that the cursor can end up
+    // here at all.
+    compiler.next_spill_offset = outer_base;
+    assert!(
+        compiler.next_spill_offset < locals_top,
+        "the hazard requires the cursor BELOW the enclosing locals; with it \
+         above, this test would prove nothing"
+    );
+
+    let start = compiler
+        .reserve_spill_slots(1, SpillReason::Push)
+        .expect("the reservation must succeed");
+    assert!(
+        start >= locals_top,
+        "reservation was handed slot {start}, inside the locals of an open \
+         enclosing inline scope ({outer_base}..{locals_top}): that callee's \
+         body continues after the inner call returns and still reads the word"
+    );
+    assert!(
+        compiler.next_spill_offset > locals_top,
+        "the cursor must also come back ABOVE the enclosing locals, or the NEXT \
+         reservation walks straight back into them"
+    );
+
+    // A LONE open scope IS the innermost, so the floor is inert for it: a
+    // single splice must keep landing its result at the caller's operand depth.
+    compiler.inline_oop_scopes.truncate(1);
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        i32::MIN,
+        "one open splice has no ENCLOSING scope, so nothing may be floored"
+    );
+
+    // And with nothing spliced at all the floor is inert - this must not cost a
+    // frame word in the methods that inline nothing, which is most of them.
+    compiler.inline_oop_scopes.clear();
+    assert_eq!(
+        compiler.open_inline_locals_floor(),
+        i32::MIN,
+        "no open scope must mean no floor"
+    );
+    let before = compiler.next_spill_offset;
+    let plain = compiler
+        .reserve_spill_slots(1, SpillReason::Push)
+        .expect("the reservation must succeed");
+    assert_eq!(
+        plain, before,
+        "with no splice open a reservation must start exactly at the cursor"
+    );
+}
+
 #[test]
 fn push_stack_refuses_to_cross_spill_limit() {
     let alloc_result = crate::regalloc::RegAllocResult {

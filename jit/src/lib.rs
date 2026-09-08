@@ -18427,16 +18427,46 @@ const MAX_DEFERRED_NEW_RETRIES: usize = 4096;
 /// the JIT's levers are.
 const MAX_DEFERRED_NEW_LOOKS: u32 = 16;
 
-/// The look budget in force, cached. `0` => unbounded.
+fn read_deferred_new_look_budget() -> u32 {
+    cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEFERRED_NEW_LOOKS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(MAX_DEFERRED_NEW_LOOKS)
+}
+
+/// The look budget in force, cached in production. `0` => unbounded.
+///
+/// # There is no process-wide memo in a TEST binary, deliberately
+///
+/// The `OnceLock` is right in production -- the flag cannot change and this is
+/// read per compile -- and wrong under `cfg(test)`, because
+/// `flags::runtime_var` honours `flags::with_thread_overrides`, which is
+/// THREAD-scoped. Memoizing a thread-scoped answer in a process-wide cell means
+/// whichever test thread reads it first decides the budget for every other test
+/// in the binary.
+///
+/// That had both of the consequences it has everywhere:
+/// `the_zero_budget_restores_the_unbounded_behaviour` carried an early return
+/// for the case where another test won the race, so it asserted NOTHING on most
+/// runs; and on the runs where it won instead, it latched an unbounded budget
+/// for the whole binary.
+///
+/// This is the same defect `ir_check_elim::enabled` was fixed for on
+/// 2026-09-07, found by the same scan, and the rule it breaks is already
+/// written down at `x64::osr::osr_empty_stack_entry_enabled`: "a process-wide
+/// latch would also put this out of reach of `flags::with_thread_overrides`,
+/// which is how a declared flag is arranged in a test."
 fn deferred_new_look_budget() -> u32 {
-    use std::sync::OnceLock;
-    static N: OnceLock<u32> = OnceLock::new();
-    *N.get_or_init(|| {
-        cratonvm_types::flags::runtime_var("CRATONVM_JIT_DEFERRED_NEW_LOOKS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(MAX_DEFERRED_NEW_LOOKS)
-    })
+    #[cfg(test)]
+    {
+        return read_deferred_new_look_budget();
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static N: OnceLock<u32> = OnceLock::new();
+        *N.get_or_init(read_deferred_new_look_budget)
+    }
 }
 
 /// Record that this method's IR build bailed on a `new` site whose class was
@@ -40935,13 +40965,19 @@ mod deferred_new_retry_gate_tests {
         cratonvm_types::flags::with_thread_overrides(
             &[("CRATONVM_JIT_DEFERRED_NEW_LOOKS", Some("0"))],
             || {
-                // The budget is read through a process-wide `OnceLock`, so this
-                // override only bites when this test wins the race to
-                // initialise it. Assert the PARSE, which is what the override
-                // controls, and the behaviour only when it took effect.
-                if super::deferred_new_look_budget() != 0 {
-                    return;
-                }
+                // No early return, and that is the point: the budget is read
+                // UNCACHED under `cfg(test)`, so the thread-scoped override
+                // always takes effect on this thread and never on any other.
+                // This used to bail whenever another test had already
+                // initialised a process-wide `OnceLock`, which on a parallel
+                // run was most of the time -- so the kill switch this test
+                // names went unexercised. See `deferred_new_look_budget`.
+                assert_eq!(
+                    super::deferred_new_look_budget(),
+                    0,
+                    "the override must reach the budget, or everything below \
+                     asserts the DEFAULT behaviour under a kill-switch name",
+                );
                 let (c, m, d) = ("T$Unbounded", "run", "()V");
                 let before = super::held_deferred_new_count();
                 super::note_deferred_new_bail(c, m, d, &[(2, 2)]);

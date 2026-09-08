@@ -3319,7 +3319,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             };
             // Each entry is a 3-field object (key=0, value=1, next=2)
             let arr_len = ctx.array_length(entries);
+            // GC-safety: `accept` is an arbitrary user lambda -- it allocates --
+            // and both the consumer and the bucket array are carried across
+            // every turn.
+            let action_pin = ctx.pin_native_root(action);
+            let entries_pin = ctx.pin_native_root(entries);
             for i in 0..arr_len {
+                let action = ctx.read_native_pin(action_pin, action);
+                let entries = ctx.read_native_pin(entries_pin, entries);
                 if let Value::Object(Some(entry)) = ctx.get_array_element(entries, i) {
                     let key = ctx.get_field(entry, 0);
                     let val = ctx.get_field(entry, 1);
@@ -8312,8 +8319,13 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
             // Not all parties arrived yet — record arrival and wait for phase to advance
             ph_set(ctx, this, PH_H_ARRIVALS, new_arrivals);
             let target_phase = phase + 1;
-            // Bounded monitor-waits until the phase advances
+            // Bounded monitor-waits until the phase advances.
+            //
+            // GC-safety: a parked thread is exactly where a PEER thread's
+            // collection runs, and `this` is dereferenced on the next turn.
+            let this_pin = ctx.pin_native_root(this);
             loop {
+                let this = ctx.read_native_pin(this_pin, this);
                 if let Err(e) = ctx.monitor_wait(this, Some(10)) {
                     ctx.monitor_exit(this);
                     return Err(e);
