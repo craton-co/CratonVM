@@ -156,10 +156,11 @@ SIGSEGV was root-caused and retired the same day, independently, as
 this Windows box on either binary, which is why nothing here claims it.
 
 The one remaining FAIL is `BindableTests.withAnnotationsShouldSetAnnotations`
-(26 of its 27 tests pass), and it is NOT one of the sites fixed here — it is the
-residual below, which the same run's always-on guard caught and named. The two
-classes that HUNG in this configuration before no longer do; one of them is this
-class, whose failure mode moved from a 900 s timeout to a named reclaim.
+(26 of its 27 tests pass), and it is not one of the sites fixed here: the same
+class fails the same way on the 2026-09-07 `dev` tip under the same stress
+interval, so it is pre-existing. The two classes that HUNG in this configuration
+before no longer do — one of them is this class, whose failure mode moved from a
+900 s timeout to a 520-830 s failure.
 
 **The negative result is worth as much as the fix.** That stress run produced
 **15,369 `[rset-verify]` reports and `missing=0` in every one** — the card table
@@ -260,15 +261,15 @@ the representation mismatch is the real defect there — it wants its own page.
 
 ## The family is NOT declared closed, and here is the residual
 
-The stressed subset above produced **one** reclaimed-receiver report, and it is
-not any of the sites fixed here:
+The stressed subset produced one reclaimed-receiver report that none of the nine
+fixes touches:
 
 ```text
 receiver is inside a YOUNG span the non-moving sweep zeroed and returned to the
-free list.
-  obj=0x1cfd3b014e0  site="invoke dispatch"  actual_class_id=0
-  target_class=java/lang/Object.asGenericType()Lnet/bytebuddy/description/type/TypeDescription$Generic;
-  freed_span="0x1cfd3b014e0+0x28"  interior_off=0  sweep_cycle=6353  free_seq=16948
+free list.  site="invoke dispatch"  actual_class_id=0
+  target_class=java/lang/Object.asGenericType()Lnet/bytebuddy/…/TypeDescription$Generic;
+…and it was RECLAIMED BY THE YOUNG SWEEP while still reachable.
+  original_class=net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType$ForLoadedType
 ```
 
 That is the ALWAYS-ON consumer, not the ring-based one this page corrects: it
@@ -276,34 +277,21 @@ fires on an interpreter INVOKE whose receiver reads an all-zero header AND whose
 address `reclaimed_hole_at` finds on the free list right now, so neither half of
 it can be a re-allocation false positive.
 
-Re-run alone with `CRATONVM_DBG_SWEEP_ZERO=1` it **reproduces, and the
-instrument names the victim**:
+**It is PRE-EXISTING.** The `dev` tip of 2026-09-07 20:29 — built the day before
+any of this work — reports the same victim class at the same sweep cycle
+(`6353`) on the same reproducer. These fixes neither caused it nor cured it.
 
-```text
-…and it was RECLAIMED BY THE YOUNG SWEEP while still reachable.
-  original_class=net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType$ForLoadedType
-  sweep_cycle=6322  free_seq=16909
-```
+**And it is not what fails the test**, which is a claim this page made in its
+first revision and which a later run refutes: on the merged tree the class
+failed with the same `MockitoException` and the guard reported nothing at all.
+Two co-occurrences were a coincidence of a deterministic workload. The reclaim
+and the Mockito failure are two separate pre-existing things in one class.
 
-2 of 2, at sweep cycle 6353/6322 and free sequence 16948/16909 — the same point
-in the allocation sequence. It lands in
-`BindableTests.withAnnotationsShouldSetAnnotations`, whose failure —
-`MockitoException: cannot mock this class: interface
-java.lang.annotation.Annotation`, "Underlying exception:
-IllegalArgumentException: Could not create type" — is this receiver and not the
-Mockito limitation the message names: `asGenericType()` on a
-`TypeDescription$Generic` is exactly what that is thrown out of.
-
-Filed separately rather than folded in here, because it is a different call path
-and survives all nine fixes above:
+Filed with the evidence, the ruled-out mechanisms, and the most specific lead
+(three predicates in this tree disagree about whether the non-moving sweep is
+running, and the one that guards the conservative frame-slot probe is the
+narrowest):
 `bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
-
-Two other classes in the same run emitted `young sweep: sweep anchor(s) are NOT
-on the object grid` (`off_grid=1 anchors=2`, eight times each, at identical
-`used=` values before and after this change). Both PASSED, and neither is the
-class above. That counter's own comment says it is "exactly zero on a sound
-anchor list", so it is a real signal; it is pre-existing, unchanged by this
-work, and belongs to whoever picks up the sweep's anchor list.
 
 ## What this does NOT claim
 
