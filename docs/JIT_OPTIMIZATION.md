@@ -4516,3 +4516,36 @@ assumed:
 What would settle it: the same 57-class A/B on a host at load < 2.5, which is
 what produced the 2.7% floor. Anything less and the answer is the noise floor,
 not the lever.
+
+#### `tools/h2-ab` — so an H2 claim can be re-checked at all
+
+The audit above found that no H2 throughput number in this file is
+reproducible: the harness that produced them was never committed, and the
+corpus's `test-classes/` directory is empty on this box, so even the 21-class
+shape cannot be rebuilt. `tools/h2-ab/h2-ab.sh` is the replacement, and its
+limits are stated in its own header rather than discovered later.
+
+It carries over the two rules that made the original trustworthy — ABBA per
+round (BAAB on odd rounds, so order bias cancels across rounds too), and a
+CONTROL arm measured twice every round whose spread is the noise floor, with an
+effect inside the floor refused. It adds a third: with no control pair at all it
+reports NO CONTROL rather than comparing against nothing.
+
+**What it cannot do, and the header says so.** One timed unit means no per-class
+sign test and no split-half check — the two things that caught a false result
+the same day. It answers only "is this bigger than the host's own same-config
+spread", the weakest of the three questions, and its positive verdict tells the
+reader to confirm on a second workload. `suite-pair-ab` remains the better
+instrument wherever the workload is fork-per-class.
+
+`--analyze <samples.tsv>` runs the statistics on recorded samples with no VM, so
+`selftest.sh` can check the maths directly. It was mutation-tested, and the
+mutation testing paid immediately: an assertion that checked only the VERDICT
+passed when `worst` was changed to "whichever round awk visited last", because
+awk walks an associative array in unspecified order and both readings happened
+to give UNMEASURABLE. The fixture now puts the worst round FIRST and asserts the
+reported floor VALUE (30.0%), which fails at 0.3% under that mutation.
+
+First real run, corroborating the Azure result on different hardware: the
+unresolved-class trap reads an effect of **-0.2% against a 7.5% floor** —
+UNMEASURABLE, agreeing with hibernate's z = +1.46.
