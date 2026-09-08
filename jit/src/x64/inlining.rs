@@ -907,7 +907,7 @@ impl InlineFrameMap {
     ///
     /// `code_len` is the artifact's final code length; a row past it describes
     /// bytes that are not in the artifact and is dropped.
-    fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
+    pub(crate) fn from_rows(rows: Vec<InlineFrameRow>, code_len: usize) -> Self {
         // Rewind backstop. Rows are appended in emission order, so their
         // offsets are strictly increasing UNLESS the buffer was rewound
         // between two of them. When it was, every row at or above the new
