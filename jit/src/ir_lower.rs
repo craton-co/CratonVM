@@ -476,6 +476,18 @@ struct Lowerer<'a> {
     /// glue, which emits no exceptional exit of its own). Read by
     /// [`Self::push_call_exc_patch`].
     cur_bci: usize,
+    /// The bytecode pc of the node being lowered, or `None` when that node
+    /// carried none.
+    ///
+    /// Distinct from [`Self::cur_bci`], which deliberately KEEPS the previous
+    /// value for a pc-less node so an exceptional exit still has a throw-site
+    /// bci. That persistence is right for a line and wrong for an inline
+    /// chain: attributing the previous node's splice nesting to a call emitted
+    /// under scheduler glue would name callees that are not on the stack, and
+    /// this area's rule is that no frame is better than a wrong one. Reset to
+    /// `None` on every pc-less node, so
+    /// [`Self::note_inline_frame_return_site`] fails closed instead.
+    cur_node_pc: Option<usize>,
     /// real-frame-deopt: native offsets of `JMP rel32` instructions emitted by
     /// failed guards that must be patched to jump to the shared deopt stub.
     deopt_stub_patches: Vec<usize>,
@@ -882,6 +894,18 @@ struct Lowerer<'a> {
     /// Empty on every compile today — `IrBuilder::build` does not inline — and
     /// an empty table reproduces the historical flat frame states exactly.
     inline_scopes: &'a InlineScopeTable,
+    /// Combined-buffer pc → the spliced callees enclosing it, innermost first.
+    ///
+    /// Empty unless `lib.rs` spliced a body into this compile. Non-empty, it is
+    /// what lets a stack trace through an optimizing-tier frame show the
+    /// callees this tier inlined — the gap `conservative_roots`'s
+    /// `compiled_frame_inline_chain` documented as "IR-tier inlining therefore
+    /// still contributes no frames". See [`ir::IrInlineFrameSites`].
+    inline_frame_sites: &'a crate::ir::IrInlineFrameSites,
+    /// Rows accumulated at call return sites inside spliced bodies, becoming
+    /// `CompiledMethod::inline_frame_map`. Empty ⇒ the artifact carries the
+    /// same empty map it always did.
+    inline_frame_rows: Vec<crate::x64::InlineFrameRow>,
 
     // ── Linear-scan register read cache ──────────────────────────────
     //
@@ -1160,6 +1184,7 @@ impl<'a> Lowerer<'a> {
         ic_slots: &'a HashMap<usize, (usize, usize)>,
         compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
         inline_scopes: &'a InlineScopeTable,
+        inline_frame_sites: &'a crate::ir::IrInlineFrameSites,
     ) -> Self {
         // Frame homes of the reference PARAMETERS, in `[rbp - off]` form. Every
         // safepoint map republishes these; see `emit_safepoint_map`.
@@ -1516,6 +1541,9 @@ impl<'a> Lowerer<'a> {
             spliced_ranges,
             sr_map,
             inline_scopes,
+            inline_frame_sites,
+            inline_frame_rows: Vec::new(),
+            cur_node_pc: None,
             // Off by default; `lower_inner_with_scopes` installs a plan when
             // `CRATONVM_JIT_IR_LINEAR_SCAN` is on. Empty vectors, not
             // node-sized ones: `resident_xmm` reads through `get`, so an
@@ -5197,6 +5225,12 @@ impl<'a> Lowerer<'a> {
         let patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
         self.self_call_patches.push(patch);
+        // This route bypasses `emit_call_return_check`, so it records its own
+        // inline-frame row. Same obligation, same reason as the republish
+        // below: what that helper does for the shared routes has to happen
+        // here too, or a frame suspended in this call reports no inlined
+        // callees while the identical call on another route reports them.
+        self.note_inline_frame_return_site();
         // The recursive callee published ITS frame's RBP into the mirror on
         // entry. This route bypasses `emit_call_return_check`, so it has to
         // republish here or the mirror keeps naming the returned frame — which
@@ -5395,6 +5429,11 @@ impl<'a> Lowerer<'a> {
             // republish and shadow reload come FIRST so the cold side (which
             // can run the interpreter and collect) sees this frame's own
             // identity rather than the callee's dead one.
+            //
+            // The inline-frame row is recorded before either, for the same
+            // reason `emit_call_return_check` records it first: the return
+            // address is the offset as it stands NOW.
+            self.note_inline_frame_return_site();
             self.emit_post_call_frame_record();
             self.emit_shadow_reload();
             let keep = self.emit_call_sentinel_fast_skip();
@@ -5985,7 +6024,60 @@ impl<'a> Lowerer<'a> {
     /// exception/deopt is pending, else keep the real value. The result is then
     /// spilled to `slot` (harmless for a void call: the slot is allocated but
     /// never read).
+    /// Record the inline chain for the call that has JUST been emitted, if it
+    /// came from inside a spliced body.
+    ///
+    /// Must be called with `self.buf.pos()` sitting immediately after the CALL
+    /// instruction: that offset IS the return address a walker will find in
+    /// this frame, and it is the exact key
+    /// `x64::InlineFrameMap::chain_for_native_offset` looks up. Exactness is
+    /// the whole design — see [`crate::ir::IrInlineFrameSites`] for why the
+    /// bci cannot serve as the key for a nested splice.
+    ///
+    /// Records NOTHING when this compile spliced nothing (the overwhelming
+    /// majority, and one `is_empty` check), when the node's pc is not inside a
+    /// spliced body (an ordinary call in the compiling method's own code, which
+    /// already reports itself correctly), or when the map is switched off.
+    fn note_inline_frame_return_site(&mut self) {
+        if self.inline_frame_sites.is_empty() || !crate::x64::inline_frame_map_enabled() {
+            return;
+        }
+        // `cur_node_pc`, never `cur_bci`: see the field's own note.
+        let Some(node_pc) = self.cur_node_pc else {
+            return;
+        };
+        let chain = self.inline_frame_sites.chain_at(node_pc);
+        if chain.is_empty() {
+            return;
+        }
+        // The compiling method's own bci for this program point. Absent it the
+        // row would have to invent one, and a bci-keyed row carrying a
+        // combined-buffer pc is exactly the "not a spec-legal bytecode index"
+        // shape the emitter refuses everywhere else.
+        let Some(safepoint_bci) = self.inline_frame_sites.enclosing_bci_at(node_pc) else {
+            return;
+        };
+        let Ok(native_offset) = u32::try_from(self.buf.pos()) else {
+            return;
+        };
+        self.inline_frame_rows.push(crate::x64::InlineFrameRow {
+            native_offset,
+            safepoint_bci,
+            chain: chain
+                .into_iter()
+                .map(|l| crate::x64::InlineFrameLevel {
+                    label: l.method_key,
+                    bci: l.bci,
+                    class_id: l.class_id,
+                })
+                .collect(),
+        });
+    }
+
     fn emit_call_return_check(&mut self, slot: i32, ty: IrType) {
+        // The return address for the call just emitted is HERE, before any of
+        // the post-call sequence below moves `buf`.
+        self.note_inline_frame_return_site();
         // The call has just returned. Copy back any relocated shadow values
         // BEFORE anything else touches the frame — and before the sentinel
         // compare below, which clobbers R10. Uses RCX, never RAX, so the return
@@ -6186,6 +6278,7 @@ impl<'a> Lowerer<'a> {
         // has to happen here too, in the same order: the bci anchor is read at
         // the position the first byte lands on, and the slot allocation is what
         // publishes the node to `defined_nodes` and moves the spill watermark.
+        self.cur_node_pc = self.graph.nodes[id as usize].bytecode_pc;
         if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
             let here = self.buf.pos();
             self.cur_bci = pc;
@@ -6856,6 +6949,7 @@ impl<'a> Lowerer<'a> {
         // native offset emitted for it, so safepoint snapshots can be keyed
         // by native offset. `self.graph` is a `&'a Graph`, so reading
         // `bytecode_pc` here does not borrow `self`.
+        self.cur_node_pc = self.graph.nodes[id as usize].bytecode_pc;
         if let Some(pc) = self.graph.nodes[id as usize].bytecode_pc {
             let here = self.buf.pos();
             self.cur_bci = pc;
@@ -9160,6 +9254,7 @@ impl<'a> Lowerer<'a> {
         {
             self.emit_safepoint_poll();
         }
+        self.cur_node_pc = self.graph.nodes[term as usize].bytecode_pc;
         if let Some(pc) = self.graph.nodes[term as usize].bytecode_pc {
             self.cur_bci = pc;
         }
@@ -14802,6 +14897,7 @@ pub fn lower(
         &no_direct,
         &no_ic,
         &no_compact,
+        &crate::ir::IrInlineFrameSites::default(),
     )
 }
 
@@ -14833,6 +14929,7 @@ pub fn lower_with_branch_hints(
         &no_direct,
         &no_ic,
         &no_compact,
+        &crate::ir::IrInlineFrameSites::default(),
     )
 }
 
@@ -14866,6 +14963,7 @@ pub fn lower_with_scalar_deopt(
         &no_direct,
         &no_ic,
         &no_compact,
+        &crate::ir::IrInlineFrameSites::default(),
     )
 }
 
@@ -14935,9 +15033,12 @@ pub(crate) fn lower_inner(
     direct_calls: &HashMap<usize, (usize, bool)>,
     ic_slots: &HashMap<usize, (usize, usize)>,
     compact_fields: &HashMap<(usize, bool), (u32, bool, u8)>,
+    inline_frame_sites: &crate::ir::IrInlineFrameSites,
 ) -> Option<CompiledMethod> {
     // No inlined callee scopes: every deopt point is a single flat frame, which
-    // is what this path has always produced.
+    // is what this path has always produced. The inline FRAME sites are a
+    // different table with a different consumer (stack traces, not deopt), so
+    // this path forwards the caller's rather than substituting an empty one.
     let no_scopes = InlineScopeTable::new();
     lower_inner_with_scopes(
         graph,
@@ -14952,6 +15053,7 @@ pub(crate) fn lower_inner(
         ic_slots,
         compact_fields,
         &no_scopes,
+        inline_frame_sites,
     )
 }
 
@@ -14991,6 +15093,10 @@ pub(crate) fn lower_inner_with_scopes(
     // Which inlined callee each `graph.safepoints` entry belongs to, and the
     // caller scopes above it. Empty ⇒ flat, caller-less deopt frames.
     inline_scopes: &InlineScopeTable,
+    // Combined-buffer pc → enclosing spliced callees. Empty ⇒ this compile
+    // spliced nothing and the artifact's inline frame map stays empty, exactly
+    // as it was before 2026-09-08.
+    inline_frame_sites: &crate::ir::IrInlineFrameSites,
 ) -> Option<CompiledMethod> {
     // A monitor whose helper is absent must REFUSE the compile.
     //
@@ -15335,6 +15441,7 @@ pub(crate) fn lower_inner_with_scopes(
         ic_slots,
         compact_fields,
         inline_scopes,
+        inline_frame_sites,
     );
 
     // Null-check and bounds-check elimination. Runs on the SCHEDULED graph
@@ -15649,6 +15756,7 @@ pub(crate) fn lower_inner_with_scopes(
     let shadow_savebase_slot_off = lowerer.shadow_savebase_slot_off;
     let oop_maps = std::mem::take(&mut lowerer.oop_maps);
     let sp_id_bcis = std::mem::take(&mut lowerer.sp_id_bcis);
+    let inline_frame_rows = std::mem::take(&mut lowerer.inline_frame_rows);
     let locals_size = lowerer.locals_size;
     let first_spill = lowerer.first_spill;
     let spill_cap_off = lowerer.spill_cap_off;
@@ -15910,6 +16018,15 @@ pub(crate) fn lower_inner_with_scopes(
     // asserted: a future lowerer that emits a safepoint out of order would
     // otherwise turn a diagnostic into a wrong line, and the vector is one
     // entry per GC-capable point.
+    // The inlined callees this tier spliced, as a stack trace needs them.
+    //
+    // `code_len()` is load-bearing exactly as it is on the single-pass side:
+    // `from_rows` uses it to bound the offsets it will keep. An artifact that
+    // spliced nothing pushes no rows and gets `InlineFrameMap::default()` —
+    // two empty `Vec`s, the state every IR artifact was in before 2026-09-08,
+    // when `compiled_frame_inline_chain` returned on its `is_empty()` guard and
+    // IR-tier inlining contributed no frames at all.
+    cm.inline_frame_map = crate::x64::InlineFrameMap::from_rows(inline_frame_rows, cm.code_len());
     cm.safepoint_bci_table = {
         let mut t = sp_id_bcis;
         t.sort_unstable_by_key(|(id, _)| *id);
@@ -16911,6 +17028,7 @@ mod tests {").next().unwrap_or(src);
             &no_direct,
             &no_ic,
             &compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("a reference putfield with its helper wired must compile")
         .code_bytes()
@@ -17021,6 +17139,7 @@ mod tests {").next().unwrap_or(src);
             &no_direct,
             &no_ic,
             &compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("the gated reference store must compile");
 
@@ -17238,6 +17357,7 @@ mod tests {").next().unwrap_or(src);
             &no_direct,
             &no_ic,
             &no_compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("the store must still compile through the helper")
         .code_bytes()
@@ -17295,6 +17415,7 @@ mod tests {").next().unwrap_or(src);
             &no_direct,
             &no_ic,
             &compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("the store must still compile through the helper")
         .code_bytes()
@@ -17697,6 +17818,7 @@ mod tests {").next().unwrap_or(src);
             &no_direct,
             ic,
             &no_compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("virtual-call method must lower")
         .code_bytes()
@@ -17767,6 +17889,7 @@ mod tests {").next().unwrap_or(src);
             &direct,
             &no_ic,
             &no_compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("wide direct call must lower")
         .code_bytes()
@@ -17941,6 +18064,7 @@ mod tests {").next().unwrap_or(src);
             &no_direct,
             &no_ic,
             &no_compact,
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect(
             "the self-recursive body must lower — an imbalance now makes \
@@ -18785,6 +18909,7 @@ mod tests {").next().unwrap_or(src);
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("lower");
 
@@ -18820,6 +18945,7 @@ mod tests {").next().unwrap_or(src);
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("lower");
         assert!(
@@ -18862,6 +18988,7 @@ mod tests {").next().unwrap_or(src);
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &crate::ir::IrInlineFrameSites::default(),
         )
         .expect("lower");
 
@@ -20485,6 +20612,7 @@ mod tests {").next().unwrap_or(src);
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
         let no_compact_fields: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let no_scopes = InlineScopeTable::new();
+        let no_frame_sites = crate::ir::IrInlineFrameSites::default();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
         let plan = plan_slots(&graph, &schedule, None);
@@ -20503,6 +20631,7 @@ mod tests {").next().unwrap_or(src);
             &no_ic,
             &no_compact_fields,
             &no_scopes,
+            &no_frame_sites,
         );
 
         // Unallocated is an error, not an offset.
@@ -21256,6 +21385,7 @@ mod tests {").next().unwrap_or(src);
         let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
         let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let no_scopes = InlineScopeTable::new();
+        let no_frame_sites = crate::ir::IrInlineFrameSites::default();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
         let mut lowerer = Lowerer::new(
@@ -21273,6 +21403,7 @@ mod tests {").next().unwrap_or(src);
             &no_ic,
             &no_compact,
             &no_scopes,
+            &no_frame_sites,
         );
         let scratch = lowerer.phi_copy_scratch_slot_off;
         let frame = lowerer.frame_size;
@@ -21487,6 +21618,7 @@ mod tests {").next().unwrap_or(src);
             let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
             let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
             let no_scopes = InlineScopeTable::new();
+            let no_frame_sites = crate::ir::IrInlineFrameSites::default();
             let buf = ExecutableBuffer::new(4096).expect("executable buffer");
             let helpers = no_helpers();
             let lowerer = Lowerer::new(
@@ -21504,6 +21636,7 @@ mod tests {").next().unwrap_or(src);
                 &no_ic,
                 &no_compact,
                 &no_scopes,
+                &no_frame_sites,
             );
 
             // The five bookkeeping words are contiguous and end at first_spill.
@@ -21664,6 +21797,7 @@ mod tests {").next().unwrap_or(src);
         let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let buf = ExecutableBuffer::new(4096).expect("executable buffer");
         let helpers = no_helpers();
+        let no_frame_sites = crate::ir::IrInlineFrameSites::default();
         let lowerer = Lowerer::new(
             graph,
             &schedule,
@@ -21679,6 +21813,7 @@ mod tests {").next().unwrap_or(src);
             &no_ic,
             &no_compact,
             scopes,
+            &no_frame_sites,
         );
         lowerer.resolve_frame_state(&graph.safepoints[index], index)
     }
@@ -23912,6 +24047,8 @@ mod tests {").next().unwrap_or(src);
         let no_ic: &'static HashMap<usize, (usize, usize)> = Box::leak(Box::new(HashMap::new()));
         let no_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
         let no_scopes: &'static InlineScopeTable = Box::leak(Box::new(InlineScopeTable::new()));
+        let no_frame_sites: &'static crate::ir::IrInlineFrameSites =
+            Box::leak(Box::new(crate::ir::IrInlineFrameSites::default()));
         let helpers: &'static JitRuntimeHelpers = Box::leak(Box::new(no_helpers()));
         let buf = ExecutableBuffer::new(buf_cap).expect("executable buffer");
         let mut lowerer = Lowerer::new(
@@ -23929,6 +24066,7 @@ mod tests {").next().unwrap_or(src);
             no_ic,
             &no_compact,
             no_scopes,
+            no_frame_sites,
         );
         if let Some(reg) = reg {
             lowerer.set_residency(RegResidency {

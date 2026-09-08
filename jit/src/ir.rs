@@ -1278,6 +1278,178 @@ pub struct IrInlineSite {
     /// Not derivable from `num_args` or `arg_local_slots`: a static callee's
     /// argument 0 also lands in local 0.
     pub receiver_is_arg0: bool,
+    /// The callee's `"class/Name.method:descriptor"` label — the same shape
+    /// [`crate::x64::InlineFrameLevel::label`] carries and the same one
+    /// `CompiledMethod::method_label` uses, so a consumer parses it with the
+    /// splitter `stackwalker::compiled_frame_entry` already has.
+    ///
+    /// Carried for ONE reason: a spliced body's frames are invisible to a stack
+    /// trace without it. Everything else on this struct describes how to RUN
+    /// the callee's bytecode; this pair describes whose bytecode it is, which
+    /// is what a trace needs and what nothing here recorded until 2026-09-08.
+    /// See [`IrInlineFrameSites`].
+    pub method_key: String,
+    /// `ClassId` of the class [`Self::method_key`] names, or `0` when the
+    /// resolver supplied none. Same contract as
+    /// [`crate::x64::InlineFrameLevel::class_id`]: a consumer that must answer
+    /// in `ClassId` expands the level without resolving a JIT label by name.
+    pub class_id: u32,
+}
+
+/// One level of an inline chain, in the arch-neutral form this module can
+/// speak. `ir_lower` converts these to [`crate::x64::InlineFrameLevel`] at the
+/// point it records a row; the split keeps `ir.rs` free of an x64 dependency
+/// while both sides agree on the field meanings exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrInlineFrameLevel {
+    /// `"class/Name.method:descriptor"` of the spliced callee.
+    pub method_key: String,
+    /// Bytecode index inside that callee's OWN code — never a combined-buffer
+    /// pc, which is the whole point of the translation below.
+    pub bci: u32,
+    /// `ClassId` of the class `method_key` names, or `0`.
+    pub class_id: u32,
+}
+
+/// Resolves a COMBINED-BUFFER pc to the chain of spliced callees enclosing it,
+/// innermost first.
+///
+/// # Why this exists, and why the combined pc is the right key
+///
+/// The IR tier splices in the bytecode domain: `lib.rs` appends each admitted
+/// callee's body after the caller's code and the builder walks the result, so
+/// a program point inside a spliced body carries a pc PAST the caller's own
+/// `code_len` (see [`IrInlineSite`]). Every node the builder creates there is
+/// stamped with that combined pc, and it survives untouched into `ir_lower`.
+///
+/// That makes the combined pc an EXACT key, and exactness is what this needed.
+/// The obvious alternative — the bci a frame reports — cannot work: a spliced
+/// region is covered by the caller's snapshot at the `invoke` pc, so every
+/// level of a nested splice reports the SAME bci, and
+/// `x64::InlineFrameMap::from_rows` (correctly) poisons rows that disagree
+/// under one bci. Combined-pc ranges, by contrast, are disjoint by
+/// construction: `lib.rs` appends each body once, at its own `base`, so a pc
+/// names exactly one body and the nesting is recovered by following each
+/// site's CALLER pc outward.
+///
+/// # What it deliberately does not do
+///
+/// It answers `None` — not a guess — for a pc in no spliced range (the
+/// compiling method's own code, which is the physical frame and not an inlined
+/// level), for a malformed site table, and for a chain that would exceed
+/// [`MAX_INLINE_SCOPE_DEPTH`]. A missing chain costs a trace some frames; a
+/// wrong one names a method that never ran, which is the outcome this whole
+/// area refuses.
+#[derive(Clone, Debug, Default)]
+pub struct IrInlineFrameSites {
+    /// `(base, code_len, caller_pc, method_key, class_id)` per spliced body,
+    /// ascending by `base`. Ranges are disjoint, so a binary search on `base`
+    /// finds the only candidate.
+    bodies: Vec<(usize, usize, usize, String, u32)>,
+}
+
+impl IrInlineFrameSites {
+    /// Build from the builder's site table. `sites` is keyed by CALLER pc, in
+    /// combined coordinates, exactly as [`IrInlineTables::sites`] holds it.
+    pub fn from_sites(sites: &HashMap<usize, IrInlineSite>) -> Self {
+        let mut bodies: Vec<(usize, usize, usize, String, u32)> = sites
+            .iter()
+            .map(|(&caller_pc, s)| {
+                (
+                    s.base,
+                    s.code_len,
+                    caller_pc,
+                    s.method_key.clone(),
+                    s.class_id,
+                )
+            })
+            .collect();
+        bodies.sort_unstable_by_key(|&(base, _, _, _, _)| base);
+        Self { bodies }
+    }
+
+    /// `true` when nothing was spliced — the state of every compile that
+    /// inlines nothing, and the fast path every caller takes first.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
+    /// Index of the body whose range contains `pc`, or `None`.
+    fn body_at(&self, pc: usize) -> Option<usize> {
+        // The last body whose `base <= pc`; ranges are disjoint and ascending,
+        // so no earlier one can contain `pc`.
+        let i = match self.bodies.binary_search_by_key(&pc, |&(b, _, _, _, _)| b) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let (base, code_len, ..) = self.bodies[i];
+        // `base + code_len` cannot overflow: both came from a buffer this
+        // process built, but saturate rather than assume it.
+        if pc < base.saturating_add(code_len) {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// The chain of spliced callees enclosing `pc`, innermost first, or an
+    /// empty vector when `pc` is not inside any spliced body.
+    ///
+    /// Each level's `bci` is an index into THAT level's own code: for the
+    /// innermost it is `pc - base`, and for every level above it the offset of
+    /// the nested call inside its parent's body.
+    pub fn chain_at(&self, pc: usize) -> Vec<IrInlineFrameLevel> {
+        let mut out = Vec::new();
+        let mut at = pc;
+        while let Some(i) = self.body_at(at) {
+            let (base, _, caller_pc, ref key, class_id) = self.bodies[i];
+            // Cast: a bci inside a body this compile appended, so it is bounded
+            // by the combined buffer's length.
+            let Ok(bci) = u32::try_from(at - base) else {
+                return Vec::new();
+            };
+            out.push(IrInlineFrameLevel {
+                method_key: key.clone(),
+                bci,
+                class_id,
+            });
+            if out.len() > MAX_INLINE_SCOPE_DEPTH {
+                // A malformed table (a body whose caller pc lands back inside
+                // itself) would otherwise walk forever. Give up the chain
+                // whole rather than return a truncated one that reads as
+                // complete.
+                return Vec::new();
+            }
+            // Step out: the call that produced this level lives at the site's
+            // CALLER pc, which is either inside the enclosing spliced body or
+            // in the compiling method's own code — where the walk ends.
+            at = caller_pc;
+        }
+        out
+    }
+
+    /// The COMPILING method's own bci covering `pc`: the caller pc of the
+    /// outermost splice enclosing it, which is by construction an index into
+    /// that method's real bytecode.
+    ///
+    /// `None` when `pc` is in no spliced body — the caller already has the
+    /// method's own bci in that case and must not take one from here.
+    pub fn enclosing_bci_at(&self, pc: usize) -> Option<u32> {
+        let mut at = pc;
+        let mut guard = 0usize;
+        let mut found = None;
+        while let Some(i) = self.body_at(at) {
+            at = self.bodies[i].2;
+            found = Some(at);
+            guard += 1;
+            if guard > MAX_INLINE_SCOPE_DEPTH {
+                return None;
+            }
+        }
+        found.and_then(|b| u32::try_from(b).ok())
+    }
 }
 
 /// The pc-keyed rows a set of [`IrInlineSite`]s adds to the builder's existing
@@ -12508,6 +12680,132 @@ mod tests {
         );
         assert_eq!(graph.verify_use_lists(), Ok(()));
         assert_eq!(graph.use_counts(), scanned_use_counts(&graph));
+    }
+
+    // ── IR-tier inline FRAME sites (stack traces) ────────────────────
+    //
+    // The probe these are modelled on is `probes/StackTraceAfterOsr.java`:
+    // `probe()` calls `outer(1)`, which calls `mid`, which calls `leaf`. The
+    // IR tier splices `outer` and then `mid` into `probe`'s combined buffer,
+    // and before 2026-09-08 both contributed no stack frame at all.
+
+    /// `probe` has real code `[0, code_len)`; `outer` is spliced at caller pc
+    /// 42 and `mid` is spliced at a caller pc INSIDE `outer`'s body.
+    fn probe_shaped_sites() -> HashMap<usize, IrInlineSite> {
+        fn site(base: usize, code_len: usize, key: &str, class_id: u32) -> IrInlineSite {
+            IrInlineSite {
+                base,
+                code_len,
+                num_args: 1,
+                max_locals: 1,
+                arg_local_slots: vec![0],
+                returns_value: true,
+                receiver_is_arg0: false,
+                method_key: key.to_string(),
+                class_id,
+            }
+        }
+        let mut m = HashMap::new();
+        // `outer` spliced at probe's pc 42, body at [100, 107).
+        m.insert(42, site(100, 7, "P.outer:(I)I", 7));
+        // `mid` spliced at combined pc 101 — one byte into `outer`'s body —
+        // with its own body at [200, 207).
+        m.insert(101, site(200, 7, "P.mid:(I)I", 7));
+        m
+    }
+
+    /// Nothing spliced ⇒ no chain anywhere, and the fast path reports empty.
+    #[test]
+    fn inline_frame_sites_empty_answers_nothing() {
+        let sites = IrInlineFrameSites::default();
+        assert!(sites.is_empty());
+        assert!(sites.chain_at(0).is_empty());
+        assert!(sites.chain_at(9999).is_empty());
+        assert_eq!(sites.enclosing_bci_at(42), None);
+    }
+
+    /// A pc in the COMPILING method's own code is not an inlined level. It is
+    /// the physical frame, which reports itself; answering a chain for it would
+    /// name a callee that is not on the stack.
+    #[test]
+    fn inline_frame_sites_refuse_the_compiling_methods_own_code() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        assert!(!sites.is_empty());
+        assert!(sites.chain_at(0).is_empty());
+        assert!(sites.chain_at(42).is_empty());
+        assert_eq!(sites.enclosing_bci_at(42), None);
+    }
+
+    /// One level deep: a pc inside `outer`'s body names `outer` alone, at
+    /// `outer`'s OWN bci — never the combined-buffer pc.
+    #[test]
+    fn inline_frame_sites_one_level() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        let chain = sites.chain_at(103);
+        assert_eq!(chain.len(), 1, "one spliced body encloses pc 103");
+        assert_eq!(chain[0].method_key, "P.outer:(I)I");
+        assert_eq!(chain[0].bci, 3, "103 - base 100");
+        assert_eq!(chain[0].class_id, 7);
+        // The compiling method's own bci covering it is the splice's caller pc.
+        assert_eq!(sites.enclosing_bci_at(103), Some(42));
+    }
+
+    /// Two levels: a pc inside `mid` reports `mid` THEN `outer`, innermost
+    /// first, each with a bci in its own code. This is the exact shape that
+    /// printed `len=3` instead of `len=5` on `StackTraceAfterOsr`.
+    #[test]
+    fn inline_frame_sites_nested_chain_is_innermost_first() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        let chain = sites.chain_at(204);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].method_key, "P.mid:(I)I");
+        assert_eq!(chain[0].bci, 4, "204 - base 200, inside mid");
+        assert_eq!(chain[1].method_key, "P.outer:(I)I");
+        assert_eq!(
+            chain[1].bci, 1,
+            "mid's caller pc 101 - outer's base 100: where outer calls mid"
+        );
+        // Still the OUTERMOST splice's caller pc — an index into probe's own
+        // bytecode, which is the only bci a row may legally carry.
+        assert_eq!(sites.enclosing_bci_at(204), Some(42));
+    }
+
+    /// A pc in the gap between two bodies belongs to neither. Ranges are
+    /// half-open, so `base + code_len` is already outside.
+    #[test]
+    fn inline_frame_sites_ranges_are_half_open() {
+        let sites = IrInlineFrameSites::from_sites(&probe_shaped_sites());
+        assert!(!sites.chain_at(106).is_empty(), "last byte of outer's body");
+        assert!(sites.chain_at(107).is_empty(), "one past it");
+        assert!(sites.chain_at(150).is_empty(), "the gap before mid's body");
+    }
+
+    /// A malformed table whose site sits inside its OWN body would walk
+    /// forever. The chain is given up WHOLE rather than truncated: a truncated
+    /// chain reads as complete and names a caller that is not there.
+    #[test]
+    fn inline_frame_sites_refuse_a_cyclic_table() {
+        let mut m = HashMap::new();
+        m.insert(
+            105, // caller pc inside the body this very site installs
+            IrInlineSite {
+                base: 100,
+                code_len: 20,
+                num_args: 0,
+                max_locals: 1,
+                arg_local_slots: vec![],
+                returns_value: false,
+                receiver_is_arg0: false,
+                method_key: "P.loop:()V".to_string(),
+                class_id: 1,
+            },
+        );
+        let sites = IrInlineFrameSites::from_sites(&m);
+        assert!(
+            sites.chain_at(110).is_empty(),
+            "a cycle must yield NO chain, not a truncated one"
+        );
+        assert_eq!(sites.enclosing_bci_at(110), None);
     }
 
     // ── Inline scopes ────────────────────────────────────────────────
