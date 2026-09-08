@@ -263,3 +263,79 @@ springboot one really was a defect (nine natives, fixed in
 `natives-hold-a-stale-reference-across-a-park-FIXED-20260908.md`). What this page
 was missing is that its surviving metric had a false-positive mode nobody had
 asked about.
+
+## Addendum 2026-09-08 (second session): the re-allocation screen has a hole, and the obvious repair is worse
+
+Reached the same root cause independently — the rings remember what was freed,
+not what is dead, so a reissued span reports forever — by a different route: the
+a2dbg lifecycle this page's "Next" section asked for. At the address reported
+seven times, `history_at` gives
+
+```
+seq=2560   cid=192 slots=10 size=0xb0   ALLOC
+seq=44698  cid=0   kind=0xff            FREE   (sweep sentinel)
+seq=81073  cid=118 slots=13 size=0xe0   ALLOC  <- reissued, live
+```
+
+the last event being an allocation whose `0xe0` size is exactly the `freed_span`
+width the report printed. Independent of that, `CRATONVM_GC_OBJECT_STARTS=1`
+takes the reports 8 → 1, the survivor being the documented TLAB incompleteness
+at `arena.rs:1571`. Two more confirmations of the resolution above.
+
+### The hole
+
+The screen is `is_object_address(addr).is_some()`. A header the non-moving sweep
+ZEROED still passes it: `ObjectKind::Object` is discriminant 0,
+`ArrayElementType`'s first variant is 0, `header_reserved_fields_plausible`
+passes on all-zero `gc_flags`, and a zeroed `num_slots` makes the extent check
+trivially fit. Pinned by
+`gen_heap::tests::a_sweep_zeroed_header_still_decodes_as_an_object_of_class_zero`.
+
+So the screen silences the one shape this guard exists for — a live reference
+into a span the sweep zeroed IN PLACE, the mapped `CRATONVM_GEN_UNCOMMIT=0`
+silent-data-loss face rather than the SIGSEGV one — while keeping every
+re-allocation false positive it was added to remove. With uncommit at its
+default the span is unmapped and the commit screen still declines it, so the
+hole is scoped to `CRATONVM_GEN_UNCOMMIT=0`.
+
+### The obvious repair is WRONG, and this is the useful part
+
+Requiring a non-zero class id alongside `is_object_address` looks like the
+discriminator. It is not one: **`java.lang.Object` is itself `ClassId(0)`** —
+this module's own header says so, next to "and so is the all-zero header the
+collector leaves over a span it reclaimed" — so the test condemns every live
+`new Object()`.
+
+Measured, not reasoned about. With that condition added:
+
+| | reports | vs HotSpot | wall |
+|---|---|---|---|
+| screen as landed | 0 | identical | ~4 s |
+| screen + non-zero class id | **8** | **DIFFERS** | ~12 s |
+
+It reinstates the exact 8 reports this page spent three addenda explaining, and
+because the guard also substitutes a benign value on a hit, the answers diverge
+from HotSpot again. Reverted; only the test survives, carrying the refutation.
+
+### What would actually close it
+
+Free-list membership is the unambiguous test — "a live object is never inside a
+free block, never past the allocation frontier, never in the inactive
+semispace". `reclaimed_hole_at` already answers it, and
+`report_reclaimed_receiver_forced` already calls it before printing. It takes
+the heap locks, so it belongs on the rare `class_id == 0` fall-through rather
+than in front of every receiver. Not attempted here.
+
+### One more thing the guard does that this page should record
+
+Substituting a benign value on EVERY hit — `ClassId(0)`, hash `0`,
+`Object(None)` — is a behaviour change, so the program diverges at the first hit
+and every later report describes an execution the diagnostic created. On the
+pre-screen binary that was not a subtlety: eight `Object(None)` returns from
+`get_array_element` left the run printing **nothing at all** against HotSpot's
+six lines. The "8 hits, 2 objects, stable across 5 runs" census was taken from a
+program the instrument had already broken. Scoping substitution to the case that
+justified it — an address whose header cannot be READ, where the caller really
+would fault — makes the armed arm byte-identical to HotSpot while still
+reporting. Measured on the pre-screen binary, 3/3; not needed once the screen
+lands, but the design point outlives it.
