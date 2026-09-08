@@ -321,7 +321,9 @@ is the useful part of the estimate.
    (`cuda-core-msvc-upstream-report.md`). Note `docs/cuda-core-linux-verified-20260905`
    exists, so the Linux half is done.
 6. **Runner enrolment** — the standing operational task
-   ([hardware-ci.md](../../gpu/hardware-ci.md)). Blocked on item 4: see step 5.
+   ([hardware-ci.md](../../gpu/hardware-ci.md)). ~~Blocked on item 4~~ — item 4
+   is settled, and step 5 already says nothing in the tree is blocking this.
+   The dependency is discharged; what is left is purely operational.
 
 ## Six traps this tree has already paid for
 
@@ -356,13 +358,41 @@ is the useful part of the estimate.
   scenario can race, the gate has to repeat it, and in the configuration
   that makes it most likely to fail rather than the most comfortable one.
 
-## Known residual in this page's neighbourhood
+## Known residual in this page's neighbourhood — SWEPT 2026-09-08
 
-Several public files still cite
-`docs/known-issues/gpu-offload-followups-20260711.md`, which has moved to
-the internal tree and so is stripped from public history —
-`bench-gpu/ci-gate.sh`, `bench-gpu/run-gpu-comparison.sh`,
-`bench-gpu/run-gpu-warm.sh`, `.github/workflows/gpu-selfhosted.yml`,
-`cratonvm-embed/README.md` and `CHANGELOG.md` among them. Left alone here
-deliberately: fixing one or two of ten identical references makes the tree
-less consistent, not more. It wants one sweep, not a drive-by.
+Eleven citations of `docs/known-issues/gpu-offload-followups-20260711.md` — a
+path that has not existed since the record moved to `internal/fixed-suite-bugs/`
+— now carry the bare filename, which is what `types/tests/doc_citation_paths.rs`
+documents as the rule for an internal record: *keep the FILENAME and drop every
+directory*, because `fixed-suite-bugs/` ships nowhere either and the shorter
+path is the same dead end one directory in.
+
+Swept: `bench-gpu/ci-gate.sh`, `run-gpu-comparison.sh` (×2), `run-gpu-warm.sh`
+(×2), `GpuDotBench.java`, `GpuLdcBench.java`,
+`.github/workflows/gpu-selfhosted.yml`, `cratonvm-embed/README.md` (a markdown
+LINK, so a click-through dead end rather than only a stale mention),
+`CHANGELOG.md` (×2), and
+`internal/comparison-handoff/bug-gpu-offload-launch-glue-stub.md` — whose path
+was wrong in a second way, naming `docs/internal/…` at the top level when the
+record is a directory further in.
+
+**Why these rotted while the Rust citations of the same record did not.**
+`every_relocatable_doc_citation_points_at_the_page` walks `rust_sources` only,
+so a citation in `.sh`, `.java`, `.yml` or `.md` is checked by nothing at all.
+That is the entire explanation for a two-month-old dead link surviving in seven
+files while the four Rust citations of the same record were already correct.
+
+Extending that gate to every tracked text file is the change that would close
+the class, and it is deliberately NOT done here. A first pass suggests a backlog
+sits behind it, and the same pass is a caution about the number: the gate
+resolves a citation by BASENAME with stem normalisation, not by literal path, so
+a naive "does this path exist" scan reports far more than the gate would.
+Turning a gate on with an unmeasured backlog attached is its own piece of work,
+not a rider on a sweep.
+
+**One trap worth keeping**, because it nearly left this sweep half-done: one of
+the eleven was WRAPPED across a line break (`…gpu-offload-followups-` /
+`20260711.md`), so grepping the whole path does not find it — and it was in
+`ci-gate.sh`, the file this section named first. `doc_citation_paths.rs` handles
+that case on purpose (a break is honoured directly after `/` or `-`). Grep for
+the stem, not the full path.

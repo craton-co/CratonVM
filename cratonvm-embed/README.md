@@ -162,7 +162,7 @@ builder helper here yet. Two things this crate does not do for you today:
 
 See [`docs/EMBEDDING.md`](../docs/EMBEDDING.md#gpu-offload-for-embedders) for the C-ABI
 comparison (GPU offload is **not** reachable from `libcratonvm` at all today) and
-[`docs/known-issues/gpu-offload-followups-20260711.md`](../docs/known-issues/gpu-offload-followups-20260711.md)
+`gpu-offload-followups-20260711.md`
 for open gaps in the offload path itself.
 
 ## Minimal usage
