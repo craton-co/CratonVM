@@ -21212,6 +21212,62 @@ mod tests {
             .is_none());
     }
 
+    /// A header the non-moving sweep ZEROED still decodes as a valid object.
+    ///
+    /// This is the hole under any screen of the form
+    /// `if is_object_address(addr).is_some() { not a victim }`:
+    /// `ObjectKind::Object` is discriminant **0**, `ArrayElementType`'s first
+    /// variant is 0, `header_reserved_fields_plausible` passes on all-zero
+    /// `gc_flags`, and a zeroed `num_slots` makes the extent check trivially
+    /// fit. So the one shape a reclaim guard exists to catch — a live reference
+    /// to a span the sweep zeroed IN PLACE, which is the mapped
+    /// (`CRATONVM_GEN_UNCOMMIT=0`) silent-data-loss face rather than the
+    /// SIGSEGV one — reads back as "a live object" here.
+    ///
+    /// `is_object_address` is not wrong: it answers "do these bytes decode as
+    /// an object header", which is what conservative stack-spill validation
+    /// needs. It is the wrong question for "is this object DEAD".
+    ///
+    /// THE OBVIOUS REPAIR DOES NOT WORK, and was measured rather than reasoned
+    /// about. Requiring a non-zero class id alongside it looks like the
+    /// discriminator and is not one: `java.lang.Object` is ITSELF `ClassId(0)`
+    /// (see `vm/src/memory/reclaim_guard.rs`'s header), so that test condemns
+    /// every live `new Object()`. Added to `deadrecv_check`'s re-allocation
+    /// screen it put `GpuResidencyGc` back to 8 reports a run, and — because
+    /// that guard also substitutes a benign value on a hit — back to answers
+    /// that DIFFER from HotSpot. Reverted.
+    ///
+    /// The unambiguous test is free-list membership
+    /// (`GenerationalHeap::reclaimed_hole_at`): a live object is never inside a
+    /// free block, never past the allocation frontier, never in the inactive
+    /// semispace. It takes the heap locks, so it belongs on the rare
+    /// `class_id == 0` fall-through rather than in front of every receiver.
+    #[test]
+    fn a_sweep_zeroed_header_still_decodes_as_an_object_of_class_zero() {
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(7), 2);
+        let addr = obj.as_ptr() as usize;
+        assert!(
+            heap.is_object_address(addr).is_some(),
+            "the live object must validate before the header is zeroed, or this              test proves nothing about the zeroing"
+        );
+        // Exactly what the sweep leaves behind.
+        // SAFETY: `obj` was just allocated by this heap and is `HEADER_SIZE`
+        // bytes wide at minimum; the test is single-threaded.
+        unsafe {
+            std::ptr::write_bytes(obj.as_ptr(), 0, cratonvm_types::HEADER_SIZE);
+        }
+        assert!(
+            heap.is_object_address(addr).is_some(),
+            "if this now answers None, `is_object_address` rejects a zeroed              header on its own and a re-allocation screen built on it is safe —              delete the class-id requirement in `deadrecv_check` that this test              justifies"
+        );
+        assert_eq!(
+            heap.class_id_of(obj).as_u32(),
+            0,
+            "and the class id is what separates it from a real object"
+        );
+    }
+
     #[test]
     fn conservative_candidate_diagnostics_require_a2_mode() {
         assert!(!emit_conservative_candidate_diagnostic(0, false));
