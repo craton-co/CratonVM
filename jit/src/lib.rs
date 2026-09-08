@@ -25293,6 +25293,13 @@ fn try_compile_inner(
         // `code_len` stays the COMPILING method's length whichever buffer this
         // is: everything past it is relocated callee code, unreachable from pc
         // 0 and walked only through a splice.
+        // The builder needs this BEFORE the walk, not after it: it is one of
+        // the three clauses `IrBuilder::trap_replay_is_safe` asks before it
+        // will plant an uncommon trap, and a trap is planted mid-walk. The
+        // same value is stamped onto the artifact below
+        // (`compiled.spliced_bodies_side_effect_free`), which is where the
+        // interpreter reads it — producer and consumer now read one number.
+        builder.set_spliced_bodies_pure(ir_spliced_bodies_pure);
         let built = builder.build(ir_combined.as_deref().unwrap_or(code), code_len);
         // Record that this method's optimizing body carries a site trap, so a
         // trap TAKEN at runtime can be told apart from genuinely unreachable

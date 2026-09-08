@@ -19633,13 +19633,13 @@ pub fn register_essential_natives_with_shims(
     // explicit assignments. Our native replaces the constructor outright,
     // so those initializers never run unless we do them by hand.
     fn ucp_init_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
         let urls_val = args.get(1).copied().unwrap_or(Value::Object(None));
         // Construct path = new ArrayList<>(len)
-        let path = match ctx.new_object("java/util/ArrayList")? {
+        let mut path = match ctx.new_object("java/util/ArrayList")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19650,7 +19650,7 @@ pub fn register_essential_natives_with_shims(
             &[Value::Object(Some(path))],
         )?;
         // Construct unopenedUrls = new ArrayDeque<>(len)
-        let unopened = match ctx.new_object("java/util/ArrayDeque")? {
+        let mut unopened = match ctx.new_object("java/util/ArrayDeque")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19662,7 +19662,7 @@ pub fn register_essential_natives_with_shims(
         )?;
         // Construct loaders = new ArrayList<>() — required for getLoader(int)
         // which reads loaders.size() at URLClassPath.java:393.
-        let loaders = match ctx.new_object("java/util/ArrayList")? {
+        let mut loaders = match ctx.new_object("java/util/ArrayList")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19674,7 +19674,7 @@ pub fn register_essential_natives_with_shims(
         )?;
         // Construct lmap = new HashMap<>() — guards getLoader(int)'s
         // `lmap.containsKey(...)` check at URLClassPath.java:402.
-        let lmap = match ctx.new_object("java/util/HashMap")? {
+        let mut lmap = match ctx.new_object("java/util/HashMap")? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
         };
@@ -19685,23 +19685,58 @@ pub fn register_essential_natives_with_shims(
             &[Value::Object(Some(lmap))],
         )?;
         // Iterate URLs (if non-null) and seed both collections.
+        //
+        // GC-safety: `ArrayList.add` and `ArrayDeque.add` are real bytecode and
+        // each can grow a backing array, so every reference this loop carries
+        // in -- both collections, the source array, and `this`, which is stored
+        // into below -- is a pre-GC address from the second turn on. `elem` is
+        // re-read from the (refreshed) array inside the turn, and the SECOND
+        // `add` needs it re-read again because the first one allocated.
         if let Value::Object(Some(arr)) = urls_val {
             let len = ctx.array_length(arr);
+            let this_pin = ctx.pin_native_root(this);
+            let path_pin = ctx.pin_native_root(path);
+            let unopened_pin = ctx.pin_native_root(unopened);
+            let loaders_pin = ctx.pin_native_root(loaders);
+            let lmap_pin = ctx.pin_native_root(lmap);
+            let arr_pin = ctx.pin_native_root(arr);
             for i in 0..len {
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 let elem = ctx.get_array_element(arr, i);
+                let elem_pin = match elem {
+                    Value::Object(Some(o)) => ctx.pin_native_root(o),
+                    _ => usize::MAX,
+                };
+                let path = ctx.read_native_pin(path_pin, path);
                 ctx.invoke(
                     "java/util/ArrayList",
                     "add",
                     "(Ljava/lang/Object;)Z",
                     &[Value::Object(Some(path)), elem],
                 )?;
+                let elem = match (elem, elem_pin) {
+                    (Value::Object(Some(o)), p) if p != usize::MAX => {
+                        Value::Object(Some(ctx.read_native_pin(p, o)))
+                    }
+                    (other, _) => other,
+                };
+                let unopened = ctx.read_native_pin(unopened_pin, unopened);
                 ctx.invoke(
                     "java/util/ArrayDeque",
                     "add",
                     "(Ljava/lang/Object;)Z",
                     &[Value::Object(Some(unopened)), elem],
                 )?;
+                if elem_pin != usize::MAX {
+                    ctx.unpin_native_roots(elem_pin);
+                }
             }
+            this = ctx.read_native_pin(this_pin, this);
+            path = ctx.read_native_pin(path_pin, path);
+            unopened = ctx.read_native_pin(unopened_pin, unopened);
+            loaders = ctx.read_native_pin(loaders_pin, loaders);
+            lmap = ctx.read_native_pin(lmap_pin, lmap);
+            ctx.unpin_native_roots(this_pin);
         }
         ctx.set_field_by_name(this, "path", Value::Object(Some(path)));
         ctx.set_field_by_name(this, "unopenedUrls", Value::Object(Some(unopened)));
@@ -46510,6 +46545,32 @@ fn pd_stream_gather(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(stream?))))
 }
 
+/// Pin every reference in a `Value` slice, returning one handle per element
+/// (`usize::MAX` for the non-reference ones).
+///
+/// The `pd_gather_*` bodies each run an arbitrary user lambda once per element,
+/// and the caller's slice is a bare Rust local: nothing rewrites it, so element
+/// `i` is a pre-GC address for every turn after the one that first allocated.
+fn pd_pin_elems(ctx: &mut dyn NativeContext, elems: &[Value]) -> Vec<usize> {
+    elems
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => ctx.pin_native_root(*o),
+            _ => usize::MAX,
+        })
+        .collect()
+}
+
+/// Read element `i` back through the handle [`pd_pin_elems`] took for it.
+fn pd_read_elem(ctx: &dyn NativeContext, pins: &[usize], i: usize, orig: Value) -> Value {
+    match (orig, pins.get(i).copied().unwrap_or(usize::MAX)) {
+        (Value::Object(Some(o)), pin) if pin != usize::MAX => {
+            Value::Object(Some(ctx.read_native_pin(pin, o)))
+        }
+        (other, _) => other,
+    }
+}
+
 fn pd_gather_fold(
     ctx: &mut dyn NativeContext,
     elems: &[Value],
@@ -46521,17 +46582,27 @@ fn pd_gather_fold(
     } else {
         Value::Object(None)
     };
+    // GC-safety: `state` is reassigned from each call's own return value, so it
+    // is current by construction -- the folder and the elements are not.
+    // `apply` is an arbitrary user lambda: it allocates, and both the receiver
+    // read once from `gatherer` and every element of the caller's slice are
+    // bare Rust locals from the second turn on.
     if let Value::Object(Some(folder)) = ctx.get_field(gatherer, 1) {
-        for elem in elems {
+        let folder_pin = ctx.pin_native_root(folder);
+        let elem_pins = pd_pin_elems(ctx, elems);
+        for (i, elem) in elems.iter().enumerate() {
+            let folder = ctx.read_native_pin(folder_pin, folder);
+            let elem = pd_read_elem(ctx, &elem_pins, i, *elem);
             state = ctx
                 .invoke_virtual(
                     folder,
                     "apply",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[state, *elem],
+                    &[state, elem],
                 )?
                 .unwrap_or(Value::Object(None));
         }
+        ctx.unpin_native_roots(folder_pin);
     }
     Ok(vec![state])
 }
@@ -46548,18 +46619,34 @@ fn pd_gather_scan(
         Value::Object(None)
     };
     let mut result = Vec::with_capacity(elems.len());
+    // GC-safety: see `pd_gather_fold`. `result` additionally accumulates
+    // references across later allocations, so each is pinned as it is pushed
+    // and read back through its pin before the vector is returned.
     if let Value::Object(Some(scanner)) = ctx.get_field(gatherer, 1) {
-        for elem in elems {
+        let scanner_pin = ctx.pin_native_root(scanner);
+        let elem_pins = pd_pin_elems(ctx, elems);
+        let mut result_pins: Vec<usize> = Vec::with_capacity(elems.len());
+        for (i, elem) in elems.iter().enumerate() {
+            let scanner = ctx.read_native_pin(scanner_pin, scanner);
+            let elem = pd_read_elem(ctx, &elem_pins, i, *elem);
             state = ctx
                 .invoke_virtual(
                     scanner,
                     "apply",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[state, *elem],
+                    &[state, elem],
                 )?
                 .unwrap_or(Value::Object(None));
+            result_pins.push(match state {
+                Value::Object(Some(o)) => ctx.pin_native_root(o),
+                _ => usize::MAX,
+            });
             result.push(state);
         }
+        for i in 0..result.len() {
+            result[i] = pd_read_elem(ctx, &result_pins, i, result[i]);
+        }
+        ctx.unpin_native_roots(scanner_pin);
     }
     Ok(result)
 }
@@ -46662,19 +46749,40 @@ fn pd_gather_custom(
     ctx.set_field(downstream, 0, Value::Object(Some(downstream_arr)));
     ctx.set_field(downstream, 1, Value::Int(0));
 
+    // GC-safety: unlike `pd_gather_fold`/`_scan`, `state` here is NOT
+    // reassigned -- the same reference is handed to every `integrate` call and
+    // then to the finisher. `integrate` is an arbitrary user lambda that
+    // allocates, so `state`, the freshly built `downstream` collector, the
+    // integrator itself and every element are all pre-GC addresses from the
+    // second turn on.
+    let state_pin = match state {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    };
+    let downstream_pin = ctx.pin_native_root(downstream);
+    let mut state = state;
     if let Value::Object(Some(integrator)) = integrator_val {
-        for elem in elems {
+        let integrator_pin = ctx.pin_native_root(integrator);
+        let elem_pins = pd_pin_elems(ctx, elems);
+        for (i, elem) in elems.iter().enumerate() {
+            let integrator = ctx.read_native_pin(integrator_pin, integrator);
+            let elem = pd_read_elem(ctx, &elem_pins, i, *elem);
+            state = pd_read_elem(ctx, &[state_pin], 0, state);
+            let downstream = ctx.read_native_pin(downstream_pin, downstream);
             let cont = ctx.invoke_virtual(
                 integrator,
                 "integrate",
                 "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/stream/Gatherer$Downstream;)Z",
-                &[state, *elem, Value::Object(Some(downstream))],
+                &[state, elem, Value::Object(Some(downstream))],
             );
             if let Ok(Some(Value::Int(0))) = cont {
                 break;
             }
         }
+        ctx.unpin_native_roots(integrator_pin);
     }
+    let downstream = ctx.read_native_pin(downstream_pin, downstream);
+    let state = pd_read_elem(ctx, &[state_pin], 0, state);
 
     if let Value::Object(Some(finisher_ref)) = finisher {
         let _ = ctx.invoke_virtual(
@@ -46684,6 +46792,8 @@ fn pd_gather_custom(
             &[state, Value::Object(Some(downstream))],
         );
     }
+    let downstream = ctx.read_native_pin(downstream_pin, downstream);
+    ctx.unpin_native_roots(downstream_pin);
 
     // Read collected downstream values
     let ds_size = match ctx.get_field(downstream, 1) {

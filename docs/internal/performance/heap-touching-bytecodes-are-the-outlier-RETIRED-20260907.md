@@ -137,9 +137,59 @@ the corrected column is a small difference of large numbers and its *ordering*
 changes between runs. The one thing that survives the noise is that
 `field_ptr` and `read+stack` are the top two in all four runs, and that
 `gates` — whichever half — is no longer the largest phase it was on the quiet
-Windows host. **Whoever wants the entry-vs-peek verdict must take it on a quiet
-box**; the instrument and its split are in the tree waiting, and its own doc
-already says it ranks rather than costs.
+Windows host.
+
+### The verdict, taken 2026-09-08 with ten runs instead of four
+
+Same probe, same host, load ~21, ten runs — corrected cycles per access:
+
+| phase | corrected, 10 runs |
+|---|---|
+| `entry+wpgate` | 0.0 0.5 0.0 0.0 0.0 0.0 3.1 0.0 1.7 0.0 |
+| `stack_peek` | 0.0 0.6 0.0 0.4 0.9 0.2 0.8 1.6 0.0 0.0 |
+| `site_lookup` | 0.0 9.5 20.3 1.4 0.3 1.0 1.9 4.0 0.2 0.2 |
+| **`field_ptr`** | **4.4 7.1 5.8 5.9 2.8 5.2 8.9 10.1 6.4 6.3** |
+| `read+stack` | 4.9 4.4 2.5 4.9 1.8 4.4 3.5 6.7 3.3 8.4 |
+
+`P_PEEK`'s own doc frames the question: *"if `P_ENTRY` keeps the bulk, the cost
+is entry-shaped; if this one does, it is the operand stack and neither candidate
+is right."*
+
+**Neither keeps the bulk.** `entry+wpgate` reads **0.0 in seven of ten runs**
+and never exceeds 3.1; `stack_peek` never exceeds 1.6. Both sit at or under this
+instrument's resolution. `field_ptr` is the largest of the five in **ten of
+ten**, at 3–10 cycles, with `read+stack` second.
+
+So the `gates` phase that the open page called the largest at 33.0 cycles / 38%,
+"holding the least obvious work", **is not where the time is** — and both
+candidates it named for that work are now refuted rather than merely untested:
+the `Acquire` compiler barrier by the A/B recorded at the load itself in
+`vm/src/runtime/jvmti.rs` (three relaxed runs, identical to three significant
+figures), and `getfield_fast_keyed`'s un-inlined prologue by this split, since a
+prologue would land in `P_ENTRY` and `P_ENTRY` is zero.
+
+**And again at load ~11, which is the quietest this host got.** Ten more runs,
+same probe, same binary:
+
+| phase | corrected, 10 runs at load ~11 | median |
+|---|---|---:|
+| `entry+wpgate` | 0.4 0.9 0.0 0.2 0.1 7.2 0.4 0.4 1.9 0.5 | ~0.4 |
+| `stack_peek` | 0.6 0.7 0.0 0.0 0.2 0.0 0.8 0.2 0.4 0.6 | ~0.4 |
+| `site_lookup` | 2.6 1.5 0.2 1.4 1.1 0.7 2.5 1.4 3.6 1.1 | ~1.4 |
+| **`field_ptr`** | **5.3 4.7 3.3 6.3 3.6 3.2 5.2 4.8 6.5 3.5** | **~4.8** |
+| `read+stack` | 4.1 4.6 2.4 4.0 2.6 6.1 3.5 3.5 4.6 2.8 | ~3.8 |
+
+Tighter than the load-21 set — `site_lookup`'s 20-cycle excursion is gone — and
+the ranking is unchanged: `field_ptr` largest (9 of 10, the exception being run
+6), `read+stack` second, `entry` and `peek` at ~0.4 each, an order of magnitude
+below. **Two independent ten-run samples at two load levels agreeing on the
+ordering is what turns this from a reading into a verdict.**
+
+**The caveat that remains.** Load 11 on 8 cores is still oversubscribed, and
+these are means over 8 M accesses, not minima — so the numbers are a RANKING,
+which is all this instrument promises (*"it ranks rather than costs"*). What is
+settled is which phase is largest and that `gates` is not it; what is not
+settled is what `field_ptr`'s ~4.8 cycles would read on an idle machine.
 
 Two facts that did survive and are worth carrying:
 
@@ -148,7 +198,8 @@ Two facts that did survive and are worth carrying:
   `probes/SiteSpread.java` refuted by varying site count.
 * `field_ptr` at ~14.8 cycles on the quiet host is consistent with the registry
   probe's separately measured 1–4 ns, which is a third cross-check landing where
-  it should.
+  it should — and it is the top phase in ten of ten runs above, so the ranking
+  agrees across two hosts and two load regimes.
 
 ## Why the gate loads cannot be hoisted — now in the tree, not just here
 

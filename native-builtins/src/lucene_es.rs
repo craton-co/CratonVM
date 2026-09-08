@@ -208,8 +208,17 @@ fn randomized_context_for_thread(
         None => return Err(randomized_no_context_error(ctx, thread, false)),
     };
     let mut current_group = group;
+    // GC-safety: `contexts` was pinned per turn below and never READ BACK --
+    // the pin kept the map alive and the local kept its pre-GC address, so from
+    // the second turn on `get` dispatched on a stale receiver. `thread` is used
+    // by the two error paths inside the loop for the same reason. Pin both
+    // ONCE, outside, and re-read at the top of each turn; the per-turn
+    // `contexts` pin is gone.
+    let contexts_pin = ctx.pin_native_root(contexts);
+    let thread_pin = ctx.pin_native_root(thread);
     loop {
-        let contexts_pin = ctx.pin_native_root(contexts);
+        let contexts = ctx.read_native_pin(contexts_pin, contexts);
+        let thread = ctx.read_native_pin(thread_pin, thread);
         let group_pin = ctx.pin_native_root(current_group);
         let candidate = ctx.invoke_virtual(
             contexts,
@@ -218,7 +227,7 @@ fn randomized_context_for_thread(
             &[Value::Object(Some(current_group))],
         )?;
         current_group = ctx.read_native_pin(group_pin, current_group);
-        ctx.unpin_native_roots(contexts_pin);
+        ctx.unpin_native_roots(group_pin);
         if let Some(Value::Object(Some(context))) = candidate {
             randomized_context_cache_store(ctx, key, context);
             return Ok(Some(Value::Object(Some(context))));

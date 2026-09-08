@@ -1436,9 +1436,19 @@ fn mirror_loaded_entries_to_properties_backend(
                 Ok(Some(Value::Object(Some(o)))) => Some(o),
                 _ => None,
             }) else {
+                // GC-safety: `create_property_string` allocates twice per turn
+                // and `Hashtable.put` is real bytecode, so `this` is a pre-GC
+                // address from the second entry on, and `k_obj` is stale by the
+                // time `v_obj`'s allocation returns. This is the same file and
+                // the same shape as the four receivers gdb caught on
+                // 2026-09-06.
+                let this_pin = ctx.pin_native_root(this);
                 for (k, v) in parsed {
                     let k_obj = create_property_string(ctx, k);
+                    let k_pin = ctx.pin_native_root(k_obj);
                     let v_obj = create_property_string(ctx, v);
+                    let k_obj = ctx.read_native_pin(k_pin, k_obj);
+                    let this = ctx.read_native_pin(this_pin, this);
                     let _ = ctx.invoke_special(
                         "java/util/Hashtable",
                         "put",
@@ -1449,7 +1459,9 @@ fn mirror_loaded_entries_to_properties_backend(
                             Value::Object(Some(v_obj)),
                         ],
                     );
+                    ctx.unpin_native_roots(k_pin);
                 }
+                ctx.unpin_native_roots(this_pin);
                 return;
             };
             let _ = ctx.invoke(
@@ -1463,16 +1475,24 @@ fn mirror_loaded_entries_to_properties_backend(
         }
     };
 
+    // GC-safety: as above -- two allocations and a virtual `put` per turn, with
+    // the backing map carried in from outside the loop.
+    let chm_pin = ctx.pin_native_root(chm);
     for (k, v) in parsed {
         let k_obj = create_property_string(ctx, k);
+        let k_pin = ctx.pin_native_root(k_obj);
         let v_obj = create_property_string(ctx, v);
+        let k_obj = ctx.read_native_pin(k_pin, k_obj);
+        let chm = ctx.read_native_pin(chm_pin, chm);
         let _ = ctx.invoke_virtual(
             chm,
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(k_obj)), Value::Object(Some(v_obj))],
         );
+        ctx.unpin_native_roots(k_pin);
     }
+    ctx.unpin_native_roots(chm_pin);
 }
 
 /// Store entries parsed by a native `load` into the receiver.
@@ -3302,8 +3322,8 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             other => other,
         };
     }
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    let set = cratonvm_native_collections::make_static_key_set(ctx, this_cur, &keys)?;
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let set = cratonvm_native_collections::make_static_key_set(ctx, &mut this_cur, &keys)?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
@@ -4179,21 +4199,20 @@ fn collect_via_virtual_entryset(
 /// (e.g. `SortedProperties`' sorted view) are honored.
 fn collect_store_entries(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    this: &mut ObjectRef,
 ) -> Vec<(JavaText, JavaText)> {
-    let mut this = this;
-    let cid = ctx.class_id_of_object(this);
+    let cid = ctx.class_id_of_object(*this);
     let is_exact = ctx
         .class_name_of_id(cid)
         .is_none_or(|n| n == "java/util/Properties");
     if is_exact {
-        return ordered_snapshot_kv(ctx, &mut this);
+        return ordered_snapshot_kv(ctx, this);
     }
-    let entries = collect_via_virtual_entryset(ctx, this);
+    let entries = collect_via_virtual_entryset(ctx, *this);
     // Fallback: if the virtual walk produced nothing (unexpected dispatch
     // failure) but the side-table has data, don't silently drop it.
     if entries.is_empty() {
-        return ordered_snapshot_kv(ctx, &mut this);
+        return ordered_snapshot_kv(ctx, this);
     }
     entries
 }
@@ -4250,8 +4269,8 @@ fn build_store_text(
     // forwarded (post-GC) reference.
     let this_pin = ctx.pin_native_root(this);
     let date = current_date_string(ctx);
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    let entries = collect_store_entries(ctx, this_cur);
+    let mut this_cur = ctx.read_native_pin(this_pin, this);
+    let entries = collect_store_entries(ctx, &mut this_cur);
     ctx.unpin_native_roots(this_pin);
     render_store_text(comments, date.as_deref(), &entries, escape_unicode, &eol)
 }
