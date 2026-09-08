@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN, filed 2026-09-08. **Pre-existing** — reproduces identically on the 2026-09-07 `dev` tip. Not root-caused. |
+| **Status** | OPEN, filed 2026-09-08. **Pre-existing** — reproduces identically on the 2026-09-07 `dev` tip, 5 of 6 runs. Not root-caused. |
 | **Scope** | `--XX:UseGc Generational`, JIT on, `CRATONVM_DBG_GC_STRESS=4194304`. Passes without the stress interval. |
 | **Reproducer** | `org.springframework.boot.context.properties.bind.BindableTests`, 520-890 s; 26 of its 27 tests pass |
 | **Victim** | `net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType$ForLoadedType` — **named by the instrument** |
@@ -26,11 +26,13 @@ reachable. The original class names the root-coverage gap.
 
 ## It is PRE-EXISTING, and the sweep cycle proves it
 
-| binary | reclaim | victim class | sweep_cycle | test |
-|---|---|---|---|---|
-| `dev` tip of 2026-09-07 20:29 (**pre-fix**) | **yes** | `…OfNonGenericType$ForLoadedType` | **6353** | FAIL |
-| the nine park/allocation fixes, pre-merge | yes | same | 6353 / 6322 | FAIL |
-| those fixes merged with `dev` of 2026-09-08 | yes (1 of 2 runs) | same | — | FAIL |
+| binary | runs | reclaim seen | victim class | sweep_cycle | test |
+|---|---:|---:|---|---|---|
+| `dev` tip of 2026-09-07 20:29 (**pre-fix**) | 1 | **1** | `…OfNonGenericType$ForLoadedType` | **6353** | FAIL |
+| the nine park/allocation fixes, pre-merge | 2 | 2 | same | 6353 / 6322 | FAIL |
+| those fixes merged with `dev` of 2026-09-08 | 3 | 2 | same | — | FAIL |
+
+**5 of 6 runs**, across three binaries.
 
 Same victim class at the same point in the allocation sequence on a binary built
 the day before any of this work. Nothing in
@@ -60,7 +62,7 @@ coincidence of a deterministic workload, not evidence.
 That leaves **two independent things in this class**, and they should be chased
 separately:
 
-1. **the reclaim** — real, pre-existing, intermittent (present in 3 of 4 runs);
+1. **the reclaim** — real, pre-existing, intermittent (5 of 6 runs);
 2. **the Mockito failure under GC stress** — also pre-existing, and so far
    unexplained; the class passes without `CRATONVM_DBG_GC_STRESS`.
 
