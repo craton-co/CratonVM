@@ -160,6 +160,35 @@ ROOT = re.compile(
 # lang_string.rs were reported under `register_phase52_string_buffer`.
 FNDEF = re.compile(r"^\s*(?:pub(?:\([a-z ]+\))? )?(?:async )?(?:unsafe )?fn ([a-z_][a-z_0-9]*)")
 LET = re.compile(r"^\s*let\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*[:=]")
+# A DESTRUCTURING `let` IS A REBINDING TOO, and `LET` cannot see one.
+# `rooted_across1` hands its refreshed receiver back as `(this, out)`, and
+# all 21 of its callers spell that `let (this, buf) = rooted_across1(..)`.
+# With only the scalar `LET`, none of those reads as a rebinding and every
+# one of them was reported as a caller reusing a stale copy -- 21 of the
+# `--launder` rule's 34 native-collections sites, all false.
+LET_PAT = re.compile(r"^\s*let\s+(.*?)\s*=[^=]")
+IDENT = re.compile(r"[a-z_][a-z_0-9]*")
+PAT_KEYWORDS = frozenset(("mut", "ref", "if", "let"))
+
+
+def let_binds(name, text):
+    """True if this statement `let`-binds `name` -- scalar OR destructured.
+
+    The pattern side of a `let` is matched loosely on purpose: a name that
+    appears there is bound by it in every shape this tree uses (`(a, b)`,
+    `[a, b]`, `Some(a)`, `Foo { a, .. }`), and a name that appears on the
+    pattern side but is NOT a binder (an enum path segment, say) is a
+    conservative early stop rather than a false report."""
+    m = LET.match(text)
+    if m and m.group(1) == name:
+        return True
+    m = LET_PAT.match(text)
+    if not m:
+        return False
+    pat = m.group(1)
+    if not pat.startswith(("(", "[", "{")) and "(" not in pat and "{" not in pat:
+        return False
+    return any(t == name for t in IDENT.findall(pat) if t not in PAT_KEYWORDS)
 CALLEE = re.compile(r"(?<![a-z_0-9.])([a-z_][a-z_0-9]*)\s*\(")
 PARAM_REF = re.compile(r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&mut\s+)?ObjectRef\b")
 # The shapes a bare `ObjectRef` declaration misses. `--opt` scans these too.
@@ -910,8 +939,7 @@ def scan_loops(fn, allocfns):
                 if REREAD.search(st.text) and names(name, st.text):
                     refreshed = True
                     break
-                m2 = LET.match(st.text)
-                if m2 and m2.group(1) == name:
+                if let_binds(name, st.text):
                     refreshed = True
                     break
                 if REBIND(name).search(st.text):
@@ -1078,9 +1106,62 @@ def _args(text, callee):
     return out
 
 
+def return_type(fn):
+    """The declared return type, or "" for a unit function.
+
+    Needed because "hands the refresh back" is only meaningful for a function
+    that returns something. `ad_grow`, `lbq_ensure_capacity`,
+    `lli_resnapshot` and `pq_ensure_capacity` all end on a trailing
+    `if .. { .. }` block that MENTIONS `this`, and a tail test without this
+    gate read all four as returning it. They return `()`."""
+    sig = signature(fn)
+    head = "\n".join(fn.body[: len(sig.split("\n")) + 4])
+    depth, idx = 0, None
+    for i, ch in enumerate(head):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                idx = i
+                break
+    if idx is None:
+        return ""
+    rest = head[idx + 1:]
+    brace = rest.find("{")
+    if brace >= 0:
+        rest = rest[:brace]
+    m = re.search(r"->\s*(.+)", rest, re.S)
+    return " ".join(m.group(1).split()) if m else ""
+
+
+def returns_param(fn, p):
+    """True if `fn`'s TAIL EXPRESSION hands `p` back to its caller.
+
+    Only the tail, deliberately. `cslm_ensure_capacity` has an early
+    `return (keys, values);` on the no-growth path and returns
+    `(new_keys, new_values)` on the growth path -- the one that refreshes
+    `keys`/`values` and then does NOT return them. Accepting any `return` that
+    names the parameter excused exactly that laundering."""
+    if not return_type(fn):
+        return False
+    stmts = statements(fn.body)
+    if stmts and FNDEF.match(stmts[0].text):
+        stmts = stmts[1:]
+    for st in reversed(stmts):
+        t = st.text.strip()
+        if not t or t in ("}", "};"):
+            continue
+        # A statement is not a tail expression, and neither is a `let`.
+        if t.endswith(";") or LET.match(t) or LET_PAT.match(t):
+            return False
+        return names(p, t)
+    return False
+
+
 def launderers(fns):
     """Functions that take an `ObjectRef` BY VALUE and refresh their own copy."""
-    out = {}
+    out, out_returns = {}, {}
     for fn in fns:
         sig = signature(fn)
         body = "\n".join(fn.body)
@@ -1098,15 +1179,25 @@ def launderers(fns):
             # It fired 244 times in one crate, which is what said it was the
             # wrong question. The laundering shape is narrower: a contract that
             # says "this refreshes YOUR variable", satisfied with a copy.
+            # NOT laundering: the copy is RETURNED. `rooted_across1` exists to
+            # root one receiver across a body and hand it back as
+            # `(this, out)`, and every caller spells the call
+            # `let (this, buf) = rooted_across1(..)` -- a refresh, not a leak.
+            # Reported on its own line rather than dropped, because "returns
+            # it" only helps a caller that BINDS it: `let (_, buf) = ..` is
+            # back in the laundering shape and this rule cannot tell.
+            if why and returns_param(fn, p):
+                out_returns.setdefault(fn.name, []).append(p)
+                why = None
             if why:
                 out.setdefault(fn.name, []).append((p, why, fn))
-    return out
+    return out, out_returns
 
 
 def scan_launder(fns):
     """(laundering fn, param) plus the call sites whose caller reuses its own
     copy after the call -- which is where the stale read actually happens."""
-    lau = launderers(fns)
+    lau, handed_back = launderers(fns)
     hits = []
     for name, entries in sorted(lau.items()):
         for p, why, fn in entries:
@@ -1125,20 +1216,25 @@ def scan_launder(fns):
                     a = args[idx].strip()
                     if not re.fullmatch(r"[a-z_][a-z_0-9]*", a):
                         continue
+                    # `let (this, buf) = helper(ctx, this, ..)` REBINDS the
+                    # very name it passes, so every statement below reads the
+                    # RETURNED value. The rebinding scan starts at k+1 and
+                    # structurally cannot see the call statement itself.
+                    if let_binds(a, st.text):
+                        continue
                     for st2 in stmts[k + 1:]:
                         # A REBINDING is a fresh value, not a stale use. A
                         # registration function holds several closures, each
                         # with its own `let this = obj_arg(args, 0)?`, and
                         # without this every later closure read as a reuse of
                         # the earlier one's receiver.
-                        m2 = LET.match(st2.text)
-                        if (m2 and m2.group(1) == a) or REBIND(a).search(st2.text):
+                        if let_binds(a, st2.text) or REBIND(a).search(st2.text):
                             break
                         if names(a, st2.text):
                             sites.append((g.name, a, g.line + st.line, g.line + st2.line))
                             break
             hits.append((name, p, why, sites))
-    return hits
+    return hits, handed_back
 
 
 def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
@@ -1180,8 +1276,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
                     rooted_elsewhere = True
                 # A rebinding is a FRESH value. `let p = ...`, `if let Some(p)`,
                 # `for p in ...` and a closure parameter all shadow.
-                m2 = LET.match(t)
-                if m2 and m2.group(1) == p:
+                if let_binds(p, t):
                     break
                 if REBIND(p).search(t):
                     break
@@ -1263,8 +1358,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
             # not the only way to make one. `if let Some(obj) = ...` in a later
             # branch shadowed the outer `obj` in `bb_derive_view` and was
             # reported as a use of it.
-            m2 = LET.match(t)
-            if m2 and m2.group(1) == name:
+            if let_binds(name, t):
                 break
             if REBIND(name).search(t):
                 break
@@ -1294,7 +1388,7 @@ def scan(fn, allocfns, want_params, want_opt=False, any_binding=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("glob")
+    ap.add_argument("glob", nargs="+")
     ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--detail", action="store_true")
     ap.add_argument("--tests", action="store_true", help="include test bodies")
@@ -1309,7 +1403,11 @@ def main():
                     help="also scan Option<ObjectRef> / &[ObjectRef] / Vec<ObjectRef> / &[Value] / Value parameters (`wide`). `args: &[Value]` is the shape of every registered native, so this is the tranche that covers native ENTRY "
                     "points rather than their helpers.")
     a = ap.parse_args()
-    fns = index(sorted(glob.glob(a.glob)))
+    # `**` is written in every invocation in the docs; without recursive=True
+    # glob treats it as a single `*` and SILENTLY drops every file below the
+    # first subdirectory level -- 41 of native-builtins' 178 sources.
+    files = sorted({f for g in a.glob for f in glob.glob(g, recursive=True)})
+    fns = index(files)
     allocfns = allocating(fns, a.depth)
     rows, skipped = [], 0
     for fn in fns:
@@ -1327,7 +1425,7 @@ def main():
         for (ln, nm, use, kind) in found:
             rows.append((os.path.basename(fn.file), ln, fn.name, nm, use, kind))
     if a.launder:
-        hits = scan_launder(fns)
+        hits, handed_back = scan_launder(fns)
         print("laundering helpers: %d" % len(hits))
         live = 0
         for name, p, why, sites in hits:
@@ -1337,6 +1435,12 @@ def main():
                 live += 1
                 print("        caller %-40s passes `%s` at :%d, uses it again at :%d" % (g, var, cl, ul))
         print("TOTAL laundering helpers: %d ; call sites that then reuse: %d" % (len(hits), live))
+        if handed_back:
+            print("not laundering -- the refreshed copy is RETURNED "
+                  "(sound only where the caller binds it): %d"
+                  % sum(len(v) for v in handed_back.values()))
+            for nm, ps in sorted(handed_back.items()):
+                print("  %-46s %s" % (nm, ", ".join(sorted(ps))))
         return
     per = collections.Counter(r[0] for r in rows)
     print("functions indexed: %d (test bodies skipped: %d) ; reachable-allocating: %d"
