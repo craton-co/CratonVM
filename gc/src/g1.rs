@@ -5739,23 +5739,40 @@ impl Drop for G1Collector {
     }
 }
 
-/// `CRATONVM_GC_G1_MOVABLE_PINS=0` — pin the region of EVERY conservative JIT
-/// root, ignoring the movable/rewritable partition. **Default ON**, i.e. the
-/// partition is honoured, as it already is on the generational path.
+/// `CRATONVM_GC_G1_MOVABLE_PINS=1` — let G1's pin set honour the
+/// movable/rewritable partition, as the generational path already does.
+/// **Default OFF.**
 ///
-/// The bisect lever for [`G1Collector::jit_pinned_region_set`]'s filter. A
-/// wrong "movable" verdict evacuates an object a frame still points at, so this
-/// is the switch that says whether a stale-pointer report belongs to this
-/// change or to something else.
+/// # Why this ships off
+///
+/// The filter is right and it is inert, and the second half is why it is not
+/// on. Measured on H2 `TestValueMemory` Type 3, the pause that pins 14 regions
+/// for 12474 KB:
+///
+/// ```text
+/// [g1][MOVPIN] snapshot=38 kept=38 movable_claimed=2 unrew_veto=9
+///              honour_movable=false coverage_incomplete=true movable_set=2
+/// ```
+///
+/// Two independent reasons nothing is filtered. `coverage_incomplete=true`
+/// disables the whole-cycle proof, so `honour_movable` is false outright; and
+/// even with it forced on, only 2 of the 38 addresses are CLAIMED movable,
+/// because `add_movable_jit_root` is reached only from the shadow-stack scan
+/// and only when that scan is not publishing pinned. The other 36 are precise
+/// oop-map roots, which `remap_active_jit_frames` does rewrite but which
+/// nothing publishes to the movable set.
+///
+/// So the ceiling of this filter today is 2 pins out of 38, and turning it on
+/// by default would be a live GC behaviour change bought for nothing. It is
+/// kept, and kept off, because the shortfall is in what feeds the partition
+/// rather than in the partition: whoever teaches the precise map roots to
+/// publish themselves movable will want this already here and already correct.
 fn g1_movable_pins_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(
         || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
-            Ok(v) => !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            ),
-            Err(_) => true,
+            Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+            Err(_) => false,
         },
     )
 }
@@ -19540,7 +19557,8 @@ impl G1Collector {
     /// it, such as a compiled frame's callee-saved register image, which
     /// `band_slot_is_verifiable` refuses to inspect and no channel rewrites.
     ///
-    /// `CRATONVM_GC_G1_MOVABLE_PINS=0` restores the pin-everything behaviour.
+    /// Gated OFF by default on `CRATONVM_GC_G1_MOVABLE_PINS` — see that function
+    /// for the measurement that says why.
     fn jit_pinned_region_set(&self) -> RegionSet {
         let honour_movable = g1_movable_pins_enabled()
             && !crate::gc_quiescence::moving_young_coverage_incomplete();
