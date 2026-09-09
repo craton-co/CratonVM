@@ -616,9 +616,43 @@ fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: Object
             &[],
         ),
     };
+    // If the module's own catalog could not be obtained, fall back to the
+    // system loader's rather than registering the module NOWHERE. Before this
+    // change every module went into the system catalog, so returning here would
+    // make a `BootLoader.getServicesCatalog` that this build cannot call a
+    // REGRESSION -- `java.base`'s providers would stop being visible to
+    // `ServiceLoader.load` as well, which is strictly worse than the defect
+    // being fixed. Best-effort means degrading to the old behaviour, not to
+    // nothing.
     let catalog = match catalog {
-        Ok(Some(Value::Object(Some(c)))) => c,
-        _ => {
+        Ok(Some(Value::Object(Some(c)))) => Some(c),
+        _ => match ctx.invoke(
+            "java/lang/ClassLoader",
+            "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(sys)))) => {
+                let sys_pin = ctx.pin_native_root(sys);
+                let sys = ctx.read_native_pin(sys_pin, sys);
+                let c = match ctx.invoke(
+                    "jdk/internal/module/ServicesCatalog",
+                    "getServicesCatalog",
+                    "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+                    &[Value::Object(Some(sys))],
+                ) {
+                    Ok(Some(Value::Object(Some(c)))) => Some(c),
+                    _ => None,
+                };
+                ctx.unpin_native_roots(sys_pin);
+                c
+            }
+            _ => None,
+        },
+    };
+    let catalog = match catalog {
+        Some(c) => c,
+        None => {
             if let Some((pin, _)) = loader_pin {
                 ctx.unpin_native_roots(pin);
             }
