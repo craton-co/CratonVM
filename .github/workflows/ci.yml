@@ -1659,6 +1659,14 @@ jobs:
       # passes); it was required to pass ten consecutive gate runs, and the
       # paired ratchet was then re-run against it to prove it can still fail.
       #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
+      #
       # The script self-tests its own ratchet hermetically before touching a VM
       # — it asserts that an injected new section IS flagged and a baselined one
       # is NOT — and refuses to adjudicate if that fails. A ratchet that has
