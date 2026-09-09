@@ -1023,7 +1023,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-176 tokens.
+177 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -1038,6 +1038,7 @@ export inherited from a parent shell.
 | `reg-oop-maps` | `CRATONVM_GC_REG_OOP_MAPS` |
 | `dead-spill-roots` | `CRATONVM_GC_DEAD_SPILL_ROOTS` |
 | `outgoing-arg-roots` | `CRATONVM_GC_OUTGOING_ARG_ROOTS` |
+| `g1-movable-pins` | `CRATONVM_GC_G1_MOVABLE_PINS` |
 | `moving-young-band-skip-in-map` | `CRATONVM_MOVING_YOUNG_BAND_SKIP_IN_MAP` |
 | `forced-finalizers` | `CRATONVM_FORCED_FINALIZERS` |
 | `gpu-min-work-giveup` | `CRATONVM_GPU_MIN_WORK_GIVEUP` |

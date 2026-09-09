@@ -5739,6 +5739,27 @@ impl Drop for G1Collector {
     }
 }
 
+/// `CRATONVM_GC_G1_MOVABLE_PINS=0` — pin the region of EVERY conservative JIT
+/// root, ignoring the movable/rewritable partition. **Default ON**, i.e. the
+/// partition is honoured, as it already is on the generational path.
+///
+/// The bisect lever for [`G1Collector::jit_pinned_region_set`]'s filter. A
+/// wrong "movable" verdict evacuates an object a frame still points at, so this
+/// is the switch that says whether a stale-pointer report belongs to this
+/// change or to something else.
+fn g1_movable_pins_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_GC_G1_MOVABLE_PINS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
 impl G1Collector {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -19482,10 +19503,56 @@ impl G1Collector {
         set
     }
 
+    /// The regions a live JIT frame forces out of the collection set.
+    ///
+    /// # The movable partition, which this used to ignore
+    ///
+    /// Not every conservative JIT root has to be pinned. A reference the shadow
+    /// stack published is PRECISE and REWRITABLE -- `shadow_stack.remap`
+    /// rewrites it after a move and the JIT's post-safepoint reload refreshes
+    /// the register from the (rewritten) frame slot -- so its object may be
+    /// evacuated like any other. `gc_quiescence` carries that partition, and
+    /// `gen_heap::collect_garbage_inner` has consulted it since the moving
+    /// young generation shipped:
+    ///
+    /// ```text
+    /// let movable = honour_movable
+    ///     && is_movable_jit_root(a)
+    ///     && !is_unrewritable_jit_root(a);
+    /// if is_y(a) && !movable { pin_base_of(a, &mut pinned); }
+    /// ```
+    ///
+    /// G1 applied NO such filter: every address in the snapshot pinned its
+    /// region. On a region-granular collector that is the expensive way to be
+    /// wrong -- a pinned region leaves the collection set WHOLESALE, so one
+    /// rewritable reference costs a whole megabyte at `-Xmx2g`. On H2's
+    /// `TestValueMemory` Type 3 it pinned 14 regions for 12474 KB from 38
+    /// addresses of which only 10 were actually unrewritable, and G1 read
+    /// ~11000 where the generational collector read 1149 and ZGC 1205 on the
+    /// same row.
+    ///
+    /// The three conjuncts are the generational path's, unchanged and for its
+    /// reasons: `honour_movable` is the whole-cycle proof that precise coverage
+    /// held, `is_movable_jit_root` is the per-address claim that a rewritable
+    /// channel names it, and `is_unrewritable_jit_root` is the VETO -- the pin
+    /// set is keyed by OBJECT, so one rewritable channel naming an address must
+    /// not license moving it out from under every other word that also holds
+    /// it, such as a compiled frame's callee-saved register image, which
+    /// `band_slot_is_verifiable` refuses to inspect and no channel rewrites.
+    ///
+    /// `CRATONVM_GC_G1_MOVABLE_PINS=0` restores the pin-everything behaviour.
     fn jit_pinned_region_set(&self) -> RegionSet {
+        let honour_movable = g1_movable_pins_enabled()
+            && !crate::gc_quiescence::moving_young_coverage_incomplete();
         let mut set: RegionSet = if crate::gc_quiescence::is_active() {
             crate::gc_quiescence::pinned_jit_roots_snapshot()
                 .into_iter()
+                .filter(|&addr| {
+                    let movable = honour_movable
+                        && crate::gc_quiescence::is_movable_jit_root(addr)
+                        && !crate::gc_quiescence::is_unrewritable_jit_root(addr);
+                    !movable
+                })
                 .filter_map(|addr| self.lookup_region_for_addr(addr))
                 .collect()
         } else {
