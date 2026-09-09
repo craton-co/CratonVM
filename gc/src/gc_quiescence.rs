@@ -3114,7 +3114,10 @@ pub fn was_vacated_try(addr: usize) -> Result<Option<usize>, ()> {
     if dests.contains(&addr) {
         return Ok(None);
     }
-    Ok(from.get(&addr).copied())
+    // The ledger's value carries the vacating COLLECTION as well as the
+    // destination (see `VacatedLedger`); a signal handler only wants the
+    // address it should have been reading.
+    Ok(from.get(&addr).map(|&(to, _)| to))
 }
 
 // ---------------------------------------------------------------------------
