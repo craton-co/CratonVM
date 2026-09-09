@@ -6628,6 +6628,31 @@ pub struct InlineSite {
     pub ldc_info: Vec<(usize, i64)>,
     /// Resolved ldc2_w constants: (callee_pc, i64_value).
     pub ldc2w_info: Vec<(usize, i64)>,
+    /// Callee PCs, among [`Self::ldc_info`] and [`Self::ldc2w_info`], whose
+    /// constant is a **float or double** rather than an int or a long.
+    ///
+    /// The two vectors above carry a bare `i64` because that is all the
+    /// single-pass emitter needs: it materialises the bits and the surrounding
+    /// bytecode decides how to read them. The IR builder cannot work that way —
+    /// it must choose a NODE, `Op::ConstF` typed `Float`/`Double` or `Op::Const`
+    /// typed `Int`/`Long`, at the moment it lowers the `ldc`, and it cannot
+    /// infer the width from the opcode (`ldc` is polymorphic) or from admission
+    /// (a method whose only FP is `ldc 1.5f` is admitted through the int
+    /// clause). Its own `ldc_info`/`ldc2w_info` maps are therefore
+    /// `(bits, is_fp)` pairs and always have been.
+    ///
+    /// That one missing bit was the whole of the `ir-splice-ldc` refusal: a
+    /// callee containing ANY `ldc` was refused for inlining by the optimizing
+    /// tier — not for a modelling reason, but because this struct dropped the
+    /// tag on the floor. Measured on a four-callee probe, `ldc` alone refused
+    /// two of the four (`x *= 0x9E3779B1`, `s * 1000003L` — a constant wider
+    /// than `sipush` is unremarkable in real code).
+    ///
+    /// A `Vec` rather than a third parallel `(pc, value, flag)` vector so the
+    /// two existing shapes and every consumer of them stay byte-identical; the
+    /// lists are per-callee and short, so membership is a linear scan over a
+    /// handful of entries at splice time only.
+    pub ldc_fp_pcs: Vec<usize>,
     /// Whether the callee needs VM context (heap pointer).
     pub needs_heap: bool,
     /// Class name of the inlined callee (for invalidation tracking).
@@ -6938,6 +6963,20 @@ fn append_ir_inline_site(
     for &(cpc, class_id, num_fields) in &site.ir_new_info {
         tables.new_info.insert(base + cpc, (class_id, num_fields));
     }
+    // Constants, rebased with the type tag the builder needs. The resolver has
+    // already refused any `ldc` whose constant-pool entry is not an
+    // Integer/Float (or Long/Double for `ldc2_w`), so a pc present here is one
+    // of exactly those four kinds and `ldc_fp_pcs` splits them.
+    for &(cpc, val) in &site.ldc_info {
+        tables
+            .ldc_info
+            .insert(base + cpc, (val, site.ldc_fp_pcs.contains(&cpc)));
+    }
+    for &(cpc, val) in &site.ldc2w_info {
+        tables
+            .ldc2w_info
+            .insert(base + cpc, (val, site.ldc_fp_pcs.contains(&cpc)));
+    }
     // The resolver PROVED these bodies are no-ops, which is what
     // `object_init_pcs` means — elidable on any receiver, not only on a fresh
     // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
@@ -7017,11 +7056,31 @@ fn append_ir_inline_site(
 /// Merge one top-level site's rows into the compile's plan. Split out so the
 /// roll-back path has something to NOT call.
 fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTables) {
-    into.sites.extend(from.sites);
-    into.field_info.extend(from.field_info);
-    into.invoke_info.extend(from.invoke_info);
-    into.new_info.extend(from.new_info);
-    into.object_init_pcs.extend(from.object_init_pcs);
+    // DESTRUCTURED, not field-by-field on `from`. A row added to
+    // `IrInlineTables` and forgotten here does not fail to compile — it
+    // silently reaches the builder empty, and the builder then bails the whole
+    // METHOD at the first spliced site that needed it, which reads from the
+    // outside exactly like a workload with no such site. That is not
+    // hypothetical: it is how the `ldc` rows behaved for their first hour of
+    // existence, with the scanner admitting the callee and the builder refusing
+    // it 65 bytes later. The pattern below makes the next such row a
+    // compile error.
+    let ir::IrInlineTables {
+        sites,
+        field_info,
+        invoke_info,
+        new_info,
+        object_init_pcs,
+        ldc_info,
+        ldc2w_info,
+    } = from;
+    into.sites.extend(sites);
+    into.field_info.extend(field_info);
+    into.invoke_info.extend(invoke_info);
+    into.new_info.extend(new_info);
+    into.object_init_pcs.extend(object_init_pcs);
+    into.ldc_info.extend(ldc_info);
+    into.ldc2w_info.extend(ldc2w_info);
 }
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
@@ -8150,6 +8209,7 @@ mod profile_guided_inlining_tests {
             static_field_info: Vec::new(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
+            ldc_fp_pcs: Vec::new(),
             needs_heap: false,
             class_name: class.to_string(),
             class_id: 0,
@@ -8936,6 +8996,7 @@ mod inline_selection_tests {
                 .collect(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
+            ldc_fp_pcs: Vec::new(),
             needs_heap,
             class_name: "InlineCost".to_string(),
             class_id: 0,
@@ -25472,6 +25533,36 @@ fn try_compile_inner(
         // report can separate "the front end refused this bytecode" (build
         // returned None, `nodes_built` stays unmeasured) from "the graph was
         // built and then rejected for size".
+        // The branches whose cold arm this compile may speculate away.
+        //
+        // Strictly stronger than `ir_branch_hints` above, and the
+        // difference is the whole point: a hint says which edge to lay
+        // out first and is free to be wrong, while this DELETES an arm
+        // and pays a deopt when it is wrong. So the test is exact —
+        // `not_taken == 0`, not "usually" — over a sample large enough
+        // that zero means something (`ir::MIN_OBSERVATIONS_TO_PRUNE`).
+        //
+        // Empty without a profile, which is every run that has not
+        // asked for one; `IrBuilder::prune_always_taken_branch` then
+        // never fires and the graph is byte-identical.
+        let ir_pruned_branches: std::collections::HashSet<usize> =
+            if ir::ir_speculate_enabled() {
+                profile
+                    .map(|prof| {
+                        prof.branches
+                            .iter()
+                            .filter(|(_, c)| {
+                                c.not_taken == 0
+                                    && c.taken >= ir::MIN_OBSERVATIONS_TO_PRUNE
+                            })
+                            .map(|(&pc, _)| pc)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashSet::new()
+            };
+        builder.set_pruned_branches(ir_pruned_branches);
         note_jit_pipeline_stage(JIT_STAGE_BUILD);
         let metrics_build = metrics.phase(metrics::Phase::Build);
         // `code_len` stays the COMPILING method's length whichever buffer this

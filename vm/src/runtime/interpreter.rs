@@ -4904,6 +4904,91 @@ fn method_key_parts<'a>(
     )
 }
 
+/// Per-thread handle cache for [`cratonvm_jit::profile::BranchCounters`].
+///
+/// # Why this exists
+///
+/// Recording one branch used to cost a 64-bit fingerprint of
+/// `(class_id, name, descriptor)`, a shard `RwLock` read, an index probe, a
+/// `MethodKey` comparison, a `parking_lot::Mutex` acquire and an `FxHashMap`
+/// entry — on the interpreter's hot path, per branch. That price is the whole
+/// reason `CRATONVM_TIER_PGO` has never shipped on, and the reason the
+/// optimizing tier's scheduler reads an empty `branch_counts` at essentially
+/// every compile.
+///
+/// The counters themselves are lock-free and indexed by pc; all that is left is
+/// FINDING them, and a method's counters do not change while it runs. So this
+/// caches the handle against the identity of the frame's
+/// `CachedBytecodeMethod`. In a loop the whole lookup collapses to one pointer
+/// comparison and one relaxed `fetch_add`.
+///
+/// # Why the method `Arc` is held, not just its address
+///
+/// The obvious key is `Arc::as_ptr(cm) as usize`. It is wrong on its own: a
+/// `CachedBytecodeMethod` that is dropped and a new one allocated at the same
+/// address would be served the previous method's counters — an ABA that would
+/// mis-attribute a profile silently and never fail a test. Holding the `Arc`
+/// keeps the address from being reused while the entry is live, so
+/// `Arc::ptr_eq` is a real identity test.
+///
+/// Direct-mapped over eight ways rather than a single cell: a caller alternating
+/// between two hot methods would otherwise thrash, and eight entries of two
+/// `Arc`s each is nothing per thread.
+const BRANCH_MEMO_WAYS: usize = 8;
+
+thread_local! {
+    static BRANCH_COUNTER_MEMO: std::cell::RefCell<
+        Vec<Option<(Arc<cratonvm_jit::CachedBytecodeMethod>,
+                    Arc<cratonvm_jit::profile::BranchCounters>)>>,
+    > = std::cell::RefCell::new(vec![None; BRANCH_MEMO_WAYS]);
+}
+
+/// Record one conditional-branch observation for `frame`.
+///
+/// Falls back to the map-based recorder for a frame that carries no
+/// `CachedBytecodeMethod` — the launcher's `main` and some reflective entries —
+/// so no observation is lost by shape. `MethodProfile::snapshot` folds the two
+/// sources together, so a method recorded through both is still counted once
+/// per observation.
+#[inline]
+fn record_branch_for_frame(
+    shared: &crate::vm::SharedVm,
+    frame: &crate::runtime::frame::Frame,
+    pc: usize,
+    taken: bool,
+) {
+    let Some(cm) = frame.cached_method() else {
+        let (cid, mn, md) = method_key_parts(frame);
+        shared
+            .jit
+            .profile_store
+            .record_branch_borrowed(cid, mn, md, pc, taken);
+        return;
+    };
+    // Cast: an `Arc` address used only to pick a memo way; identity is settled
+    // by `Arc::ptr_eq` below, never by this value.
+    let way = (Arc::as_ptr(cm) as usize >> 4) % BRANCH_MEMO_WAYS;
+    let counters = BRANCH_COUNTER_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some((have, counters)) = memo.get(way).and_then(|e| e.as_ref()) {
+            if Arc::ptr_eq(have, cm) {
+                return Arc::clone(counters);
+            }
+        }
+        let fresh = shared.jit.profile_store.branch_counters_borrowed(
+            frame.class_id.as_u32(),
+            frame.method_name_arc_ref(),
+            frame.method_descriptor_arc_ref(),
+            cm.code.len(),
+        );
+        if let Some(slot) = memo.get_mut(way) {
+            *slot = Some((Arc::clone(cm), Arc::clone(&fresh)));
+        }
+        fresh
+    });
+    counters.record(pc, taken);
+}
+
 // ---------------------------------------------------------------------------
 // Frame pop helper (releases synchronized monitor if present)
 // ---------------------------------------------------------------------------
@@ -5802,11 +5887,7 @@ fn execute_frame_from_index(
         ($frame:expr, $saved_pc:expr, $b1:expr, $b2:expr, $taken:expr) => {{
             let taken = $taken;
             if pgo_enabled {
-                let (cid, mn, md) = method_key_parts($frame);
-                shared
-                    .jit
-                    .profile_store
-                    .record_branch_borrowed(cid, mn, md, $saved_pc, taken);
+                record_branch_for_frame(shared, $frame, $saved_pc, taken);
             }
             if taken {
                 // Cast: bytecode operand decoding
@@ -6176,12 +6257,12 @@ fn execute_frame_from_index(
                                 let ob2 = unsafe { *code_ptr.add(saved_pc + 4) };
                                 let taken = vx < vy;
                                 if pgo_enabled {
-                                    let (cid, mn, md) = method_key_parts(frame);
-                                    shared.jit.profile_store.record_branch_borrowed(
-                                        cid,
-                                        mn,
-                                        md,
-                                        saved_pc + 2, // profile at the if_icmplt pc
+                                    // profile at the `if_icmplt` pc, not the
+                                    // fused pair's start
+                                    record_branch_for_frame(
+                                        shared,
+                                        frame,
+                                        saved_pc + 2,
                                         taken,
                                     );
                                 }
