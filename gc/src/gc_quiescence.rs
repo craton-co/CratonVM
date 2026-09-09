@@ -2629,6 +2629,41 @@ fn vacated_frames_enabled_init(state: &std::sync::atomic::AtomicU8) -> bool {
 /// exactly the `SessionLocal$Savepoint` its `astore 4` had put there). With
 /// re-issued addresses removed, a hit is unambiguous: nothing has been
 /// allocated at that address since the collector moved its occupant away.
+/// Relocating collections this process has completed (every cycle that
+/// produced a non-empty pointer map).
+///
+/// Paired with [`note_pointer_map_applied`] it answers the question a stale
+/// register otherwise leaves open: was this thread ever handed the map it is
+/// missing? A thread whose last applied cycle EQUALS this counter was rewritten
+/// and is stale anyway -- a hole in the rewrite. One whose number is smaller
+/// never got the map at all, which is a different defect with a different fix.
+pub static RELOCATING_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// `(relocating-cycle number, path)` of the last pointer map THIS thread
+    /// applied to itself. Path: 1 = the stop-the-world resume
+    /// (`apply_pointer_map_to_thread`), 2 = the ordinary blocked-region wake
+    /// (`check_post_block_gc_refs`), 3 = the leaked-region fallback
+    /// (`apply_pending_blocked_fixups`).
+    ///
+    /// Read from the fatal-signal handler, which runs on the faulting thread,
+    /// so a plain thread-local `Cell` is the one storage class that is both
+    /// correct and reachable there.
+    static LAST_MAP_APPLIED: std::cell::Cell<(u64, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Record that this thread has just applied a relocation pointer map. See
+/// [`LAST_MAP_APPLIED`].
+pub fn note_pointer_map_applied(path: u8) {
+    let n = RELOCATING_CYCLES.load(Ordering::Relaxed);
+    let _ = LAST_MAP_APPLIED.try_with(|c| c.set((n, path)));
+}
+
+/// `(cycle, path)` for this thread; `(0, 0)` if it never applied one.
+pub fn last_pointer_map_applied() -> (u64, u8) {
+    LAST_MAP_APPLIED.try_with(|c| c.get()).unwrap_or((0, 0))
+}
+
 pub fn record_vacated(pointer_map: &cratonvm_types::PointerMap) {
     if !vacated_frames_enabled() {
         return;
@@ -2863,6 +2898,29 @@ pub fn was_vacated(addr: usize) -> Option<usize> {
         return None;
     }
     from.get(&addr).copied()
+}
+
+/// [`was_vacated`] for a SIGNAL HANDLER: never blocks.
+///
+/// The fatal-signal reporter runs on the faulting thread, which may itself hold
+/// the ledger's lock -- a blocking `read()` there turns a diagnosable crash into
+/// a hang, and a hang produces no report at all. `try_read` answers "cannot
+/// tell" instead, and the caller prints that rather than pretending the register
+/// was clean.
+pub fn was_vacated_try(addr: usize) -> Result<Option<usize>, ()> {
+    if !vacated_frames_enabled() {
+        return Ok(None);
+    }
+    let Some(g) = VACATED_ADDRS.try_read() else {
+        return Err(());
+    };
+    let Some((from, dests)) = g.as_ref() else {
+        return Ok(None);
+    };
+    if dests.contains(&addr) {
+        return Ok(None);
+    }
+    Ok(from.get(&addr).copied())
 }
 
 // ---------------------------------------------------------------------------

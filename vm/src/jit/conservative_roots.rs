@@ -9383,6 +9383,71 @@ pub fn audit_jit_frames_for_vacated(
 pub static JIT_VACATED_FRAME_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The subset of [`JIT_VACATED_FRAME_HITS`] in a slot `band_slot_is_verifiable`
+/// INSPECTS -- a java local, or an operand-spill slot below the safepoint's
+/// live cursor.
+///
+/// This is the number that separates the two candidate stories. An unverifiable
+/// hit is a dead register image or an abandoned outgoing-argument word, which
+/// is what every conservative frame scan carries and what
+/// `CRATONVM_JIT_REMAP_ALL_UNVERIFIABLE` was measured against to no effect. A
+/// VERIFIABLE hit is a slot the coverage machinery claims to describe and the
+/// remap still did not rewrite -- a live oop of a live compiled frame left
+/// naming a vacated address.
+pub static JIT_VACATED_FRAME_HITS_VERIFIABLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-region tally, indexed by [`vacated_region_bucket`].
+pub static JIT_VACATED_BY_REGION: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Bucket names for [`JIT_VACATED_BY_REGION`], in index order.
+pub const JIT_VACATED_REGION_NAMES: [&str; 8] = [
+    "java-local",
+    "operand-spill",
+    "licm-or-scalar",
+    "callee-saved-gpr-image",
+    "safepoint-gpr-spill-image",
+    "outgoing-args-or-deopt-regs",
+    "reserved-locals-tail",
+    "other",
+];
+
+fn vacated_region_bucket(region: &str) -> usize {
+    match region {
+        "java-local" => 0,
+        "operand-spill" => 1,
+        "licm-ref-hoist" | "licm-arith" | "scalar-replaced-field" => 2,
+        "callee-saved-gpr-image" | "callee-saved-xmm-image" => 3,
+        "safepoint-gpr-spill-image" => 4,
+        "outgoing-args-or-deopt-regs" => 5,
+        "reserved-locals-tail" => 6,
+        _ => 7,
+    }
+}
+
+/// `(total, verifiable, per-region)` for the run's `[jit-vacated-frame]` census.
+pub fn jit_vacated_frame_census() -> (u64, u64, [u64; 8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut per = [0u64; 8];
+    for (i, c) in JIT_VACATED_BY_REGION.iter().enumerate() {
+        per[i] = c.load(Relaxed);
+    }
+    (
+        JIT_VACATED_FRAME_HITS.load(Relaxed),
+        JIT_VACATED_FRAME_HITS_VERIFIABLE.load(Relaxed),
+        per,
+    )
+}
+
 fn report_vacated_words_in(
     lo: usize,
     hi: usize,
@@ -9404,7 +9469,22 @@ fn report_vacated_words_in(
         let w = unsafe { (addr as *const usize).read() };
         if let Some(moved_to) = cratonvm_gc::gc_quiescence::was_vacated(w) {
             let n = JIT_VACATED_FRAME_HITS.fetch_add(1, Ordering::Relaxed);
-            if n < 200 {
+            // Cast: a compiled frame is far smaller than i32::MAX.
+            let off_t = (rbp - addr) as i32;
+            let region_t = cm.frame_layout.region_name(off_t);
+            let verifiable_t = band_slot_is_verifiable(
+                off_t,
+                &cm.frame_layout,
+                moving_young_frame_live_hi(rbp, cm),
+            );
+            if verifiable_t {
+                JIT_VACATED_FRAME_HITS_VERIFIABLE.fetch_add(1, Ordering::Relaxed);
+            }
+            JIT_VACATED_BY_REGION[vacated_region_bucket(region_t)].fetch_add(1, Ordering::Relaxed);
+            // Report the VERIFIABLE ones without a budget: they are the finding,
+            // and on a healthy run there are none. The unverifiable tail is dead
+            // slop every conservative scan carries, so it keeps a cap.
+            if verifiable_t || n < 200 {
                 // Cast: a compiled frame is far smaller than i32::MAX.
                 let off = (rbp - addr) as i32;
                 eprintln!(
