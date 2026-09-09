@@ -39,12 +39,15 @@ jit_cold_new_cp
 jit_collection_ctor_identity
 jit_cov06_array_allocation
 jit_final_devirt_native_shadow
+jit_guarded_inline_native_shadow
 jit_interp_differential
 jit_ir_athrow_dispatch
 jit_ir_exception_stub_throw_bci
+jit_ir_phi_copy_register_alias
 jit_null_receiver_npe
 jit_osr_athrow_lift
 jit_osr_throw_outside_try
+jit_site_trap_never_duplicates_a_side_effect
 map_view_remove_if
 native_alloc_oom_catchable
 native_io_dis_read_fully_pin
@@ -72,6 +75,7 @@ socket_input_stream_timeout
 spring_io_enumset_regression
 sslserversocket_accept_echo
 stack_trace_across_tiers
+stack_trace_compiled_callee
 stackwalker_reflect_gc
 sublist_view_regression
 synchronized_wrapper_mutex
@@ -164,17 +168,48 @@ writer_flush_real
 #   jit_final_devirt_native_shadow  25s      osr_unbox_intrinsic_...      14s
 #   sealed_bootstrap_permitted_subclasses    10s
 #
-# FOUR of the nine passed the same bar and are still NOT promoted, on cost
-# alone. Ratcheting them would add ~5 minutes to a step whose whole list took
-# 34m55s here (Windows, debug, idle host) against ci.yml's `timeout-minutes:
-# 15`. That gap is not itself an alarm -- the step runs on ubuntu-latest only
-# and is green there -- but it is not headroom to spend blind either. Someone
-# with the Linux number should take these; the measurement is done:
+# THE FOUR THAT THIS BLOCK DEFERRED ON COST -- listed by name in the table
+# below -- ARE NOW PROMOTED (2026-09-09), and the Linux number is why. The
+# block below asked for it; here it is, measured on the host this lane builds
+# on (debug binary, javac on PATH, CRATONVM_BIN set, each target run THREE
+# times -- the file's bar is twice; the third was added because the first two
+# used a binary carrying an experimental locale arm that was reverted before
+# landing, so the pair was re-run against a clean HEAD build. Same times):
 #
-#   jit_guarded_inline_native_shadow          97s
-#   jit_ir_phi_copy_register_alias            77s
-#   jit_site_trap_never_duplicates_a_side_effect  61s
-#   stack_trace_compiled_callee               57s
+#   target                                        Windows   Linux run1/run2
+#   jit_guarded_inline_native_shadow                 97s        13s / 12s
+#   jit_ir_phi_copy_register_alias                   77s        12s / 11s
+#   jit_site_trap_never_duplicates_a_side_effect     61s         9s /  9s
+#   stack_trace_compiled_callee                      57s        13s / 13s
+#
+#   third run, clean HEAD binary: 12.42s / 11.37s / 8.38s / 12.03s of test
+#   time, all `1 passed` -- indistinguishable from the pair above.
+#   ------------------------------------------------------------------
+#   total                                          ~292s        ~47s
+#
+# So the cost objection was measured on the wrong platform. This step is
+# `if: matrix.os == 'ubuntu-latest'` in ci.yml -- it NEVER runs on Windows --
+# and the Windows figures that deferred these four were never the step's cost.
+# On Linux they add ~47s, not ~5 minutes.
+#
+# The budget, same run, same host: the whole 78-target list took 398s wall on
+# a WARM target dir, against `timeout-minutes: 15`. A cold CI run pays build
+# cost on top of that, which this measurement does NOT capture -- so read 398s
+# as a floor for the run phase, not as the step's total. Even doubled, +47s is
+# not the line item to worry about.
+#
+# Each was observed `ok` with a real clock (8.8-12.9s of test time, `1 passed`),
+# which is the check that matters here: CRATONVM_REQUIRE_E2E guards the BINARY
+# only, and a missing javac still lets an e2e target report `ok` in 0.00s.
+#
+# FOUND WHILE MEASURING, and NOT caused by this change: `stack_trace_across_tiers`
+# fails DETERMINISTICALLY on dev (7/7, ~7.2s each), so this step is red until
+# that is fixed. It is filed at
+# docs/known-issues/jit/stack-trace-across-tiers-fails-deterministically-on-dev-20260909.md
+# with the evidence that the reflection-caller change in flight at the time is
+# not the cause. `wp2_5_proxy` also failed, for a different and benign reason:
+# its fixture lives under gitignored `apps/`, so a fresh checkout has no
+# ProxyProbe.class and REQUIRE_E2E correctly turns that skip into a failure.
 #
 # The ninth, `vthread_probe_regression`, FAILED again on 2026-09-08 at 120s --
 # the FLAKY block above is right and its one green that morning was luck.
