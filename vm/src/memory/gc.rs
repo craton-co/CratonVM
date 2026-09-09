@@ -2182,6 +2182,24 @@ fn verify_no_stale_refs(
                             heap.map(|h| h.is_heap_addr(addr).is_some()).unwrap_or(false),
                             heap.map(|h| h.collection_count()).unwrap_or(0),
                         );
+                        // AND WHETHER THE SCAN WOULD PRODUCE IT AT ALL. Re-run
+                        // the frame's own root scan -- the very call `roots.rs`
+                        // step 1 makes -- and look for the address. TRUE means
+                        // the root set contained this slot and the collection
+                        // dropped the object anyway, which is a marking or
+                        // copying fault, not a scanning one. FALSE means the
+                        // scan is the place to look, and `local_kind` /
+                        // `in_heap` above say which of its two filters did it.
+                        if let Some(h) = heap {
+                            let mut probe: Vec<ObjectRef> = Vec::new();
+                            frame.scan_local_objects(&mut probe, h);
+                            eprintln!(
+                                "POST-GC RECLAIMED-WHILE-HELD LOCAL ^ scan_would_root={} \
+                                 (frame's own scan yields {} roots)",
+                                probe.iter().any(|r| r.as_ptr() as usize == addr),
+                                probe.len(),
+                            );
+                        }
                     }
                 }
                 if heavy && addr != 0 {
