@@ -26201,6 +26201,37 @@ mod tests {
         assert!(size > 0);
     }
 
+    /// Regression: `Tlab::new` requires `ptr + size` to be 8-aligned
+    /// (gc/src/tlab.rs — "end pointer must be 8-aligned for tail-filler
+    /// safety"). `refill_tlab` used to hand back `requested_size.min(available)`
+    /// verbatim; when a refill request is truncated because the young
+    /// from-space is nearly full, `available` need only be a multiple of 8
+    /// (not 16+), so the truncated grant could itself be a non-8-aligned
+    /// byte count even though the returned `ptr` is always 8-byte aligned.
+    /// A deliberately non-8-aligned arena capacity (real capacities are
+    /// always multiples of 8, but nothing enforced that at this boundary)
+    /// reproduces the truncation deterministically without needing a JIT
+    /// allocation storm.
+    #[test]
+    fn tlab_refill_truncated_grant_is_always_8_aligned() {
+        // 4101 is deliberately NOT a multiple of 8.
+        let heap = GenerationalHeap::with_sizes(4101, 4096);
+        let (ptr, size) = heap
+            .refill_tlab(1_000_000)
+            .expect("refill_tlab should still succeed with a truncated grant");
+        assert_eq!(
+            size % 8,
+            0,
+            "truncated TLAB size must be 8-aligned, got {size}"
+        );
+        assert_eq!(
+            (ptr as usize + size) % 8,
+            0,
+            "ptr + size must be 8-aligned so Tlab::new's contract holds"
+        );
+        assert!(size <= 4101);
+    }
+
     #[test]
     fn gc_reclaims_dead_objects() {
         // Allocate objects, don't keep roots to them, GC should reclaim.
