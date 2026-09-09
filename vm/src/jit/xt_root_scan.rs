@@ -1502,7 +1502,9 @@ mod imp {
             // Kill switch, so the reader and the historical direct load are
             // A/B-able inside ONE binary. Setting it restores the pre-fix
             // behaviour exactly — including the SIGSEGV.
-            if std::env::var_os("CRATONVM_XT_NO_SAFE_PEER_READ").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_XT_NO_SAFE_PEER_READ")
+                .is_some()
+            {
                 return false;
             }
             let probe: u64 = 0x5ab0_1234_5678_9abc;
