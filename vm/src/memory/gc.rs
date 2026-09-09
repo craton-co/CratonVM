@@ -1852,7 +1852,14 @@ pub fn verify_heap_object_fields(
             .unwrap_or_else(|| format!("cid#{}", cid.as_u32()))
     };
     let mut reported = 0usize;
-    const CAP: usize = 40;
+    // Distinct (referrer class, slot, reason) triples already reported THIS
+    // collection. Without it one repeated pair burns the whole cap and hides
+    // every other referrer: on BindableTests under GC stress a single
+    // `java/lang/Module field[0]` accounted for 2272 of 2280 lines, and nothing
+    // else in the heap was ever reachable by this pass.
+    let mut seen: std::collections::HashSet<(u32, usize, &'static str)> =
+        std::collections::HashSet::new();
+    const CAP: usize = 200;
     // Recycled-destination filter — the same ambiguity `verify_no_stale_refs`
     // documents at length, which this pass was missing.
     //
@@ -1904,16 +1911,19 @@ pub fn verify_heap_object_fields(
             for i in 0..nf {
                 if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
                     if let Some(reason) = classify(target.as_ptr() as usize) {
-                        eprintln!(
-                            "[heap-stale] {} OBJ {} field[{}] -> 0x{:x}",
-                            reason,
-                            class_name(r_cid),
-                            i,
-                            target.as_ptr() as usize,
-                        );
-                        reported += 1;
-                        if reported >= CAP {
-                            break;
+                        if seen.insert((r_cid.as_u32(), i, reason)) {
+                            eprintln!(
+                                "[heap-stale] {} OBJ {} field[{}] -> 0x{:x} (referrer 0x{:x})",
+                                reason,
+                                class_name(r_cid),
+                                i,
+                                target.as_ptr() as usize,
+                                ptr as usize,
+                            );
+                            reported += 1;
+                            if reported >= CAP {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1928,16 +1938,22 @@ pub fn verify_heap_object_fields(
                     unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                 let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
-                    eprintln!(
-                        "[heap-stale] {} ARR {}[{}] -> 0x{:x}",
-                        reason,
-                        class_name(r_cid),
-                        i,
-                        raw,
-                    );
-                    reported += 1;
-                    if reported >= CAP {
-                        break;
+                    // Arrays dedupe on the CLASS and the reason only: the index
+                    // is data, and a 4096-element array with one dangling slot
+                    // must not read as 4096 distinct findings.
+                    if seen.insert((r_cid.as_u32(), usize::MAX, reason)) {
+                        eprintln!(
+                            "[heap-stale] {} ARR {}[{}] -> 0x{:x} (referrer 0x{:x})",
+                            reason,
+                            class_name(r_cid),
+                            i,
+                            raw,
+                            ptr as usize,
+                        );
+                        reported += 1;
+                        if reported >= CAP {
+                            break;
+                        }
                     }
                 }
             }
@@ -1945,8 +1961,9 @@ pub fn verify_heap_object_fields(
     }
     if reported > 0 {
         eprintln!(
-            "[heap-stale] ^ {} stale field(s) this GC (pointer_map size={})",
+            "[heap-stale] ^ {} distinct stale (class, slot, reason) triple(s) at collection {}              (pointer_map size={})",
             reported,
+            heap.collection_count(),
             pointer_map.len(),
         );
     }

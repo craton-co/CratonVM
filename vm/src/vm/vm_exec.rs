@@ -28720,6 +28720,38 @@ fn invoke_on_class_shared_inner(
                             f.pc
                         );
                     }
+                    // The frame chain names WHERE the bad receiver was used; it
+                    // does not say which slot still holds it, or whether the
+                    // same address sits in a caller's local as well. Both are
+                    // the difference between "the producer handed back a stale
+                    // value" and "one slot went stale in place", and both are
+                    // gone the moment this terminal returns. Dump the object
+                    // slots of the innermost three frames with the class each
+                    // address actually resolves to.
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(3) {
+                        let mut show = |what: &str, idx: usize, o: ObjectRef| {
+                            let a = o.as_ptr() as usize;
+                            let cid = shared.mem.heap.class_id_of(o);
+                            let cn = shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| format!("cid#{}", cid.as_u32()));
+                            eprintln!("    CCE-BT-SLOT[{i}] {what}[{idx}] 0x{a:x} {cn}");
+                        };
+                        for li in 0..f.locals_len() {
+                            if let Value::Object(Some(o)) = f.get_local(li as u16) {
+                                show("local", li, o);
+                            }
+                        }
+                        for si in 0..f.stack.len() {
+                            if let Value::Object(Some(o)) = f.stack.peek_at(si) {
+                                show("stack", si, o);
+                            }
+                        }
+                    }
                     if let Some(Value::Object(Some(r))) = args.first() {
                         let addr = r.as_ptr() as usize;
                         let blocked_flag = thread
