@@ -157,7 +157,7 @@ use std::path::{Path, PathBuf};
 /// which `bench-gpu/GpuAsyncChainBench.java` already calls) or an
 /// executor-close path drains the map. Either gives this item a production
 /// caller, and the number comes down in that change.
-const BASELINE_OFFENDERS: usize = 299;
+const BASELINE_OFFENDERS: usize = 297;
 
 /// Minimum number of declarations the scan must find before its result means
 /// anything.
