@@ -2920,6 +2920,9 @@ fn fwd_walk_enabled() -> bool {
     })
 }
 
+/// See `GenerationalHeap::note_objstart_walk`.
+static LAST_OBJSTART_WALK: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
 impl GenerationalHeap {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -8242,6 +8245,23 @@ impl GenerationalHeap {
         mv_phase!("objstart_walk");
         if mv_phase_on {
             moving_phase_count_push("objstart_walk_bytes", young_used as u128);
+        }
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_some() {
+            let skip_bytes: usize = start_skips.iter().map(|&(_, sz)| sz).sum();
+            let head: Vec<String> = start_skips
+                .iter()
+                .take(4)
+                .map(|&(off, sz)| format!("0x{off:x}+0x{sz:x}"))
+                .collect();
+            Self::note_objstart_walk(format!(
+                "used=0x{young_used:x} starts_recorded={} parallel={walked_in_parallel} \
+                 chunks={objstart_chunk_count} complete={start_walk_complete} \
+                 skips={} skip_bytes=0x{skip_bytes:x} first_skips=[{}] \
+                 reserved_tails={moving_with_reserved_tails}",
+                young_object_starts.len(),
+                start_skips.len(),
+                head.join(" "),
+            ));
         }
         if moving_with_reserved_tails {
             // T-3 refusal. The walk above completed fine — the tails were
@@ -16234,6 +16254,21 @@ impl GenerationalHeap {
     /// every survivor is promoted regardless of age. This breaks the
     /// long-lived-tree semispace death spiral.
     #[allow(clippy::too_many_arguments)]
+    /// `CRATONVM_DBG_ROOT_REMAP_AUDIT`: what the object-start walk that built
+    /// THIS cycle's bitmap actually did.
+    ///
+    /// A refusal names an address the bitmap does not hold; whether that is the
+    /// walk's fault needs the walk's own numbers, and by the time
+    /// `forward_object` runs they are three hundred lines out of scope. Stored
+    /// rather than printed: it would otherwise be one line per collection on a
+    /// run that does seven thousand of them.
+    fn note_objstart_walk(summary: String) {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
+            return;
+        }
+        *LAST_OBJSTART_WALK.lock() = Some(summary);
+    }
+
     /// `CRATONVM_DBG_ROOT_REMAP_AUDIT`: the evacuator REFUSED to move a root.
     ///
     /// `forward_object_impl` has three refusal paths and every one of them
@@ -16297,6 +16332,9 @@ impl GenerationalHeap {
                 near.map(|a| format!("0x{a:x}")).unwrap_or_else(|| "none".into()),
                 near.map(|a| (old_ptr as usize).saturating_sub(a) as i64).unwrap_or(-1),
             );
+            if let Some(w) = LAST_OBJSTART_WALK.lock().as_ref() {
+                eprintln!("[forward-refused] ^ objstart_walk: {w}");
+            }
         }
     }
 
