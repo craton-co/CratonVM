@@ -1592,6 +1592,34 @@ moving_young={moving_young} osr_fallback={moving_young_osr_fallback} incomplete=
             .iter()
             .map(|r| r.as_ptr() as usize)
             .collect();
+        // `CRATONVM_DBG_JIT_ROOTSCAN=1` — each DISTINCT address this pass is
+        // about to pin, with the two facts that decide whether it needs to be
+        // pinned at all. `scan_added=15 unrewritable=4` on the line below is a
+        // pair of totals over different domains (words, then objects) and the
+        // arithmetic between them is not available anywhere: 15 words dedupe to
+        // 5 addresses, and which of THOSE five are held only through rewritable
+        // storage is the whole of what a narrowed pin set could drop.
+        if dbg_jit_rootscan() {
+            let mut distinct: Vec<usize> = addrs.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let mut line = String::new();
+            for a in &distinct {
+                line.push_str(&format!(
+                    " 0x{a:x}(unrew={},movable={})",
+                    cratonvm_gc::gc_quiescence::is_unrewritable_jit_root(*a) as u8,
+                    cratonvm_gc::gc_quiescence::is_movable_jit_root(*a) as u8,
+                ));
+            }
+            eprintln!(
+                "[jitpins] words={} distinct={} unrew_set={} movable_set={}{}",
+                addrs.len(),
+                distinct.len(),
+                cratonvm_gc::gc_quiescence::unrewritable_jit_root_count(),
+                cratonvm_gc::gc_quiescence::movable_jit_root_count(),
+                line,
+            );
+        }
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
     }
     // 14a5. A5 CONSERVATIVE FRAME PASS — the second half of step 1, run here
