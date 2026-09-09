@@ -493,8 +493,12 @@ jobs:
       # HOW MANY PROBES THIS RUNS IS NOT IN THIS FILE, AND THAT IS DELIBERATE.
       # The script's built-in list is three. It then appends every line of
       # `scripts/baselines/jdk-only-strict-corpus-<feature>-<os>.probes` for
-      # THIS leg's key, if that file exists -- so the Windows leg runs 67 and
-      # the Linux leg runs 3, from one unchanged command. The list has to be
+      # THIS leg's key, if that file exists -- so both the Windows and the
+      # Linux legs run 67 today, from one unchanged command. They were 67 and 3
+      # until 2026-09-09, when the 64 promoted on Windows were measured on Linux
+      # too: 64 of 64 clean over two runs, 25435 rows -- the SAME row total the
+      # Windows promotion measured, on a different platform and a different JDK
+      # build. The list has to be
       # keyed that way because the ratchet is a set difference against a
       # baseline with the same key: scheduling a probe on a leg whose baseline
       # was frozen without it makes each of its divergent sections a NEW row
@@ -1641,9 +1645,27 @@ jobs:
       # gate can say "no worse"; they are NOT accepted behaviour, and the
       # baseline's own note names the page that diagnoses them.
       #
-      # The LINUX 21 leg still refuses, same posture and same reason as the
-      # bridge ratchet being `ubuntu-latest` only: a `21-linux` key can only be
-      # minted by a run on 21 on Linux.
+      # `21-linux` was minted 2026-09-09 against Temurin 21.0.12+8, so ALL FOUR
+      # legs now adjudicate and none refuses. It carries 16 sections -- the same
+      # count as `21-windows`, but NOT the same set: Linux does not diverge on
+      # `textformat` (that row is locale data and this is a different host), and
+      # it carries a vthreads row Windows does not.
+      #
+      # It was not accepted from one mint. The vthreads section is an
+      # intermittent race, so a baseline minted from a run that saw the smaller
+      # set reads the larger set as NEW and the leg goes red at random -- which
+      # is what the first two mints here did. The accepted baseline is the
+      # MAXIMAL observed set (every later run is then a subset, and GONE always
+      # passes); it was required to pass ten consecutive gate runs, and the
+      # paired ratchet was then re-run against it to prove it can still fail.
+      #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
       #
       # The script self-tests its own ratchet hermetically before touching a VM
       # — it asserts that an injected new section IS flagged and a baselined one
