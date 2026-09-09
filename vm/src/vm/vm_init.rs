@@ -4469,7 +4469,25 @@ impl SharedVm {
         // `profile_store` (branch bias, receiver types, loop trips); the optimizing
         // C2 compile then consumes it. Default-OFF: `enable_profiling` is never
         // called, every `record_*` short-circuits, and behaviour is unchanged.
-        if crate::runtime::env_cache::tier_pgo() {
+        // `CRATONVM_TIER_PGO` — the original opt-in, and still the one that
+        // turns recording on for the whole process.
+        //
+        // `CRATONVM_TIER_PGO_ALWAYS` is the same switch under a name that says
+        // what it is FOR. Branch recording is now one relaxed `fetch_add` into a
+        // per-method array found through a per-thread handle cache
+        // (`record_branch_for_frame`), not a fingerprint + shard lock + slot
+        // mutex + map entry, so the argument that kept it off — "a GLOBAL cost
+        // paid for a LOCAL benefit" — is the thing that changed and the thing
+        // this flag exists to re-measure. If it prices out, the C2 window
+        // (`arm_branch_profiling_for_c2`) can go, and with it the situation
+        // where the optimizing tier's scheduler reads an empty `branch_counts`
+        // at essentially every compile.
+        //
+        // Default OFF: this is a measurement lever until somebody takes the
+        // measurement, not a default flipped on an argument.
+        if crate::runtime::env_cache::tier_pgo()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_TIER_PGO_ALWAYS").is_some()
+        {
             crate::jit::profile::enable_profiling(true);
         }
         crate::jit::profile::enable_receiver_profiling(

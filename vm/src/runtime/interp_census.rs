@@ -352,6 +352,23 @@ pub fn report_at_exit() {
             "[c2-supersede] ir aastore sites lowered: {}",
             cratonvm_jit::ir_lower::ir_aastore_census(),
         );
+        // Block-exit shape. Read as a RATIO: `elided` alone cannot separate a
+        // layout that is working from a method whose blocks were already in
+        // source order, and until the elision existed every edge ended in an
+        // explicit `JMP` — so frequency-driven block layout could not pay,
+        // whatever it reordered.
+        let (ft_elided, ft_jmps) = cratonvm_jit::ir_lower::ir_fallthrough_census();
+        eprintln!(
+            "[c2-supersede] ir block exits: fell_through={ft_elided} jmp_emitted={ft_jmps}"
+        );
+        // Speculation. A zero with `CRATONVM_JIT_IR_SPECULATE=1` means no
+        // branch in this workload was one-sided over the sample — a fact about
+        // the program, not about the pass — and that is precisely what a bare
+        // "nothing happened" cannot tell you.
+        eprintln!(
+            "[c2-supersede] ir cold branch arms pruned: {}",
+            cratonvm_jit::ir::branch_prune_census(),
+        );
         let (held, spent, retired) = cratonvm_jit::deferred_new_retry_census();
         eprintln!(
             "[c2-supersede] deferred-new retries: held={held} spent={spent} retired={retired} re_offered={}",
