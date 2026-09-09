@@ -36,21 +36,6 @@
 # binary and on Windows, so it is NOT comparable to this one and neither
 # number should be quoted for the other platform.
 #
-# VERIFIED ON THE PROFILE CI ACTUALLY USES. Everything above was measured with
-# a RELEASE binary, and ci.yml runs the strict-corpus step against
-# target/debug/cratonvm -- a gate run under a different codegen profile is not
-# that gate. Re-run end to end with a DEBUG binary:
-#
-#   25-linux debug, 64 promoted   rc=0 PASS   609 s   (host load average 27)
-#   21-linux debug, 3 default     rc=0 PASS   144 s   (host load average 22)
-#
-# 609 s is the number to budget against, and it is pessimistic twice over: a
-# debug binary, on an 8-core host that was four times oversubscribed by other
-# work at the time. The same leg on a release binary at low load took 171 s and
-# 195 s. If this step ever needs a timeout raised, raise it -- do not thin this
-# list to fit, because the promotion is what makes the leg measure anything
-# beyond the three default probes.
-#
 # The two probes the 25-windows file excludes on cost (FjpDeepSum, 564 s for
 # 1 row; InvokeAllCount, 436 s for 7 rows) are excluded here too, and for
 # consistency rather than from a Linux measurement: they were not swept here.
