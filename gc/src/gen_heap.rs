@@ -16247,17 +16247,34 @@ impl GenerationalHeap {
     /// The BindableTests residual is exactly that shape: `in_root_set=true`,
     /// `scan_would_root=true`, and no pointer-map entry.
     #[cold]
-    fn note_forward_refusal(old_ptr: *mut u8, reason: &'static str) {
+    fn note_forward_refusal(
+        old_ptr: *mut u8,
+        reason: &'static str,
+        young_from: &Arena,
+        starts: &crate::young_mark::ObjectStartBits,
+    ) {
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_REMAP_AUDIT").is_none() {
             return;
         }
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 24 {
+            let base = young_from.base_ptr() as usize;
+            let (bm_base, bm_span) = starts.extent();
+            let off = (old_ptr as usize).wrapping_sub(base);
+            let in_free_block = young_from
+                .free_blocks_sorted()
+                .iter()
+                .any(|(o, sz)| off >= *o && off < *o + *sz);
             eprintln!(
-                "[forward-refused] {reason} old_ptr=0x{:x} (#{n}) -- the root stays in from-space \
-                 with no pointer-map entry, and from-space is about to be reset",
+                "[forward-refused] {reason} old_ptr=0x{:x} (#{n}) off=0x{off:x} \
+                 arena=[0x{base:x} cap=0x{:x} used=0x{:x}] bitmap=[0x{bm_base:x} span=0x{bm_span:x}] \
+                 off_beyond_bitmap={} in_free_block={in_free_block} -- the root stays in \
+                 from-space with no pointer-map entry, and from-space is about to be reset",
                 old_ptr as usize,
+                young_from.capacity(),
+                young_from.used(),
+                off >= bm_span,
             );
         }
     }
@@ -16317,7 +16334,12 @@ impl GenerationalHeap {
                 // does not know is not an interior word from a conservative
                 // root: it is an object the pre-GC walk that built the bitmap
                 // never saw.
-                Self::note_forward_refusal(old_ptr, "not-an-object-start");
+                Self::note_forward_refusal(
+                    old_ptr,
+                    "not-an-object-start",
+                    young_from,
+                    young_object_starts,
+                );
             }
             return old_ptr;
         }
@@ -16359,7 +16381,12 @@ impl GenerationalHeap {
                 "gen_heap::forward_object: invalid kind/element_type tag — false root or \
                  corrupted header, not decoded as ObjectHeader",
             );
-            Self::note_forward_refusal(old_ptr, "invalid-kind-or-element-tag");
+            Self::note_forward_refusal(
+                old_ptr,
+                "invalid-kind-or-element-tag",
+                young_from,
+                young_object_starts,
+            );
             return old_ptr;
         }
 
@@ -16442,7 +16469,7 @@ impl GenerationalHeap {
             // Leave the object unmoved; this is a suspected false root or
             // corrupted slot. Returning old_ptr preserves progress while the
             // eprintln above gives us the evidence needed to diagnose.
-            Self::note_forward_refusal(old_ptr, "suspect-header");
+            Self::note_forward_refusal(old_ptr, "suspect-header", young_from, young_object_starts);
             return old_ptr;
         }
 

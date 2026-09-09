@@ -279,6 +279,17 @@ impl ObjectStartBits {
         }
     }
 
+    /// `(base, span)` — the arena extent this bitmap can represent at all.
+    ///
+    /// Exposed for the evacuator's refusal census: an address the bitmap says
+    /// is not an object start because it lies OUTSIDE the covered span is a
+    /// completely different finding from one the walk simply did not visit,
+    /// and the report has to be able to tell them apart.
+    #[inline]
+    pub(crate) fn extent(&self) -> (usize, usize) {
+        (self.base, self.span)
+    }
+
     /// Membership. An address outside the span, or not 8-byte aligned, is not
     /// an object start — the same answer the `FxHashSet` gave.
     #[inline]
