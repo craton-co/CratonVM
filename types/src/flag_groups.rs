@@ -1967,7 +1967,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "blocked-peer-stack-remap", on_key: None, off_key: Some("CRATONVM_GC_NO_BLOCKED_PEER_STACK_REMAP"), off_word: None, since: "2026-09-07" },
     E { group: Group::JIT, token: "xt-keep-unrewritable-on-discharge", on_key: Some("CRATONVM_XT_KEEP_UNREWRITABLE_ON_DISCHARGE"), off_key: None, off_word: None, since: "2026-09-04" },
     E { group: Group::GC, token: "zgc-unrewritable-peer-refuses", on_key: Some("CRATONVM_ZGC_UNREWRITABLE_PEER_REFUSES"), off_key: None, off_word: None, since: "2026-09-04" },
-    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: None, since: "2026-09-04" },
+    // Default-ON since 2026-09-08. It shipped opt-in, and the helper-window
+    // DISCHARGE (default-on, same family) then made the pin load-bearing: a
+    // discharged cycle relocates on the strength of "every window pinned", and
+    // `is_heap_addr` -- the predicate it used to pin with -- drops a misaligned
+    // interior pointer and a one-past-the-end cursor, which are the two shapes a
+    // compiled loop leaves in a frozen peer's registers. `0` is the kill switch.
+    E { group: Group::JIT, token: "xt-helper-window-pin-resolve", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE"), off_key: None, off_word: Some("0"), since: "2026-09-04" },
     E { group: Group::JIT, token: "xt-helper-window-interior", on_key: Some("CRATONVM_XT_HELPER_WINDOW_INTERIOR"), off_key: None, off_word: None, since: "2026-09-02" },
     E { group: Group::JIT, token: "xt-helper-window-pin", on_key: Some("CRATONVM_XT_HELPER_WINDOW_PIN"), off_key: None, off_word: None, since: "2026-09-01" },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None, since: "2026-07-02" },
@@ -3461,6 +3467,11 @@ mod tests {
                 "CRATONVM_JIT",
                 "xt-peer-shadow-scan",
                 "CRATONVM_XT_PEER_SHADOW_SCAN",
+            ),
+            (
+                "CRATONVM_JIT",
+                "xt-helper-window-pin-resolve",
+                "CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE",
             ),
         ] {
             let off = case(&[(group, &format!("-{token}"))]);

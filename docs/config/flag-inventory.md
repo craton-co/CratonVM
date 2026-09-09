@@ -1858,7 +1858,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_XT_HELPER_WINDOW_DISCHARGE` | JIT | `CRATONVM_JIT=xt-helper-window-discharge` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_XT_HELPER_WINDOW_INTERIOR` | JIT | `CRATONVM_JIT=xt-helper-window-interior` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_HELPER_WINDOW_PIN` | JIT | `CRATONVM_JIT=xt-helper-window-pin` | opt-in | off | behaviour | snapshot | vm |
-| `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE` | JIT | `CRATONVM_JIT=xt-helper-window-pin-resolve` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE` | JIT | `CRATONVM_JIT=xt-helper-window-pin-resolve` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_XT_HELPER_WINDOW_SCAN` | JIT | `CRATONVM_JIT=xt-helper-window-scan` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_JIT_COVERAGE_ASSUME` | GC | `CRATONVM_GC=xt-jit-coverage-assume` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_XT_JIT_COVERAGE_HANDSHAKE` | GC | `CRATONVM_GC=xt-jit-coverage-handshake` | default-on | on | behaviour | snapshot | vm |
