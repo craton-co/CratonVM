@@ -217,15 +217,50 @@ where
     Some(slots)
 }
 
-/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=1` -- resolve a frozen peer's words
-/// with `resolve_interior_for_pin` rather than `is_heap_addr`.
+/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=0` -- resolve a frozen peer's words
+/// with `is_heap_addr` rather than `resolve_interior_for_pin`.
 ///
 /// The difference is the two cases `is_heap_addr` drops and a frozen peer's
 /// registers hold: a MISALIGNED interior pointer and a ONE-PAST-THE-END cursor.
 /// Both leave an object unpinned, and relocation then moves it out from under
 /// the register that names it.
+///
+/// # DEFAULT ON since 2026-09-08, because the discharge made it load-bearing
+///
+/// It shipped opt-in on 2026-09-04 and, as
+/// `fixed-suite-bugs/bug-testlargeblob-segv-decommit-under-live-memcpy-20260904`
+/// records while eliminating it as that page's cause, *"it is
+/// `runtime_var_os(..).is_some()`, i.e. opt-in and default OFF, so it was never
+/// active in any run"*. That left an asymmetry nobody had to notice while the
+/// pin was merely additive: `helper_window_discharge_enabled` is default ON and
+/// **discharges the refusal on the strength of the pin**, so from that day the
+/// pin stopped being a hint and became the thing standing between relocation
+/// and a peer's registers.
+///
+/// A discharged cycle asks `helper_windows_all_pinned_this_cycle`, and that
+/// answers yes for a window whose every candidate came back from a predicate
+/// documented to drop exactly the two shapes a compiled loop puts in a register.
+/// `is_heap_addr` rejects a misaligned address -- a cursor into a `char[]` or
+/// `byte[]` -- and its extent test is `addr < end`, so a cursor one past the
+/// last element resolves to no base. Either leaves the array unpinned while the
+/// cycle relocates, which is a use-after-free rather than lost compaction.
+///
+/// So the two flags have to agree, and the direction to agree in is the one
+/// `ZgcRealHeap::resolve_interior_for_pin` already argues for itself: the
+/// result withholds a page from relocation, so a false positive costs one page
+/// of compaction and a false negative costs a use-after-free.
+///
+/// `CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE=0` is the kill switch and restores the
+/// `is_heap_addr` probe. It is the A/B for pricing the wider pin, not a
+/// configuration anyone should run with the discharge on.
 pub fn helper_window_pin_resolve_enabled() -> bool {
-    cratonvm_types::flags::runtime_var_os("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE").is_some()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_PIN_RESOLVE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 pub fn helper_window_discharge_enabled() -> bool {
@@ -1467,7 +1502,9 @@ mod imp {
             // Kill switch, so the reader and the historical direct load are
             // A/B-able inside ONE binary. Setting it restores the pre-fix
             // behaviour exactly — including the SIGSEGV.
-            if std::env::var_os("CRATONVM_XT_NO_SAFE_PEER_READ").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_XT_NO_SAFE_PEER_READ")
+                .is_some()
+            {
                 return false;
             }
             let probe: u64 = 0x5ab0_1234_5678_9abc;

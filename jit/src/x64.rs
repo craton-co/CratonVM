@@ -1611,6 +1611,19 @@ struct Compiler {
     /// point resumes at its bci, an exceptional one is *thrown* at its bci and
     /// is only ever used to pick a handler. Sharing one map let a reason-2/6
     /// box be handed to a reason-9 stub (and vice versa).
+    /// Per-bci JEP-358 NPE action for a bci routed to the PRECISE null-check
+    /// stub (reason 10).
+    ///
+    /// Reason 10 was written for `putfield`, whose action is always
+    /// `npe_action::NONE`, so it baked that constant in. An array access does
+    /// NOT have a constant action -- `array_opcode_npe_action` derives it per
+    /// element type so the helpful message can say which access was null -- and
+    /// routing array null checks through the precise stub without carrying it
+    /// would silently downgrade every array NPE message inside a try block.
+    ///
+    /// Absent means `NONE`, which is exactly the `putfield` behaviour this
+    /// preserves.
+    precise_npe_action_by_bci: FxHashMap<usize, u8>,
     exc_frame_box_ptr_by_bci:
         rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
     /// deopt-osr Step 7: bcis (loop-boundary PCs vetted by OSR-entry) that carry
@@ -2939,6 +2952,7 @@ impl Compiler {
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
             exc_frame_box_ptr_by_bci: FxHashMap::default(),
+            precise_npe_action_by_bci: FxHashMap::default(),
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,
