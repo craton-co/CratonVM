@@ -4,17 +4,11 @@
 # Never hand-edited: every line is a (probe, arm, section) that a real
 # three-arm run measured as diverging from the HotSpot control.
 #
-# note: first baseline for 21-linux. Both 21 legs have refused (exit 2) since the gate was written because no key existed, and with no key the leg measures NOTHING. This freezes the divergent set on Temurin 21.0.12+8. SOME OF THESE ROWS ARE DEFECTS, not acceptable behaviour: see docs/known-issues/jdk-only/the-first-jdk-21-run-found-the-javalangaccess-carrier-is-pinned-to-system-1-20260908.md and jdk-21-serialization-round-trip-returns-the-wrong-class-20260909.md. The vthreads rows are an intermittent race, so this set is the MAXIMAL one observed and was required to survive two consecutive gate runs before being accepted.
+# note: the JDK 21 serialization defect is FIXED (JDK 21 installs a run-time-generated GeneratedSerializationConstructorAccessorN, which the VM now delegates to instead of recognising only the JDK 25 DirectConstructorHandleAccessor), so the six JdkOnlyBreadthProbe serialization rows no longer diverge and the ratchet is re-tightened from 16 rows to 10. Accepted ONLY from a mint that captured the MAXIMAL set: the vthreads section is an intermittent race that showed 9 or 10 rows across a 4-run sweep on this host, and a baseline minted from a 9-row run reads the 10th row as NEW and sends the leg red at random. The remaining rows are the JavaLangAccess carrier defect and are NOT accepted behaviour.
 #
 # The gate fails when this set GROWS. A line that stops diverging is
 # reported and passes, so a fix is never blocked by the gate that
 # measured it — re-freeze afterwards to keep the ratchet tight.
-JdkOnlyBreadthProbe/real/PROBE2
-JdkOnlyBreadthProbe/real/SECTION-FAILED:serialization
-JdkOnlyBreadthProbe/real/serialization
-JdkOnlyBreadthProbe/strict/PROBE2
-JdkOnlyBreadthProbe/strict/SECTION-FAILED:serialization
-JdkOnlyBreadthProbe/strict/serialization
 JdkOnlyCensusLoadProbe/strict/CENSUSLOAD
 JdkOnlyCensusLoadProbe/strict/SECTION-FAILED:io
 JdkOnlyCensusLoadProbe/strict/io

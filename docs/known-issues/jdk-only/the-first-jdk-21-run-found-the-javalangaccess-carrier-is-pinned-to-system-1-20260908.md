@@ -89,6 +89,16 @@ row.
 > `Object` does not). Reproducer, the 3x4 matrix, and two ruled-out mechanisms:
 > jdk-21-serialization-round-trip-returns-the-wrong-class-20260909.md. Reading
 > the row above as "one small divergence" understates it.
+>
+> **FIXED 2026-09-09.** The page moved to
+> `docs/internal/retired/jdk-21-serialization-round-trip-returns-the-wrong-class-FIXED-20260909.md`.
+> The mechanism was the accessor object itself: JDK 21 installs a
+> run-time-generated `GeneratedSerializationConstructorAccessorN` (no
+> fields at all), JDK 25 a `DirectConstructorHandleAccessor` (carries the
+> target type), and the VM recognised only the latter. **It was NOT this
+> page's carrier defect** -- the two 21 findings really are separate
+> mechanisms, as section 6 of that page guessed. The `io` and `vthreads`
+> rows below are still the carrier, and are still open.
 
 #3 is mode-independent, so it is not a strict-mode question. #4 is
 strict-only and **not** diagnosed here — the control's separators are the
