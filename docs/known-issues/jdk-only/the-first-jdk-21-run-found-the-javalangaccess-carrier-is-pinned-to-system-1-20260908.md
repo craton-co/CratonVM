@@ -79,6 +79,17 @@ row.
 | 3 | `JdkOnlyBreadthProbe` / `serialization` | **BOTH** | `SECTION-FAILED serialization: java.lang.RuntimeException: java.io.InvalidClassException: java.util.ArrayList; unable to create instance` |
 | 4 | `JdkOnlyBreadthProbe` / `textformat` | strict | grouping and decimal separators differ from the control: HotSpot 21 gives `df=1<nbsp>234,50`, CratonVM gives `df=1,234.50` |
 
+> **#3 NARROWED 2026-09-09 — it is two symptoms, not one, and the other one is
+> silent.** The section aborts at its first throw, so the `ArrayList` row above
+> hid the rest of it: on JDK 21 `Integer`, `Long` and `Boolean` also round-trip
+> wrongly, returning a bare `java.lang.Object` and throwing **nothing**. Both
+> are one contract violation — the serialization constructor allocates the
+> declaring superclass instead of the target — and whether it is loud or silent
+> is decided only by whether that ancestor is abstract (`AbstractList` throws;
+> `Object` does not). Reproducer, the 3x4 matrix, and two ruled-out mechanisms:
+> jdk-21-serialization-round-trip-returns-the-wrong-class-20260909.md. Reading
+> the row above as "one small divergence" understates it.
+
 #3 is mode-independent, so it is not a strict-mode question. #4 is
 strict-only and **not** diagnosed here — the control's separators are the
 locale's and CratonVM's are US-style, which is a lead about locale data, not a
