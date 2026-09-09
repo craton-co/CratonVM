@@ -199,8 +199,39 @@ writer_flush_real
 # THEY ARE LEFT RATCHETED ON PURPOSE. The FLAKY rule above would remove them,
 # but this step runs on `ubuntu-latest` only and every observation here is
 # Windows; unratcheting on that evidence would cut real Linux coverage to fix a
-# red nobody has seen. What is needed is the same rate measured on Linux. Until
-# then they are named here rather than left as a surprise.
+# red nobody has seen. What is needed is the same rate measured on Linux.
+#
+# THE LINUX RATE, MEASURED 2026-09-09. 15 consecutive runs of each, ALONE, on an
+# 8-core Linux host at load 2.4-4.2, debug profile, CRATONVM_REQUIRE_E2E=1:
+#
+#   socket_input_stream_timeout   15 of 15 PASS. 19.23-20.22 s, a 5% spread.
+#                                 Windows recorded a FAILING run at 86.9 s, so
+#                                 the margin to the harness clock that killed it
+#                                 is about 4.4x here.
+#   wave1_c_executor              15 of 15 PASS. All five tests in 2.31-2.56 s
+#                                 TOTAL. Windows needed ~30 s serialised and the
+#                                 fixture's hardcoded 30 s wall is what a bad run
+#                                 blew; on Linux the whole target finishes ~12x
+#                                 under that wall.
+#
+# WHAT THAT DOES AND DOES NOT ESTABLISH. The Windows rate (1 of 3) is excluded
+# on Linux: at p=1/3 the chance of 15 clean runs is 0.67^15, about 0.2%. It does
+# NOT establish that they never fail here -- 15 runs cannot see a low rate, and
+# a true 5% would still give a clean sweep 46% of the time. So this is "not the
+# Windows rate", not "not flaky". The load was 2.4-4.2 rather than a true idle
+# 0, which is the quietest this shared host offers; the 5% timing spread says
+# contention was not a factor in the window measured.
+#
+# THE MEASUREMENT IS EASY TO TAKE VACUOUSLY, and the first attempt at it was.
+# Both targets need `javac` ON PATH -- without it the fixture cannot compile,
+# `cached_run()` returns None, and each #[test] takes a bare `return` and
+# reports `ok` IN 0.00 s. CRATONVM_REQUIRE_E2E does NOT catch that: it guards
+# the cratonvm binary, and the javac skip is a separate, deliberate one. A first
+# run here reported a clean 10-of-10 for wave1_c_executor that was entirely
+# vacuous. THE TELL IS THE CLOCK, not the exit code: a pass in 0.00 s is not a
+# pass of a target whose real time is 2.5 s, and neither is a "failure" in 0 s
+# of one whose failing run is 86.9 s. Set CRATONVM_BIN, put <jdk>/bin on PATH,
+# and check the reported duration before believing any rate from this pair.
 #
 #   stack_trace_across_tiers   FIXED AND PROMOTED 2026-09-09. It is in the
 #                              ratcheted list above; this entry is kept only so
