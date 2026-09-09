@@ -1,3 +1,94 @@
+# RETIRED — FIXED 2026-09-09. `--jdk-only` on JDK 21 no longer answers a non-root locale request with ROOT resources
+
+**Retired from** `docs/known-issues/jdk-only/strict-mode-on-jdk-21-answers-a-non-root-locale-request-with-root-resources-20260909.md`,
+written earlier the same day. The page below is kept verbatim: its five
+refutations are all still true, and its "where to look" pointed at the right
+step. What it could not name is recorded here.
+
+## The cause, in one sentence
+
+CratonVM registers a native over
+`sun/util/locale/provider/JRELocaleProviderAdapter.getLocaleServiceProvider`
+that answered **`null` for every SPI class**, and `LocaleProviderAdapter.findAdapter`
+accepts an adapter only when that call is non-null — so no adapter was ever
+accepted, and `getAdapter` fell through to the fallback adapter.
+
+## Why the answer was still correct in three of the four cells
+
+Two variables are stacked, and the page's section 1 table is the projection of
+both. The blanket `null` is present in **every** cell — both modes, both images.
+It only becomes wrong data when the fallback adapter is also root-only:
+
+| cell | provider lookup | chosen adapter | its `LocaleResources` | answer |
+|---|---|---|---|---|
+| HotSpot 21 | `DecimalFormatSymbolsProviderImpl` | CLDR | `de_DE` | correct |
+| CratonVM 21 `--real-jdk` | `null` | Fallback | ROOT | correct \* |
+| CratonVM 21 `--jdk-only` | `null` | Fallback | ROOT | **WRONG** |
+| CratonVM 25 `--jdk-only` | `null` | Fallback | `de_DE` | correct |
+
+\* correct only because `--real-jdk` runs a synthetic
+`DecimalFormatSymbols.initialize` stub that never walks providers at all.
+Strict mode refuses that stub, which is why strict mode is the **only** arm
+that consults this native — the defect was equally present in the default mode
+and invisible there.
+
+The second variable is a JDK difference, and it is why JDK 25 is spared:
+
+```
+JDK 21  FallbackLocaleProviderAdapter   declares getLocaleResources(Locale)
+                                        + a private rootLocaleResources field
+                                        -> hands back ROOT for ANY locale
+JDK 25  FallbackLocaleProviderAdapter   declares NO getLocaleResources
+                                        -> inherits the per-locale one
+```
+
+Both facts came from `javap -p` on the two images. This is the same species of
+finding as the serialization accessor fixed earlier the same day: a VM
+behaviour pinned to one JDK's internal class shape.
+
+## What was landed
+
+One arm of the switch the wave-4 comment in `locale_bootstrap.rs` already
+prescribed: `java.text.spi.DecimalFormatSymbolsProvider` now delegates to the
+receiver's real `getDecimalFormatSymbolsProvider()` bytecode. Every other SPI
+class still gets the blanket `null`. That comment's instruction — delegate ONE
+SPI at a time, re-run the formatting suites for each, never blanket-delegate on
+the strength of reading the switch — is unchanged and still governs the rest.
+
+The native was **not** retired, and no synthetic bridge was removed.
+
+## Measured after the fix
+
+`probes/LocaleSelect.java`, all four cells: the provider lookup answers
+`DecimalFormatSymbolsProviderImpl`, `isSupportedLocale(de_DE)` is `true`, the
+chosen adapter is `CLDRLocaleProviderAdapter`, and its `LocaleResources` carries
+`de_DE`. Separators and `NumberFormat` output in the formerly failing cell are
+byte-identical to HotSpot 21 for `de-DE`, `fr-FR` and the `en-US` control. The
+`W7-80` warning added earlier that day fired **12 times** in that cell before
+and **0** after.
+
+## Two things this does NOT claim
+
+**The corpus cannot see it on Linux.** The `textformat` row exists only in
+`jdk-only-strict-corpus-21-windows.txt`; the defect is invisible wherever the
+machine default locale is already `en-US`, which is why `21-linux` never froze
+it. That row should now read GONE — which the ratchet passes — but re-minting
+the Windows baseline needs a Windows JDK 21 image the build host no longer has.
+The verification above is therefore the probe, asking for `de-DE` **by name**,
+not a corpus arm.
+
+**A sibling SPI is still wrong, and this probe found it.** `Calendar` for
+`de-DE` reports `firstDayOfWeek=1, minimalDaysInFirstWeek=1` where HotSpot 21
+reports `2` and `4` — the `CalendarDataProvider` arm, still on the blanket
+`null`. It is **mode-independent** (it reads the same under `--real-jdk`), so it
+is not a strict-mode row, and it is filed separately as
+`docs/known-issues/calendar-firstdayofweek-is-root-data-because-the-provider-lookup-answers-null-20260909.md`.
+It is the obvious next arm to delegate.
+
+---
+
+*Original page follows, unedited.*
+
 # `--jdk-only` on JDK 21 answers a non-root locale request with ROOT `LocaleResources`, so every locale formats as English
 
 **Status:** open, localised to one step. Not diagnosed further than "adapter /
@@ -6,7 +97,7 @@ resource selection", which is where the next person should start.
 correct, and **both** modes on JDK 25 are correct.
 **Found:** 2026-09-09, as the residual left after the
 `ServiceLoader.loadInstalled` fix
-(`../serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md`)
+(`../../known-issues/serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md`)
 removed the dominant cause of the same symptom.
 
 ## 1. The one wrong cell

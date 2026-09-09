@@ -1666,6 +1666,22 @@ jobs:
       # rows looser than the Linux one until someone with a Windows JDK 21
       # re-freezes it. Anyone who does: expect exactly those six rows to drop.
       #
+      # LATER THE SAME DAY a SEVENTH `21-windows` row joined them:
+      # `JdkOnlyBreadthProbe/strict/textformat`. The JDK 21 strict locale defect
+      # behind it was fixed on 2026-09-09 -- the provider lookup answered null
+      # for every SPI, so adapter selection fell through to the fallback
+      # adapter, whose `LocaleResources` is root-only on JDK 21. Expect that row
+      # to read GONE too and to drop on the same re-mint, making it seven.
+      #
+      # That row is also why this fix has NO corpus arm that can verify it.
+      # `21-linux` never froze a `textformat` row: the defect is invisible
+      # wherever the machine default locale is already `en-US`, which the Linux
+      # host's is -- and `21-windows`, the leg that does carry it, is the one
+      # that cannot be re-minted. The verification of record is therefore
+      # `probes/LocaleSelect.java`, which asks for `de-DE` BY NAME rather than
+      # relying on the default locale, and which reads identical to HotSpot 21
+      # in all four mode/image cells.
+      #
       # It was not accepted from one mint. The vthreads section is an
       # intermittent race, so a baseline minted from a run that saw the smaller
       # set reads the larger set as NEW and the leg goes red at random -- which
