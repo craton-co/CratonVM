@@ -3055,22 +3055,62 @@ pub(crate) fn alloc_all_buffer_pools(
     Ok(pools)
 }
 
+/// Does THIS receiver carry the two fabricated pool slots?
+///
+/// [`alloc_buffer_pool`] is the only producer of a slot-carrying pool object
+/// and it always stamps [`CRATON_BUFFER_POOL_CLASS`]. Every other receiver the
+/// five bodies are registered for is a REAL class with no such layout: the
+/// `java/lang/management/BufferPoolMXBean` interface, the
+/// `jdk/internal/misc/VM$BufferPool` stamp, and the JDK's own `java/nio/Bits$1`
+/// -- which declares no fields at all.
+///
+/// # Why this is asked instead of just reading the slot
+///
+/// Reading slot 0 or 1 on one of those receivers is an out-of-bounds field
+/// read. `gen_heap::get_field` drops it and answers null, so the fallbacks
+/// below were always taken and the ANSWERS were always right -- but the guard
+/// also LOGS it, and its own triage text reads exactly the `Bits$1` shape
+/// (`class_name` a real JDK class, `num_slots` equal to `real_field_count`) as
+/// the NOT-benign "total, silent data loss" case rather than the benign
+/// speculative probe it is. The heuristic cannot separate them when both
+/// numbers are ZERO: a class that declares no fields has no room for a second
+/// layout, so there is no other writer to disagree with.
+///
+/// Every Spring Boot Hazelcast run carried one of these, once, at boot
+/// (`VM$BufferPoolsHolder.<clinit>` -> `JavaNioAccess.getBufferPool`), and it
+/// was filed as the lead on a SIGSEGV that fires minutes later and has nothing
+/// to do with it. Ask the receiver's class and the speculative read -- and the
+/// warning it mints -- is not performed at all.
+///
+/// `class_id_of_object_forwarded`, not `class_id_of_object`: a moving young
+/// generation may have forwarded the receiver, and the id must be the one the
+/// `get_field` beside it resolves its slots against.
+fn buffer_pool_has_slots(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_id_by_name(CRATON_BUFFER_POOL_CLASS)
+        .is_some_and(|id| id == ctx.class_id_of_object_forwarded(this))
+}
+
 fn buffer_pool_kind(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    // A receiver from the legacy `jdk/internal/misc/VM$BufferPool` stamp, or
+    // the JDK's own `java/nio/Bits$1`, carries no kind slot. Those stamps only
+    // ever name the direct pool, so that is the answer, not a zeroed "mapped".
+    if !buffer_pool_has_slots(ctx, this) {
+        return BUFFER_POOL_KIND_DIRECT;
+    }
     match ctx.get_field(this, BUFFER_POOL_SLOT_KIND) {
         Value::Int(k) => k,
-        // A receiver from the legacy `jdk/internal/misc/VM$BufferPool` stamp
-        // carries no kind slot. That stamp only ever named the direct pool, so
-        // that is the answer, not a zeroed "mapped".
         _ => BUFFER_POOL_KIND_DIRECT,
     }
 }
 
 fn buffer_pool_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if let Value::Object(Some(name)) = ctx.get_field(this, BUFFER_POOL_SLOT_NAME) {
-        return Ok(Some(Value::Object(Some(name))));
+    if buffer_pool_has_slots(ctx, this) {
+        if let Value::Object(Some(name)) = ctx.get_field(this, BUFFER_POOL_SLOT_NAME) {
+            return Ok(Some(Value::Object(Some(name))));
+        }
     }
-    // Legacy stamp, no name slot — see `buffer_pool_kind`.
+    // Legacy stamp, no name slot — see `buffer_pool_has_slots`.
     let s = ctx.create_string("direct");
     Ok(Some(Value::Object(Some(s))))
 }

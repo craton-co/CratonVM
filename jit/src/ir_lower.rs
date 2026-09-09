@@ -491,6 +491,31 @@ struct Lowerer<'a> {
     /// real-frame-deopt: native offsets of `JMP rel32` instructions emitted by
     /// failed guards that must be patched to jump to the shared deopt stub.
     deopt_stub_patches: Vec<usize>,
+    /// Bytecode indices at which this body can actually transfer to the
+    /// interpreter — the resume bci of every guard [`Self::emit_deopt_unless`]
+    /// planted, and the throw-site bci of every call-exception patch.
+    ///
+    /// # What it is for
+    ///
+    /// `IrBuilder` records a `SafepointSnapshot` at EVERY bytecode index, and
+    /// `build_deopt_points` turns each one that got a native offset into a
+    /// `DeoptimizationPoint` carrying a fully-resolved frame state. Measured on
+    /// one 52-node graph: 48 snapshots, 17 points, **9 970 bytes of deopt
+    /// metadata against 1 207 bytes of code** — and across a whole run, 5.0 MB
+    /// of metadata for 630 KB of code, a factor of eight.
+    ///
+    /// Most of it describes program points nothing can arrive at. A guard's own
+    /// deopt does not read this vector at all — `emit_deopt_unless` boxes its
+    /// own point and passes the pointer in `DEOPT_ARG0` — so what the vector
+    /// actually serves is the by-bci PROVENANCE checks on the resume path
+    /// ("is this bci a recorded deopt point of this artifact"). A bci that
+    /// cannot transfer is never asked about.
+    ///
+    /// Recorded at the two emission sites rather than predicted from the graph,
+    /// for the reason `ir_drop_unreachable_homes_enabled` gives about its own
+    /// prediction: a classification that decides what to DROP must be checked
+    /// against the emission that actually happened, not trusted.
+    transfer_bcis: std::collections::HashSet<usize>,
     /// real-frame-deopt: boxed deopt points whose stable addresses are baked
     /// as imm64 into guard code. Moved into the `CompiledMethod` so the code's
     /// raw pointers stay valid for the method's (retained) lifetime.
@@ -1078,6 +1103,14 @@ struct Lowerer<'a> {
     /// Nodes named by some safepoint snapshot. Their home word must hold the
     /// value at that bci, so such a compare is never fused away.
     deopt_named: Vec<bool>,
+    /// `deopt_named_reachable[id]` — a deopt that can ACTUALLY HAPPEN names
+    /// `id`. See [`Lowerer::compute_deopt_named_reachable`]; this is the
+    /// per-value refinement of the whole-body `graph_cannot_deopt`, and it is
+    /// what lets a promoted value stop writing its home word.
+    deopt_named_reachable: Vec<bool>,
+    /// Carried single-use values whose home write this compile removed. See
+    /// [`Lowerer::extend_home_drops_to_carried_values`].
+    carried_homes_dropped: usize,
     /// Per-block CSE of the mapped-receiver guard (null, alignment, the six
     /// read-bounds compares): receivers already proven in the block being
     /// lowered. Cleared at every block entry (`ir_receiver_guard_cse_enabled`).
@@ -1452,6 +1485,7 @@ impl<'a> Lowerer<'a> {
             bci_native: HashMap::new(),
             cur_bci: 0,
             deopt_stub_patches: Vec::new(),
+            transfer_bcis: std::collections::HashSet::new(),
             deopt_boxes: Vec::new(),
             invoke_dispatch: helpers.invoke_dispatch,
             lambda_int_to_double: helpers.lambda_int_to_double,
@@ -1584,6 +1618,8 @@ impl<'a> Lowerer<'a> {
             use_count: Vec::new(),
             fused_cmp: Vec::new(),
             deopt_named: Vec::new(),
+            deopt_named_reachable: Vec::new(),
+            carried_homes_dropped: 0,
             guarded_receivers: Vec::new(),
             null_proven_receivers: Vec::new(),
             ls_spills: 0,
@@ -1636,6 +1672,9 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+        // Which values a REACHABLE deopt can name. Computed before the
+        // droppability pass below, which consults it.
+        self.deopt_named_reachable = self.compute_deopt_named_reachable();
         // Two passes: the droppability predicates borrow `&self`.
         let droppable: Vec<usize> = (0..self.home_dropped.len())
             // Cast: an index into the node arena is a `NodeId`.
@@ -1678,7 +1717,17 @@ impl<'a> Lowerer<'a> {
         {
             return false;
         }
-        if !self.deopt_nameable.get(phi as usize).copied().unwrap_or(false) {
+        // Same widening as `value_home_droppable`: a phi named by no deopt that
+        // can actually happen is not pinned by a frame state either. Its
+        // register is published by the edge copies (`emit_copy_op`), which the
+        // `ir_phi_copy_regs_enabled` clause above already requires.
+        if !self.deopt_nameable.get(phi as usize).copied().unwrap_or(false)
+            && self
+                .deopt_named_reachable
+                .get(phi as usize)
+                .copied()
+                .unwrap_or(true)
+        {
             return false;
         }
         matches!(
@@ -1717,6 +1766,114 @@ impl<'a> Lowerer<'a> {
         !self.graph_cannot_deopt()
     }
 
+    /// Can a deopt that can actually happen name `id`?
+    ///
+    /// # Why this exists — the real limit on register residency
+    ///
+    /// A value's home store is dropped only when a deopt frame could describe
+    /// it some other way, and the test for that was
+    /// [`Self::deopt_nameable`]: the value must own its register
+    /// **exclusively, for the whole method**. With a five-register file and a
+    /// linear-scan allocator whose entire job is to give one register to
+    /// several values with disjoint ranges, that is nearly never true — so
+    /// nearly every promoted value kept its home store, and the register file
+    /// stayed a write-through read CACHE rather than the authoritative
+    /// location. That, not the allocator, is why this tier stores every SSA
+    /// value to the frame.
+    ///
+    /// The only escape was `graph_cannot_deopt()` — whole-body trap freedom,
+    /// which one `getfield` anywhere in the method destroys.
+    ///
+    /// This is the per-value form of the same question. A frame state can only
+    /// ever be read at a bci something can actually trap at, so a value named
+    /// exclusively by frame states at NON-trapping bcis is not pinned by any of
+    /// them, whatever the rest of the method does.
+    ///
+    /// # Why it is safe without touching the GC
+    ///
+    /// Strictly a widening of the existing escape: `graph_cannot_deopt()`
+    /// implies this for every value, so nothing that dropped a home before
+    /// stops doing so. And the callers restrict it to `Int` and `Long` —
+    /// `IrType::Ref` is refused by `value_home_droppable` and
+    /// `phi_home_droppable` exactly as before, so no reference becomes
+    /// register-resident and `OopMapEntry` needs no register bank. That
+    /// remains the blocker for reference promotion and is untouched here.
+    ///
+    /// # Why a wrong prediction cannot produce a wrong answer
+    ///
+    /// This is a PREDICTION from the graph, made before emission, in the same
+    /// shape and with the same net as `graph_cannot_deopt`: if a trap does
+    /// occur at a bci predicted safe, `frame_value_for` meets a dropped home
+    /// with no register describing it and REFUSES THE COMPILE. The method
+    /// falls to the single-pass backend — a coverage loss, never a wrong
+    /// frame.
+    ///
+    /// # The loop-header exception
+    ///
+    /// Every loop header is treated as trapping whether or not its ops can
+    /// trap. An optimizing OSR entry seeds this tier's locals at a loop header
+    /// from the interpreter's frame, and it seeds HOME WORDS; a value whose
+    /// home was dropped there would be seeded into a word nothing reads. The
+    /// door was implicated in one miscompile for exactly this reason
+    /// (`ir-osr-entry-miscompiles-a-spliced-merge-FIXED-20260909.md`: the stub
+    /// jumped past the block that writes a constant's home word). That one is
+    /// fixed, by MAKING the stub write the words it skipped rather than by
+    /// refusing anything — so this clause stands on its own argument, not on
+    /// that page: a dropped home is a word the seeding cannot write at all,
+    /// which is a different problem from a word it merely forgot to.
+    fn compute_deopt_named_reachable(&self) -> Vec<bool> {
+        let n = self.graph.nodes.len();
+        let mut out = vec![false; n];
+        let widened = ir_register_authoritative_enabled();
+        // bcis a deopt can arrive at: every node whose op is outside the
+        // cannot-trap allowlist, plus every loop header.
+        let mut trapping: std::collections::HashSet<usize> = if widened {
+            self.graph
+                .nodes
+                .iter()
+                .filter(|node| !op_cannot_deopt(&node.op))
+                .filter_map(|node| node.bytecode_pc)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        if widened {
+            for (b, block) in self.schedule.blocks.iter().enumerate() {
+                if block.successors.iter().any(|&s| s <= b) {
+                    for &succ in &block.successors {
+                        if succ <= b {
+                            if let Some(header) = self.schedule.blocks.get(succ) {
+                                if let Some(pc) = self
+                                    .graph
+                                    .nodes
+                                    .get(header.ctrl as usize)
+                                    .and_then(|node| node.bytecode_pc)
+                                {
+                                    trapping.insert(pc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for sp in &self.graph.safepoints {
+            // Unwidened: every naming counts, which is the pre-2026-09-09
+            // behaviour and leaves `graph_cannot_deopt` as the only escape.
+            if widened && !trapping.contains(&sp.bci) {
+                continue;
+            }
+            for &v in sp.locals.iter().chain(sp.stack.iter()) {
+                if v != NO_NODE {
+                    if let Some(cell) = out.get_mut(v as usize) {
+                        *cell = true;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// May this ORDINARY value's home word go unwritten?
     ///
     /// The same conjunction as [`Self::phi_home_droppable`] with the phi's
@@ -1749,8 +1906,24 @@ impl<'a> Lowerer<'a> {
         // A body nothing can deopt from never asks, so an assigned register is
         // enough — the readers need it, the frame states do not exist to be
         // wrong. Verified against the emission in `lower_inner`.
+        // Three ways to satisfy the frame-state obligation, in widening order:
+        //
+        //   1. a deopt can NAME this value in its register (exclusive owner);
+        //   2. the whole body cannot deopt, so no frame state is ever read;
+        //   3. no deopt that can actually happen names THIS value.
+        //
+        // (3) subsumes (2) and is the one that makes the register file
+        // authoritative on ordinary methods — see
+        // `compute_deopt_named_reachable` for why one `getfield` used to be
+        // enough to force every promoted value in the method back to memory.
         if !self.deopt_nameable.get(id as usize).copied().unwrap_or(false)
             && !(self.graph_cannot_deopt() && self.assigned_gpr(id).is_some())
+            && !(!self
+                .deopt_named_reachable
+                .get(id as usize)
+                .copied()
+                .unwrap_or(true)
+                && self.assigned_gpr(id).is_some())
         {
             return false;
         }
@@ -5127,19 +5300,16 @@ impl<'a> Lowerer<'a> {
         } else {
             // No explicit terminator: this is a goto / fall-through edge into
             // a Merge/Region. BUG FIX [jit-irlower #2]: emit the edge's phi
-            // copies before transferring control, then jump to the successor
-            // explicitly (block emission order is not guaranteed to place the
-            // successor physically next).
+            // copies before transferring control, then transfer to the
+            // successor — as a real fall-through when the layout already put it
+            // physically next, and otherwise as an explicit `JMP`.
             let succ = self.schedule.blocks[block_idx].successors.first().copied();
             if let Some(succ_block) = succ {
                 if succ_block <= block_idx {
                     self.emit_safepoint_poll();
                 }
                 self.emit_phi_copies(block_idx, succ_block);
-                self.buf.emit_byte(0xE9); // JMP succ_block
-                let patch_pos = self.buf.pos();
-                self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                self.branch_patches.push((patch_pos, succ_block));
+                self.emit_jmp_to_block_or_fall_through(succ_block, block_idx);
             }
         }
     }
@@ -5532,6 +5702,8 @@ impl<'a> Lowerer<'a> {
         // `cur_bci` is the node's own pc, which inside a spliced region is a
         // combined-buffer pc — see `resume_bci`.
         let bci = self.resume_bci(self.cur_bci);
+        // This bci CAN transfer. See `transfer_bcis`.
+        self.transfer_bcis.insert(bci);
         self.call_exc_patches.push((patch, bci));
     }
 
@@ -6798,6 +6970,92 @@ impl<'a> Lowerer<'a> {
         self.use_count = use_count;
         self.deopt_named = deopt_named;
         self.fused_cmp = fused_cmp;
+        self.extend_home_drops_to_carried_values();
+    }
+
+    /// Let a CARRIED single-use value stop writing its home word.
+    ///
+    /// # The store this removes
+    ///
+    /// `plan_register_residency` deliberately does not promote a single-use
+    /// intermediate — its live range is one instruction long, and what it wants
+    /// is not a register for the whole method but *not to be written to memory
+    /// at all*. The carry gives it exactly that on the READ side: the producer
+    /// leaves the value in a register and its one consumer reads it there, no
+    /// load.
+    ///
+    /// The STORE stayed. `store_rax` drops it only when `home_dropped` is set,
+    /// and `home_dropped` came from `value_home_droppable`, which requires a
+    /// register assignment the value does not have. So the emitter wrote a
+    /// frame word for every intermediate and then never read it — visible in
+    /// the disassembly as literal dead stores:
+    ///
+    /// ```text
+    ///     imul eax,41C64E6Dh
+    ///     mov  [rbp-0A8h],rax   ; never read
+    ///     add  eax,3039h
+    ///     mov  [rbp-0C8h],rax   ; never read
+    /// ```
+    ///
+    /// Measured on the counted-loop probe: of 52 graph nodes, **28 are
+    /// single-use** and skipped by the residency planner for this reason, and
+    /// the loop body carried 17 frame stores for 16 instructions of real work.
+    ///
+    /// # Why it is safe
+    ///
+    /// The carry planner's own contract is that the value has exactly one use
+    /// and that use is the next node in the same block. So the only reader of
+    /// the home word would be a frame state — and this runs only for values no
+    /// REACHABLE deopt names (see `compute_deopt_named_reachable`). Any other
+    /// site that asks for the slot meets `slot_of`'s refusal on a dropped home
+    /// and the compile is abandoned to the single-pass backend, which is the
+    /// same net every other home-drop rests on.
+    ///
+    /// `Ref` is excluded here as everywhere else in this file: a reference in a
+    /// register is invisible to a root walk, and the oop map cannot name one.
+    /// This changes nothing about that.
+    fn extend_home_drops_to_carried_values(&mut self) {
+        if !ir_register_authoritative_enabled() {
+            return;
+        }
+        // The same switch conjunction `value_home_droppable` opens with: the
+        // carry's read side and the publish discipline have to be in force, or
+        // dropping the write leaves the value nowhere.
+        if !(ir_drop_home_enabled()
+            && ir_publish_at_def_enabled()
+            && ir_deopt_regs_enabled()
+            && ir_skip_live_republish_enabled()
+            && ir_phi_copy_regs_enabled())
+        {
+            return;
+        }
+        for id in 0..self.home_dropped.len().min(self.carry_of.len()) {
+            if self.home_dropped[id] {
+                continue;
+            }
+            if self.carry_of[id].is_none() {
+                continue;
+            }
+            let Some(node) = self.graph.nodes.get(id) else {
+                continue;
+            };
+            if !matches!(node.ty, IrType::Int | IrType::Long) {
+                continue;
+            }
+            if !op_home_is_one_store_rax(&node.op) {
+                continue;
+            }
+            if self
+                .deopt_named_reachable
+                .get(id)
+                .copied()
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            self.home_dropped[id] = true;
+            self.carried_homes_dropped += 1;
+        }
     }
 
     /// `MOV reg, imm` in the shortest encoding that reproduces `val` in all 64
@@ -8657,6 +8915,20 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                 }
+                // Everything above returned. Reaching here means this call is
+                // lowered to `jit_invoke_dispatch`, which resolves the callee
+                // BY NAME on every execution -- ~175 ns against a direct
+                // `CALL`'s ~4. That is sometimes the only correct answer (a
+                // megamorphic site with no cache, a kind this tier cannot
+                // bind), and it was silently also the answer for every
+                // statically-bound call inside a SPLICED body, whose
+                // `ir_direct_calls` row nothing produced. Count it, split by
+                // whether the site is inside a relocated body, so that failure
+                // has a reading instead of only a wall clock.
+                note_ir_blind_dispatch(
+                    node.bytecode_pc
+                        .is_some_and(|pc| self.pc_is_in_a_spliced_body(pc)),
+                );
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -9483,10 +9755,12 @@ impl<'a> Lowerer<'a> {
                         // `Self::patch_or_bail` / `patch_rel32_to_here`.
                         Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
                         self.emit_phi_copies(block_idx, second_block);
-                        self.buf.emit_byte(0xE9); // JMP second_block
-                        let jmp_second = self.buf.pos();
-                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                        self.branch_patches.push((jmp_second, second_block));
+                        // The TRAILING edge of this arm, and the only one of
+                        // the two that may fall through: nothing is emitted
+                        // after it, whereas the first edge's `JMP` is followed
+                        // by the `around_first` trampoline and so can never be
+                        // dropped. See `emit_jmp_to_block_or_fall_through`.
+                        self.emit_jmp_to_block_or_fall_through(second_block, block_idx);
                     }
                     (Some(only_block), None) => {
                         // Degenerate single-successor If: copies are
@@ -9503,6 +9777,42 @@ impl<'a> Lowerer<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Transfer control to `target`, as a fall-through when the block layout
+    /// already placed it physically next and as a `JMP rel32` otherwise.
+    ///
+    /// `lower_inner` emits blocks with `for block_idx in 0..blocks.len()`, so
+    /// "physically next" is exactly `block_idx + 1` — the same test the fused-
+    /// branch arm has always used for its near edge, lifted here so the two
+    /// cannot drift apart. It is only sound at a site that emits NOTHING after
+    /// this transfer, which is why the general two-successor arm may use it for
+    /// its second (trailing) edge and not for its first.
+    ///
+    /// This is the half of the frequency-driven block layout that was missing.
+    /// `ir_schedule`'s module header states it plainly: making the hot
+    /// successor physically next is "necessary but not yet sufficient" while
+    /// every edge still ends in an explicit `JMP`, because the taken-branch
+    /// count and the byte count are then unchanged by any reordering. Measured
+    /// before this, a counted loop's body carried five jumps — one of them the
+    /// five-byte encoding `E9 00 00 00 00`, a jump to the very next
+    /// instruction.
+    ///
+    /// Counted rather than asserted: `ir_fallthroughs_elided` against
+    /// `ir_block_jmps_emitted` is what says whether a layout change moved
+    /// anything, and a pass whose only evidence is "the code got smaller" is a
+    /// pass nobody can tune.
+    fn emit_jmp_to_block_or_fall_through(&mut self, target: usize, block_idx: usize) {
+        if ir_fallthrough_enabled() && target == block_idx + 1 && target < self.schedule.blocks.len()
+        {
+            FALLTHROUGHS_ELIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        BLOCK_JMPS_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.buf.emit_byte(0xE9); // JMP target
+        let patch_pos = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.branch_patches.push((patch_pos, target));
     }
 
     fn patch_branches(&mut self) {
@@ -9711,6 +10021,18 @@ impl<'a> Lowerer<'a> {
         bci
     }
 
+    /// Is `pc` a combined-buffer pc inside a RELOCATED callee body?
+    ///
+    /// The same scan [`Self::resume_bci`] does, asked for its predicate rather
+    /// than its answer, and kept beside it so the two cannot come to disagree
+    /// about what "inside a splice" means. Diagnostic-only; see
+    /// [`ir_blind_dispatch_census`].
+    fn pc_is_in_a_spliced_body(&self, pc: usize) -> bool {
+        self.spliced_ranges
+            .iter()
+            .any(|&(start, end, _)| pc >= start && pc < end)
+    }
+
     fn resolve_frame_state_for_bci(&self, bci: usize) -> FrameState {
         match self.graph.safepoints.iter().position(|s| s.bci == bci) {
             Some(idx) => self.resolve_frame_state(&self.graph.safepoints[idx], idx),
@@ -9905,6 +10227,8 @@ impl<'a> Lowerer<'a> {
         // A guard inside a spliced body resumes at the enclosing `invoke`, whose
         // snapshot is the caller's state before the call — see `resume_bci`.
         let bci = self.resume_bci(bci);
+        // This bci CAN transfer. See `transfer_bcis`.
+        self.transfer_bcis.insert(bci);
         let frame_state = self.resolve_frame_state_for_bci(bci);
         let point = Box::new(DeoptimizationPoint {
             native_offset: self.buf.pos() as u32,
@@ -10164,6 +10488,25 @@ impl<'a> Lowerer<'a> {
     /// can reconstruct it. `live.range` gives that check exactly: a value whose
     /// range STARTS before the entry position and extends past it is live-in,
     /// and every such value must be named by the snapshot.
+    /// May a value of this shape be excused from an OSR entry's seeding
+    /// obligation, on the grounds that **the stub can produce it itself**?
+    ///
+    /// One function because there are two duties and they must agree. The
+    /// eligibility test below excuses such a value from "every value live
+    /// across this block start must be named by a local"; the emission loop
+    /// then has to WRITE it. Excusing without emitting is exactly what
+    /// `ir-osr-entry-miscompiles-a-spliced-merge-FIXED-20260909.md` was: the
+    /// two halves were written in different places and agreed only by
+    /// accident, and when the accident ran out a literal loop arm read a frame
+    /// word nothing had written.
+    ///
+    /// Anything added here needs an arm in that emission loop too, and
+    /// `an_osr_entry_emits_every_shape_its_eligibility_test_excuses` fails
+    /// until it has one.
+    fn osr_entry_can_produce(op: &Op) -> bool {
+        matches!(op, Op::Const(_) | Op::ConstF(_))
+    }
+
     fn emit_osr_entry_stubs(&mut self, live: &crate::regalloc::LiveModel) {
         if !ir_osr_entry_enabled() {
             return;
@@ -10174,7 +10517,7 @@ impl<'a> Lowerer<'a> {
         }
         // Planned first, emitted second: the plan reads `self` immutably and
         // the emission needs it mutably.
-        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>)> = Vec::new();
+        let mut plans: Vec<(u32, usize, Vec<(usize, NodeId)>, Vec<NodeId>)> = Vec::new();
         let mut refusals: Vec<&'static str> = Vec::new();
         // Keyed by BLOCK, not by bci. Two reasons, and the first is fatal on
         // its own: `bci_native` anchors DATA nodes, and a loop header's bci is
@@ -10227,32 +10570,55 @@ impl<'a> Lowerer<'a> {
                 .copied()
                 .filter(|v| *v != NO_NODE)
                 .collect();
+            // Live across this block's start, in the liveness model's own
+            // positions: defined before it, and read at or after it.
+            let live_across = |id: usize| {
+                live.range
+                    .get(id)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|r| r.lo < entry_pos && entry_pos <= r.hi)
+            };
             // Live-in, and not something the entered code can produce for
-            // itself. A CONSTANT can: every reader materialises it as an
-            // immediate (`ir_const_imm_enabled`), so its range crossing the
-            // header says nothing about what has to be seeded. Counting it as
-            // unseedable refused every loop in the language.
-            let unseedable = live.range.iter().enumerate().any(|(id, r)| {
-                if matches!(
-                    self.graph.nodes.get(id).map(|n| &n.op),
-                    Some(Op::Const(_)) | Some(Op::ConstF(_))
-                ) {
+            // itself.
+            //
+            // A CONSTANT is the one exception, and it is an exception because
+            // THE STUB PRODUCES IT -- see `const_seeds` below. It did not
+            // always: this clause used to excuse constants on the grounds that
+            // "every reader materialises it as an immediate
+            // (`ir_const_imm_enabled`)", and that is not true of every reader.
+            // `emit_phi_copies` and the merge stores read a value from its HOME
+            // WORD, and a constant's home word is written once, by its own
+            // definition, in a block this stub jumps past.
+            //
+            // `probes/Min0.java` is the shape: a three-armed clamp inside a
+            // counted loop, whose two literal arms (100 and 900) reach a phi.
+            // Entered through this door, `r = 100` read `[rbp-0D8h]` -- a frame
+            // word nothing had written -- and the program returned a wrong,
+            // run-to-run VARYING sum from deterministic input, which is the
+            // signature of exactly that. Excusing a constant is right; excusing
+            // it without emitting it was the defect.
+            let unseedable = (0..live.range.len()).any(|id| {
+                if self
+                    .graph
+                    .nodes
+                    .get(id)
+                    .is_some_and(|n| Self::osr_entry_can_produce(&n.op))
+                {
                     return false;
                 }
-                r.is_some_and(|r| {
-                    r.lo < entry_pos
-                        && entry_pos <= r.hi
-                        // Cast: an index into the node arena is a `NodeId`.
-                        && !named.contains(&(id as NodeId))
-                })
+                // Cast: an index into the node arena is a `NodeId`.
+                live_across(id) && !named.contains(&(id as NodeId))
             });
             if unseedable {
                 if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LINEAR_SCAN").is_some() {
                     for (id, r) in live.range.iter().enumerate() {
-                        if matches!(
-                            self.graph.nodes.get(id).map(|n| &n.op),
-                            Some(Op::Const(_)) | Some(Op::ConstF(_))
-                        ) {
+                        if self
+                            .graph
+                            .nodes
+                            .get(id)
+                            .is_some_and(|n| Self::osr_entry_can_produce(&n.op))
+                        {
                             continue;
                         }
                         if r.is_some_and(|r| {
@@ -10268,6 +10634,26 @@ impl<'a> Lowerer<'a> {
                 refusals.push("a value live here is named by no local");
                 continue;
             }
+            // The constants whose definition this stub jumps past and whose
+            // home word a reader at or after the entry still loads.
+            //
+            // Restricted to those LIVE ACROSS the entry, and that is not
+            // tightening for its own sake: spill slots are COLOURED
+            // (`slot_plan.node_color`), so a constant that is NOT live here may
+            // share its word with a value that is, and writing it would clobber
+            // a seed. Live-across is exactly the set whose colour is exclusive
+            // at this point.
+            let const_seeds: Vec<NodeId> = (0..live.range.len())
+                .filter(|&id| {
+                    self.graph
+                        .nodes
+                        .get(id)
+                        .is_some_and(|n| Self::osr_entry_can_produce(&n.op))
+                        && live_across(id)
+                })
+                // Cast: an index into the node arena is a `NodeId`.
+                .map(|id| id as NodeId)
+                .collect();
             let mut seeds: Vec<(usize, NodeId)> = Vec::new();
             let mut homeless = false;
             for (i, &v) in sp.locals.iter().enumerate() {
@@ -10287,12 +10673,12 @@ impl<'a> Lowerer<'a> {
                 continue;
             }
             // Cast: a bci fits u32 (`IR_MAX_BYTECODE_SIZE` is far below it).
-            plans.push((bci as u32, native, seeds));
+            plans.push((bci as u32, native, seeds, const_seeds));
         }
         for why in refusals {
             self.note_osr_refusal(why);
         }
-        for (bci, native, seeds) in plans {
+        for (bci, native, seeds, const_seeds) in plans {
             // Cast: a JVM local index plus one; `max_locals` is u16.
             let seeds_hi = seeds.iter().map(|(i, _)| *i as u32 + 1).max().unwrap_or(0);
             let stub = self.buf.pos();
@@ -10345,6 +10731,43 @@ impl<'a> Lowerer<'a> {
             self.emit_frame_record();
             self.fetch_current_thread();
             self.zero_ref_phi_slots();
+            // ── Re-materialise the constants the skipped blocks defined ──
+            //
+            // Byte-for-byte what `Op::Const` / `Op::ConstF` emit at their own
+            // definition site: the home word, and for a float or double the
+            // register copy `publish_fp_from_slot` makes. An INTEGER constant
+            // publishes to no register at its definition, so neither does this
+            // -- a reader only ever takes one from its home word.
+            //
+            // Before the locals seeding rather than after, and RAX-only, so the
+            // two cannot interfere: the seeding parks the interpreter's locals
+            // pointer in R11, which nothing here touches.
+            for id in const_seeds {
+                let Some(off) = self.node_slot.get(id as usize).copied().flatten() else {
+                    continue;
+                };
+                // Cast: a frame offset inside this method's own frame.
+                let off = off.get() as i32;
+                let (bits, is_fp, is_double) = match self.graph.nodes.get(id as usize) {
+                    Some(n) => match n.op {
+                        Op::Const(v) => (v, false, false),
+                        // Cast: an IEEE-754 bit pattern into the imm64 encoder.
+                        Op::ConstF(b) => (b as i64, true, n.ty == IrType::Double),
+                        _ => continue,
+                    },
+                    None => continue,
+                };
+                self.emit_mov_rax_imm64(bits);
+                self.store_abi_reg(RAX, off);
+                // `publish_fp_from_slot`, not an open-coded load, because that
+                // is the function `Op::ConstF`'s own definition calls -- and
+                // because `assigned_xmm`'s contract is that only the publishing
+                // sites read it.
+                if is_fp {
+                    self.publish_fp_from_slot(id, off, is_double);
+                }
+            }
+
             // ── Seed, last ───────────────────────────────────────────
             self.load_reg_from_frame(R11, self.phi_copy_scratch_slot_off);
             for (i, v) in seeds {
@@ -10352,7 +10775,43 @@ impl<'a> Lowerer<'a> {
                 self.emit_mov_rax_from_r11_disp((i as i32) * 8);
                 if !self.home_dropped.get(v as usize).copied().unwrap_or(false) {
                     if let Some(off) = self.node_slot.get(v as usize).copied().flatten() {
-                        self.store_abi_reg(RAX, off.get() as i32);
+                        // Cast: a frame offset inside this method's own frame.
+                        let off = off.get() as i32;
+                        self.store_abi_reg(RAX, off);
+                        // -- ...and into its XMM register, when it has one --
+                        //
+                        // The home word is not the whole truth for an FP value.
+                        // `fp_load_value` -- which every FP operand read in the
+                        // body goes through -- takes a value from its RESIDENT
+                        // XMM and never looks at the frame when one exists, and
+                        // an FP definition publishes one: `Op::Param` through
+                        // `publish_fp_from_slot`, every FP arithmetic node
+                        // through `fp_store_value`. Those definitions sit in
+                        // the blocks this stub jumps past.
+                        //
+                        // So this is the constants defect above, in the other
+                        // register file, and it needs neither a splice nor a
+                        // merge to reach: `double f(int n, double k) { double
+                        // a = k*3.0+1.5; ... for (..) s += x*k + a; }` names
+                        // `k` and `a` at the header, both live across it, both
+                        // read from XMMs the entry stub had never written.
+                        // Seeding only the home word left the PREVIOUS frame's
+                        // floating-point registers standing in for them.
+                        //
+                        // A GPR-resident local was already handled below; that
+                        // half was written and this one was not, which is the
+                        // same asymmetry `osr_entry_can_produce` now exists to
+                        // stop repeating.
+                        //
+                        // Reading the word back is safe under this `if`: an FP
+                        // home is never dropped (`value_home_droppable` admits
+                        // `Int` and `Long` alone), so the branch that skips the
+                        // store is not one an FP value can take.
+                        if let Some(ty) = self.graph.nodes.get(v as usize).map(|n| n.ty) {
+                            if matches!(ty, IrType::Float | IrType::Double) {
+                                self.publish_fp_from_slot(v, off, ty == IrType::Double);
+                            }
+                        }
                     }
                 }
                 if let Some(dst) = self.assigned_gpr(v) {
@@ -10974,6 +11433,7 @@ impl<'a> Lowerer<'a> {
                 .set(self.graph.safepoints.len());
             return Vec::new();
         }
+        let at_traps_only = ir_deopt_points_at_traps_enabled();
         let mut points: Vec<DeoptimizationPoint> = Vec::with_capacity(self.graph.safepoints.len());
         for (index, sp) in self.graph.safepoints.iter().enumerate() {
             let native_offset = match self.bci_native.get(&sp.bci) {
@@ -10981,6 +11441,23 @@ impl<'a> Lowerer<'a> {
                 // bci produced no node / no machine code — nothing to anchor.
                 None => continue,
             };
+            // A bci this body cannot transfer from describes a program point no
+            // resume can ask about — see `transfer_bcis`. Skipping it costs a
+            // fully-resolved frame state per bytecode index, which is where the
+            // 8x metadata-to-code ratio comes from.
+            //
+            // OFF by default. The consumers are the resume path's by-bci
+            // provenance checks, and those FAIL CLOSED — a missing point turns
+            // a precise resume into a whole-method re-run, and an
+            // exception-exit transfer into a propagate. Both are safe
+            // directions, but the second is observable, so this wants a soak on
+            // the exception-heavy suites before it becomes a default rather
+            // than an argument made here.
+            if at_traps_only && !self.transfer_bcis.contains(&sp.bci) {
+                self.unreachable_points_skipped
+                    .set(self.unreachable_points_skipped.get() + 1);
+                continue;
+            }
             // No speculation yet — these are plain resume points (step 2,
             // emit-and-discard). A real guard (step 3) sets its own reason.
             let reason = DeoptReason::TransferToInterpreter;
@@ -12740,6 +13217,57 @@ fn ir_alu_imm_enabled() -> bool {
 /// dropped home with no register describing it, and refuses the compile —
 /// exactly as it does today. Nothing is taken away; a case is added in which
 /// the net is provably not needed.
+/// Build a `DeoptimizationPoint` only at a bci this body can actually transfer
+/// from — **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS=1`.
+///
+/// `ir_drop_unreachable_homes_enabled` above does this for the ALL-or-nothing
+/// case: a body that emitted no trap at all skips every point. This is the same
+/// argument at per-point granularity, and it applies to the ordinary body —
+/// the one with a handful of guards and forty-odd frame states describing
+/// bytecode boundaries between them.
+///
+/// Measured with it on, against off, on the same binary: see
+/// `[c2] deopt points` in the exit census.
+/// Let the register file be AUTHORITATIVE for a promoted `Int`/`Long`, instead
+/// of a write-through read cache over the frame — **default OFF**, opt in with
+/// `CRATONVM_JIT_IR_REG_AUTHORITATIVE=1`.
+///
+/// This is the switch on [`Lowerer::compute_deopt_named_reachable`]. Off, a
+/// value keeps its home store unless it owns its register for the whole method
+/// or the whole method cannot deopt. On, it also keeps it only when a deopt
+/// that can actually happen names it — which is the difference between "a
+/// handful of values in a trap-free kernel" and "ordinary methods".
+///
+/// Default OFF because the prediction it rests on is the same one
+/// `CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES` rests on, and that has been off
+/// since it landed for the same reason: the net under a wrong prediction is a
+/// refused compile, which is safe, but the population it newly applies to has
+/// not been soaked. **It does not touch reference values or the GC**: `Ref` is
+/// refused by both droppability predicates exactly as before, so no oop becomes
+/// register-resident and `OopMapEntry` still needs no register bank.
+pub fn ir_register_authoritative_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_REG_AUTHORITATIVE").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
+pub fn ir_deopt_points_at_traps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DEOPT_POINTS_AT_TRAPS").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+        )
+    })
+}
+
 pub fn ir_drop_unreachable_homes_enabled() -> bool {
     match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DROP_UNREACHABLE_HOMES") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -12860,6 +13388,72 @@ pub fn ir_aastore_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("off") | Ok("no")
         )
     })
+}
+
+/// Block-exit edges that became a real fall-through because the layout already
+/// placed the successor next, and those that still needed a `JMP rel32`.
+///
+/// Read as a pair. `elided` alone cannot distinguish a layout that is working
+/// from a method whose blocks happen to be in source order anyway; the ratio is
+/// what says whether `ir_schedule`'s frequency-driven layout is buying
+/// anything, which until the elision existed it provably was not.
+static FALLTHROUGHS_ELIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOCK_JMPS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fall-through elision at block exits — **default ON**;
+/// `CRATONVM_JIT_IR_FALLTHROUGH=0` restores the pre-2026-09-09 shape, in which
+/// every CFG edge ended in an explicit `JMP rel32`. The switch exists so the
+/// two arms can be timed from ONE binary, which is the only control that does
+/// not confound this change with everything else in a separate build.
+///
+/// Not `OnceLock`-cached in test builds for the same reason
+/// `force_c2_enabled` is not: it is read at compile time only, never on a
+/// runtime hot path, and caching would make it racy against whichever test
+/// thread lowers first.
+fn ir_fallthrough_enabled() -> bool {
+    !matches!(
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FALLTHROUGH").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// `(fall-throughs elided, block JMPs still emitted)`, process-wide.
+pub fn ir_fallthrough_census() -> (u64, u64) {
+    (
+        FALLTHROUGHS_ELIDED.load(std::sync::atomic::Ordering::Relaxed),
+        BLOCK_JMPS_EMITTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Calls this tier lowered to the blind `jit_invoke_dispatch` helper:
+/// `[0]` in the compiling method's own code, `[1]` inside a spliced body.
+///
+/// The split is the whole point. A blind dispatch in the method's own code is
+/// ordinary -- an unbindable kind, a site with no inline cache. One inside a
+/// SPLICED body is a contradiction: the splice exists to delete a frame, and
+/// paying a name resolution for the calls left behind costs far more than the
+/// frame it removed. That combination is what made `SpliceCallProbe`'s
+/// optimizing body 8.5x slower than its single-pass one (~455 ms against
+/// 53 ms), and it had no reading of any kind -- which is how it survived a
+/// measurement campaign that concluded the two bodies were
+/// throughput-neutral. With the rows produced, this row reads 0 on that probe
+/// and the optimizing body is at parity.
+static IR_BLIND_DISPATCH: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn note_ir_blind_dispatch(in_splice: bool) {
+    IR_BLIND_DISPATCH[usize::from(in_splice)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(in the method's own code, inside a spliced body)`. See
+/// [`IR_BLIND_DISPATCH`]; a non-zero second element is the one to act on.
+pub fn ir_blind_dispatch_census() -> (u64, u64) {
+    (
+        IR_BLIND_DISPATCH[0].load(std::sync::atomic::Ordering::Relaxed),
+        IR_BLIND_DISPATCH[1].load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// `aastore` sites this tier lowered, process-wide.
@@ -15932,6 +16526,10 @@ pub(crate) fn lower_inner_with_scopes(
         );
         eprintln!("[ir-ls] alu immediates folded: {}", lowerer.alu_imms_folded);
         eprintln!(
+            "[ir-ls] carried homes dropped: {}",
+            lowerer.carried_homes_dropped,
+        );
+        eprintln!(
             "[ir-ls] unreachable frame states: graph_trap_free={} homes_freed={} points_skipped={}",
             lowerer.graph_cannot_deopt(),
             lowerer.unreachable_homes,
@@ -15973,6 +16571,16 @@ pub(crate) fn lower_inner_with_scopes(
     let mut cm = CompiledMethod::new(buf);
     cm.compile_id = compile_id;
     cm.deopt_points = deopt_points;
+    // Published unconditionally since 2026-09-09.
+    //
+    // A merge inside a relocated callee body used to withhold this vector
+    // wholesale (`ir::SPLICED_MERGE_SEEN`), because entering such an artifact
+    // at a loop header produced a wrong, run-to-run varying answer. The cause
+    // was never the splice: `emit_osr_entry_stubs` jumped past the block that
+    // writes a CONSTANT's home word, and a merge store reads its arms from
+    // their home words. `probes/Min0.java` reproduces it with no call at all.
+    // The stub seeds those constants now — see the `const_seeds` loop there —
+    // and the containment comes off with them.
     cm.ir_osr_entries = lowerer_osr_entries;
     cm.ir_osr_sentinel_free = osr_sentinel_free;
     cm._deopt_point_boxes = deopt_boxes;
@@ -16856,6 +17464,65 @@ mod tests {").next().unwrap_or(src);
         ir_optimize::optimize(&mut graph);
         let schedule = ir_schedule::schedule(&graph);
         lower(&graph, &schedule, num_params, num_locals, &no_helpers())
+    }
+
+    /// A block whose successor the layout already placed next must FALL
+    /// THROUGH, not jump.
+    ///
+    /// Two assertions, because either alone can pass on a broken emitter. The
+    /// census says the elision ran at all — without it, a method that happens
+    /// to need every jump is indistinguishable from an elision that never
+    /// fires. The byte scan says no `JMP rel32` survives with a displacement of
+    /// zero, which is a jump to the very next instruction and therefore always
+    /// dead weight; `E9 00 00 00 00` at the head of the loop body is exactly
+    /// what this emitter used to produce, and is the shape the fix exists to
+    /// remove.
+    ///
+    /// The census counters are process-global and monotone, so a strict
+    /// increase is sound even when other tests run concurrently: a parallel
+    /// lowering can only push the count further up.
+    #[test]
+    fn a_successor_placed_next_is_reached_by_falling_through() {
+        // int f(int x) { return x == 0 ? 2 : 1; }
+        //   0: iload_0
+        //   1: ifeq -> 8
+        //   4: iconst_1
+        //   5: goto -> 9
+        //   8: iconst_2
+        //   9: ireturn
+        let code = [
+            0x1a, // iload_0
+            0x99, 0x00, 0x07, // ifeq +7 -> 8
+            0x04, // iconst_1
+            0xa7, 0x00, 0x04, // goto +4 -> 9
+            0x05, // iconst_2
+            0xac, // ireturn
+            0, 0, 0,
+        ];
+        let before = ir_fallthrough_census();
+        let compiled = compile_via_ir(&code, 10, 1, 1).expect("a two-armed select must lower");
+        let after = ir_fallthrough_census();
+        assert!(
+            after.0 > before.0,
+            "no block-exit edge fell through: census went {before:?} -> {after:?}",
+        );
+
+        let code_bytes = compiled.code_bytes();
+        assert!(
+            !code_bytes.windows(5).any(|w| w == [0xE9, 0x00, 0x00, 0x00, 0x00]),
+            "emitted a JMP rel32 with displacement 0 -- a jump to the next \
+             instruction; {} bytes of code",
+            code_bytes.len(),
+        );
+
+        // The body must still compute the right answer: an elision that drops a
+        // jump the layout did NOT make redundant is wrong code, not a smaller
+        // body, and the census cannot tell the difference.
+        // SAFETY: one int parameter, no context, no helpers reachable.
+        for (arg, want) in [(0i64, 2i64), (1, 1), (-7, 1)] {
+            let got = unsafe { compiled.try_call(&[arg]).expect("call") };
+            assert_eq!(got, want, "f({arg})");
+        }
     }
 
     /// Build → schedule → lower WITHOUT the optimizer, so safepoint NodeIds
@@ -20278,6 +20945,447 @@ mod tests {").next().unwrap_or(src);
             entered(&again[..1]),
             None,
             "a short locals snapshot must be refused, not read past",
+        );
+    }
+
+    /// **The entered body may not read a constant nobody wrote.**
+    ///
+    /// `int f(int n){ int s=0; for(int i=0;i<n;i++){ int r; if(i<3) r=100;
+    /// else r=900; s+=r; } return s; }` — a counted loop whose body carries an
+    /// in-loop MERGE, and whose two arms are literals.
+    ///
+    /// That last detail is the whole test. A constant reached only by ALU code
+    /// is folded into an immediate at every use, so it needs no frame word; a
+    /// constant that flows into a PHI does not get that treatment — the merge
+    /// store and `emit_phi_copies` read it from its HOME WORD, which its own
+    /// `Op::Const` definition writes once, in the entry block. An OSR stub
+    /// jumps past that block, so before 2026-09-09 the entered body read
+    /// `[rbp - const_slot]` for `100` and got whatever the previous frame at
+    /// that address had left there: a wrong, run-to-run VARYING answer from a
+    /// deterministic program (`probes/Min0.java`, 8x800 000: three runs, three
+    /// different sums, none of them HotSpot's 5 134 452 788).
+    ///
+    /// `emit_osr_entry_stubs` re-materialises those constants now. The check
+    /// that let them through — the `Op::Const` arm of the live-in test — was
+    /// correct to let them through, and wrong to do so without emitting them.
+    #[test]
+    fn an_osr_entry_seeds_the_constants_its_merge_arms_read() {
+        let _osr = OsrEntryForce::on();
+        //  0: iconst_0   1: istore_1   2: iconst_0   3: istore_2
+        //  4: iload_2    5: iload_0    6: if_icmpge 35        <- header, bci 4
+        //  9: iload_2   10: iconst_3  11: if_icmpge 21
+        // 14: sipush 100 17: istore_3 18: goto 25
+        // 21: sipush 900 24: istore_3
+        // 25: iload_1   26: iload_3   27: iadd     28: istore_1
+        // 29: iinc 2,1  32: goto 4    35: iload_1  36: ireturn
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x1d, 0x1c, 0x06, 0xa2, 0x00, 0x0a,
+            0x11, 0x00, 0x64, 0x3e, 0xa7, 0x00, 0x07, 0x11, 0x03, 0x84, 0x3e, 0x1b, 0x1d, 0x60,
+            0x3c, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xe4, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 37, 1, 4).expect("clamp loop compiles via IR");
+        // The ordinary entry, which never skipped the constants and was always
+        // right. `i < 3` on three iterations, `i >= 3` on two.
+        assert_eq!(
+            unsafe { cm.try_call(&[5]).expect("test JIT call") },
+            3 * 100 + 2 * 900,
+            "the method-entry door: 100,100,100,900,900",
+        );
+
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(4) else {
+            assert!(
+                cm.ir_osr_entries.is_empty(),
+                "an entry for some other bci while the loop header was refused                  means the eligibility test and the emitter disagree",
+            );
+            return;
+        };
+        // Enter at the header in a state the method could not have reached from
+        // its own entry: n=10, s=1000, i=4. Every remaining iteration takes the
+        // `i >= 3` arm, so the answer is 1000 + 6*900 and it names the `900`
+        // constant's home word directly.
+        //
+        // SAFETY: the stub builds and tears down its own frame, reads exactly
+        // `locals[0..3]`, and returns the method's `int` result in RAX.
+        let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(4, 0, l) };
+        assert_eq!(
+            entered(&[10, 1000, 4]),
+            Some(1000 + 6 * 900),
+            "the `900` arm must come from the constant this stub seeded, not              from whatever the previous frame left in its word",
+        );
+        // And the other arm, from a state whose remaining iterations are all
+        // `i < 3` — so a stub that seeded one constant and not the other is not
+        // reported as a pass.
+        assert_eq!(
+            entered(&[3, 0, 0]),
+            Some(3 * 100),
+            "the `100` arm, on its own, from i=0",
+        );
+        // Both arms in one entry, which is also the shape that would catch a
+        // seed emitted INSIDE the loop rather than before it.
+        assert_eq!(
+            entered(&[6, 7, 1]),
+            Some(7 + 2 * 100 + 3 * 900),
+            "i=1,2 take the 100 arm and i=3,4,5 take the 900 arm",
+        );
+    }
+
+    /// **The entered body may not read an XMM register nobody wrote.**
+    ///
+    /// The constants defect above, in the other register file, and reached
+    /// without a merge, a literal arm or a splice:
+    ///
+    /// ```java
+    /// int f(int n) { double a = (double) n; int s = 0;
+    ///                for (int i = 0; i < n; i++) {
+    ///                    s += (int) (a + i);
+    ///                    s += (int) (a + s);
+    ///                }
+    ///                return s; }
+    /// ```
+    ///
+    /// `a` is an ordinary JVM local. It is not a phi -- nothing reassigns it
+    /// in the loop -- so at the header the snapshot names the `Op::I2D` that
+    /// computed it, the eligibility test is satisfied, and the stub seeds it.
+    /// Seeded into its HOME WORD, which was the whole of the seeding: and an
+    /// FP definition does not stop at the home word. `fp_store_value` copies
+    /// the result into the value's assigned XMM and marks it resident, after
+    /// which every reader in the body takes the REGISTER (`fp_load_value` ->
+    /// `resident_xmm`) and never looks at the frame again. The stub jumps past
+    /// that definition, so the body read whatever floating-point register the
+    /// previous frame happened to leave behind.
+    ///
+    /// **Observable on Windows only, and that is a property of the defect
+    /// rather than of the test.** A value is register-resident across a
+    /// safepoint only if its register survives one, and `IR_PROLOGUE_SAVED` --
+    /// the XMMs this prologue saves -- is `[6, 7]` on Win64 and EMPTY on
+    /// System V, where the ABI makes every XMM volatile. So on Linux every
+    /// register in `IR_LINEAR_SCAN` is caller-saved, an FP value live across
+    /// the safepoint at a loop header is split rather than promoted, and there
+    /// is no stale register for the entry to leave behind. The byte scan below
+    /// is what establishes which of the two a given run is, instead of letting
+    /// System V report a pass it did not earn.
+    ///
+    /// Three details of the fixture are load-bearing, and every one of them
+    /// was found by watching an earlier fixture fail to reproduce:
+    ///
+    /// * `a` read TWICE, because residency is `static_uses >= 2`
+    ///   (`ir_residency_pays_here`, whose loop weighting is default-off). A
+    ///   value read once per trip gets no register, stays in its frame word,
+    ///   and is seeded correctly by the unfixed emitter.
+    /// * the two reads adding `i` and `s`, not `i` twice: GVN merges two
+    ///   `(double) i` conversions into ONE node with two uses of its own, and
+    ///   that one -- defined in the loop, with the shorter range -- takes the
+    ///   register instead of `a`.
+    /// * neither read loop-invariant, because LICM hoists an invariant
+    ///   `(int) a` out of the loop and the hoisted `Op::D2I` is then an
+    ///   unnamed integer live across the header, which the eligibility test
+    ///   refuses outright -- a test that never enters, passing for the wrong
+    ///   reason.
+    ///
+    /// The byte scan below is what turned each of those from a false pass into
+    /// a failure, and it is why this test is worth more than its assertion.
+    #[test]
+    fn an_osr_entry_seeds_the_fp_registers_its_body_reads() {
+        let _osr = OsrEntryForce::on();
+        //  0: iload_0  1: i2d  2: dstore_1        (a = (double) n)
+        //  3: iconst_0 4: istore_3                (s = 0)
+        //  5: iconst_0 6: istore 4                (i = 0)
+        //  8: iload 4 10: iload_0 11: if_icmpge 37   <- header, bci 8
+        // 14: iload_3 15: dload_1 16: iload 4 18: i2d 19: dadd 20: d2i
+        // 21: iadd    22: istore_3
+        // 23: iload_3 24: dload_1 25: iload_3 26: i2d 27: dadd 28: d2i
+        // 29: iadd    30: istore_3
+        // 31: iinc 4,1 34: goto 8  37: iload_3  38: ireturn
+        let code = [
+            0x1a, 0x87, 0x48, 0x03, 0x3e, 0x03, 0x36, 0x04, 0x15, 0x04, 0x1a, 0xa2, 0x00, 0x1a,
+            0x1d, 0x27, 0x15, 0x04, 0x87, 0x63, 0x8e, 0x60, 0x3e, 0x1d, 0x27, 0x1d, 0x87, 0x63,
+            0x8e, 0x60, 0x3e, 0x84, 0x04, 0x01, 0xa7, 0xff, 0xe6, 0x1d, 0xac, 0, 0,
+        ];
+        // The bytecode's own arithmetic, in Rust, so the expected answers are
+        // derived rather than hand-computed: `d2i` truncates toward zero and
+        // `iadd` is 32-bit, which `as i32` and `wrapping_add` reproduce.
+        let expect = |n: i32, a: f64, s0: i32, i0: i32| -> i32 {
+            let (mut s, mut i) = (s0, i0);
+            while i < n {
+                s = s.wrapping_add((a + f64::from(i)) as i32);
+                s = s.wrapping_add((a + f64::from(s)) as i32);
+                i += 1;
+            }
+            s
+        };
+
+        let cm = compile_via_ir(&code, 39, 1, 5).expect("the FP-invariant loop compiles via IR");
+        // The ordinary entry, which never skipped the definition and was always
+        // right. `a` is `(double) n` here, because that is what the method's
+        // own prologue computes.
+        // Cast: both doors hand back RAX, whose low 32 bits are this method's
+        // `int` result; the upper half is not sign-extended, so the comparison
+        // is made on the 32 bits the body actually wrote.
+        assert_eq!(
+            unsafe { cm.try_call(&[5]).expect("test JIT call") } as i32,
+            expect(5, 5.0, 0, 0),
+            "the method-entry door",
+        );
+
+        let Some((_addr, _needed)) = cm.ir_osr_entry_addr(8) else {
+            assert!(
+                cm.ir_osr_entries.is_empty(),
+                "an entry for some other bci while the loop header was refused \
+                 means the eligibility test and the emitter disagree",
+            );
+            return;
+        };
+        // Cast: as above.
+        let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(8, 0, l) }.map(|v| v as i32);
+        // Enter at the header in a state the method could not have reached
+        // from its own entry -- `a` is 2.5, which `(double) n` never produces,
+        // so a stub that leaves the register alone cannot accidentally hold
+        // the right bits. The fraction also makes `d2i`'s truncation part of
+        // the answer, so a register holding SOME double is not enough either.
+        //
+        // SAFETY: the stub builds and tears down its own frame, reads exactly
+        // `locals[0..5]`, and returns the method's `int` result in RAX.
+        // Cast: an IEEE-754 bit pattern into the locals array's word.
+        let locals: [i64; 5] = [6, 2.5f64.to_bits() as i64, 0, 3, 2];
+        assert_eq!(
+            entered(&locals),
+            Some(expect(6, 2.5, 3, 2)),
+            "`a` must come from the XMM this stub seeded, not from whatever              floating-point register the previous frame left behind",
+        );
+        // A second entry, with a DIFFERENT `a`, from a frame the first entry
+        // has just used: a stub that seeds the register once, or that passes
+        // because the right value happened to still be there, fails here.
+        // Cast: as above.
+        let again: [i64; 5] = [4, (-1.75f64).to_bits() as i64, 0, 0, 0];
+        assert_eq!(
+            entered(&again),
+            Some(expect(4, -1.75, 0, 0)),
+            "a second entry must re-seed the register rather than inherit it",
+        );
+
+        // The vacuity guard, LAST: the two entries above are the claim, and
+        // this is the evidence that they were asked anything at all. If the
+        // allocator gave `a` no register there is no stale register to read,
+        // the body loads it from its frame word, and both entries pass on the
+        // unfixed emitter too. This graph builds no `Op::ConstF` and the
+        // stub's other work is integer stores, so a MOVSD inside the stub can
+        // only be the FP publish this test exists to check.
+        let bytes = cm.code_bytes();
+        let (_, stub_off, _) = *cm
+            .ir_osr_entries
+            .first()
+            .expect("the header entry was found above");
+        assert_eq!(cm.ir_osr_entries.len(), 1, "one entry, so one stub to scan");
+        let movsd = |b: &[u8]| b.windows(3).filter(|w| *w == [0xF2, 0x0F, 0x10]).count();
+        let (in_body, in_stub) = (
+            movsd(&bytes[..stub_off as usize]),
+            movsd(&bytes[stub_off as usize..]),
+        );
+        if IR_LOWER_SAVED_XMMS.is_empty() {
+            // System V, where this defect is unreachable. Stated as an
+            // assertion rather than an early `return` with a comment, because
+            // the interesting failure is the day it stops being true: an FP
+            // value that IS resident here, on a platform whose prologue saves
+            // no XMM, is a register the epilogue does not restore -- a
+            // different and worse bug than this one.
+            assert_eq!(
+                in_stub, 0,
+                "an FP value is register-resident across a safepoint on a                  platform whose prologue saves no XMM ({in_body} MOVSD in the                  body): `IR_PROLOGUE_SAVED` and `IR_LINEAR_SCAN` have come                  apart",
+            );
+            return;
+        }
+        assert!(
+            in_stub > 0,
+            "the stub publishes no XMM register ({in_body} MOVSD in the body,              {in_stub} in the stub): the allocator gave `a` none, so this              fixture no longer reproduces the defect it was written for and              must be repaired rather than believed",
+        );
+    }
+
+    /// **Every shape the eligibility test excuses must have an emission arm.**
+    ///
+    /// The mechanical half of `osr_entry_can_produce`'s doc comment. The
+    /// defect it was extracted from was not a wrong predicate -- excusing a
+    /// constant is right -- but two lists in two places that had to agree and
+    /// were only checked by hand. This checks them.
+    ///
+    /// Textual, in the idiom of
+    /// `every_droppable_op_writes_its_home_once_through_store_rax` above: the
+    /// alternative is a runtime scan, and there is nothing to scan at runtime
+    /// -- the failure is a shape that never gets emitted, which is precisely
+    /// the case that produces no node to look at.
+    #[test]
+    fn an_osr_entry_emits_every_shape_its_eligibility_test_excuses() {
+        let src = include_str!("ir_lower.rs");
+        // The FIRST occurrence of each needle is the code; the second is this
+        // test quoting it.
+        let excused_src = src
+            .split("fn osr_entry_can_produce(op: &Op) -> bool {")
+            .nth(1)
+            .expect("`osr_entry_can_produce` is in this file")
+            .split("\n    }")
+            .next()
+            .expect("the function ends");
+        let mut excused = std::collections::BTreeSet::new();
+        collect_op_names(excused_src, &mut excused);
+        assert!(
+            !excused.is_empty(),
+            "the predicate scan found nothing -- `osr_entry_can_produce` \
+             changed shape and this test would now pass vacuously",
+        );
+
+        let emitted_src = src
+            .split("let (bits, is_fp, is_double) = match self.graph.nodes.get(id as usize) {")
+            .nth(1)
+            .expect("the seed emission is in this file")
+            .split("None => continue,")
+            .next()
+            .expect("the match ends");
+        let mut emitted = std::collections::BTreeSet::new();
+        collect_op_names(emitted_src, &mut emitted);
+
+        assert_eq!(
+            excused, emitted,
+            "the OSR entry excuses {excused:?} from being seeded but emits \
+             {emitted:?}. A shape excused and not emitted is a value the \
+             entered body reads out of a frame word nothing wrote -- see \
+             `an_osr_entry_seeds_the_constants_its_merge_arms_read`.",
+        );
+    }
+
+    /// The page's own reproducer, at unit scale: `Min1.clamp` spliced into a
+    /// counted loop, entered through BOTH doors.
+    ///
+    /// `int clamp(int v){ int r; if (v < 100) r = 100; else r = v; return r; }`
+    /// relocated to a combined-buffer offset, which is what
+    /// `ir-splice-branch` admits and what `SPLICED_MERGE_SEEN` used to bar from
+    /// the optimizing OSR door. The bar is off; this is what has to hold
+    /// without it.
+    ///
+    /// The OSR half is the half that failed. Its two arms are LITERALS, so the
+    /// merge store reads them from their home words, and the entry stub jumps
+    /// past the block that writes those words — see
+    /// `an_osr_entry_seeds_the_constants_its_merge_arms_read` for the same
+    /// defect with nothing spliced at all.
+    fn splice_branch_fixture() -> (Vec<u8>, usize, HashMap<usize, crate::ir::IrInlineSite>) {
+        // Caller: `int f(int n){ int s=0; for(int i=0;i<n;i++) s += clamp(i);
+        //          return s; }`   locals: 0=n, 1=s, 2=i
+        //  0: iconst_0   1: istore_1   2: iconst_0   3: istore_2
+        //  4: iload_2    5: iload_0    6: if_icmpge 22        <- header, bci 4
+        //  9: iload_1   10: iload_2   11: invokestatic #1   14: iadd
+        // 15: istore_1  16: iinc 2,1  19: goto 4
+        // 22: iload_1   23: ireturn
+        let caller = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x10, 0x1b, 0x1c, 0xb8, 0x00, 0x01,
+            0x60, 0x3c, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xf1, 0x1b, 0xac,
+        ];
+        const CALLER_LEN: usize = 24;
+        // Callee: locals 0=v, 1=r
+        //  0: iload_0    1: sipush 100   4: if_icmpge 14
+        //  7: sipush 100 10: istore_1   11: goto 16
+        // 14: iload_0   15: istore_1
+        // 16: iload_1   17: ireturn                       <- single trailing return
+        let callee = [
+            0x1a, 0x11, 0x00, 0x64, 0xa2, 0x00, 0x0a, 0x11, 0x00, 0x64, 0x3c, 0xa7, 0x00, 0x05,
+            0x1a, 0x3c, 0x1b, 0xac,
+        ];
+        let mut combined = caller.to_vec();
+        let base = combined.len();
+        combined.extend_from_slice(&callee);
+        // The two trailing sentinel bytes every method's code carries.
+        combined.extend_from_slice(&[0, 0]);
+        let mut sites = HashMap::new();
+        sites.insert(
+            11,
+            crate::ir::IrInlineSite {
+                base,
+                code_len: callee.len(),
+                num_args: 1,
+                max_locals: 2,
+                arg_local_slots: vec![0],
+                returns_value: true,
+                receiver_is_arg0: false,
+                method_key: "P.clamp:(I)I".to_string(),
+                class_id: 0,
+            },
+        );
+        (combined, CALLER_LEN, sites)
+    }
+
+    #[test]
+    fn a_spliced_body_may_branch_and_its_phi_carries_a_combined_pc() {
+        let (combined, caller_len, sites) = splice_branch_fixture();
+        let mut builder = IrBuilder::new(1, 3);
+        builder.set_inline_sites(sites);
+        let graph = builder
+            .build(&combined, caller_len)
+            .expect("a spliced body with a forward branch must build");
+        let spliced_phi = graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::Phi) && n.bytecode_pc.is_some_and(|pc| pc >= caller_len));
+        assert!(
+            spliced_phi,
+            "the callee's if/else must produce a phi, and it must carry the \
+             COMBINED-buffer pc every node in a relocated region carries",
+        );
+        // And no `Op::Call` survives at the spliced site: a body that was
+        // spliced AND dispatched would run twice.
+        assert!(
+            !graph.nodes.iter().any(|n| matches!(n.op, Op::Call { .. })),
+            "the spliced call must be gone, not emitted alongside the body",
+        );
+    }
+
+    #[test]
+    fn a_spliced_branchy_body_runs_from_both_doors() {
+        let _osr = OsrEntryForce::on();
+        let (combined, caller_len, sites) = splice_branch_fixture();
+        let mut builder = IrBuilder::new(1, 3);
+        builder.set_inline_sites(sites);
+        let mut graph = builder
+            .build(&combined, caller_len)
+            .expect("a spliced body with a forward branch must build");
+        ir_optimize::optimize(&mut graph);
+        let schedule = ir_schedule::schedule(&graph);
+        let cm =
+            lower(&graph, &schedule, 1, 3, &no_helpers()).expect("the spliced graph must lower");
+
+        // The method-entry door. `clamp(i)` is 100 for every i below 100.
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("test JIT call") };
+        assert_eq!(f(5), 500, "clamp(0..4) is 100 each");
+        assert_eq!(f(0), 0, "an empty loop sums to zero");
+        assert_eq!(
+            f(105),
+            100 * 100 + (100 + 101 + 102 + 103 + 104),
+            "i<100 clamps to 100; i>=100 passes through",
+        );
+
+        // The OSR door, into the same body, at the loop header. This is the one
+        // the containment used to withhold, so its PRESENCE is asserted rather
+        // than tolerated: a silent absence is how the containment would come
+        // back without anyone noticing, and this test would then "pass" by
+        // never entering.
+        assert!(
+            cm.ir_osr_entry_addr(4).is_some(),
+            "the loop header must carry an optimizing OSR entry even though a \
+             spliced body contributed the merge inside it (entries: {:?})",
+            cm.ir_osr_entries
+                .iter()
+                .map(|(b, _, _)| *b)
+                .collect::<Vec<_>>(),
+        );
+        // SAFETY: the stub builds and tears down its own frame, reads exactly
+        // `locals[0..3]`, and returns the method's `int` result in RAX.
+        let entered = |l: &[i64]| unsafe { cm.ir_osr_enter(4, 0, l) };
+        assert_eq!(
+            entered(&[5, 1000, 2]),
+            Some(1000 + 3 * 100),
+            "entering at i=2 with s=1000 must run i=2,3,4 through the spliced \
+             clamp and add 100 each",
+        );
+        assert_eq!(
+            entered(&[103, 0, 100]),
+            Some(100 + 101 + 102),
+            "the OTHER arm of the spliced branch, from i=100",
         );
     }
 

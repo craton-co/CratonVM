@@ -1249,7 +1249,41 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// treatment. Widening this to all of `sun/reflect/` would be a fail-OPEN
 /// change if any accessor-like class ever lands there again, and the skip list
 /// is what keeps `Method.invoke` attributed to real user code.
-const REFLECTION_INTERNAL_EXCEPTIONS: &[&str] = &["sun/reflect/misc/"];
+///
+/// `ReflectionFactory` (2026-09-09) is the second entry, and it is the case the
+/// paragraph above got wrong. That paragraph asserts that the classes left
+/// under `sun/reflect/` are "none of which sit between a caller and a
+/// reflection native" -- but `ReflectionFactory.newConstructorForSerialization`
+/// does exactly that, and so does its `jdk.internal.reflect` delegate:
+///
+///     SerTrace.show                                         <- was resolved as the caller
+///     sun.reflect.ReflectionFactory.newConstructorForSerialization      skipped
+///     jdk.internal.reflect.ReflectionFactory.newConstructorForSerialization  skipped
+///     jdk.internal.reflect.ReflectionFactory.generateConstructor        skipped
+///       -> c.setAccessible(true)                            ReflectionFactory.java:437
+///
+/// `generateConstructor` marks the constructor it just built accessible,
+/// because serialization must construct types nobody opened. Skipping those
+/// frames walked out to the application class, decided the accessor was the
+/// unnamed module, and threw `InaccessibleObjectException: module java.base
+/// does not "opens java.util" to unnamed module` -- on BOTH JDK images and in
+/// BOTH modes, where HotSpot allows it with no `--add-opens`. This is the same
+/// failure shape as the `MethodUtil` entry above, one package over.
+///
+/// Kryo, XStream, Objenesis and several ORMs allocate through this exact entry
+/// point, so the blast radius is larger than the one probe that found it.
+///
+/// Why trusting this frame is not fail-open: `ReflectionFactory` calls
+/// `setAccessible` only on a `Constructor` it generated itself, and the JDK
+/// makes that constructor accessible by design. Exposing the frame therefore
+/// grants exactly what HotSpot grants. It is spelled as two exact class names
+/// rather than a package prefix so that nothing else under either package
+/// inherits the trust.
+const REFLECTION_INTERNAL_EXCEPTIONS: &[&str] = &[
+    "sun/reflect/misc/",
+    "sun/reflect/ReflectionFactory",
+    "jdk/internal/reflect/ReflectionFactory",
+];
 
 /// Walk the current Java call stack and return the ClassId of the first
 /// non-reflection frame вЂ” i.e. the user code that invoked the reflection
@@ -12297,6 +12331,72 @@ pub(crate) fn native_constructor_new_instance(
                     }
                 }
             }
+        }
+        // JDK 21 and earlier install a DIFFERENT accessor object for this very
+        // same contract: a `GeneratedSerializationConstructorAccessorN` under
+        // `jdk/internal/reflect/`, which the JDK generates at run time via
+        // `MethodAccessorGenerator`. It declares NO instance fields at all --
+        // no `target`, therefore no `instanceClass` -- so there is nothing on
+        // it to read the target type out of, and the name test above simply
+        // does not match. Measured on the two images this VM is gated against,
+        // and the choice is not configurable:
+        //
+        //     JDK 21.0.12+8  ->  GeneratedSerializationConstructorAccessorN
+        //     JDK 25.0.4+7   ->  DirectConstructorHandleAccessor
+        //
+        // Neither `-Djdk.reflect.useDirectMethodHandle` (true or false) nor
+        // `-Djdk.reflect.noInflation=true` moves either image, which is also
+        // why an earlier attempt to pin the difference on that flag found the
+        // output byte-identical: the flag was never the variable.
+        //
+        // Without this arm the name test failed on 21 and control fell through
+        // to the generic path below, which allocates `clazz` -- the ANCESTOR.
+        // That single skipped branch was the whole JDK 21 serialization defect,
+        // and it wore two faces, which is why it read as two unrelated bugs:
+        //
+        //   * ancestor CONCRETE (`Integer` -> `Object`): allocating the
+        //     ancestor SUCCEEDS and returns a bare `java.lang.Object`. Silent.
+        //     The caller gets a plausible object and fails elsewhere, or writes
+        //     the wrong thing down and never fails at all.
+        //   * ancestor ABSTRACT (`ArrayList` -> `AbstractList`): allocating it
+        //     throws `InstantiationException`, which `ObjectStreamClass`
+        //     wraps as `InvalidClassException: ... unable to create instance`.
+        //     Loud.
+        //
+        // The generated accessor's own bytecode already does exactly the right
+        // thing (`new <target>; invokespecial <ancestor>.<init>()V; areturn`),
+        // so the fix is to RUN it rather than to re-derive the target type from
+        // an object that does not carry it. That is also the --jdk-only-shaped
+        // answer: the real JDK bytecode is authoritative, and we stop pretending
+        // to know a JDK-internal layout that turned out to be version-pinned.
+        //
+        // `_bytecode_only` is required, not a preference: dispatching normally
+        // would re-enter this same native and recurse forever.
+        else if acc_class.as_deref().is_some_and(|n| {
+            n.starts_with("jdk/internal/reflect/GeneratedSerializationConstructorAccessor")
+        }) {
+            // Refresh through the pin: anything above here may have moved the
+            // array (same convention as the generic path below).
+            let args_array = args_array_pin.map(|(pin, arr)| ctx.read_native_pin(pin, arr));
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                eprintln!(
+                    "[rf-ser] delegating to generated accessor {} for declaring class {:?}",
+                    acc_class.as_deref().unwrap_or("?"),
+                    ctx.get_field_by_name(this, "clazz")
+                );
+            }
+            return ctx.invoke_virtual_bytecode_only(
+                acc,
+                "newInstance",
+                "([Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(args_array)],
+            );
+        }
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+            eprintln!(
+                "[rf-ser] constructorAccessor = {:?} -- no arm matched; falling through to the generic path, which allocates the DECLARING class",
+                acc_class.as_deref()
+            );
         }
     }
 
@@ -29121,5 +29221,266 @@ mod protection_domain_layout_tests {
                  (measured); `{anchor}` is gone"
             );
         }
+    }
+}
+
+
+#[cfg(test)]
+mod serialization_constructor_accessor_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::{FieldMetadata, NativeClassAccess, NativeHeapAccess};
+
+    /// Every JDK this VM is gated against installs a `constructorAccessor` on
+    /// the `Constructor` that `ReflectionFactory.newConstructorForSerialization`
+    /// returns -- but NOT the same one, and the difference is not configurable:
+    ///
+    ///     JDK 21.0.12+8  ->  jdk/internal/reflect/GeneratedSerializationConstructorAccessorN
+    ///     JDK 25.0.4+7   ->  jdk/internal/reflect/DirectConstructorHandleAccessor
+    ///
+    /// The 25-shaped object carries the target type in `target.instanceClass`.
+    /// The 21-shaped one carries NOTHING -- it declares no instance fields at
+    /// all -- so the only way to honour the serialization contract on 21 is to
+    /// run the accessor's own `newInstance` bytecode.
+    ///
+    /// Before the delegating arm existed, the 21 shape matched no arm and fell
+    /// through to allocating the constructor's DECLARING class (the first
+    /// non-serializable ancestor), which is the whole JDK 21 serialization
+    /// defect. It was silent whenever that ancestor was concrete: `Integer`
+    /// deserialized to a bare `java.lang.Object` and threw nothing.
+    ///
+    /// These tests are written against the mock precisely because the defect is
+    /// invisible to any test run on a JDK 25 image -- and a JDK 25 image is what
+    /// CI has.
+    fn constructor_with_accessor_named(
+        ctx: &mut MockNativeContext,
+        accessor_class: &str,
+    ) -> ObjectRef {
+        let ctor_cid = ctx
+            .ensure_class_initialized("java/lang/reflect/Constructor")
+            .expect("declare Constructor");
+        // `constructorAccessor` is slot 0 and `clazz` slot 1 for this test only;
+        // the mock resolves names through `set_declared_fields`, which outranks
+        // its built-in tables.
+        ctx.set_declared_fields(
+            ctor_cid,
+            vec![
+                FieldMetadata {
+                    name: "constructorAccessor".to_string(),
+                    descriptor: "Ljdk/internal/reflect/ConstructorAccessor;".to_string(),
+                    access_flags: 0,
+                    slot_index: 0,
+                    declaring_class_id: ctor_cid,
+                    is_static: false,
+                },
+                FieldMetadata {
+                    name: "clazz".to_string(),
+                    descriptor: "Ljava/lang/Class;".to_string(),
+                    access_flags: 0,
+                    slot_index: 1,
+                    declaring_class_id: ctor_cid,
+                    is_static: false,
+                },
+            ],
+        );
+        let ctor = ctx.alloc_object(ctor_cid, 4);
+
+        let acc_cid = ctx
+            .ensure_class_initialized(accessor_class)
+            .expect("declare accessor class");
+        let acc = ctx.alloc_object(acc_cid, 0);
+        ctx.set_field_by_name(ctor, "constructorAccessor", Value::Object(Some(acc)));
+        ctor
+    }
+
+    /// The delegation must be a call to the accessor's OWN `newInstance`, with
+    /// the JDK signature. Asserting only "something was returned" would pass
+    /// for a fallthrough that happened to produce an object.
+    fn record_call(
+        _ctx: &mut MockNativeContext,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "newInstance"
+            && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
+        {
+            // A sentinel Int is not a legal `newInstance` return in production;
+            // it is used here BECAUSE it cannot be confused with anything the
+            // fallthrough path could construct.
+            Some(Ok(Some(Value::Int(0x5E21))))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_jdk21_generated_serialization_accessor_is_delegated_to() {
+        let mut ctx = MockNativeContext::new();
+        let ctor = constructor_with_accessor_named(
+            &mut ctx,
+            "jdk/internal/reflect/GeneratedSerializationConstructorAccessor1",
+        );
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = native_constructor_new_instance(
+            &mut ctx,
+            &[Value::Object(Some(ctor)), Value::Object(None)],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Int(0x5E21)),
+            "the JDK 21 generated serialization accessor was NOT delegated to; \
+             control fell through to the generic path, which allocates the \
+             DECLARING class -- that is the JDK 21 serialization defect"
+        );
+    }
+
+    /// Same accessor family, a higher generation counter. The JDK numbers these
+    /// per generated class (`...Accessor1`, `...Accessor2`, ...), so an
+    /// equality test against a single name would pass the first case in a
+    /// process and fail every one after it.
+    #[test]
+    fn the_generation_counter_in_the_accessor_name_is_not_part_of_the_match() {
+        let mut ctx = MockNativeContext::new();
+        let ctor = constructor_with_accessor_named(
+            &mut ctx,
+            "jdk/internal/reflect/GeneratedSerializationConstructorAccessor47",
+        );
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = native_constructor_new_instance(
+            &mut ctx,
+            &[Value::Object(Some(ctor)), Value::Object(None)],
+        );
+
+        assert_eq!(
+            got.ok().flatten(),
+            Some(Value::Int(0x5E21)),
+            "only the FIRST generated accessor in a process would be handled"
+        );
+    }
+
+    /// The control that makes the two tests above mean something: an accessor
+    /// this arm must NOT claim. Without it, a `starts_with` that matched
+    /// everything would pass both tests above and silently divert every
+    /// ordinary reflective construction into the accessor.
+    /// The control that matters most, because it is one word away from a match.
+    /// The JDK ALSO generates `GeneratedConstructorAccessorN` -- no
+    /// `Serialization` in the name -- for ordinary reflective construction under
+    /// the old inflation scheme. Those must keep taking the generic path;
+    /// delegating them would route every ordinary
+    /// `Constructor.newInstance` through an accessor and skip the JPMS and
+    /// argument-arity checks below. A match loosened to, say,
+    /// `contains("ConstructorAccessor")` passes every other test in this module
+    /// and fails this one.
+    #[test]
+    fn the_ordinary_generated_constructor_accessor_is_not_delegated_to() {
+        let mut ctx = MockNativeContext::new();
+        let ctor = constructor_with_accessor_named(
+            &mut ctx,
+            "jdk/internal/reflect/GeneratedConstructorAccessor1",
+        );
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = native_constructor_new_instance(
+            &mut ctx,
+            &[Value::Object(Some(ctor)), Value::Object(None)],
+        );
+
+        assert_ne!(
+            got.ok().flatten(),
+            Some(Value::Int(0x5E21)),
+            "an ORDINARY generated constructor accessor was routed into the serialization arm -- the match is too loose"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_accessor_class_is_not_delegated_to() {
+        let mut ctx = MockNativeContext::new();
+        let ctor = constructor_with_accessor_named(
+            &mut ctx,
+            "jdk/internal/reflect/NativeConstructorAccessorImpl",
+        );
+        ctx.set_invoke_virtual_hook(record_call);
+
+        let got = native_constructor_new_instance(
+            &mut ctx,
+            &[Value::Object(Some(ctor)), Value::Object(None)],
+        );
+
+        assert_ne!(
+            got.ok().flatten(),
+            Some(Value::Int(0x5E21)),
+            "an unrelated accessor was routed into the serialization arm"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reflection_factory_caller_visibility_tests {
+    use super::is_reflection_internal_frame;
+
+    /// `ReflectionFactory.generateConstructor` calls `setAccessible(true)` on
+    /// the constructor it just generated. If its frame is skipped as
+    /// "reflection plumbing", the caller walk continues out to the application
+    /// class, the accessor is judged to be the unnamed module, and
+    /// `newConstructorForSerialization` throws
+    /// `InaccessibleObjectException: module java.base does not "opens
+    /// java.util" to unnamed module` -- where HotSpot succeeds with no
+    /// `--add-opens`, on both JDK images and in both modes.
+    #[test]
+    fn both_reflection_factory_frames_stay_visible_as_the_caller() {
+        assert!(
+            !is_reflection_internal_frame("jdk/internal/reflect/ReflectionFactory"),
+            "the jdk.internal delegate must stay visible; it is the frame that \
+             actually calls setAccessible (ReflectionFactory.java:437)"
+        );
+        assert!(
+            !is_reflection_internal_frame("sun/reflect/ReflectionFactory"),
+            "the jdk.unsupported entry point must stay visible too, or the walk \
+             simply skips to the application class one frame later"
+        );
+    }
+
+    /// The controls that make the test above mean something. These are the
+    /// accessor classes the skip list exists FOR: if they stopped being
+    /// skipped, every `Method.invoke` would be attributed to reflection
+    /// plumbing instead of to the real user caller, and the deep-reflection
+    /// gate would trust user code.
+    #[test]
+    fn the_real_reflection_plumbing_is_still_skipped() {
+        for plumbing in [
+            "jdk/internal/reflect/NativeMethodAccessorImpl",
+            "jdk/internal/reflect/DelegatingMethodAccessorImpl",
+            "jdk/internal/reflect/GeneratedConstructorAccessor3",
+            "java/lang/reflect/Method",
+            "java/lang/reflect/Constructor",
+            "java/lang/invoke/MethodHandles",
+            "java/lang/AccessibleObject",
+            "java/lang/Class",
+        ] {
+            assert!(
+                is_reflection_internal_frame(plumbing),
+                "{plumbing} must stay skipped -- it really does sit between a \
+                 caller and a reflection native"
+            );
+        }
+    }
+
+    /// The exception is spelled as exact class names rather than a package
+    /// prefix, so the rest of both packages keeps its existing treatment. A
+    /// prefix entry here would be a fail-open change the moment another
+    /// accessor-like class lands in either package.
+    #[test]
+    fn the_exception_did_not_widen_to_the_whole_package() {
+        // A DIFFERENT class in the same two packages is still skipped, which
+        // is what "narrow on purpose" means.
+        assert!(is_reflection_internal_frame("jdk/internal/reflect/Reflection"));
+        assert!(is_reflection_internal_frame("sun/reflect/annotation/AnnotationParser"));
+        // ... while the pre-existing MethodUtil carve-out is untouched.
+        assert!(!is_reflection_internal_frame("sun/reflect/misc/MethodUtil"));
     }
 }

@@ -1233,7 +1233,13 @@ impl TlabPressureTracker {
         let next = if grow && !shrink {
             current.saturating_mul(2).min(MAX_TLAB_SIZE)
         } else if shrink && !grow {
-            (current / 2).max(MIN_TLAB_SIZE)
+            // `current` is only guaranteed to be a multiple of 8 (it can be
+            // seeded from a truncated, arena-nearly-full grant — see
+            // `refill_tlab`), not a multiple of 16+, so halving it can drop
+            // below the 8-byte alignment `Tlab::new` requires of the final
+            // refill size. Re-mask after the divide so every value this
+            // heuristic ever produces stays 8-aligned.
+            ((current / 2) & !7).max(MIN_TLAB_SIZE)
         } else {
             current
         };
@@ -1424,6 +1430,33 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let next = t.next_refill_size();
         assert_eq!(next, 32 * 1024);
+    }
+
+    /// Regression: `next_refill_size`'s shrink branch used to compute
+    /// `current / 2` without re-masking to 8-byte alignment. `current`
+    /// (`last_refill_size`) can be seeded from a truncated `refill_tlab`
+    /// grant (see `gen_heap.rs` / `g1.rs` — the arena/region need only
+    /// guarantee multiples of 8, not 16+), so a value like 16392
+    /// (multiple of 8, not of 16) halves to 8196 — still inside
+    /// `[MIN_TLAB_SIZE, MAX_TLAB_SIZE]` so the final clamp doesn't catch
+    /// it, but not 8-aligned. That poisoned "requested size" would flow
+    /// straight into `Tlab::new`, tripping its `end`-pointer alignment
+    /// contract. Every value this heuristic can ever produce must stay
+    /// 8-aligned regardless of what `last_refill_size` was seeded with.
+    #[test]
+    fn pressure_tracker_shrink_stays_8_aligned_even_from_odd_seed() {
+        let mut t = TlabPressureTracker::new();
+        // 16392 = 16384 + 8: a multiple of 8, deliberately not of 16.
+        t.begin_refill(16392);
+        t.record_allocation(64);
+        t.record_allocation(64);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let next = t.next_refill_size();
+        assert_eq!(
+            next % 8,
+            0,
+            "next_refill_size must stay 8-aligned, got {next}"
+        );
     }
 
     #[test]

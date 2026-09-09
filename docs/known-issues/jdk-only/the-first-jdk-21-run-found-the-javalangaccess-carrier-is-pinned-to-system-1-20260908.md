@@ -79,10 +79,56 @@ row.
 | 3 | `JdkOnlyBreadthProbe` / `serialization` | **BOTH** | `SECTION-FAILED serialization: java.lang.RuntimeException: java.io.InvalidClassException: java.util.ArrayList; unable to create instance` |
 | 4 | `JdkOnlyBreadthProbe` / `textformat` | strict | grouping and decimal separators differ from the control: HotSpot 21 gives `df=1<nbsp>234,50`, CratonVM gives `df=1,234.50` |
 
+> **#3 NARROWED 2026-09-09 — it is two symptoms, not one, and the other one is
+> silent.** The section aborts at its first throw, so the `ArrayList` row above
+> hid the rest of it: on JDK 21 `Integer`, `Long` and `Boolean` also round-trip
+> wrongly, returning a bare `java.lang.Object` and throwing **nothing**. Both
+> are one contract violation — the serialization constructor allocates the
+> declaring superclass instead of the target — and whether it is loud or silent
+> is decided only by whether that ancestor is abstract (`AbstractList` throws;
+> `Object` does not). Reproducer, the 3x4 matrix, and two ruled-out mechanisms:
+> jdk-21-serialization-round-trip-returns-the-wrong-class-20260909.md. Reading
+> the row above as "one small divergence" understates it.
+>
+> **FIXED 2026-09-09.** The page moved to
+> `docs/internal/retired/jdk-21-serialization-round-trip-returns-the-wrong-class-FIXED-20260909.md`.
+> The mechanism was the accessor object itself: JDK 21 installs a
+> run-time-generated `GeneratedSerializationConstructorAccessorN` (no
+> fields at all), JDK 25 a `DirectConstructorHandleAccessor` (carries the
+> target type), and the VM recognised only the latter. **It was NOT this
+> page's carrier defect** -- the two 21 findings really are separate
+> mechanisms, as section 6 of that page guessed. The `io` and `vthreads`
+> rows below are still the carrier, and are still open.
+
 #3 is mode-independent, so it is not a strict-mode question. #4 is
 strict-only and **not** diagnosed here — the control's separators are the
 locale's and CratonVM's are US-style, which is a lead about locale data, not a
 finding.
+
+> **#4 NARROWED 2026-09-09 — it is the locale DATA, not the default locale.**
+> The lead above ("a lead about locale data") is now measured, and the other
+> reading is ruled out: on the failing image `Locale.getDefault()` is `ru_RU`,
+> `Locale.getDefault(FORMAT)` is `ru_RU`, and `user.language`/`user.country`
+> are `ru`/`RU` — all correct, in strict mode. What is wrong is that a locale
+> asked for **explicitly by name** answers with US separators.
+> `DecimalFormatSymbols.getInstance(Locale.GERMANY)`:
+>
+> ```text
+>                              grouping   decimal
+>   HotSpot 21                 U+002E     U+002C
+>   CratonVM --real-jdk  21    U+002E     U+002C
+>   CratonVM --jdk-only  21    U+002C     U+002E   <-- the one wrong cell
+>   CratonVM --real-jdk  25    U+002E     U+002C
+>   CratonVM --jdk-only  25    U+002E     U+002C
+> ```
+>
+> So it is strict-only AND 21-only, and it is not reachable through
+> `user.*` properties — those are right. Every non-US locale collapses to US
+> separators, which is the shape of locale data resolving to root/US rather
+> than of a locale being chosen wrongly. Mechanism not yet identified.
+> `probes/Jdk21StrictLocaleData.java` reproduces it; it prints separators as
+> code points because ru-RU's is U+00A0 and "looks like a space" is not a
+> measurement (it also makes `grep` treat the transcript as binary).
 
 Neither reproduces on JDK 25: the `25-windows` and `25-linux` keys carry two
 sections each, both `vthreads`, and neither of these.
@@ -116,9 +162,72 @@ was silently absent.
   obvious shape and is exactly the kind of thing that needs its own lane — the
   literal is load-bearing in a registrar, a factory, a classloader path and
   that bridge's own contract tests.
+> **SUPERSEDED 2026-09-09 -- `21-linux` is minted and gating.** Run on an
+> azure Linux host against Temurin 21.0.12+8 with a release binary built from
+> `origin/dev` @ 5487287dc. All four matrix legs now adjudicate; none refuses.
+>
+> The Linux key carries **16 sections, the same count as `21-windows` but not
+> the same set**: Linux does not diverge on `textformat` (that row is locale
+> data, and the Windows measurement was taken on a host whose default locale is
+> ru_RU -- see the #4 note above), and Linux carries a `real/vthreads` row
+> Windows does not.
+>
+> **It was not accepted from one mint, and the first two attempts would have
+> been a gate that went red at random.** The vthreads section is an
+> intermittent race, and because the baseline records section IDENTITY, a
+> baseline minted from a run that saw the smaller set reads the larger set as
+> NEW. Attempt 1 minted 15 sections, passed one gate run and failed the next.
+> The accepted baseline is the MAXIMAL observed set -- every later run is then
+> a subset, and GONE always passes -- and it was held to ten consecutive
+> passing gate runs before acceptance, with the paired ratchet then re-run
+> against it (remove one row -> rc=5 naming that row; restore -> rc=0).
+>
+> Two of the four defects on this page are therefore now frozen on BOTH
+> platforms rather than one.
+
+> **SUPERSEDED 2026-09-09 -- `21-linux` is minted and gating.** Run on an
+> azure Linux host against Temurin 21.0.12+8 with a release binary built from
+> `origin/dev` @ 5487287dc. All four matrix legs now adjudicate; none refuses.
+>
+> The Linux key carries **16 sections, the same count as `21-windows` but not
+> the same set**: Linux does not diverge on `textformat` (that row is locale
+> data, and the Windows measurement was taken on a host whose default locale is
+> ru_RU -- see the #4 note above), and Linux carries a `real/vthreads` row
+> Windows does not.
+>
+> **It was not accepted from one mint, and the first two attempts would have
+> been a gate that went red at random.** The vthreads section is an
+> intermittent race, and because the baseline records section IDENTITY, a
+> baseline minted from a run that saw the smaller set reads the larger set as
+> NEW. Attempt 1 minted 15 sections, passed one gate run and failed the next.
+> The accepted baseline is the MAXIMAL observed set -- every later run is then
+> a subset, and GONE always passes -- and it was held to ten consecutive
+> passing gate runs before acceptance, with the paired ratchet then re-run
+> against it (remove one row -> rc=5 naming that row; restore -> rc=0).
+>
+> Two of the four defects on this page are therefore now frozen on BOTH
+> platforms rather than one.
+
 * **`21-linux` is untouched.** This is one platform. The 21 Linux leg still
   refuses, and a baseline from another key cannot adjudicate it.
 * **#4 is an observation.** No locale mechanism is identified.
+  **SUPERSEDED 2026-09-09 — the mechanism is now identified.** CratonVM’s
+  CLDR locale adapter reports only **5** supported locales where HotSpot
+  reports **1,063**, and the five are exactly the set that ships inside
+  `java.base`; the rest live in the `jdk.localedata` module, which is not
+  being picked up. `LocaleProviderAdapter.getAdapter` therefore finds no
+  adapter claiming `de-DE` and falls through to
+  `FallbackLocaleProviderAdapter`, whose root/English data IS the US
+  separators. Nothing throws anywhere, which is why this never appeared in
+  a stack trace. Full measurement, and an UNRESOLVED conflict with the
+  `--real-jdk` cell recorded above (Linux shows the fallback in BOTH modes,
+  Windows recorded `--real-jdk` correct):
+  ../serviceloader-loadinstalled-finds-nothing-so-every-platform-loader-service-is-empty-20260909.md
+  **CORRECTED the same day:** the cause is NOT `jdk.localedata` failing to
+  load — that module is present and its data is intact. It is
+  `ServiceLoader.loadInstalled` returning NOTHING for every service (the
+  platform-loader lookup), which is what the CLDR adapter uses to find its
+  supplementary metadata. Not a locale defect at all.
 * **The 87-method claim is about the class, not about CratonVM.** Only
   `parkVirtualThread(long)` and `encodeASCII` were observed failing; that the
   other 85 would fail the same way is a prediction from the mechanism, not a
