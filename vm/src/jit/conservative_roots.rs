@@ -2100,7 +2100,7 @@ pub mod above_chain {
 /// Kept, default off, as the lever that reading measures rather than a fix:
 /// a default-on gigabyte of stack reads per run buys nothing demonstrated.
 /// See
-/// `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+/// `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn above_chain_scan_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -6472,7 +6472,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // What remains of the fullstack diagnostic's difference is the PATH, not
     // the range: it also scans from `update_root_snapshot`, on every
     // object-returning native call. See `above_chain_all_paths`, and
-    // `docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+    // `docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
     //
     // Sound on the same terms as the chain band beside it, which has always
     // pushed conservative roots on cycles that could still relocate: a live

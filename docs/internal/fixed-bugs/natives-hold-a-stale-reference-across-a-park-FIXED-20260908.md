@@ -291,7 +291,7 @@ Filed with the evidence, the ruled-out mechanisms, and the most specific lead
 (the predicate guarding the conservative frame-slot probe is narrower than the
 collector's own, so an A5 unregistered-JIT-frame cycle ran the non-moving sweep
 with the root-widening pass off):
-`docs/known-issues/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
+`docs/internal/springboot/bindabletests-bytebuddy-receiver-reclaimed-under-gc-stress-20260908.md`.
 
 That lead was a real gap and is fixed (`collect_roots` step 14a5), and of the
 THREE disagreeing predicates the page named, one turned out to be a disjunct
