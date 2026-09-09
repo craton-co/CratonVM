@@ -2955,6 +2955,20 @@ pub(super) const ALL_SPILL_GPRS: [u8; 14] = [
     RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
 ];
 
+/// `reg`'s bit in an [`ALL_SPILL_GPRS`]-indexed mask, or `0` when `reg` is not
+/// in that set (RSP/RBP, which never hold a Java reference).
+///
+/// The one place the `OopMapEntry::reg_oop_mask` bit order is computed, so a
+/// producer and a consumer cannot disagree about which bit is which register.
+#[inline]
+pub(super) fn spill_gpr_bit(reg: u8) -> u16 {
+    match ALL_SPILL_GPRS.iter().position(|&r| r == reg) {
+        // Cast: position < 14 < 16, so the shift is in range.
+        Some(i) => 1u16 << i,
+        None => 0,
+    }
+}
+
 /// The registers the inline-TLAB `new` fast path clobbers between the
 /// safepoint and its slow-path exits — and therefore the only ones whose
 /// blind spill cannot be sunk out of the fast path (see
