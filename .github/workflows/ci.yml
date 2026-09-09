@@ -1698,6 +1698,14 @@ jobs:
       # appeared and on what runner -- NOT to widen it by hand, and NOT to
       # drop the probe. Any other NEW row is a real regression.
       #
+      # IF THE 21-LINUX LEG GOES RED ON A vthreads ROW, THIS IS WHY, and it is
+      # not a regression. The maximal set was observed on an 8-core host; a
+      # runner with a different core count can lose the race a way that was
+      # never seen here and produce a vthreads section identity the baseline
+      # does not carry. The fix is to re-freeze with a note saying which row
+      # appeared and on what runner -- NOT to widen it by hand, and NOT to
+      # drop the probe. Any other NEW row is a real regression.
+      #
       # That risk was then measured rather than left as a worry. The race was
       # amplified along the axis its window sits on -- LOAD -- by re-running the
       # leg while the 8-core host sat at a load average of 30 to 40, i.e. four to
