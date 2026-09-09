@@ -8867,7 +8867,11 @@ fn scan_compiled_frame_bands(
             if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
                 return false;
             }
-            scan_one_frame(rbp - frame_size, rbp, heap, out);
+            if let Some(skip) = band_skip_classes() {
+                scan_one_frame_skipping(rbp, frame_size, cm, skip, heap, out);
+            } else {
+                scan_one_frame(rbp - frame_size, rbp, heap, out);
+            }
             // The band was just read as marking roots, which is what keeps
             // these objects alive across the pause AND what gets them copied.
             // Say which of them arrived through a word no channel rewrites, so
@@ -9155,6 +9159,92 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     );
 }
 
+/// `CRATONVM_JIT_BAND_SKIP=<class>[,<class>...]` — **a MEASUREMENT LEVER, and
+/// unsafe. Default unset, which is byte-for-byte today's scan.**
+///
+/// Drops the named [`cratonvm_jit::FrameLayout::region_name`] classes from the
+/// conservative band scan, so words there stop being marking roots. It exists
+/// to put a NUMBER on what a precise compiled-frame root set could buy, because
+/// the alternative is arguing about it:
+/// `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+/// spent its "where to start" list on two narrowings that measurement then
+/// refuted, and the third — precise oop maps — is a project nobody will start
+/// on a guess about its payoff.
+///
+/// Recognised classes are `region_name`'s own vocabulary; the three worth
+/// measuring are `operand-spill` (words above the safepoint's live cursor —
+/// which is the only class the VM already CLAIMS is dead, see
+/// `OopMapEntry::live_frame_hi`), `outgoing-args-or-deopt-regs` (the
+/// uninitialised outgoing-argument reserve, which holds whatever a previous,
+/// deeper frame left below the old stack pointer), and
+/// `safepoint-gpr-spill-image` (the blind GPR spill, where a dead scratch
+/// register is indistinguishable from a live one without register liveness).
+///
+/// **Do not enable this in production.** Dropping a root frees what it named.
+/// Only `operand-spill` above the live cursor has a written deadness argument
+/// behind it; the other two are conservative backstops and skipping them is a
+/// use-after-free waiting for the right frame. The lever measures the ceiling,
+/// it does not implement the fix.
+fn band_skip_classes() -> Option<&'static [String]> {
+    static G: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        let v = cratonvm_types::flags::runtime_var("CRATONVM_JIT_BAND_SKIP").ok()?;
+        let classes: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (!classes.is_empty()).then_some(classes)
+    })
+    .as_deref()
+}
+
+/// [`scan_one_frame`] over `[rbp - frame_size, rbp)`, minus the storage classes
+/// [`band_skip_classes`] names. Only reachable with that flag set.
+fn scan_one_frame_skipping(
+    rbp: usize,
+    frame_size: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    skip: &[String],
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) {
+    if frame_size == 0 || frame_size > rbp {
+        return;
+    }
+    let live_hi = moving_young_frame_live_hi(rbp, cm);
+    let layout = &cm.frame_layout;
+    let mut addr = (rbp - frame_size + 7) & !7usize;
+    let envelope = heap.conservative_addr_span();
+    while addr + 8 <= rbp {
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        let class = layout.region_name(off);
+        // `operand-spill` is skipped only ABOVE the live cursor. Below it the
+        // slots hold the CURRENT operand stack, which is as live as a root
+        // gets — skipping those would not be measuring a ceiling, it would be
+        // measuring a crash.
+        let skipped = skip.iter().any(|c| c == class)
+            && (class != "operand-spill" || live_hi.is_some_and(|hi| off >= hi));
+        if skipped {
+            addr += 8;
+            continue;
+        }
+        // SAFETY: aligned read inside this thread's own live compiled frame,
+        // over the same interval `scan_one_frame` reads.
+        let qword = unsafe { (addr as *const usize).read() };
+        addr += 8;
+        if let Some((lo, hi)) = envelope {
+            if qword < lo || qword >= hi {
+                continue;
+            }
+        }
+        if let Some(obj) = heap.is_object_address(qword) {
+            out.push(obj);
+        }
+    }
+}
+
 /// Total addresses published to the unrewritable-root veto this process.
 static UNREWRITABLE_BAND_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
@@ -9182,6 +9272,31 @@ pub fn unrewritable_band_root_count() -> usize {
 /// exactly the set `remap_register_image_words` would otherwise have to
 /// REWRITE. Pinning is the sound half of that choice — see the module comment
 /// on `UNREWRITABLE_JIT_ROOTS` in `gc_quiescence`.
+/// Which of [`band_slot_is_verifiable`]'s three refusals `off` earned.
+///
+/// Diagnostic vocabulary only, and it must stay in step with that function --
+/// the point of the split is that the three refusals have DIFFERENT repairs
+/// (`callee-saved` and `register-image` can only be pinned; `dead-spill` is a
+/// word nothing reads again, so it need not have been a marking root at all).
+fn unverifiable_region(
+    off: i32,
+    layout: &cratonvm_jit::FrameLayout,
+    live_hi: Option<i32>,
+) -> &'static str {
+    if !layout.callee_saved_shallow && layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
+        return "callee-saved";
+    }
+    if layout.is_register_image(off) {
+        return "register-image";
+    }
+    if let Some(hi) = live_hi {
+        if layout.spill_hi > layout.spill_lo && off >= layout.spill_lo && off >= hi {
+            return "dead-spill";
+        }
+    }
+    "verifiable"
+}
+
 fn publish_unrewritable_band_roots(
     rbp: usize,
     frame_size: usize,
@@ -9225,6 +9340,23 @@ fn publish_unrewritable_band_roots(
         if heap.is_object_address(qword).is_some() {
             cratonvm_gc::gc_quiescence::add_unrewritable_jit_root(qword);
             published += 1;
+            // `CRATONVM_DBG_JIT_ROOTSCAN=1` — WHICH unverifiable region this
+            // word sits in. The three have nothing in common but the verdict:
+            // a callee-saved image holds the CALLER's live registers and can
+            // only be pinned, while a spill slot above the safepoint's live
+            // cursor is one nothing will ever read again. Reporting them under
+            // one `unrewritable=4` cannot separate "must pin" from "need not
+            // even mark", which is the only question with a fix behind it.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_ROOTSCAN").is_some() {
+                eprintln!(
+                    "[bandword] 0x{qword:x} off={off} refusal={} region={}                      live_hi={:?} frame_size={} reg={:?}",
+                    unverifiable_region(off, &cm.frame_layout, live_hi),
+                    cm.frame_layout.region_name(off),
+                    live_hi,
+                    cm.frame_layout.frame_size,
+                    cm.frame_layout.spill_image_register(off),
+                );
+            }
         }
     }
     if published > 0 {

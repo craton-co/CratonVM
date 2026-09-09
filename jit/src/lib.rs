@@ -2673,6 +2673,28 @@ impl FrameLayout {
         }
     }
 
+    /// Name the x86-64 GPR whose image `off` is, when `off` lands in the
+    /// per-safepoint blind spill (`safepoint-gpr-spill-image`).
+    ///
+    /// The spill is emitted as one store per entry of `x64::ALL_SPILL_GPRS`, in
+    /// table order, at `reg_spill_lo + 8 * index` (`emit_blind_reg_spill`), so
+    /// the index inverts exactly. Diagnostics only, and the table below must
+    /// stay in step with that constant -- a wrong name here misattributes a
+    /// retained object to the wrong register, which is worse than no name.
+    pub fn spill_image_register(&self, off: i32) -> Option<&'static str> {
+        const NAMES: [&str; 14] = [
+            "rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+            "r14", "r15",
+        ];
+        if self.reg_spill_hi <= self.reg_spill_lo || off < self.reg_spill_lo
+            || off >= self.reg_spill_hi
+        {
+            return None;
+        }
+        // Cast: the span is 14 slots, so the index is in range by construction.
+        NAMES.get(((off - self.reg_spill_lo) / 8) as usize).copied()
+    }
+
     /// Name the region `off` falls in. Diagnostics only.
     pub fn region_name(&self, off: i32) -> &'static str {
         let hit = |lo: i32, hi: i32| hi > lo && off >= lo && off < hi;
@@ -6872,6 +6894,27 @@ fn append_ir_inline_site(
     // to `ir_lower`, not to the builder, which is why it is not in
     // `IrInlineTables`.
     compact_fields_out: &mut HashMap<(usize, bool), (u32, bool, u8)>,
+    // The compiling method's value tier, for the spliced `getstatic` rows.
+    // `getstatic` is polymorphic and is listed by neither `is_category2_opcode`
+    // nor `is_float_opcode`, so a callee whose only wide or floating-point
+    // content is a static read reaches here inside a method admitted through
+    // the INT clause. The caller's own sites are gated on exactly this pair in
+    // `try_compile_inner`; a spliced site gated differently would put a `Long`
+    // node in a graph the long tier is switched off for.
+    ir_emit_long: bool,
+    ir_emit_fp: bool,
+    // Declaring classes of the spliced `getstatic` sites. Compiled code reads
+    // static storage directly, so every one of them is an ensure-init
+    // obligation this artifact owes before its first entry — the same
+    // obligation `ir_static_init_classes` records for the caller's own sites.
+    // Collected here rather than derived later because this is the only place
+    // that sees the callee's resolved rows.
+    static_init_classes_out: &mut Vec<u32>,
+    // `combined pc -> (callee entry, callee_needs_ctx)` for each surviving
+    // STATICALLY BOUND call in the spliced bodies. Goes to `ir_direct_calls`,
+    // which is what `ir_lower`'s `Op::Call` arm consults before falling
+    // through to the dispatch helper.
+    direct_call_sites: &mut Vec<(usize, (usize, bool))>,
 ) -> bool {
     let code_len = site.callee_code_len;
     if code_len == 0 || site.callee_code.len() < code_len || code_len > *budget {
@@ -6955,6 +6998,50 @@ fn append_ir_inline_site(
             .ldc2w_info
             .insert(base + cpc, (val, site.ldc_fp_pcs.contains(&cpc)));
     }
+    // Static reads, rebased. `InlineSite::static_field_info` has carried these
+    // resolved rows for the single-pass inliner all along; the optimizing tier
+    // refused the callee outright (`ir-splice-static-field`) because nothing
+    // put them where the builder's `0xb2` arm looks.
+    //
+    // Two guards, and neither is redundant with the resolver's:
+    //
+    // * The OPCODE is re-read from the relocated bytes. `static_field_info` is
+    //   a `getstatic`-and-`putstatic` list on the single-pass side, and the
+    //   builder has no `putstatic` arm at all — one such row reaching the map
+    //   would be a `getstatic` lowering planted at a store. The resolver
+    //   refuses a `putstatic`-bearing body, so this can only fire on a defect,
+    //   which is the case worth having a check for.
+    // * The VALUE TIER, exactly as `try_compile_inner` gates the caller's own
+    //   feed. A gated-off site cannot simply be omitted the way the caller's
+    //   is: omitting it there bails the method to single-pass, but omitting it
+    //   HERE bails the method after the splice has already been committed to.
+    //   Refusing the body instead rolls `combined` back and leaves the caller
+    //   compiling with one less inline.
+    if ir::ir_splice_getstatic_enabled() {
+        for &(cpc, class_id, field_index, type_tag, is_volatile) in &site.static_field_info {
+            if site.callee_code.get(cpc).copied() != Some(0xb2) {
+                return false;
+            }
+            let admitted_by_value_tier = match type_tag {
+                b'J' => ir_emit_long,
+                b'D' | b'F' => ir_emit_fp,
+                _ => true,
+            };
+            if !admitted_by_value_tier {
+                return false;
+            }
+            tables
+                .static_field_info
+                .insert(base + cpc, (class_id, field_index, type_tag, is_volatile));
+            static_init_classes_out.push(class_id);
+        }
+    } else if !site.static_field_info.is_empty() {
+        // The kill switch is set and the VM-side scanner mirror should already
+        // have refused this body. Refuse here too rather than splice a body
+        // whose statics have no rows: the two halves must not be able to
+        // disagree. See `ir::ir_splice_getstatic_enabled`.
+        return false;
+    }
     // The resolver PROVED these bodies are no-ops, which is what
     // `object_init_pcs` means — elidable on any receiver, not only on a fresh
     // `Op::New`. `trivial_init_pcs` is the narrower set and would refuse the
@@ -6994,6 +7081,10 @@ fn append_ir_inline_site(
             budget,
             virtual_call_sites,
             compact_fields_out,
+            ir_emit_long,
+            ir_emit_fp,
+            static_init_classes_out,
+            direct_call_sites,
         ) {
             return false;
         }
@@ -7027,8 +7118,77 @@ fn append_ir_inline_site(
         {
             virtual_call_sites.push((base + r.callee_pc, r.num_jit_args));
         }
+        // A STATICALLY BOUND surviving call gets the raw `CALL` the caller's
+        // own sites get.
+        //
+        // This row is what was missing, and its absence was not neutral. The
+        // resolver binds `direct_entry` for every `invokestatic` /
+        // `invokespecial` in a spliced body, and `intern_inline_invoke_targets`
+        // registers it in `direct_callee_entries` -- the KEEP-ALIVE list, which
+        // pins the callee artifact so a baked address cannot dangle. So the
+        // compile paid to pin a target for a direct call it then never emitted:
+        // `ir_direct_calls` was filled only from the CALLER's own scan loop, the
+        // lowerer's `self.direct_calls.get(&pc)` missed at every spliced pc, and
+        // the call fell through to `jit_invoke_dispatch` -- a blind NAME
+        // RESOLUTION, not a call.
+        //
+        // `resolve_inline_site_from` exempts IR mode from the single-pass side's
+        // "a spliced call must not be worse than the call it replaced" refusal,
+        // on the stated grounds that the IR tier's spliced call "is a call, not
+        // a resolution". That was the intent; it was not what the code did.
+        // Measured on `SpliceCallProbe`, whose spliced `mid` leaves behind a
+        // call to a `tableswitch`-bearing `pick` no resolver will splice:
+        // 53 ms running the single-pass body against ~455 ms running the
+        // optimizing one, checksums matching Temurin JDK 25 throughout. With
+        // the rows produced the optimizing body is at parity (~57 ms).
+        // Splicing a frame away while downgrading the calls inside it to
+        // resolutions is a net loss -- the same conclusion, and the same
+        // ~175 ns per resolution, the single-pass side measured in 2026-08.
+        //
+        // Virtual and interface kinds are NOT here: they select on the runtime
+        // receiver, the resolver offers them no direct bind, and the row above
+        // already routes them to the inline-cache cascade.
+        if ir_splice_direct_call_enabled() && ir_direct_calls_enabled() && r.direct_entry != 0 {
+            // The GPU gate the top-level planner applies, applied here for the
+            // same reason: a raw `CALL` to a kernel's entry bypasses
+            // `jit_invoke_dispatch`, and that helper is where the offload hook
+            // lives. Binding one directly would compile the caller and silently
+            // end offload. Unarmed, `keeps_dispatch_helper` is one relaxed bool.
+            let keeps_helper = site.invoke_targets.iter().any(|(pc, t)| {
+                *pc == r.callee_pc
+                    && crate::offload_hook::keeps_dispatch_helper(
+                        t.class_name.as_str(),
+                        t.method_name.as_str(),
+                        t.descriptor.as_str(),
+                    )
+            });
+            if !keeps_helper {
+                direct_call_sites
+                    .push((base + r.callee_pc, (r.direct_entry, r.direct_needs_context)));
+            }
+        }
     }
     true
+}
+
+/// May a surviving statically-bound call inside a SPLICED body be bound to the
+/// callee's entry with a raw `CALL`? **Default ON**;
+/// `CRATONVM_JIT_IR_SPLICE_DIRECT_CALL=0` restores the dispatch-helper
+/// fallback, which is what every such site got before 2026-09-09.
+///
+/// The off arm is not so much a safety net as the measurement's A arm: what it
+/// restores is `jit_invoke_dispatch`, which resolves the callee by NAME on
+/// every call. Keep it, because "did the splice make this slower?" has to stay
+/// a question one binary can answer.
+pub fn ir_splice_direct_call_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SPLICE_DIRECT_CALL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
 }
 
 /// Merge one top-level site's rows into the compile's plan. Split out so the
@@ -7051,6 +7211,7 @@ fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTable
         object_init_pcs,
         ldc_info,
         ldc2w_info,
+        static_field_info,
     } = from;
     into.sites.extend(sites);
     into.field_info.extend(field_info);
@@ -7059,6 +7220,7 @@ fn merge_ir_inline_tables(into: &mut ir::IrInlineTables, from: ir::IrInlineTable
     into.object_init_pcs.extend(object_init_pcs);
     into.ldc_info.extend(ldc_info);
     into.ldc2w_info.extend(ldc2w_info);
+    into.static_field_info.extend(static_field_info);
 }
 
 /// Turn a spliced body's resolver-side [`InlineInvokeTarget`]s into the
@@ -25404,6 +25566,12 @@ fn try_compile_inner(
                     let mut sub = ir::IrInlineTables::default();
                     let mut sub_vcalls: Vec<(usize, usize)> = Vec::new();
                     let mut sub_compact: HashMap<(usize, bool), (u32, bool, u8)> = HashMap::new();
+                    // Per-site, and merged only on success, for the same
+                    // reason `sub` itself is: a rolled-back body must not
+                    // leave this artifact owing a `<clinit>` for a class its
+                    // code never reads.
+                    let mut sub_static_init: Vec<u32> = Vec::new();
+                    let mut sub_direct_calls: Vec<(usize, (usize, bool))> = Vec::new();
                     let ok = append_ir_inline_site(
                         site,
                         pc,
@@ -25415,9 +25583,22 @@ fn try_compile_inner(
                         &mut budget,
                         &mut sub_vcalls,
                         &mut sub_compact,
+                        ir_emit_long,
+                        ir_emit_fp,
+                        &mut sub_static_init,
+                        &mut sub_direct_calls,
                     );
                     if ok {
                         merge_ir_inline_tables(&mut tables, sub);
+                        // The surviving statically-bound calls in the spliced
+                        // bodies, at their combined-buffer pcs. Merged only on
+                        // success, and keyed past `code_len`, so the spliced-pc
+                        // sweep below -- which drops the caller's own row at
+                        // every pc it spliced OVER -- cannot reach them.
+                        ir_direct_calls.extend(sub_direct_calls);
+                        // The ensure-init obligation the spliced statics add.
+                        // Sorted and deduped where the vector is consumed.
+                        ir_static_init_classes.append(&mut sub_static_init);
                         // Same gate the caller's own rows are behind, so
                         // the spliced bodies and the method around them cannot
                         // disagree about whether compact offsets are in play.

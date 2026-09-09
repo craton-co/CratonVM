@@ -7716,10 +7716,11 @@ impl G1Collector {
         let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         if gc_flags().g1_dbg_pins {
             eprintln!(
-                "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
+                "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?} {}",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::pinned_jit_root_count(),
                 jit_pinned_regions,
+                self.describe_pin_set(&regions, &jit_pinned_regions),
             );
         }
 
@@ -9261,10 +9262,12 @@ impl G1Collector {
         // exist.
         if gc_flags().g1_dbg_pins {
             eprintln!(
-                "[g1][PINS] young pause (parallel): jit_active={} pin_addrs={} pin_regions={:?}",
+                "[g1][PINS] young pause (parallel): jit_active={} pin_addrs={} \
+                 pin_regions={:?} {}",
                 crate::gc_quiescence::is_active(),
                 crate::gc_quiescence::pinned_jit_root_count(),
                 jit_pinned_regions,
+                self.describe_pin_set(&regions, &jit_pinned_regions),
             );
         }
         let cset: Vec<usize> = regions
@@ -19267,6 +19270,142 @@ impl G1Collector {
     /// turned out to be detecting before `collect_roots` was fixed.
     fn refuse_evacuation_for_empty_publication(detected: bool, lever_on: bool) -> bool {
         detected && lever_on
+    }
+
+    /// `CRATONVM_G1_DBG_PINS=1` — what each pinned region COSTS this pause, and
+    /// which pin vocabulary published it.
+    ///
+    /// `pin_regions={0, 11, 16}` (the line this extends) names the regions but
+    /// not the bill. A pin excludes a whole region from the collection set, so
+    /// the retention it buys is that region's OCCUPANCY, not the size of the
+    /// object the conservative word pointed at — and an investigation that
+    /// cannot see the occupancy cannot tell a pin that costs 40 bytes from one
+    /// that costs a megabyte. On
+    /// `docs/known-issues/h2/testvaluememory-fails-under-g1-on-conservative-jit-roots-20260908.md`
+    /// that distinction IS the defect: three pinned regions, and the two that
+    /// hold nothing the roots name are the whole of the 3224-vs-2228 gap.
+    ///
+    /// Provenance, because the three vocabularies have different repairs:
+    ///
+    /// * `jit` — an address in `gc_quiescence::pinned_jit_roots_snapshot()`, i.e.
+    ///   a conservative compiled-frame word. Narrowing this needs precise oop
+    ///   maps.
+    /// * `tlab` — a frozen peer's un-retired TLAB tail
+    ///   ([`Self::jit_tlab_skip_regions`]). Narrowing this needs the tail
+    ///   parseable, not the region excluded.
+    /// * `nonobj` — a root that failed [`Self::addr_is_followable_object`], pinned
+    ///   by [`Self::pinned_region_set_including_non_object_roots`].
+    ///
+    /// Diagnostic-only, and it recomputes the provenance rather than threading it
+    /// through the pin set: this runs once per pause behind a flag that is off,
+    /// and a `RegionSet` is a bitset with nowhere to put a label.
+    fn describe_pin_set(&self, regions: &[G1Region], pinned: &RegionSet) -> String {
+        let region_size = self.config.region_size.max(1);
+        // Provenance, by region, recomputed from the three publishers.
+        let mut jit: RegionSet = RegionSet::new();
+        if crate::gc_quiescence::is_active() {
+            for addr in crate::gc_quiescence::pinned_jit_roots_snapshot() {
+                if let Some(i) = self.lookup_region_for_addr(addr) {
+                    jit.insert(i);
+                }
+            }
+        }
+        let mut tlab: RegionSet = RegionSet::new();
+        for &(start, end) in self.jit_tlab_skip_regions.lock().iter() {
+            if let Some(i) = self.lookup_region_for_addr(start) {
+                tlab.insert(i);
+            }
+            if end > start {
+                if let Some(i) = self.lookup_region_for_addr(end - 1) {
+                    tlab.insert(i);
+                }
+            }
+        }
+        let mut nonobj: RegionSet = RegionSet::new();
+        // Per region: the PIN addresses that landed in it, not every root that
+        // did. Counting roots was the first version of this line and it is
+        // useless — region 0 reported `roots=5369` because the whole root set
+        // lives in Survivor, which says nothing about what pinned it. Five
+        // addresses decide this CSet; those five are the census.
+        let mut pin_hits: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut pin_addrs: Vec<usize> = if crate::gc_quiescence::is_active() {
+            crate::gc_quiescence::pinned_jit_roots_snapshot()
+        } else {
+            Vec::new()
+        };
+        pin_addrs.sort_unstable();
+        pin_addrs.dedup();
+        for addr in pin_addrs {
+            let Some(idx) = self.lookup_region_for_addr(addr) else {
+                continue;
+            };
+            pin_hits.entry(idx).or_default().push(addr);
+            if !self.addr_is_followable_object(regions, addr, "pin-census") {
+                nonobj.insert(idx);
+            }
+        }
+
+        let mut out = String::new();
+        let mut pinned_bytes = 0usize;
+        for idx in pinned.iter() {
+            let Some(r) = regions.get(idx) else {
+                out.push_str(&format!(" [{idx}:no-such-region]"));
+                continue;
+            };
+            let occ = r.cursor();
+            pinned_bytes += occ;
+            let mut prov = String::new();
+            for (set, label) in [(&jit, "jit"), (&tlab, "tlab"), (&nonobj, "nonobj")] {
+                if set.contains(&idx) {
+                    if !prov.is_empty() {
+                        prov.push('+');
+                    }
+                    prov.push_str(label);
+                }
+            }
+            if prov.is_empty() {
+                // A pinned region no vocabulary claims is not a tidy-up item:
+                // the pin set and this census would then disagree about what
+                // pinned it, and the pin set is the one that decides the CSet.
+                prov.push_str("UNATTRIBUTED");
+            }
+            let empty: Vec<usize> = Vec::new();
+            let hits = pin_hits.get(&idx).unwrap_or(&empty);
+            // Each pin address with the size of the object it names, because
+            // that is the number the region's occupancy has to be read against:
+            // a 16-byte object holding a 997 KB region out of the CSet and a
+            // 976 KB object holding its own are the same line otherwise.
+            let mut named = String::new();
+            for addr in hits.iter().take(4) {
+                let (verdict, _) = self.classify_candidate_header(regions, *addr);
+                let base = r.data.as_ptr() as usize;
+                let size = if verdict == HeaderVerdict::Object {
+                    // SAFETY: `Object` is the verdict that both tag bytes decoded
+                    // and the shape is sane, which is what the sizer needs.
+                    crate::concurrent_mark::concurrent_mark_object_size(
+                        *addr as *const ObjectHeader,
+                    )
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                named.push_str(&format!(
+                    " 0x{addr:x}(+0x{:x},{verdict:?},{size}B)",
+                    addr.wrapping_sub(base)
+                ));
+            }
+            out.push_str(&format!(
+                " [{idx}:{:?} occ={}K/{}K pins={} {}{}]",
+                r.region_type,
+                occ >> 10,
+                region_size >> 10,
+                hits.len(),
+                prov,
+                named,
+            ));
+        }
+        format!("pinned_bytes={}K{}", pinned_bytes >> 10, out)
     }
 
     /// [`Self::jit_pinned_region_set`] PLUS every region holding a root that is
