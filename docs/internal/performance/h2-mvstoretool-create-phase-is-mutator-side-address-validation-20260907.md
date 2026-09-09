@@ -295,7 +295,7 @@ reason:
    (the class-mirror populator arms it at bootstrap). Carrying that back to G1
    is worth ~4% of CPU. **Not taken here** because it trades a validated read
    for an unvalidated one on exactly the family
-   `docs/known-issues/tomcat/g1-eight-byte-write-at-a-live-objects-base-20260906.md`
+   `docs/internal/fixed-bugs/g1-eight-byte-write-at-a-live-objects-base-FIXED-20260908.md`
    is about — a stale reference-array element read as an object — and this lane
    had no way to bound that risk.
 2. **The read barrier's entry walk.** `load_and_forward_inner` validates before

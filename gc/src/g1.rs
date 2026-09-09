@@ -607,6 +607,31 @@ pub static UNRETIRED_FORWARDS: AtomicUsize = AtomicUsize::new(0);
 /// nothing.
 pub static EVAC_EMPTY_HEADER_PROVED: AtomicUsize = AtomicUsize::new(0);
 
+/// How many empty-header candidates were WAIVED because this pause had already
+/// spent its grid-proof budget.
+///
+/// Expected to be ZERO on any workload that is not pathological. A non-zero
+/// count means the empty-header shape arrives more than
+/// [`EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE`] times in one pause, so the screen is
+/// no longer covering all of them and the budget is what to raise -- or the
+/// shape is genuine and common, which the ratio to
+/// [`EVAC_EMPTY_HEADER_REFUSED`] says.
+pub static EVAC_EMPTY_HEADER_WAIVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Grid proofs this pause has already paid for; reset at the pause funnel.
+static EMPTY_HEADER_PROOFS_THIS_PAUSE: AtomicUsize = AtomicUsize::new(0);
+
+/// How many O(region) grid walks one pause will pay to prove empty-header
+/// candidates.
+///
+/// The proof is exact and the shape is rare -- 9 to 17 refusals per WHOLE RUN
+/// on the class this was measured against -- but "rare" is a property of a
+/// workload and this is a per-candidate cost on the evacuation path, so it is
+/// bounded rather than trusted. Above the budget the candidate is accepted, as
+/// it was before 2026-09-08: a refusal that is WRONG drops a live reference,
+/// and an unproved candidate is not a proved-bad one.
+const EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE: usize = 64;
+
 /// How many of those the grid said were not object starts.
 ///
 /// Expected to be ZERO. Non-zero means a reference slot (or a conservative
@@ -1245,6 +1270,38 @@ struct RegionsBase(*mut G1Region);
 // SAFETY: see the module-level SAFETY MODEL note — disjoint per-worker access.
 unsafe impl Send for RegionsBase {}
 unsafe impl Sync for RegionsBase {}
+
+/// Whether a followability test may pay for an O(region) grid walk to settle
+/// the EMPTY-HEADER shape.
+///
+/// # Why this is a parameter and not a policy
+///
+/// `empty_header_is_a_real_object` is exact and it is the only thing that can
+/// separate a real zero-field object from the payload word of a null `Value`
+/// cell. It is also a linear region walk, and the two kinds of caller are three
+/// orders of magnitude apart:
+///
+///  * the ROOT routes (`note_root_object_plausibility`, the root-pin scan) and
+///    the three evacuation SUPPLY routes ask once per root / keep-alive entry /
+///    seed -- tens to hundreds per pause, and **every empty-header refusal
+///    measured on 2026-09-08 came from `root-pin-scan`**;
+///  * the two evacuator ENTRY screens ask once per object evacuated. Measured
+///    on the same class: 21 000 - 43 000 empty-header candidates in one run,
+///    against 27 - 46 refusals. Proving those is a per-copy region walk for a
+///    population that is overwhelmingly genuine.
+///
+/// So the entry screens keep the cheap half of the test -- tag bytes, cursor
+/// containment, the class-id band and the arena test -- and leave the grid to
+/// the routes that supply them. That is not a coverage hole: an address only
+/// reaches `evacuate` through a root, a supply route or a reference slot, and
+/// the first two now prove it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GridProof {
+    /// Walk the region's object grid for an empty-header candidate.
+    Yes,
+    /// Do not; this caller is on the per-object path.
+    No,
+}
 
 /// Which end of a holder's region bounds a reference walk.
 ///
@@ -2430,7 +2487,12 @@ impl<'a> SharedEvac<'a> {
         if gc_flags().g1_evac_supply_screen
             && !self
                 .collector
-                .addr_is_followable_object_view(self.view(), old_ptr as usize, "parallel-evacuate")
+                .addr_is_followable_object_view(
+                    self.view(),
+                    old_ptr as usize,
+                    "parallel-evacuate",
+                    GridProof::No,
+                )
         {
             let n = EVAC_SUPPLY_NON_OBJECT.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
@@ -10140,7 +10202,12 @@ impl G1Collector {
         // The serial twin of the screen in `SharedEvac::evacuate`; see it for
         // what an interior address costs here.
         if gc_flags().g1_evac_supply_screen
-            && !self.addr_is_followable_object(regions, old_addr, "serial-evacuate")
+            && !self.addr_is_followable_object_view(
+                RegionView::Slice(regions),
+                old_addr,
+                "serial-evacuate",
+                GridProof::No,
+            )
         {
             let n = EVAC_SUPPLY_NON_OBJECT.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
@@ -11249,7 +11316,7 @@ impl G1Collector {
         addr: usize,
         site: &'static str,
     ) -> bool {
-        self.addr_is_followable_object_view(RegionView::Slice(regions), addr, site)
+        self.addr_is_followable_object_view(RegionView::Slice(regions), addr, site, GridProof::Yes)
     }
 
     /// [`Self::addr_is_followable_object`] against a [`RegionView`].
@@ -11258,6 +11325,7 @@ impl G1Collector {
         regions: RegionView<'_>,
         addr: usize,
         site: &'static str,
+        prove: GridProof,
     ) -> bool {
         if !self.candidate_header_is_plausible_view(regions, addr) {
             return false;
@@ -11269,7 +11337,8 @@ impl G1Collector {
         // `empty_header_is_a_real_object`. Tested before the band screen
         // because it is the cheaper predicate to FAIL: three field reads, and
         // only a match pays for the grid walk.
-        if gc_flags().g1_evac_empty_header_grid_proof
+        if prove == GridProof::Yes
+            && gc_flags().g1_evac_empty_header_grid_proof
             && header.class_id.as_u32() == 0
             && header.num_slots() == 0
             && header.kind() == ObjectKind::Object
@@ -11456,6 +11525,17 @@ impl G1Collector {
         if addr < base || addr >= base + cursor {
             return true;
         }
+        // THE BUDGET. See `EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE`: the proof is
+        // O(region) and this is the evacuation path, so a workload that
+        // produces the shape in bulk must not turn a correctness screen into a
+        // pause-time regression. Above it, answer as the collector did before
+        // this screen existed and count the waiver.
+        if EMPTY_HEADER_PROOFS_THIS_PAUSE.fetch_add(1, Ordering::Relaxed)
+            >= EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE
+        {
+            EVAC_EMPTY_HEADER_WAIVED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         EVAC_EMPTY_HEADER_PROVED.fetch_add(1, Ordering::Relaxed);
         let jit_skips = self.jit_tlab_skip_spans();
         let mut offset = 0usize;
@@ -11580,7 +11660,7 @@ impl G1Collector {
     /// `mixed_collection` only, and parallel evacuation is the DEFAULT arm
     /// (`CRATONVM_G1_PARALLEL_EVAC`, on unless `0`).
     fn note_root_object_plausibility_view(&self, regions: RegionView<'_>, addr: usize) -> bool {
-        if self.addr_is_followable_object_view(regions, addr, "cset-root") {
+        if self.addr_is_followable_object_view(regions, addr, "cset-root", GridProof::Yes) {
             return true;
         }
         let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -20936,6 +21016,10 @@ impl GarbageCollector for G1Collector {
             let regions = self.regions.read();
             self.report_pending_corrupt_holders(&regions);
         }
+        // The empty-header grid-proof budget is per PAUSE; this is the funnel
+        // every pause returns through. See
+        // `EMPTY_HEADER_PROOF_BUDGET_PER_PAUSE`.
+        EMPTY_HEADER_PROOFS_THIS_PAUSE.store(0, Ordering::Relaxed);
         // One pause's worth of writes; the ledger answers questions about the
         // pause that made them and a run-long map would be gigabytes.
         if let Some(w) = REF_WRITE_WATCH.get() {

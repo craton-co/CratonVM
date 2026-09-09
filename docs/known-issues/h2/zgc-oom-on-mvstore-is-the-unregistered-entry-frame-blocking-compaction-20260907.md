@@ -145,7 +145,7 @@ the compactor is allowed to run. `relocation_on_proven_jit=1` shows the proving
 path exists and fires; it just almost never can.
 
 **Not attempted on this page.** It is a GC/JIT-integration change on exactly the
-family `docs/known-issues/tomcat/g1-eight-byte-write-at-a-live-objects-base-20260906.md`
+family `docs/internal/fixed-bugs/g1-eight-byte-write-at-a-live-objects-base-FIXED-20260908.md`
 is about, and it needs its own lane and its own gating.
 
 ## 6. Repro

@@ -10,8 +10,14 @@ answered: the arithmetic on this path cannot overflow, and both halves of the
 contract it rests on are proven sound by probes that now live in the tree.**
 What is left is the page's own alternative — a reference naming memory that is
 not the object the check measured — which is
-`docs/known-issues/tomcat/g1-eight-byte-write-at-a-live-objects-base-20260906.md`'s
-family, and whose scope line already claims this workload.
+`docs/internal/fixed-bugs/g1-eight-byte-write-at-a-live-objects-base-FIXED-20260908.md`'s
+family, and whose scope line already claims this workload. **That family was
+closed on 2026-09-08**: an address that is not an object start reached
+`evacuate`, which installed a forwarding mark word eight bytes into a live
+object's body. A `WriteBuffer.buff` slot naming memory that is not the object
+the check measured is exactly what that produces, so this residual has an
+attributed producer and a fix rather than an open chase. Re-run this class
+before re-opening anything here.
 
 | | |
 |---|---|
@@ -105,7 +111,7 @@ Both halves hold, so the buffer `ensureCapacity` measured and the buffer
 `writeStringData` wrote into cannot be the same live object with disagreeing
 metadata. They can still be *different memory*: a `WriteBuffer.buff` slot naming
 a block that was freed, relocated or reused is exactly the shape
-`g1-eight-byte-write-at-a-live-objects-base-20260906.md` documents — that page's
+`g1-eight-byte-write-at-a-live-objects-base-FIXED-20260908.md` documents — that page's
 own table lists four Java-visible faces of one defect (`OutOfMemoryError`, two
 `ClassCastException` shapes, `EXCEPTION_ACCESS_VIOLATION`) and its scope line
 already names this workload's `BufferOverflowException` alongside them.
