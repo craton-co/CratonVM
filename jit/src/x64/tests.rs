@@ -13440,6 +13440,7 @@ fn make_inline_site(
         static_field_info: Vec::new(),
         ldc_info: Vec::new(),
         ldc2w_info: Vec::new(),
+        ldc_fp_pcs: Vec::new(),
         needs_heap: false,
         class_name: "Test".to_string(),
         class_id: 0,
